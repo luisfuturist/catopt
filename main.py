@@ -15,6 +15,7 @@ from catopt.ir import Op, Var, Param, TensorType, IR, op_repr
 from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
 from catopt.cost import flops_cost, launch_aware_cost
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt.optimize import optimize_model
 from catopt.models import MatrixChain
 
 
@@ -181,7 +182,8 @@ def demo_fused_projections(verbose: bool = True) -> None:
     pairing projections of a shared input via the product universal
     property <f,g> = (f x g) . Delta.
     """
-    from catopt.models import SwiGLU, AttentionBlock, NormLinear  # noqa: E402
+    from catopt.models import (SwiGLU, AttentionBlock, NormLinear,  # noqa: E402
+                               ParallelBlock, GQAAttention)
 
     torch.manual_seed(0)
     if verbose:
@@ -192,31 +194,27 @@ def demo_fused_projections(verbose: bool = True) -> None:
     cases = [
         ("SwiGLU gate/up", SwiGLU(64, hidden_mult=2), torch.randn(128, 64)),
         ("Attention QKV", AttentionBlock(64, n_heads=4), torch.randn(2, 8, 64)),
+        ("GQA fused QKV", GQAAttention(128, 4, 2), torch.randn(2, 8, 128)),
         ("NormLinear fold", NormLinear(64, 64), torch.randn(128, 8, 64)),
+        ("ParallelBlock (5-way)", ParallelBlock(128, n_heads=4,
+                                               hidden_mult=2),
+         torch.randn(4, 16, 128)),
     ]
     for name, model, x in cases:
-        ir, src = export_to_ir(model, x)
-        eg = EGraph()
-        eid = eg.add_term(ir.root)
-        eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-               max_iterations=30, max_nodes=50000)
-        best = eg.extract_best(eid, launch_aware_cost)
-        low = ir_to_torch_module(IR(
-            root=best, inputs=ir.inputs,
-            input_names=ir.input_names, params=ir.params,
-        ), param_values=src)
-        model.eval(); low.eval()
+        opt, stats = optimize_model(model, x, verbose=False)
+        model.eval(); opt.eval()
         with torch.no_grad():
-            d = (model(x.clone()) - low(x.clone())).abs().max().item()
-        n_fused = len([p for p in low._param_map if p.startswith("fused_")])
-        n_chunks = op_repr(best).count("(chunk")
+            d = (model(x.clone()) - opt(x.clone())).abs().max().item()
+        r = op_repr(opt._root)
+        n_fused = len([p for p in opt._param_map if p.startswith("fused_")])
+        n_views = r.count("(split") + r.count("(chunk")
         ok = "✓" if d < 1e-4 else "✗"
         if verbose:
             print(f"\n  {name}:")
-            print(f"    IR:    {op_repr(ir.root)[:100]}")
-            print(f"    best:  {op_repr(best)[:100]}")
+            print(f"    best:  {r[:110]}")
             print(f"    {ok} diff {d:.2e} | fused params: {n_fused}"
-                  f" | chunk views: {n_chunks}")
+                  f" | projection views: {n_views}"
+                  f" | paired: {bool(stats.get('paired_extract'))}")
 
 
 def demo_naturality(batch: int = 64, verbose: bool = True) -> None:

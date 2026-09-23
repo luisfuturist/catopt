@@ -419,8 +419,17 @@ class EGraph:
 
     # -- extraction --
 
-    def extract_best(self, eid: int, cost_fn) -> Any:
+    def extract_best(self, eid: int, cost_fn,
+                     overrides: dict[int, Any] | None = None) -> Any:
         """Extract the minimum-cost term from the e-class at *eid*.
+
+        ``overrides`` maps canonical e-class ids to a specific ENode:
+        extraction is then forced to use that enode for those classes.
+        This is how non-local rewrites (the diagram-level product rule)
+        get *coordinated* extraction — per-class greedy choice cannot see
+        that k members each selecting `split_i(fused)` share ONE fused
+        GEMM, since each split's subtree alone looks more expensive than
+        the member's own linear.
 
         Cost accounting is DAG-aware: each e-class in the extracted
         expression is charged exactly once, even when several parents
@@ -454,13 +463,15 @@ class EGraph:
                 return (float("inf"), None, frozenset(), False)
             in_progress.add(eclass_id)
             eclass = self._classes[eclass_id]
+            override = overrides.get(eclass_id) if overrides else None
+            nodes = (override,) if override is not None else eclass.nodes
             best_total: float | None = None
             best_term: Any = None
             best_used: frozenset = frozenset({eclass_id})
             best_local = 0.0
             best_param_only = False
             best_nops = 0
-            for node in eclass.nodes:
+            for node in nodes:
                 if node.op == "leaf":
                     key = node.attrs[0][1] if node.attrs else "??"
                     term = _LeafRegistry.decode(key)
@@ -533,6 +544,71 @@ class EGraph:
 
         _, term, _, _ = best(eid)
         return term
+
+    # -- coordinated (group) extraction ----------------------------------
+
+    def extract_paired(self, root_eid: int, cost_fn,
+                       groups: list[dict[int, Any]]) -> Any:
+        """Extract with pairing groups forced to share their fused GEMM.
+
+        Per-class greedy extraction cannot express the product law's
+        non-local choice: member class C_i containing both
+        ``linear(x, W_i)`` and ``split_i(fused)`` sees the split's
+        subtree cost as the FULL fused GEMM, which always loses locally.
+        The fused form only wins when *all* members take it — and
+        additionally when every consumer class routes through the member
+        classes rather than a specialized-fusion alternative (e.g. an
+        ``sdpa`` enode built over rule-introduced ``chunk`` terms).
+
+        So: (1) each member class is overridden to its split enode;
+        (2) every other class with multiple enodes is overridden to an
+        enode whose descendants reach a member class, when one exists —
+        steering consumers through the shared GEMM.  The caller compares
+        true DAG cost against the greedy term and keeps the winner.
+        """
+        member_over: dict[int, Any] = {}
+        member_classes: set[int] = set()
+        for g in groups:
+            for cid, enode in g.items():
+                cid = self.find(cid)
+                member_over.setdefault(cid, enode)
+                member_classes.add(cid)
+
+        # descendant e-class sets, memoized, cycle-guarded
+        desc_cache: dict[int, frozenset] = {}
+
+        def desc(cid: int, stack: frozenset) -> frozenset:
+            cid = self.find(cid)
+            if cid in desc_cache:
+                return desc_cache[cid]
+            if cid in stack:
+                return frozenset({cid})
+            out: set[int] = {cid}
+            for n in self._classes[cid].nodes:
+                for ch in n.children:
+                    out |= desc(ch, stack | {cid})
+            desc_cache[cid] = frozenset(out)
+            return desc_cache[cid]
+
+        def enode_reaches_member(node: Any) -> bool:
+            for ch in node.children:
+                if member_classes & desc(ch, frozenset()):
+                    return True
+            return False
+
+        overrides: dict[int, Any] = dict(member_over)
+        for cid, ec in list(self._classes.items()):
+            cid = self.find(cid)
+            if cid in member_over or len(ec.nodes) < 2:
+                continue
+            member_reaching = [n for n in ec.nodes
+                               if enode_reaches_member(n)]
+            if member_reaching and len(member_reaching) < len(ec.nodes):
+                # class has both member-reaching and bypassing enodes —
+                # force the member route so the shared GEMM is used
+                overrides[cid] = member_reaching[0]
+
+        return self.extract_best(root_eid, cost_fn, overrides=overrides)
 
 
 def _iter_ops(term: Any):

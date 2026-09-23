@@ -21,6 +21,7 @@ import torch
 from catopt.models import (
     MatrixChain, ParallelLinear, DeepParallel, SwiGLU,
     AttentionBlock, NormLinear, GQAAttention, TransformerBlock,
+    ParallelBlock,
 )
 from catopt.optimize import optimize_model
 from catopt.benchmark import benchmark_model
@@ -56,6 +57,10 @@ def main() -> None:
          torch.randn(64, 512, 512)),
         ("TBlock b=16 T=256", TransformerBlock(512, 8, 4),
          torch.randn(16, 256, 512)),
+        ("ParallelBlock b=64 T=256", ParallelBlock(512, 8, 4),
+         torch.randn(64, 256, 512)),
+        ("ParallelBlock b=4 T=64", ParallelBlock(512, 8, 4),
+         torch.randn(4, 64, 512)),
     ]
 
     for name, model, x in cases:

@@ -18,8 +18,10 @@ import torch
 
 from catopt.ir import IR, Op, Var, Const, Param
 from catopt.egraph import EGraph
-from catopt.rules import all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES
-from catopt.cost import flops_cost, count_cost, launch_aware_cost, CostModel
+from catopt.rules import (all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
+                          pair_shared_input_linears)
+from catopt.cost import (flops_cost, count_cost, launch_aware_cost,
+                         CostModel, dag_cost)
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.ir import op_repr
 
@@ -78,13 +80,20 @@ def optimize_model(
     eg = EGraph()
     root_eid = eg.add_term(ir.root)
 
-    # Choose rules
+    # Choose rules.  The term-local fusion rules (swiglu_fuse, qkv_fuse,
+    # parallel_mul_fuse, qkv_fuse_asym) are special cases of the product
+    # law; in the pipeline they are SUBSUMED by the non-local
+    # pair_shared_input_linears pass, which needs no consumer pattern.
+    # Keeping them would let extraction pick consumer-level chunk
+    # alternatives that bypass the globally-coordinated split choice.
+    _SUBSUMED = {"swiglu_fuse", "parallel_mul_fuse",
+                 "qkv_fuse", "qkv_fuse_asym"}
     if ruleset == "all":
-        rules = all_rules()
+        rules = [r for r in all_rules() if r.name not in _SUBSUMED]
     elif ruleset == "simpl":
         rules = SIMPLIFICATION_RULES
     elif ruleset == "categorical":
-        rules = CATEGORICAL_RULES
+        rules = [r for r in CATEGORICAL_RULES if r.name not in _SUBSUMED]
     else:
         raise ValueError(f"Unknown ruleset: {ruleset}")
 
@@ -93,11 +102,32 @@ def optimize_model(
 
     stats = eg.run(rules, root_eid,
                    max_iterations=max_iterations, max_nodes=max_enodes)
+
+    # Diagram-level product law: pair every linear sharing an input into
+    # one GEMM + split views.  Non-local — no consumer pattern needed.
+    groups = pair_shared_input_linears(eg)
+    if groups:
+        eg.rebuild()
+        stats["pairing_groups"] = len(groups)
+        # brief second saturation so other rules see the new enodes
+        eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
+
     if verbose:
         print(f"  E-graph: {stats}")
 
     # -- Extract best term -----------------------------------------------
     best_term = eg.extract_best(root_eid, cost_fn)
+    if groups:
+        # Coordinated extraction: force every paired member to its split
+        # enode AND steer consumers through the shared GEMM.  Compare
+        # true DAG costs — forcing loses if a group is only partially
+        # reachable or a bypassing alternative was already cheaper.
+        forced = eg.extract_paired(root_eid, cost_fn, groups)
+        if (forced is not None
+                and dag_cost(forced, cost_fn)
+                <= dag_cost(best_term, cost_fn)):
+            best_term = forced
+            stats["paired_extract"] = True
     if verbose:
         print(f"  Best term: {op_repr(best_term)}")
         print(f"  Cost: {cost_fn(best_term):.2f} FLOPs (est.)")

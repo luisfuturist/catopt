@@ -687,6 +687,83 @@ def test_transformer_block_stacks_fusions():
     assert d < 1e-4
 
 
+# ---------------------------------------------------------------------------
+#  Diagram-level pairing pass (general product law)
+# ---------------------------------------------------------------------------
+
+def test_pairing_pass_five_way_parallel_block():
+    """ParallelBlock: all 5 same-source projections fuse into ONE GEMM."""
+    from catopt.models import ParallelBlock
+    from catopt.optimize import optimize_model
+    from catopt.ir import op_repr
+    torch.manual_seed(0)
+    m = ParallelBlock(128, n_heads=4, hidden_mult=2).eval()
+    x = torch.randn(4, 16, 128)
+    opt, stats = optimize_model(m, x, verbose=False)
+    r = op_repr(opt._root)
+    assert stats.get("paired_extract")
+    assert r.count("(split") >= 5
+    # uneven sizes: q,k,v are dim; gate,up are 2*dim
+    assert "(128, 128, 128, 256, 256)" in r
+    m.eval(); opt.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - opt(x.clone())).abs().max().item()
+    assert d < 1e-4
+
+
+def test_pairing_subsumes_swiglu_rule():
+    """The pairing pass alone fuses gate/up — no consumer pattern needed."""
+    from catopt.models import SwiGLU
+    from catopt.rules import (pair_shared_input_linears,
+                              CATEGORICAL_RULES, SIMPLIFICATION_RULES,
+                              SWIGLU_FUSE, PARALLEL_MUL_FUSE,
+                              QKV_FUSE, QKV_FUSE_ASYM)
+    from catopt.cost import launch_aware_cost, dag_cost
+    subsumed = {SWIGLU_FUSE.name, PARALLEL_MUL_FUSE.name,
+                QKV_FUSE.name, QKV_FUSE_ASYM.name}
+    rules = [r for r in CATEGORICAL_RULES if r.name not in subsumed]
+    torch.manual_seed(0)
+    m = SwiGLU(64, 2).eval()
+    x = torch.randn(16, 64)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(rules + SIMPLIFICATION_RULES, eid, max_iterations=10,
+           max_nodes=50000)
+    groups = pair_shared_input_linears(eg)
+    eg.rebuild()
+    assert groups and any(len(g) >= 2 for g in groups)
+    greedy = eg.extract_best(eid, launch_aware_cost)
+    forced = eg.extract_paired(eid, launch_aware_cost, groups)
+    assert forced is not None
+    assert dag_cost(forced, launch_aware_cost) <= dag_cost(greedy, launch_aware_cost)
+    splits = _find_ops(forced, "split")
+    assert len(splits) == 2
+    assert splits[0].args[0] is splits[1].args[0]
+    low = _lower(ir, forced, source)
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-5
+
+
+def test_pairing_no_shared_input_no_fusion():
+    """Linears with different inputs must NOT be paired."""
+    from catopt.rules import pair_shared_input_linears
+    x = Var("x", TensorType((4, 4)))
+    y = Var("y", TensorType((4, 4)))
+    wa = Param("A", TensorType((4, 4)))
+    wb = Param("B", TensorType((4, 4)))
+    t = Op.make("mul",
+                Op.make("linear", x, wa),
+                Op.make("linear", y, wb))
+    eg = EGraph()
+    eid = eg.add_term(t)
+    groups = pair_shared_input_linears(eg)
+    assert not any(len(g) >= 2 for g in groups)
+    assert not any(n.op == "split" for n in eg._node_to_class)
+
+
 def test_channel_scale_rejects_row_scale():
     """linear(x*r, W) with r per-row must not fold r into W."""
     from catopt.rules import LINEAR_CHANNEL_SCALE

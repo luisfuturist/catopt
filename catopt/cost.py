@@ -269,6 +269,36 @@ def flops_cost(term: Any) -> float:
     return 0.0
 
 
+def dag_cost(term: Any, cost_fn) -> float:
+    """True DAG cost of an extracted term: shared subtrees charged once.
+
+    ``cost_fn(term)`` counts shared subtrees once per *parent* (a tree
+    walk); extracted terms can share Op objects when two e-class parents
+    picked terms over the same e-class (e.g. one fused GEMM under two
+    split views).  This sums each distinct node's local cost —
+    ``cost_fn(node) - sum(cost_fn(children))`` — deduplicated by object
+    identity.
+    """
+    seen: set[int] = set()
+    total = 0.0
+
+    def rec(t: Any) -> None:
+        nonlocal total
+        if id(t) in seen:
+            return
+        seen.add(id(t))
+        if isinstance(t, Op):
+            for a in t.args:
+                rec(a)
+            local = cost_fn(t) - sum(cost_fn(c) for c in t.args)
+            total += max(local, 0.0)
+        else:
+            total += cost_fn(t)
+
+    rec(term)
+    return total
+
+
 def launch_aware_cost(term: Any) -> float:
     """flops_cost + _LAUNCH_PENALTY per non-view op.
 

@@ -559,6 +559,97 @@ ASSOC_MATMUL_REV = R(
 
 
 # ---------------------------------------------------------------------------
+#  Diagram-level pairing pass — the product law in full generality.
+#
+#  ⟨f₁,…,f_k⟩ = (f₁ × … × f_k) ∘ Δ  is a NON-LOCAL rewrite: it pairs
+#  morphisms by their shared domain, not by a consumer pattern.  A
+#  term-local lhs→rhs rule can only fire when a specific parent op
+#  (mul, sdpa) happens to consume the projections — which is exactly why
+#  pattern-matching optimizers miss the general case.  Here we implement
+#  it as a pass over the e-graph: group every `linear(x, Wᵢ)` e-node by
+#  the e-class of x, then offer each member's class the alternative
+#
+#      splitᵢ( linear(x, cat(W₁,…,W_k)) )
+#
+#  so the group may be extracted as ONE GEMM plus k zero-cost views.
+#  Subsumes swiglu_fuse / qkv_fuse / qkv_fuse_asym / parallel_mul_fuse.
+#  Guards: the shared input must be runtime data (contain a Var), and
+#  every weight must be param-only so the concat folds at compile time.
+# ---------------------------------------------------------------------------
+
+def _term_has_var(t: Any) -> bool:
+    from catopt.ir import Var
+    if isinstance(t, Var):
+        return True
+    if isinstance(t, Op):
+        return any(_term_has_var(a) for a in t.args)
+    return False
+
+
+def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
+    """Pair all `linear` e-nodes that share an input e-class.
+
+    Returns one group per shared input: a dict mapping each member's
+    canonical class id to the ``split`` ENode that reads its section of
+    the shared fused GEMM.  The caller may feed the union of these dicts
+    to ``extract_best`` as ``overrides`` — per-class greedy extraction
+    cannot see that all members choosing a split share ONE fused GEMM
+    (each split's subtree alone costs more than the member's own
+    linear), so the coordinated choice must be forced globally.
+
+    Idempotent: re-running rebuilds the same (hash-consed) enodes.
+    """
+    from catopt.cost import _shape_of as _so
+    from catopt.egraph import ENode
+
+    by_input: dict[int, list[tuple[int, int]]] = {}
+    for cid in list(eg._classes.keys()):
+        for node in eg._classes[cid].nodes:
+            if node.op != "linear" or len(node.children) != 2:
+                continue
+            by_input.setdefault(
+                eg.find(node.children[0]), []
+            ).append((cid, eg.find(node.children[1])))
+
+    groups: list[dict[int, Any]] = []
+    for x_eid, members in by_input.items():
+        xt = eg.any_term(x_eid)
+        if xt is None or not _term_has_var(xt):
+            continue  # pairing weight-only chains is compile-time noise
+        weights = sorted({w for _, w in members})
+        if len(weights) < 2:
+            continue
+        wts = [eg.any_term(w) for w in weights]
+        if any(t is None or _term_has_var(t) for t in wts):
+            continue  # fused weight must fold at compile time
+        sizes: list[int] = []
+        for t in wts:
+            s = _so(t)
+            if not (isinstance(s, tuple) and len(s) == 2 and s[0]):
+                break
+            sizes.append(s[0])
+        if len(sizes) != len(weights):
+            continue
+        cat = weights[0]
+        for w in weights[1:]:
+            cat = eg.add_enode("concat", (cat, w), {"dim": 0})
+        fused = eg.add_enode("linear", (x_eid, cat))
+        index_of = {w: i for i, w in enumerate(weights)}
+        group: dict[int, Any] = {}
+        for cid, w in members:
+            enode = ENode("split", (fused,), (
+                ("dim", -1), ("index", index_of[w]),
+                ("sizes", tuple(sizes)),
+            ))
+            eg.union(cid, eg.add_enode("split", (fused,), {
+                "sizes": tuple(sizes), "dim": -1,
+                "index": index_of[w]}))
+            group.setdefault(cid, enode)
+        groups.append(group)
+    return groups
+
+
+# ---------------------------------------------------------------------------
 #  Rule collections
 # ---------------------------------------------------------------------------
 

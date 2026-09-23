@@ -216,6 +216,34 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class ParallelBlock(nn.Module):
+    """PaLM/GPT-J-style parallel block: ``x + attn(norm(x)) + mlp(norm(x))``.
+
+    All five projections — q, k, v, gate, up — read the SAME normed
+    activation ``n``.  The product law pairs them transitively into ONE
+    GEMM whose output splits into five uneven sections; the downstream
+    structure (head views + SDPA for q/k/v, silu·mul for gate/up) is
+    preserved.  This is the closure property of the categorical product:
+    pairing composes, and the fused weight is ``cat(Wq,Wk,Wv,Wg,Wu)``.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 8,
+                 hidden_mult: int = 4, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.norm_w = nn.Parameter(torch.ones(dim))
+        self.attn = AttentionBlock(dim, n_heads)
+        h = dim * hidden_mult
+        self.gate = nn.Linear(dim, h, bias=False)
+        self.up = nn.Linear(dim, h, bias=False)
+        self.down = nn.Linear(h, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        n = x * rms * self.norm_w
+        return x + self.attn(n) + self.down(F.silu(self.gate(n)) * self.up(n))
+
+
 class GQAAttention(nn.Module):
     """Grouped-query attention: q has ``n_heads``, k/v have ``n_kv_heads``.
 

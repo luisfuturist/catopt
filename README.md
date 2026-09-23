@@ -208,9 +208,9 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 
 | Layer | Module | What it does |
 | ----- | ------ | ------------ |
-| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws (incl. `concat`/`chunk` for the product structure, `sdpa`/`contiguous`/`reshape`/`transpose` for attention) |
-| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, **attribute metavariables**, **per-rule `check` predicates** (shape-aware side conditions), **DAG-aware extraction**: shared e-classes charged once, param-only classes charged at compile-time cost 0, cycle-safe |
-| Rules | `catopt/rules.py` | 34 rules: monoid/group laws, `silu`/`pow` bridges, bilinearity/weight-merge, naturality + **shape-checked scale naturality** (row vs channel vs scalar), associativity, **product-structure fusion** (`swiglu_fuse`, `parallel_mul_fuse`, `qkv_fuse`) |
+| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws (incl. `concat`/`chunk`/`split` for the product structure, `sdpa`/`contiguous`/`reshape`/`transpose` for attention) |
+| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, **attribute metavariables**, **per-rule `check`/`derive` hooks** (shape-aware side conditions, computed RHS attrs), **DAG-aware extraction**: shared e-classes charged once, param-only classes charged at compile-time cost 0, cycle-safe, **`extract_paired`** coordinated extraction for non-local rewrites |
+| Rules | `catopt/rules.py` | 35 rules: monoid/group laws, `silu`/`pow` bridges, bilinearity/weight-merge, naturality + **shape-checked scale naturality** (row vs channel vs scalar), associativity, product-structure fusion (`swiglu_fuse`, `parallel_mul_fuse`, `qkv_fuse`, `qkv_fuse_asym` — all **subsumed** by the pass below), plus **`pair_shared_input_linears`**: the product law ⟨f₁…f_k⟩ = (f₁×…×f_k)∘Δ as a non-local rewrite over shared-input e-classes — arbitrary arity, asymmetric dims, consumer-agnostic |
 | Cost | `catopt/cost.py` | `count_cost`, shape-aware `flops_cost` (`2·M·N·K`), `launch_aware_cost` (FLOPs + per-kernel penalty), **`roofline_cost`** (per-op `max(compute, memory)` + launch, stride-aware) |
 | Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion** (incl. `concat`); shared-subterm memoisation; SDPA/reshape/transpose attr plumbing |
 | Pipeline | `catopt/optimize.py` | 4-phase `optimize_model` with equivalence verification |
@@ -247,6 +247,8 @@ quartile of 30 reps.
 | **GQA fused QKV b=64 T=256** | yes (0.0) | 17.42 | 17.99 | 0.97× |
 | TransformerBlock b=64 T=512 (QKV+gate/up stacked) | yes (0.0) | 169.8 | 174.8 | 0.97× |
 | TransformerBlock b=16 T=256 | yes (5e-07) | 18.62 | 18.61 | 1.00× |
+| **ParallelBlock b=64 T=256** (5 proj → 1 GEMM) | yes (5e-07) | 73.95 | 75.12 | 0.98× |
+| **ParallelBlock b=4 T=64** (launch-bound) | yes (5e-07) | 1.193 | 1.004 | **1.19×** |
 | NormLinear b=256 | yes (8e-06) | 4.29 | 4.38 | 0.98× |
 
 Both paths go through `torch.compile`, so the comparison isolates the
@@ -295,6 +297,31 @@ representation expose?"*: composing **two** laws where the second is only
 constraint the cost model cannot see. Both got caught not by inspection but by
 the e-graph's equivalence check.
 
+### The product law is non-local — that's why pattern matchers miss it
+
+`⟨f₁,…,f_k⟩ = (f₁ × … × f_k) ∘ Δ` is a statement about the *whole
+diagram*: it pairs morphisms by their shared domain, not by a consumer
+subtree. A term-local `lhs → rhs` rewrite can only express it through a
+consumer pattern (`mul(l₁, l₂)`, `sdpa(h₁, h₂, h₃)`), which is why
+conventional graph optimizers — and our own first attempt — need a
+handwritten rule per consumer shape and still can't generalise.
+
+The implementation that works is a **diagram-level pass**:
+`pair_shared_input_linears` groups `linear` e-nodes by their input
+e-class and offers each member the alternative `splitᵢ(linear(x,
+cat(W₁,…,W_k)))` — arbitrary arity, asymmetric output dims, any
+consumers. It subsumes `swiglu_fuse`, `qkv_fuse`, `qkv_fuse_asym`, and
+`parallel_mul_fuse`; on `ParallelBlock` (PaLM-style parallel
+attn+MLP) it produces **one GEMM feeding five uneven split views**
+(q,k,v,gate,up) where no term-local rule combination could reach.
+
+The cost: extraction is no longer locally decomposable — the shared
+GEMM's cost only amortises if *all* members coordinate, which per-class
+greedy selection cannot see. `extract_paired` handles this with
+override-based coordinated extraction: members are forced to their
+splits, consumers steered onto member-reaching enodes, and the result
+is only kept if its true DAG cost beats the greedy term.
+
 ### The pattern across all six cases — where the wins actually live
 
 This is now the clearest empirical result in the repo. Every transform the
@@ -305,25 +332,23 @@ GEMMs run. They divide cleanly:
 * **FLOP-reducing transforms pay on CPU.** MatrixChain, ParallelLinear,
   DeepParallel each shrink the actual GEMM FLOP count (6.3×, 2×, 2.9×) —
   those wins are backend-independent and measured at 1.6–6.2×, 2.24×, 3.02×.
-* **Same-FLOP restructuring is parity on GPU — the earlier "win" was a
-  benchmark artifact.** SwiGLU gate/up fusion, fused QKV (both symmetric
-  and GQA-asymmetric), and the stacked TransformerBlock all verify
-  bit-exactly and mechanically halve the GEMM count (profiler: 4 GEMMs +
-  1 SDPA → 2 GEMMs + 1 SDPA per forward).  But measured GPU execution is
-  ~parity (0.97–1.04×): inside a `torch.compile`d graph Inductor already
-  schedules kernels back-to-back, and at these GEMM sizes launch overhead
-  and tile-efficiency differences are below noise.  A first version of
-  this table reported 1.10–1.20× — that was measuring **kernel-submission
-  time** (`_bench_once` synced once after warmup but not per iteration;
-  CUDA calls are async).  The fix and re-measurement are committed.
-* **The value of categorical restructuring on a compiled backend is
-  almost entirely FLOP reduction.** The algebraic wins (reassociation,
-  weight merging, factorization) measure 1.5–2.5× on GPU and 1.6–6.2× on
-  CPU.  The pairing/product rewrites are semantically valuable — verified
-  parameter restructuring Inductor cannot express — but their runtime
-  value lives in eager/serving regimes (the 1.10× eager SwiGLU data
-  point) and in enabling downstream optimizations, not in compiled-graph
-  execution time at these shapes.
+* **Same-FLOP restructuring is parity at compute-bound sizes but wins
+  in the launch-bound regime.** Fused projections keep FLOPs identical;
+  their wins are fewer kernel launches and better GEMM aspect ratios.
+  On GPU at B≥16 the fused forms measure parity (0.97–1.04×) — Inductor
+  already hides launches inside a compiled graph.  But at B=4 the
+  ParallelBlock's 5→1 projection fusion measures **1.19×** — the
+  launch-bound regime where serving systems actually fuse QKV by hand.
+  (A first version of this table reported 1.10–1.20× at *large* batch —
+  that measured kernel-submission time, a `_bench_once` async bug, now
+  fixed and regression-noted.)
+* **The value of categorical restructuring splits cleanly by regime.**
+  The algebraic wins (reassociation, weight merging, factorization —
+  FLOP reduction) measure 1.5–2.5× GPU and 1.6–6.2× on CPU at every
+  size.  The pairing/product rewrites pay where launches dominate
+  (small-batch serving) and are free otherwise — the cost model can
+  choose per shape, which is the point of discovering them through a
+  cost-driven search rather than hard rules.
 * **NormLinear is the controlled negative case on both backends** (~0.9–0.98×):
   Inductor already fuses `x·rms·wn` into the GEMM's input read, so
   graph-level folding adds a materialized intermediate for no benefit.
@@ -331,11 +356,14 @@ GEMMs run. They divide cleanly:
 So the honest claim today: **categorical semantics + equality saturation
 finds and formally verifies parameter-restructuring transforms that
 TorchInductor cannot express — including a *stacked* composition (fused
-QKV + fused gate/up + folded norms in one TransformerBlock) and an
-*asymmetric* pairing (GQA) whose split sizes are derived, not matched.
-On the measured backends the profitable subset is precisely the
-FLOP-reducing one — 1.5–2.5× GPU — and the instrument now correctly
-reports where the boundary is.**
+QKV + fused gate/up + folded norms in one TransformerBlock), an
+*asymmetric* pairing (GQA) whose split sizes are derived, not matched,
+and a *non-local* product law that fuses k≥2 shared-input projections
+through one coordinated extraction — a shape no term-local rewrite can
+express. On the measured backends the profitable subset splits by
+regime: FLOP-reduction wins everywhere (1.5–2.5× GPU, 1.6–6.2× CPU),
+and pairing wins in the launch-bound regime (1.19× at b=4) — the
+instrument reports which is which rather than assuming.**
 
 ### Honest reading of the numbers
 
@@ -377,20 +405,23 @@ reports where the boundary is.**
   chosen whenever it is *semantically* available; the earlier break-even
   behaviour (partial fusion at small batch) was an artifact of charging
   compile-time work at runtime rates.
-* **The nonlinear barrier is breached — but not profitably on this
-  backend.** Three product-structure transforms now work end to end:
-  `swiglu_fuse` (merged gate/up GEMM), `qkv_fuse` (one GEMM feeding three
-  `chunk` projections into SDPA — uses *attribute metavariables* so the
-  pattern binds concrete reshape shapes and the SDPA scale), and the
-  `NormLinear` fold (channel gain into the weight, per-row `rms` hoisted
-  out — two different naturality laws composing), and `qkv_fuse_asym`
-  (GQA — uneven head counts via a derived `split`, the
-  `QKVParallelLinear` trick). All verify bit-exactly or within float
-  noise. None is profitable inside a compiled graph on the measured
-  hardware — their value is semantic restructuring, not runtime. What
-  remains undemonstrated: a transform that is *new to practitioners*,
-  not just new to Inductor — fused QKV and merged gate/up are textbook
-  deployment tricks discovered automatically, not novel optimizations.
+* **The nonlinear barrier is breached — through a single non-local law.**
+  The product-structure transforms now work end to end: merged gate/up,
+  symmetric and GQA-asymmetric fused QKV, the `NormLinear` fold (channel
+  gain into weight, `rms` hoisted — two different naturality laws
+  composing), and `ParallelBlock`'s **5-way fusion** (q,k,v,gate,up →
+  one GEMM + five uneven splits). All are generated by the same
+  `pair_shared_input_linears` pass plus coordinated extraction; all
+  verify bit-exactly or within float noise. Runtime value is
+  regime-dependent: parity at compute-bound sizes, **1.19× at b=4**
+  where launches dominate. What remains undemonstrated: a transform
+  *new to practitioners*, not just new to Inductor — fused QKV and
+  merged gate/up are textbook deployment tricks discovered
+  automatically, not novel optimizations.
+* **Pairing is restricted to `linear` children.** The pass groups
+  `linear` e-nodes by input e-class; `conv2d`, `matmul`-with-add, and
+  norms-with-learned-scales are not yet pairable. The mechanism is
+  generic — extend it by registering pairable op signatures.
 * **The cost model now knows about compile time, sharing, and layout.**
   Extraction charges param-only classes at 0 and shared e-classes once.
   `roofline_cost` estimates per-op `max(flops/peak_flops, bytes/peak_bw)
@@ -422,7 +453,7 @@ reports where the boundary is.**
 python main.py                     # associativity, parallel merges, fused
                                    # projections (SwiGLU/QKV/norm), naturality
 python main.py --large-batch 4096  # measured large-batch timing
-python -m pytest tests/ -q         # 74 tests
+python -m pytest tests/ -q         # 77 tests
 python bench_gpu.py                # same table on CUDA
 ```
 
