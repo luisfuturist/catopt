@@ -274,10 +274,12 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   (AOTAutograd) graphs is unimplemented future work.
 - **Chunked attention loses to fused sdpa head-to-head** whenever K,V
   fit on device (sdpa is already score-bounded; ~1.8–2× latency win for
-  sdpa). The om win is *feasibility* — streaming KV beyond VRAM, O(1)
-  incremental state — and requires the streaming schedule, which the
-  executor does not yet emit (demonstrated via a hand-written fold).
-  The fixed-query incremental mode does not model per-token decode.
+  sdpa). The om win is *feasibility* — `StreamingOMModule` evaluates the
+  om tree as a bounded-memory fold (~57 MiB transient flat in T_kv,
+  verified identical to the hand-written benchmark fold) and
+  `om_step_qk` gives O(block) incremental state updates (~40× vs
+  sdpa-recompute at 65k cache, CUDA-graph capturable). The fixed-query
+  incremental mode does not model per-token decode.
 - **Masked chunked attention needs a "mask distributes over concat"
   law** — causal masks carry positional offsets that the current IR
   cannot yet express per-block; additive masks compose freely.
@@ -325,11 +327,11 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/torch_bridge.py` | `torch.export` → IR, IR → `IRModule`, compile-time weight folding |
 | `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
 | `catopt/om.py` | Online-softmax monoid laws (chunked/streaming attention) |
-| `catopt/om_lower.py` | Level-batched chunked-attention executor + CUDA graphs/compile |
+| `catopt/om_lower.py` | Level-batched + streaming chunked-attention executors, incremental om state, CUDA graphs/compile |
 | `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 206 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid |
+| `tests/` | 231 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming |
 
 ## Reproduce
 
