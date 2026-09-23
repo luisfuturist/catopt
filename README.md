@@ -264,9 +264,9 @@ parameters*, which lies outside kernel fusion. The extracted form shares the
 fused GEMM as a single e-class read by both chunk parents, and lowering runs
 it exactly once (memoised eval, regression-tested). Profitability on CPU is
 batch-dependent (1.06× at b=128, 0.98× at b=4096 — the fused GEMM saves a
-launch but chunk yields non-contiguous views for the elementwise ops); on GPU,
-where launches dominate and fused QKV is standard practice, this is the
-expected regime for a win — untested here (no CUDA device).
+launch but chunk yields non-contiguous views for the elementwise ops); on GPU
+the same transform measures **1.10–1.20×** (see the GPU table below) — the
+predicted regime for a win, confirmed.
 
 ### The algebra is error-prone, which is the interesting part
 
@@ -399,7 +399,7 @@ python main.py                     # associativity, parallel merges, fused
                                    # projections (SwiGLU/QKV/norm), naturality
 python main.py --large-batch 4096  # measured large-batch timing
 python -m pytest tests/ -q         # 71 tests
-python bench_gpu.py                # same table on CUDA (needs unblocked driver)
+python bench_gpu.py                # same table on CUDA
 ```
 
 ---
