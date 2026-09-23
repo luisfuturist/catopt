@@ -360,8 +360,10 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   block i's mask = `split` columns `[o_i, o_i+K_i)`), so causal chunked
   attention verifies fp64-exact; but no `arange`/`tril` generators
   exist, so masks must arrive materialized (buffer/param/computed —
-  all real export idioms), and `sdpa(is_causal=True)` has no mask
-  operand to slice.
+  all real export idioms). `SDPA_CAT_LAWS` also chunk
+  `sdpa(is_causal=True)` over concatenated K/V — the implicit mask
+  materializes as a `cmask` op and `split` carries the offsets;
+  an explicit `attn_mask` operand still doesn't chunk.
 - **SDPA-fold coverage is bounded** — mul/div score scaling,
   masked_fill and additive masks, optional eval-mode dropout;
   `is_causal` requires the mask to be parameter-only and exactly
@@ -390,9 +392,10 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 - **More weight-preserving dualities**: RepVGG-style branch merging,
   conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
   architecture over the same parameters.
-- **Mask synthesis + `is_causal` chunking**: `OM_MASK_LAWS` distribute
-  materialized masks over concat; generating masks from positions
-  (`arange`/`tril`) and chunking the `is_causal` flag remain open.
+- **Mask synthesis + `attn_mask` chunking**: `OM_MASK_LAWS` distribute
+  materialized masks and `SDPA_CAT_LAWS` chunk the `is_causal` flag;
+  generating masks from positions (`arange`/`tril`) and chunking an
+  explicit `attn_mask` operand remain open.
 - **Trace beyond linear bodies**: affine/nonlinear loop bodies need
   constant-1 augmentation or function-valued objects; delay-loop
   trace with init state needs a stream-function category.
@@ -420,7 +423,7 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 361 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
+| `tests/` | 389 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
 
 ## Reproduce
 
