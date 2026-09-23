@@ -1077,7 +1077,7 @@ def test_linear_recurrence_scan_structure():
     laws = [R.DISTRIBUTE_MUL, R.ASSOC_MATMUL, R.ASSOC_MATMUL_REV,
             R.ASSOC_ADD, R.COMM_ADD]
     eg.run(laws, root, max_iterations=4, max_nodes=80_000)
-    best = eg.extract_best(root, lambda t, **k: opdepth(t, {}))
+    best = eg.extract_min_depth(root)
     assert opdepth(best, {}) < opdepth(ir.root, {})
     opt_ir = IR(root=best, inputs=ir.inputs, input_names=ir.input_names,
                 params=ir.params)
@@ -1119,7 +1119,7 @@ def test_affine_monoid_parallel_scan():
     eg = EGraph()
     root = eg.add_term(ir.root)
     eg.run(R.SCAN_LAWS, root, max_iterations=14, max_nodes=200_000)
-    best = eg.extract_best(root, lambda t, **k: opdepth(t, {}))
+    best = eg.extract_min_depth(root)
     # log-depth: ~2·log2(T) compose slots, far below the 2T spine.
     assert opdepth(best, {}) <= 4 * math.ceil(math.log2(16)) + 4
     opt_ir = IR(root=best, inputs=ir.inputs, input_names=ir.input_names,

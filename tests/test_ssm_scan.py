@@ -70,7 +70,7 @@ def _scan(m, x, max_nodes=400_000):
     root = eg.add_term(ir.root)
     stats = eg.run(R.SCAN_LAWS, root, max_iterations=14,
                    max_nodes=max_nodes)
-    best = eg.extract_best(root, lambda t, **k: _opdepth(t, {}))
+    best = eg.extract_min_depth(root)
     return ir, st, best, stats
 
 

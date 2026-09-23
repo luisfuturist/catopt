@@ -1089,6 +1089,168 @@ SCAN_LAWS: list[Rewrite] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+#  Scan monoid: diagonal-affine domain (elementwise / Mamba-faithful SSMs)
+# ---------------------------------------------------------------------------
+# ``AFF_LIFT`` only sees steps spelled ``add(matmul(A, h), x)``.  A
+# Mamba-faithful selective step ``h ↦ a ⊙ h + x`` is a DIAGONAL affine
+# map — the same monoid restricted to diagonal linear parts:
+#
+#     (a2,b2) ∘ (a1,b1) = (a2⊙a1, a2⊙b1 + b2)
+#
+# a strictly CHEAPER carrier: O(d) elementwise work per compose instead
+# of a dense d×d product.  The step exports as ``add(mul(a,h), x)``
+# (for ``DiagonalSSM`` the translation x is itself ``mul(b_t, x_t)`` —
+# the metavariable binds it whole, so no second LHS shape is needed),
+# which ``AFF_LIFT`` cannot see.  These rules mirror ``SCAN_LAWS``
+# verbatim in structure:
+#
+# ``aff_diag(a, b)``     — the map h ↦ a⊙h + b (a pair value)
+# ``affd_compose(f, g)`` — f∘g in the diagonal-affine monoid
+# ``applyd(f, h)``       — evaluate: f₀⊙h + f₁ (back in tensor-land)
+
+
+def _affd_state_like(bound: dict) -> bool:
+    """Side condition for the diagonal lifts: the ``h`` binding must be
+    state-shaped — a previous step's ``add``/``sub`` spine, an already
+    lifted application (``applyd``/``apply``), or a leaf (the h0 Param
+    or a free Var).  Per-step vectors (a_t, b_t, x_t — select/mul
+    terms) are NOT states.
+
+    The check exists for e-graph economy, not soundness — the rewrite
+    a⊙h + x ≡ applyd(aff_diag(a,x), h) is valid for ANY h.  Without it,
+    the operand-position variants below would each fire a useless
+    sideways lift binding an input vector as "h"."""
+    t = bound.get("h")
+    if isinstance(t, Op):
+        return t.op in ("add", "sub", "apply", "applyd")
+    return True
+
+
+# --- the four operand positions --------------------------------------
+# add and mul are commutative, and ``meta.canonicalize`` normalises
+# operand ORDER (children sorted by op_repr): DiagonalSSM's steps
+# canonicalise to ``add(mul(h, a), mul(b, x))`` for t > 0 but
+# ``add(mul(b, x), mul(a, h0))`` for the first step.  Since comm_add /
+# comm_mul are deliberately absent from the law set, each position the
+# state-mul can occupy gets its own LHS so the lift fires on both
+# raw-exported AND canonicalised terms.  ``_affd_state_like`` keeps the
+# cross-bindings (state vs input swapped) from firing spuriously, so
+# exactly one variant fires per ``add`` e-node.
+
+AFFD_LIFT = R("affd_lift",
+              Op.make("add", Op.make("mul", "a", "h"), "x"),
+              Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+              law="diagonal recurrence step is diagonal-affine "
+                  "application: a⊙h + x = (aff_diag(a,x))(h)",
+              check=_affd_state_like)
+
+AFFD_LIFT_SWAP = R("affd_lift_swap",
+                   Op.make("add", Op.make("mul", "h", "a"), "x"),
+                   Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+                   law="mul-order variant of affd_lift (canonicalised "
+                       "terms put the state operand first)",
+                   check=_affd_state_like)
+
+AFFD_LIFT_POST = R("affd_lift_post",
+                   Op.make("add", "x", Op.make("mul", "a", "h")),
+                   Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+                   law="add-order variant of affd_lift (state-mul in "
+                       "the second add slot)",
+                   check=_affd_state_like)
+
+AFFD_LIFT_POST_SWAP = R("affd_lift_post_swap",
+                        Op.make("add", "x", Op.make("mul", "h", "a")),
+                        Op.make("applyd",
+                                Op.make("aff_diag", "a", "x"), "h"),
+                        law="remaining operand position of affd_lift",
+                        check=_affd_state_like)
+
+# The step rules need no side condition: the ``applyd`` inside the mul
+# already pins the state operand — an input e-class contains no
+# ``applyd`` enode, so only the true direction matches.
+AFFD_LIFT_STEP = R("affd_lift_step",
+                   Op.make("add",
+                           Op.make("mul", "a",
+                                   Op.make("applyd", "f", "h")),
+                           "x"),
+                   Op.make("applyd",
+                           Op.make("affd_compose",
+                                   Op.make("aff_diag", "a", "x"), "f"),
+                           "h"),
+                   law="compose step with the preceding map")
+
+AFFD_LIFT_STEP_SWAP = R(
+    "affd_lift_step_swap",
+    Op.make("add",
+            Op.make("mul", Op.make("applyd", "f", "h"), "a"),
+            "x"),
+    Op.make("applyd",
+            Op.make("affd_compose",
+                    Op.make("aff_diag", "a", "x"), "f"),
+            "h"),
+    law="mul-order variant of affd_lift_step")
+
+AFFD_LIFT_STEP_POST = R(
+    "affd_lift_step_post",
+    Op.make("add", "x",
+            Op.make("mul", "a",
+                    Op.make("applyd", "f", "h"))),
+    Op.make("applyd",
+            Op.make("affd_compose",
+                    Op.make("aff_diag", "a", "x"), "f"),
+            "h"),
+    law="add-order variant of affd_lift_step")
+
+AFFD_LIFT_STEP_POST_SWAP = R(
+    "affd_lift_step_post_swap",
+    Op.make("add", "x",
+            Op.make("mul",
+                    Op.make("applyd", "f", "h"), "a")),
+    Op.make("applyd",
+            Op.make("affd_compose",
+                    Op.make("aff_diag", "a", "x"), "f"),
+            "h"),
+    law="remaining operand position of affd_lift_step")
+
+AFFD_UNLIFT = R("affd_unlift",
+                Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+                Op.make("add", Op.make("mul", "a", "h"), "x"),
+                law="diagonal-affine application unfolds")
+
+AFFD_COMPOSE_UNFOLD = R("affd_compose_unfold",
+                        Op.make("applyd",
+                                Op.make("affd_compose", "f", "g"), "h"),
+                        Op.make("applyd", "f",
+                                Op.make("applyd", "g", "h")),
+                        law="composition is sequential application")
+
+AFFD_ASSOC = R("affd_assoc",
+               Op.make("affd_compose",
+                       Op.make("affd_compose", "f", "g"), "h"),
+               Op.make("affd_compose", "f",
+                       Op.make("affd_compose", "g", "h")),
+               law="diagonal-affine composition is associative")
+
+AFFD_ASSOC_REV = R("affd_assoc_rev",
+                   Op.make("affd_compose", "f",
+                           Op.make("affd_compose", "g", "h")),
+                   Op.make("affd_compose",
+                           Op.make("affd_compose", "f", "g"), "h"),
+                   law="diagonal-affine composition is associative")
+
+#: Minimal law set for diagonal-scan discovery — the mul-form mirror of
+#: ``SCAN_LAWS``.  Covers every operand position the state-mul can take
+#: under comm-normalisation; ``_affd_state_like`` suppresses the
+#: sideways firings.
+SCAN_DIAG_LAWS: list[Rewrite] = [
+    AFFD_LIFT, AFFD_LIFT_SWAP, AFFD_LIFT_POST, AFFD_LIFT_POST_SWAP,
+    AFFD_LIFT_STEP, AFFD_LIFT_STEP_SWAP,
+    AFFD_LIFT_STEP_POST, AFFD_LIFT_STEP_POST_SWAP,
+    AFFD_UNLIFT, AFFD_COMPOSE_UNFOLD, AFFD_ASSOC, AFFD_ASSOC_REV,
+]
+
+
 #: All rules combined.
 ALL_RULES: list[Rewrite] = SIMPLIFICATION_RULES + CATEGORICAL_RULES
 

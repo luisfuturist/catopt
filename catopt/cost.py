@@ -229,6 +229,16 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "apply":
             # apply(f, h) evaluates back to tensor-land: h's shape.
             return shapes[1]
+        case "aff_diag":
+            # The diagonal map h ↦ a⊙h + b is a pair value; its "shape"
+            # is the scale part's — what consumers' costs price from.
+            return shapes[0]
+        case "affd_compose":
+            # f∘g keeps the outer map's diagonal shape.
+            return shapes[0]
+        case "applyd":
+            # applyd(f, h) evaluates back to tensor-land: h's shape.
+            return shapes[1]
         case "om":
             # The carrier triple (m, l, a); its "shape" is the
             # accumulator's — what consumers' costs are priced from.
@@ -353,7 +363,7 @@ _OP_FLOPS: dict[str, int] = {
 #: runtime cat() is a real copy kernel — it is only free when the whole
 #: subtree is param-only (compile-time fold, handled by extraction).
 _VIEW_OPS = {"transpose", "reshape", "broadcast", "chunk",
-             "split", "leaf", "aff", "om"}
+             "split", "leaf", "aff", "om", "aff_diag"}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.
@@ -418,6 +428,16 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
         if (f is not None and f is not _INVALID and len(f) >= 2
                 and isinstance(f[-1], int)):
             return float(2 * n_out * f[-1])
+        return float(2 * n_out)
+    if term.op == "aff_diag":
+        # Packaging a diagonal pair — no runtime work.
+        return 0.0
+    if term.op == "affd_compose":
+        # (a2,b2)∘(a1,b1) = (a2⊙a1, a2⊙b1 + b2): mul + mul + add, all
+        # elementwise ≈ 3·n_out — O(d), not the dense carrier's O(d³).
+        return float(3 * n_out)
+    if term.op == "applyd":
+        # f₀⊙h + f₁: mul + add ≈ 2·n_out.
         return float(2 * n_out)
     if term.op == "om":
         # Packaging the (m, l, a) triple — no runtime work.

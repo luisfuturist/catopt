@@ -190,7 +190,7 @@ def test_stratified_run_reduces_enodes_and_stays_exact():
     out = meta.stratified_run(
         eg_strat, all_rules, ir.root, max_iterations=14,
         max_nodes=400_000,
-        cost_fn=meta.canonical_cost(lambda t, **k: _opdepth(t, {})))
+        extract_fn=eg_strat.extract_min_depth)
 
     n_full, n_strat = stats_full["n_enodes"], out["stats"]["n_enodes"]
     assert n_strat < n_full / 10

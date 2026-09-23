@@ -436,6 +436,14 @@ _IR_TO_TORCH: dict[str, Any] = {
     "om_elem": lambda s, v, *a, **kw: _om_elem(s, v),
     "om_compose": lambda f, g, *a, **kw: _om_compose(f, g),
     "om_apply": lambda f, *a, **kw: f[2] / f[1],
+    # Diagonal-affine monoid (scan domain for elementwise SSMs — the
+    # Mamba-faithful ``h ↦ a⊙h + x`` step).  An aff_diag is a pair
+    # (a, b) of same-shaped tensors; compose/apply are elementwise —
+    # O(d) work per node instead of the dense carrier's d×d products.
+    "aff_diag": lambda a, b, *x, **kw: (a, b),
+    "affd_compose": lambda f, g, *a, **kw: (f[0] * g[0],
+                                            f[0] * g[1] + f[1]),
+    "applyd": lambda f, h, *a, **kw: f[0] * h + f[1],
 }
 
 

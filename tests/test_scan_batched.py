@@ -45,7 +45,7 @@ def _scan_term(model_dim, steps, dtype=torch.float64, seed=0):
     eg = EGraph()
     root = eg.add_term(ir.root)
     eg.run(R.SCAN_LAWS, root, max_iterations=14, max_nodes=300_000)
-    best = eg.extract_best(root, lambda t, **k: _opdepth(t, {}))
+    best = eg.extract_min_depth(root)
     opt_ir = IR(root=best, inputs=ir.inputs,
                 input_names=ir.input_names, params=ir.params)
     return m, x, opt_ir, source

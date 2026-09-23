@@ -116,7 +116,7 @@ def test_certificate_scan_laws_t4():
     root = eg.add_term(src)
     stats = eg.run(R.SCAN_LAWS, root, max_iterations=14,
                    max_nodes=300_000)
-    best = eg.extract_best(root, lambda t, **k: _opdepth(t, {}))
+    best = eg.extract_min_depth(root)
     assert "aff_compose" in op_repr(best)  # sanity: scan form reached
 
     cert = eg.certificate(src, best)
@@ -309,7 +309,7 @@ def test_proof_tracking_overhead_small():
 
     # and the tracked run still produces a verifiable certificate
     root = eg_on._class_of_term(src)
-    best = eg_on.extract_best(root, lambda t, **k: _opdepth(t, {}))
+    best = eg_on.extract_min_depth(root)
     cert = eg_on.certificate(src, best)
     assert op_repr(verify_certificate(src, cert)) == op_repr(best)
 

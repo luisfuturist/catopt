@@ -245,7 +245,8 @@ def canonical_cost(cost_fn):
 def stratified_run(eg: EGraph, rules: list[Rewrite], term: Any,
                    *, max_iterations: int = 100, max_nodes: int = 100_000,
                    cost_fn=None, extract: bool = True,
-                   canonicalize_output: bool = True) -> dict:
+                   canonicalize_output: bool = True,
+                   extract_fn=None) -> dict:
     """Canonicalize *term*, saturate with the CONTENTFUL rules only.
 
     The coherent laws are never run: equivalent bracketings/permutations
@@ -271,8 +272,12 @@ def stratified_run(eg: EGraph, rules: list[Rewrite], term: Any,
         "coherent_dropped": [r.name for r in coherent],
         "contentful_used": [r.name for r in contentful],
     }
-    if extract and cost_fn is not None:
-        best = eg.extract_best(root, cost_fn)
+    if extract and (cost_fn is not None or extract_fn is not None):
+        # Depth (and other max-composed measures) are not additive, so
+        # extract_best cannot rank them — pass extract_fn =
+        # eg.extract_min_depth for those objectives.
+        best = (extract_fn(root) if extract_fn is not None
+                else eg.extract_best(root, cost_fn))
         out["best"] = best
         out["canonical_best"] = (
             canonicalize(best) if canonicalize_output and best is not None

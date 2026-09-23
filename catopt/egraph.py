@@ -680,6 +680,60 @@ class EGraph:
 
     # -- extraction --
 
+    def extract_min_depth(self, eid: int) -> Any:
+        """Extract the minimum critical-path-depth member.
+
+        Depth is not additive (``local = cost(term) − Σ cost(children)``
+        is meaningless for a max-composed measure), so ``extract_best``
+        cannot serve it.  But depth IS decomposable per class —
+        ``1 + max(child depths)`` — which this greedy walk computes
+        directly.  Deterministic: members are scanned in a canonical
+        sorted order so ties resolve identically every run.
+        """
+        from catopt.ir import op_repr
+        cache: dict[int, tuple[float, Any]] = {}
+        in_prog: set[int] = set()
+
+        def go(cid: int) -> tuple[float, Any]:
+            cid = self.find(cid)
+            if cid in cache:
+                return cache[cid]
+            if cid in in_prog:
+                return (float("inf"), None)
+            in_prog.add(cid)
+            best = (float("inf"), None)
+            for node in sorted(self._classes[cid].nodes,
+                               key=lambda n: (n.op, n.children,
+                                              repr(n.attrs))):
+                if node.op == "leaf":
+                    key = node.attrs[0][1] if node.attrs else "??"
+                    cand = (0, _LeafRegistry.decode(key))
+                else:
+                    kids, dmax, ok = [], 0, True
+                    for c in node.children:
+                        cc = self.find(c)
+                        if cc == cid:
+                            ok = False
+                            break
+                        d, t = go(cc)
+                        if t is None:
+                            ok = False
+                            break
+                        kids.append(t)
+                        dmax = max(dmax, d)
+                    if not ok:
+                        continue
+                    cand = (1 + dmax,
+                            Op.make(node.op, *kids,
+                                    **dict(node.attrs)))
+                if cand[0] < best[0]:
+                    best = cand
+            in_prog.discard(cid)
+            cache[cid] = best
+            return best
+
+        return go(eid)[1]
+
     def extract_alternatives(self, eid: int, cost_fn,
                              top_k: int = 8) -> list[tuple[float, Any]]:
         """Enumerate the root e-class frontier: for each non-leaf enode,
@@ -798,7 +852,13 @@ class EGraph:
             in_progress.add(eclass_id)
             eclass = self._classes[eclass_id]
             override = overrides.get(eclass_id) if overrides else None
-            nodes = (override,) if override is not None else eclass.nodes
+            # Deterministic member order: eclass.nodes is a set, and
+            # equal-cost/equal-size ties otherwise resolve by hash
+            # order — the extraction result (and any test asserting a
+            # particular extracted shape) must not depend on it.
+            nodes = (override,) if override is not None else sorted(
+                eclass.nodes,
+                key=lambda n: (n.op, n.children, repr(n.attrs)))
             best_total: float | None = None
             best_term: Any = None
             best_used: frozenset = frozenset({eclass_id})

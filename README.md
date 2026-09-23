@@ -188,9 +188,11 @@ Novelty has levels, and the frontier report makes them inspectable:
   recurrence** (6.3× with CUDA-graph capture) at T=64, d=32.
   It fires unprompted on **input-dependent selective dynamics**
   (`SelectiveSSM`: `A_t = I + Δ_t·A`, `B_t = B_θ(x_t)` — the
-  Mamba-style core): depth 70→17 at T=32, fp64-exact.  Gap:
-  diagonal `a_t⊙h` SSMs export as `mul` not `matmul` and need an
-  `aff_diag` carrier (specced, not yet implemented).
+  Mamba-style core): depth 70→17 at T=32, fp64-exact.  And the
+  Mamba-faithful elementwise form `a_t⊙h + b_t⊙x_t` is covered by
+  the **diagonal-affine carrier** `aff_diag`/`affd_compose`/
+  `applyd` (`SCAN_DIAG_LAWS`) — the same monoid restricted to
+  diagonal linear parts, O(d) per compose instead of O(d³).
 
 - **The same mechanism discovers chunked attention** (nonlinear
   recurrence): the online-softmax monoid `om(m,l,a)` — running
@@ -201,10 +203,14 @@ Novelty has levels, and the frontier report makes them inspectable:
   `om_apply(⊕ᵢ om_elem(...))` — the streaming/chunked
   decomposition falls out of homomorphism + associativity, with
   no `flash_attention` rule written.  fp64-verified 8.9e-15.
-  Honest caveat: extracted chunked form is currently slower
-  wall-clock (many small eager kernels vs one fused softmax) —
-  it proves *reachability*; a batched/tiling executor like the
-  scan's is the missing backend work.
+  `om_lower.BatchedOMModule` level-batches the om tree (batched
+  `om_elem` scores collapse to one dense `q@Kᵀ` GEMM): up to
+  **4.4× over the serial carrier eval** in launch-bound regimes,
+  and within **1.13–1.6× of dense** with the optional Inductor
+  compile path.  Honest caveat: dense `matmul+softmax+matmul`
+  (and certainly fused `sdpa`) still wins outright — chunked
+  attention is *reachable and near-parity*, not yet a win; the
+  payoff regime is bounded-memory/streaming execution.
 
 **2-morphisms are first-class data; 3-morphisms are computed, not
 stored.** Every `union` records a `ProofEdge` witness and every
@@ -328,17 +334,18 @@ lowering overhead visible on real blocks.
 | `catopt/torch_bridge.py` | `torch.export` → IR, IR → `IRModule`, compile-time weight folding |
 | `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
 | `catopt/om.py` | Online-softmax monoid laws (chunked attention) |
+| `catopt/om_lower.py` | Level-batched chunked-attention executor + CUDA graphs/compile |
 | `catopt/scan_lower.py` | Level-batched parallel-scan executor + CUDA graphs |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective SSMs) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 158 tests: equivalence, soundness, pairing, monoid domains |
+| `tests/` | 185 tests: equivalence, soundness, pairing, monoid domains |
 
 ## Reproduce
 
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 158 tests
+python -m pytest tests/ -q         # 185 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 
