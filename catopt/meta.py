@@ -45,10 +45,21 @@ pairs of existing rules, in two ways:
   to a fresh metavariable but keeps leaves that were matched against
   concrete pattern leaves.
 
-Every emitted rule is validated: metavars(rhs) ⊆ metavars(lhs), the
-r1-then-r2 derivation is replayed on a fresh instantiation, and (when
-every op has a torch binding) both sides are evaluated on random
-tensors and compared with ``allclose``.
+Guarded parents are handled soundly: a derived rule's ``check`` is the
+CONJUNCTION of both parents' checks, each evaluated on its own binding
+re-expressed through the intermediate substitution, and a parent's
+``derive``-produced attributes travel as namespaced placeholders the
+derived rule's own ``derive`` recomputes at fire time.  Compositions
+whose side conditions cannot be re-expressed — or cannot be satisfied
+on any validation instance — are rejected, never emitted.
+
+Every emitted rule is validated: rhs term metavars ⊆ lhs metavars,
+the r1-then-r2 derivation is replayed on a fresh instantiation (or on
+the seed derivation's own witness binding), and (when every op has a
+torch binding) both sides are evaluated on random tensors and compared
+with ``allclose``.  Provenance — which parent pair a rule descends
+from — is recorded in ``law``, on ``rule.parents``, and in
+:data:`SYNTH_PARENTS`.
 
 Example finding: given ``SCAN_LAWS`` minus ``aff_lift_step`` and a
 two-step unrolled recurrence seed, synthesis emits the *unfolded
@@ -292,8 +303,7 @@ def stratified_run(eg: EGraph, rules: list[Rewrite], term: Any,
 # ---------------------------------------------------------------------------
 
 #: ops with at least one string attr value carry *attribute*
-#: metavariables; synthesis skips such rules (their derived attrs can't
-#: be propagated soundly).
+#: metavariables (bound into the substitution under "$attr:<name>").
 def _has_attr_metavars(pat: Any) -> bool:
     if isinstance(pat, Op):
         if any(isinstance(v, str) for v in pat.attrs.values()):
@@ -303,12 +313,28 @@ def _has_attr_metavars(pat: Any) -> bool:
 
 
 def _synthesizable(r: Rewrite) -> bool:
-    """A rule participates in synthesis iff it is side-condition-free
-    and attr-metavar-free (checks can't run on symbolic terms, and a
-    generalized derived rule could fire where a check would veto)."""
-    return (r.check is None and r.derive is None
-            and not _has_attr_metavars(r.lhs)
-            and not _has_attr_metavars(r.rhs))
+    """A rule participates in synthesis iff it is *guarded-sound*:
+    every metavariable in its RHS is either bound by the LHS or — for
+    attribute metavars only — producible by ``derive``.
+
+    ``check``/``derive`` hooks and attribute metavars no longer exclude
+    a rule: parent side conditions are re-expressed on the derived
+    rule's own substitution (see :func:`_compose_guards`), and
+    derive-produced attributes are carried through the derivation as
+    namespaced placeholders (``"@1:SD"`` / ``"@2:SD"``) that the derived
+    rule's own ``derive`` fills at fire time.  A rule whose RHS needs an
+    attribute it can neither match nor derive stays excluded — there is
+    no sound way to propagate it."""
+    lhs_mv = pattern_metavars(r.lhs)
+    lhs_terms = {v for v in lhs_mv if not v.startswith("$attr:")}
+    lhs_attrs = lhs_mv - lhs_terms
+    for v in pattern_metavars(r.rhs):
+        if v.startswith("$attr:"):
+            if v not in lhs_attrs and r.derive is None:
+                return False
+        elif v not in lhs_terms:
+            return False
+    return True
 
 
 def match_pattern(pat: Any, term: Any, subst: dict | None = None) -> dict | None:
@@ -420,16 +446,293 @@ def _overlapping(p: tuple, q: tuple) -> bool:
 
 def apply_rewrite_at(rule: Rewrite, term: Any, path: tuple) -> Any | None:
     """Apply *rule* to ``term`` at *path*; return the rewritten term or
-    ``None`` if the LHS doesn't match there.  (check/derive rules are
-    not supported by this term-level helper.)"""
+    ``None`` if the LHS doesn't match or a guard vetoes the firing.
+
+    ``check``/``derive`` hooks ARE evaluated here: at the term level the
+    fired substitution already maps metavariables to terms, which is
+    exactly the ``bound`` convention the e-graph uses (``any_term``-
+    resolved bindings).  A raising hook counts as a veto — a side
+    condition that cannot be evaluated can never justify a rewrite."""
     subst = match_pattern(rule.lhs, _subterm(term, path), {})
     if subst is None:
         return None
+    if rule.check is not None:
+        try:
+            if not rule.check(subst):
+                return None
+        except Exception:
+            return None
+    if rule.derive is not None:
+        try:
+            extra = rule.derive(subst)
+        except Exception:
+            return None
+        if extra is None:
+            return None
+        subst = {**subst, **extra}
     try:
         rhs = instantiate_pattern(rule.rhs, subst)
     except KeyError:
         return None
     return _replace(term, path, rhs)
+
+
+# ---------------------------------------------------------------------------
+#  Guarded composition — re-expressing parent side conditions
+# ---------------------------------------------------------------------------
+#
+#: Attribute metavariables produced by a parent's ``derive`` hook are
+#: carried through a derivation as *namespaced placeholders*: the
+#: string ``"@<i>:<name>"`` where ``i`` is 1 for the first parent and 2
+#: for the second.  A placeholder is an ordinary attr metavariable in
+#: the derived patterns; the derived rule's own ``derive`` (built by
+#: :func:`_compose_guards`) re-runs the parent hooks at fire time and
+#: fills ``"$attr:@i:name"`` in the substitution.  Namespacing keeps the
+#: parents' metavar namespaces disjoint — two parents may both derive a
+#: ``"SD"`` attr with different meanings.
+_DRV_PREFIX = ("@1:", "@2:")
+
+
+class _Unreexpressible(Exception):
+    """A parent binding cannot be re-expressed on the derived rule's
+    metavariables — the composition must be rejected, never guessed."""
+
+
+#: Provenance of every emitted rule: name -> (first parent, second parent).
+SYNTH_PARENTS: dict[str, tuple[str, str]] = {}
+
+
+def provenance(rule: Rewrite) -> tuple[str, ...]:
+    """The parent rules a synthesized rule descends from (``()`` for a
+    non-synthesized rule).  Recorded on the rule as ``.parents`` and in
+    :data:`SYNTH_PARENTS`."""
+    return getattr(rule, "parents", SYNTH_PARENTS.get(rule.name, ()))
+
+
+def _fire_guarded(rule: Rewrite, term: Any, path: tuple, ns: str):
+    """Fire *rule* on a CONCRETE term like :func:`apply_rewrite_at`, but
+    keep ``derive``-produced attributes symbolic under the *ns*
+    placeholder prefix.
+
+    Returns ``(subst, rewritten, concrete_attrs)`` where
+    ``concrete_attrs`` maps each placeholder name to the value the
+    parent actually derived on this instance — needed to evaluate a
+    second parent's guards on the intermediate term.  ``None`` on
+    no-match or guard veto."""
+    subst = match_pattern(rule.lhs, _subterm(term, path), {})
+    if subst is None:
+        return None
+    try:
+        if rule.check is not None and not rule.check(subst):
+            return None
+    except Exception:
+        return None
+    inst = dict(subst)
+    conc: dict[str, Any] = {}
+    if rule.derive is not None:
+        try:
+            extra = rule.derive(subst)
+        except Exception:
+            return None
+        if extra is None:
+            return None
+        for k, v in extra.items():
+            if k.startswith("$attr:"):
+                ph = ns + k[len("$attr:"):]
+                inst[k] = ph        # stays a metavar in the derived rule
+                conc[ph] = v        # but this instance's value is known
+            else:
+                inst[k] = v
+    try:
+        rhs = instantiate_pattern(rule.rhs, inst)
+    except KeyError:
+        return None
+    return subst, _replace(term, path, rhs), conc
+
+
+def _concretize_attrs(t: Any, conc: dict) -> Any:
+    """Replace placeholder attr values inside a concrete term using the
+    fired *conc* map (placeholder name -> derived value)."""
+    if isinstance(t, Op):
+        attrs = {k: (conc.get(v, v) if isinstance(v, str) else v)
+                 for k, v in t.attrs.items()}
+        return Op.make(t.op,
+                       *(_concretize_attrs(a, conc) for a in t.args),
+                       **attrs)
+    return t
+
+
+def _reexpress_term(t: Any, names: dict, keep: set) -> Any:
+    """Re-express a term bound during a seed-guided derivation as a
+    pattern over the derived rule's metavariables.
+
+    Region leaves become their ``names`` metavariable; leaves pinned by
+    a parent's concrete pattern (*keep*) and literal constants stay
+    concrete.  A metavar leaf (symbolic path) passes through.  Anything
+    else — a leaf the derived rule does not bind — is un-reexpressible."""
+    if isinstance(t, Op):
+        return Op.make(t.op,
+                       *(_reexpress_term(a, names, keep)
+                         for a in t.args),
+                       **dict(t.attrs))
+    if isinstance(t, str):
+        return t
+    if t in keep:
+        return t
+    if t in names:
+        return names[t]
+    if isinstance(t, Const):
+        return t
+    raise _Unreexpressible(t)
+
+
+def _reexpress_map(m: dict, names: dict, keep: set) -> dict:
+    """Re-express a whole fired binding (term metavars + ``$attr:``
+    entries).  ``$attr:`` values pass through: concrete ones are baked
+    in, string ones are metavar references resolved at fire time."""
+    out = {}
+    for k, v in m.items():
+        if k.startswith("$attr:"):
+            out[k] = v
+        else:
+            out[k] = _reexpress_term(v, names, keep)
+    return out
+
+
+def _reexpress_binding(pats: dict, subst: dict) -> dict | None:
+    """Instantiate a re-expressed binding against a fired substitution.
+
+    Term metavars instantiate as patterns; a ``$attr:`` entry that is a
+    string means "the attribute metavariable of that name" and is
+    resolved through ``subst`` — a missing key is an un-reexpressible
+    reference and rejects the composition (returns ``None``)."""
+    out = {}
+    for k, pat in pats.items():
+        if k.startswith("$attr:"):
+            if isinstance(pat, str):
+                key = "$attr:" + pat
+                if key not in subst:
+                    return None
+                out[k] = subst[key]
+            else:
+                out[k] = pat
+        else:
+            try:
+                out[k] = instantiate_pattern(pat, subst)
+            except (KeyError, Exception):
+                return None
+    return out
+
+
+def _compose_guards(r1: Rewrite, r2: Rewrite,
+                    pat1: dict, pat2: dict):
+    """Build the derived rule's ``(check, derive)`` from the parents'.
+
+    ``pat1``/``pat2`` map each parent's metavariables to patterns over
+    the DERIVED rule's metavariables (symbolic path: ``pat1`` is the
+    identity and ``pat2`` is r2's symbolic match; seed path: both are
+    the fired bindings re-abstracted through the region's leaf names).
+
+    The composite check on a fired binding ``bound`` is:
+
+        r1.check(bound1) ∧ r2.check(bound2)
+        where bound_i = instantiate(pat_i, bound ∪ parents' derives)
+
+    — i.e. each parent's side condition evaluated on ITS OWN binding,
+    re-expressed through the intermediate substitution.  ``derive``
+    hooks are also re-run (they can veto) and their outputs fill the
+    ``"@i:"`` placeholders the derived RHS carries.  Returns
+    ``(None, None)`` when neither parent is guarded."""
+    if (r1.check is None and r1.derive is None
+            and r2.check is None and r2.derive is None):
+        return None, None
+    ns1, ns2 = _DRV_PREFIX
+
+    def _eval(bound: dict):
+        """Evaluate both parents' guards on the derived binding.
+
+        Returns ``(bound1, extra1, bound2, extra2)`` or ``None`` if any
+        re-expression fails or any hook vetoes/raises."""
+        b1 = _reexpress_binding(pat1, bound)
+        if b1 is None:
+            return None
+        try:
+            if r1.check is not None and not r1.check(b1):
+                return None
+        except Exception:
+            return None
+        # pat2 is instantiated over the DERIVED rule's metavars (bound),
+        # never r1's namespace — merging b1 here would clobber a derived
+        # metavar that happens to share a name with an r1 metavar (e.g.
+        # om_split binds "v1"/"v2", the same names leaf-generalization
+        # mints).  Only r1's derive-produced attrs join, namespaced.
+        eff1 = dict(bound)
+        e1 = None
+        if r1.derive is not None:
+            try:
+                e1 = r1.derive(b1)
+            except Exception:
+                return None
+            if e1 is None:
+                return None
+            for k, v in e1.items():
+                if k.startswith("$attr:"):
+                    eff1["$attr:" + ns1 + k[len("$attr:"):]] = v
+                else:
+                    eff1[k] = v
+        b2 = _reexpress_binding(pat2, eff1)
+        if b2 is None:
+            return None
+        try:
+            if r2.check is not None and not r2.check(b2):
+                return None
+        except Exception:
+            return None
+        e2 = None
+        if r2.derive is not None:
+            try:
+                e2 = r2.derive(b2)
+            except Exception:
+                return None
+            if e2 is None:
+                return None
+        return b1, e1, b2, e2
+
+    def check(bound: dict) -> bool:
+        return _eval(bound) is not None
+
+    def derive(bound: dict) -> dict | None:
+        ctx = _eval(bound)
+        if ctx is None:
+            return None
+        _, e1, _, e2 = ctx
+        out: dict[str, Any] = {}
+        for e, ns in ((e1, ns1), (e2, ns2)):
+            if not e:
+                continue
+            for k, v in e.items():
+                if k.startswith("$attr:"):
+                    out["$attr:" + ns + k[len("$attr:"):]] = v
+                else:
+                    out[k] = v
+        return out
+
+    return check, derive
+
+
+def _rhs_derive_placeholders(rhs: Any) -> set[str]:
+    """Namespaced derive placeholders (``"@1:X"`` / ``"@2:X"``) that
+    appear as attribute metavars in a derived RHS — the keys its
+    composite ``derive`` must provide."""
+    out: set[str] = set()
+    if isinstance(rhs, Op):
+        for v in rhs.attrs.values():
+            if (isinstance(v, str)
+                    and any(v.startswith(p) for p in _DRV_PREFIX)):
+                out.add(v)
+        for a in rhs.args:
+            out |= _rhs_derive_placeholders(a)
+    return out
 
 
 def _concrete_matched_leaves(pat: Any, term: Any, out: set | None = None) -> set:
@@ -559,39 +862,107 @@ def _fresh_leaves(n: int, shape: tuple = (4, 4)) -> list[Var]:
     return [Var(f"_synth_{i}", TensorType(shape)) for i in range(n)]
 
 
+#: Leaf shapes tried when instantiating a candidate LHS for validation.
+#: ``(4,4)`` satisfies shape-checked guards on rank-2 terms; ``()``
+#: catches guards requiring scalar bindings.  A candidate whose guards
+#: need a mixed/other profile is rejected — conservative, never unsound.
+_LEAF_SHAPES: tuple = ((4, 4), ())
+
+#: Values enumerated for attribute metavariables in a candidate LHS
+#: (dims first — they dominate; a few shapes for view-style attrs).
+_ATTR_POOL: tuple = (-1, -2, 1, 2, 0, -3, 3, 4, -4,
+                     (4, 4), (4,), (2, 4, 4))
+
+#: Cap on LHS instantiations tried per leaf-shape profile.
+_MAX_INSTANTIATIONS: int = 400
+
+
+def _instantiation_stream(term_mvars: list[str], attr_mvars: list[str]):
+    """Yield candidate-LHS substitutions: fresh typed leaves (per
+    :data:`_LEAF_SHAPES` profile) times a bounded product of
+    :data:`_ATTR_POOL` values for attribute metavariables."""
+    import itertools
+    for shape in _LEAF_SHAPES:
+        leaves = _fresh_leaves(len(term_mvars), shape)
+        base = dict(zip(term_mvars, leaves))
+        count = 0
+        for combo in itertools.product(*([_ATTR_POOL] * len(attr_mvars))):
+            subst = dict(base)
+            for a, v in zip(attr_mvars, combo):
+                subst["$attr:" + a] = v
+            yield subst
+            count += 1
+            if count >= _MAX_INSTANTIATIONS:
+                break
+
+
+def _tensor_env(subst: dict) -> dict:
+    """Random fp64 tensors for the typed leaves in a substitution."""
+    import torch
+    env = {}
+    for v in subst.values():
+        if isinstance(v, (Var, Param)):
+            shape = getattr(getattr(v, "typ", None), "shape", None)
+            if (shape is not None
+                    and all(isinstance(d, int) for d in shape)):
+                env[v] = torch.randn(*shape, dtype=torch.float64)
+    return env
+
+
 def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
-                        numeric: bool) -> bool:
-    """Well-formedness + derivation replay + (optional) numeric check."""
-    # RHS may only use LHS metavariables.
-    if not pattern_metavars(cand.rhs) <= pattern_metavars(cand.lhs):
-        return False
-    # Instantiate the LHS with fresh leaves and apply the derived rule.
-    mvars = sorted(pattern_metavars(cand.lhs))
-    if any(v.startswith("$attr:") for v in mvars):
-        return False
-    leaves = _fresh_leaves(len(mvars))
-    subst = dict(zip(mvars, leaves))
-    try:
-        t0 = instantiate_pattern(cand.lhs, subst)
-        tout = instantiate_pattern(cand.rhs, subst)
-    except KeyError:
-        return False
-    if not _term_is_ground(tout):
-        return False
-    # The claimed derivation r1-then-r2 must actually replay.
-    if not _replays(cand, r1, r2, t0, tout):
-        return False
-    if numeric:
-        import torch
+                        numeric: bool, witness: dict | None = None) -> bool:
+    """Well-formedness + derivation replay + (optional) numeric check.
+
+    *witness* (seed path) is the concrete binding the derivation
+    actually fired on — instantiating the LHS with it is guaranteed to
+    satisfy the composite guards.  Without a witness (symbolic path)
+    the LHS is instantiated with fresh leaves over a bounded pool of
+    attribute values; a candidate whose guards are unsatisfiable within
+    the budget is rejected rather than trusted."""
+    lhs_mv = pattern_metavars(cand.lhs)
+    rhs_mv = pattern_metavars(cand.rhs)
+    lhs_terms = {v for v in lhs_mv if not v.startswith("$attr:")}
+    # RHS term metavars must be LHS-bound; RHS attr metavars may also be
+    # produced by the candidate's own ``derive``.
+    for v in rhs_mv:
+        if v.startswith("$attr:"):
+            if v not in lhs_mv and cand.derive is None:
+                return False
+        elif v not in lhs_terms:
+            return False
+    term_mvars = sorted(lhs_terms)
+    attr_mvars = sorted(v[len("$attr:"):]
+                        for v in lhs_mv if v.startswith("$attr:"))
+
+    substs = [dict(witness)] if witness is not None else \
+        _instantiation_stream(term_mvars, attr_mvars)
+    for subst in substs:
         try:
-            env = {v: torch.randn(4, 4, dtype=torch.float64)
-                   for v in leaves}
-            a = _eval_term(t0, env)
-            b = _eval_term(tout, env)
-        except Exception:
-            return True  # ops without torch bindings: structural only
-        return _eval_allclose(a, b)
-    return True
+            t0 = instantiate_pattern(cand.lhs, subst)
+        except KeyError:
+            continue
+        # Fire the derived rule itself — this runs the composite
+        # check/derive, so a guarded instantiation that vetoes simply
+        # moves the enumeration to the next assignment.
+        tout = apply_rewrite_at(cand, t0, ())
+        if tout is None:
+            continue
+        if not _term_is_ground(tout):
+            continue
+        # The claimed derivation r1-then-r2 must actually replay —
+        # parent guards are evaluated on this concrete instance too.
+        if not _replays(cand, r1, r2, t0, tout):
+            return False
+        if numeric:
+            try:
+                env = _tensor_env(subst)
+                a = _eval_term(t0, env)
+                b = _eval_term(tout, env)
+            except Exception:
+                return True  # ops without torch bindings: structural only
+            return _eval_allclose(a, b)
+        return True
+    return False
 
 
 def _is_tautology(lhs: Any, rhs: Any) -> bool:
@@ -604,6 +975,10 @@ def _subsumed(cand: Rewrite, existing: list[Rewrite]) -> bool:
     matches some rule's lhs and the corresponding rhs instantiation
     alpha-equals cand.rhs)."""
     for e in existing:
+        # A guarded rule cannot subsume: it only fires where its side
+        # conditions pass, so *cand* may cover instances it cannot.
+        if e.check is not None or e.derive is not None:
+            continue
         subst = match_pattern(e.lhs, cand.lhs, {})
         if subst is None:
             continue
@@ -634,6 +1009,14 @@ def synthesize_rules(rules: list[Rewrite],
       captures interactions that only appear in context (e.g. an
       ``apply`` node produced inside a larger ``add(matmul(...), x)``).
 
+    Guarded parents compose too: the derived rule's ``check`` is the
+    CONJUNCTION of both parents' checks, each evaluated on its own
+    binding re-expressed through the intermediate substitution (see
+    :func:`_compose_guards`), and ``derive``-produced attributes are
+    carried as namespaced placeholders the derived rule refills at fire
+    time.  A composition whose side condition cannot be re-expressed is
+    rejected — never emitted unsound.
+
     ``fuel`` bounds the total number of rule-application attempts.
     ``require_overlap`` keeps only pairs whose rewrite sites share an
     ancestor/descendant relation (true critical pairs — disjoint pairs
@@ -641,32 +1024,46 @@ def synthesize_rules(rules: list[Rewrite],
     candidate on random fp64 tensors when its ops have torch bindings.
 
     Returns a list of :class:`Rewrite` objects named
-    ``syn_<r1>__<r2>_<i>`` with provenance recorded in ``law``.
+    ``syn_<r1>__<r2>_<i>`` with provenance recorded in ``law``, on
+    ``rule.parents``, and in :data:`SYNTH_PARENTS`.
     """
     usable = [r for r in rules if _synthesizable(r)]
     derived: list[Rewrite] = []
     seen: set[tuple[str, str]] = set()
     spent = 0
     counter = [0]
+    ns1, ns2 = _DRV_PREFIX
 
     def offer(lhs: Any, rhs: Any, r1: Rewrite, r2: Rewrite,
-              via: str) -> None:
+              via: str, check=None, derive=None,
+              witness: dict | None = None) -> None:
         if _is_tautology(lhs, rhs):
             return
         key = _alpha_key(lhs, rhs)
         if key in seen:
             return
         seen.add(key)
+        # A composite derive is only attached when the RHS actually
+        # carries placeholders it must fill (the check alone already
+        # covers vetoing; extra derives would be dead weight).
+        placeholders = _rhs_derive_placeholders(rhs)
+        drv = derive if (derive is not None and placeholders) else None
         cand = Rewrite(
             name=f"syn_{r1.name}__{r2.name}_{counter[0]}",
             lhs=lhs, rhs=rhs,
             law=f"synthesized: {r1.name} then {r2.name} ({via})",
+            check=check, derive=drv,
         )
         counter[0] += 1
+        # Frozen dataclass: provenance rides on the instance dict plus
+        # the module-level registry.
+        object.__setattr__(cand, "parents", (r1.name, r2.name))
+        SYNTH_PARENTS[cand.name] = (r1.name, r2.name)
         if not emit_subsumed and _subsumed(
                 cand, usable + derived):
             return
-        if not _validate_candidate(cand, r1, r2, numeric_check):
+        if not _validate_candidate(cand, r1, r2, numeric_check,
+                                   witness=witness):
             return
         derived.append(cand)
 
@@ -674,9 +1071,22 @@ def synthesize_rules(rules: list[Rewrite],
     for r1 in usable:
         if spent > fuel:
             break
-        subst = {v: v for v in pattern_metavars(r1.lhs)
-                 if not v.startswith("$attr:")}
-        t1 = instantiate_pattern(r1.rhs, subst)
+        # Identity instantiation: term metavars stay themselves, LHS
+        # attr metavars keep their names, and RHS attr metavars that
+        # only ``derive`` can produce become "@1:" placeholders.
+        subst = {}
+        for v in pattern_metavars(r1.lhs):
+            subst[v] = v[len("$attr:"):] if v.startswith("$attr:") else v
+        for v in pattern_metavars(r1.rhs):
+            if v.startswith("$attr:") and v not in subst:
+                subst[v] = ns1 + v[len("$attr:"):]
+        try:
+            t1 = instantiate_pattern(r1.rhs, subst)
+        except KeyError:
+            continue
+        # r1's binding on the derived rule's own subst is the identity.
+        pat1 = {v: (v[len("$attr:"):] if v.startswith("$attr:") else v)
+                for v in pattern_metavars(r1.lhs)}
         for q, sub in _positions(t1):
             for r2 in usable:
                 spent += 1
@@ -685,12 +1095,26 @@ def synthesize_rules(rules: list[Rewrite],
                 m2 = match_pattern(r2.lhs, sub, {})
                 if m2 is None:
                     continue
+                # r2's RHS attr metavars not bound by its LHS need
+                # r2.derive — carried as "@2:" placeholders.
+                inst2 = dict(m2)
+                ok = True
+                for v in pattern_metavars(r2.rhs):
+                    if (v.startswith("$attr:") and v not in inst2):
+                        if r2.derive is None:
+                            ok = False
+                            break
+                        inst2[v] = ns2 + v[len("$attr:"):]
+                if not ok:
+                    continue
                 try:
-                    rhs2 = instantiate_pattern(r2.rhs, m2)
+                    rhs2 = instantiate_pattern(r2.rhs, inst2)
                 except KeyError:
                     continue
                 t2 = _replace(t1, q, rhs2)
-                offer(r1.lhs, t2, r1, r2, "symbolic")
+                chk, drv = _compose_guards(r1, r2, pat1, m2)
+                offer(r1.lhs, t2, r1, r2, "symbolic",
+                      check=chk, derive=drv)
 
     # -- seed-guided path: r1 then r2 on concrete terms -------------------
     for s in seed_terms:
@@ -700,9 +1124,10 @@ def synthesize_rules(rules: list[Rewrite],
             for p, _ in _positions(s):
                 if spent > fuel:
                     break
-                t1 = apply_rewrite_at(r1, s, p)
-                if t1 is None:
+                f1 = _fire_guarded(r1, s, p, ns1)
+                if f1 is None:
                     continue
+                m1, t1, conc1 = f1
                 spent += 1
                 keep = _concrete_matched_leaves(r1.lhs, _subterm(s, p))
                 for r2 in usable:
@@ -715,8 +1140,45 @@ def synthesize_rules(rules: list[Rewrite],
                         if m2 is None:
                             continue
                         spent += 1
+                        # r2's guards need the CONCRETE binding: resolve
+                        # placeholder attrs inside the matched terms and
+                        # in the "$attr:" entries via r1's derived values.
+                        m2e = {}
+                        bad = False
+                        for k, v in m2.items():
+                            if k.startswith("$attr:"):
+                                if isinstance(v, str):
+                                    if v in conc1:
+                                        v = conc1[v]
+                                    else:
+                                        bad = True
+                                        break
+                                m2e[k] = v
+                            else:
+                                m2e[k] = _concretize_attrs(v, conc1)
+                        if bad:
+                            continue
                         try:
-                            rhs2 = instantiate_pattern(r2.rhs, m2)
+                            if r2.check is not None \
+                                    and not r2.check(m2e):
+                                continue
+                        except Exception:
+                            continue
+                        inst2 = dict(m2)
+                        if r2.derive is not None:
+                            try:
+                                e2 = r2.derive(m2e)
+                            except Exception:
+                                continue
+                            if e2 is None:
+                                continue
+                            for k, v in e2.items():
+                                if k.startswith("$attr:"):
+                                    inst2[k] = ns2 + k[len("$attr:"):]
+                                else:
+                                    inst2[k] = v
+                        try:
+                            rhs2 = instantiate_pattern(r2.rhs, inst2)
                         except KeyError:
                             continue
                         t2 = _replace(t1, q, rhs2)
@@ -730,6 +1192,19 @@ def synthesize_rules(rules: list[Rewrite],
                         rhs_pat = _leaf_generalize(
                             _subterm(t2, lca), names, keep | keep2, cnt,
                             assign_fresh=False)
-                        offer(lhs_pat, rhs_pat, r1, r2, "seed")
+                        # Re-express both fired bindings over the derived
+                        # metavariables; an un-reexpressible binding
+                        # rejects the pair outright.
+                        try:
+                            pat1 = _reexpress_map(m1, names,
+                                                  keep | keep2)
+                            pat2 = _reexpress_map(m2, names,
+                                                  keep | keep2)
+                        except _Unreexpressible:
+                            continue
+                        chk, drv = _compose_guards(r1, r2, pat1, pat2)
+                        witness = {v: leaf for leaf, v in names.items()}
+                        offer(lhs_pat, rhs_pat, r1, r2, "seed",
+                              check=chk, derive=drv, witness=witness)
 
     return derived
