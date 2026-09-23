@@ -33,17 +33,23 @@ PART B — rule synthesis via critical-pair completion
 :func:`synthesize_rules` derives new rewrite rules by composing ordered
 pairs of existing rules, in two ways:
 
+* *Seed-guided composition* (preferred): apply ``r1`` to a concrete
+  seed term at position ``p``, then ``r2`` at position ``q``; the
+  composite rule is
+  ``abstract(subterm(s, lca(p,q))) -> abstract(subterm(result, lca(p,q)))``
+  where abstraction renames every metavariable-bound or untouched leaf
+  to a fresh metavariable but keeps leaves that were matched against
+  concrete pattern leaves.  The fired binding becomes the derived
+  rule's *witness* — validation is guaranteed an instance on which
+  both parents' guards actually hold.
 * *Symbolic composition*: instantiate ``r1``'s RHS pattern with its own
   metavariables (as opaque symbolic leaves) and try to match ``r2``'s
   LHS against the result.  A match at position ``q`` yields the derived
   rule ``r1.lhs -> (r1.rhs with r2 applied at q)`` — fully general by
-  construction.
-* *Seed-guided composition*: apply ``r1`` to a concrete seed term at
-  position ``p``, then ``r2`` at position ``q``; the composite rule is
-  ``abstract(subterm(s, lca(p,q))) -> abstract(subterm(result, lca(p,q)))``
-  where abstraction renames every metavariable-bound or untouched leaf
-  to a fresh metavariable but keeps leaves that were matched against
-  concrete pattern leaves.
+  construction, but with no witness.  Guarded symbolic candidates are
+  validated against seed-derived instances first (see
+  :func:`_validate_candidate`), falling back to the bounded
+  instantiation pool.
 
 Guarded parents are handled soundly: a derived rule's ``check`` is the
 CONJUNCTION of both parents' checks, each evaluated on its own binding
@@ -896,29 +902,64 @@ def _instantiation_stream(term_mvars: list[str], attr_mvars: list[str]):
                 break
 
 
+def _leaf_vars(t: Any, out: set | None = None) -> set:
+    """Var/Param leaves occurring anywhere inside a (sub)term."""
+    if out is None:
+        out = set()
+    if isinstance(t, (Var, Param)):
+        out.add(t)
+    elif isinstance(t, Op):
+        for a in t.args:
+            _leaf_vars(a, out)
+    return out
+
+
 def _tensor_env(subst: dict) -> dict:
-    """Random fp64 tensors for the typed leaves in a substitution."""
+    """Random fp64 tensors for the typed leaves in a substitution.
+
+    Bound values may be whole subterms (witness bindings mined from
+    seeds), so Var/Param leaves are collected recursively — a scalar or
+    tensor needed only deep inside a bound mask still gets an entry."""
     import torch
     env = {}
     for v in subst.values():
-        if isinstance(v, (Var, Param)):
-            shape = getattr(getattr(v, "typ", None), "shape", None)
+        for leaf in _leaf_vars(v):
+            shape = getattr(getattr(leaf, "typ", None), "shape", None)
             if (shape is not None
                     and all(isinstance(d, int) for d in shape)):
-                env[v] = torch.randn(*shape, dtype=torch.float64)
+                env[leaf] = torch.randn(*shape, dtype=torch.float64)
     return env
 
 
+def _seed_witnesses(lhs: Any, seeds: Iterable[Any]):
+    """Substitutions obtained by matching *lhs* against every subterm of
+    the seed terms.
+
+    These are the *real witnesses* a guarded candidate needs: concrete
+    bindings on which the composite side conditions demonstrably can
+    hold (Const-valued scales, broadcast-shaped masks, transpose dims
+    tied to an actual rank) — assignments the bounded leaf/attr pool
+    cannot produce."""
+    for s in seeds or ():
+        for _, sub in _positions(s):
+            m = match_pattern(lhs, sub, {})
+            if m is not None:
+                yield m
+
+
 def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
-                        numeric: bool, witness: dict | None = None) -> bool:
+                        numeric: bool, witness: dict | None = None,
+                        seeds: Iterable[Any] = ()) -> bool:
     """Well-formedness + derivation replay + (optional) numeric check.
 
     *witness* (seed path) is the concrete binding the derivation
     actually fired on — instantiating the LHS with it is guaranteed to
-    satisfy the composite guards.  Without a witness (symbolic path)
-    the LHS is instantiated with fresh leaves over a bounded pool of
-    attribute values; a candidate whose guards are unsatisfiable within
-    the budget is rejected rather than trusted."""
+    satisfy the composite guards.  Without a witness (symbolic path) a
+    GUARDED candidate first tries seed-mined bindings — its LHS matched
+    against every seed subterm — since tight side conditions are only
+    satisfiable on real instances; the bounded instantiation pool then
+    remains as a fallback.  A candidate whose guards are unsatisfiable
+    on every tried instance is rejected rather than trusted."""
     lhs_mv = pattern_metavars(cand.lhs)
     rhs_mv = pattern_metavars(cand.rhs)
     lhs_terms = {v for v in lhs_mv if not v.startswith("$attr:")}
@@ -934,25 +975,27 @@ def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
     attr_mvars = sorted(v[len("$attr:"):]
                         for v in lhs_mv if v.startswith("$attr:"))
 
-    substs = [dict(witness)] if witness is not None else \
-        _instantiation_stream(term_mvars, attr_mvars)
-    for subst in substs:
+    def attempt(subst: dict, fatal_replay: bool):
+        """None: instance vetoed/skipped; False: reject; True: emit."""
         try:
             t0 = instantiate_pattern(cand.lhs, subst)
         except KeyError:
-            continue
+            return None
         # Fire the derived rule itself — this runs the composite
         # check/derive, so a guarded instantiation that vetoes simply
         # moves the enumeration to the next assignment.
         tout = apply_rewrite_at(cand, t0, ())
         if tout is None:
-            continue
+            return None
         if not _term_is_ground(tout):
-            continue
+            return None
         # The claimed derivation r1-then-r2 must actually replay —
-        # parent guards are evaluated on this concrete instance too.
+        # parent guards are evaluated on this concrete instance too.  A
+        # firing instance the derivation cannot reproduce is a genuine
+        # counterexample (fatal); a seed-mined match may instead merely
+        # be too large for the replay fuel, so it only skips ahead.
         if not _replays(cand, r1, r2, t0, tout):
-            return False
+            return False if fatal_replay else None
         if numeric:
             try:
                 env = _tensor_env(subst)
@@ -962,6 +1005,22 @@ def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
                 return True  # ops without torch bindings: structural only
             return _eval_allclose(a, b)
         return True
+
+    if witness is not None:
+        return attempt(dict(witness), fatal_replay=True) is True
+
+    # Guarded candidates prefer real seed witnesses; a vetoed match is
+    # just an instance the side conditions exclude, a verified match is
+    # proof on a binding that actually arises.
+    if seeds and (cand.check is not None or cand.derive is not None):
+        for subst in _seed_witnesses(cand.lhs, seeds):
+            res = attempt(subst, fatal_replay=False)
+            if res is not None:
+                return res
+    for subst in _instantiation_stream(term_mvars, attr_mvars):
+        res = attempt(subst, fatal_replay=True)
+        if res is not None:
+            return res
     return False
 
 
@@ -998,16 +1057,26 @@ def synthesize_rules(rules: list[Rewrite],
                      emit_subsumed: bool = False) -> list[Rewrite]:
     """Compose ordered pairs of rules into derived rewrite rules.
 
-    Two synthesis paths:
+    Two synthesis paths (seed-guided runs FIRST — it is the preferred
+    path for guarded pairs):
 
-    * **Symbolic** — apply ``r1`` to its own LHS symbolically (its RHS
-      with metavariable leaves) and match ``r2``'s LHS on the result.
-      Produces fully general derived rules ``r1.lhs -> t2``.
     * **Seed-guided** — apply ``r1`` then ``r2`` on concrete seed terms;
       the composite over the smallest region containing both rewrite
-      sites is re-abstracted leaf-by-leaf into a new pattern.  This
-      captures interactions that only appear in context (e.g. an
-      ``apply`` node produced inside a larger ``add(matmul(...), x)``).
+      sites is re-abstracted leaf-by-leaf into a new pattern, and the
+      fired binding is carried into validation as the candidate's
+      *witness*.  A guarded pair's side conditions (Const-valued
+      scales, broadcast-shaped masks, rank-tied transpose dims) are in
+      general only satisfiable on real instances, so a pair where
+      either parent has ``check``/``derive`` needs this path — or a
+      seed-mined witness — to emit.  This path also captures
+      interactions that only appear in context (e.g. an ``apply`` node
+      produced inside a larger ``add(matmul(...), x)``).
+    * **Symbolic** — apply ``r1`` to its own LHS symbolically (its RHS
+      with metavariable leaves) and match ``r2``'s LHS on the result.
+      Produces fully general derived rules ``r1.lhs -> t2``.  Guarded
+      symbolic candidates are validated against seed-mined witnesses
+      first (the candidate LHS matched against every seed subterm),
+      then against the bounded instantiation pool as fallback.
 
     Guarded parents compose too: the derived rule's ``check`` is the
     CONJUNCTION of both parents' checks, each evaluated on its own
@@ -1017,11 +1086,16 @@ def synthesize_rules(rules: list[Rewrite],
     time.  A composition whose side condition cannot be re-expressed is
     rejected — never emitted unsound.
 
-    ``fuel`` bounds the total number of rule-application attempts.
-    ``require_overlap`` keeps only pairs whose rewrite sites share an
-    ancestor/descendant relation (true critical pairs — disjoint pairs
-    are just parallel application).  ``numeric_check`` evaluates each
-    candidate on random fp64 tensors when its ops have torch bindings.
+    ``seed_terms`` supplies the concrete terms the seed-guided path
+    fires on (and that guarded symbolic candidates mine for witness
+    bindings); pass real terms on which the guarded parents actually
+    fire — e.g. a materialised attention term for the ``sdpa_fold``
+    family.  ``fuel`` bounds the total number of rule-application
+    attempts.  ``require_overlap`` keeps only pairs whose rewrite sites
+    share an ancestor/descendant relation (true critical pairs —
+    disjoint pairs are just parallel application).  ``numeric_check``
+    evaluates each candidate on random fp64 tensors when its ops have
+    torch bindings.
 
     Returns a list of :class:`Rewrite` objects named
     ``syn_<r1>__<r2>_<i>`` with provenance recorded in ``law``, on
@@ -1063,60 +1137,16 @@ def synthesize_rules(rules: list[Rewrite],
                 cand, usable + derived):
             return
         if not _validate_candidate(cand, r1, r2, numeric_check,
-                                   witness=witness):
+                                   witness=witness, seeds=seed_terms):
             return
         derived.append(cand)
 
-    # -- symbolic path: r1 applied to its own lhs -------------------------
-    for r1 in usable:
-        if spent > fuel:
-            break
-        # Identity instantiation: term metavars stay themselves, LHS
-        # attr metavars keep their names, and RHS attr metavars that
-        # only ``derive`` can produce become "@1:" placeholders.
-        subst = {}
-        for v in pattern_metavars(r1.lhs):
-            subst[v] = v[len("$attr:"):] if v.startswith("$attr:") else v
-        for v in pattern_metavars(r1.rhs):
-            if v.startswith("$attr:") and v not in subst:
-                subst[v] = ns1 + v[len("$attr:"):]
-        try:
-            t1 = instantiate_pattern(r1.rhs, subst)
-        except KeyError:
-            continue
-        # r1's binding on the derived rule's own subst is the identity.
-        pat1 = {v: (v[len("$attr:"):] if v.startswith("$attr:") else v)
-                for v in pattern_metavars(r1.lhs)}
-        for q, sub in _positions(t1):
-            for r2 in usable:
-                spent += 1
-                if spent > fuel:
-                    break
-                m2 = match_pattern(r2.lhs, sub, {})
-                if m2 is None:
-                    continue
-                # r2's RHS attr metavars not bound by its LHS need
-                # r2.derive — carried as "@2:" placeholders.
-                inst2 = dict(m2)
-                ok = True
-                for v in pattern_metavars(r2.rhs):
-                    if (v.startswith("$attr:") and v not in inst2):
-                        if r2.derive is None:
-                            ok = False
-                            break
-                        inst2[v] = ns2 + v[len("$attr:"):]
-                if not ok:
-                    continue
-                try:
-                    rhs2 = instantiate_pattern(r2.rhs, inst2)
-                except KeyError:
-                    continue
-                t2 = _replace(t1, q, rhs2)
-                chk, drv = _compose_guards(r1, r2, pat1, m2)
-                offer(r1.lhs, t2, r1, r2, "symbolic",
-                      check=chk, derive=drv)
-
     # -- seed-guided path: r1 then r2 on concrete terms -------------------
+    # Seeds run FIRST: a guarded pair's side conditions (Const-valued
+    # scales, broadcast-shaped masks, rank-tied dims) are only
+    # satisfiable on real instances, and the fired binding rides into
+    # validation as the candidate's witness.  The symbolic path below
+    # stays as the fully-general fallback.
     for s in seed_terms:
         if spent > fuel:
             break
@@ -1206,5 +1236,55 @@ def synthesize_rules(rules: list[Rewrite],
                         witness = {v: leaf for leaf, v in names.items()}
                         offer(lhs_pat, rhs_pat, r1, r2, "seed",
                               check=chk, derive=drv, witness=witness)
+
+    # -- symbolic path: r1 applied to its own lhs -------------------------
+    for r1 in usable:
+        if spent > fuel:
+            break
+        # Identity instantiation: term metavars stay themselves, LHS
+        # attr metavars keep their names, and RHS attr metavars that
+        # only ``derive`` can produce become "@1:" placeholders.
+        subst = {}
+        for v in pattern_metavars(r1.lhs):
+            subst[v] = v[len("$attr:"):] if v.startswith("$attr:") else v
+        for v in pattern_metavars(r1.rhs):
+            if v.startswith("$attr:") and v not in subst:
+                subst[v] = ns1 + v[len("$attr:"):]
+        try:
+            t1 = instantiate_pattern(r1.rhs, subst)
+        except KeyError:
+            continue
+        # r1's binding on the derived rule's own subst is the identity.
+        pat1 = {v: (v[len("$attr:"):] if v.startswith("$attr:") else v)
+                for v in pattern_metavars(r1.lhs)}
+        for q, sub in _positions(t1):
+            for r2 in usable:
+                spent += 1
+                if spent > fuel:
+                    break
+                m2 = match_pattern(r2.lhs, sub, {})
+                if m2 is None:
+                    continue
+                # r2's RHS attr metavars not bound by its LHS need
+                # r2.derive — carried as "@2:" placeholders.
+                inst2 = dict(m2)
+                ok = True
+                for v in pattern_metavars(r2.rhs):
+                    if (v.startswith("$attr:") and v not in inst2):
+                        if r2.derive is None:
+                            ok = False
+                            break
+                        inst2[v] = ns2 + v[len("$attr:"):]
+                if not ok:
+                    continue
+                try:
+                    rhs2 = instantiate_pattern(r2.rhs, inst2)
+                except KeyError:
+                    continue
+                t2 = _replace(t1, q, rhs2)
+                chk, drv = _compose_guards(r1, r2, pat1, m2)
+                offer(r1.lhs, t2, r1, r2, "symbolic",
+                      check=chk, derive=drv)
+
 
     return derived
