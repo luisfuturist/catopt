@@ -855,3 +855,40 @@ def test_rope_style_ops_roundtrip():
     with torch.no_grad():
         diff = (m(x, fc, fs) - opt(x, fc, fs)).abs().max().item()
     assert diff < 1e-4
+
+
+def test_dag_sharing_scales():
+    """Deep DAGs with heavy sharing must not blow up extraction/lowering.
+
+    Regression: cost fns, add_term, _uses_input, and collect all used
+    unmemoised tree walks — exponential on shared-subterm DAGs (the
+    llama2.c 4-layer case hung for minutes).  With id()-memoisation this
+    must finish in seconds.
+    """
+    import time
+    # Build a maximally-shared term DAG directly: x feeds every stage,
+    # each stage's output feeds all later stages (depth d → 2^d tree if
+    # expanded; the DAG object shares subtrees by identity).
+    x = Var("x", TensorType((4, 32)))
+    shared = x
+    t = shared
+    for i in range(14):  # tree-expansion would be ~16k nodes; DAG is 14
+        t = Op.make("add", t, Op.make("mul", t, shared))
+    eg = EGraph()
+    t0 = time.time()
+    root = eg.add_term(t)
+    from catopt.cost import launch_aware_cost
+    best = eg.extract_best(root, launch_aware_cost)
+    mod = ir_to_torch_module(
+        IR(root=best, inputs=[x], input_names={"x"}, params={}))
+    dt = time.time() - t0
+    assert dt < 30  # exponential blowup made this minutes
+    import torch as _t
+    xv = _t.randn(4, 32)
+    with _t.no_grad():
+        out = mod(xv)
+    # closed-form check: t_{i+1} = t + t*x; t_0 = x
+    expect = xv
+    for _ in range(14):
+        expect = expect + expect * xv
+    assert (out - expect).abs().max().item() < 1e-3

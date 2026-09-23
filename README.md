@@ -28,7 +28,7 @@ semantically equivalent.
 | Transform family | Examples | GPU | CPU |
 |---|---|---|---|
 | **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
-| **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound sizes; **1.19× launch-bound** | ~1.0× |
+| **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound; **1.19× launch-bound toy**; 0.82–0.99× real llama2.c blocks | ~1.0× |
 | **Norm folding** | NormLinear | 0.98× (controlled negative) | 0.90× |
 
 **Headline capability:** pointed at unmodified community code —
@@ -99,6 +99,24 @@ block): original issues 40 GEMM + 10 SDPA calls; optimized issues
 | `Attention` | wq/wk/wv → 1 GEMM + uneven splits | 3.3e-07 | 1.00× | 0.97× |
 | `TransformerBlock` | 4 pairing groups in one pass | 4.8e-07 | 0.97× | 0.98× |
 
+Stacked N-layer llama2.c blocks (pairing pass only, no saturation):
+**linear scaling** — n=1…16 layers, 2 pairing groups per layer
+(QKV + gate/up), all verified ≤2.4e-06, pipeline time dominated by
+`torch.export`, not the optimizer.
+
+| llama2.c stacked, GPU | b=1 T=1 | b=1 T=8 | b=4 T=64 | b=64 T=256 |
+|---|---|---|---|---|
+| 4 layers | 0.89× | 0.82× | 0.95× | 0.99× |
+| 2 layers b=1 T=1 / 1 layer b=1 T=1 | 0.90× | | 0.88× | |
+
+**The decode-regime hypothesis was falsified on real blocks.** Pairing
+pays where *projections dominate* the kernel count (toy ParallelBlock:
+1.19× at b=4). In a real transformer block, RoPE + SDPA + norms +
+residuals contribute ~40 kernels per layer — fusing 3 GEMMs saves ~2
+launches of ~40 while handing strided views to downstream reshapes.
+The honest regime boundary is sharper than "launch-bound wins":
+pairing needs launch-bound **and** GEMM-dominated to pay.
+
 ## What the experiments establish
 
 - **Inductor genuinely misses these transforms** — measured, not
@@ -121,6 +139,13 @@ block): original issues 40 GEMM + 10 SDPA calls; optimized issues
   produced a well-typed but semantically wrong program (diff 9.83), and
   a benchmark that measured CUDA submission time instead of execution
   (fabricating 1.10–1.20× GPU "wins"). All regression-tested.
+- **Scaling required three DAG-aware fixes** — `add_term`, cost fns, and
+  lowering's `_uses_input`/`collect` all used unmemoised tree walks that
+  are exponential on shared-subterm DAGs (llama2.c n≥4 hung for
+  minutes; now linear). Saturation itself remains the scaling wall:
+  AC/distributive rules explode combinatorially on real graphs, so the
+  profitable path at scale is the O(n) pairing pass + bounded
+  saturation, not full eqsat.
 
 ## Honest limitations
 
@@ -160,7 +185,7 @@ block): original issues 40 GEMM + 10 SDPA calls; optimized issues
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 80 tests
+python -m pytest tests/ -q         # 81 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

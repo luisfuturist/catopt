@@ -174,18 +174,30 @@ class EGraph:
         self._classes[eid].nodes.add(enode)
         return eid
 
-    def add_term(self, term: Any) -> int:
-        """Add a term (Var/Const/Param/Op) to the e-graph."""
+    def add_term(self, term: Any, _memo: dict | None = None) -> int:
+        """Add a term (Var/Const/Param/Op) to the e-graph.
+
+        ``_memo`` is an ``id()``-keyed cache: exported IR terms are DAGs
+        with heavy sharing (residual streams, RoPE tables), and without
+        memoisation the recursion re-walks shared subtrees
+        exponentially.
+        """
+        memo = {} if _memo is None else _memo
+        key = id(term)
+        if key in memo:
+            return memo[key]
         if isinstance(term, Op):
-            child_eids = tuple(self.add_term(a) for a in term.args)
+            child_eids = tuple(self.add_term(a, memo) for a in term.args)
             attr_t = _pattern_attrs(term)
             enode = ENode(term.op, child_eids, attr_t)
             if enode in self._node_to_class:
-                return self.find(self._node_to_class[enode])
-            return self._add_enode(enode)
-        else:
-            _LeafRegistry.register(term)
-            return self.add_leaf(repr(term))
+                memo[key] = self.find(self._node_to_class[enode])
+            else:
+                memo[key] = self._add_enode(enode)
+            return memo[key]
+        _LeafRegistry.register(term)
+        memo[key] = self.add_leaf(repr(term))
+        return memo[key]
 
     def union(self, a: int, b: int) -> bool:
         ra, rb = self.find(a), self.find(b)
@@ -448,19 +460,31 @@ class EGraph:
         Cyclic nodes (a class reachable from itself through rewrite-
         introduced unions) are skipped: they cannot be extracted.
         """
-        # eid -> (total_cost, term, used_eclass_ids, subtree_is_param_only)
-        cache: dict[int, tuple[float, Any, frozenset, bool]] = {}
+        # eid -> (total_cost, term, used_eclass_ids, subtree_is_param_only, nops)
+        cache: dict[int, tuple[float, Any, frozenset, bool, int]] = {}
         local_of: dict[int, float] = {}
         param_only_of: dict[int, bool] = {}
         in_progress: set[int] = set()
 
-        def best(eclass_id: int) -> tuple[float, Any, frozenset, bool]:
+        # Shared cost/shape memo for the whole extraction: makes the
+        # per-candidate cost_fn calls O(1) amortised over the DAG.
+        # keepalive retains every candidate term so id() keys in the
+        # memo cannot be recycled by the GC mid-extraction.
+        import inspect
+        cost_memo: dict = {}
+        keepalive: list = []
+        takes_memo = "memo" in inspect.signature(cost_fn).parameters
+
+        def cfn(t: Any) -> float:
+            return cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
+
+        def best(eclass_id: int) -> tuple[float, Any, frozenset, bool, int]:
             eclass_id = self.find(eclass_id)
             if eclass_id in cache:
                 return cache[eclass_id]
             if eclass_id in in_progress:
                 # Cycle back to an ancestor — not extractable.
-                return (float("inf"), None, frozenset(), False)
+                return (float("inf"), None, frozenset(), False, 0)
             in_progress.add(eclass_id)
             eclass = self._classes[eclass_id]
             override = overrides.get(eclass_id) if overrides else None
@@ -475,7 +499,7 @@ class EGraph:
                 if node.op == "leaf":
                     key = node.attrs[0][1] if node.attrs else "??"
                     term = _LeafRegistry.decode(key)
-                    total = cost_fn(term)
+                    total = cfn(term)
                     if best_total is None or total < best_total:
                         from catopt.ir import Var as _Var
                         best_total = total
@@ -483,9 +507,11 @@ class EGraph:
                         best_used = frozenset({eclass_id})
                         best_local = total
                         best_param_only = not isinstance(term, _Var)
+                        best_nops = 0
                     continue
 
                 child_terms: list[Any] = []
+                child_nops = 0
                 used: set[int] = {eclass_id}
                 sub_cost = 0.0
                 param_only = True
@@ -495,11 +521,12 @@ class EGraph:
                     if canon_child == eclass_id:
                         valid = False  # direct self-reference
                         break
-                    ctotal, cterm, cused, cpo = best(canon_child)
+                    ctotal, cterm, cused, cpo, cnops = best(canon_child)
                     if cterm is None:
                         valid = False
                         break
                     child_terms.append(cterm)
+                    child_nops += cnops
                     param_only = param_only and cpo
                     # Charge each distinct e-class in the DAG once:
                     # a shared child contributes its subtree cost only
@@ -512,8 +539,9 @@ class EGraph:
                 if not valid:
                     continue
                 term = Op.make(node.op, *child_terms, **dict(node.attrs))
-                local = cost_fn(term) - sum(
-                    cost_fn(c) for c in child_terms
+                keepalive.append(term)
+                local = cfn(term) - sum(
+                    cfn(c) for c in child_terms
                 )
                 local = max(local, 0.0)
                 if param_only:
@@ -521,8 +549,9 @@ class EGraph:
                 total = local + sub_cost
                 # Secondary key: among equal-cost candidates prefer the
                 # structurally smallest term (a leaf over add(W, 0) in a
-                # param-only class, for example).
-                nops = sum(1 for _ in _iter_ops(term))
+                # param-only class, for example).  Counted incrementally
+                # from child caches — no tree walk.
+                nops = child_nops + 1
                 if (best_total is None
                         or total < best_total
                         or (total == best_total and nops < best_nops)):
@@ -539,10 +568,11 @@ class EGraph:
             param_only_of[eclass_id] = best_param_only
             cache[eclass_id] = (
                 best_total or 0.0, best_term, best_used, best_param_only,
+                best_nops,
             )
             return cache[eclass_id]
 
-        _, term, _, _ = best(eid)
+        _, term, _, _, _ = best(eid)
         return term
 
     # -- coordinated (group) extraction ----------------------------------

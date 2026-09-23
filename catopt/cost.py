@@ -23,19 +23,31 @@ from catopt.ir import Op, Var, Const, Param
 # Shape inference (lightweight)
 # ---------------------------------------------------------------------------
 
-def _shape_of(term: Any) -> tuple | None:
-    """Best-effort shape inference for a term."""
+def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
+    """Best-effort shape inference for a term.
+
+    ``memo`` is an optional ``id()``-keyed dict shared across a whole
+    traversal: extracted terms share Op objects (DAG structure), so
+    memoising turns an exponential tree walk into a linear DAG walk.
+    """
+    key = id(term)
+    if memo is not None and key in memo:
+        return memo[key]
     if isinstance(term, (Var, Param)):
-        return term.typ.shape
-    if isinstance(term, Const):
-        return ()
-    if isinstance(term, Op):
-        return _infer_op_shape(term)
-    return None
+        out = term.typ.shape
+    elif isinstance(term, Const):
+        out = ()
+    elif isinstance(term, Op):
+        out = _infer_op_shape(term, memo)
+    else:
+        out = None
+    if memo is not None:
+        memo[key] = out
+    return out
 
 
-def _infer_op_shape(op: Op):
-    shapes = [_shape_of(a) for a in op.args]
+def _infer_op_shape(op: Op, memo: dict | None = None):
+    shapes = [_shape_of(a, memo) for a in op.args]
     if any(s is _INVALID for s in shapes):
         return _INVALID
     if not shapes or any(s is None for s in shapes):
@@ -214,28 +226,28 @@ _LAUNCH_PENALTY = 1.0
 _INVALID_COST = 1e15
 
 
-def _flops_of(term: Op) -> float:
+def _flops_of(term: Op, memo: dict | None = None) -> float:
     """FLOP count of a single op node (excludes children)."""
-    shape = _infer_op_shape(term)
+    shape = _infer_op_shape(term, memo)
     if shape is _INVALID:
         return _INVALID_COST
     n_out = _numel(shape)
     if term.op == "matmul":
         # Standard matmul: 2 * M * N * K
-        shapes = [_shape_of(a) for a in term.args]
+        shapes = [_shape_of(a, memo) for a in term.args]
         if shapes and shapes[1] is not None and shapes[1] is not _INVALID:
             k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
             return float(2 * n_out * k_dim)
         return float(2 * n_out)
     if term.op == "linear":
         # F.linear(x[..,in], W[out,in]) -> 2 * M * out * in
-        shapes = [_shape_of(a) for a in term.args]
+        shapes = [_shape_of(a, memo) for a in term.args]
         if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
             return float(2 * n_out * shapes[0][-1])
         return float(2 * n_out)
     if term.op == "sdpa":
         # attention: ~2 * (T * d + T * T) per head ≈ 2*T*max(d,T)*B*h
-        shapes = [_shape_of(a) for a in term.args]
+        shapes = [_shape_of(a, memo) for a in term.args]
         q = shapes[0] if shapes else None
         if q is not None and q is not _INVALID and len(q) >= 3:
             t_dim = q[-2]
@@ -244,32 +256,44 @@ def _flops_of(term: Op) -> float:
     return float(_OP_FLOPS.get(term.op, 1) * n_out)
 
 
-def _local_cost(term: Op, launch_penalty: float = 0.0) -> float:
+def _local_cost(term: Op, launch_penalty: float = 0.0,
+                memo: dict | None = None) -> float:
     """Cost contribution of a single op node (excludes children).
 
     = op FLOPs on the inferred output shape + launch penalty.
     """
-    base = _flops_of(term)
+    base = _flops_of(term, memo)
     if term.op not in _VIEW_OPS:
         base += launch_penalty
     return float(base)
 
 
-def flops_cost(term: Any) -> float:
+def flops_cost(term: Any, memo: dict | None = None) -> float:
     """Cost = estimated FLOPs using shape inference.
 
     For matmul, uses the standard 2*M*N*K formula.
     For element-wise ops, uses 1 FLOP per output element.
+
+    ``memo`` (id-keyed) makes repeated calls over a shared-subterm DAG
+    linear instead of exponential; callers doing many evaluations
+    (e.g. extraction) should pass a shared dict.
     """
+    memo = {} if memo is None else memo
+    key = id(term)
+    ck = ("c", key)
+    if ck in memo:
+        return memo[ck]
     if isinstance(term, Op):
-        base = _local_cost(term)
+        base = _local_cost(term, memo=memo)
         for arg in term.args:
-            base += flops_cost(arg)
-        return float(base)
+            base += flops_cost(arg, memo)
+        memo[ck] = float(base)
+        return memo[ck]
+    memo[ck] = 0.0
     return 0.0
 
 
-def dag_cost(term: Any, cost_fn) -> float:
+def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     """True DAG cost of an extracted term: shared subtrees charged once.
 
     ``cost_fn(term)`` counts shared subtrees once per *parent* (a tree
@@ -278,7 +302,17 @@ def dag_cost(term: Any, cost_fn) -> float:
     split views).  This sums each distinct node's local cost —
     ``cost_fn(node) - sum(cost_fn(children))`` — deduplicated by object
     identity.
+
+    ``memo`` is forwarded to cost functions that accept it (the
+    built-in models do), so children already costed are O(1) lookups.
     """
+    import inspect
+    memo = {} if memo is None else memo
+    takes_memo = "memo" in inspect.signature(cost_fn).parameters
+
+    def c(t: Any) -> float:
+        return cost_fn(t, memo=memo) if takes_memo else cost_fn(t)
+
     seen: set[int] = set()
     total = 0.0
 
@@ -290,16 +324,16 @@ def dag_cost(term: Any, cost_fn) -> float:
         if isinstance(t, Op):
             for a in t.args:
                 rec(a)
-            local = cost_fn(t) - sum(cost_fn(c) for c in t.args)
+            local = c(t) - sum(c(a) for a in t.args)
             total += max(local, 0.0)
         else:
-            total += cost_fn(t)
+            total += c(t)
 
     rec(term)
     return total
 
 
-def launch_aware_cost(term: Any) -> float:
+def launch_aware_cost(term: Any, memo: dict | None = None) -> float:
     """flops_cost + _LAUNCH_PENALTY per non-view op.
 
     Two equivalent forms can have identical FLOPs yet differ in kernel
@@ -307,21 +341,33 @@ def launch_aware_cost(term: Any) -> float:
     such ties deterministically toward fewer launches.  This is the
     default extraction cost in :func:`catopt.optimize.optimize_model`.
     """
+    memo = {} if memo is None else memo
+    ck = ("lc", id(term))
+    if ck in memo:
+        return memo[ck]
     if isinstance(term, Op):
-        base = _local_cost(term, _LAUNCH_PENALTY)
+        base = _local_cost(term, _LAUNCH_PENALTY, memo=memo)
         for arg in term.args:
-            base += launch_aware_cost(arg)
-        return float(base)
+            base += launch_aware_cost(arg, memo)
+        memo[ck] = float(base)
+        return memo[ck]
+    memo[ck] = 0.0
     return 0.0
 
 
-def count_cost(term: Any) -> float:
+def count_cost(term: Any, memo: dict | None = None) -> float:
     """Cost = number of non-view operations in the term tree."""
+    memo = {} if memo is None else memo
+    ck = ("cc", id(term))
+    if ck in memo:
+        return memo[ck]
     if isinstance(term, Op):
         n = 0 if term.op in _VIEW_OPS else 1
         for arg in term.args:
-            n += count_cost(arg)
-        return float(n)
+            n += count_cost(arg, memo)
+        memo[ck] = float(n)
+        return memo[ck]
+    memo[ck] = 0.0
     return 0.0
 
 
@@ -347,7 +393,7 @@ _LAUNCH_S = 5.0e-6      # ~5 µs kernel-launch / scheduling overhead
 _STRIDE_PENALTY = 2.0   # strided reads waste ~half of each cache line
 
 
-def _is_strided(term: Any) -> bool:
+def _is_strided(term: Any, memo: dict | None = None) -> bool:
     """True if *term* is a view whose elements are not contiguous.
 
     chunk on the LAST dim splits each row — consumers read with a row
@@ -356,41 +402,41 @@ def _is_strided(term: Any) -> bool:
     """
     if not (isinstance(term, Op) and term.op in ("chunk", "split")):
         return False
-    s = _infer_op_shape(term)
+    s = _infer_op_shape(term, memo)
     if not isinstance(s, tuple) or not s:
         return False
     dim = term.attrs.get("dim", -1) % len(s)
     return dim == len(s) - 1
 
 
-def _bytes_of(term: Op) -> float:
+def _bytes_of(term: Op, memo: dict | None = None) -> float:
     """Bytes moved by a single op: inputs read + output written (fp32)."""
     in_bytes = 0.0
     for a in term.args:
-        n = _numel(_shape_of(a))
-        w = _STRIDE_PENALTY if _is_strided(a) else 1.0
+        n = _numel(_shape_of(a, memo))
+        w = _STRIDE_PENALTY if _is_strided(a, memo) else 1.0
         in_bytes += n * 4.0 * w
     # view ops share storage with their input — no output write
     out_bytes = 0.0 if term.op in _VIEW_OPS else _numel(
-        _infer_op_shape(term)) * 4.0
+        _infer_op_shape(term, memo)) * 4.0
     return in_bytes + out_bytes
 
 
-def _local_roofline(term: Op) -> float:
+def _local_roofline(term: Op, memo: dict | None = None) -> float:
     """Estimated nanoseconds for one op: max(compute, memory) + launch."""
-    shape = _infer_op_shape(term)
+    shape = _infer_op_shape(term, memo)
     if shape is _INVALID:
         return _INVALID_COST
-    flops = _flops_of(term)
+    flops = _flops_of(term, memo)
     if flops >= _INVALID_COST:
         return _INVALID_COST
     compute_s = flops / _PEAK_FLOPS
-    memory_s = _bytes_of(term) / _PEAK_BW
+    memory_s = _bytes_of(term, memo) / _PEAK_BW
     launch = 0.0 if term.op in _VIEW_OPS else _LAUNCH_S
     return (max(compute_s, memory_s) + launch) * 1e9
 
 
-def roofline_cost(term: Any) -> float:
+def roofline_cost(term: Any, memo: dict | None = None) -> float:
     """Roofline cost in estimated nanoseconds (per-op, additive).
 
     max(flops/PEAK_FLOPS, bytes/PEAK_BW) + launch per op; view ops are
@@ -399,11 +445,17 @@ def roofline_cost(term: Any) -> float:
     pay?" — it answers differently at different batch sizes, which is
     what the measurements show.
     """
+    memo = {} if memo is None else memo
+    ck = ("rc", id(term))
+    if ck in memo:
+        return memo[ck]
     if isinstance(term, Op):
-        base = _local_roofline(term)
+        base = _local_roofline(term, memo)
         for arg in term.args:
-            base += roofline_cost(arg)
-        return float(base)
+            base += roofline_cost(arg, memo)
+        memo[ck] = float(base)
+        return memo[ck]
+    memo[ck] = 0.0
     return 0.0
 
 

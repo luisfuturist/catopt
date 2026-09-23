@@ -600,7 +600,33 @@ def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
     Idempotent: re-running rebuilds the same (hash-consed) enodes.
     """
     from catopt.cost import _shape_of as _so
-    from catopt.egraph import ENode
+    from catopt.egraph import ENode, _LeafRegistry
+    from catopt.ir import Var as _Var
+
+    # Per-class "can some representative reach a Var leaf" — memoized and
+    # cycle-guarded.  Replaces materializing any_term + _term_has_var per
+    # class (quadratic tree walks on deep graphs) and is *more* sound:
+    # it detects var-reachability rather than trusting an arbitrary rep.
+    hasvar: dict[int, bool] = {}
+
+    def cls_has_var(cid: int, stack: frozenset = frozenset()) -> bool:
+        cid = eg.find(cid)
+        if cid in hasvar:
+            return hasvar[cid]
+        if cid in stack:
+            return False
+        res = False
+        for n in eg._classes[cid].nodes:
+            if n.op == "leaf":
+                t = _LeafRegistry.decode(n.attrs[0][1])
+                if isinstance(t, _Var):
+                    res = True
+                    break
+            elif any(cls_has_var(c, stack | {cid}) for c in n.children):
+                res = True
+                break
+        hasvar[cid] = res
+        return res
 
     by_input: dict[int, list[tuple[int, int]]] = {}
     for cid in list(eg._classes.keys()):
@@ -613,15 +639,16 @@ def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
 
     groups: list[dict[int, Any]] = []
     for x_eid, members in by_input.items():
-        xt = eg.any_term(x_eid)
-        if xt is None or not _term_has_var(xt):
+        if not cls_has_var(x_eid):
             continue  # pairing weight-only chains is compile-time noise
         weights = sorted({w for _, w in members})
         if len(weights) < 2:
             continue
-        wts = [eg.any_term(w) for w in weights]
-        if any(t is None or _term_has_var(t) for t in wts):
+        if any(cls_has_var(w) for w in weights):
             continue  # fused weight must fold at compile time
+        wts = [eg.any_term(w) for w in weights]
+        if any(t is None for t in wts):
+            continue
         sizes: list[int] = []
         for t in wts:
             s = _so(t)

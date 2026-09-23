@@ -404,17 +404,27 @@ class IRModule(torch.nn.Module):
         # Phase 3b: materialize weight-only subtrees (e.g. W1 @ (W2 @ W3))
         # at construction time, so runtime is a single matmul per fused chain.
         self._fold_memo: dict[int, Any] = {}
+        self._uses_memo: dict[int, bool] = {}
         self._root = self._fold_weight_chains(ir.root)
         self._build_params()
 
-    @staticmethod
-    def _uses_input(term: Any) -> bool:
-        """True if the term mentions any data-dependent leaf (Var/Const input)."""
+    def _uses_input(self, term: Any) -> bool:
+        """True if the term mentions any data-dependent leaf (Var input).
+
+        Memoised by id(): extracted terms are shared-subterm DAGs, and
+        an unmemoised walk is exponential in DAG depth.
+        """
+        key = id(term)
+        if key in self._uses_memo:
+            return self._uses_memo[key]
         if isinstance(term, Var):
-            return True
-        if isinstance(term, Op):
-            return any(IRModule._uses_input(a) for a in term.args)
-        return False
+            res = True
+        elif isinstance(term, Op):
+            res = any(self._uses_input(a) for a in term.args)
+        else:
+            res = False
+        self._uses_memo[key] = res
+        return res
 
     def _fold_weight_chains(self, term: Any) -> Any:
         """Bottom-up: replace weight-only subtrees with a single fused Param.
@@ -500,7 +510,12 @@ class IRModule(torch.nn.Module):
 
         param_shapes: dict[str, tuple] = {}
 
+        seen: set[int] = set()
+
         def collect(t: Any) -> None:
+            if id(t) in seen:
+                return
+            seen.add(id(t))
             if isinstance(t, _Param):
                 if t.name not in param_shapes and t.typ.size is not None:
                     param_shapes[t.name] = tuple(
