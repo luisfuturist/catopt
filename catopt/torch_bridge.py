@@ -210,15 +210,70 @@ class IRModule(torch.nn.Module):
         param_values: dict[str, torch.Tensor] | None = None,
     ) -> None:
         super().__init__()
-        self._root = ir.root
         self._inputs = ir.inputs
         self._param_map: dict[str, torch.nn.Parameter] = {}
         self._param_values = param_values or {}
-        self._build_params(ir)
+        # Phase 3b: materialize weight-only subtrees (e.g. W1 @ (W2 @ W3))
+        # at construction time, so runtime is a single matmul per fused chain.
+        self._root = self._fold_weight_chains(ir.root)
+        self._build_params()
 
-    def _build_params(self, ir: IR) -> None:
+    @staticmethod
+    def _uses_input(term: Any) -> bool:
+        """True if the term mentions any data-dependent leaf (Var/Const input)."""
+        if isinstance(term, Var):
+            return True
+        if isinstance(term, Op):
+            return any(IRModule._uses_input(a) for a in term.args)
+        return False
+
+    def _fold_weight_chains(self, term: Any) -> Any:
+        """Bottom-up: replace weight-only subtrees with a single fused Param.
+
+        A subtree with no Var leaves is parameter-only and can be evaluated
+        once at construction time (using _param_values when available).
+        Its result is stored as a new fused Param, so the runtime graph
+        contains one matmul instead of a chain of them.  Matmul is handled
+        with torch.matmul; other ops fall back to eager _eval.
+        """
+        from catopt.ir import Op as _Op
+        from catopt.ir import Param as _Param
+
+        if isinstance(term, _Op):
+            folded_args = tuple(self._fold_weight_chains(a) for a in term.args)
+            term = _Op.make(term.op, *folded_args, **dict(term.attrs))
+            if term.op == "matmul" and not self._uses_input(term):
+                left = self._param_values.get(term.args[0].name) \
+                    if isinstance(term.args[0], _Param) else None
+                right = self._param_values.get(term.args[1].name) \
+                    if isinstance(term.args[1], _Param) else None
+                if left is not None and right is not None:
+                    with torch.no_grad():
+                        fused = torch.matmul(left, right)
+                    fused_name = f"fused_{len(self._param_map) + len(self._param_values)}"
+                    self._param_values[fused_name] = fused.detach().clone()
+                    shape = tuple(int(d) for d in fused.shape)
+                    from catopt.ir import TensorType
+                    return _Param(name=fused_name, typ=TensorType(shape))
+        return term
+
+    def _build_params(self) -> None:
+        from catopt.ir import Op as _Op
+        from catopt.ir import Param as _Param
+
         param_shapes: dict[str, tuple] = {}
-        self._collect_params(ir.root, param_shapes)
+
+        def collect(t: Any) -> None:
+            if isinstance(t, _Param):
+                if t.name not in param_shapes and t.typ.size is not None:
+                    param_shapes[t.name] = tuple(
+                        d if d is not None else 1 for d in t.typ.shape
+                    )
+            elif isinstance(t, _Op):
+                for a in t.args:
+                    collect(a)
+
+        collect(self._root)
         for name, shape in param_shapes.items():
             if name in self._param_values:
                 # Use the original model's parameter value
@@ -228,16 +283,6 @@ class IRModule(torch.nn.Module):
             # Use the IR name (e.g. p_w1) so _eval can find it
             setattr(self, name, p)
             self._param_map[name] = p
-
-    def _collect_params(self, term: Any, acc: dict[str, tuple]) -> None:
-        if isinstance(term, Param):
-            if term.name not in acc and term.typ.size is not None:
-                acc[term.name] = tuple(
-                    d if d is not None else 1 for d in term.typ.shape
-                )
-        elif isinstance(term, Op):
-            for arg in term.args:
-                self._collect_params(arg, acc)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         env: dict[str, torch.Tensor] = {"self": x}
