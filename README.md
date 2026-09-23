@@ -221,8 +221,8 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | ------- | ----------: | ------------: | ---------------------: | ------: |
 | MatrixChain b=128  | yes (7e-09) | 0.048 | 0.030 | **1.60×** |
 | MatrixChain b=4096 | yes (5e-09) | 0.240 | 0.039 | **6.22×** |
-| SwiGLU   | yes (0.0)   | — | — | 1.00× (cost unchanged) |
-| RMSNorm  | yes (2e-07) | — | — | **1.95×** FLOPs (4101→2086) |
+| SwiGLU   | yes (0.0)   | — | — | 1.00× (cost unchanged, 802,816 FLOPs) |
+| RMSNorm  | yes (2e-07) | — | — | **1.98×** FLOPs (4,256→2,148) |
 
 Both paths go through `torch.compile`, so the comparison isolates the
 representation: same backend, same model, same weights — only the graph
@@ -240,7 +240,7 @@ handed to TorchInductor differs.
   equivalence but find no strictly cheaper form. Reporting that is the point:
   a rule system that always "wins" would be measuring its cost model, not the
   compiler.
-* **RMSNorm genuinely improves (1.95×).** Here the e-graph finds a form that
+* **RMSNorm genuinely improves (1.98×).** Here the e-graph finds a form that
   hoists `rsqrt` onto the reduced `(B, T, 1)` tensor instead of the broadcast
   `(B, T, C)` tensor. That is a real, semantics-preserving FLOP reduction that
   the exported graph does not express.
