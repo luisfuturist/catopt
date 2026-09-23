@@ -83,6 +83,7 @@ from catopt.cost import (
 from catopt.rules import SCAN_LAWS, SCAN_DIAG_LAWS
 from catopt.om import OM_LAWS
 from catopt.trace import TRACE_LAWS
+from catopt.xcarrier import XC_LAWS
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.scan_lower import (
     to_batched_scan_module,
@@ -1002,10 +1003,16 @@ class RegimeDispatch(nn.Module):
 #: TRACE_LAWS rides along: importing catopt.trace also registers the
 #: trace/bdiag/parl/eye/cswap/inv torch bindings, so any trace-bearing
 #: member the JSV laws reach is executable by the generic executor.
-#: (No exported model produces trace enodes and no current law lifts
-#: tensor algebra into trace form, so today these rules only fire
-#: where a trace term was seeded — see tests/test_trace_pipeline.py.)
+#: trace enodes enter via the trace_lift non-local pass in optimize.py.
+#: XC_LAWS crosses the carrier seam: linear readouts exit the scan
+#: carriers, the om numerator is such a readout, and the deferred omd
+#: carrier keeps chunked attention affine in the scan's initial state.
 CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS
+#: Opt-in: the cross-carrier readout laws roughly double the rule set
+#: (mostly bidirectional pairs) and blow up default saturation on
+#: carrier-heavy graphs — attach them per-call via ``rules=`` where the
+#: seam matters.  The non-local xcarrier passes run regardless.
+CARRIER_X_LAWS = CARRIER_LAWS + XC_LAWS
 
 
 def default_rules() -> list:
@@ -1025,6 +1032,21 @@ def build_egraph(model: nn.Module, example_input: Any, *,
     root = eg.add_term(ir.root)
     stats = eg.run(default_rules() if rules is None else rules, root,
                    max_iterations=max_iterations, max_nodes=max_nodes)
+    # Non-local lifts: recurrences -> trace(F), stacks of same-state
+    # carrier applications -> one application, om trees over scanned
+    # values -> the deferred omd carrier.  Witnessed, replayable.
+    from catopt.trace_lift import lift_scan_to_trace
+    from catopt.xcarrier import (gather_applyd_stack,
+                                 gather_apply_stack, omd_tree_lift)
+    lifts = (lift_scan_to_trace(eg)
+             + gather_applyd_stack(eg)
+             + gather_apply_stack(eg)
+             + omd_tree_lift(eg))
+    if lifts:
+        eg.rebuild()
+        stats["nonlocal_lifts"] = len(lifts)
+        eg.run(default_rules() if rules is None else rules, root,
+               max_iterations=5, max_nodes=max_nodes)
     return eg, root, ir, source, stats
 
 

@@ -22,6 +22,8 @@ from catopt.rules import (all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
                           pair_shared_input_linears,
                           pair_shared_input_convs)
 from catopt.trace_lift import lift_scan_to_trace
+from catopt.xcarrier import (gather_applyd_stack, gather_apply_stack,
+                             omd_tree_lift)
 from catopt.cost import (flops_cost, count_cost, launch_aware_cost,
                          CostModel, dag_cost)
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
@@ -135,12 +137,17 @@ def discover_alternatives(
         eg.rebuild()
         stats["pairing_groups"] = len(groups)
         eg.run(rules, root_eid, max_iterations=5)
-    # Non-local trace lift: unrolled recurrences -> trace(F) members,
-    # witnessed so certificates stay replayable.
-    lifts = lift_scan_to_trace(eg)
+    # Non-local lifts: unrolled recurrences -> trace(F), stacks of
+    # same-state carrier applications -> one application, and whole
+    # om trees over scanned values -> the deferred omd carrier.
+    # All witnessed so certificates stay replayable.
+    lifts = (lift_scan_to_trace(eg)
+             + gather_applyd_stack(eg)
+             + gather_apply_stack(eg)
+             + omd_tree_lift(eg))
     if lifts:
         eg.rebuild()
-        stats["trace_lifts"] = len(lifts)
+        stats["nonlocal_lifts"] = len(lifts)
         eg.run(rules, root_eid, max_iterations=5)
     alts = eg.extract_alternatives(root_eid, cost_fn, top_k=top_k)
     return {
@@ -243,12 +250,17 @@ def optimize_model(
         # brief second saturation so other rules see the new enodes
         eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
 
-    # Non-local trace lift: unrolled recurrences -> trace(F) members,
-    # witnessed so certificates stay replayable.
-    lifts = lift_scan_to_trace(eg)
+    # Non-local lifts: unrolled recurrences -> trace(F), stacks of
+    # same-state carrier applications -> one application, and whole
+    # om trees over scanned values -> the deferred omd carrier.
+    # All witnessed so certificates stay replayable.
+    lifts = (lift_scan_to_trace(eg)
+             + gather_applyd_stack(eg)
+             + gather_apply_stack(eg)
+             + omd_tree_lift(eg))
     if lifts:
         eg.rebuild()
-        stats["trace_lifts"] = len(lifts)
+        stats["nonlocal_lifts"] = len(lifts)
         eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
 
     stats["rule_fires"] = dict(eg.rule_fires)

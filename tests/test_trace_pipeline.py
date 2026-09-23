@@ -9,19 +9,15 @@ This file proves the pipeline-level story:
   ``"trace"`` executor spec exists so regimes can *prefer* the
   fixpoint carrier.
 
-* **Honest negative — the export boundary.**  On real exported models
-  (``DiagonalSSM``, ``HybridBlock``) NO ``tr_*`` law fires and no
-  trace-family enode materialises.  Trace ops are never produced by
-  ``torch.export``, and of the 13 trace laws only ``tr_collapse`` has a
-  trace-free LHS — but its LHS is the resolvent pattern
-  ``add(P, Q·(I−S)⁻¹·R)`` with all four blocks ``split``-projections of
-  ONE matrix through ``inv``/``eye``, structure no export and no other
-  law family produces.  The missing lift — unrolled recurrence spine →
-  ``matmul(trace(F, T·d), vec)`` over the nilpotent block-shift F — is
-  the non-local "trm ↔ apply bridge" catopt/trace.py itself documents:
-  it must *construct* the time-extended matrix from the whole horizon,
-  a pairing pass (like ``pair_shared_input_linears``), not a lhs→rhs
-  rule.  These tests pin that boundary instead of pretending.
+* **The export boundary — now crossed by a non-local pass.**  Raw
+  exports contain no ``trace``/``inv``/``eye`` foothold, and no
+  lhs→rhs law can mint one (``tr_collapse``'s resolvent LHS needs
+  shared ``split``-projections nothing produces).  The bridge is
+  ``catopt.trace_lift.lift_scan_to_trace`` — wired into
+  ``build_egraph`` — which *constructs* the nilpotent block-shift F
+  from the whole unrolled horizon and offers
+  ``matmul(trace(F, T·d), vec)``, witnessed.  Post-lift the JSV laws
+  fire on real exports (superpose/expand/vanish/tighten).
 
 * **What IS reachable without the lift.**  Seeded into the same
   pipeline law set, a joint-loop trace saturates normally:
@@ -136,26 +132,25 @@ class TestTraceInPipeline:
 # ---------------------------------------------------------------------------
 
 class TestExportBoundary:
-    """No trace law fires on real exports; the only trace-free LHS
-    (``tr_collapse``'s resolvent pattern) needs ``inv``/``eye``/shared
-    ``split``-projection structure nothing produces."""
+    """Raw exports contain no trace foothold — trace enters only via
+    the non-local ``lift_scan_to_trace`` pass (wired into
+    ``build_egraph``), after which the JSV laws fire on real models."""
 
-    def test_diagonal_ssm_no_trace_fires(self):
+    def test_diagonal_ssm_trace_fires_via_lift(self):
         torch.manual_seed(0)
         T, D = 16, 16
         m = DiagonalSSM(D, D, T).eval().double()
         x = torch.randn(T, D)
-        # the ACTUAL regime pipeline entry point (CARRIER_LAWS)
+        # the ACTUAL regime pipeline entry point (CARRIER_LAWS + lifts)
         eg, root, ir, src, stats = build_egraph(m, x)
-        assert _tr_fires(eg) == {}
+        assert stats.get("nonlocal_lifts", 0) > 0
+        assert _tr_fires(eg), "trace laws should fire post-lift"
         census = _op_census(eg)
-        for op in _TRACE_FAMILY:
-            assert census[op] == 0, op
-        # the scan carrier DID lift — the graph is alive, traces just
-        # have no way in
+        assert census["trace"] > 0
+        # the scan carrier lifted too — both domains coexist
         assert census["applyd"] > 0 and census["aff_diag"] > 0
 
-    def test_hybrid_block_no_trace_fires(self):
+    def test_hybrid_block_saturation_alone_no_trace(self):
         torch.manual_seed(0)
         T, D = 16, 16
         m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
@@ -176,25 +171,28 @@ class TestExportBoundary:
         # both real carriers lifted in the same graph
         assert census["applyd"] > 0 and census["om_apply"] > 0
 
-    def test_why_tr_collapse_cannot_match(self):
-        """Mechanistic check: ``tr_collapse`` is the ONLY trace law
-        whose LHS mentions no trace-family op — its pattern is
-        ``add(P, matmul(Q, matmul(inv(sub(eye,S)), R)))`` where
-        P,Q,R,S are ``split`` projections of one f.  Exports contain no
-        ``inv``/``eye``/``split`` enodes at all, so the LHS can never
-        be present — the bridge is missing, not vetoed."""
+    def test_why_trace_needs_the_lift(self):
+        """Mechanistic check: the raw export contains no ``trace``/
+        ``inv``/``eye`` enodes — saturation alone can never reach the
+        trace domain.  ``build_egraph``'s non-local ``lift_scan_to_trace``
+        pass introduces the block-shift ``trace(F)`` (and the resolvent
+        structure the laws then expand), so trace enodes appear only
+        *after* the lift."""
         torch.manual_seed(0)
         T, D = 16, 16
         m = DiagonalSSM(D, D, T).eval().double()
         x = torch.randn(T, D)
+        # raw export + plain saturation: no trace foothold exists
+        ir, _ = export_to_ir(m, x)
+        eg0 = EGraph()
+        r0 = eg0.add_term(ir.root)
+        eg0.run(TRACE_LAWS, r0, max_iterations=3)
+        c0 = _op_census(eg0)
+        assert c0["trace"] == 0 and c0["inv"] == 0 and c0["eye"] == 0
+        # the full pipeline lifts recurrences into trace form
         eg, root, ir, src, stats = build_egraph(m, x)
-        census = _op_census(eg)
-        # none of tr_collapse's distinguishing structure exists
-        assert census["inv"] == 0
-        assert census["eye"] == 0
-        assert census["split"] == 0
-        # and no trace law fired — saturation is complete (2 iters)
-        assert stats["iterations"] <= 3
+        assert stats.get("nonlocal_lifts", 0) > 0
+        assert _op_census(eg)["trace"] > 0
 
     def test_no_served_member_contains_trace(self):
         """End-to-end dispatch on a real model: every served regime
