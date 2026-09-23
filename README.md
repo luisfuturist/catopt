@@ -208,11 +208,11 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 
 | Layer | Module | What it does |
 | ----- | ------ | ------------ |
-| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws (incl. `concat`/`chunk` for the product structure) |
-| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, **DAG-aware extraction**: shared e-classes charged once, param-only classes charged at compile-time cost 0, cycle-safe |
-| Rules | `catopt/rules.py` | 29 rules: monoid/group laws, `silu`/`pow` bridges, bilinearity/weight-merge, naturality, associativity, **product-structure fusion** (`swiglu_fuse`, `parallel_mul_fuse`) |
-| Cost | `catopt/cost.py` | `count_cost`, shape-aware `flops_cost` (`2·M·N·K`), `launch_aware_cost` (FLOPs + per-kernel penalty) |
-| Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion**; shared-subterm memoisation |
+| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws (incl. `concat`/`chunk` for the product structure, `sdpa`/`contiguous`/`reshape`/`transpose` for attention) |
+| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, **attribute metavariables**, **per-rule `check` predicates** (shape-aware side conditions), **DAG-aware extraction**: shared e-classes charged once, param-only classes charged at compile-time cost 0, cycle-safe |
+| Rules | `catopt/rules.py` | 34 rules: monoid/group laws, `silu`/`pow` bridges, bilinearity/weight-merge, naturality + **shape-checked scale naturality** (row vs channel vs scalar), associativity, **product-structure fusion** (`swiglu_fuse`, `parallel_mul_fuse`, `qkv_fuse`) |
+| Cost | `catopt/cost.py` | `count_cost`, shape-aware `flops_cost` (`2·M·N·K`), `launch_aware_cost` (FLOPs + per-kernel penalty), **`roofline_cost`** (per-op `max(compute, memory)` + launch, stride-aware) |
+| Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion** (incl. `concat`); shared-subterm memoisation; SDPA/reshape/transpose attr plumbing |
 | Pipeline | `catopt/optimize.py` | 4-phase `optimize_model` with equivalence verification |
 
 ### Measured results (CPU, run on this machine)
@@ -224,7 +224,10 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | **DeepParallel b=4096** | yes (2e-06) | 1.362 | 0.451 | **3.02×** |
 | **ParallelLinear b=4096** | yes (3e-06) | 0.878 | 0.393 | **2.24×** |
 | **SwiGLU b=128 (fused gate/up)** | yes (0.0) | 2.800 | 2.642 | **1.06×** |
-| SwiGLU b=4096 (same fused form) | yes (6e-08) | 94.93 | 97.18 | 0.98× (see note) |
+| SwiGLU b=4096 (same fused form) | yes (6e-08) | 94.93 | 97.18 | 0.98× |
+| **Attention QKV b=16 T=128** | yes (3e-08) | 16.14 | 16.35 | 0.99× |
+| Attention QKV b=64 T=256 | yes (3e-08) | 157.1 | 166.7 | 0.94× |
+| **NormLinear b=256 T=64** | yes (3e-06) | 39.91 | 44.52 | 0.90× |
 | RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
 
 Both paths go through `torch.compile`, so the comparison isolates the
@@ -269,6 +272,35 @@ representation expose?"*: composing **two** laws where the second is only
 constraint the cost model cannot see. Both got caught not by inspection but by
 the e-graph's equivalence check.
 
+### The pattern across all six cases — where the wins actually live
+
+This is now the clearest empirical result in the repo. Every transform the
+e-graph discovers is a **parameter-restructuring** transformation: it moves
+work into the weights (compile-time) or merges weight matrices so fewer
+GEMMs run. They divide cleanly:
+
+* **FLOP-reducing transforms pay on CPU.** MatrixChain, ParallelLinear,
+  DeepParallel each shrink the actual GEMM FLOP count (6.3×, 2×, 2.9×) —
+  those wins are backend-independent and measured at 1.6–6.2×, 2.24×, 3.02×.
+* **Same-FLOP restructuring is a wash on CPU.** SwiGLU gate/up fusion,
+  fused QKV, and norm folding keep FLOPs identical — their wins are fewer
+  kernel launches and better GEMM aspect ratios. On this CPU those gains
+  are offset by the strided `chunk` views they create, while Inductor's
+  *intra-kernel* fusion (prologue/epilogue scale application inside the
+  GEMM's own loop) already captures the memory-bandwidth benefit that
+  restructuring promised at graph level. Measured: 0.94–1.06×.
+* **The same-FLOP cases are precisely the ones that are standard practice
+  on GPU** — fused QKV and merged gate/up are in every fast inference
+  stack *because* kernel launches dominate and Inductor still won't do
+  them. GPU numbers pending (driver currently blacklisted on this
+  machine; `bench_gpu.py` reproduces the table on CUDA).
+
+So the honest claim today: **categorical semantics + equality saturation
+reliably *finds and formally verifies* parameter-restructuring transforms
+that TorchInductor cannot express — the verification caught four real
+unsoundnesses in this codebase alone. Whether each transform *pays* is a
+backend question, and the split above is the boundary.**
+
 ### Honest reading of the numbers
 
 * **The 6.3× FLOP figure is not a 6.3× speedup.** It counts the one-time
@@ -309,37 +341,48 @@ the e-graph's equivalence check.
   chosen whenever it is *semantically* available; the earlier break-even
   behaviour (partial fusion at small batch) was an artifact of charging
   compile-time work at runtime rates.
-* **The nonlinear barrier is now partially breached — but not profitably
-  yet.** `swiglu_fuse` is a real nonlinear-adjacent transform (the two
-  projections feed *different* nonlinear consumers, so the graph cannot
-  collapse — it can only *restructure* the weights), discovered by the
-  product rule rather than by linear algebra. What remains undemonstrated:
-  a case where the fused form is unambiguously profitable on the measured
-  backend, and deeper composed wins (e.g. RMSNorm's per-row scale commuting
-  through a following projection via `naturality_scalar` while the reduction
-  reassociates above it). Those rules exist; they do not yet compose into
-  a win.
-* **The cost model now knows about compile time and sharing.** Extraction
-  charges param-only classes at 0 (they fold at compile time) and charges
-  shared e-classes once (the fused GEMM feeds two chunk parents but runs
-  once). It does **not** yet model memory layout — it cannot see that a
-  strided `chunk` view slows the downstream elementwise kernel, which is
-  why the SwiGLU fuse is predicted as a small win and measured as a wash
-  on CPU. A layout/memory-traffic-aware cost model is the obvious next
-  improvement.
-* **Two soundness bugs were found and fixed in this work**, which is the
+* **The nonlinear barrier is breached — but not profitably on this
+  backend.** Three product-structure transforms now work end to end:
+  `swiglu_fuse` (merged gate/up GEMM), `qkv_fuse` (one GEMM feeding three
+  `chunk` projections into SDPA — uses *attribute metavariables* so the
+  pattern binds concrete reshape shapes and the SDPA scale), and the
+  `NormLinear` fold (channel gain into the weight, per-row `rms` hoisted
+  out — two different naturality laws composing). All three verify
+  bit-exactly or within float noise. All three measure ~0.9–1.06× on CPU
+  for the reason in the pattern section: same-FLOP restructuring wins are
+  GPU-regime wins. What remains undemonstrated: a composed *nonlinear*
+  win that beats Inductor on the measured backend.
+* **The cost model now knows about compile time, sharing, and layout.**
+  Extraction charges param-only classes at 0 and shared e-classes once.
+  `roofline_cost` estimates per-op `max(flops/peak_flops, bytes/peak_bw)
+  + launch`, with strided-view penalties — it *can* see that a `chunk`
+  view slows a downstream kernel. Its constants
+  (`_PEAK_FLOPS`, `_PEAK_BW`, `_LAUNCH_S` in `catopt/cost.py`) are
+  order-of-magnitude, not calibrated to this machine; it is a modelling
+  tool for comparing candidates, not a predictor of wall-clock.
+* **Inductor's intra-kernel fusion is the baseline to beat.** The
+  NormLinear experiment is the clearest signal: every graph-level folded
+  variant loses (38–47 ms vs Inductor's 38 ms) because Inductor already
+  fuses `x·rms·wn` into the GEMM's input read. Graph restructuring cannot
+  promise a bandwidth win that backend kernel fusion already delivers.
+* **Three soundness bugs were found and fixed in this work**, which is the
   strongest evidence the instrument is trustworthy: (1) the matcher did not
   enforce repeated metavariables as "same e-class", so `x@W1 + y@W2` would
   have matched a pattern requiring `x@W1 + x@W2` and emitted a false proof;
   (2) `cost._infer_op_shape` took `shapes[0]` instead of the broadcast shape,
-  which had fabricated a spurious 1.98× RMSNorm "win". Both are regression-tested.
+  which had fabricated a spurious 1.98× RMSNorm "win"; (3) scale-naturality
+  rules originally bound metavariables to *any* tensor, producing a
+  well-typed but semantically wrong program (diff 9.83) until `check`
+  predicates were added. All three are regression-tested.
 
 ### Reproduce
 
 ```bash
-python main.py                     # associativity, SwiGLU fusion, RMSNorm, naturality
+python main.py                     # associativity, parallel merges, fused
+                                   # projections (SwiGLU/QKV/norm), naturality
 python main.py --large-batch 4096  # measured large-batch timing
-python -m pytest tests/ -q         # 65 tests
+python -m pytest tests/ -q         # 71 tests
+python bench_gpu.py                # same table on CUDA (needs unblocked driver)
 ```
 
 ---

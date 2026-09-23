@@ -160,6 +160,25 @@ class DeepParallel(nn.Module):
         return self.W3(self.W1(x) + self.W2(x))
 
 
+class NormLinear(nn.Module):
+    """RMSNorm followed by a linear projection — the norm-folding target.
+
+    ``x * rms * w_norm @ W.T`` has two commutable diagonals:
+    the per-row scale ``rms`` (left diagonal — hoists out) and the
+    per-channel gain ``w_norm`` (right diagonal — folds into W).
+    """
+
+    def __init__(self, dim: int, out: int | None = None, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.norm_weight = nn.Parameter(torch.ones(dim) * 0.5 + 1.0)
+        self.proj = nn.Linear(dim, out or dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.proj(x * rms * self.norm_weight)
+
+
 class MatrixChain(nn.Module):
     """Three sequential matmuls — demonstrates associativity optimization.
 

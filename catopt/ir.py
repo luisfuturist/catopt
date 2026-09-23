@@ -228,6 +228,13 @@ op_def("chunk", 1, 1,
        law="Projection pi_i of a paired output; a zero-cost view like "
            "transpose/reshape.")
 
+# Attention
+op_def("contiguous", 1, 1,
+       law="Memory-layout coercion; semantically the identity map.")
+op_def("sdpa", 3, 1,
+       law="Scaled dot-product attention; a fused nonlinear kernel "
+           "whose three arguments are projections of the same source.")
+
 
 # ---------------------------------------------------------------------------
 #  IR  — top-level program (a single term with free variables)

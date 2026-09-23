@@ -174,6 +174,51 @@ def demo_parallel_projections(batch: int = 4096, verbose: bool = True) -> None:
               f"runtime params {[n for n, _ in lowered.named_parameters()]}")
 
 
+def demo_fused_projections(verbose: bool = True) -> None:
+    """Product-structure results: fused SwiGLU gate/up, fused QKV, norm fold.
+
+    These are parameter-restructuring transforms Inductor cannot express:
+    pairing projections of a shared input via the product universal
+    property <f,g> = (f x g) . Delta.
+    """
+    from catopt.models import SwiGLU, AttentionBlock, NormLinear  # noqa: E402
+
+    torch.manual_seed(0)
+    if verbose:
+        print(f"\n{'='*70}")
+        print("  Case: product structure — fused projections")
+        print(f"{'='*70}")
+
+    cases = [
+        ("SwiGLU gate/up", SwiGLU(64, hidden_mult=2), torch.randn(128, 64)),
+        ("Attention QKV", AttentionBlock(64, n_heads=4), torch.randn(2, 8, 64)),
+        ("NormLinear fold", NormLinear(64, 64), torch.randn(128, 8, 64)),
+    ]
+    for name, model, x in cases:
+        ir, src = export_to_ir(model, x)
+        eg = EGraph()
+        eid = eg.add_term(ir.root)
+        eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+               max_iterations=30, max_nodes=50000)
+        best = eg.extract_best(eid, launch_aware_cost)
+        low = ir_to_torch_module(IR(
+            root=best, inputs=ir.inputs,
+            input_names=ir.input_names, params=ir.params,
+        ), param_values=src)
+        model.eval(); low.eval()
+        with torch.no_grad():
+            d = (model(x.clone()) - low(x.clone())).abs().max().item()
+        n_fused = len([p for p in low._param_map if p.startswith("fused_")])
+        n_chunks = op_repr(best).count("(chunk")
+        ok = "✓" if d < 1e-4 else "✗"
+        if verbose:
+            print(f"\n  {name}:")
+            print(f"    IR:    {op_repr(ir.root)[:100]}")
+            print(f"    best:  {op_repr(best)[:100]}")
+            print(f"    {ok} diff {d:.2e} | fused params: {n_fused}"
+                  f" | chunk views: {n_chunks}")
+
+
 def demo_naturality(batch: int = 64, verbose: bool = True) -> None:
     """Demonstrate naturality of scalar multiplication w.r.t. matmul.
 
@@ -292,6 +337,7 @@ def main() -> None:
         demo_large_batch(batch=args.large_batch)
     demo_swiglu_rmsnorm()
     demo_parallel_projections(batch=max(args.batch, 4096))
+    demo_fused_projections()
     demo_naturality(batch=64)
 
     if args.bench:

@@ -74,11 +74,19 @@ class Rewrite:
     """A rewrite rule: lhs -> rhs (both are pattern terms).
 
     Patterns are terms where leaf variables are *strings* (metavariables).
+
+    ``check`` is an optional side condition: a predicate over the
+    *resolved* binding ``{metavar: representative_term}``.  Rules that
+    are only valid for particular SHAPES (e.g. a scale that must be
+    per-row or per-channel) declare it here — the matcher alone cannot
+    see tensor types, and firing without the check produces well-typed
+    but semantically wrong terms.
     """
     name: str
     lhs: Any
     rhs: Any
     law: str = ""
+    check: Any = None  # Callable[[dict[str, Any]], bool] | None
 
     def __repr__(self) -> str:
         return f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
@@ -213,16 +221,49 @@ class EGraph:
         if isinstance(pattern, Op):
             attr_t = _pattern_attrs(pattern)
             for node in eclass.nodes:
-                if node.op != pattern.op or node.attrs != attr_t:
+                if node.op != pattern.op:
                     continue
                 if len(node.children) != len(pattern.args):
+                    continue
+                # Attribute matching: every pattern attr key must exist in
+                # the node with an equal value — UNLESS the pattern value
+                # is a string, which makes it an attribute metavariable
+                # bound into the substitution under a "$attr:" key.
+                # This is how shape-polymorphic rules match e.g.
+                # view(t, shape=S) for any concrete S.
+                node_attrs = dict(node.attrs)
+                if set(node_attrs) != {k for k, _ in attr_t}:
+                    continue
+                attr_substs: list[dict[str, Any]] = [dict(subst)]
+                attr_ok = True
+                for k, pv in attr_t:
+                    nv = node_attrs[k]
+                    if isinstance(pv, str):
+                        key = "$attr:" + pv
+                        nxt: list[dict[str, Any]] = []
+                        for cs in attr_substs:
+                            if key in cs:
+                                if cs[key] == nv:
+                                    nxt.append(cs)
+                            else:
+                                cc = dict(cs)
+                                cc[key] = nv
+                                nxt.append(cc)
+                        attr_substs = nxt
+                    elif nv != pv:
+                        attr_ok = False
+                        break
+                    if not attr_substs:
+                        attr_ok = False
+                        break
+                if not attr_ok:
                     continue
                 # Thread the incoming bindings so that a metavariable which
                 # appears at several positions (e.g. the shared input x in
                 # x@W1 + x@W2) is checked for consistency everywhere.
                 # Starting from {} would silently rebind it, turning an
                 # unSound rewrite into an apparent match.
-                child_substs: list[dict[str, int]] = [dict(subst)]
+                child_substs: list[dict[str, Any]] = attr_substs
                 ok = True
                 for i, pat_arg in enumerate(pattern.args):
                     new_substs: list[dict[str, int]] = []
@@ -276,9 +317,46 @@ class EGraph:
         if isinstance(pattern, Op):
             child_eids = tuple(self._instantiate(a, subst) for a in pattern.args)
             attr_t = _pattern_attrs(pattern)
-            return self.add_enode(pattern.op, child_eids, dict(attr_t))
+            # Attribute metavariables (string values) resolve through the
+            # substitution's "$attr:" namespace.
+            attrs = {}
+            for k, v in attr_t:
+                if isinstance(v, str):
+                    attrs[k] = subst.get("$attr:" + v, v)
+                else:
+                    attrs[k] = v
+            return self.add_enode(pattern.op, child_eids, attrs)
         else:
             return self.add_leaf(repr(pattern))
+
+    def any_term(self, eid: int, _seen: frozenset = frozenset()) -> Any:
+        """Return any acyclic representative term of an e-class.
+
+        Prefers leaf nodes; used to resolve metavariable bindings to
+        concrete terms for rewrite side conditions (shape checks).
+        """
+        eid = self.find(eid)
+        eclass = self._classes[eid]
+        for node in eclass.nodes:
+            if node.op == "leaf":
+                key = node.attrs[0][1] if node.attrs else "??"
+                return _LeafRegistry.decode(key)
+        for node in eclass.nodes:
+            args = []
+            ok = True
+            for c in node.children:
+                canon = self.find(c)
+                if canon == eid or canon in _seen:
+                    ok = False
+                    break
+                t = self.any_term(canon, _seen | {eid})
+                if t is None:
+                    ok = False
+                    break
+                args.append(t)
+            if ok:
+                return Op.make(node.op, *args, **dict(node.attrs))
+        return None
 
     def apply_rule(self, rule: Rewrite, root_eid: int) -> bool:
         """Apply a single rewrite rule across all e-classes."""
@@ -286,6 +364,16 @@ class EGraph:
         for eid in list(self._classes.keys()):
             eid = self.find(eid)
             for subst in self.matches(rule.lhs, eid):
+                if rule.check is not None:
+                    bound = {
+                        k: self.any_term(v)
+                        for k, v in subst.items()
+                        if not k.startswith("$attr:")
+                    }
+                    if any(v is None for v in bound.values()):
+                        continue
+                    if not rule.check(bound):
+                        continue
                 rhs_eid = self._instantiate(rule.rhs, subst)
                 if self.union(eid, rhs_eid):
                     changed = True

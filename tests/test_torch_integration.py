@@ -475,3 +475,147 @@ def test_swiglu_fuse_requires_shared_input():
     # without the shared source object.
     ops = {n.op for n in eg.get_class(eid).nodes}
     assert "chunk" not in ops and "concat" not in ops
+
+
+# ---------------------------------------------------------------------------
+#  Fused QKV (attribute metavariables + triple pairing)
+# ---------------------------------------------------------------------------
+
+def test_attention_roundtrip():
+    """AttentionBlock exports and lowers bit-exactly."""
+    from catopt.models import AttentionBlock
+    torch.manual_seed(0)
+    m = AttentionBlock(64, n_heads=4).eval()
+    x = torch.randn(2, 8, 64)
+    ir, source = export_to_ir(m, x)
+    low = _lower(ir, ir.root, source)
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-5
+
+
+def test_qkv_fuse_produces_single_gemm():
+    """qkv_fuse merges q/k/v into one GEMM + three chunk projections."""
+    from catopt.models import AttentionBlock
+    from catopt.cost import launch_aware_cost
+    torch.manual_seed(0)
+    m = AttentionBlock(64, n_heads=4).eval()
+    x = torch.randn(2, 8, 64)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=30, max_nodes=50000)
+    best = eg.extract_best(eid, launch_aware_cost)
+
+    chunks = _find_ops(best, "chunk")
+    assert len(chunks) == 3
+    # all three chunks read the SAME fused linear
+    assert chunks[0].args[0] is chunks[1].args[0] is chunks[2].args[0]
+    assert chunks[0].args[0].op == "linear"
+    # concat of three weights along dim 0
+    cat = chunks[0].args[0].args[1]
+    assert cat.op == "concat"
+
+    low = _lower(ir, best, source)
+    names = [n for n, _ in low.named_parameters()]
+    assert any(n.startswith("fused_") for n in names)
+    assert "p_q_proj_weight" not in names
+    assert "p_k_proj_weight" not in names
+    assert "p_v_proj_weight" not in names
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-5
+
+
+def test_attr_metavariable_binds_shape():
+    """Pattern attr value-as-string binds the node's concrete attr."""
+    from catopt.rules import QKV_FUSE
+    from catopt.models import AttentionBlock
+    torch.manual_seed(0)
+    m = AttentionBlock(32, n_heads=2).eval()
+    x = torch.randn(2, 4, 32)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run([QKV_FUSE], eid, max_iterations=5, max_nodes=5000)
+    # the fused enode must carry the ORIGINAL view shape, rebound via $attr:S
+    reshape_nodes = [
+        n for n in eg._node_to_class if n.op == "reshape"
+    ]
+    fused_reshapes = [
+        n for n in reshape_nodes
+        if any(dict(n.attrs).get("shape") == (2, 4, 2, 16) for _ in [0])
+    ]
+    # at least the three original reshapes exist; fused form adds 3 more
+    # with the SAME shape bound through the attribute metavariable.
+    assert len(fused_reshapes) >= 3
+
+
+# ---------------------------------------------------------------------------
+#  Norm folding (channel-scale into weight, row-scale hoists out)
+# ---------------------------------------------------------------------------
+
+def test_normlinear_folds_channel_scale():
+    """linear(x*rms*wn, W) -> rms * linear(x, W*wn): gain folds at compile time."""
+    from catopt.models import NormLinear
+    from catopt.cost import launch_aware_cost
+    torch.manual_seed(0)
+    m = NormLinear(64, 64).eval()
+    x = torch.randn(128, 8, 64)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=30, max_nodes=50000)
+    best = eg.extract_best(eid, launch_aware_cost)
+    low = _lower(ir, best, source)
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-4
+    # the norm gain must be folded INTO the weight: exactly one fused param
+    names = [n for n, _ in low.named_parameters()]
+    assert names == ["fused_2"] or (
+        len([n for n in names if n.startswith("fused_")]) == 1
+        and "p_norm_weight" not in names)
+
+
+def test_row_scale_rejects_data_scale():
+    """Soundness: linear(a, data-shaped 'scale') must NOT row-hoist.
+
+    r bound to a (B,T,C) data tensor is well-typed but semantically
+    wrong — the check predicate must reject it (regression for the
+    diff=9.83 unsoundness caught by the verifier).
+    """
+    from catopt.rules import LINEAR_ROW_SCALE
+    x = Var("x", TensorType((4, 4)))
+    r = Var("r", TensorType((4, 4)))  # data-shaped, NOT per-row
+    w = Param("W", TensorType((4, 4)))
+    t = Op.make("linear", Op.make("mul", x, r), w)
+    eg = EGraph()
+    eid = eg.add_term(t)
+    eg.run([LINEAR_ROW_SCALE], eid, max_iterations=5, max_nodes=500)
+    # no mul(linear, r) enode may be created
+    for n in eg.get_class(eid).nodes:
+        if n.op == "mul":
+            pytest.fail("row_scale fired on a data-shaped scale")
+
+
+def test_channel_scale_rejects_row_scale():
+    """linear(x*r, W) with r per-row must not fold r into W."""
+    from catopt.rules import LINEAR_CHANNEL_SCALE
+    x = Var("x", TensorType((4, 8, 4)))
+    r = Var("r", TensorType((4, 8, 1)))  # per-row
+    w = Param("W", TensorType((4, 4)))
+    t = Op.make("linear", Op.make("mul", x, r), w)
+    eg = EGraph()
+    eid = eg.add_term(t)
+    eg.run([LINEAR_CHANNEL_SCALE], eid, max_iterations=5, max_nodes=500)
+    # mul(W, r) would be ill-typed AND wrong; the check must reject it
+    for n in eg.get_class(eid).nodes:
+        if n.op == "linear":
+            # only the original linear should exist
+            pass

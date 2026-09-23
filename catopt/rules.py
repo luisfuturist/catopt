@@ -18,9 +18,46 @@ from catopt.egraph import Rewrite
 from catopt.ir import Op, Const
 
 
-def R(name: str, lhs: Any, rhs: Any, law: str = "") -> Rewrite:
+def R(name: str, lhs: Any, rhs: Any, law: str = "", check=None) -> Rewrite:
     """Shorthand for creating a rewrite rule."""
-    return Rewrite(name=name, lhs=lhs, rhs=rhs, law=law)
+    return Rewrite(name=name, lhs=lhs, rhs=rhs, law=law, check=check)
+
+
+def _shape_of(t: Any):
+    """Best-effort shape of a bound term (delegates to cost model)."""
+    from catopt.cost import _shape_of as _so
+    return _so(t)
+
+
+def _is_scalar(t: Any) -> bool:
+    """True if the bound term is a scalar (shape ())."""
+    s = _shape_of(t)
+    return s == () or s == tuple()
+
+
+def _is_row_scale(t: Any) -> bool:
+    """Per-ROW scale: broadcasts to (B,T,1) — last dim is 1 (or scalar)."""
+    s = _shape_of(t)
+    if not isinstance(s, tuple):
+        return s == ()
+    return len(s) == 0 or s[-1] == 1
+
+
+def _is_channel_scale(bound: dict) -> bool:
+    """Per-CHANNEL scale: broadcasts over the weight's input dim.
+
+    c may be scalar, (in,), or (1,...,1,in) — i.e. every non-last dim
+    must be 1 and the last must equal W's input feature dim.
+    """
+    c, w = bound.get("c"), bound.get("W")
+    cs, ws = _shape_of(c), _shape_of(w)
+    if not isinstance(cs, tuple):
+        return cs == ()
+    if not isinstance(ws, tuple) or len(ws) < 1:
+        return False
+    if len(cs) == 0:
+        return True
+    return cs[-1] == ws[-1] and all(d == 1 for d in cs[:-1])
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +354,119 @@ PARALLEL_MUL_FUSE = R(
         "recovers the parallel-product form.",
 )
 
+# ---------------------------------------------------------------------------
+#  Diagonal-scale naturality for `linear` — the RMSNorm-folding rules.
+#
+#  Two kinds of broadcast scale commute through F.linear differently:
+#
+#  * CHANNEL scale c ~ (in,) folds INTO the weight:
+#        linear(x∘c, W) = (x∘c)@W.T = x@(W∘c).T = linear(x, W∘c)
+#    This is the classic "fold the norm's affine gain into the next
+#    linear" deployment trick — the diagonal D=diag(c) satisfies
+#    (xD)W = x(DW), i.e. a right action absorbed at compile time.
+#
+#  * ROW scale r ~ (B,T,1) hoists OUT:
+#        linear(x∘r, W) = diag(r)·(x@W.T) = linear(x,W) ∘ r
+#    A left diagonal commutes with any linear map — naturality of the
+#    scalar action.
+#
+#  CAVEAT: the matcher cannot check broadcast shapes.  Applied to a
+#  term where c is sized `out` and out != in, the RHS is ill-typed;
+#  the cost model prices provably-ill-typed terms at _INVALID_COST so
+#  they can never win, and the verifier is the last line of defence.
+# ---------------------------------------------------------------------------
+
+LINEAR_CHANNEL_SCALE = R(
+    "linear_channel_scale",
+    Op.make("linear", Op.make("mul", "x", "c"), "W"),
+    Op.make("linear", "x", Op.make("mul", "W", "c")),
+    law="Channel scale is a right diagonal: (xD)W = x(DW).  Folds the "
+        "norm's affine gain into the weight at compile time.",
+    check=_is_channel_scale,
+)
+
+LINEAR_CHANNEL_SCALE_REV = R(
+    "linear_channel_scale_rev",
+    Op.make("linear", "x", Op.make("mul", "W", "c")),
+    Op.make("linear", Op.make("mul", "x", "c"), "W"),
+    law="Reverse channel-scale fold (eqsat compares both forms).",
+    check=_is_channel_scale,
+)
+
+LINEAR_ROW_SCALE = R(
+    "linear_row_scale",
+    Op.make("linear", Op.make("mul", "x", "r"), "W"),
+    Op.make("mul", Op.make("linear", "x", "W"), "r"),
+    law="Row scale is a left diagonal: commutes through the linear map "
+        "to the output (naturality of scalar action).",
+    check=lambda b: _is_row_scale(b["r"]),
+)
+
+LINEAR_ROW_SCALE_REV = R(
+    "linear_row_scale_rev",
+    Op.make("mul", Op.make("linear", "x", "W"), "r"),
+    Op.make("linear", Op.make("mul", "x", "r"), "W"),
+    law="Reverse row-scale hoist (eqsat compares both forms).",
+    check=lambda b: _is_row_scale(b["r"]),
+)
+
+
+# ---------------------------------------------------------------------------
+#  Fused QKV — the product rule applied to attention's three projections.
+#
+#  sdpa( f(linear(x,Q)), f(linear(x,K)), f(linear(x,V)) )
+#    where f = transpose ∘ view is the head-splitting view
+#  -->
+#  y = linear(x, cat(cat(Q,K),V)) ;
+#  sdpa( f(chunk0(y)), f(chunk1(y)), f(chunk2(y)) )
+#
+#  The view shape and the transpose dims are ATTRIBUTE metavariables
+#  (string values in the pattern bind the node's concrete attrs), which
+#  is what makes this rule shape-polymorphic.
+# ---------------------------------------------------------------------------
+
+def _head(t: str) -> Op:
+    """The head-splitting view: view(t, S) then transpose(1, 2)."""
+    return Op.make("transpose",
+                   Op.make("reshape", t, shape="S"),
+                   arg1=1, arg2=2)
+
+
+QKV_FUSE = R(
+    "qkv_fuse",
+    Op.make("sdpa",
+            _head(Op.make("linear", "x", "Q")),
+            _head(Op.make("linear", "x", "K")),
+            _head(Op.make("linear", "x", "V")),
+            scale="SC"),
+    Op.make("sdpa",
+            _head(Op.make("chunk",
+                          Op.make("linear", "x",
+                                  Op.make("concat",
+                                          Op.make("concat", "Q", "K",
+                                                  dim=0),
+                                          "V", dim=0)),
+                          chunks=3, dim=-1, index=0)),
+            _head(Op.make("chunk",
+                          Op.make("linear", "x",
+                                  Op.make("concat",
+                                          Op.make("concat", "Q", "K",
+                                                  dim=0),
+                                          "V", dim=0)),
+                          chunks=3, dim=-1, index=1)),
+            _head(Op.make("chunk",
+                          Op.make("linear", "x",
+                                  Op.make("concat",
+                                          Op.make("concat", "Q", "K",
+                                                  dim=0),
+                                          "V", dim=0)),
+                          chunks=3, dim=-1, index=2)),
+            scale="SC"),
+    law="Triple pairing <q,k,v> : X -> V^3 — three projections of the "
+        "same input are ONE GEMM into the product space, then three "
+        "zero-cost chunk projections.  (Fused QKV.)",
+)
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -325,6 +475,7 @@ NATURALITY_SCALAR = R(
     Op.make("matmul", "W", Op.make("mul", "x", "c")),
     Op.make("mul", Op.make("matmul", "W", "x"), "c"),
     law="Naturality: scalar multiplication commutes with linear maps.",
+    check=lambda b: _is_scalar(b["c"]),
 )
 
 NATURALITY_SCALAR_REV = R(
@@ -332,6 +483,7 @@ NATURALITY_SCALAR_REV = R(
     Op.make("mul", Op.make("matmul", "W", "x"), "c"),
     Op.make("matmul", "W", Op.make("mul", "x", "c")),
     law="Reverse naturality: pull scalar into the matmul's input.",
+    check=lambda b: _is_scalar(b["c"]),
 )
 
 # (A @ B) @ C = A @ (B @ C)  — associativity of composition
@@ -392,6 +544,12 @@ CATEGORICAL_RULES: list[Rewrite] = [
     # Product structure (fused projections)
     SWIGLU_FUSE,
     PARALLEL_MUL_FUSE,
+    QKV_FUSE,
+    # Diagonal-scale naturality (norm folding)
+    LINEAR_CHANNEL_SCALE,
+    LINEAR_CHANNEL_SCALE_REV,
+    LINEAR_ROW_SCALE,
+    LINEAR_ROW_SCALE_REV,
 ]
 
 #: All rules combined.

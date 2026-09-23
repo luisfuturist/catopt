@@ -32,6 +32,9 @@ _ATEN_TO_IR: dict[str, str] = {
     "view": "reshape",
     "amax": "max",
     "matmul.default": "matmul",
+    "contiguous": "contiguous",
+    "clone": "contiguous",
+    "scaled_dot_product_attention": "sdpa",
 }
 
 #: ATen overload-specific names (e.g. 'mul.Tensor') that do not survive
@@ -52,7 +55,10 @@ _IR_TO_TORCH_EXTRA: dict[str, str] = {
     "neg.default": "neg",
     "transpose.int": "transpose",
     "reshape.default": "reshape",
+    "view.default": "reshape",
+    "clone.default": "contiguous",
     "amax.default": "max",
+    "scaled_dot_product_attention.default": "sdpa",
 }
 
 
@@ -181,8 +187,12 @@ def export_to_ir(model: torch.nn.Module, example_input: torch.Tensor) -> IR:
                 elif isinstance(arg_node, str):
                     continue
                 elif isinstance(arg_node, (list, tuple)):
-                    # e.g. dim=[-1] lists for reductions
-                    attrs["dim"] = tuple(arg_node)
+                    # e.g. dim=[-1] lists for reductions; for view/reshape
+                    # the list is the target SHAPE, not a dim.
+                    if ir_op == "reshape":
+                        attrs["shape"] = tuple(arg_node)
+                    else:
+                        attrs["dim"] = tuple(arg_node)
                 elif isinstance(arg_node, bool):
                     attrs["keepdim"] = arg_node
                 else:
@@ -248,9 +258,18 @@ _IR_TO_TORCH: dict[str, Any] = {
     "sum": lambda x, *a, **kw: x.sum(*_dim_args(a, kw)),
     "mean": lambda x, *a, **kw: x.mean(*_dim_args(a, kw)),
     "transpose": lambda x, *a, **kw: (
-        x.t() if x.dim() == 2 else x.transpose(-2, -1)
+        x.t() if x.dim() == 2 and "arg1" not in kw
+        else x.transpose(kw.get("arg1", -2), kw.get("arg2", -1))
     ),
-    "reshape": lambda x, *a, **kw: x.reshape(-1),
+    "reshape": lambda x, *a, **kw: x.reshape(
+        tuple(kw["shape"]) if "shape" in kw else (-1,)
+    ),
+    "contiguous": lambda x, *a, **kw: x.contiguous(),
+    "sdpa": lambda q, k, v, **kw: torch.nn.functional
+        .scaled_dot_product_attention(
+            q, k, v,
+            **{kk: vv for kk, vv in kw.items() if vv is not None},
+        ),
     "broadcast": lambda x, *a, **kw: x,
     "linear": lambda x, w, *a, **kw: torch.nn.functional.linear(
         x, w, (a[0] if a else kw.get("bias"))
