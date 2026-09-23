@@ -14,11 +14,16 @@ Covers:
 import torch
 import pytest
 
+from catopt.calibrate import (
+    TargetProfile, save_profile, PROFILE_DIR_ENV,
+)
 from catopt.egraph import EGraph, verify_certificate
 from catopt.ir import IR, Op, Var, TensorType, op_repr
 from catopt.models.ssm import DiagonalSSM
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.cost import flops_cost, launch_aware_cost, roofline_cost
+from catopt.cost import (
+    flops_cost, launch_aware_cost, roofline_cost, roofline_cost_for,
+)
 from catopt import rules as R
 from catopt.om import OM_LAWS
 from catopt.regime import (
@@ -306,6 +311,146 @@ class TestDegradation:
         assert collapsed
         assert set(collapsed[0][1]) == {"a", "b"}
         assert "collapsed" in frontier.report()
+
+
+# ---------------------------------------------------------------------------
+# target profiles (catopt.calibrate) wired into regimes
+# ---------------------------------------------------------------------------
+
+# Toy profiles spanning the roofline space.  GPUISH is a fat discrete
+# GPU; CPUISH a modest host; EDGE_SRAM a compute-starved accelerator
+# with huge on-package bandwidth (the corner where the om tree's extra
+# FLOPs outweigh the dense form's memory traffic).
+GPUISH = TargetProfile("gpu-ish", tflops=100.0, gbps=2000.0,
+                       launch_us=2.0, device="cuda:0", measured_at="t")
+CPUISH = TargetProfile("cpu-ish", tflops=0.2, gbps=20.0,
+                       launch_us=30.0, device="cpu", measured_at="t")
+EDGE_SRAM = TargetProfile("edge-sram", tflops=0.05, gbps=200.0,
+                          launch_us=10.0, device="cpu", measured_at="t")
+
+
+def _profile_terms():
+    """A compute-bound term and a memory-bound one."""
+    x = Var("x", TensorType((256, 256)))
+    w = Var("w", TensorType((256, 256)))
+    a = Var("a", TensorType((512, 512)))
+    b = Var("b", TensorType((512, 512)))
+    return Op.make("matmul", x, w), Op.make("add", a, b)
+
+
+class TestProfiles:
+    def test_profile_wires_cost_fn(self):
+        r = Regime("p", profile=GPUISH)
+        fn = roofline_cost_for(GPUISH)
+        assert r.profile is GPUISH
+        for t in _profile_terms():
+            assert r.cost_fn(t) == pytest.approx(fn(t))
+        # and the constants actually differ from the built-in default
+        mm, _ = _profile_terms()
+        assert r.cost_fn(mm) != pytest.approx(roofline_cost(mm))
+
+    def test_explicit_cost_fn_overrides_profile(self):
+        r = Regime("p", profile=GPUISH, cost_fn=flops_cost)
+        assert r.cost_fn is flops_cost
+        assert r.profile is GPUISH            # kept for provenance
+        # no profile → unchanged behaviour
+        assert Regime("q").cost_fn is None
+        r2 = Regime("q", extract_fn=EGraph.extract_min_depth)
+        assert r2.cost_fn is None and r2.profile is None
+
+    def test_profile_dict_spec(self):
+        spec = {"tflops": 100.0, "gbps": 2000.0, "launch_us": 2.0}
+        r = Regime("p", profile=spec)
+        fn = roofline_cost_for(spec)
+        mm, ew = _profile_terms()
+        assert r.cost_fn(mm) == pytest.approx(fn(mm))
+        assert r.cost_fn(ew) == pytest.approx(fn(ew))
+
+    def test_profile_by_name_loads(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(PROFILE_DIR_ENV, str(tmp_path))
+        save_profile(EDGE_SRAM)
+        r = Regime("p", profile="edge-sram")
+        assert r.profile == EDGE_SRAM
+        mm, _ = _profile_terms()
+        assert r.cost_fn(mm) == pytest.approx(
+            roofline_cost_for(EDGE_SRAM)(mm))
+        with pytest.raises(FileNotFoundError):
+            Regime("q", profile="no-such-target")
+
+    def test_profiles_flip_extraction_attention(self):
+        """Same e-graph, two targets, two different served members.
+
+        Chunked attention: the compute-starved EDGE_SRAM profile prices
+        the om tree's extra FLOPs above the dense form's memory traffic
+        and picks the raw ``matmul(softmax(matmul))``; the GPU profile
+        does the reverse and picks the ``om_apply`` tree.
+        """
+        ir, _inputs, eg, root = _chunked_attention()
+        frontier = regime_frontier(eg, root, [
+            Regime("edge", profile=EDGE_SRAM, executor="generic"),
+            Regime("gpu", profile=GPUISH, executor="om_batched"),
+        ], ir=ir)
+        edge, gpu = frontier["edge"], frontier["gpu"]
+        assert edge.term.op == "matmul"            # dense form
+        assert is_om_apply_term(gpu.term)          # lifted om tree
+        assert edge.signature != gpu.signature
+        # sanity: each choice is exactly what direct extraction under
+        # that profile's roofline yields
+        assert op_repr(edge.term) == op_repr(
+            eg.extract_best(root, roofline_cost_for(EDGE_SRAM)))
+        assert op_repr(gpu.term) == op_repr(
+            eg.extract_best(root, roofline_cost_for(GPUISH)))
+
+    def test_profiles_flip_ssm_member(self, ssm):
+        """CPU-ish vs GPU-ish profiles pick different applyd balances."""
+        _m, _x, ir, _src, eg, root, _st = ssm
+        frontier = regime_frontier(eg, root, [
+            Regime("cpu", profile=CPUISH, executor="scan"),
+            Regime("gpu", profile=GPUISH, executor="scan"),
+        ], ir=ir)
+        cpu, gpu = frontier["cpu"], frontier["gpu"]
+        assert is_scan_apply_term(cpu.term)
+        assert is_scan_apply_term(gpu.term)
+        # different members of the same e-class: different amounts of
+        # affd_compose reassociation are worthwhile per target
+        assert op_repr(cpu.term) != op_repr(gpu.term)
+        assert op_repr(cpu.term) == op_repr(
+            eg.extract_best(root, roofline_cost_for(CPUISH)))
+        assert op_repr(gpu.term) == op_repr(
+            eg.extract_best(root, roofline_cost_for(GPUISH)))
+
+    def test_frontier_profiles_kwarg(self):
+        ir, _inputs, eg, root = _chunked_attention()
+        frontier = regime_frontier(eg, root, {
+            # dict spec without cost_fn: profile supplies the model
+            "edge": {"executor": "generic"},
+            # explicit profile on the Regime beats the map entry
+            "gpu": Regime("gpu", profile=GPUISH, executor="generic"),
+        }, ir=ir, profiles={"edge": EDGE_SRAM, "gpu": EDGE_SRAM})
+        edge, gpu = frontier["edge"], frontier["gpu"]
+        assert edge.term.op == "matmul"            # EDGE_SRAM attached
+        reg_by_name = {r.name: r for r in frontier.regimes}
+        assert reg_by_name["edge"].profile == EDGE_SRAM
+        assert reg_by_name["gpu"].profile is GPUISH   # not overridden
+
+    def test_regime_dispatch_calibrate_profile(self):
+        """calibrate=<profile> fills profile-less regimes, no measuring."""
+        model, x, ir, _src, _eg, _root, _st = _ssm_fixture()
+        disp = regime_dispatch(model, x, regimes=[
+            Regime("roof"),                      # no cost model at all
+            Regime("work", cost_fn=flops_cost, executor="generic"),
+        ], calibrate=GPUISH)
+        regs = {r.name: r for r in disp.frontier.regimes}
+        assert regs["roof"].profile is GPUISH
+        assert regs["work"].profile is GPUISH    # provenance recorded
+        assert regs["work"].cost_fn is flops_cost  # explicit still wins
+        # the filled profile drove "roof"'s extraction: on the SSM the
+        # roofline objective lifts the recurrence into applyd scan form
+        roof = disp.frontier["roof"]
+        assert is_scan_apply_term(roof.term)
+        assert roof.executor == "scan"           # auto-resolved
+        for name, v in disp.verification.items():
+            assert v["ok"], f"{name}: {v}"
 
 
 # ---------------------------------------------------------------------------

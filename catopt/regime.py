@@ -38,22 +38,41 @@ Or directly on a saturated e-graph::
 
     frontier = regime_frontier(eg, root_eid, regimes, ir=ir)
     disp = frontier.build(param_values=state)
+
+Target profiles
+---------------
+A regime can carry a *target profile* — measured hardware constants
+from :mod:`catopt.calibrate` — which defaults its cost model to
+``roofline_cost_for(profile)``::
+
+    from catopt.calibrate import calibrate, load_profile
+
+    prof = calibrate()                       # or load_profile("rtx2050")
+    disp = regime_dispatch(model, x, regimes=[
+        Regime("prefill", profile=prof, executor="om_batched"),
+    ])
+
+    # or measure the current device once and fill every
+    # profile-less regime with it:
+    disp = regime_dispatch(model, x, calibrate=True)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from catopt.egraph import EGraph, ENode
 from catopt.ir import IR, Op, Var, Param, Const, op_repr
+from catopt.calibrate import TargetProfile, load_profile
 from catopt.cost import (
     flops_cost,
     launch_aware_cost,
     roofline_cost,
+    roofline_cost_for,
     dag_cost,
     _shape_of,
     _numel,
@@ -280,6 +299,16 @@ class Regime:
     the cost-best term is served under the declared executor — which
     runs its serial fallback — and the choice is flagged
     ``degraded=True``.
+
+    ``profile``: a :class:`catopt.calibrate.TargetProfile`, a dict with
+    ``tflops``/``gbps``/``launch_us`` keys, or a profile name loadable
+    via ``catopt.calibrate.load_profile`` (resolved eagerly at
+    construction).  When set and ``cost_fn`` is ``None``, the cost
+    model defaults to ``roofline_cost_for(profile)`` — an explicit
+    ``cost_fn`` always wins, so ``profile`` then only records which
+    target the regime prices against (and still feeds cost accounting
+    when ``extract_fn`` drives extraction).  ``profile=None`` is the
+    old behaviour.
     """
 
     name: str
@@ -288,6 +317,17 @@ class Regime:
     executor: str = "auto"
     prefer_executor: bool = True
     note: str = ""
+    profile: Optional[Union[TargetProfile, dict, str]] = None
+
+    def __post_init__(self) -> None:
+        if self.profile is None:
+            return
+        prof = self.profile
+        if isinstance(prof, str):
+            prof = load_profile(prof)
+            object.__setattr__(self, "profile", prof)
+        if self.cost_fn is None:
+            object.__setattr__(self, "cost_fn", roofline_cost_for(prof))
 
 
 def default_regimes() -> List[Regime]:
@@ -333,6 +373,33 @@ def _as_regime(name: str, spec: Any) -> Regime:
         return Regime(name, cost_fn=cost_fn, executor=executor,
                       prefer_executor=prefer)
     raise TypeError(f"cannot interpret regime spec for {name!r}: {spec!r}")
+
+
+def _normalise_regimes(regimes: Any) -> List[Regime]:
+    """Normalise the ``regimes`` argument to a list of :class:`Regime`."""
+    if regimes is None:
+        return default_regimes()
+    if isinstance(regimes, dict):
+        return [_as_regime(n, s) for n, s in regimes.items()]
+    return list(regimes)
+
+
+def _attach_profiles(regime_list: List[Regime],
+                     profiles: Optional[Dict[str, Any]]) -> List[Regime]:
+    """Attach ``profiles[regime_name]`` to regimes not carrying one.
+
+    ``profiles`` is keyed by *regime* name; each value is a profile spec
+    (``TargetProfile``, dict, or persisted profile name).  A regime with
+    an explicit ``profile=`` keeps it — the mapping only fills gaps.
+    """
+    if not profiles:
+        return regime_list
+    out: List[Regime] = []
+    for r in regime_list:
+        if r.profile is None and r.name in profiles:
+            r = replace(r, profile=profiles[r.name])
+        out.append(r)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -635,23 +702,25 @@ def regime_frontier(eg: EGraph, root_eid: int,
                     regimes: Any = None, *,
                     ir: Optional[IR] = None,
                     src_term: Optional[Any] = None,
-                    top_k: int = 4) -> RegimeFrontier:
+                    top_k: int = 4,
+                    profiles: Optional[Dict[str, Any]] = None
+                    ) -> RegimeFrontier:
     """Extract the best member per regime and pair it with an executor.
 
     ``regimes`` may be a list of :class:`Regime`, or a dict whose values
     are ``Regime``, a bare ``cost_fn``, ``(cost_fn, executor)`` tuples,
     or kwargs dicts.  ``None`` uses :func:`default_regimes`.
 
+    ``profiles`` is an optional ``{regime_name: profile_spec}`` map:
+    each named regime that doesn't already carry a ``profile=`` gets it
+    attached (a ``TargetProfile``, a constants dict, or a persisted
+    profile name).  Profiles otherwise ride on the ``Regime`` itself.
+
     ``ir`` (the exported source ``IR``) is needed to :meth:`build` a
     dispatch; ``src_term`` enables :meth:`certificate` — both default to
     ``ir.root`` when ``ir`` is given.
     """
-    if regimes is None:
-        regime_list = default_regimes()
-    elif isinstance(regimes, dict):
-        regime_list = [_as_regime(n, s) for n, s in regimes.items()]
-    else:
-        regime_list = list(regimes)
+    regime_list = _attach_profiles(_normalise_regimes(regimes), profiles)
     if src_term is None and ir is not None:
         src_term = ir.root
 
@@ -966,19 +1035,44 @@ def regime_dispatch(model: nn.Module, example_input: Any,
                     max_nodes: int = 400_000,
                     default: Optional[str] = None,
                     verify: bool = True,
-                    atol: float = 1e-9) -> RegimeDispatch:
+                    atol: float = 1e-9,
+                    profiles: Optional[Dict[str, Any]] = None,
+                    calibrate: Any = None) -> RegimeDispatch:
     """End-to-end: export → saturate → frontier → build → verify.
 
     Returns a :class:`RegimeDispatch` whose ``.frontier`` records every
     regime's choice.  With ``verify=True`` each form is checked against
     the model's own output on ``example_input`` (fp64 recommended).
+
+    ``profiles`` is a ``{regime_name: profile_spec}`` map forwarded to
+    :func:`regime_frontier` — it fills ``profile`` on named regimes
+    that don't carry one.  ``calibrate`` is a convenience for "price
+    this model against the current device": ``calibrate=True`` calls
+    ``catopt.calibrate.calibrate()`` once and attaches the measured
+    profile to every regime still lacking one; a ``TargetProfile`` /
+    dict / persisted name does the same without measuring.  Since an
+    explicit ``cost_fn`` always wins over a profile, ``calibrate``
+    changes *extraction* only for regimes that declare no cost model —
+    elsewhere it is recorded for provenance.  ``calibrate=None`` (the
+    default) is the old behaviour.
     """
     args = (example_input if isinstance(example_input, tuple)
             else (example_input,))
     eg, root, ir, source, stats = build_egraph(
         model, example_input, rules=rules,
         max_iterations=max_iterations, max_nodes=max_nodes)
-    frontier = regime_frontier(eg, root, regimes, ir=ir,
+    regime_list = _attach_profiles(_normalise_regimes(regimes), profiles)
+    if calibrate:
+        pending = [r.name for r in regime_list if r.profile is None]
+        if pending:
+            if calibrate is True:
+                from catopt.calibrate import calibrate as _measure
+                prof: Any = _measure()
+            else:
+                prof = calibrate
+            regime_list = _attach_profiles(
+                regime_list, {n: prof for n in pending})
+    frontier = regime_frontier(eg, root, regime_list, ir=ir,
                                src_term=ir.root)
     disp = frontier.build(param_values=source, default=default)
     disp.saturation_stats = stats
