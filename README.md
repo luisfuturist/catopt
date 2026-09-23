@@ -118,7 +118,9 @@ configurable `truncation_level`:
   (rule + substitution); `certificate(src,dst)` reconstructs an ordered
   positional derivation and `verify_certificate` replays it on real
   terms — *derivational* equivalence, not numerical spot-checks.
-  ~4–10% overhead.
+  Non-local passes attach a **pointwise witness rule** per offer
+  (`union(witness=…)`), so even `trace_lift`'s constructed members
+  replay standalone under `strict=True`. ~4–10% overhead.
 - **Level 3 — lazy coherences.** `all_proofs`/`coherent_paths` enumerate
   *alternate derivations* between two terms on demand (bounded BFS over
   the term-rewriting space). Nothing is stored: coherence is a property
@@ -418,7 +420,7 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 354 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
+| `tests/` | 361 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
 
 ## Reproduce
 
