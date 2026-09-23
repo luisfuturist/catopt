@@ -280,9 +280,13 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   `om_step_qk` gives O(block) incremental state updates (~40× vs
   sdpa-recompute at 65k cache, CUDA-graph capturable). The fixed-query
   incremental mode does not model per-token decode.
-- **Masked chunked attention needs a "mask distributes over concat"
-  law** — causal masks carry positional offsets that the current IR
-  cannot yet express per-block; additive masks compose freely.
+- **Mask synthesis is out of IR scope** — `masked_fill`/`add`/`where`
+  distribute over concat with positional offsets (`OM_MASK_LAWS`:
+  block i's mask = `split` columns `[o_i, o_i+K_i)`), so causal chunked
+  attention verifies fp64-exact; but no `arange`/`tril` generators
+  exist, so masks must arrive materialized (buffer/param/computed —
+  all real export idioms), and `sdpa(is_causal=True)` has no mask
+  operand to slice.
 - **SDPA-fold coverage is bounded** — mul/div score scaling,
   masked_fill and additive masks, optional eval-mode dropout;
   `is_causal` requires the mask to be parameter-only and exactly
@@ -310,8 +314,9 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 - **More weight-preserving dualities**: RepVGG-style branch merging,
   conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
   architecture over the same parameters.
-- **Masked chunked attention**: "mask distributes over concat" with
-  positional offsets — the remaining gap to causal om.
+- **Mask synthesis + `is_causal` chunking**: `OM_MASK_LAWS` distribute
+  materialized masks over concat; generating masks from positions
+  (`arange`/`tril`) and chunking the `is_causal` flag remain open.
 - **Guarded-rule synthesis**: extend completion to `check`/`derive`
   rules so the om/attention lemma library derives itself.
 
@@ -331,7 +336,7 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 231 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming |
+| `tests/` | 249 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks |
 
 ## Reproduce
 
