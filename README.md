@@ -230,6 +230,18 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | **NormLinear b=256 T=64** | yes (3e-06) | 39.91 | 44.52 | 0.90× |
 | RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
 
+### Measured results (GPU, RTX 2050 — `bench_gpu.py`)
+
+| Program | Equivalent? | Inductor (ms) | CatOpt + Inductor (ms) | Speedup |
+| ------- | ----------: | ------------: | ---------------------: | ------: |
+| MatrixChain b=4096 | yes (8e-09) | 0.051 | 0.037 | **1.36×** |
+| ParallelLinear b=4096 | yes (3e-06) | 0.069 | 0.041 | **1.68×** |
+| **DeepParallel b=4096** | yes (2e-06) | 0.092 | 0.043 | **2.13×** |
+| **SwiGLU b=4096 (fused gate/up)** | yes (0.0) | 0.076 | 0.063 | **1.20×** |
+| **SwiGLU b=128** | yes (3e-07) | 0.072 | 0.065 | **1.10×** |
+| **Attention QKV b=64 T=256** | yes (0.0) | 0.107 | 0.097 | **1.10×** |
+| NormLinear b=256 | yes (7e-06) | 0.054 | 0.062 | 0.88× |
+
 Both paths go through `torch.compile`, so the comparison isolates the
 representation: same backend, same model, same weights — only the graph
 handed to TorchInductor differs.
@@ -282,24 +294,26 @@ GEMMs run. They divide cleanly:
 * **FLOP-reducing transforms pay on CPU.** MatrixChain, ParallelLinear,
   DeepParallel each shrink the actual GEMM FLOP count (6.3×, 2×, 2.9×) —
   those wins are backend-independent and measured at 1.6–6.2×, 2.24×, 3.02×.
-* **Same-FLOP restructuring is a wash on CPU.** SwiGLU gate/up fusion,
-  fused QKV, and norm folding keep FLOPs identical — their wins are fewer
-  kernel launches and better GEMM aspect ratios. On this CPU those gains
-  are offset by the strided `chunk` views they create, while Inductor's
-  *intra-kernel* fusion (prologue/epilogue scale application inside the
-  GEMM's own loop) already captures the memory-bandwidth benefit that
-  restructuring promised at graph level. Measured: 0.94–1.06×.
-* **The same-FLOP cases are precisely the ones that are standard practice
-  on GPU** — fused QKV and merged gate/up are in every fast inference
-  stack *because* kernel launches dominate and Inductor still won't do
-  them. GPU numbers pending (driver currently blacklisted on this
-  machine; `bench_gpu.py` reproduces the table on CUDA).
+* **Same-FLOP restructuring is a wash on CPU but a win on GPU — the
+  predicted regime split, measured.** SwiGLU gate/up fusion and fused QKV
+  keep FLOPs identical; their wins are fewer kernel launches and better
+  GEMM aspect ratios. On CPU, strided `chunk` views offset the launch
+  savings (0.94–1.06×). On the RTX 2050 the same transforms measure
+  **1.10–1.20× over full Inductor** — exactly why every fast inference
+  stack hand-writes fused QKV and merged gate/up, and exactly the class
+  of transform Inductor cannot express because it requires creating a
+  *new parameter*.
+* **NormLinear is the controlled negative case on both backends** (0.88×
+  GPU, 0.90× CPU): Inductor already fuses `x·rms·wn` into the GEMM's
+  input read, so graph-level folding adds a materialized intermediate
+  for no benefit. The cost-model boundary is now measured, not assumed.
 
 So the honest claim today: **categorical semantics + equality saturation
-reliably *finds and formally verifies* parameter-restructuring transforms
-that TorchInductor cannot express — the verification caught four real
-unsoundnesses in this codebase alone. Whether each transform *pays* is a
-backend question, and the split above is the boundary.**
+finds and formally verifies parameter-restructuring transforms that
+TorchInductor cannot express — and on GPU, where launch overhead and
+GEMM efficiency dominate, the product-structure fusions are profitable:
+fused QKV 1.10×, fused SwiGLU 1.20×, all verified bit-exact or within
+float noise.**
 
 ### Honest reading of the numbers
 
@@ -348,10 +362,13 @@ backend question, and the split above is the boundary.**
   pattern binds concrete reshape shapes and the SDPA scale), and the
   `NormLinear` fold (channel gain into the weight, per-row `rms` hoisted
   out — two different naturality laws composing). All three verify
-  bit-exactly or within float noise. All three measure ~0.9–1.06× on CPU
-  for the reason in the pattern section: same-FLOP restructuring wins are
-  GPU-regime wins. What remains undemonstrated: a composed *nonlinear*
-  win that beats Inductor on the measured backend.
+  bit-exactly or within float noise. On GPU two of the three are
+  profitable (SwiGLU 1.20×, QKV 1.10×); the norm fold loses on both
+  backends because Inductor's intra-kernel prologue fusion already
+  captures its bandwidth win. What remains undemonstrated: a transform
+  that is *new to practitioners*, not just new to Inductor — fused QKV
+  and merged gate/up are textbook deployment tricks discovered
+  automatically, not novel optimizations.
 * **The cost model now knows about compile time, sharing, and layout.**
   Extraction charges param-only classes at 0 and shared e-classes once.
   `roofline_cost` estimates per-op `max(flops/peak_flops, bytes/peak_bw)
