@@ -620,6 +620,129 @@ GQA_ABSORB = R(
     check=_check_gqa_absorb,
 )
 
+
+# ---------------------------------------------------------------------------
+#  Softmax-attention fold — the flash-attention transform.
+#
+#  softmax(q @ k^T * s [+ mask | masked_fill(mask, -inf)]) @ v
+#      ==  sdpa(q, k, v, attn_mask=..., scale=s)
+#
+#  This is the *definition* of scaled_dot_product_attention, so the fold
+#  is sound for ANY mask term: additive masks pass straight through,
+#  boolean fill masks invert to keep-masks via logical_not.  Inductor
+#  fuses the softmax elementwise chain but (for the masked_fill form)
+#  never recognises the enclosing matmul pair as SDPA — the pattern
+#  spans a softmax nonlinearity and two matmuls.
+# ---------------------------------------------------------------------------
+
+_QK_SCORES = Op.make(
+    "matmul", "Q", Op.make("transpose", "K", arg1="TD1", arg2="TD2"))
+
+
+def _const_val(t):
+    return getattr(t, "value", None)
+
+
+def _check_score_transpose(bound) -> bool:
+    """k must be transposed on its last two dims — matmul(q, k^T)."""
+    ks = _shape_of(bound.get("K"))
+    d1, d2 = bound.get("$attr:TD1"), bound.get("$attr:TD2")
+    if not (isinstance(ks, tuple) and all(isinstance(x, int) for x in ks)
+            and isinstance(d1, int) and isinstance(d2, int)):
+        return False
+    nd = len(ks)
+    return {d1 % nd, d2 % nd} == {nd - 2, nd - 1}
+
+
+def _check_softmax_dim(bound) -> bool:
+    """softmax must be over the last dim (keys) of the score matrix."""
+    sd = bound.get("$attr:SD")
+    qs = _shape_of(bound.get("Q"))
+    if not (isinstance(sd, int) and isinstance(qs, tuple) and qs):
+        return False
+    return sd % len(qs) == len(qs) - 1
+
+
+def _scale_of(bound):
+    s = _const_val(bound.get("S"))
+    return float(s) if isinstance(s, (int, float)) else None
+
+
+def _check_sdpa_base(bound) -> bool:
+    return _check_score_transpose(bound) and _check_softmax_dim(bound)
+
+
+def _check_sdpa_scaled(bound) -> bool:
+    return _check_sdpa_base(bound) and _scale_of(bound) is not None
+
+
+def _check_sdpa_mf(bound) -> bool:
+    if not _check_sdpa_base(bound):
+        return False
+    f = _const_val(bound.get("F"))
+    return isinstance(f, (int, float)) and f < -1e30
+
+
+def _check_sdpa_mf_scaled(bound) -> bool:
+    return _check_sdpa_mf(bound) and _scale_of(bound) is not None
+
+
+def _derive_scale_mul(bound):
+    s = _scale_of(bound)
+    return {"$attr:SC": s} if s is not None else None
+
+
+def _derive_scale_div(bound):
+    s = _scale_of(bound)
+    return {"$attr:SC": 1.0 / s} if s is not None else None
+
+
+def _derive_scale_one(bound):
+    return {"$attr:SC": 1.0}
+
+
+def _make_sdpa_fold_rules() -> list:
+    """6 mask/scale forms × optional eval-mode dropout wrapper."""
+    out = []
+    scaled = (
+        ("mul", lambda: Op.make("mul", _QK_SCORES, "S"),
+         _check_sdpa_scaled, _check_sdpa_mf_scaled, _derive_scale_mul),
+        ("div", lambda: Op.make("div", _QK_SCORES, "S"),
+         _check_sdpa_scaled, _check_sdpa_mf_scaled, _derive_scale_div),
+        ("", lambda: _QK_SCORES,
+         _check_sdpa_base, _check_sdpa_mf, _derive_scale_one),
+    )
+    wraps = (
+        ("", lambda sm: sm),
+        ("_drop", lambda sm: Op.make("dropout", sm, arg1="DP", arg2="DT")),
+    )
+    for sname, scores, check_add, check_mf, derive in scaled:
+        for wname, wrap in wraps:
+            sm = lambda inner: wrap(
+                Op.make("softmax", inner, arg1="SD"))
+            out.append(R(
+                f"sdpa_fold_add{sname}{wname}",
+                Op.make("matmul", sm(Op.make("add", scores(), "M")), "V"),
+                Op.make("sdpa", "Q", "K", "V", "M", scale="SC"),
+                law="softmax(qk^T s + m) v is sdpa — the additive mask is "
+                    "the kernel's attn_mask argument.",
+                check=check_add, derive=derive))
+            out.append(R(
+                f"sdpa_fold_masked_fill{sname}{wname}",
+                Op.make("matmul",
+                        sm(Op.make("masked_fill", scores(), "MK", "F")),
+                        "V"),
+                Op.make("sdpa", "Q", "K", "V",
+                        Op.make("logical_not", "MK"), scale="SC"),
+                law="masked_fill(m, -inf) before softmax is a boolean "
+                    "attn_mask — logical_not turns the fill-mask into "
+                    "SDPA's keep-mask.",
+                check=check_mf, derive=derive))
+    return out
+
+
+SDPA_FOLD_RULES: list = _make_sdpa_fold_rules()
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -893,6 +1016,8 @@ CATEGORICAL_RULES: list[Rewrite] = [
     LINEAR_ROW_SCALE_REV,
     # Diagonal-map absorption (copy pushed inside the kernel)
     GQA_ABSORB,
+    # Softmax-attention fold (flash-attention transform)
+    *SDPA_FOLD_RULES,
 ]
 
 #: All rules combined.

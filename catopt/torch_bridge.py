@@ -76,6 +76,9 @@ _POSITIONAL_ATTRS: dict[str, dict[int, str]] = {
 _SCALAR_OPERAND_OPS: set[str] = {
     "pow", "mul", "div", "add", "sub", "rsub", "rmul", "rdiv",
     "clamp", "clamp_min", "clamp_max", "leaky_relu",
+    # masked_fill(x, mask, -inf) / eq(x, 0) — the scalar is a Const
+    # operand so rewrites can bind and check it.
+    "masked_fill", "eq", "ne", "lt", "le", "gt", "ge",
 }
 
 
@@ -156,6 +159,13 @@ def export_to_ir(
     inputs_to_params: dict[str, str] = {}
     try:
         inputs_to_params = dict(exported._graph_signature.inputs_to_parameters)
+    except Exception:
+        pass
+    # Buffers (e.g. nanoGPT's causal-mask `bias`) are placeholders too —
+    # they are constants, not user inputs: lift them like parameters.
+    try:
+        inputs_to_params.update(
+            exported._graph_signature.inputs_to_buffers)
     except Exception:
         pass
 
@@ -241,6 +251,8 @@ def export_to_ir(
                         attrs["shape"] = tuple(arg_node)
                     elif ir_op in ("expand", "repeat"):
                         attrs["shape"] = tuple(arg_node)
+                    elif ir_op in ("split", "chunk"):
+                        attrs["sizes"] = tuple(arg_node)
                     else:
                         attrs["dim"] = tuple(arg_node)
                 elif isinstance(arg_node, bool):
@@ -260,7 +272,16 @@ def export_to_ir(
                     attrs[k] = v
                 elif isinstance(v, list):
                     attrs[k] = tuple(v)
-            if args:
+            if (ir_op == "getitem" and args
+                    and isinstance(args[0], Op)
+                    and args[0].op in ("split", "chunk", "unbind")
+                    and isinstance(node.args[1], int)):
+                # getitem(split(t), i) — fold the index into the
+                # splitter so the op yields element i directly.
+                base = args[0]
+                ir_node = Op.make(base.op, *base.args,
+                                  **{**dict(base.attrs), "index": node.args[1]})
+            elif args:
                 ir_node = Op.make(ir_op, *args, **attrs)
             else:
                 ir_node = Op.make(ir_op, **attrs)
@@ -319,9 +340,10 @@ _IR_TO_TORCH: dict[str, Any] = {
         tuple(kw["shape"]) if "shape" in kw else (-1,)
     ),
     "contiguous": lambda x, *a, **kw: x.contiguous(),
-    "sdpa": lambda q, k, v, **kw: torch.nn.functional
+    "sdpa": lambda q, k, v, *a, **kw: torch.nn.functional
         .scaled_dot_product_attention(
             q, k, v,
+            **({"attn_mask": a[0]} if a else {}),
             **{("attn_mask" if kk == "arg3" else
                 "dropout_p" if kk == "arg4" else
                 "is_causal" if kk == "arg5" else
@@ -341,10 +363,10 @@ _IR_TO_TORCH: dict[str, Any] = {
     "concat": lambda *ts, **kw: torch.cat(
         list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))),
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
-        t, chunks, dim=dim
+        t, int(kw.get("arg1", chunks)), dim=int(kw.get("arg2", dim))
     )[index],
     "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
-        t, list(sizes), dim=dim
+        t, _split_sizes(sizes, kw), dim=int(kw.get("arg2", dim))
     )[index],
     # torch.export emits aten.dropout with train=False in eval mode —
     # the op is a semantic identity there.  This binding is only valid
@@ -356,7 +378,7 @@ _IR_TO_TORCH: dict[str, Any] = {
     "getitem": lambda t, **kw: t[kw.get("arg1", kw.get("index", 0))],
     "unbind": lambda t, *a, **kw: torch.unbind(
         t, dim=int(kw.get("dim", kw.get("arg1", -1)))
-    ),
+    )[int(kw.get("index", 0))],
     "stack": lambda *ts, **kw: torch.stack(
         list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))
     ),
@@ -385,7 +407,29 @@ _IR_TO_TORCH: dict[str, Any] = {
     "cos": torch.cos,
     "sin": torch.sin,
     "float": lambda x, *a, **kw: x.float(),
+    "alias": lambda x, *a, **kw: x,
+    "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
+        x, dim=int(kw.get("arg1", kw.get("dim", -1)))
+    ),
+    "masked_fill": lambda x, m, v, *a, **kw: x.masked_fill(m, v),
+    "eq": lambda x, y, *a, **kw: x == y,
+    "ne": lambda x, y, *a, **kw: x != y,
+    "lt": lambda x, y, *a, **kw: x < y,
+    "le": lambda x, y, *a, **kw: x <= y,
+    "gt": lambda x, y, *a, **kw: x > y,
+    "ge": lambda x, y, *a, **kw: x >= y,
+    "logical_not": lambda x, *a, **kw: torch.logical_not(x),
+    "where": lambda c, x, y, *a, **kw: torch.where(c, x, y),
 }
+
+
+def _split_sizes(sizes: Any, kw: dict):
+    """split(x, sizes_list) and split(x, int) both export as 'split':
+    a sizes tuple lands in 'sizes', an int chunk size in 'arg1'."""
+    sz = kw.get("sizes", sizes)
+    if isinstance(sz, (list, tuple)) and sz:
+        return list(sz)
+    return int(kw.get("arg1", sz if isinstance(sz, int) else 1))
 
 
 def _dim_args(args: tuple, kwargs: dict) -> tuple:

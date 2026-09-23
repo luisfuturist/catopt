@@ -12,6 +12,8 @@ where conventional compilers (TorchInductor) reportedly struggle.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -402,4 +404,59 @@ class RepeatKVAttention(nn.Module):
         v = _repeat_kv(v, self.n_rep).transpose(1, 2)
         o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return o.transpose(1, 2).reshape(b, t, -1)
+
+
+class EagerAttention(nn.Module):
+    """nanoGPT-style manual attention: masked_fill causal mask + softmax.
+
+    This is what flash attention replaced — the sdpa-fold rules must
+    discover the fused kernel form automatically.
+    """
+
+    def __init__(self, dim: int = 128, n_heads: int = 4,
+                 block_size: int = 64) -> None:
+        super().__init__()
+        self.h = n_heads
+        self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(block_size, block_size))
+                 .view(1, 1, block_size, block_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        q, k, v = self.c_attn(x).split(c, dim=2)
+        q = q.view(b, t, self.h, c // self.h).transpose(1, 2)
+        k = k.view(b, t, self.h, c // self.h).transpose(1, 2)
+        v = v.view(b, t, self.h, c // self.h).transpose(1, 2)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        return att @ v
+
+
+class AdditiveMaskAttention(nn.Module):
+    """HF-style eager attention: softmax(qk^T * s + additive_mask) @ v."""
+
+    def __init__(self, dim: int = 128, n_heads: int = 4,
+                 block_size: int = 64) -> None:
+        super().__init__()
+        self.h = n_heads
+        self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
+        neg = torch.full((block_size, block_size), float("-inf"))
+        self.register_buffer(
+            "mask", torch.tril(torch.zeros(block_size, block_size))
+                    .add(torch.triu(neg, diagonal=1))
+                    .view(1, 1, block_size, block_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        q, k, v = self.c_attn(x).split(c, dim=2)
+        q = q.view(b, t, self.h, c // self.h).transpose(1, 2)
+        k = k.view(b, t, self.h, c // self.h).transpose(1, 2)
+        v = v.view(b, t, self.h, c // self.h).transpose(1, 2)
+        att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(k.size(-1))
+        att = att + self.mask[:, :, :t, :t]
+        att = F.softmax(att, dim=-1)
+        return torch.matmul(att, v)
 

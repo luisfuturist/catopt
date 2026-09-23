@@ -999,6 +999,54 @@ def test_gqa_absorb_rejects_bad_repeat():
     assert _check_gqa_absorb(good) is True
 
 
+def test_sdpa_fold_masked_fill():
+    """nanoGPT-style masked_fill causal attention must fold to
+    sdpa(is_causal=True): the whole softmax-mask-attention chain
+    collapses into one fused kernel call."""
+    from catopt.models import EagerAttention
+    from catopt.optimize import optimize_model
+    from catopt.ir import op_repr
+
+    torch.manual_seed(0)
+    m = EagerAttention(dim=128, n_heads=4, block_size=64).eval()
+    x = torch.randn(1, 32, 128)
+    opt, info = optimize_model(m, x, ruleset="categorical",
+                               max_iterations=4, verbose=False)
+    with torch.no_grad():
+        diff = (m(x) - opt(x)).abs().max().item()
+    assert diff < 1e-4
+    root = op_repr(opt._root)
+    assert "sdpa" in root
+    assert info.get("causal_specialized")
+
+
+def test_sdpa_fold_additive_mask():
+    """HF-style additive causal mask must fold to sdpa(attn_mask=...)."""
+    from catopt.models import AdditiveMaskAttention
+    from catopt.optimize import optimize_model
+    from catopt.ir import op_repr
+
+    torch.manual_seed(0)
+    m = AdditiveMaskAttention(dim=128, n_heads=4, block_size=64).eval()
+    x = torch.randn(1, 32, 128)
+    opt, info = optimize_model(m, x, ruleset="categorical",
+                               max_iterations=4, verbose=False)
+    with torch.no_grad():
+        diff = (m(x) - opt(x)).abs().max().item()
+    assert diff < 1e-4
+    assert "sdpa" in op_repr(opt._root)
+
+
+def test_sdpa_fold_rejects_wrong_dim():
+    """softmax over a non-key dim is NOT attention — must not fold."""
+    from catopt.rules import _check_softmax_dim
+    from catopt.ir import Op, Var, TensorType
+
+    q = Var("q", TensorType((1, 4, 32, 16)))
+    bound = {"Q": q, "$attr:SD": 1}
+    assert not _check_softmax_dim(bound)
+
+
 def test_linear_attention_reassociation():
     """(Q K^T) V reassociates to Q (K^T V) — O(T^2 d) -> O(T d^2).
     Exact identity (verified in fp64); the cost model must pick it."""

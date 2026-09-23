@@ -28,6 +28,7 @@ semantically equivalent.
 | Transform family | Examples | GPU | CPU |
 |---|---|---|---|
 | **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
+| **Attention fold** (flash-attention transform) | `softmax(masked qk^T·s) @ v` → `sdpa(is_causal)` — nanoGPT eager path | **1.8–4.6×** eager; **1.1–2.5×** under Inductor | — |
 | **Asymptotic reassociation** | LinearAttention `(QK^T)V → Q(K^TV)`: O(T²d) → O(Td²) | **8.0×** at T=2048, d=64 | — |
 | **Diagonal absorption** | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | **1.12×** at T=512 | — |
 | **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound; **1.19× launch-bound toy**; 0.82–0.99× real llama2.c blocks | ~1.0× |
@@ -129,19 +130,22 @@ over projection signatures (linear, conv2d), with a compat cluster key
 per op (conv members must share stride/padding/dilation/groups and
 kernel dims; asymmetric out-channels supported).
 
-**Two nonlinear-boundary transforms landed.** (a) *Diagonal
-absorption*: `unsqueeze→expand→reshape` before SDPA is the copy map
-Δ (llama2.c's `repeat_kv`); the `gqa_absorb_repeat` rule pushes the
-duplication inside the kernel via `enable_gqa`, deleting the
-materialisation — discovered automatically on unmodified community
-code, 1.12× at T=512 (the saving scales with T). (b) *Linear-attention
-reassociation*: `(QK^T)V` → `Q(K^TV)` is the O(T²d) → O(Td²) identity
-the linear-transformer literature is built on — the e-graph finds it
-from associativity alone and the cost model picks it by shape:
-**8.0× at T=2048, d=64**, verified exact in fp64 (rel err 8e-16).
-Neither transform is expressible by Inductor: one requires recognising
-that a view chain equals a kernel flag, the other requires reordering
-matmul composition — both outside local pattern fusion.
+**Three nonlinear-boundary transforms landed.**
+(a) *Attention fold* — the flash-attention transform:
+`softmax(masked_fill(qk^T·s, mask, −inf)) @ v` is literally SDPA's
+semantics, so the fold is sound for *any* mask: boolean fill-masks
+invert to keep-masks, additive masks pass straight through. A
+post-extraction pass then evaluates the (parameter-only) mask and, if
+it is exactly lower-triangular, replaces it with `is_causal=True` —
+no mask op at all. On **unmodified nanoGPT** eager attention:
+**4.6× vs eager, 2.5× under Inductor at T=2048** — Inductor's 17
+SDPA patterns miss the `masked_fill` form (verified in its generated
+code: `bmm` + fused softmax + `bmm`). (b) *Diagonal absorption*:
+`unsqueeze→expand→reshape` before SDPA is the copy map Δ (llama2.c's
+`repeat_kv`); `gqa_absorb_repeat` pushes it inside the kernel via
+`enable_gqa`, 1.12× at T=512. (c) *Linear-attention reassociation*:
+`(QK^T)V` → `Q(K^TV)`, O(T²d) → O(Td²) — **8.0× at T=2048**,
+verified exact in fp64 (rel err 8e-16).
 
 **The calibrated cost model predicts the crossover.** `roofline_cost`
 constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
@@ -186,10 +190,16 @@ lowering overhead visible on real blocks.
 ## Honest limitations
 
 - **Nothing found yet is novel to practitioners.** Fused QKV, merged
-  gate/up, `enable_gqa` absorption, and the linear-attention identity
-  are all known — the contribution is automatic discovery + formal
-  verification + cost-driven choice, including one transform with
-  *asymptotic* (not constant-factor) impact.
+  gate/up, `enable_gqa` absorption, flash attention, and the
+  linear-attention identity are all known — the contribution is
+  automatic discovery + formal verification + cost-driven choice,
+  including transforms with *asymptotic* (not constant-factor) impact.
+- **SDPA-fold coverage is bounded** — mul/div score scaling,
+  masked_fill and additive masks, optional eval-mode dropout;
+  `is_causal` specialization additionally requires the mask to be
+  parameter-only and exactly lower-triangular (verified by evaluating
+  it). Other mask constructions fold to `attn_mask` but not
+  `is_causal`.
 - **The FLOP-reducing wins are degenerate cases** — linear-only DAGs
   collapse to one linear, which a domain expert writes in one line.
   What is demonstrated is that Inductor misses them and the derivation
@@ -233,7 +243,7 @@ lowering overhead visible on real blocks.
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 87 tests
+python -m pytest tests/ -q         # 90 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

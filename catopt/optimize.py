@@ -27,6 +27,75 @@ from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.ir import op_repr
 
 
+def _eval_const(term: Any, params: dict) -> torch.Tensor | None:
+    """Evaluate a parameter-only subtree to a concrete tensor."""
+    from catopt.torch_bridge import _IR_TO_TORCH
+    if isinstance(term, Param):
+        return params.get(term.name)
+    if isinstance(term, Const):
+        return torch.tensor(term.value)
+    if isinstance(term, Var):
+        return None
+    if isinstance(term, Op):
+        vals = [_eval_const(a, params) for a in term.args]
+        if any(v is None for v in vals):
+            return None
+        fn = _IR_TO_TORCH.get(term.op)
+        if fn is None:
+            return None
+        try:
+            with torch.no_grad():
+                out = fn(*vals, **dict(term.attrs))
+            return out if isinstance(out, torch.Tensor) else None
+        except Exception:
+            return None
+    return None
+
+
+def _is_causal_keep_mask(mask_val: torch.Tensor, q_shape) -> bool:
+    """mask (…, T, T) keeps exactly the lower triangle and T matches
+    q's sequence dim — i.e. the mask IS is_causal."""
+    from catopt.cost import _shape_of as _so
+    if not isinstance(q_shape, tuple) or len(q_shape) < 2:
+        return False
+    if (mask_val.ndim < 2 or mask_val.shape[-1] != mask_val.shape[-2]
+            or mask_val.shape[-1] != q_shape[-2]):
+        return False
+    keep = (mask_val.bool() if mask_val.dtype == torch.bool
+            else mask_val > -1e30)
+    tril = torch.tril(torch.ones(mask_val.shape[-2], mask_val.shape[-1],
+                                 dtype=torch.bool,
+                                 device=mask_val.device))
+    return bool((keep == tril).all())
+
+
+def _specialize_causal(term: Any, params: dict,
+                       memo: dict | None = None) -> Any:
+    """sdpa(q,k,v, mask) where mask is parameter-only and evaluates to
+    a causal keep-mask → sdpa(q,k,v, is_causal=True).  Dropping the
+    materialised mask unlocks the fused flash/mem-efficient kernels."""
+    from catopt.cost import _shape_of as _so
+    if memo is None:
+        memo = {}
+    if not isinstance(term, Op):
+        return term
+    key = id(term)
+    if key in memo:
+        return memo[key]
+    args = tuple(_specialize_causal(a, params, memo) for a in term.args)
+    attrs = dict(term.attrs)
+    if (term.op == "sdpa" and len(args) >= 4
+            and not attrs.get("arg5")):
+        mv = _eval_const(args[3], params)
+        if mv is not None and _is_causal_keep_mask(mv, _so(args[0])):
+            args = args[:3]
+            attrs["arg5"] = True
+            memo["_hit"] = True
+    out = Op.make(term.op, *args, **attrs)
+    memo[key] = out
+    return out
+
+
 def optimize_model(
     model: torch.nn.Module,
     example_input: torch.Tensor,
@@ -130,6 +199,13 @@ def optimize_model(
                 <= dag_cost(best_term, cost_fn)):
             best_term = forced
             stats["paired_extract"] = True
+    # Causal specialization: a param-only attn_mask that evaluates to a
+    # lower-triangular keep-mask is is_causal=True — no mask op at all.
+    _cm: dict = {}
+    best_term = _specialize_causal(best_term, source_tensors, _cm)
+    if _cm.get("_hit"):
+        stats["causal_specialized"] = True
+
     if verbose:
         print(f"  Best term: {op_repr(best_term)}")
         print(f"  Cost: {cost_fn(best_term):.2f} FLOPs (est.)")

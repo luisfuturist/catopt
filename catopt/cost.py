@@ -64,9 +64,15 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # Element-wise ops broadcast: result is the broadcast shape,
             # not simply the first operand's shape.
             return _broadcast(shapes[0], shapes[1] if len(shapes) > 1 else None)
+        case "eq" | "ne" | "lt" | "le" | "gt" | "ge":
+            return _broadcast(shapes[0], shapes[1] if len(shapes) > 1 else None)
+        case "where":
+            out = _broadcast(shapes[1], shapes[2] if len(shapes) > 2 else None)
+            return _broadcast(out, shapes[0])
         case (
             "square" | "sqrt" | "neg" | "sigmoid" | "silu" | "tanh"
-            | "gelu" | "rsqrt" | "exp"
+            | "gelu" | "rsqrt" | "exp" | "softmax" | "masked_fill"
+            | "logical_not"
         ):
             return shapes[0]
         case "pow":
@@ -188,7 +194,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             d0, d1 = d0 % len(base), d1 % len(base)
             merged = _numel(base[d0:d1 + 1])
             return tuple(base[:d0]) + (merged,) + tuple(base[d1 + 1:])
-        case "contiguous" | "to" | "type_as" | "float" | "dropout":
+        case "contiguous" | "to" | "type_as" | "float" | "dropout" | "alias":
             return shapes[0]
         case "sdpa":
             # out has q's shape (B, h, T, d)
