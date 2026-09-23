@@ -35,6 +35,8 @@ _ATEN_TO_IR: dict[str, str] = {
     "contiguous": "contiguous",
     "clone": "contiguous",
     "scaled_dot_product_attention": "sdpa",
+    "conv2d": "conv2d",
+    "cat": "concat",
 }
 
 #: ATen overload-specific names (e.g. 'mul.Tensor') that do not survive
@@ -59,6 +61,14 @@ _IR_TO_TORCH_EXTRA: dict[str, str] = {
     "clone.default": "contiguous",
     "amax.default": "max",
     "scaled_dot_product_attention.default": "sdpa",
+    "conv2d.default": "conv2d",
+}
+
+#: Positional-argument → named-attribute maps for ops whose trailing
+#: args are not generic dims (aten.conv2d takes stride/padding/dilation/
+#: groups positionally).
+_POSITIONAL_ATTRS: dict[str, dict[int, str]] = {
+    "conv2d": {3: "stride", 4: "padding", 5: "dilation", 6: "groups"},
 }
 
 
@@ -198,7 +208,15 @@ def export_to_ir(
             ir_op = _ATEN_TO_IR.get(op_name, op_name)
             args = []
             attrs = {}
+            positional_attrs = _POSITIONAL_ATTRS.get(ir_op, {})
             for i, arg_node in enumerate(node.args):
+                if i in positional_attrs and not hasattr(arg_node, "name"):
+                    # e.g. conv2d(x, w, b, [s,s], [p,p], [d,d], g) —
+                    # non-node positionals are named op attributes.
+                    v = arg_node
+                    attrs[positional_attrs[i]] = (
+                        tuple(v) if isinstance(v, (list, tuple)) else v)
+                    continue
                 if isinstance(arg_node, (int, float)) and not isinstance(arg_node, bool):
                     # Scalar operands of arithmetic ops are real operands
                     # (e.g. pow(x, 2)); for reductions the scalar is a
@@ -315,7 +333,13 @@ _IR_TO_TORCH: dict[str, Any] = {
     "linear": lambda x, w, *a, **kw: torch.nn.functional.linear(
         x, w, (a[0] if a else kw.get("bias"))
     ),
-    "concat": lambda a, b, dim=0, **kw: torch.cat((a, b), dim=dim),
+    "conv2d": lambda x, w, *a, **kw: torch.nn.functional.conv2d(
+        x, w, a[0] if a else kw.get("bias"),
+        stride=kw.get("stride", 1), padding=kw.get("padding", 0),
+        dilation=kw.get("dilation", 1), groups=kw.get("groups", 1),
+    ),
+    "concat": lambda *ts, **kw: torch.cat(
+        list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))),
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
         t, chunks, dim=dim
     )[index],

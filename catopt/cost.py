@@ -131,6 +131,26 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "sdpa":
             # out has q's shape (B, h, T, d)
             return shapes[0]
+        case "conv2d":
+            # x (N,C,H,W) @ w (O,C,kh,kw) -> (N,O,H',W')
+            x, w = shapes[0], shapes[1]
+            if (x is None or w is None or len(x) < 4 or len(w) < 4
+                    or isinstance(op.attrs.get("padding"), str)):
+                return (x[0], w[0], None, None) if (
+                    x is not None and w is not None
+                    and len(x) >= 1 and len(w) >= 1) else x
+            st = op.attrs.get("stride", 1)
+            pd = op.attrs.get("padding", 0)
+            dl = op.attrs.get("dilation", 1)
+            st = st if isinstance(st, (tuple, list)) else (st, st)
+            pd = pd if isinstance(pd, (tuple, list)) else (pd, pd)
+            dl = dl if isinstance(dl, (tuple, list)) else (dl, dl)
+            oh = ow = None
+            if x[2] is not None and w[2] is not None:
+                oh = (x[2] + 2 * pd[0] - dl[0] * (w[2] - 1) - 1) // st[0] + 1
+            if x[3] is not None and w[3] is not None:
+                ow = (x[3] + 2 * pd[1] - dl[1] * (w[3] - 1) - 1) // st[1] + 1
+            return (x[0], w[0], oh, ow)
         case "concat":
             a, b = shapes[0], shapes[1]
             if a is None or b is None:
@@ -268,6 +288,18 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
         shapes = [_shape_of(a, memo) for a in term.args]
         if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
             return float(2 * n_out * shapes[0][-1])
+        return float(2 * n_out)
+    if term.op == "conv2d":
+        # 2 * N * O * H' * W' * (C*kh*kw / groups)
+        shapes = [_shape_of(a, memo) for a in term.args]
+        w = shapes[1] if len(shapes) > 1 else None
+        if (w is not None and w is not _INVALID and len(w) >= 4
+                and all(isinstance(d, int) for d in w[1:4])):
+            k = w[1] * w[2] * w[3]
+            g = term.attrs.get("groups", 1)
+            if isinstance(g, int) and g > 1:
+                k //= g
+            return float(2 * n_out * k)
         return float(2 * n_out)
     if term.op == "sdpa":
         # attention: ~2 * (T * d + T * T) per head ≈ 2*T*max(d,T)*B*h

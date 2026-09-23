@@ -29,6 +29,7 @@ semantically equivalent.
 |---|---|---|---|
 | **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
 | **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound; **1.19× launch-bound toy**; 0.82–0.99× real llama2.c blocks | ~1.0× |
+| **Same-FLOP conv pairing** | 4× parallel conv1×1 branches | **1.24–1.33× at all batch sizes** | — |
 | **Norm folding** | NormLinear | 0.98× (controlled negative) | 0.90× |
 
 **Headline capability:** pointed at unmodified community code —
@@ -117,6 +118,25 @@ launches of ~40 while handing strided views to downstream reshapes.
 The honest regime boundary is sharper than "launch-bound wins":
 pairing needs launch-bound **and** GEMM-dominated to pay.
 
+**Conv pairing is the exception — it pays at every size measured**
+(1.24–1.33× on 4 parallel conv1×1 branches, b=1…64). Inductor does not
+fuse cuDNN conv calls, so 4→1 is genuine kernel reduction, and one
+wide conv reuses the input better than four narrow ones. The same
+diagram-level pass produces it — `pair_shared_input` is now generic
+over projection signatures (linear, conv2d), with a compat cluster key
+per op (conv members must share stride/padding/dilation/groups and
+kernel dims; asymmetric out-channels supported).
+
+**The calibrated cost model predicts the crossover.** `roofline_cost`
+constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
+8.7 µs launch). Predicted vs measured direction agrees on all tested
+cases; at the boundary the magnitude is right (ParallelBlock b=4:
+predicted 1.08×, measured 1.08×). With `cost_fn=roofline_cost` the
+pipeline *accepts* pairing where it wins and *declines* it on real
+llama2.c blocks where it loses — per-shape, cost-driven selection.
+Residual gap: the model prices the transform, not the ~5% `IRModule`
+lowering overhead visible on real blocks.
+
 ## What the experiments establish
 
 - **Inductor genuinely misses these transforms** — measured, not
@@ -185,7 +205,7 @@ pairing needs launch-bound **and** GEMM-dominated to pay.
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 81 tests
+python -m pytest tests/ -q         # 84 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

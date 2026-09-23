@@ -326,3 +326,28 @@ class MatrixChain(nn.Module):
         runtime = 2 * batch * d0 * d3
         return precompute + runtime
 
+
+class ParallelConv(nn.Module):
+    """Parallel conv2d branches on one input — the product law beyond
+    ``linear``.
+
+    ``n`` same-geometry convolutions (e.g. ResNet bottleneck 1x1 heads,
+    multi-branch stems) read the SAME feature map.  The pairing pass
+    fuses them into ONE conv whose weight is the out-channel concat,
+    with per-branch ``split`` views on the channel dim.  Unlike linear
+    pairing — which is runtime-neutral under Inductor — conv fusion
+    wins at every measured batch size because Inductor does not fuse
+    cuDNN conv calls at all.
+    """
+
+    def __init__(self, in_ch: int = 64, out_ch: int = 64,
+                 branches: int = 4, kernel: int = 1) -> None:
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Conv2d(in_ch, out_ch, kernel, bias=False)
+            for _ in range(branches)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return sum(c(x) for c in self.convs)
+

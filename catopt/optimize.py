@@ -19,7 +19,8 @@ import torch
 from catopt.ir import IR, Op, Var, Const, Param
 from catopt.egraph import EGraph
 from catopt.rules import (all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
-                          pair_shared_input_linears)
+                          pair_shared_input_linears,
+                          pair_shared_input_convs)
 from catopt.cost import (flops_cost, count_cost, launch_aware_cost,
                          CostModel, dag_cost)
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
@@ -105,7 +106,8 @@ def optimize_model(
 
     # Diagram-level product law: pair every linear sharing an input into
     # one GEMM + split views.  Non-local — no consumer pattern needed.
-    groups = pair_shared_input_linears(eg)
+    groups = (pair_shared_input_linears(eg)
+              + pair_shared_input_convs(eg))
     if groups:
         eg.rebuild()
         stats["pairing_groups"] = len(groups)

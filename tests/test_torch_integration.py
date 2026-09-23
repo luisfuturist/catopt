@@ -892,3 +892,67 @@ def test_dag_sharing_scales():
     for _ in range(14):
         expect = expect + expect * xv
     assert (out - expect).abs().max().item() < 1e-3
+
+
+def test_conv2d_pairing_asymmetric_and_incompatible():
+    """The product law on conv2d: same-geometry convs sharing an input
+    fuse into one out-channel-concat conv + channel-dim splits; convs
+    with different kernels must be excluded."""
+    import torch.nn as nn
+
+    class MixedConv(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c1 = nn.Conv2d(16, 32, 1, bias=False)
+            self.c2 = nn.Conv2d(16, 64, 1, bias=False)  # asymmetric out
+            self.c3 = nn.Conv2d(16, 96, 3, padding=1, bias=False)
+
+        def forward(self, x):
+            return torch.cat([self.c1(x), self.c2(x)], 1) + self.c3(x)
+
+    from catopt.optimize import optimize_model
+    m = MixedConv().eval()
+    x = torch.randn(2, 16, 8, 8)
+    opt, info = optimize_model(m, x, ruleset="simpl", max_iterations=2,
+                               verbose=False)
+    # exactly one pairing group: c1/c2 fuse (96-ch conv + 32/64 split),
+    # c3 (3x3 kernel) is excluded by the compat cluster key
+    assert info.get("pairing_groups") == 1
+    with torch.no_grad():
+        assert (m(x) - opt(x)).abs().max().item() < 1e-4
+
+
+def test_conv2d_pairing_not_offered_for_grouped():
+    """groups>1 convs must not pair — cat on out-channels would mix
+    grouped convolutions incorrectly."""
+    import torch.nn as nn
+    from catopt.torch_bridge import export_to_ir
+    from catopt.egraph import EGraph
+    from catopt.rules import pair_shared_input_convs
+
+    class Grouped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c1 = nn.Conv2d(16, 32, 1, groups=2, bias=False)
+            self.c2 = nn.Conv2d(16, 32, 1, groups=2, bias=False)
+
+        def forward(self, x):
+            return self.c1(x) + self.c2(x)
+
+    m = Grouped().eval()
+    x = torch.randn(2, 16, 8, 8)
+    ir, _ = export_to_ir(m, x)
+    eg = EGraph()
+    eg.add_term(ir.root)
+    assert pair_shared_input_convs(eg) == []
+
+
+def test_reshape_negative_dim_shape_inference():
+    """reshape attrs keep literal -1 dims; shape inference must resolve
+    them from input numel rather than poisoning broadcast as _INVALID."""
+    from catopt.cost import _infer_op_shape, _INVALID, _broadcast
+    x = Var("x", TensorType((4, 8)))
+    r = Op.make("reshape", x, shape=(-1, 2, 4))
+    assert _infer_op_shape(r) == (4, 2, 4)  # numel 32 / (2*4) = 4
+    # unresolved -1 must broadcast as unknown (None), not _INVALID
+    assert _broadcast((4, -1), (4, 8)) == (4, None)

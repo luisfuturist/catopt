@@ -586,18 +586,16 @@ def _term_has_var(t: Any) -> bool:
     return False
 
 
-def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
-    """Pair all `linear` e-nodes that share an input e-class.
+def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
+                       cluster_key) -> list[dict[int, Any]]:
+    """Product law over an arbitrary projection signature.
 
-    Returns one group per shared input: a dict mapping each member's
-    canonical class id to the ``split`` ENode that reads its section of
-    the shared fused GEMM.  The caller may feed the union of these dicts
-    to ``extract_best`` as ``overrides`` — per-class greedy extraction
-    cannot see that all members choosing a split share ONE fused GEMM
-    (each split's subtree alone costs more than the member's own
-    linear), so the coordinated choice must be forced globally.
-
-    Idempotent: re-running rebuilds the same (hash-consed) enodes.
+    Groups ``op`` e-nodes by shared input e-class and offers each member
+    ``split_i(op(x, cat(W_1..W_k)))`` — one fused kernel plus per-member
+    views.  ``cluster_key(enode, weight_term)`` returns a hashable
+    signature under which members can share one fused kernel (or None to
+    exclude a member): for conv2d it captures stride/padding/dilation/
+    groups and the trailing weight dims.
     """
     from catopt.cost import _shape_of as _so
     from catopt.egraph import ENode, _LeafRegistry
@@ -628,52 +626,123 @@ def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
         hasvar[cid] = res
         return res
 
-    by_input: dict[int, list[tuple[int, int]]] = {}
+    by_input: dict[int, list[tuple[ENode, int, int]]] = {}
     for cid in list(eg._classes.keys()):
         for node in eg._classes[cid].nodes:
-            if node.op != "linear" or len(node.children) != 2:
+            # Only bias-free projections: a fused bias would need a
+            # second concat; keeping the pairing arity at (x, w).
+            if node.op != op or len(node.children) != 2:
                 continue
             by_input.setdefault(
                 eg.find(node.children[0]), []
-            ).append((cid, eg.find(node.children[1])))
+            ).append((node, cid, eg.find(node.children[1])))
 
     groups: list[dict[int, Any]] = []
     for x_eid, members in by_input.items():
         if not cls_has_var(x_eid):
             continue  # pairing weight-only chains is compile-time noise
-        weights = sorted({w for _, w in members})
-        if len(weights) < 2:
-            continue
-        if any(cls_has_var(w) for w in weights):
-            continue  # fused weight must fold at compile time
-        wts = [eg.any_term(w) for w in weights]
-        if any(t is None for t in wts):
-            continue
-        sizes: list[int] = []
-        for t in wts:
-            s = _so(t)
-            if not (isinstance(s, tuple) and len(s) == 2 and s[0]):
-                break
-            sizes.append(s[0])
-        if len(sizes) != len(weights):
-            continue
-        cat = weights[0]
-        for w in weights[1:]:
-            cat = eg.add_enode("concat", (cat, w), {"dim": 0})
-        fused = eg.add_enode("linear", (x_eid, cat))
-        index_of = {w: i for i, w in enumerate(weights)}
-        group: dict[int, Any] = {}
-        for cid, w in members:
-            enode = ENode("split", (fused,), (
-                ("dim", -1), ("index", index_of[w]),
-                ("sizes", tuple(sizes)),
-            ))
-            eg.union(cid, eg.add_enode("split", (fused,), {
-                "sizes": tuple(sizes), "dim": -1,
-                "index": index_of[w]}))
-            group.setdefault(cid, enode)
-        groups.append(group)
+        # Cluster members by compat signature: convs differing only in
+        # stride/kernel cannot share one fused conv, but each compatible
+        # subset still pairs (e.g. two 1x1 heads pair; a 3x3 stays out).
+        clusters: dict[Any, list[tuple[ENode, int, int]]] = {}
+        for entry in members:
+            node, cid, w = entry
+            wt = eg.any_term(w)
+            if wt is None:
+                continue
+            k = cluster_key(node, wt)
+            if k is None:
+                continue
+            clusters.setdefault(k, []).append(entry)
+
+        for cluster in clusters.values():
+            weights = sorted({w for _, _, w in cluster})
+            if len(weights) < 2:
+                continue
+            if any(cls_has_var(w) for w in weights):
+                continue  # fused weight must fold at compile time
+            wts = [eg.any_term(w) for w in weights]
+            if any(t is None for t in wts):
+                continue
+            sizes: list[int] = []
+            for t in wts:
+                s = _so(t)
+                if not (isinstance(s, tuple) and len(s) >= 1 and s[0]):
+                    break
+                sizes.append(s[0])
+            if len(sizes) != len(weights):
+                continue
+            cat = weights[0]
+            for w in weights[1:]:
+                cat = eg.add_enode("concat", (cat, w), {"dim": 0})
+            fused = eg.add_enode(op, (x_eid, cat),
+                                 dict(cluster[0][0].attrs))
+            index_of = {w: i for i, w in enumerate(weights)}
+            group: dict[int, Any] = {}
+            for _, cid, w in cluster:
+                enode = ENode("split", (fused,), (
+                    ("dim", split_dim), ("index", index_of[w]),
+                    ("sizes", tuple(sizes)),
+                ))
+                eg.union(cid, eg.add_enode("split", (fused,), {
+                    "sizes": tuple(sizes), "dim": split_dim,
+                    "index": index_of[w]}))
+                group.setdefault(cid, enode)
+            groups.append(group)
     return groups
+
+
+def _wshape(t: Any):
+    from catopt.cost import _shape_of as _so
+    return _so(t)
+
+
+def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
+    """Pair all `linear` e-nodes that share an input e-class.
+
+    Returns one group per shared input: a dict mapping each member's
+    canonical class id to the ``split`` ENode that reads its section of
+    the shared fused GEMM.  The caller may feed the union of these dicts
+    to ``extract_best`` as ``overrides`` — per-class greedy extraction
+    cannot see that all members choosing a split share ONE fused GEMM
+    (each split's subtree alone costs more than the member's own
+    linear), so the coordinated choice must be forced globally.
+
+    Idempotent: re-running rebuilds the same (hash-consed) enodes.
+    """
+    def key(enode, wt):
+        s = _wshape(wt)
+        # 2-D weight only (a 1-D "weight" cannot cat along out-dim).
+        return ("lin",) if isinstance(s, tuple) and len(s) == 2 else None
+
+    return _pair_shared_input(eg, op="linear", split_dim=-1,
+                              cluster_key=key)
+
+
+_CONV_ATTR_KEYS = ("stride", "padding", "dilation", "groups")
+
+
+def pair_shared_input_convs(eg: Any) -> list[dict[int, Any]]:
+    """Pair `conv2d` e-nodes sharing an input — the same product law.
+
+    The fused weight is ``cat`` along out-channels (dim 0), valid only
+    when members share stride/padding/dilation/groups and kernel dims;
+    the projections split the output along the channel dim (1).
+    """
+    def key(enode, wt):
+        a = dict(enode.attrs)
+        if a.get("groups", 1) != 1:
+            return None  # grouped conv: cat on O mixes groups wrongly
+        s = _wshape(wt)
+        if not (isinstance(s, tuple) and len(s) == 4):
+            return None
+        # same non-weight attrs AND same (in_ch, kh, kw) — cat on O
+        # requires identical trailing weight dims.
+        return (tuple(sorted(
+            (k, a[k]) for k in _CONV_ATTR_KEYS if k in a)), s[1:])
+
+    return _pair_shared_input(eg, op="conv2d", split_dim=1,
+                              cluster_key=key)
 
 
 # ---------------------------------------------------------------------------
