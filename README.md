@@ -64,6 +64,29 @@ The contribution is a **discovery engine**: laws in, verified +
 certified + measured transforms out — including structures whose
 *derivation* is emergent even when the destination is practitioner-known.
 
+## Mathematical foundations
+
+The category theory is load-bearing, not decoration — it determines
+what is *reachable*:
+
+- **Symmetric monoidal structure** — ops are morphisms; the pairing
+  pass is the product law `⟨f₁,…,f_k⟩ = (×fᵢ)∘Δ` applied as a
+  diagram-level rewrite, not a consumer-side pattern match.
+- **Monoid objects as carriers** — `aff`, `aff_diag`, `om` are monoid
+  objects; parallel scans and chunked attention fall out of
+  homomorphism + associativity, not handwritten rules.
+- **Traced monoidal category** — `trace` carries the Joyal–Street–
+  Verity axioms (vanishing, superposing, sliding, tightening, yanking)
+  as rewrite rules; feedback becomes a closed-form resolvent.
+- **Higher morphisms** — 2-cells are proof objects (certificates);
+  an e-class is a groupoid of programs; `truncation_level` is
+  n-truncation of the program ∞-groupoid.
+- **Coherence as scheduling** — Mac Lane's theorem operationalized:
+  contractible law-spaces are canonicalized, never searched
+  (the ~5,700× enode reduction).
+- **Completion as rule synthesis** — Knuth–Bendixson critical-pair
+  closure over the 2-cells; the law set grows its own lemmas.
+
 ## Semantic carriers
 
 Each carrier is a monoid object in the IR; lifting and lowering rules
