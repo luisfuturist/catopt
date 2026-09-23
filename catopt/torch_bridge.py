@@ -278,6 +278,9 @@ _IR_TO_TORCH: dict[str, Any] = {
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
         t, chunks, dim=dim
     )[index],
+    "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
+        t, list(sizes), dim=dim
+    )[index],
 }
 
 

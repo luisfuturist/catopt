@@ -18,9 +18,11 @@ from catopt.egraph import Rewrite
 from catopt.ir import Op, Const
 
 
-def R(name: str, lhs: Any, rhs: Any, law: str = "", check=None) -> Rewrite:
+def R(name: str, lhs: Any, rhs: Any, law: str = "", check=None,
+      derive=None) -> Rewrite:
     """Shorthand for creating a rewrite rule."""
-    return Rewrite(name=name, lhs=lhs, rhs=rhs, law=law, check=check)
+    return Rewrite(name=name, lhs=lhs, rhs=rhs, law=law, check=check,
+                   derive=derive)
 
 
 def _shape_of(t: Any):
@@ -467,6 +469,59 @@ QKV_FUSE = R(
         "zero-cost chunk projections.  (Fused QKV.)",
 )
 
+
+# ---------------------------------------------------------------------------
+#  Asymmetric fused QKV (GQA): q/k/v projections with DIFFERENT output
+#  dims.  The product law is identical; only the projections differ —
+#  `split` with explicit sizes instead of `chunk`.  The sizes are not
+#  present anywhere in the LHS, so a `derive` hook computes them from
+#  the bound weight shapes.  (vLLM's QKVParallelLinear.)
+# ---------------------------------------------------------------------------
+
+def _head_v(t: Any, shape_var: str) -> Op:
+    """Head view with a per-projection shape metavariable."""
+    return Op.make("transpose",
+                   Op.make("reshape", t, shape=shape_var),
+                   arg1=1, arg2=2)
+
+
+def _derive_split_sizes(bound: dict) -> dict | None:
+    """sizes = (|Q|, |K|, |V|) — each bound weight's output dim."""
+    sizes = []
+    for k in ("Q", "K", "V"):
+        w = bound.get(k)
+        shape = getattr(getattr(w, "typ", None), "shape", None)
+        if not shape or any(d is None for d in shape):
+            return None
+        sizes.append(shape[0])
+    return {"$attr:SZ": tuple(sizes)}
+
+
+_QKV_CAT = Op.make("concat",
+                   Op.make("concat", "Q", "K", dim=0),
+                   "V", dim=0)
+
+QKV_FUSE_ASYM = R(
+    "qkv_fuse_asym",
+    Op.make("sdpa",
+            _head_v(Op.make("linear", "x", "Q"), "S1"),
+            _head_v(Op.make("linear", "x", "K"), "S2"),
+            _head_v(Op.make("linear", "x", "V"), "S3"),
+            scale="SC", enable_gqa="G"),
+    Op.make("sdpa",
+            _head_v(Op.make("split", Op.make("linear", "x", _QKV_CAT),
+                            sizes="SZ", dim=-1, index=0), "S1"),
+            _head_v(Op.make("split", Op.make("linear", "x", _QKV_CAT),
+                            sizes="SZ", dim=-1, index=1), "S2"),
+            _head_v(Op.make("split", Op.make("linear", "x", _QKV_CAT),
+                            sizes="SZ", dim=-1, index=2), "S3"),
+            scale="SC", enable_gqa="G"),
+    law="Asymmetric triple pairing: the same product law as qkv_fuse, "
+        "but the three projections have different output dims — one "
+        "GEMM, three uneven split views.  (GQA fused QKV.)",
+    derive=_derive_split_sizes,
+)
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -545,6 +600,7 @@ CATEGORICAL_RULES: list[Rewrite] = [
     SWIGLU_FUSE,
     PARALLEL_MUL_FUSE,
     QKV_FUSE,
+    QKV_FUSE_ASYM,
     # Diagonal-scale naturality (norm folding)
     LINEAR_CHANNEL_SCALE,
     LINEAR_CHANNEL_SCALE_REV,

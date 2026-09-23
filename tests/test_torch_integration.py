@@ -604,6 +604,89 @@ def test_row_scale_rejects_data_scale():
             pytest.fail("row_scale fired on a data-shaped scale")
 
 
+# ---------------------------------------------------------------------------
+#  Asymmetric product pairing (GQA) + stacked TransformerBlock
+# ---------------------------------------------------------------------------
+
+def test_gqa_asym_fuse():
+    """qkv_fuse_asym: uneven head counts -> split with derived sizes."""
+    from catopt.models import GQAAttention
+    from catopt.cost import launch_aware_cost
+    torch.manual_seed(0)
+    m = GQAAttention(128, n_heads=4, n_kv_heads=2).eval()
+    x = torch.randn(2, 8, 128)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=20, max_nodes=50000)
+    best = eg.extract_best(eid, launch_aware_cost)
+
+    splits = _find_ops(best, "split")
+    assert len(splits) == 3
+    # derived sizes: q=4*32=128, k=v=2*32=64
+    for s in splits:
+        assert s.attrs.get("sizes") == (128, 64, 64)
+    assert splits[0].args[0] is splits[1].args[0] is splits[2].args[0]
+    assert splits[0].args[0].op == "linear"
+
+    low = _lower(ir, best, source)
+    names = [n for n, _ in low.named_parameters()]
+    assert any(n.startswith("fused_") for n in names)
+    assert "p_q_proj_weight" not in names
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-5
+
+
+def test_derive_hook_computes_sizes():
+    """Rewrite.derive injects computed attrs into the instantiation."""
+    from catopt.rules import QKV_FUSE_ASYM
+    from catopt.models import GQAAttention
+    torch.manual_seed(0)
+    m = GQAAttention(64, n_heads=2, n_kv_heads=1).eval()
+    x = torch.randn(2, 4, 64)
+    ir, _ = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    changed = eg.apply_rule(QKV_FUSE_ASYM, eid)
+    assert changed
+    eg.rebuild()
+    # a split enode must exist carrying the derived sizes (64, 32, 32)
+    sizes = {
+        dict(n.attrs).get("sizes")
+        for n in eg._node_to_class if n.op == "split"
+    }
+    assert (64, 32, 32) in sizes
+
+
+def test_transformer_block_stacks_fusions():
+    """One saturation pass finds BOTH fusions in a full block."""
+    from catopt.models import TransformerBlock
+    from catopt.cost import launch_aware_cost
+    torch.manual_seed(0)
+    m = TransformerBlock(128, n_heads=4, hidden_mult=2).eval()
+    x = torch.randn(4, 16, 128)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=30, max_nodes=200000)
+    best = eg.extract_best(eid, launch_aware_cost)
+    r = op_repr(best)
+    # fused QKV (3 chunks on one GEMM) AND fused gate/up (2 chunks)
+    assert r.count("(chunk") >= 5
+    low = _lower(ir, best, source)
+    n_fused = len([n for n, _ in low.named_parameters()
+                   if n.startswith("fused_")])
+    assert n_fused >= 2  # qkv concat + gate/up concat
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-4
+
+
 def test_channel_scale_rejects_row_scale():
     """linear(x*r, W) with r per-row must not fold r into W."""
     from catopt.rules import LINEAR_CHANNEL_SCALE

@@ -227,6 +227,10 @@ op_def("concat", 2, 1,
 op_def("chunk", 1, 1,
        law="Projection pi_i of a paired output; a zero-cost view like "
            "transpose/reshape.")
+op_def("split", 1, 1,
+       law="Projection pi_i with explicit (possibly unequal) section "
+           "sizes — the asymmetric counterpart of chunk, for pairing "
+           "maps with different output dimensions (e.g. GQA fused QKV).")
 
 # Attention
 op_def("contiguous", 1, 1,

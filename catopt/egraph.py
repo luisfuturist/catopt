@@ -81,12 +81,21 @@ class Rewrite:
     per-row or per-channel) declare it here — the matcher alone cannot
     see tensor types, and firing without the check produces well-typed
     but semantically wrong terms.
+
+    ``derive`` is an optional computed-attribute hook: given the resolved
+    binding it returns extra substitution entries (typically
+    ``{"$attr:NAME": value}``) used when instantiating the RHS.  This is
+    how a rule computes RHS attributes that are not present verbatim in
+    the LHS — e.g. the uneven ``split`` sizes of an asymmetric pairing,
+    derived from the bound weight shapes.  Returning ``None`` vetoes the
+    rewrite.
     """
     name: str
     lhs: Any
     rhs: Any
     law: str = ""
-    check: Any = None  # Callable[[dict[str, Any]], bool] | None
+    check: Any = None   # Callable[[dict[str, Any]], bool] | None
+    derive: Any = None  # Callable[[dict], dict | None] | None
 
     def __repr__(self) -> str:
         return f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
@@ -364,7 +373,7 @@ class EGraph:
         for eid in list(self._classes.keys()):
             eid = self.find(eid)
             for subst in self.matches(rule.lhs, eid):
-                if rule.check is not None:
+                if rule.check is not None or rule.derive is not None:
                     bound = {
                         k: self.any_term(v)
                         for k, v in subst.items()
@@ -372,8 +381,13 @@ class EGraph:
                     }
                     if any(v is None for v in bound.values()):
                         continue
-                    if not rule.check(bound):
+                    if rule.check is not None and not rule.check(bound):
                         continue
+                    if rule.derive is not None:
+                        extra = rule.derive(bound)
+                        if extra is None:
+                            continue
+                        subst = {**subst, **extra}
                 rhs_eid = self._instantiate(rule.rhs, subst)
                 if self.union(eid, rhs_eid):
                     changed = True

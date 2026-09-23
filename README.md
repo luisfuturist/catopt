@@ -230,21 +230,32 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | **NormLinear b=256 T=64** | yes (3e-06) | 39.91 | 44.52 | 0.90× |
 | RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
 
-### Measured results (GPU, RTX 2050 — `bench_gpu.py`)
+### Measured results (GPU, RTX 2050 — synced timing, `bench_gpu.py`)
+
+Measured with per-iteration `torch.cuda.synchronize()` (see the timing
+bug note below), interleaved orig/cat to cancel clock drift, lower
+quartile of 30 reps.
 
 | Program | Equivalent? | Inductor (ms) | CatOpt + Inductor (ms) | Speedup |
 | ------- | ----------: | ------------: | ---------------------: | ------: |
-| MatrixChain b=4096 | yes (8e-09) | 0.051 | 0.037 | **1.36×** |
-| ParallelLinear b=4096 | yes (3e-06) | 0.069 | 0.041 | **1.68×** |
-| **DeepParallel b=4096** | yes (2e-06) | 0.092 | 0.043 | **2.13×** |
-| **SwiGLU b=4096 (fused gate/up)** | yes (0.0) | 0.076 | 0.063 | **1.20×** |
-| **SwiGLU b=128** | yes (3e-07) | 0.072 | 0.065 | **1.10×** |
-| **Attention QKV b=64 T=256** | yes (0.0) | 0.107 | 0.097 | **1.10×** |
-| NormLinear b=256 | yes (7e-06) | 0.054 | 0.062 | 0.88× |
+| MatrixChain b=4096 | yes (8e-09) | 0.188 | 0.126 | **1.49×** |
+| **ParallelLinear b=4096** | yes (3e-06) | 1.763 | 0.720 | **2.45×** |
+| **DeepParallel b=4096** | yes (2e-06) | 5.420 | 2.159 | **2.51×** |
+| SwiGLU b=4096 (fused gate/up) | yes (0.0) | 12.51 | 12.49 | 1.00× |
+| SwiGLU b=128 | yes (3e-07) | 0.780 | 0.751 | 1.04× |
+| Attention fused QKV b=64 T=256 | yes (0.0) | 23.71 | 24.47 | 0.97× |
+| **GQA fused QKV b=64 T=256** | yes (0.0) | 17.42 | 17.99 | 0.97× |
+| TransformerBlock b=64 T=512 (QKV+gate/up stacked) | yes (0.0) | 169.8 | 174.8 | 0.97× |
+| TransformerBlock b=16 T=256 | yes (5e-07) | 18.62 | 18.61 | 1.00× |
+| NormLinear b=256 | yes (8e-06) | 4.29 | 4.38 | 0.98× |
 
 Both paths go through `torch.compile`, so the comparison isolates the
 representation: same backend, same model, same weights — only the graph
 handed to TorchInductor differs.
+
+**Eager-mode control:** SwiGLU b=128 without compile measures 1.10× —
+the only same-FLOP win observed — consistent with kernel-count reduction
+mattering only when the backend does not already hide launches.
 
 `DeepParallel` is the strongest result: `(W1(x) + W2(x)) @ W3` collapses to a
 single `linear` via **two composed rules** (`weight_factor_linear` then
@@ -294,26 +305,37 @@ GEMMs run. They divide cleanly:
 * **FLOP-reducing transforms pay on CPU.** MatrixChain, ParallelLinear,
   DeepParallel each shrink the actual GEMM FLOP count (6.3×, 2×, 2.9×) —
   those wins are backend-independent and measured at 1.6–6.2×, 2.24×, 3.02×.
-* **Same-FLOP restructuring is a wash on CPU but a win on GPU — the
-  predicted regime split, measured.** SwiGLU gate/up fusion and fused QKV
-  keep FLOPs identical; their wins are fewer kernel launches and better
-  GEMM aspect ratios. On CPU, strided `chunk` views offset the launch
-  savings (0.94–1.06×). On the RTX 2050 the same transforms measure
-  **1.10–1.20× over full Inductor** — exactly why every fast inference
-  stack hand-writes fused QKV and merged gate/up, and exactly the class
-  of transform Inductor cannot express because it requires creating a
-  *new parameter*.
-* **NormLinear is the controlled negative case on both backends** (0.88×
-  GPU, 0.90× CPU): Inductor already fuses `x·rms·wn` into the GEMM's
-  input read, so graph-level folding adds a materialized intermediate
-  for no benefit. The cost-model boundary is now measured, not assumed.
+* **Same-FLOP restructuring is parity on GPU — the earlier "win" was a
+  benchmark artifact.** SwiGLU gate/up fusion, fused QKV (both symmetric
+  and GQA-asymmetric), and the stacked TransformerBlock all verify
+  bit-exactly and mechanically halve the GEMM count (profiler: 4 GEMMs +
+  1 SDPA → 2 GEMMs + 1 SDPA per forward).  But measured GPU execution is
+  ~parity (0.97–1.04×): inside a `torch.compile`d graph Inductor already
+  schedules kernels back-to-back, and at these GEMM sizes launch overhead
+  and tile-efficiency differences are below noise.  A first version of
+  this table reported 1.10–1.20× — that was measuring **kernel-submission
+  time** (`_bench_once` synced once after warmup but not per iteration;
+  CUDA calls are async).  The fix and re-measurement are committed.
+* **The value of categorical restructuring on a compiled backend is
+  almost entirely FLOP reduction.** The algebraic wins (reassociation,
+  weight merging, factorization) measure 1.5–2.5× on GPU and 1.6–6.2× on
+  CPU.  The pairing/product rewrites are semantically valuable — verified
+  parameter restructuring Inductor cannot express — but their runtime
+  value lives in eager/serving regimes (the 1.10× eager SwiGLU data
+  point) and in enabling downstream optimizations, not in compiled-graph
+  execution time at these shapes.
+* **NormLinear is the controlled negative case on both backends** (~0.9–0.98×):
+  Inductor already fuses `x·rms·wn` into the GEMM's input read, so
+  graph-level folding adds a materialized intermediate for no benefit.
 
 So the honest claim today: **categorical semantics + equality saturation
 finds and formally verifies parameter-restructuring transforms that
-TorchInductor cannot express — and on GPU, where launch overhead and
-GEMM efficiency dominate, the product-structure fusions are profitable:
-fused QKV 1.10×, fused SwiGLU 1.20×, all verified bit-exact or within
-float noise.**
+TorchInductor cannot express — including a *stacked* composition (fused
+QKV + fused gate/up + folded norms in one TransformerBlock) and an
+*asymmetric* pairing (GQA) whose split sizes are derived, not matched.
+On the measured backends the profitable subset is precisely the
+FLOP-reducing one — 1.5–2.5× GPU — and the instrument now correctly
+reports where the boundary is.**
 
 ### Honest reading of the numbers
 
@@ -361,14 +383,14 @@ float noise.**
   `chunk` projections into SDPA — uses *attribute metavariables* so the
   pattern binds concrete reshape shapes and the SDPA scale), and the
   `NormLinear` fold (channel gain into the weight, per-row `rms` hoisted
-  out — two different naturality laws composing). All three verify
-  bit-exactly or within float noise. On GPU two of the three are
-  profitable (SwiGLU 1.20×, QKV 1.10×); the norm fold loses on both
-  backends because Inductor's intra-kernel prologue fusion already
-  captures its bandwidth win. What remains undemonstrated: a transform
-  that is *new to practitioners*, not just new to Inductor — fused QKV
-  and merged gate/up are textbook deployment tricks discovered
-  automatically, not novel optimizations.
+  out — two different naturality laws composing), and `qkv_fuse_asym`
+  (GQA — uneven head counts via a derived `split`, the
+  `QKVParallelLinear` trick). All verify bit-exactly or within float
+  noise. None is profitable inside a compiled graph on the measured
+  hardware — their value is semantic restructuring, not runtime. What
+  remains undemonstrated: a transform that is *new to practitioners*,
+  not just new to Inductor — fused QKV and merged gate/up are textbook
+  deployment tricks discovered automatically, not novel optimizations.
 * **The cost model now knows about compile time, sharing, and layout.**
   Extraction charges param-only classes at 0 and shared e-classes once.
   `roofline_cost` estimates per-op `max(flops/peak_flops, bytes/peak_bw)
@@ -382,7 +404,7 @@ float noise.**
   variant loses (38–47 ms vs Inductor's 38 ms) because Inductor already
   fuses `x·rms·wn` into the GEMM's input read. Graph restructuring cannot
   promise a bandwidth win that backend kernel fusion already delivers.
-* **Three soundness bugs were found and fixed in this work**, which is the
+* **Four soundness bugs were found and fixed in this work**, which is the
   strongest evidence the instrument is trustworthy: (1) the matcher did not
   enforce repeated metavariables as "same e-class", so `x@W1 + y@W2` would
   have matched a pattern requiring `x@W1 + x@W2` and emitted a false proof;
@@ -390,7 +412,9 @@ float noise.**
   which had fabricated a spurious 1.98× RMSNorm "win"; (3) scale-naturality
   rules originally bound metavariables to *any* tensor, producing a
   well-typed but semantically wrong program (diff 9.83) until `check`
-  predicates were added. All three are regression-tested.
+  predicates were added; (4) `_bench_once` measured CUDA *submission* time
+  — no per-iteration sync — which had fabricated 1.10–1.20× GPU "wins"
+  for the fused projections. All four are regression-tested or fixed.
 
 ### Reproduce
 
@@ -398,7 +422,7 @@ float noise.**
 python main.py                     # associativity, parallel merges, fused
                                    # projections (SwiGLU/QKV/norm), naturality
 python main.py --large-batch 4096  # measured large-batch timing
-python -m pytest tests/ -q         # 71 tests
+python -m pytest tests/ -q         # 74 tests
 python bench_gpu.py                # same table on CUDA
 ```
 

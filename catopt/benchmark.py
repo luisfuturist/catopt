@@ -39,10 +39,17 @@ def _bench_once(model: torch.nn.Module, x: torch.Tensor,
         torch.cuda.synchronize()
 
     times: list[float] = []
+    is_cuda = torch.cuda.is_available() and x.is_cuda
     for _ in range(repeats):
+        # CUDA calls are async: sync before AND after so the measured
+        # interval covers kernel execution, not just submission.
+        if is_cuda:
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.no_grad():
             _ = model(x)
+        if is_cuda:
+            torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1000)  # ms
 
     times.sort()

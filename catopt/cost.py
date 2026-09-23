@@ -120,6 +120,16 @@ def _infer_op_shape(op: Op):
             out = list(base)
             out[dim] = (base[dim] or 0) // n
             return tuple(out)
+        case "split":
+            base = shapes[0]
+            if base is None:
+                return None
+            dim = op.attrs.get("dim", -1) % len(base)
+            sizes = op.attrs.get("sizes", ())
+            idx = op.attrs.get("index", 0)
+            out = list(base)
+            out[dim] = sizes[idx] if idx < len(sizes) else 0
+            return tuple(out)
         case _:
             return shapes[0]
 
@@ -180,7 +190,7 @@ _OP_FLOPS: dict[str, int] = {
     "transpose": 0, "reshape": 0, "broadcast": 0, "linear": 2,
     # concat/chunk are wire juxtaposition / projection: pure data
     # movement, zero FLOPs.  On weights they are compile-time work.
-    "concat": 0, "chunk": 0,
+    "concat": 0, "chunk": 0, "split": 0,
     # contiguous copies memory (0 FLOPs but real bandwidth — the
     # roofline model prices it); sdpa ~2*T work per output element.
     "contiguous": 0, "sdpa": 2,
@@ -188,7 +198,8 @@ _OP_FLOPS: dict[str, int] = {
 
 #: Ops that produce no kernel — views or wire bookkeeping.  Exempt from
 #: the launch penalty and from count_cost.
-_VIEW_OPS = {"transpose", "reshape", "broadcast", "concat", "chunk", "leaf"}
+_VIEW_OPS = {"transpose", "reshape", "broadcast", "concat", "chunk",
+             "split", "leaf"}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.
@@ -313,7 +324,7 @@ def _is_strided(term: Any) -> bool:
     stride of 2x the logical row.  chunk on any other dim yields
     contiguous blocks.
     """
-    if not (isinstance(term, Op) and term.op == "chunk"):
+    if not (isinstance(term, Op) and term.op in ("chunk", "split")):
         return False
     s = _infer_op_shape(term)
     if not isinstance(s, tuple) or not s:

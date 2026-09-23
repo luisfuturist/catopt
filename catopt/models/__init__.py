@@ -179,6 +179,75 @@ class NormLinear(nn.Module):
         return self.proj(x * rms * self.norm_weight)
 
 
+class TransformerBlock(nn.Module):
+    """Decoder block: ``x + attn(norm(x)); x + swiglu(norm(x))``.
+
+    Stacks every product-structure opportunity in one graph:
+
+    * channel-gain fold into the q/k/v weights,
+    * fused QKV (one GEMM → three head projections),
+    * channel-gain fold into the gate/up weights,
+    * fused SwiGLU gate/up,
+    * residual adds (monoid structure).
+
+    The two norms are RMSNorm-style (``x * rms * w``).
+    """
+
+    def __init__(self, dim: int, n_heads: int = 8,
+                 hidden_mult: int = 4, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.norm1_w = nn.Parameter(torch.ones(dim))
+        self.norm2_w = nn.Parameter(torch.ones(dim))
+        self.attn = AttentionBlock(dim, n_heads)
+        h = dim * hidden_mult
+        self.gate = nn.Linear(dim, h, bias=False)
+        self.up = nn.Linear(dim, h, bias=False)
+        self.down = nn.Linear(h, dim, bias=False)
+
+    def _rms(self, t: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + self.eps)
+        return t * rms * w
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self._rms(x, self.norm1_w))
+        n = self._rms(x, self.norm2_w)
+        x = x + self.down(F.silu(self.gate(n)) * self.up(n))
+        return x
+
+
+class GQAAttention(nn.Module):
+    """Grouped-query attention: q has ``n_heads``, k/v have ``n_kv_heads``.
+
+    Fused QKV here requires an *asymmetric* split — the fused GEMM output
+    is ``[n_heads*d | n_kv*d | n_kv*d]`` — which is what real inference
+    stacks implement (vLLM's ``QKVParallelLinear``).  ``torch.chunk``
+    cannot express it; the IR needs a ``split`` with explicit sizes.
+    """
+
+    def __init__(self, dim: int, n_heads: int = 8, n_kv_heads: int = 2) -> None:
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = dim // n_heads
+        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale,
+                                           enable_gqa=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.dim)
+        return self.out_proj(out)
+
+
 class MatrixChain(nn.Module):
     """Three sequential matmuls — demonstrates associativity optimization.
 
