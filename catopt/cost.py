@@ -47,7 +47,9 @@ def _infer_op_shape(op: Op) -> tuple | None:
                 return a[:-1] + (b[-1],)
             return shapes[0]
         case "add" | "mul" | "sub" | "div":
-            return shapes[0]
+            # Element-wise ops broadcast: result is the broadcast shape,
+            # not simply the first operand's shape.
+            return _broadcast(shapes[0], shapes[1] if len(shapes) > 1 else None)
         case (
             "square" | "sqrt" | "neg" | "sigmoid" | "silu" | "tanh"
             | "gelu" | "rsqrt" | "exp"
@@ -83,6 +85,30 @@ def _infer_op_shape(op: Op) -> tuple | None:
             return tuple(reversed(shapes[0])) if shapes[0] else shapes[0]
         case _:
             return shapes[0]
+
+
+def _broadcast(a, b):
+    """Broadcast two tensor shapes (numpy/PyTorch semantics)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    ndim = max(len(a), len(b))
+    a_pad = (1,) * (ndim - len(a)) + tuple(a)
+    b_pad = (1,) * (ndim - len(b)) + tuple(b)
+    out = []
+    for da, db in zip(a_pad, b_pad):
+        if da is None or db is None:
+            out.append(None)
+        elif da == 1:
+            out.append(db)
+        elif db == 1:
+            out.append(da)
+        elif da == db:
+            out.append(da)
+        else:
+            out.append(None)  # shape error; treat as unknown
+    return tuple(out)
 
 
 def _numel(shape) -> int:

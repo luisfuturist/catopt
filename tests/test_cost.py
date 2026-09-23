@@ -29,6 +29,28 @@ def test_count_cost_view_ops():
     assert count_cost(op) == 0.0
 
 
+def test_broadcast_shape_inference():
+    """Elementwise ops must broadcast, not take shapes[0].
+
+    Regression test: a missing broadcast here previously made the cost
+    model credit mul((B,T,1),(B,T,C)) with only B*T elements, which
+    fabricated a 1.98x 'optimization' out of two identical forms.
+    """
+    from catopt.cost import _infer_op_shape
+
+    a = Var("a", TensorType((4, 8, 1)))
+    b = Var("b", TensorType((4, 8, 32)))
+
+    assert _infer_op_shape(Op.make("mul", a, b)) == (4, 8, 32)
+    assert _infer_op_shape(Op.make("add", a, b)) == (4, 8, 32)
+    assert _infer_op_shape(Op.make("mul", b, a)) == (4, 8, 32)
+
+    # The two broadcast orderings must cost the same — they are the same work.
+    c1 = flops_cost(Op.make("mul", a, b))
+    c2 = flops_cost(Op.make("mul", b, a))
+    assert c1 == pytest.approx(c2)
+
+
 def test_flops_cost_scalar():
     c = Const(2.0)
     assert flops_cost(c) == 0.0

@@ -222,7 +222,7 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | MatrixChain b=128  | yes (7e-09) | 0.048 | 0.030 | **1.60×** |
 | MatrixChain b=4096 | yes (5e-09) | 0.240 | 0.039 | **6.22×** |
 | SwiGLU   | yes (0.0)   | — | — | 1.00× (cost unchanged, 802,816 FLOPs) |
-| RMSNorm  | yes (2e-07) | — | — | **1.98×** FLOPs (4,256→2,148) |
+| RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
 
 Both paths go through `torch.compile`, so the comparison isolates the
 representation: same backend, same model, same weights — only the graph
@@ -240,10 +240,30 @@ handed to TorchInductor differs.
   equivalence but find no strictly cheaper form. Reporting that is the point:
   a rule system that always "wins" would be measuring its cost model, not the
   compiler.
-* **RMSNorm genuinely improves (1.98×).** Here the e-graph finds a form that
-  hoists `rsqrt` onto the reduced `(B, T, 1)` tensor instead of the broadcast
-  `(B, T, C)` tensor. That is a real, semantics-preserving FLOP reduction that
-  the exported graph does not express.
+* **RMSNorm reports 1.00×, and an earlier 1.98× claim was a cost-model bug.**
+  A version of this table showed 1.98× because `cost._infer_op_shape` returned
+  `shapes[0]` for elementwise ops instead of the broadcast shape, so
+  `mul((B,T,1),(B,T,C))` was costed on `(B,T,1)`. Both candidate forms do
+  identical work (verified by inspecting real output shapes). Broadcasting is
+  now handled and the extractor correctly reports 1.000×.
+
+### Known limitations of the current results
+
+* **MatrixChain is a degenerate model.** Three consecutive linear layers with
+  no nonlinearity between them are exactly equivalent to one linear layer, so
+  a practitioner would merge them by hand (measured: hand-fusing gives 5.88×,
+  essentially the same as what catopt finds). The transformation catopt
+  discovers is matrix-chain reordering — a textbook dynamic-programming
+  problem. So condition 3 of the 5-point claim holds (Inductor does *not*
+  produce it), but condition 4's premise — that it is *difficult* for
+  conventional optimizers — is **not** yet demonstrated. Inductor plausibly
+  could do this and doesn't; it is not shown to be unable to.
+* **Weight folding is inference-only.** `x @ (W1@W2@W3)` is value-preserving
+  during training, but folding destroys per-layer gradients, so it is only
+  sound on frozen graphs.
+* **The hypothesis is still open.** No transformation has yet been found that
+  is non-obvious to a human, genuinely missed by pattern-matching optimizers,
+  and confirmed by a correct cost model. That is the actual bar.
 
 ### Reproduce
 
