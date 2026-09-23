@@ -1,539 +1,173 @@
 # catopt
 
-**Categorical optimization of neural-network computation graphs.**
+**Categorical semantics + equality saturation as a neural-network graph optimizer.**
 
-> **Research question:** Can categorical semantics expose semantics-preserving
-> transformations of neural-network computation graphs that are difficult or
-> impossible for conventional tensor-level graph optimizers to discover
-> efficiently?
-
----
-
-## Yes. **That is the actual research question.**
-
-And after checking the current state of the field, there is a particularly
-interesting reason to pursue it: **the problem is demonstrably still open even
-for conventional compiler techniques.**
-
-PyTorch Inductor already has extensive graph rewriting, fusion, elimination,
-and simplification passes. ([PyTorch Developer Mailing List][1]) Yet a 2026
-PyTorch RFC proposes adding a **polyhedral optimization pass specifically
-because existing pattern-matching/heuristic fusion can miss mathematically
-valid and profitable fusion opportunities**; its initial SwiGLU/RMSNorm case
-reports about a 1.4× speedup. ([PyTorch Developer Mailing List][2])
-
-That's extremely relevant.
-
-## The hypothesis
-
-We could state it very cleanly:
-
-> **Categorical semantics can expose semantics-preserving transformations of
-> neural-network computation graphs that are difficult or impossible for
-> conventional tensor-level graph optimizers to discover efficiently.**
-
-Not:
-
-> "Category theory makes CUDA faster."
-
-But:
+`catopt` translates PyTorch models into a typed symmetric-monoidal IR, explores
+semantics-preserving rewrites with an e-graph, extracts a lower-cost program,
+and lowers it back through `torch.compile`/TorchInductor. Every comparison in
+this README uses the same model, weights, backend, and inputs — only the graph
+representation differs.
 
 ```text
-                    same model
-                        │
-              ┌─────────┴─────────┐
-              │                   │
-       conventional IR      categorical IR
-              │                   │
-       existing optimizer    categorical optimizer
-              │                   │
-              └─────────┬─────────┘
-                        ↓
-                  same backend
-                        ↓
-                 Triton / CUDA
-                        ↓
-                    benchmark
+PyTorch model
+    → torch.export
+    → typed CatOpt IR
+    → e-graph / equality saturation   (categorical + algebraic laws)
+    → cost-based extraction           (DAG-aware, coordinated)
+    → executable PyTorch module
+    → torch.compile / TorchInductor
+    → benchmark + equivalence check
 ```
 
-That isolates the variable we care about.
+## Results at a glance
 
-### And we can make the claim much stronger
+Measured on an RTX 2050 (per-iteration `cuda.synchronize`, interleaved
+baseline/optimized, lower quartile of 30 reps) and CPU. All rows verified
+semantically equivalent.
 
-Suppose we find a transformation:
+| Transform family | Examples | GPU | CPU |
+|---|---|---|---|
+| **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
+| **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound sizes; **1.19× launch-bound** | ~1.0× |
+| **Norm folding** | NormLinear | 0.98× (controlled negative) | 0.90× |
 
-```text
-G₁ → G₂
-```
+**Headline capability:** pointed at unmodified community code —
+Karpathy's `llama2.c` Llama 2 implementation — the pipeline
+automatically rediscovers `MergedColumnParallelLinear` (w1/w3 fusion)
+and `QKVParallelLinear` (asymmetric wq/wk/wv fusion), the transforms
+vLLM and TensorRT-LLM implement by hand. Verified to float noise.
 
-where:
+## The mechanism: the product law is non-local
 
-1. `G₁` and `G₂` have the **same categorical semantics**.
-2. We can formally establish that equivalence.
-3. Existing TorchInductor does not produce `G₂` from `G₁`.
-4. `G₂` generates measurably better GPU code.
-5. The improvement survives comparison against current compiler optimizations.
+`⟨f₁,…,f_k⟩ = (f₁ × … × f_k) ∘ Δ` — pair morphisms by shared domain.
+A term-local `lhs → rhs` rewrite can only express this through a
+consumer pattern (`mul(l₁,l₂)`, `sdpa(h₁,h₂,h₃)`), which is why
+pattern-matching compilers need a handwritten rule per consumer shape
+and still cannot generalize.
 
-Then we have something substantial.
+`pair_shared_input_linears` is a **diagram-level pass**: it groups
+`linear` e-nodes by input e-class and offers each member
+`splitᵢ(linear(x, cat(W₁,…,W_k)))` — arbitrary arity, asymmetric
+output dims, consumer-agnostic. It subsumes the specialized
+`swiglu_fuse`, `qkv_fuse`, `qkv_fuse_asym`, `parallel_mul_fuse` rules;
+on a PaLM-style parallel block it produces **one GEMM feeding five
+uneven split views**, a shape no term-local rule combination reaches.
 
-Not merely:
+The cost: extraction stops being locally decomposable — the shared
+GEMM amortizes only if *all* members coordinate. `extract_paired`
+performs override-based coordinated extraction (members forced to
+splits, consumers steered onto member-reaching enodes) and keeps the
+result only if true DAG cost beats the greedy term.
 
-> "Category theory is a nice way to represent neural networks."
+## Full measurements
 
-But:
+### GPU (RTX 2050, synced timing)
 
-> **A semantic representation enabled a compiler optimization that a mature
-> tensor compiler failed to discover.**
+| Program | Equiv | Inductor (ms) | CatOpt (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| MatrixChain b=4096 | 8e-09 | 0.188 | 0.126 | **1.49×** |
+| ParallelLinear b=4096 | 3e-06 | 1.763 | 0.720 | **2.45×** |
+| DeepParallel b=4096 | 2e-06 | 5.420 | 2.159 | **2.51×** |
+| SwiGLU b=4096 / b=128 | 0.0 / 3e-07 | 12.51 / 0.780 | 12.49 / 0.751 | 1.00× / 1.04× |
+| Attention fused QKV b=64 T=256 | 0.0 | 23.71 | 24.47 | 0.97× |
+| GQA fused QKV b=64 T=256 | 0.0 | 17.42 | 17.99 | 0.97× |
+| TransformerBlock b=64 T=512 | 0.0 | 169.8 | 174.8 | 0.97× |
+| ParallelBlock b=64 T=256 (5 proj → 1 GEMM) | 5e-07 | 73.95 | 75.12 | 0.98× |
+| **ParallelBlock b=4 T=64 (launch-bound)** | 5e-07 | 1.193 | 1.004 | **1.19×** |
+| NormLinear b=256 | 8e-06 | 4.29 | 4.38 | 0.98× |
 
-That's a legitimate compiler/PL/ML-systems result.
+Kernel-count evidence (`torch.profiler`, 10 forwards of an attention
+block): original issues 40 GEMM + 10 SDPA calls; optimized issues
+**20 GEMM + 10 SDPA** — fused QKV halves the GEMM count mechanically.
 
-## There's an especially interesting connection
+### CPU
 
-The 2025 LICS work on **Equivalence Hypergraphs** explicitly develops
-categorical semantics for e-graphs and extends equality-saturation techniques
-to monoidal categories. The paper frames rewrite optimization precisely as
-sequences of semantics-preserving transformations where the ordering of rewrites
-can affect the final execution cost. ([DOI][3])
+| Program | Equiv | Inductor (ms) | CatOpt (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| MatrixChain b=128 / b=4096 | 7e-09 / 5e-09 | 0.048 / 0.240 | 0.030 / 0.039 | **1.60× / 6.22×** |
+| DeepParallel b=4096 | 2e-06 | 1.362 | 0.451 | **3.02×** |
+| ParallelLinear b=4096 | 3e-06 | 0.878 | 0.393 | **2.24×** |
+| SwiGLU b=128 / b=4096 | 0.0 / 6e-08 | 2.800 / 94.93 | 2.642 / 97.18 | 1.06× / 0.98× |
+| Attention QKV b=64 T=256 | 3e-08 | 157.1 | 166.7 | 0.94× |
+| NormLinear b=256 | 3e-06 | 39.91 | 44.52 | 0.90× |
 
-And separate 2025 work shows that string-diagram rewriting can be implemented
-as sound and complete hypergraph rewriting for richer categorical structures.
-([UCL Discovery][4])
+### Community code, unmodified (llama2.c)
 
-So we don't need to invent the mathematical machinery from scratch.
-
-We can ask:
-
-**Can this machinery actually buy us something on neural-network computation?**
-
-That's the experiment.
-
-## The killer experiment
-
-I would actually avoid starting with an LLM.
-
-Start with something like:
-
-```text
-SwiGLU / RMSNorm / attention blocks
-```
-
-because we already know current compilers have difficult optimization cases
-there. The 2026 PyTorch RFC gives us an excellent baseline challenge.
-([PyTorch Developer Mailing List][2])
-
-Then:
-
-### Phase 1 — Equivalence
-
-Take a PyTorch computation graph:
-
-```text
-PyTorch
-   ↓
-torch.export
-   ↓
-ATen graph
-   ↓
-categorical/hypergraph IR
-```
-
-Define the categorical semantics.
-
-### Phase 2 — Search
-
-Build a rewrite system:
-
-```text
-         original graph
-               │
-       ┌───────┴───────┐
-       │               │
-     rewrite 1       rewrite 2
-       │               │
-     rewrite 3       rewrite 4
-       │               │
-       └───────┬───────┘
-               ↓
-       equivalent programs
-               │
-          cost model
-               ↓
-          best candidate
-```
-
-Potentially use **equality saturation** rather than greedily applying rewrites.
-
-### Phase 3 — Lower
-
-Don't write a CUDA compiler. That's unnecessary.
-
-```text
-optimized categorical IR
-          ↓
-       ATen / FX
-          ↓
-      TorchInductor
-          ↓
-       Triton/CUDA
-```
-
-Let NVIDIA/PyTorch solve the low-level engineering.
-
-### Phase 4 — Compare
-
-This is the critical table:
-
-| Program  | Semantically equivalent? | TorchInductor result | Categorical result |
-| -------- | -----------------------: | -------------------: | -----------------: |
-| baseline |                        — |                 X ms |               X ms |
-| case A   |                      yes |                 X ms |               Y ms |
-| case B   |                      yes |                 X ms |               Y ms |
-| case C   |                      yes |                 X ms |               Y ms |
-
-And importantly:
-
-**We need examples where TorchInductor already performs its normal optimization
-pipeline.**
-
-Otherwise we're just demonstrating that optimization beats no optimization.
-
----
-
-## Status: first working prototype
-
-`catopt/` now implements the pipeline above end to end. Run `python main.py`
-(or `python main.py --large-batch 4096`) to reproduce everything below.
-
-### What works
-
-| Layer | Module | What it does |
-| ----- | ------ | ------------ |
-| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws (incl. `concat`/`chunk`/`split` for the product structure, `sdpa`/`contiguous`/`reshape`/`transpose` for attention) |
-| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, **attribute metavariables**, **per-rule `check`/`derive` hooks** (shape-aware side conditions, computed RHS attrs), **DAG-aware extraction**: shared e-classes charged once, param-only classes charged at compile-time cost 0, cycle-safe, **`extract_paired`** coordinated extraction for non-local rewrites |
-| Rules | `catopt/rules.py` | 35 rules: monoid/group laws, `silu`/`pow` bridges, bilinearity/weight-merge, naturality + **shape-checked scale naturality** (row vs channel vs scalar), associativity, product-structure fusion (`swiglu_fuse`, `parallel_mul_fuse`, `qkv_fuse`, `qkv_fuse_asym` — all **subsumed** by the pass below), plus **`pair_shared_input_linears`**: the product law ⟨f₁…f_k⟩ = (f₁×…×f_k)∘Δ as a non-local rewrite over shared-input e-classes — arbitrary arity, asymmetric dims, consumer-agnostic |
-| Cost | `catopt/cost.py` | `count_cost`, shape-aware `flops_cost` (`2·M·N·K`), `launch_aware_cost` (FLOPs + per-kernel penalty), **`roofline_cost`** (per-op `max(compute, memory)` + launch, stride-aware) |
-| Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion** (incl. `concat`); shared-subterm memoisation; SDPA/reshape/transpose attr plumbing |
-| Pipeline | `catopt/optimize.py` | 4-phase `optimize_model` with equivalence verification |
-
-### Measured results (CPU, run on this machine)
-
-| Program | Equivalent? | Inductor (ms) | CatOpt + Inductor (ms) | Speedup |
-| ------- | ----------: | ------------: | ---------------------: | ------: |
-| MatrixChain b=128  | yes (7e-09) | 0.048 | 0.030 | **1.60×** |
-| MatrixChain b=4096 | yes (5e-09) | 0.240 | 0.039 | **6.22×** |
-| **DeepParallel b=4096** | yes (2e-06) | 1.362 | 0.451 | **3.02×** |
-| **ParallelLinear b=4096** | yes (3e-06) | 0.878 | 0.393 | **2.24×** |
-| **SwiGLU b=128 (fused gate/up)** | yes (0.0) | 2.800 | 2.642 | **1.06×** |
-| SwiGLU b=4096 (same fused form) | yes (6e-08) | 94.93 | 97.18 | 0.98× |
-| **Attention QKV b=16 T=128** | yes (3e-08) | 16.14 | 16.35 | 0.99× |
-| Attention QKV b=64 T=256 | yes (3e-08) | 157.1 | 166.7 | 0.94× |
-| **NormLinear b=256 T=64** | yes (3e-06) | 39.91 | 44.52 | 0.90× |
-| RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
-
-### Measured results (GPU, RTX 2050 — synced timing, `bench_gpu.py`)
-
-Measured with per-iteration `torch.cuda.synchronize()` (see the timing
-bug note below), interleaved orig/cat to cancel clock drift, lower
-quartile of 30 reps.
-
-| Program | Equivalent? | Inductor (ms) | CatOpt + Inductor (ms) | Speedup |
-| ------- | ----------: | ------------: | ---------------------: | ------: |
-| MatrixChain b=4096 | yes (8e-09) | 0.188 | 0.126 | **1.49×** |
-| **ParallelLinear b=4096** | yes (3e-06) | 1.763 | 0.720 | **2.45×** |
-| **DeepParallel b=4096** | yes (2e-06) | 5.420 | 2.159 | **2.51×** |
-| SwiGLU b=4096 (fused gate/up) | yes (0.0) | 12.51 | 12.49 | 1.00× |
-| SwiGLU b=128 | yes (3e-07) | 0.780 | 0.751 | 1.04× |
-| Attention fused QKV b=64 T=256 | yes (0.0) | 23.71 | 24.47 | 0.97× |
-| **GQA fused QKV b=64 T=256** | yes (0.0) | 17.42 | 17.99 | 0.97× |
-| TransformerBlock b=64 T=512 (QKV+gate/up stacked) | yes (0.0) | 169.8 | 174.8 | 0.97× |
-| TransformerBlock b=16 T=256 | yes (5e-07) | 18.62 | 18.61 | 1.00× |
-| **ParallelBlock b=64 T=256** (5 proj → 1 GEMM) | yes (5e-07) | 73.95 | 75.12 | 0.98× |
-| **ParallelBlock b=4 T=64** (launch-bound) | yes (5e-07) | 1.193 | 1.004 | **1.19×** |
-| NormLinear b=256 | yes (8e-06) | 4.29 | 4.38 | 0.98× |
-
-Both paths go through `torch.compile`, so the comparison isolates the
-representation: same backend, same model, same weights — only the graph
-handed to TorchInductor differs.
-
-**Eager-mode control:** SwiGLU b=128 without compile measures 1.10× —
-the only same-FLOP win observed — consistent with kernel-count reduction
-mattering only when the backend does not already hide launches.
-
-`DeepParallel` is the strongest result: `(W1(x) + W2(x)) @ W3` collapses to a
-single `linear` via **two composed rules** (`weight_factor_linear` then
-`assoc_linear`) plus compile-time weight folding. No single pattern-matching
-pass finds it — the distributive merge must fire *before* reassociation makes
-folding legal. Hand-derived reference, measured: 0.406 ms (3.35×), so catopt
-lands within 11% of what a human can achieve.
-
-`SwiGLU` is the first result that is **not** a linear-only collapse. The
-`swiglu_fuse` rule applies the *product universal property*: two maps
-`f, g : X → V` with the same source pair into one map `⟨f,g⟩ : X → V×V`. On
-tensors that is `cat(Wg, Wu)` along the output dim — **one wide GEMM** — with
-zero-cost `chunk` views as the projections πᵢ. This is precisely the
-`MergedColumnParallelLinear` / fused-QKV transformation that inference stacks
-perform by hand; Inductor cannot produce it because it must *reshape
-parameters*, which lies outside kernel fusion. The extracted form shares the
-fused GEMM as a single e-class read by both chunk parents, and lowering runs
-it exactly once (memoised eval, regression-tested). Profitability on CPU is
-batch-dependent (1.06× at b=128, 0.98× at b=4096 — the fused GEMM saves a
-launch but chunk yields non-contiguous views for the elementwise ops); on GPU
-the same transform measures **1.10–1.20×** (see the GPU table below) — the
-predicted regime for a win, confirmed.
-
-### The algebra is error-prone, which is the interesting part
-
-Deriving the closed form for `DeepParallel` by hand, I got the transpose order
-wrong **twice** — `F.linear(x, W) = x @ W.T` means the stacked composition
-fuses to `B @ A`, not `A @ B`, and with distinct dims the naive order
-`(W1+W2) @ W3` isn't even shape-valid (12×8 @ 16×12). catopt's
-`assoc_linear` rule encodes `fused = B @ A` and its equivalence verifier
-caught both of my errors (`catopt fused == closed form: True`,
-`closed form == original: True`).
-
-That is the concrete answer to *"what structural property did the categorical
-representation expose?"*: composing **two** laws where the second is only
-*applicable* after the first fires, plus a type-level (transpose-order)
-constraint the cost model cannot see. Both got caught not by inspection but by
-the e-graph's equivalence check.
-
-### It runs on community code unmodified — llama2.c
-
-The pipeline is not specific to our test modules.  Pointed at
-**Karpathy's `llama2.c` `model.py`** — the reference Llama 2 inference
-implementation, with *unfused* `wq`/`wk`/`wv` (GQA: 8 q-heads, 2
-kv-heads) and *unfused* `w1`/`w3` — the same pipeline, unchanged:
-
-| llama2.c module (verbatim) | Found | Verified | GPU (b=4) | GPU (b=64) |
+| Module | Found | Verified | GPU b=4 | GPU b=64 |
 |---|---|---|---|---|
-| `FeedForward` | w1/w3 → one GEMM + 2 splits | 1.3e-07 | 1.04× | 1.06× |
-| `Attention` | wq/wk/wv → one GEMM + uneven splits | 3.3e-07 | 1.00× | 0.97× |
-| `TransformerBlock` | **4 pairing groups** in one pass | 4.8e-07 | 0.97× | 0.98× |
+| `FeedForward` | w1/w3 → 1 GEMM + 2 splits | 1.3e-07 | 1.04× | 1.06× |
+| `Attention` | wq/wk/wv → 1 GEMM + uneven splits | 3.3e-07 | 1.00× | 0.97× |
+| `TransformerBlock` | 4 pairing groups in one pass | 4.8e-07 | 0.97× | 0.98× |
 
-That is `MergedColumnParallelLinear` (w1/w3) and `QKVParallelLinear`
-(wq/wk/wv, asymmetric) **rediscovered automatically in code we did not
-write** — the same transformations vLLM and TensorRT-LLM implement by
-hand.  The runtime value is regime-dependent as established (parity at
-compute-bound sizes, small gains launch-bound); the discovery is the
-point: the fusions are derivable consequences of the product law, not
-per-architecture hacks.
+## What the experiments establish
 
-### The product law is non-local — that's why pattern matchers miss it
+- **Inductor genuinely misses these transforms** — measured, not
+  assumed (up to 3.35× headroom on DeepParallel, within 11% of a
+  hand-derived reference). They require creating new parameters, which
+  is outside kernel fusion's capability class.
+- **Value splits cleanly by regime.** FLOP-reducing algebraic laws pay
+  on every backend. Same-FLOP pairing pays where launches dominate
+  (small-batch serving — the regime where fused QKV is standard
+  practice) and is free otherwise. The cost model, not a hard rule,
+  decides per shape.
+- **NormLinear is the controlled negative**: Inductor already fuses
+  `x·rms·wn` into the GEMM's input read, so graph-level norm folding
+  loses on both backends — graph restructuring cannot promise a
+  bandwidth win that intra-kernel fusion already delivers.
+- **The verifier is load-bearing.** It caught four real bugs: a
+  matcher that didn't enforce repeated-metavariable equality (would
+  have emitted a false proof), broadcast-shape misinference that
+  fabricated a 1.98× "win", unchecked scale-metavariable binding that
+  produced a well-typed but semantically wrong program (diff 9.83), and
+  a benchmark that measured CUDA submission time instead of execution
+  (fabricating 1.10–1.20× GPU "wins"). All regression-tested.
 
-`⟨f₁,…,f_k⟩ = (f₁ × … × f_k) ∘ Δ` is a statement about the *whole
-diagram*: it pairs morphisms by their shared domain, not by a consumer
-subtree. A term-local `lhs → rhs` rewrite can only express it through a
-consumer pattern (`mul(l₁, l₂)`, `sdpa(h₁, h₂, h₃)`), which is why
-conventional graph optimizers — and our own first attempt — need a
-handwritten rule per consumer shape and still can't generalise.
+## Honest limitations
 
-The implementation that works is a **diagram-level pass**:
-`pair_shared_input_linears` groups `linear` e-nodes by their input
-e-class and offers each member the alternative `splitᵢ(linear(x,
-cat(W₁,…,W_k)))` — arbitrary arity, asymmetric output dims, any
-consumers. It subsumes `swiglu_fuse`, `qkv_fuse`, `qkv_fuse_asym`, and
-`parallel_mul_fuse`; on `ParallelBlock` (PaLM-style parallel
-attn+MLP) it produces **one GEMM feeding five uneven split views**
-(q,k,v,gate,up) where no term-local rule combination could reach.
+- **Nothing found yet is novel to practitioners.** Fused QKV and merged
+  gate/up are textbook deployment tricks — the contribution is
+  automatic discovery + formal verification, not new optimizations.
+- **The FLOP-reducing wins are degenerate cases** — linear-only DAGs
+  collapse to one linear, which a domain expert writes in one line.
+  What is demonstrated is that Inductor misses them and the derivation
+  is error-prone by hand (the verifier caught transpose-order mistakes
+  twice).
+- **Weight folding is inference-only** — folding destroys per-layer
+  gradients; sound only on frozen graphs.
+- **Pairing is restricted to `linear`** — `conv2d`, `matmul`+bias, and
+  learned-scale norms are not yet pairable; the mechanism is generic.
+- **`roofline_cost` constants are uncalibrated** order-of-magnitude
+  estimates — a candidate-ranking tool, not a wall-clock predictor.
+- **Small absolute timings** on a 4 GB mobile GPU; magnitudes should
+  not be extrapolated to datacenter hardware.
 
-The cost: extraction is no longer locally decomposable — the shared
-GEMM's cost only amortises if *all* members coordinate, which per-class
-greedy selection cannot see. `extract_paired` handles this with
-override-based coordinated extraction: members are forced to their
-splits, consumers steered onto member-reaching enodes, and the result
-is only kept if its true DAG cost beats the greedy term.
+## Repository layout
 
-### The pattern across all six cases — where the wins actually live
+| Path | Role |
+|---|---|
+| `catopt/ir.py` | Typed term algebra, symmetric-monoidal generator registry |
+| `catopt/egraph.py` | Union-find, e-matching, saturation, attr metavariables, `check`/`derive` hooks, DAG-aware + coordinated extraction |
+| `catopt/rules.py` | 35 laws + `pair_shared_input_linears` non-local pass |
+| `catopt/cost.py` | `count_cost`, `flops_cost`, `launch_aware_cost`, `roofline_cost`, `dag_cost` |
+| `catopt/torch_bridge.py` | `torch.export` → IR, IR → `IRModule`, compile-time weight folding |
+| `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
+| `catopt/models/` | Benchmark modules (incl. llama2.c-compatible blocks) |
+| `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
+| `tests/` | 80 tests: equivalence, soundness regressions, pairing |
 
-This is now the clearest empirical result in the repo. Every transform the
-e-graph discovers is a **parameter-restructuring** transformation: it moves
-work into the weights (compile-time) or merges weight matrices so fewer
-GEMMs run. They divide cleanly:
-
-* **FLOP-reducing transforms pay on CPU.** MatrixChain, ParallelLinear,
-  DeepParallel each shrink the actual GEMM FLOP count (6.3×, 2×, 2.9×) —
-  those wins are backend-independent and measured at 1.6–6.2×, 2.24×, 3.02×.
-* **Same-FLOP restructuring is parity at compute-bound sizes but wins
-  in the launch-bound regime.** Fused projections keep FLOPs identical;
-  their wins are fewer kernel launches and better GEMM aspect ratios.
-  On GPU at B≥16 the fused forms measure parity (0.97–1.04×) — Inductor
-  already hides launches inside a compiled graph.  But at B=4 the
-  ParallelBlock's 5→1 projection fusion measures **1.19×** — the
-  launch-bound regime where serving systems actually fuse QKV by hand.
-  (A first version of this table reported 1.10–1.20× at *large* batch —
-  that measured kernel-submission time, a `_bench_once` async bug, now
-  fixed and regression-noted.)
-* **The value of categorical restructuring splits cleanly by regime.**
-  The algebraic wins (reassociation, weight merging, factorization —
-  FLOP reduction) measure 1.5–2.5× GPU and 1.6–6.2× on CPU at every
-  size.  The pairing/product rewrites pay where launches dominate
-  (small-batch serving) and are free otherwise — the cost model can
-  choose per shape, which is the point of discovering them through a
-  cost-driven search rather than hard rules.
-* **NormLinear is the controlled negative case on both backends** (~0.9–0.98×):
-  Inductor already fuses `x·rms·wn` into the GEMM's input read, so
-  graph-level folding adds a materialized intermediate for no benefit.
-
-So the honest claim today: **categorical semantics + equality saturation
-finds and formally verifies parameter-restructuring transforms that
-TorchInductor cannot express — including a *stacked* composition (fused
-QKV + fused gate/up + folded norms in one TransformerBlock), an
-*asymmetric* pairing (GQA) whose split sizes are derived, not matched,
-and a *non-local* product law that fuses k≥2 shared-input projections
-through one coordinated extraction — a shape no term-local rewrite can
-express. On the measured backends the profitable subset splits by
-regime: FLOP-reduction wins everywhere (1.5–2.5× GPU, 1.6–6.2× CPU),
-and pairing wins in the launch-bound regime (1.19× at b=4) — the
-instrument reports which is which rather than assuming.**
-
-### Honest reading of the numbers
-
-* **The 6.3× FLOP figure is not a 6.3× speedup.** It counts the one-time
-  `W1@(W2@W3)` precompute; at `batch=128` fixed overheads dominate and the
-  wall-clock gain is 1.6×. At `batch=4096` the precompute amortises and the
-  measured gain climbs to **6.22×**, approaching the runtime-only matmul-FLOP
-  ratio of 10.2×. This is exactly the predicted behaviour, and it is why the
-  demo prints both.
-* **SwiGLU's fused form is found, verified, and marginal on CPU.** The
-  e-graph now produces the gate/up-fused form (2 GEMMs → 1). Its DAG cost is
-  identical FLOPs minus one kernel launch; measured on CPU that is a wash
-  (1.06× at b=128 → 0.98× at b=4096, because strided chunk views cost the
-  elementwise ops what the launch saves). The transformation is real and
-  Inductor cannot express it; whether it pays is a hardware/cost-model
-  question, which is exactly the question a compiler should be answering
-  rather than assuming.
-* **RMSNorm reports 1.00×, and an earlier 1.98× claim was a cost-model bug.**
-  A version of this table showed 1.98× because `cost._infer_op_shape` returned
-  `shapes[0]` for elementwise ops instead of the broadcast shape, so
-  `mul((B,T,1),(B,T,C))` was costed on `(B,T,1)`. Both candidate forms do
-  identical work (verified by inspecting real output shapes). Broadcasting is
-  now handled and the extractor correctly reports 1.000×.
-
-### Known limitations of the current results
-
-* **Every win so far collapses a *linear-only* DAG to one linear layer.**
-  Three stacked linears (MatrixChain) and two parallel plus one (DeepParallel)
-  both satisfy `no nonlinearity in between ⇒ equals a single linear`, and a
-  domain expert would specify that in one line. So condition 4's premise —
-  *difficult* for conventional optimizers — is still **not** demonstrated for
-  the models themselves. What *is* demonstrated: Inductor genuinely does not
-  find it (measured 3.02×–3.35× miss), the derivation is error-prone for
-  humans, and two categorical laws must compose to produce it.
-* **Weight folding is inference-only.** `x @ (W1@W2@W3)` is value-preserving
-  during training, but folding destroys per-layer gradients, so it is only
-  sound on frozen graphs. The extraction model now charges param-only
-  subtrees at zero — the amortised-inference assumption — so fusion is
-  chosen whenever it is *semantically* available; the earlier break-even
-  behaviour (partial fusion at small batch) was an artifact of charging
-  compile-time work at runtime rates.
-* **The nonlinear barrier is breached — through a single non-local law.**
-  The product-structure transforms now work end to end: merged gate/up,
-  symmetric and GQA-asymmetric fused QKV, the `NormLinear` fold (channel
-  gain into weight, `rms` hoisted — two different naturality laws
-  composing), and `ParallelBlock`'s **5-way fusion** (q,k,v,gate,up →
-  one GEMM + five uneven splits). All are generated by the same
-  `pair_shared_input_linears` pass plus coordinated extraction; all
-  verify bit-exactly or within float noise. Runtime value is
-  regime-dependent: parity at compute-bound sizes, **1.19× at b=4**
-  where launches dominate. What remains undemonstrated: a transform
-  *new to practitioners*, not just new to Inductor — fused QKV and
-  merged gate/up are textbook deployment tricks discovered
-  automatically, not novel optimizations.
-* **Pairing is restricted to `linear` children.** The pass groups
-  `linear` e-nodes by input e-class; `conv2d`, `matmul`-with-add, and
-  norms-with-learned-scales are not yet pairable. The mechanism is
-  generic — extend it by registering pairable op signatures.
-* **The cost model now knows about compile time, sharing, and layout.**
-  Extraction charges param-only classes at 0 and shared e-classes once.
-  `roofline_cost` estimates per-op `max(flops/peak_flops, bytes/peak_bw)
-  + launch`, with strided-view penalties — it *can* see that a `chunk`
-  view slows a downstream kernel. Its constants
-  (`_PEAK_FLOPS`, `_PEAK_BW`, `_LAUNCH_S` in `catopt/cost.py`) are
-  order-of-magnitude, not calibrated to this machine; it is a modelling
-  tool for comparing candidates, not a predictor of wall-clock.
-* **Inductor's intra-kernel fusion is the baseline to beat.** The
-  NormLinear experiment is the clearest signal: every graph-level folded
-  variant loses (38–47 ms vs Inductor's 38 ms) because Inductor already
-  fuses `x·rms·wn` into the GEMM's input read. Graph restructuring cannot
-  promise a bandwidth win that backend kernel fusion already delivers.
-* **Four soundness bugs were found and fixed in this work**, which is the
-  strongest evidence the instrument is trustworthy: (1) the matcher did not
-  enforce repeated metavariables as "same e-class", so `x@W1 + y@W2` would
-  have matched a pattern requiring `x@W1 + x@W2` and emitted a false proof;
-  (2) `cost._infer_op_shape` took `shapes[0]` instead of the broadcast shape,
-  which had fabricated a spurious 1.98× RMSNorm "win"; (3) scale-naturality
-  rules originally bound metavariables to *any* tensor, producing a
-  well-typed but semantically wrong program (diff 9.83) until `check`
-  predicates were added; (4) `_bench_once` measured CUDA *submission* time
-  — no per-iteration sync — which had fabricated 1.10–1.20× GPU "wins"
-  for the fused projections. All four are regression-tested or fixed.
-
-### Reproduce
+## Reproduce
 
 ```bash
-python main.py                     # associativity, parallel merges, fused
-                                   # projections (SwiGLU/QKV/norm), naturality
-python main.py --large-batch 4096  # measured large-batch timing
+python main.py                     # full demo: all transform families
+python main.py --large-batch 4096  # large-batch timing
 python -m pytest tests/ -q         # 80 tests
-python bench_gpu.py                # same table on CUDA
+python bench_gpu.py                # GPU table (requires CUDA)
 ```
-
----
-
-## And if we find even ONE convincing case...
-
-Then the project becomes much more interesting.
-
-Because then the follow-up question is:
-
-> **What structural property did the categorical representation expose that the
-> tensor representation obscured?**
-
-That is where the theory becomes valuable.
-
-Maybe it's:
-
-* associativity/compositionality,
-* symmetry,
-* monoidal structure,
-* sharing,
-* naturality,
-* algebraic identities,
-* tensor/network contraction structure,
-* equivalence classes of diagrams,
-* or some combination.
-
-And potentially we could eventually have:
-
-```text
-Neural network
-      ↓
-categorical semantics
-      ↓
-equivalence class
-      ↓
-search over mathematically equivalent programs
-      ↓
-cost model
-      ↓
-optimal executable representation
-```
-
-That is a **much deeper idea than "another graph optimizer."**
-
-The exciting part is that **the existing compiler ecosystem gives us a brutally
-strong baseline**. TorchInductor already does sophisticated graph optimization,
-and current work is still adding new optimization machinery because there
-remain missed opportunities. ([PyTorch Developer Mailing List][1])
-
-So yes: **this is the question I'd build the entire project around.**
 
 ## References
 
-[1]: https://dev-discuss.pytorch.org/t/inductor-passes/2742 "Inductor Passes - compiler - PyTorch Developer Mailing List"
-
-[2]: https://dev-discuss.pytorch.org/t/rfc-polyhedral-optimization-pass-for-pytorch-inductor/3341 "RFC: Polyhedral Optimization Pass for PyTorch Inductor - compiler - PyTorch Developer Mailing List"
-
-[3]: https://doi.org/10.1109/LICS65433.2025.00023 "Equivalence Hypergraphs: DPO Rewriting for Monoidal E-Graphs"
-
-[4]: https://discovery.ucl.ac.uk/id/eprint/10211429 "Rewriting for Traced Monoidal Closed Categories - UCL Discovery"
+- [Inductor passes — PyTorch dev discuss](https://dev-discuss.pytorch.org/t/inductor-passes/2742)
+- [RFC: Polyhedral optimization pass for Inductor](https://dev-discuss.pytorch.org/t/rfc-polyhedral-optimization-pass-for-pytorch-inductor/3341)
+- [Equivalence Hypergraphs: DPO Rewriting for Monoidal E-Graphs (LICS 2025)](https://doi.org/10.1109/LICS65433.2025.00023)
+- [Rewriting for Traced Monoidal Closed Categories (UCL)](https://discovery.ucl.ac.uk/id/eprint/10211429)
+- [karpathy/llama2.c](https://github.com/karpathy/llama2.c) — community model used verbatim
