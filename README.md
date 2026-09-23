@@ -105,6 +105,13 @@ moves maps across the loop boundary; `tr_expand` bridges any trace
 into ordinary matmul/add/inv algebra — the same carrier laws then
 apply. Recurrences are traces *exactly* via nilpotent block-shift
 encoding: `Tr(F)·[x;h₀]` ≡ the unrolled loop ≡ the affine-scan fold.
+`trace_lift.lift_scan_to_trace` is the non-local bridge — it
+recognizes unrolled-recurrence spines (raw `add(mul…)` chains or
+`apply`/`applyd` carrier trees) in the e-graph and constructs `F`
+directly, unioning `matmul(trace(F, T·d), vec)` into the recurrence's
+e-class. Post-lift, the axioms fire on *real* recurrences: channel
+splitting produces `bdiag(trace(F₁), trace(F₂))`, `tr_expand` reaches
+the resolvent closed form — fp64-exact.
 
 **Rules synthesize themselves.** `meta.synthesize_rules` performs
 critical-pair completion: compose rule pairs on seed terms, validate
@@ -355,10 +362,11 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/om_lower.py` | Level-batched + streaming chunked-attention executors, incremental om state, CUDA graphs/compile |
 | `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
 | `catopt/trace.py` | Traced-monoidal structure: `trace`/`bdiag`/`parl`/`eye`/`cswap`/`inv` + JSV axioms |
+| `catopt/trace_lift.py` | Non-local lift: unrolled recurrences → `trace(F)` via nilpotent block-shift |
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 292 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
+| `tests/` | 327 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
 
 ## Reproduce
 
