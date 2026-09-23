@@ -60,6 +60,7 @@ produces the parallel/decomposed forms.
 | `aff(A,b)` dense affine | `h ↦ Ah+b` | Blelloch parallel scan | **6.3×** (CUDA-graph, T=64) |
 | `aff_diag(a,b)` diagonal affine | `h ↦ a⊙h+b` | elementwise scan (Mamba-faithful SSMs) | **4.4×** (CUDA-graph, T=64) |
 | `om(m,l,a)` online softmax | running max/exp-sum/numerator | chunked/flash attention, streaming KV | memory-feasibility win (below) |
+| `trace^U` feedback | `Tr(f) = P + Q(I−S)⁻¹R` | channel splitting, loop-boundary sliding | iterative↔closed forms |
 | tensor domain | — | folds, pairing, reassociations | up to **8×** |
 
 Executors (`scan_lower.py`, `om_lower.py`) lower discovered trees into
@@ -94,12 +95,28 @@ contentful laws run. On the T=8 recurrence: **2,011,701 → 351 enodes
 (~5,700×), 182s → 0.05s**, same fp64-exact result. This is Mac Lane
 coherence operationalized as a scheduler.
 
+**Feedback is first-class.** `trace^U` (catopt/trace.py) adds the
+traced-monoidal structure: `Tr^U(f) = P + Q(I−S)⁻¹R` — the linear
+fixpoint/resolvent — with all five Joyal–Street–Verity axioms as
+shape-checked rewrites (vanishing, superposing, sliding, tightening,
+yanking). `tr_superpose` splits a joint loop over independent
+recurrence channels into parallel-schedulable traces; `tr_slide`
+moves maps across the loop boundary; `tr_expand` bridges any trace
+into ordinary matmul/add/inv algebra — the same carrier laws then
+apply. Recurrences are traces *exactly* via nilpotent block-shift
+encoding: `Tr(F)·[x;h₀]` ≡ the unrolled loop ≡ the affine-scan fold.
+
 **Rules synthesize themselves.** `meta.synthesize_rules` performs
 critical-pair completion: compose rule pairs on seed terms, validate
-each candidate by replay + fp64 evaluation. Fed
-`SCAN_LAWS \ {aff_lift_step}`, it emits the unfolded equivalent of a
-previously hand-written derived rule. Certified composite paths distill
-back into the law set — the meta-optimization loop is closed.
+each candidate by replay + fp64 evaluation. Guarded rules participate
+soundly — parent `check`s re-express on the derived rule's
+substitution, `derive` outputs flow as namespaced placeholders — so
+**all 109 rules** now feed synthesis. Fed `SCAN_LAWS \
+{aff_lift_step}`, it emits the unfolded equivalent of a previously
+hand-written derived rule; om/attention lemmas (the chunked-attention
+homomorphism, score-concat lift, mask-distribution composites) derive
+themselves. Certified composite paths distill back into the law set —
+the meta-optimization loop is closed.
 
 ## The mechanism: the product law is non-local
 
@@ -317,8 +334,11 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 - **Mask synthesis + `is_causal` chunking**: `OM_MASK_LAWS` distribute
   materialized masks over concat; generating masks from positions
   (`arange`/`tril`) and chunking the `is_causal` flag remain open.
-- **Guarded-rule synthesis**: extend completion to `check`/`derive`
-  rules so the om/attention lemma library derives itself.
+- **Trace beyond linear bodies**: affine/nonlinear loop bodies need
+  constant-1 augmentation or function-valued objects; delay-loop
+  trace with init state needs a stream-function category.
+- **Guarded-rule synthesis**: ✅ done — all 109 rules participate in
+  completion; om/attention lemmas derive themselves.
 
 ## Repository layout
 
@@ -334,9 +354,11 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/om.py` | Online-softmax monoid laws (chunked/streaming attention) |
 | `catopt/om_lower.py` | Level-batched + streaming chunked-attention executors, incremental om state, CUDA graphs/compile |
 | `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
+| `catopt/trace.py` | Traced-monoidal structure: `trace`/`bdiag`/`parl`/`eye`/`cswap`/`inv` + JSV axioms |
+| `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 249 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks |
+| `tests/` | 292 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
 
 ## Reproduce
 

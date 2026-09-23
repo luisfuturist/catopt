@@ -47,6 +47,17 @@ def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
 
 
 def _infer_op_shape(op: Op, memo: dict | None = None):
+    # Zero-argument constant morphisms (catopt.trace): their shapes are
+    # fully determined by attributes, so they must be answered before
+    # the empty-shapes early return below.
+    if op.op == "eye":
+        d = op.attrs.get("dim", op.attrs.get("d", 1))
+        return (d, d) if isinstance(d, int) else (None, None)
+    if op.op == "cswap":
+        d1, d2 = op.attrs.get("d1", 0), op.attrs.get("d2", 0)
+        if isinstance(d1, int) and isinstance(d2, int):
+            return (d1 + d2, d1 + d2)
+        return None
     shapes = [_shape_of(a, memo) for a in op.args]
     if any(s is _INVALID for s in shapes):
         return _INVALID
@@ -254,6 +265,31 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return s
         case "om_compose" | "om_apply":
             return shapes[0]
+        case "trace":
+            # Tr(f): drop the first `usize` rows/cols of the block
+            # matrix f : U⊗X → U⊗Y, leaving the X → Y map.
+            s = shapes[0]
+            if not (isinstance(s, tuple) and len(s) == 2):
+                return s
+            u = op.attrs.get("usize", 0)
+            du = sum(u) if isinstance(u, (list, tuple)) else u
+            if not isinstance(du, int):
+                return s
+            r = s[0] - du if isinstance(s[0], int) else None
+            c = s[1] - du if isinstance(s[1], int) else None
+            return (r, c)
+        case "bdiag" | "parl":
+            # Both are total-dims-preserving matrix juxtaposition:
+            # bdiag is literal block-diagonal; parl re-lays the same
+            # blocks keeping feedback wires first (see catopt.trace).
+            a, b = shapes[0], shapes[1]
+            if (isinstance(a, tuple) and isinstance(b, tuple)
+                    and len(a) == 2 and len(b) == 2
+                    and all(isinstance(d, int) for d in (*a, *b))):
+                return (a[0] + b[0], a[1] + b[1])
+            return a
+        case "inv":
+            return shapes[0]
         case "concat":
             # Variadic cat: sum every operand along the cat axis.
             a = shapes[0]
@@ -354,6 +390,10 @@ _OP_FLOPS: dict[str, int] = {
     # contiguous copies memory (0 FLOPs but real bandwidth — the
     # roofline model prices it); sdpa ~2*T work per output element.
     "contiguous": 0, "sdpa": 2,
+    # Traced-monoidal ops (catopt.trace): wire juxtaposition and
+    # constant morphisms carry no FLOPs; trace/inv are priced in
+    # _flops_of directly (solve cost depends on usize).
+    "bdiag": 0, "parl": 0, "eye": 0, "cswap": 0,
 }
 
 #: Ops that produce no kernel — true views or wire bookkeeping.
@@ -363,7 +403,11 @@ _OP_FLOPS: dict[str, int] = {
 #: runtime cat() is a real copy kernel — it is only free when the whole
 #: subtree is param-only (compile-time fold, handled by extraction).
 _VIEW_OPS = {"transpose", "reshape", "broadcast", "chunk",
-             "split", "leaf", "aff", "om", "aff_diag"}
+             "split", "leaf", "aff", "om", "aff_diag",
+             # Constant morphisms (catopt.trace): zero-arg ops that
+             # materialise a fixed matrix — compile-time constants,
+             # like the carrier-packaging ops above.
+             "eye", "cswap"}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.
@@ -464,6 +508,16 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
             t_dim = q[-2]
             return float(4 * n_out * (t_dim or 1))
         return float(4 * n_out)
+    if term.op == "trace":
+        # LFT: one du×du solve (~2·du³) plus the resolvent projection
+        # Q·(I−S)⁻¹·R on the dy×dx output (~2·du·n_out).
+        u = term.attrs.get("usize", 0)
+        du = sum(u) if isinstance(u, (list, tuple)) else u
+        du = du if isinstance(du, int) else 0
+        return float(2 * du * du * du + 2 * n_out * max(du, 1) + n_out)
+    if term.op == "inv":
+        # n×n inverse ≈ 2·n³ = 2·n_out^1.5 FLOPs.
+        return float(2 * max(n_out, 1) ** 1.5)
     return float(_OP_FLOPS.get(term.op, 1) * n_out)
 
 
