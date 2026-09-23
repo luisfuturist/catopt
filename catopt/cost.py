@@ -744,7 +744,10 @@ def _bytes_of(term: Op, memo: dict | None = None) -> float:
     return in_bytes + out_bytes
 
 
-def _local_roofline(term: Op, memo: dict | None = None) -> float:
+def _local_roofline(term: Op, memo: dict | None = None, *,
+                    peak_flops: float = _PEAK_FLOPS,
+                    peak_bw: float = _PEAK_BW,
+                    launch_s: float = _LAUNCH_S) -> float:
     """Estimated nanoseconds for one op: max(compute, memory) + launch."""
     shape = _infer_op_shape(term, memo)
     if shape is _INVALID:
@@ -752,14 +755,36 @@ def _local_roofline(term: Op, memo: dict | None = None) -> float:
     flops = _flops_of(term, memo)
     if flops >= _INVALID_COST:
         return _INVALID_COST
-    compute_s = flops / _PEAK_FLOPS
-    memory_s = _bytes_of(term, memo) / _PEAK_BW
-    launch = 0.0 if term.op in _VIEW_OPS else _LAUNCH_S
+    compute_s = flops / peak_flops
+    memory_s = _bytes_of(term, memo) / peak_bw
+    launch = 0.0 if term.op in _VIEW_OPS else launch_s
     # True views emit no kernel: no launch AND no memory traffic — the
     # read happens at the consumer, priced there via _STRIDE_PENALTY.
     if term.op in _VIEW_OPS:
         return 0.0
     return (max(compute_s, memory_s) + launch) * 1e9
+
+
+def _roofline_cost(term: Any, memo: dict, peak_flops: float,
+                   peak_bw: float, launch_s: float) -> float:
+    """Shared traversal for roofline_cost and roofline_cost_for.
+
+    The memo key carries the constants so two profiles can share a memo
+    dict (e.g. inside dag_cost) without colliding.
+    """
+    ck = ("rc", peak_flops, peak_bw, launch_s, id(term))
+    if ck in memo:
+        return memo[ck]
+    if isinstance(term, Op):
+        base = _local_roofline(term, memo, peak_flops=peak_flops,
+                               peak_bw=peak_bw, launch_s=launch_s)
+        for arg in term.args:
+            base += _roofline_cost(arg, memo, peak_flops, peak_bw,
+                                   launch_s)
+        memo[ck] = float(base)
+        return memo[ck]
+    memo[ck] = 0.0
+    return 0.0
 
 
 def roofline_cost(term: Any, memo: dict | None = None) -> float:
@@ -770,19 +795,95 @@ def roofline_cost(term: Any, memo: dict | None = None) -> float:
     This is the honest model for questions like "does the fused GEMM
     pay?" — it answers differently at different batch sizes, which is
     what the measurements show.
+
+    The constants are the RTX 2050 profile hardcoded above; use
+    :func:`roofline_cost_for` with a measured ``TargetProfile``
+    (``catopt.calibrate.calibrate``) for other targets.
     """
     memo = {} if memo is None else memo
-    ck = ("rc", id(term))
-    if ck in memo:
-        return memo[ck]
-    if isinstance(term, Op):
-        base = _local_roofline(term, memo)
-        for arg in term.args:
-            base += roofline_cost(arg, memo)
-        memo[ck] = float(base)
-        return memo[ck]
-    memo[ck] = 0.0
-    return 0.0
+    return _roofline_cost(term, memo, _PEAK_FLOPS, _PEAK_BW, _LAUNCH_S)
+
+
+def _profile_constants(profile: Any) -> tuple[float, float, float]:
+    """(peak_flops, peak_bw, launch_s) from a TargetProfile-like object.
+
+    Accepts anything with ``.tflops`` / ``.gbps`` / ``.launch_us``
+    attributes (e.g. ``catopt.calibrate.TargetProfile``) or a dict with
+    those keys; ``None`` yields the built-in RTX 2050 constants.
+    """
+    if profile is None:
+        return _PEAK_FLOPS, _PEAK_BW, _LAUNCH_S
+    if isinstance(profile, dict):
+        get = profile.__getitem__
+    else:
+        get = lambda k: getattr(profile, k)  # noqa: E731
+    return (float(get("tflops")) * 1e12,
+            float(get("gbps")) * 1e9,
+            float(get("launch_us")) * 1e-6)
+
+
+def roofline_cost_for(profile: Any = None, *,
+                      peak_flops: float | None = None,
+                      peak_bw: float | None = None,
+                      launch_s: float | None = None):
+    """Return a roofline cost fn calibrated to a measured target profile.
+
+    ``profile`` is a ``catopt.calibrate.TargetProfile`` (or any object
+    / dict with ``tflops``, ``gbps``, ``launch_us``); ``None`` plus
+    keyword overrides gives a one-off calibration.  The returned
+    closure has the standard cost-fn signature ``fn(term, memo=None)``
+    and can be dropped into ``Regime(cost_fn=...)``,
+    ``EGraph.extract_best``, or ``dag_cost``.
+
+    ``roofline_cost_for()`` (no args) is exactly ``roofline_cost``.
+    """
+    pf, bw, ls = _profile_constants(profile)
+    if peak_flops is not None:
+        pf = float(peak_flops)
+    if peak_bw is not None:
+        bw = float(peak_bw)
+    if launch_s is not None:
+        ls = float(launch_s)
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        memo = {} if memo is None else memo
+        return _roofline_cost(term, memo, pf, bw, ls)
+
+    cost.__name__ = "roofline_cost_for"
+    cost.profile = profile
+    return cost
+
+
+def depth_cost_for(profile: Any = None):
+    """Return a critical-path cost fn calibrated to a target profile.
+
+    Same closure convention as :func:`roofline_cost_for`, but the
+    objective is depth (local roofline latency + max child depth) like
+    :func:`depth_cost` — the axis on which a sequential recurrence and
+    its log-depth scan differ.
+    """
+    pf, bw, ls = _profile_constants(profile)
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        memo = {} if memo is None else memo
+        ck = ("dc", pf, bw, ls, id(term))
+        if ck in memo:
+            return memo[ck]
+        if isinstance(term, Op):
+            local = _local_roofline(term, memo, peak_flops=pf,
+                                    peak_bw=bw, launch_s=ls)
+            if local >= _INVALID_COST:
+                local = ls * 1e9
+            child = max((cost(a, memo) for a in term.args), default=0.0)
+            out = local + child
+            memo[ck] = float(out)
+            return out
+        memo[ck] = 0.0
+        return 0.0
+
+    cost.__name__ = "depth_cost_for"
+    cost.profile = profile
+    return cost
 
 
 class CostModel:
