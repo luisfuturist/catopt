@@ -1020,6 +1020,75 @@ CATEGORICAL_RULES: list[Rewrite] = [
     *SDPA_FOLD_RULES,
 ]
 
+# ---------------------------------------------------------------------------
+# Scan monoid: affine-map domain
+# ---------------------------------------------------------------------------
+# A recurrence step ``h ↦ A·h + x`` is an affine map.  Affine maps form
+# a monoid under composition:
+#     (A2,b2) ∘ (A1,b1) = (A2·A1, A2·b1 + b2)
+# A sequential fold is the left-associated composition; the balanced
+# tree (parallel scan, Blelloch) is another bracketing of the same
+# product — reachable by associativity alone once steps are lifted
+# into the affine domain.  Matmul/add algebra alone provably cannot
+# reach it: the pair (partial-product, partial-sum) is a cross-class
+# object no term law synthesises (measured: order-preserving laws
+# plateau at ~1.5·T depth; the monoid reaches ~log T).
+#
+# ``aff(A, b)``      — the map h ↦ A·h + b (a pair value, not a tensor)
+# ``aff_compose(f,g)`` — f∘g as an affine object
+# ``apply(f, h)``    — evaluate the map on h (back in tensor-land)
+
+AFF_LIFT = R("aff_lift",
+             Op.make("add", Op.make("matmul", "A", "h"), "x"),
+             Op.make("apply", Op.make("aff", "A", "x"), "h"),
+             law="recurrence step is affine-map application")
+
+AFF_LIFT_STEP = R("aff_lift_step",
+                  Op.make("add",
+                          Op.make("matmul", "A",
+                                  Op.make("apply", "f", "h")),
+                          "x"),
+                  Op.make("apply",
+                          Op.make("aff_compose",
+                                  Op.make("aff", "A", "x"), "f"),
+                          "h"),
+                  law="compose step with the preceding map")
+
+AFF_UNLIFT = R("aff_unlift",
+               Op.make("apply", Op.make("aff", "A", "x"), "h"),
+               Op.make("add", Op.make("matmul", "A", "h"), "x"),
+               law="affine application unfolds")
+
+AFF_COMPOSE_UNFOLD = R("aff_compose_unfold",
+                       Op.make("apply",
+                               Op.make("aff_compose", "f", "g"), "h"),
+                       Op.make("apply", "f",
+                               Op.make("apply", "g", "h")),
+                       law="composition is sequential application")
+
+AFF_ASSOC = R("aff_assoc",
+              Op.make("aff_compose",
+                      Op.make("aff_compose", "f", "g"), "h"),
+              Op.make("aff_compose", "f",
+                      Op.make("aff_compose", "g", "h")),
+              law="affine composition is associative")
+
+AFF_ASSOC_REV = R("aff_assoc_rev",
+                  Op.make("aff_compose", "f",
+                          Op.make("aff_compose", "g", "h")),
+                  Op.make("aff_compose",
+                          Op.make("aff_compose", "f", "g"), "h"),
+                  law="affine composition is associative")
+
+#: Minimal law set for scan discovery.  Deliberately excludes
+#: ``comm_add``: commutativity is the explosive law (permutation space)
+#: and Blelloch reassociation is order-preserving.
+SCAN_LAWS: list[Rewrite] = [
+    AFF_LIFT, AFF_LIFT_STEP, AFF_UNLIFT, AFF_COMPOSE_UNFOLD,
+    AFF_ASSOC, AFF_ASSOC_REV,
+]
+
+
 #: All rules combined.
 ALL_RULES: list[Rewrite] = SIMPLIFICATION_RULES + CATEGORICAL_RULES
 

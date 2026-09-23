@@ -166,13 +166,25 @@ Novelty has levels, and the frontier report makes them inspectable:
   `naturality_scalar` ∘ `sdpa_fold` in nanoGPT.
 - **Level 4** (transform nobody encoded): not yet — every
   *result* remains practitioner-known even when the *derivation*
-  is emergent.  One step taken: an unrolled LTI recurrence
-  `h_t = A h_{t-1} + x_t` (SSM-style sequential fold) reassociates
-  under **monoid laws alone** (distribute + assoc) into forms with
-  shared matrix powers `A^k` and shorter critical paths — the
-  parallel-scan (Blelloch) structure is reachable with no
-  scan-specific rule, verified exact in fp64, and a `depth_cost`
-  model selects it.  Saturation caps the demonstration at small T.
+  is emergent.  But the language-boundary claim is now *measured*:
+  an unrolled LTI recurrence `h_t = A h_{t-1} + x_t` (SSM-style
+  fold) under pure matmul/add laws (distribute + assoc, no comm —
+  commutativity is the explosive law: T=16 saturates at 883 enodes
+  without it vs 112k+ with) plateaus at **1.5·T critical-path
+  depth** — the balanced scan is unreachable because the pair
+  (partial-product, partial-sum) is a cross-class object no term
+  law synthesises.  Lift the steps into the **affine-map monoid**
+  — `aff(A,b)`, `aff_compose` (the (A,b)∘(C,d)=(A·C, A·d+b) law),
+  `apply` — and *the same associativity law alone* reaches the
+  balanced Blelloch tree: **depth 2T → ~2·log₂T** (T=64: 128→12),
+  fp64-exact.  Same laws, richer domain, asymptotically different
+  reachable set — that is the "search cannot exceed its language"
+  thesis demonstrated, not asserted.  Honest caveat: the extracted
+  scan is *slower* wall-clock on a serial GPU stream (2.1ms vs
+  1.6ms at T=32,d=16) — Blelloch trades O(T·d²) work for
+  O(T·d³) at log depth; the payoff needs a parallel executor
+  (level-batched composes or streams), which is backend work,
+  not a semantics problem.
 
 **The calibrated cost model predicts the crossover.** `roofline_cost`
 constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
@@ -270,7 +282,7 @@ lowering overhead visible on real blocks.
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 91 tests
+python -m pytest tests/ -q         # 93 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

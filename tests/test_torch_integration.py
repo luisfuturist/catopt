@@ -1087,6 +1087,64 @@ def test_linear_recurrence_scan_structure():
     assert diff < 1e-10
 
 
+def test_affine_monoid_parallel_scan():
+    """The scan monoid reaches log-depth where tensor laws plateau.
+
+    Lifting recurrence steps into affine maps (h ↦ A·h + x) makes the
+    fold a composition of monoid elements; associativity alone then
+    generates the balanced (Blelloch) bracketing.  Verified fp64-exact.
+    Pure matmul/add laws stall at ~1.5·T depth — the pair
+    (partial-product, partial-sum) is a cross-class object term
+    rewriting cannot synthesise."""
+    import math
+    from catopt.models import LinearRecurrence
+    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt.egraph import EGraph
+    from catopt import rules as R
+    from catopt.ir import Op, IR
+
+    def opdepth(t, memo):
+        if not isinstance(t, Op):
+            return 0
+        k = id(t)
+        if k not in memo:
+            memo[k] = 1 + max((opdepth(a, memo) for a in t.args),
+                              default=0)
+        return memo[k]
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(16, 16).eval().double()
+    x = torch.randn(16, 16, dtype=torch.float64)
+    ir, st = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(R.SCAN_LAWS, root, max_iterations=14, max_nodes=200_000)
+    best = eg.extract_best(root, lambda t, **k: opdepth(t, {}))
+    # log-depth: ~2·log2(T) compose slots, far below the 2T spine.
+    assert opdepth(best, {}) <= 4 * math.ceil(math.log2(16)) + 4
+    opt_ir = IR(root=best, inputs=ir.inputs, input_names=ir.input_names,
+                params=ir.params)
+    mod = ir_to_torch_module(opt_ir, param_values=st)
+    with torch.no_grad():
+        diff = (m(x) - mod(x)).abs().max().item()
+    assert diff < 1e-10
+
+
+def test_aff_monoid_ops_verify():
+    """aff/aff_compose/apply lower to tuple-passing torch code and
+    compute the affine composition correctly."""
+    from catopt.torch_bridge import _IR_TO_TORCH
+    torch.manual_seed(0)
+    A, b = torch.randn(8, 8), torch.randn(8)
+    C, d = torch.randn(8, 8), torch.randn(8)
+    f, g = _IR_TO_TORCH["aff"](A, b), _IR_TO_TORCH["aff"](C, d)
+    fg = _IR_TO_TORCH["aff_compose"](f, g)
+    h = torch.randn(8)
+    lhs = _IR_TO_TORCH["apply"](fg, h)
+    rhs = A @ (C @ h + d) + b
+    assert torch.allclose(lhs, rhs)
+
+
 def test_linear_attention_reassociation():
     """(Q K^T) V reassociates to Q (K^T V) — O(T^2 d) -> O(T d^2).
     Exact identity (verified in fp64); the cost model must pick it."""

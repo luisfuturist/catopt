@@ -420,6 +420,13 @@ _IR_TO_TORCH: dict[str, Any] = {
     "ge": lambda x, y, *a, **kw: x >= y,
     "logical_not": lambda x, *a, **kw: torch.logical_not(x),
     "where": lambda c, x, y, *a, **kw: torch.where(c, x, y),
+    # Affine-map monoid (scan domain).  An aff is a pair (A, b)
+    # denoting h ↦ A@h + b; compose/apply pass pairs around — only
+    # ``apply`` returns a tensor.
+    "aff": lambda A, b, *a, **kw: (A, b),
+    "aff_compose": lambda f, g, *a, **kw: (f[0] @ g[0],
+                                           f[0] @ g[1] + f[1]),
+    "apply": lambda f, h, *a, **kw: f[0] @ h + f[1],
 }
 
 

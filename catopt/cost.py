@@ -219,6 +219,16 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if x[3] is not None and w[3] is not None:
                 ow = (x[3] + 2 * pd[1] - dl[1] * (w[3] - 1) - 1) // st[1] + 1
             return (x[0], w[0], oh, ow)
+        case "aff":
+            # The map h ↦ A·h + b is a pair value; its "shape" is the
+            # linear part's — what consumers' costs are priced from.
+            return shapes[0]
+        case "aff_compose":
+            # f∘g keeps the outer map's linear-part shape (d×d).
+            return shapes[0]
+        case "apply":
+            # apply(f, h) evaluates back to tensor-land: h's shape.
+            return shapes[1]
         case "concat":
             a, b = shapes[0], shapes[1]
             if a is None or b is None:
@@ -323,7 +333,7 @@ _OP_FLOPS: dict[str, int] = {
 #: runtime cat() is a real copy kernel — it is only free when the whole
 #: subtree is param-only (compile-time fold, handled by extraction).
 _VIEW_OPS = {"transpose", "reshape", "broadcast", "chunk",
-             "split", "leaf"}
+             "split", "leaf", "aff"}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.
@@ -368,6 +378,26 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
             if isinstance(g, int) and g > 1:
                 k //= g
             return float(2 * n_out * k)
+        return float(2 * n_out)
+    if term.op == "aff":
+        # Packaging a pair — no runtime work.
+        return 0.0
+    if term.op == "aff_compose":
+        # (A2,b2)∘(A1,b1) = (A2·A1, A2·b1 + b2): one d×d matmul,
+        # one matvec, one add ≈ 2·d³ + O(d²) flops.
+        shapes = [_shape_of(a, memo) for a in term.args]
+        f = shapes[0] if shapes else None
+        if (f is not None and f is not _INVALID and len(f) >= 2
+                and isinstance(f[-1], int)):
+            return float(2 * n_out * f[-1])
+        return float(2 * n_out)
+    if term.op == "apply":
+        # f·h + b: matvec + add ≈ 2·d² flops on a d-vector out.
+        shapes = [_shape_of(a, memo) for a in term.args]
+        f = shapes[0] if shapes else None
+        if (f is not None and f is not _INVALID and len(f) >= 2
+                and isinstance(f[-1], int)):
+            return float(2 * n_out * f[-1])
         return float(2 * n_out)
     if term.op == "sdpa":
         # attention: ~2 * (T * d + T * T) per head ≈ 2*T*max(d,T)*B*h
