@@ -37,6 +37,12 @@ _ATEN_TO_IR: dict[str, str] = {
     "scaled_dot_product_attention": "sdpa",
     "conv2d": "conv2d",
     "cat": "concat",
+    # List-form split exports as aten.split_with_sizes; unsafe_*
+    # variants are the functionalization-internal spellings of the
+    # same op.  All lower through the "split" binding.
+    "split_with_sizes": "split",
+    "unsafe_split": "split",
+    "unsafe_split_with_sizes": "split",
 }
 
 #: ATen overload-specific names (e.g. 'mul.Tensor') that do not survive

@@ -296,6 +296,23 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 - **`roofline_cost` is calibrated to this GPU** (RTX 2050, 4 GB);
   magnitudes should not be extrapolated to datacenter hardware.
 
+## Roadmap
+
+- **Regime-adaptive architecture**: one weight set, multiple certified
+  forms — recurrent (decode), parallel-scan (train/prefill), chunked
+  (bounded memory). Extract the Pareto frontier across cost models and
+  dispatch per deployment regime.
+- **Backward-graph rewriting**: joint fwd+bwd (AOTAutograd) graphs —
+  the only path to training-side wins; weight-merging laws currently
+  destroy gradients.
+- **More weight-preserving dualities**: RepVGG-style branch merging,
+  conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
+  architecture over the same parameters.
+- **Masked chunked attention**: "mask distributes over concat" with
+  positional offsets — the remaining gap to causal om.
+- **Guarded-rule synthesis**: extend completion to `check`/`derive`
+  rules so the om/attention lemma library derives itself.
+
 ## Repository layout
 
 | Path | Role |

@@ -291,11 +291,13 @@ def test_om_elems_consume_scan_outputs():
 #  (c) the attr-spelling gap — honest negative on RAW export
 # ---------------------------------------------------------------------------
 
-def test_raw_export_blocks_om_split():
-    """Without attr normalisation the om homomorphism NEVER fires:
-    exported ``cat``/``chunk`` use positional spellings the rule side
-    can't recombine with (and the chunk mis-read vetoes
-    matmul_t_concat's shape check).  The scan side is unaffected."""
+def test_raw_export_fires_om_split():
+    """The bridge now canonicalises exported positional spellings
+    (``concat(arg1=-2)`` → ``dim=``, ``chunk(arg1,arg2)`` →
+    ``chunks=``/``dim=``) at the boundary, so the om homomorphism
+    fires on RAW exports — no test-side normalisation needed.
+    (Was ``test_raw_export_blocks_om_split``: this used to be the
+    documented bridge↔rules interface gap.)"""
     torch.manual_seed(0)
     T, D = 16, 16
     m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
@@ -305,14 +307,13 @@ def test_raw_export_blocks_om_split():
     census = _op_census(eg)
     # Scan carrier still lifts fine (spelling-independent).
     assert census["applyd"] > 0 and census["affd_compose"] > 0
-    # om_lift fires (matmul(softmax) is spelling-free) but NOTHING
-    # downstream does: no score-concat split, no carrier composition.
+    # The whole om chain fires on the raw export now.
     assert eg.rule_fires.get("om_lift", 0) >= 1
-    assert census["om_compose"] == 0
-    assert eg.rule_fires.get("om_split", 0) == 0
-    assert eg.rule_fires.get("om_split_arg1", 0) == 0
-    assert eg.rule_fires.get("matmul_t_concat", 0) == 0
-    assert eg.rule_fires.get("matmul_t_concat_arg1", 0) == 0
+    assert census["om_compose"] > 0
+    assert (eg.rule_fires.get("om_split", 0)
+            + eg.rule_fires.get("om_split_arg1", 0)) > 0
+    assert (eg.rule_fires.get("matmul_t_concat", 0)
+            + eg.rule_fires.get("matmul_t_concat_arg1", 0)) > 0
 
 
 # ---------------------------------------------------------------------------
