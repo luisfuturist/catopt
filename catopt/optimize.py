@@ -96,6 +96,58 @@ def _specialize_causal(term: Any, params: dict,
     return out
 
 
+def discover_alternatives(
+    model: torch.nn.Module,
+    example_input: torch.Tensor,
+    *,
+    ruleset: str = "categorical",
+    max_iterations: int = 6,
+    cost_fn: CostModel = None,
+    top_k: int = 8,
+) -> dict:
+    """Enumerate the cheapest distinct members of the semantic
+    equivalence class [G] — the discovery-engine view.
+
+    Runs the same export → e-graph → saturation → pairing pipeline as
+    optimize_model, but instead of committing to the single best term
+    it returns the top-k alternatives under the cost model, plus the
+    rule-fire provenance (which generic laws actually fired).  Human
+    inspection of this frontier is how level-3 candidates — emergent
+    compositions of known laws — are found.
+    """
+    if cost_fn is None:
+        cost_fn = launch_aware_cost
+    ir, source_tensors = export_to_ir(model, example_input)
+    eg = EGraph()
+    root_eid = eg.add_term(ir.root)
+    rules = {"all": all_rules(),
+             "simpl": SIMPLIFICATION_RULES,
+             "categorical": CATEGORICAL_RULES}[ruleset]
+    if ruleset == "categorical":
+        _SUBSUMED = {"swiglu_fuse", "qkv_fuse", "qkv_fuse_asym",
+                     "parallel_mul_fuse"}
+        rules = [r for r in rules if r.name not in _SUBSUMED]
+    stats = eg.run(rules, root_eid, max_iterations=max_iterations)
+    groups = (pair_shared_input_linears(eg)
+              + pair_shared_input_convs(eg))
+    if groups:
+        eg.rebuild()
+        stats["pairing_groups"] = len(groups)
+        eg.run(rules, root_eid, max_iterations=5)
+    alts = eg.extract_alternatives(root_eid, cost_fn, top_k=top_k)
+    return {
+        "alternatives": alts,
+        "diverse_classes": eg.diverse_classes(),
+        "rule_fires": dict(sorted(eg.rule_fires.items(),
+                                  key=lambda kv: -kv[1])),
+        "stats": stats,
+        "ir": ir,
+        "eg": eg,
+        "root_eid": root_eid,
+        "source_tensors": source_tensors,
+    }
+
+
 def optimize_model(
     model: torch.nn.Module,
     example_input: torch.Tensor,
@@ -183,6 +235,7 @@ def optimize_model(
         # brief second saturation so other rules see the new enodes
         eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
 
+    stats["rule_fires"] = dict(eg.rule_fires)
     if verbose:
         print(f"  E-graph: {stats}")
 

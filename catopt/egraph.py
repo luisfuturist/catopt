@@ -129,6 +129,7 @@ class EGraph:
         self._classes: dict[int, EClass] = {}
         self._node_to_class: dict[ENode, int] = {}
         self._next_id = 0
+        self.rule_fires: dict[str, int] = {}
 
     @property
     def n_classes(self) -> int:
@@ -404,6 +405,8 @@ class EGraph:
                 rhs_eid = self._instantiate(rule.rhs, subst)
                 if self.union(eid, rhs_eid):
                     changed = True
+                    self.rule_fires[rule.name] = (
+                        self.rule_fires.get(rule.name, 0) + 1)
         return changed
 
     # -- saturation --
@@ -431,6 +434,66 @@ class EGraph:
         }
 
     # -- extraction --
+
+    def extract_alternatives(self, eid: int, cost_fn,
+                             top_k: int = 8) -> list[tuple[float, Any]]:
+        """Enumerate the root e-class frontier: for each non-leaf enode,
+        force extraction through it and record the resulting term's DAG
+        cost.  Returns the top-k cheapest *distinct* alternatives —
+        i.e. the cheapest members of the semantic equivalence class
+        [G], which is what a discovery engine inspects for unexpected
+        candidates."""
+        from catopt.cost import dag_cost
+        from catopt.ir import op_repr
+        eid = self.find(eid)
+        eclass = self._classes[eid]
+        seen: dict[str, tuple[float, Any]] = {}
+        for node in eclass.nodes:
+            if node.op == "leaf":
+                continue
+            term = self.extract_best(eid, cost_fn,
+                                     overrides={eid: node})
+            if term is None:
+                continue
+            key = op_repr(term)
+            cost = dag_cost(term, cost_fn)
+            if key not in seen or cost < seen[key][0]:
+                seen[key] = (cost, term)
+        ranked = sorted(seen.values(), key=lambda kv: kv[0])
+        return ranked[:top_k]
+
+    def diverse_classes(self) -> list[dict]:
+        """E-classes containing structurally distinct equivalent terms.
+
+        These are where emergent compositions hide: a class holding both
+        `matmul(softmax(mf))` and `sdpa` means the search found that
+        two very different programs compute the same thing.  Returns
+        classes with >= 2 distinct member ops, each with a one-line
+        sketch of every distinct member."""
+        from catopt.ir import op_repr
+        out = []
+        for eid, ec in self._classes.items():
+            ops = {n.op for n in ec.nodes if n.op != "leaf"}
+            if len(ops) < 2:
+                continue
+            sketches = []
+            seen_sketch = set()
+            for n in ec.nodes:
+                if n.op == "leaf":
+                    key = n.attrs[0][1] if n.attrs else "?"
+                    sk = key.split(":")[-1][:24]
+                else:
+                    child_ops = [
+                        next(iter(self._classes[self.find(c)].nodes)).op
+                        if self._classes[self.find(c)].nodes
+                        else "?" for c in n.children]
+                    sk = f"{n.op}({','.join(child_ops)})"
+                if sk not in seen_sketch:
+                    seen_sketch.add(sk)
+                    sketches.append(sk)
+            out.append({"eid": eid, "members": sketches})
+        out.sort(key=lambda d: -len(d["members"]))
+        return out
 
     def extract_best(self, eid: int, cost_fn,
                      overrides: dict[int, Any] | None = None,

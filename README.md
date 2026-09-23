@@ -147,6 +147,28 @@ code: `bmm` + fused softmax + `bmm`). (b) *Diagonal absorption*:
 `(QK^T)V` → `Q(K^TV)`, O(T²d) → O(Td²) — **8.0× at T=2048**,
 verified exact in fp64 (rel err 8e-16).
 
+**The equivalence class is enumerable — the discovery-engine view.**
+`discover_alternatives(model, x)` runs the same pipeline but returns
+the top-k cheapest *distinct* members of [G] instead of one winner,
+plus `rule_fires` provenance and `diverse_classes` (e-classes holding
+structurally different but provably-equal programs — e.g.
+`sdpa(transpose³,logical_not)` ≡ `matmul(softmax,transpose)`).
+Novelty has levels, and the frontier report makes them inspectable:
+
+- **Level 1–2** (known transform / generalization): fused QKV,
+  merged gate/up, conv pairing, `enable_gqa`, flash fold —
+  all demonstrated on unmodified community code.
+- **Level 3** (emergent composition of laws): llama2.c Attention
+  extracts a term combining `split(linear)` pairing enodes **and**
+  `enable_gqa` sdpa — "fused QKV with internal head-broadcast".
+  No single rule encodes it; it arises from product law ∘ diagonal
+  absorption via coordinated extraction. Likewise
+  `naturality_scalar` ∘ `sdpa_fold` in nanoGPT.
+- **Level 4** (transform nobody encoded): not yet — every
+  *result* remains practitioner-known even when the *derivation*
+  is emergent.  The missing ingredient is a law set rich enough to
+  express algorithmic change (scan monoid, convolution theorem).
+
 **The calibrated cost model predicts the crossover.** `roofline_cost`
 constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
 8.7 µs launch). Predicted vs measured direction agrees on all tested
