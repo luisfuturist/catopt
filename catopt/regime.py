@@ -63,6 +63,7 @@ from catopt.cost import (
 )
 from catopt.rules import SCAN_LAWS, SCAN_DIAG_LAWS
 from catopt.om import OM_LAWS
+from catopt.trace import TRACE_LAWS
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.scan_lower import (
     to_batched_scan_module,
@@ -80,6 +81,7 @@ __all__ = [
     "footprint_cost",
     "ExecutorSpec",
     "EXECUTORS",
+    "is_trace_rooted_term",
     "Regime",
     "default_regimes",
     "RegimeChoice",
@@ -137,6 +139,24 @@ def footprint_cost(term: Any, memo: Optional[dict] = None) -> float:
 
 def _always_true(_: Any) -> bool:
     return True
+
+
+def is_trace_rooted_term(term: Any) -> bool:
+    """Does the term's root carry the traced-monoidal carrier?
+
+    Native forms: a bare ``trace`` fixpoint at the root, or the
+    superposed (channel-split) ``bdiag(trace, trace, …)`` layout the
+    ``tr_superpose`` law produces — every channel's fixpoint then
+    solves independently, in parallel.
+    """
+    if not isinstance(term, Op):
+        return False
+    if term.op == "trace":
+        return True
+    if term.op == "bdiag":
+        return any(isinstance(a, Op) and a.op == "trace"
+                   for a in term.args)
+    return False
 
 
 @dataclass(frozen=True)
@@ -206,6 +226,19 @@ EXECUTORS: Dict[str, ExecutorSpec] = {
         ),
         "bounded-working-set left fold (StreamingOMModule)",
     ),
+    "trace": ExecutorSpec(
+        "trace",
+        ir_to_torch_module,
+        is_trace_rooted_term,
+        _always_true,
+        (
+            frozenset({"trace"}),
+            frozenset({"parl", "bdiag"}),
+            frozenset({"eye", "cswap"}),
+        ),
+        "traced-monoidal fixpoint — the JSV carrier; evaluated by "
+        "IRModule through the trace/bdiag/parl/inv torch bindings",
+    ),
 }
 
 
@@ -215,6 +248,8 @@ def _auto_executor(term: Any) -> str:
         return "scan"
     if is_om_apply_term(term):
         return "om_batched"
+    if is_trace_rooted_term(term):
+        return "trace"
     return "generic"
 
 
@@ -307,6 +342,7 @@ def _as_regime(name: str, spec: Any) -> Regime:
 _SCAN_OPS = ("apply", "applyd", "aff", "aff_diag", "aff_compose",
              "affd_compose")
 _OM_OPS = ("om", "om_elem", "om_compose", "om_apply")
+_TRACE_OPS = ("trace", "bdiag", "parl", "eye", "cswap", "inv")
 
 
 def _census(term: Any) -> Dict[str, int]:
@@ -348,7 +384,8 @@ def _has_carrier(term: Any, carrier: Tuple[frozenset, frozenset,
 
 
 def _nested_carriers(census: Dict[str, int]) -> List[str]:
-    return [o for o in _SCAN_OPS + _OM_OPS if census.get(o)]
+    return [o for o in _SCAN_OPS + _OM_OPS + _TRACE_OPS
+            if census.get(o)]
 
 
 def architecture_signature(term: Any) -> tuple:
@@ -369,6 +406,10 @@ def architecture_signature(term: Any) -> tuple:
     if is_om_apply_term(term):
         return ("om", c.get("om", 0) + c.get("om_elem", 0),
                 c.get("om_compose", 0))
+    if is_trace_rooted_term(term):
+        return ("trace",
+                "split" if term.op == "bdiag" else "joint",
+                c.get("trace", 0))
     nested = _nested_carriers(c)
     root = term.op if isinstance(term, Op) else "leaf"
     if nested:
@@ -398,6 +439,11 @@ def architecture_label(term: Any) -> str:
                  f"{len(plan['levels'])} batched levels"
                  if plan is not None else "unplannable")
         return f"om_apply {sched}"
+    if is_trace_rooted_term(term):
+        n_tr = c.get("trace", 0)
+        kind = (f"bdiag of {n_tr} channel traces"
+                if term.op == "bdiag" else "joint fixpoint")
+        return f"trace[{kind}]"
     nested = _nested_carriers(c)
     root = term.op if isinstance(term, Op) else "leaf"
     if nested:
@@ -884,7 +930,13 @@ class RegimeDispatch(nn.Module):
 # ---------------------------------------------------------------------------
 
 #: All carrier rewrite families — one saturation serves every regime.
-CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS
+#: TRACE_LAWS rides along: importing catopt.trace also registers the
+#: trace/bdiag/parl/eye/cswap/inv torch bindings, so any trace-bearing
+#: member the JSV laws reach is executable by the generic executor.
+#: (No exported model produces trace enodes and no current law lifts
+#: tensor algebra into trace form, so today these rules only fire
+#: where a trace term was seeded — see tests/test_trace_pipeline.py.)
+CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS
 
 
 def default_rules() -> list:
