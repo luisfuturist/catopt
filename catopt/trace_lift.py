@@ -66,7 +66,12 @@ Each offered member is ``add_enode``-built (children stay e-class ids,
 so later rewrites see through) and merged with a ``rule=None`` union —
 the merge is recorded as e-graph-dependent in certificates, exactly
 like the pairing pass (the equality is real but has no standalone
-lhs→rhs derivation).
+lhs→rhs derivation).  With ``witness=True`` the pass instead attaches
+a synthesised pointwise :class:`Rewrite` — ``oldest_class_member ->
+offered_term`` — to each union via ``EGraph.union(..., witness=...)``;
+the merge then replays in certificates as an ordinary named rule step
+(``verify_certificate`` re-matches and re-instantiates it standalone,
+``strict=True`` included) rather than an ``egraph_dependent`` stub.
 
 CAVEATS (when the pass declines):
     * T must be concrete — the spine length is the unrolled horizon;
@@ -89,7 +94,7 @@ from typing import Any
 import catopt.trace as _cat_trace  # noqa: F401  (torch bindings for
                                    # trace/bdiag/parl/eye/cswap/inv)
 from catopt.cost import _shape_of
-from catopt.egraph import EGraph, _LeafRegistry
+from catopt.egraph import EGraph, Rewrite, _LeafRegistry
 from catopt.ir import Const, Op
 from catopt.scan_lower import build_scan_plan
 
@@ -464,8 +469,41 @@ class TraceLift:
     split: tuple | None = None
 
 
+def _lift_witness(eg: EGraph, cid: int, offered: Any, offered_eid: int,
+                  provenance: str) -> Rewrite | None:
+    """Synthesise the pointwise :class:`Rewrite` certifying one offer.
+
+    ``lhs`` is the *oldest* member of the recurrence class — the term
+    the e-graph saw first (the input spine or carrier the pass
+    recognised), chosen so the certificate's ``src`` side usually *is*
+    the witness LHS and the bridging connect is trivial.  ``rhs`` is
+    the offered trace member itself.  The pass asserts this equality by
+    construction — it built F so that ``matmul(trace(F), v)`` is the
+    fixpoint of THIS unrolled recurrence — and recording the union
+    under the synthesised rule makes that assertion replayable:
+    ``certificate`` emits it as a named step and
+    ``verify_certificate`` re-matches/re-instantiates it on real terms.
+
+    The name is unique per offered enode so several offers in one graph
+    never collide in ``_rule_objs``.  Returns ``None`` when the class
+    has no resolvable member (degenerate cyclic graph) — the union then
+    proceeds witness-free and stays ``egraph_dependent``.
+    """
+    src = eg._oldest_term(eg.find(cid))
+    if src is None:
+        return None
+    return Rewrite(
+        name=f"{provenance}#{offered_eid}",
+        lhs=src,
+        rhs=offered,
+        law=("pointwise witness for a non-local offer: this unrolled "
+             "recurrence equals its nilpotent block-shift trace "
+             "fixpoint (equality established by construction in "
+             "lift_scan_to_trace)"))
+
+
 def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
-           provenance: str) -> list:
+           provenance: str, witness: bool) -> list:
     em = _Emit(eg, provenance)
     lifts: list[TraceLift] = []
     d, T = plan.d, plan.T
@@ -478,6 +516,9 @@ def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
         F = _channel_F(em, plan.kind, maps, d)
         tr, vec, out = _emit_head(em, F, ins, h0, d, T * d)
         eg.union(cid, out[0],
+                 witness=(_lift_witness(eg, cid, out[1], out[0],
+                                        provenance)
+                          if witness else None),
                  note=(f"trace_lift: unrolled {plan.kind} recurrence "
                       f"(T={T}, d={d}) → nilpotent block-shift fixpoint"))
         lifts.append(TraceLift(
@@ -506,6 +547,9 @@ def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
         mvp = em.op("matmul", (trp, vec2))
         outp = em.op("reshape", (mvp,), {"shape": (d,)})
         eg.union(cid, outp[0],
+                 witness=(_lift_witness(eg, cid, outp[1], outp[0],
+                                        provenance)
+                          if witness else None),
                  note=(f"trace_lift: channel-split {part} of a T={T} "
                       f"diagonal recurrence → joint trace over parl"))
         lifts.append(TraceLift(
@@ -518,7 +562,8 @@ def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
 def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
                        min_steps: int = 2, channel_splits="auto",
                        maximal_only: bool = True,
-                       provenance: str = "trace_lift") -> list:
+                       provenance: str = "trace_lift",
+                       witness: bool = True) -> list:
     """Offer ``trace`` members for every unrolled recurrence in *eg*.
 
     For each e-class carrying a recognisable recurrence spine — an
@@ -535,6 +580,15 @@ def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
     ``min_steps`` sets the shortest chain worth lifting (a T=1 "step"
     is sound but pointless).  ``maximal_only`` drops chains that are
     strict prefixes of a longer recognised chain.
+
+    ``witness`` attaches a replayable certificate witness to every
+    offered union (see :func:`_lift_witness` and
+    ``EGraph.union(..., witness=...)``): each offer's merge then shows
+    up in :meth:`EGraph.certificate` as a named, standalone-replayable
+    rule step instead of an ``egraph_dependent`` stub, so
+    ``verify_certificate(..., strict=True)`` accepts it.  On by
+    default; pass ``witness=False`` to keep the honest
+    "no standalone derivation" marking.
 
     Returns a list of :class:`TraceLift` records — one per offered
     member — in class-iteration order.  Empty when nothing matches:
@@ -565,5 +619,6 @@ def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
     for c, p in plans.items():
         if c in interior:
             continue
-        lifts.extend(_offer(eg, c, p, channel_splits, provenance))
+        lifts.extend(_offer(eg, c, p, channel_splits, provenance,
+                            witness))
     return lifts

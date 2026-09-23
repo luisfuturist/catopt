@@ -138,7 +138,9 @@ class _LeafRegistry:
 #  replays the steps on real terms, independent of the e-graph.  A step
 #  that has no standalone justification (non-local merges such as the
 #  diagram-level pairing pass, or manual unions) is recorded but flagged
-#  ``egraph_dependent`` rather than silently trusted.
+#  ``egraph_dependent`` rather than silently trusted — UNLESS the pass
+#  attached a synthesised :class:`Rewrite` via ``union(..., witness=...)``,
+#  in which case the merge replays as an ordinary rule step.
 
 
 @dataclass
@@ -147,7 +149,9 @@ class ProofEdge:
 
     ``rule`` is the ``Rewrite.name`` that fired — ``None`` for merges
     performed outside rule application (non-local passes such as
-    ``pair_shared_input_linears``, or direct ``union`` calls).
+    ``pair_shared_input_linears``, or direct ``union`` calls), or the
+    name of a *synthesised* :class:`Rewrite` when the caller attached a
+    replayable ``witness`` to :meth:`EGraph.union` (see there).
     ``a``/``b`` are the canonical e-class ids of the matched (LHS) and
     produced (RHS) sides *before* the merge; ``subst`` is the fired
     binding as ``(key, value)`` pairs — metavariables map to e-class
@@ -380,13 +384,34 @@ class EGraph:
         return memo[key]
 
     def union(self, a: int, b: int, rule: str | None = None,
-              subst: dict | None = None, note: str = "") -> bool:
+              subst: dict | None = None, note: str = "",
+              witness: Rewrite | None = None) -> bool:
         """Merge the e-classes of ``a`` and ``b``.
 
         ``rule``/``subst`` optionally record the 2-morphism witnessing
         the merge: which rewrite fired and under what binding.  Only the
         first witness per merge is kept — the e-graph quotients the
         proof space.
+
+        ``witness`` is the API for *non-local passes* — transformations
+        that offer a member no LHS pattern could produce (the offered
+        term is computed from the whole e-graph, not from a matched
+        subterm).  The pass synthesises a concrete :class:`Rewrite`
+        justifying *this specific* merge — typically a **pointwise**
+        rule whose ``lhs`` is a member of ``a``'s class and whose
+        ``rhs`` is the offered term itself — and the merge then replays
+        like an ordinary rule application: the witness is registered
+        alongside the fired rules, and a synthetic application record
+        (keyed on the offered term's root enode) lets
+        :meth:`certificate` expand the offered member through it.  The
+        emitted :class:`CertStep` is re-matched and re-instantiated by
+        :func:`verify_certificate` standalone — no ``egraph_dependent``
+        stub.  The witness asserts the equality the pass established
+        non-locally; the certificate records *what was asserted* in a
+        form that replays on real terms.  (A metavariable-pattern
+        witness with a ``derive`` that reconstructs the RHS from bound
+        pieces works too; the application record is only registered
+        when ``witness.rhs`` locates a concrete enode in the graph.)
         """
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
@@ -400,6 +425,25 @@ class EGraph:
             target.cache.clear()
             del self._classes[old_canon]
             if self._track:
+                if witness is not None:
+                    rule = witness.name
+                    self._rule_objs.setdefault(witness.name, witness)
+                    # Locate the offered term's root enode and register
+                    # a synthetic application so ``_connect``'s
+                    # target-expansion strategy can replay this merge;
+                    # ``_edge_path`` also finds the witness on its own
+                    # whenever the current subterm matches its LHS.
+                    _weid, w_en = self._locate(witness.rhs)
+                    if w_en is not None:
+                        app_idx = len(self._applications)
+                        self._applications.append({
+                            "rule": witness.name,
+                            "matched_eid": self.find(ra),
+                            "rhs_eid": self.find(rb),
+                            "subst": dict(subst or {}),
+                            "rhs_root_enode": w_en,
+                        })
+                        self._enode_app.setdefault(w_en, app_idx)
                 fs = (tuple(sorted(subst.items(), key=lambda kv: kv[0]))
                       if subst else ())
                 self._merge_log.append(ProofEdge(rule, ra, rb, fs, note))

@@ -163,9 +163,9 @@ class TestInsertion:
         assert len(lifts) == 1
         cert = eg.certificate(term, lifts[0].term, root_eid=root)
         assert cert is not None
-        # the lift is a genuine non-local merge — honestly flagged
-        assert cert.n_egraph_dependent >= 1
-        # … and replays standalone with the merge as a trusted step
+        # the lift carries a pointwise witness rule — fully replayable
+        assert cert.n_egraph_dependent == 0
+        assert verify_certificate(term, cert, strict=True) is not None
         assert op_repr(verify_certificate(term, cert)) == \
             op_repr(lifts[0].term)
 
