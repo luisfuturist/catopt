@@ -96,7 +96,7 @@ produces the parallel/decomposed forms.
 | Carrier | Maps | Discovers | Wall-clock |
 |---|---|---|---|
 | `aff(A,b)` dense affine | `h ↦ Ah+b` | Blelloch parallel scan | **6.3×** (CUDA-graph, T=64) |
-| `aff_diag(a,b)` diagonal affine | `h ↦ a⊙h+b` | elementwise scan (Mamba-faithful SSMs) | **4.4×** (CUDA-graph, T=64) |
+| `aff_diag(a,b)` diagonal affine | `h ↦ a⊙h+b` | elementwise scan (Mamba-faithful SSMs); unit introduction `affd_lift_unit` also lifts *additive* accumulations — cumsum, running stats, linear-attention KV state | **4.4×** (CUDA-graph, T=64) |
 | `om(m,l,a)` online softmax | running max/exp-sum/numerator | chunked/flash attention, streaming KV | memory-feasibility win (below) |
 | `trace^U` feedback | `Tr(f) = P + Q(I−S)⁻¹R` | channel splitting, loop-boundary sliding | iterative↔closed forms |
 | tensor domain | — | folds, pairing, reassociations | up to **8×** |
@@ -165,7 +165,10 @@ emit only via seeds. Fed `SCAN_LAWS \
 hand-written derived rule; om/attention lemmas (the chunked-attention
 homomorphism, score-concat lift, mask-distribution composites) derive
 themselves. Certified composite paths distill back into the law set —
-the meta-optimization loop is closed.
+the meta-optimization loop is closed. `rulecache.py` persists
+synthesized rules (patterns + provenance as JSON; composed guards
+rebuilt from parents at load — callables never pickled), keyed by
+sha256 of ruleset+seeds+params: **58× faster reload**.
 
 ## The mechanism: the product law is non-local
 
@@ -295,8 +298,12 @@ structurally different but provably-equal programs. Novelty levels:
   certificates, frontier enumeration, cross-carrier models — is built.
 
 **The calibrated cost model predicts the crossover.** `roofline_cost`
-constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s, 8.7 µs
-launch). Predicted vs measured direction agrees on all tested cases; at
+constants are measured on the target — `calibrate.calibrate()` measures
+peak FLOPS / bandwidth / launch overhead on any device and
+`roofline_cost_for(TargetProfile)` yields a per-target cost fn (this
+machine re-measured: 3.29 TFLOPS / 93.6 GB/s / 3.4 µs vs the original
+hardcoded 2.5 / 89 / 8.7). Predicted vs measured direction agrees on
+all tested cases; at
 the boundary the magnitude is right (ParallelBlock b=4: predicted 1.08×,
 measured 1.08×). The pipeline *accepts* pairing where it wins and
 *declines* it on real blocks where it loses — per-shape, cost-driven.
@@ -365,8 +372,9 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   convs, and learned-scale norms are not yet pairable.
 - **Reassociation applies only to unnormalised attention** — softmax
   blocks the `(QK^T)V → Q(K^TV)` law.
-- **`roofline_cost` is calibrated to this GPU** (RTX 2050, 4 GB);
-  magnitudes should not be extrapolated to datacenter hardware.
+- **All measurements are on an RTX 2050 (4 GB)** — `calibrate()` now
+  makes re-targeting mechanical, but magnitudes should not be
+  extrapolated to datacenter hardware.
 
 ## Roadmap
 
@@ -397,7 +405,9 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/egraph.py` | Union-find, e-matching, saturation, `truncation_level` (1–3), proof-carrying merges (`certificate`/`verify_certificate`/`coherent_paths`), DAG-aware + coordinated extraction |
 | `catopt/meta.py` | Coherence stratification (`canonicalize`, `stratified_run`) + critical-pair rule synthesis (`synthesize_rules`) |
 | `catopt/rules.py` | Laws + `pair_shared_input_linears` non-local pass |
-| `catopt/cost.py` | `count_cost`, `flops_cost`, `launch_aware_cost`, calibrated `roofline_cost`, `depth_cost`, `dag_cost` |
+| `catopt/cost.py` | `count_cost`, `flops_cost`, `launch_aware_cost`, `roofline_cost`(+`_for(profile)`), `depth_cost`, `dag_cost` |
+| `catopt/calibrate.py` | `TargetProfile` + `calibrate()` — measure cost constants on any device |
+| `catopt/rulecache.py` | Persistent cache for synthesized rules (58× reload) |
 | `catopt/torch_bridge.py` | `torch.export` → IR, IR → `IRModule`, compile-time weight folding |
 | `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
 | `catopt/om.py` | Online-softmax monoid laws (chunked/streaming attention) |
@@ -408,7 +418,7 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 327 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
+| `tests/` | 354 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
 
 ## Reproduce
 
