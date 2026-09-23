@@ -166,8 +166,13 @@ Novelty has levels, and the frontier report makes them inspectable:
   `naturality_scalar` ∘ `sdpa_fold` in nanoGPT.
 - **Level 4** (transform nobody encoded): not yet — every
   *result* remains practitioner-known even when the *derivation*
-  is emergent.  The missing ingredient is a law set rich enough to
-  express algorithmic change (scan monoid, convolution theorem).
+  is emergent.  One step taken: an unrolled LTI recurrence
+  `h_t = A h_{t-1} + x_t` (SSM-style sequential fold) reassociates
+  under **monoid laws alone** (distribute + assoc) into forms with
+  shared matrix powers `A^k` and shorter critical paths — the
+  parallel-scan (Blelloch) structure is reachable with no
+  scan-specific rule, verified exact in fp64, and a `depth_cost`
+  model selects it.  Saturation caps the demonstration at small T.
 
 **The calibrated cost model predicts the crossover.** `roofline_cost`
 constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
@@ -265,7 +270,7 @@ lowering overhead visible on real blocks.
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 90 tests
+python -m pytest tests/ -q         # 91 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

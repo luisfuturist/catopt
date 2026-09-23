@@ -460,3 +460,26 @@ class AdditiveMaskAttention(nn.Module):
         att = F.softmax(att, dim=-1)
         return torch.matmul(att, v)
 
+
+class LinearRecurrence(nn.Module):
+    """Unrolled LTI recurrence ``h_t = A h_{t-1} + x_t`` (SSM-style).
+
+    A sequential fold — but the underlying computation is a prefix
+    product of affine maps, an *associative* monoid.  Distribute +
+    associativity expose the matrix powers ``A^k`` and block-combine
+    forms: the parallel-scan (Blelloch) structure is reachable by the
+    e-graph without any scan-specific rule.
+    """
+
+    def __init__(self, dim: int = 32, steps: int = 6) -> None:
+        super().__init__()
+        self.A = nn.Parameter(torch.randn(dim, dim) * 0.1)
+        self.h0 = nn.Parameter(torch.zeros(dim))
+        self.steps = steps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.h0
+        for t in range(self.steps):
+            h = self.A @ h + x[t]
+        return h
+

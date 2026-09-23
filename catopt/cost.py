@@ -502,6 +502,33 @@ def launch_aware_cost(term: Any, memo: dict | None = None) -> float:
     return 0.0
 
 
+def depth_cost(term: Any, memo: dict | None = None) -> float:
+    """Critical-path cost: the longest dependency chain in seconds.
+
+    Each op's latency is its roofline time (max(flops/peak, bytes/bw)
+    + launch); the term's cost is local latency + max child depth.
+    Work-preserving reassociations (parallel scans, balanced sums,
+    repeated squaring) win here even when total FLOPs are identical —
+    this is the axis on which a sequential recurrence and its
+    log-depth Blelloch form differ."""
+    memo = {} if memo is None else memo
+    ck = ("dc", id(term))
+    if ck in memo:
+        return memo[ck]
+    if isinstance(term, Op):
+        local = _local_roofline(term, memo=memo)
+        if local >= _INVALID_COST:
+            # Unshapeable op: charge a launch, not a veto — depth is a
+            # structural metric, not a soundness gate.
+            local = _LAUNCH_S * 1e9
+        child = max((depth_cost(a, memo) for a in term.args), default=0.0)
+        out = local + child
+        memo[ck] = float(out)
+        return out
+    memo[ck] = 0.0
+    return 0.0
+
+
 def count_cost(term: Any, memo: dict | None = None) -> float:
     """Cost = number of non-view operations in the term tree."""
     memo = {} if memo is None else memo

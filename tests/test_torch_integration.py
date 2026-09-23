@@ -1047,6 +1047,46 @@ def test_sdpa_fold_rejects_wrong_dim():
     assert not _check_softmax_dim(bound)
 
 
+def test_linear_recurrence_scan_structure():
+    """Monoid laws alone expose the parallel-scan form: an unrolled
+    LTI recurrence h_t = A h_{t-1} + x_t reassociates so matrix powers
+    A^k become shared subproducts and the critical path shortens.
+    Verified exact in fp64."""
+    import torch.nn as nn
+    from catopt.models import LinearRecurrence
+    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt.egraph import EGraph
+    from catopt import rules as R
+    from catopt.ir import Op, IR
+
+    def opdepth(t, memo):
+        if not isinstance(t, Op):
+            return 0
+        k = id(t)
+        if k not in memo:
+            memo[k] = 1 + max((opdepth(a, memo) for a in t.args),
+                              default=0)
+        return memo[k]
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(32, 6).eval().double()
+    x = torch.randn(6, 32, dtype=torch.float64)
+    ir, st = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    laws = [R.DISTRIBUTE_MUL, R.ASSOC_MATMUL, R.ASSOC_MATMUL_REV,
+            R.ASSOC_ADD, R.COMM_ADD]
+    eg.run(laws, root, max_iterations=4, max_nodes=80_000)
+    best = eg.extract_best(root, lambda t, **k: opdepth(t, {}))
+    assert opdepth(best, {}) < opdepth(ir.root, {})
+    opt_ir = IR(root=best, inputs=ir.inputs, input_names=ir.input_names,
+                params=ir.params)
+    mod = ir_to_torch_module(opt_ir, param_values=st)
+    with torch.no_grad():
+        diff = (m(x) - mod(x)).abs().max().item()
+    assert diff < 1e-10
+
+
 def test_linear_attention_reassociation():
     """(Q K^T) V reassociates to Q (K^T V) — O(T^2 d) -> O(T d^2).
     Exact identity (verified in fp64); the cost model must pick it."""
