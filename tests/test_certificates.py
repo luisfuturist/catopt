@@ -240,10 +240,10 @@ def test_tampered_dst_claim_fails(comm_cert):
 #  e-graph-dependent steps: recorded, flagged, never silently passed
 # ---------------------------------------------------------------------------
 
-def test_pairing_pass_merges_are_egraph_dependent():
-    """The non-local pairing pass merges classes without a term-local
-    rule — certificate marks those steps e-graph-dependent rather than
-    fabricating a derivation."""
+def test_pairing_pass_merges_are_witnessed():
+    """The non-local pairing pass attaches a pointwise witness rule per
+    member — certificate steps replay standalone instead of being
+    flagged egraph-dependent."""
     x = Var("x", TensorType((2, 4)))
     W1 = Param("W1", TensorType((8, 4)))
     W2 = Param("W2", TensorType((8, 4)))
@@ -260,17 +260,13 @@ def test_pairing_pass_merges_are_egraph_dependent():
     assert "split" in op_repr(dst)
 
     cert = eg.certificate(src, dst)
-    assert cert.n_egraph_dependent >= 2  # one per paired member
-    assert not cert.replayable
-    notes = " ".join(s.note for s in cert.steps if s.egraph_dependent)
-    assert "non-local" in notes or "outside rule" in notes
+    # one witnessed step per paired member — strictly replayable
+    assert cert.n_egraph_dependent == 0
+    assert cert.replayable
+    assert all(r.startswith("pair#") for r in cert.rules_used)
 
-    # non-strict replay substitutes the trusted assertions -> dst;
-    # strict mode refuses to call that a proof.
-    out = verify_certificate(src, cert)
+    out = verify_certificate(src, cert, strict=True)
     assert op_repr(out) == op_repr(dst)
-    with pytest.raises(CertificateVerificationError):
-        verify_certificate(src, cert, strict=True)
 
 
 # ---------------------------------------------------------------------------

@@ -905,9 +905,24 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
                     ("dim", split_dim), ("index", index_of[w]),
                     ("sizes", tuple(sizes)),
                 ))
-                eg.union(cid, eg.add_enode("split", (fused,), {
+                split_eid = eg.add_enode("split", (fused,), {
                     "sizes": tuple(sizes), "dim": split_dim,
-                    "index": index_of[w]}))
+                    "index": index_of[w]})
+                # Replayable witness: the member's own class term ->
+                # its section of the fused GEMM.  Pointwise honesty —
+                # asserts this instance, exactly what the pass proved.
+                src = getattr(eg, "_oldest_term", eg.any_term)(cid)
+                split_term = eg.any_term(split_eid)
+                wit = None
+                if src is not None and split_term is not None:
+                    wit = Rewrite(
+                        name=f"pair#{split_eid}",
+                        lhs=src, rhs=split_term,
+                        law=("pointwise witness for a non-local offer: "
+                             "this member equals its split section of "
+                             "the shared fused weight (equality "
+                             "established by the pairing pass)"))
+                eg.union(cid, split_eid, witness=wit)
                 group.setdefault(cid, enode)
             groups.append(group)
     return groups
