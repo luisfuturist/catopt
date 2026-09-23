@@ -199,6 +199,62 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 
 ---
 
+## Status: first working prototype
+
+`catopt/` now implements the pipeline above end to end. Run `python main.py`
+(or `python main.py --large-batch 4096`) to reproduce everything below.
+
+### What works
+
+| Layer | Module | What it does |
+| ----- | ------ | ------------ |
+| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws |
+| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, cycle-safe extraction |
+| Rules | `catopt/rules.py` | 18 rules: monoid/group laws, `silu`/`pow` bridges, matmul distributivity, naturality, associativity |
+| Cost | `catopt/cost.py` | `count_cost` + shape-aware `flops_cost` (proper `2·M·N·K` matmul/linear) |
+| Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion** |
+| Pipeline | `catopt/optimize.py` | 4-phase `optimize_model` with equivalence verification |
+
+### Measured results (CPU, run on this machine)
+
+| Program | Equivalent? | Inductor (ms) | CatOpt + Inductor (ms) | Speedup |
+| ------- | ----------: | ------------: | ---------------------: | ------: |
+| MatrixChain b=128  | yes (7e-09) | 0.048 | 0.030 | **1.60×** |
+| MatrixChain b=4096 | yes (5e-09) | 0.240 | 0.039 | **6.22×** |
+| SwiGLU   | yes (0.0)   | — | — | 1.00× (cost unchanged) |
+| RMSNorm  | yes (2e-07) | — | — | **1.95×** FLOPs (4101→2086) |
+
+Both paths go through `torch.compile`, so the comparison isolates the
+representation: same backend, same model, same weights — only the graph
+handed to TorchInductor differs.
+
+### Honest reading of the numbers
+
+* **The 6.3× FLOP figure is not a 6.3× speedup.** It counts the one-time
+  `W1@(W2@W3)` precompute; at `batch=128` fixed overheads dominate and the
+  wall-clock gain is 1.6×. At `batch=4096` the precompute amortises and the
+  measured gain climbs to **6.22×**, approaching the runtime-only matmul-FLOP
+  ratio of 10.2×. This is exactly the predicted behaviour, and it is why the
+  demo prints both.
+* **SwiGLU shows 1.00×.** With this cost model the categorical rules confirm
+  equivalence but find no strictly cheaper form. Reporting that is the point:
+  a rule system that always "wins" would be measuring its cost model, not the
+  compiler.
+* **RMSNorm genuinely improves (1.95×).** Here the e-graph finds a form that
+  hoists `rsqrt` onto the reduced `(B, T, 1)` tensor instead of the broadcast
+  `(B, T, C)` tensor. That is a real, semantics-preserving FLOP reduction that
+  the exported graph does not express.
+
+### Reproduce
+
+```bash
+python main.py                     # 4 demos: associativity, SwiGLU/RMSNorm, naturality
+python main.py --large-batch 4096  # measured large-batch timing
+python -m pytest tests/ -q         # 55 tests
+```
+
+---
+
 ## And if we find even ONE convincing case...
 
 Then the project becomes much more interesting.

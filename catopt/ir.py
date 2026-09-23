@@ -185,9 +185,14 @@ op_def(
 )
 op_def("sub", 2, 1, commutative=False,
        law="Subtraction: a - b = a + neg(b)  (distributivity of negation).")
+op_def("div", 2, 1, commutative=False,
+       law="Division: a / b = a * (1/b)  (multiplicative inverse).")
+op_def("pow", 2, 1, commutative=False,
+       law="Power: x**n, with square(x)=pow(x,2) and rsqrt as inverse sqrt.")
 
 # Unary element-wise
 op_def("square", 1, 1, law="Self-composition: square(x) = mul(x, x).")
+op_def("sqrt", 1, 1, law="Square root: sqrt(x)**2 = x.")
 op_def("neg", 1, 1, law="Additive inverse: neg(x) + x = 0  (group inverse).")
 op_def("rsqrt", 1, 1, law="rsqrt(x)*sqrt(x)=1 (group inverse under mul).")
 op_def("exp", 1, 1, law="Exponential.")

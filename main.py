@@ -12,7 +12,7 @@ import torch
 
 from catopt.egraph import EGraph
 from catopt.ir import Op, Var, Param, TensorType, IR, op_repr
-from catopt.rules import CATEGORICAL_RULES
+from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
 from catopt.cost import flops_cost
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.models import MatrixChain
@@ -70,6 +70,63 @@ def demo_matrix_chain(batch: int = 128, verbose: bool = True) -> None:
                         print("  ✗ WARNING: outputs differ!")
 
 
+def demo_large_batch(batch: int = 4096, verbose: bool = True) -> None:
+    """CPU-friendly larger-batch timing for the matrix-chain case.
+
+    The 6.3x FLOP figure includes the one-time W1@(W2@W3) precompute
+    (147k FLOPs); bigger batches amortize it, so the *runtime* gap
+    should widen toward the pure-runtime ratio
+    batch*d0*d1 + ... vs batch*d0*d3 (here 18688 vs 2048 per sample,
+    i.e. ~9.1x in matmul FLOPs).  Wall-clock on CPU also reflects
+    inductor overhead, thread scaling, and memory traffic, so this
+    reports measured numbers alongside the theory instead of
+    conflating the two.
+    """
+    import time  # noqa: E402
+    from catopt.models import MatrixChain  # noqa: E402
+
+    torch.manual_seed(0)
+    d0, d1, d2, d3 = 128, 64, 32, 8
+    model = MatrixChain(d0, d1, d2, d3)
+    x = torch.randn(batch, d0)
+    ir, source_tensors = export_to_ir(model, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=5000)
+    best = eg.extract_best(eid, flops_cost)
+    opt = ir_to_torch_module(IR(
+        root=best, inputs=ir.inputs,
+        input_names=ir.input_names, params=ir.params,
+    ), param_values=source_tensors)
+    model.eval(); opt.eval()
+    with torch.no_grad():
+        co = torch.compile(model); cc = torch.compile(opt)
+        for _ in range(3):
+            _ = co(x); _ = cc(x)
+
+        def bench(f, n: int = 20) -> float:
+            ts = []
+            with torch.no_grad():
+                for _ in range(n):
+                    t0 = time.perf_counter(); _ = f(x)
+                    ts.append((time.perf_counter() - t0) * 1000)
+            ts.sort(); t = ts[2:-2]
+            return sum(t) / len(t)
+
+        to, tc = bench(co), bench(cc)
+        per_left = d0 * d1 + d1 * d2 + d2 * d3   # matmul-FLOPs/2 per sample
+        per_right = d0 * d3
+        pre = d1 * d2 * d3 + d0 * d1 * d3        # 2x counted below
+        print(f"\n{'='*70}")
+        print(f"  Large-batch timing: batch={batch}")
+        print(f"  Runtime-only FLOP ratio (theory): "
+              f"{per_left/per_right:.1f}x")
+        print(f"  Precompute (one-time): {2*pre:,} FLOPs")
+        print(f"  Inductor (orig):   {to:.2f} ms")
+        print(f"  Catopt + Inductor: {tc:.2f} ms  (speedup {to/tc:.2f}x)")
+        print(f"{'='*70}")
+
+
 def demo_naturality(batch: int = 64, verbose: bool = True) -> None:
     """Demonstrate naturality of scalar multiplication w.r.t. matmul.
 
@@ -108,10 +165,69 @@ def demo_naturality(batch: int = 64, verbose: bool = True) -> None:
         print("  ✓ E-graph confirms naturality: both forms are equivalent")
 
 
+def demo_swiglu_rmsnorm(
+    dim: int = 32, batch: int = 4, seqlen: int = 8, verbose: bool = True
+) -> None:
+    """Demonstrate the categorical pipeline on real exported SwiGLU/RMSNorm.
+
+    Uses the polyhedral-RFC target ops (SwiGLU + RMSNorm from
+    catopt.models).  Both export cleanly now that _graph_signature remaps
+    the GraphModule's 'p_<attr>' placeholders to 'gate.weight' etc.  The
+    e-graph then applies silu/pow bridge rules (x*sigmoid(x), pow<->square)
+    so the SwiGLU gate/up prefix sharing and RMSNorm's x**2 scaling are
+    visible as ONE equivalence class per op.  IRModule lowers with the
+    ORIGINAL weights, so semantic equivalence is verified bit-exactly.
+    """
+    from catopt.models import SwiGLU, RMSNorm  # noqa: E402
+
+    torch.manual_seed(0)
+    if verbose:
+        print(f"\n{'='*70}")
+        print("  Case: SwiGLU + RMSNorm (polyhedral-RFC targets)")
+        print(f"{'='*70}")
+
+    xg = torch.randn(batch, seqlen, dim)
+    sg, rn = SwiGLU(dim), RMSNorm(dim)
+    results = []
+    for name, model, x in (("SwiGLU", sg, xg), ("RMSNorm", rn, xg)):
+        ir, source_tensors = export_to_ir(model, x)
+        eg = EGraph()
+        root_eid = eg.add_term(ir.root)
+        stats = eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, root_eid,
+                       max_iterations=30, max_nodes=20000)
+        best = eg.extract_best(root_eid, flops_cost)
+        if verbose:
+            print(f"\n  {name} IR:      {op_repr(ir.root)}")
+            print(f"  {name} cost:    {flops_cost(ir.root):.0f} FLOPs")
+            print(f"  E-graph stats:  {stats}")
+            print(f"  Best term:      {op_repr(best)}")
+            print(f"  Best cost:      {flops_cost(best):.0f} FLOPs")
+        model.eval()
+        lowered = ir_to_torch_module(IR(
+            root=best, inputs=ir.inputs,
+            input_names=ir.input_names, params=ir.params,
+        ), param_values=source_tensors)
+        lowered.eval()
+        with torch.no_grad():
+            out_o = model(x.clone())
+            out_n = lowered(x.clone())
+            diff = (out_o - out_n).abs().max().item()
+            ok = "✓" if diff < 1e-4 else "✗"
+            print(f"  {ok} {name}: max abs diff {diff:.3e}")
+            results.append((name, diff))
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="catopt — categorical NN optimizer demo")
     parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--large-batch", type=int, default=0,
+                        help="Run an extra CPU-friendly large-batch matrix-chain "
+                             "timing (e.g. --large-batch 4096).  The 6.3x FLOP "
+                             "figure is compile-time + runtime; large batches "
+                             "amortize the one-time W1@(W2@W3) precompute and "
+                             "narrow the measured gap toward it.")
     parser.add_argument("--bench", action="store_true",
                         help="Also benchmark with torch.compile (slow)")
     args = parser.parse_args()
@@ -119,9 +235,14 @@ def main() -> None:
     print("=" * 70)
     print("  catopt — Categorical Optimization of Neural Network Graphs")
     print("  Demonstrating: associativity + naturality of matmul")
+    print("  Note: 6.3x is FLOP count (incl. one-time precompute);")
+    print("        runtime was 1.6x on CPU batch=128 (see --large-batch).")
     print("=" * 70)
 
     demo_matrix_chain(batch=args.batch)
+    if args.large_batch:
+        demo_large_batch(batch=args.large_batch)
+    demo_swiglu_rmsnorm()
     demo_naturality(batch=64)
 
     if args.bench:

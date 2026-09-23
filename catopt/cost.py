@@ -46,12 +46,39 @@ def _infer_op_shape(op: Op) -> tuple | None:
             if len(a) >= 2 and len(b) >= 2:
                 return a[:-1] + (b[-1],)
             return shapes[0]
-        case "add" | "mul" | "sub":
+        case "add" | "mul" | "sub" | "div":
             return shapes[0]
-        case "square" | "neg" | "sigmoid" | "silu" | "tanh" | "gelu" | "rsqrt":
+        case (
+            "square" | "sqrt" | "neg" | "sigmoid" | "silu" | "tanh"
+            | "gelu" | "rsqrt" | "exp"
+        ):
+            return shapes[0]
+        case "pow":
+            return shapes[0] if shapes and shapes[0] is not None else ()
+        case "linear":
+            # F.linear(x[..., in], W[out, in]) -> [..., out]
+            if len(shapes) >= 2 and shapes[0] is not None and shapes[1] is not None:
+                w = shapes[1]
+                if len(w) >= 1:
+                    return tuple(shapes[0][:-1]) + (w[0],)
             return shapes[0]
         case "sum" | "mean":
-            return ()
+            # Honor keepdim/dim when available, else reduce to scalar.
+            dim = op.attrs.get("dim", op.attrs.get("axis", None))
+            keep = bool(op.attrs.get("keepdim", False))
+            base = shapes[0]
+            if base is None:
+                return ()
+            if dim is None:
+                return ()
+            dims = dim if isinstance(dim, (tuple, list)) else (dim,)
+            ndim = len(base)
+            norm = {d % ndim for d in dims}
+            if keep:
+                return tuple(
+                    (1 if i in norm else d) for i, d in enumerate(base)
+                )
+            return tuple(d for i, d in enumerate(base) if i not in norm)
         case "transpose":
             return tuple(reversed(shapes[0])) if shapes[0] else shapes[0]
         case _:
@@ -72,10 +99,11 @@ def _numel(shape) -> int:
 # ---------------------------------------------------------------------------
 
 _OP_FLOPS: dict[str, int] = {
-    "matmul": 2, "add": 1, "mul": 1, "sub": 1, "square": 1, "neg": 1,
+    "matmul": 2, "add": 1, "mul": 1, "sub": 1, "div": 4, "square": 1,
+    "sqrt": 2, "neg": 1, "pow": 2,
     "sigmoid": 2, "silu": 3, "tanh": 2, "gelu": 3, "rsqrt": 2, "exp": 1,
     "sum": 1, "mean": 2, "max": 1,
-    "transpose": 0, "reshape": 0, "broadcast": 0,
+    "transpose": 0, "reshape": 0, "broadcast": 0, "linear": 2,
 }
 
 
@@ -94,6 +122,13 @@ def flops_cost(term: Any) -> float:
             if shapes and shapes[1] is not None:
                 k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
                 base = 2 * n_out * k_dim
+            else:
+                base = 2 * n_out
+        elif term.op == "linear":
+            # F.linear(x[..,in], W[out,in]) -> 2 * M * out * in
+            shapes = [_shape_of(a) for a in term.args]
+            if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
+                base = 2 * n_out * shapes[0][-1]
             else:
                 base = 2 * n_out
         else:
@@ -139,6 +174,13 @@ class CostModel:
                     base = 2 * n * k_dim
                 else:
                     base = coeff * n
+            elif term.op == "linear":
+                # F.linear(x[.., in], W[out, in]) -> 2 * M * out * in
+                shapes = [_shape_of(a) for a in term.args]
+                if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
+                    base = 2 * n * shapes[0][-1]
+                else:
+                    base = 2 * n
             else:
                 base = coeff * n
             for arg in term.args:

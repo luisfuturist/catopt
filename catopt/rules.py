@@ -112,6 +112,33 @@ SQUARE_EXPAND = R(
     law="Self-composition: x² = x · x.",
 )
 
+# RMSNorm/pow family: connect x.pow(2) to the mul-based representation.
+# Lets square-related and naturality rewrites see RMSNorm's x**2 term.
+POW_TO_SQUARE = R(
+    "pow_to_square",
+    Op.make("pow", "x", Const(2)),
+    Op.make("square", "x"),
+    law="pow(x, 2) ≡ square(x) ≡ x·x (SwiGLU/RMSNorm bridge).",
+)
+
+SQUARE_TO_POW = R(
+    "square_to_pow",
+    Op.make("square", "x"),
+    Op.make("pow", "x", Const(2)),
+    law="Reverse: square(x) ≡ pow(x, 2) for shape/cost reasons.",
+)
+
+# SwiGLU bridge: the exported graph has silu(linear(...)) followed by
+# mul with another linear(...).  Expanding silu exposes the common
+# x*sigmoid(x) factor, which lets naturality/distributivity see the
+# shared linear prefix.  Already have SILU_EXPAND; add the mul-form:
+SILU_MUL_FORM = R(
+    "silu_mul_form",
+    Op.make("mul", Op.make("silu", "g"), "u"),
+    Op.make("mul", Op.make("mul", "g", Op.make("sigmoid", "g")), "u"),
+    law="SwiGLU: silu(g)*u = (g*sigmoid(g))*u (factor for prefix sharing).",
+)
+
 
 # ---------------------------------------------------------------------------
 #  Distributivity / naturality (the categorical insight)
@@ -186,7 +213,10 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     DOUBLE_NEG,
     SUB_TO_ADD,
     SILU_EXPAND,
+    SILU_MUL_FORM,
     SQUARE_EXPAND,
+    POW_TO_SQUARE,
+    SQUARE_TO_POW,
 ]
 
 #: Rules that implement the categorical insight: distributivity and naturality.
