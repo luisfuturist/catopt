@@ -222,6 +222,40 @@ block, both carriers coexist in one e-graph (444 enodes, saturates in
 fused attention `out_proj` into the *next* SSM's input projections —
 an inter-layer weight merge across the carrier seam.
 
+## Crossing the carrier seam (`xcarrier.py`)
+
+The deepest question: can a *sound* law move computation between
+carrier families? The answer splits cleanly:
+
+**The value/readout side crosses.** A carrier application is affine in
+its initial state, so linear maps push through affine evaluation —
+the scan analogue of the traced category's tightening axiom:
+
+```text
+matmul(E, applyd(aff_diag(a,b), h)) = applyd(aff_diag(Ea, Eb), h)
+matmul(W, apply(aff(A,c), h))      = apply(aff(WA, Wc), h)
+linear(applyd(aff_diag(a,b),h), W) = apply(aff(a⊙W, bW), h)  # promotion
+```
+
+The om numerator `e @ v` *is* such a readout: `om_elem(s, a⊙h+b)`
+fuses into `om_elem_affd(s,a,b,h)` — the scan folds **inside** the
+softmax element and composes under the ordinary om homomorphism.
+Stronger: the deferred `omd` carrier keeps the whole chunked-attention
+tree affine in `h` — step state `(m, l, fa, fb)` — so *attention over
+scanned values is one recurrence* (the exact S4/RWKV-style form), via
+the non-local `omd_tree_lift` pass under a global shared-state guard.
+And `gather_applyd_stack` collapses `stack(applyd(f_i, h))` into one
+application of the stacked map — "the sequence a scan emits is one map
+applied to h₀". All offers carry pointwise witnesses.
+
+**The score side is a wall — measured, not assumed.** With `q,k` both
+affine in `h`, `s = q·k` is *quadratic* in `h` — no affine carrier
+captures it, and `exp∘quadratic` has no finite carrier at all.
+Softmax ≠ linear attention exactly; the gap is quantified concretely.
+The 29-rule `XC_LAWS` set is opt-in (`CARRIER_X_LAWS`): bidirectional
+pairs double the rule set and blow up default saturation — the
+non-local passes run regardless.
+
 ## Full measurements
 
 ### GPU (RTX 2050, synced timing)
@@ -420,10 +454,11 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
 | `catopt/trace.py` | Traced-monoidal structure: `trace`/`bdiag`/`parl`/`eye`/`cswap`/`inv` + JSV axioms |
 | `catopt/trace_lift.py` | Non-local lift: unrolled recurrences → `trace(F)` via nilpotent block-shift |
+| `catopt/xcarrier.py` | Cross-carrier laws + `omd` deferred carrier: readouts exit scans, scans fold inside om elements |
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 389 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace |
+| `tests/` | 420 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier |
 
 ## Reproduce
 
