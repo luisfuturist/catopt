@@ -58,9 +58,12 @@ MASKED ATTENTION
 
 from typing import Any
 
-from catopt.egraph import Rewrite
-from catopt.ir import Op
+import torch
+
+from catopt.egraph import Rewrite, _LeafRegistry
+from catopt.ir import Const, Op, op_def
 from catopt.rules import R
+from catopt.torch_bridge import _IR_TO_TORCH
 
 
 def _shape_of(t: Any):
@@ -676,6 +679,234 @@ OM_MASK_LAWS: list[Rewrite] = [
 
 
 # ---------------------------------------------------------------------------
+#  is_causal IS a mask — chunking the flag, not the mask.
+#
+#  ``sdpa(q, cat(k_i), cat(v_i), is_causal=True)`` carries no mask
+#  operand, so OM_MASK_LAWS have nothing to slice.  But the flag is
+#  only sugar for a materialised causal bad-mask over the concatenated
+#  score matrix — unfold it into exactly that:
+#
+#      sdpa(q, cat(k_i), cat(v_i), is_causal)
+#        = om_apply(om_elem(
+#              masked_fill(cat(qs @ k_i.T), cmask(cat(qs @ k_i.T)), -inf),
+#              cat(v_i)))        where qs = q · scale
+#
+#  and then the EXISTING laws do all the chunking: masked_fill_cat_slice
+#  slices the materialised mask on the key axis (block i's positional
+#  offset lives inside the slice — the same offset story as an
+#  explicit causal mask), OM_SPLIT splits the carrier, and early rows
+#  of late blocks (t < o_i, fully masked within that block) exercise
+#  om_compose's isfinite guard exactly as in the materialised case.
+#
+#  The unfold needs two small generator ops, registered here via the
+#  trace.py mechanism (op_def + _IR_TO_TORCH):
+#
+#  ``cmask(x, off=0)``
+#      The causal bad-mask of an x-shaped score matrix: on x's last two
+#      dims, out[...,t,j] = (j + off > t) — strict upper triangle
+#      shifted ``off`` keys right, broadcast back to x's full shape.
+#      Rank-preserving so ``_shape_of`` reads it through the default
+#      case — which is what lets masked_fill_cat_slice derive split
+#      sizes for n-ary concats.  Semantics follow torch's is_causal:
+#      lower-LEFT triangular, i.e. j ≤ t, so a T_q=1 decode row sees
+#      only key 0 (torch's documented footgun — kept, not patched).
+#
+#  ``fill(x, value=c)``
+#      The constant map x ↦ c·1 (torch.full_like).  Needed because the
+#      kernel's scale — 1/√E by default — is a DERIVED constant: derive
+#      hooks can only fill attribute metavariables, never operand
+#      positions, so a scalar cannot be materialised as a Const leaf.
+#      fill puts it in an attr instead.  The scale is folded into q
+#      once (qs = q·s ⇒ qs@k.T = s·qk.T), which keeps the score concat
+#      visible to masked_fill_cat — scaling the concat'd scores would
+#      bury them under a mul that no law distributes.
+#
+#  Also present: the unmasked companion — ``sdpa(q, cat k, cat v)``
+#  with no mask at all chunks the same way minus the masked_fill.
+#
+#  Both spellings of the flag are covered: the ``is_causal``/``scale``
+#  kwarg form and torch.export's positional ``arg4`` (dropout_p) /
+#  ``arg5`` (is_causal) / ``arg6`` (scale) form.  A nonzero dropout_p
+#  or a non-numeric scale vetoes the rewrite; sdpa with an explicit
+#  attn_mask (a 4th operand) never matches by arity.
+# ---------------------------------------------------------------------------
+
+op_def(
+    "cmask", 1, 1,
+    law="Causal-mask generator: cmask(x)[...,t,j] = (j + off > t) — "
+        "the strict upper triangle of x's score plane, shifted off "
+        "keys; materialises what sdpa's is_causal flag hides.")
+op_def(
+    "fill", 1, 1,
+    law="Constant map x ↦ c·1 (full_like): the vehicle for derived "
+        "scalar constants, which can only occupy attribute positions.")
+
+
+def _cmask_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
+    off = int(kw.get("off", kw.get("arg1", 0)) or 0)
+    t, k = x.shape[-2], x.shape[-1]
+    keep = torch.ones(t, k, dtype=torch.bool,
+                      device=x.device).tril(-off)
+    return keep.logical_not().expand(x.shape)
+
+
+def _fill_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
+    return torch.full_like(x, float(kw.get("value", kw.get("arg1", 0))))
+
+
+_IR_TO_TORCH["cmask"] = _cmask_torch
+_IR_TO_TORCH["fill"] = _fill_torch
+
+#: The masked_fill fill-value in rule RHSs.  _instantiate turns a
+#: non-Op RHS leaf into a repr-keyed leaf enode; registering the Const
+#: lets extraction decode "-inf" back to a Const instead of a bare
+#: string (the registry is keyed by repr, and repr(Const) is str(value)).
+_NEG_INF = Const(float("-inf"))
+_LeafRegistry.register(_NEG_INF)
+
+
+def _check_sdpa_cat(bound: dict) -> bool:
+    """sdpa(q, cat(k1,k2,KD), cat(v1,v2,VD)) chunks only when both cats
+    are on the SEQUENCE axis (dim -2 of k and v — the key axis), the
+    blocks are cat-compatible, q's head dim contracts k's, each key
+    block pairs with its value block, batch dims broadcast per block,
+    and the sdpa flags are benign (dropout_p == 0, numeric scale)."""
+    qs = _shape_of(bound.get("q"))
+    k1s, k2s = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
+    v1s, v2s = _shape_of(bound.get("v1")), _shape_of(bound.get("v2"))
+    if not all(isinstance(s, tuple)
+               for s in (qs, k1s, k2s, v1s, v2s)):
+        return False
+    if (len(qs) < 2 or len(k1s) < 2 or len(v1s) < 2
+            or len(k2s) != len(k1s) or len(v2s) != len(v1s)):
+        return False
+    kd, vd = bound.get("$attr:KD"), bound.get("$attr:VD")
+    if not (isinstance(kd, int) and isinstance(vd, int)):
+        return False
+    nk, nv = len(k1s), len(v1s)
+    if kd % nk != nk - 2:
+        return False                          # keys cat on seq axis
+    if vd % nv != nv - 2:
+        return False                          # values cat on seq axis
+    if not all(_dim_eq(k1s[i], k2s[i])
+               for i in range(nk) if i != nk - 2):
+        return False
+    if not all(_dim_eq(v1s[i], v2s[i])
+               for i in range(nv) if i != nv - 2):
+        return False
+    # q[...,d] contracts k[...,d]; k_i's key count is v_i's.
+    if not (_dim_eq(qs[-1], k1s[-1]) and _dim_eq(qs[-1], k2s[-1])):
+        return False
+    if not (_dim_eq(k1s[-2], v1s[-2]) and _dim_eq(k2s[-2], v2s[-2])):
+        return False
+    # Per-block batch broadcast: q vs k_i, q vs v_i, k_i vs v_i.
+    for ks, vs in ((k1s, v1s), (k2s, v2s)):
+        if not (_broadcast_ok(qs[:-2], ks[:-2])
+                and _broadcast_ok(qs[:-2], vs[:-2])
+                and _broadcast_ok(ks[:-2], vs[:-2])):
+            return False
+    dp = bound.get("$attr:DP")
+    if dp is not None and dp != 0:
+        return False                          # dropout: not pure math
+    sc = bound.get("$attr:SC")
+    if sc is not None and (
+            isinstance(sc, bool) or not isinstance(sc, (int, float))):
+        return False                          # non-numeric scale
+    if sc is None and not isinstance(qs[-1], int):
+        return False                          # cannot derive 1/√E
+    return True
+
+
+def _derive_sdpa_cat(bound: dict) -> dict | None:
+    """The kernel's softmax scale: the bound ``scale`` attr if given,
+    else the default 1/√E with E = q's head dim.  Lands in the RHS
+    ``fill(q, value=SC)`` — the only way a derived number reaches an
+    operand."""
+    sc = bound.get("$attr:SC")
+    if sc is None:
+        e = _shape_of(bound.get("q"))
+        if not (isinstance(e, tuple) and e and isinstance(e[-1], int)):
+            return None
+        sc = float(e[-1]) ** -0.5
+    return {"$attr:SC": float(sc)}
+
+
+def _sdpa_cat_rhs(causal: bool) -> Op:
+    """om_apply(om_elem(masked score-concat, v-concat)) — the causal
+    variant masks the concatenated scores with a materialised
+    ``cmask``; the per-block chunking is left to OM_MASK_LAWS +
+    OM_SPLIT."""
+    qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
+    mm1 = Op.make("matmul", qs,
+                  Op.make("transpose", "k1", arg1=-2, arg2=-1))
+    mm2 = Op.make("matmul", qs,
+                  Op.make("transpose", "k2", arg1=-2, arg2=-1))
+    scores = Op.make("concat", mm1, mm2, dim=-1)
+    if causal:
+        scores = Op.make("masked_fill", scores,
+                         Op.make("cmask", scores), _NEG_INF)
+    return Op.make(
+        "om_apply",
+        Op.make("om_elem", scores,
+                Op.make("concat", "v1", "v2", dim="VD")))
+
+
+def _sdpa_cat(name: str, attr_key: str, sdpa_attrs: dict,
+              causal: bool) -> Rewrite:
+    return R(
+        name,
+        Op.make("sdpa", "q",
+                Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
+                Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
+                **sdpa_attrs),
+        _sdpa_cat_rhs(causal),
+        check=_check_sdpa_cat,
+        derive=_derive_sdpa_cat,
+        law=("is_causal unfolds to a materialised causal mask: "
+             "sdpa(q, cat k, cat v, is_causal) = om_apply(om_elem("
+             "masked_fill(cat scaled-scores, cmask), cat v)) — the "
+             "flag chunked, not the mask." if causal else
+             "unmasked sdpa over concatenated keys/values is the plain "
+             "om homomorphism on scaled scores: sdpa(q, cat k, cat v) "
+             "= om_apply(om_elem(cat(qs@k_i.T), cat v_i))."))
+
+
+#: torch.export emits sdpa positionally: arg4 = dropout_p,
+#: arg5 = is_causal, arg6 = scale; hand-built terms use the kwarg
+#: spellings is_causal=/scale=.  A literal ``True``/``False`` in the
+#: pattern is an exact attr match — the flag, chunked.
+_SDPA_CAUSAL_ATTRS: tuple[dict, ...] = (
+    {"is_causal": True},
+    {"is_causal": True, "scale": "SC"},
+    {"arg5": True},
+    {"arg4": "DP", "arg5": True},
+    {"arg4": "DP", "arg5": True, "scale": "SC"},
+    {"arg4": "DP", "arg5": True, "arg6": "SC"},
+)
+
+_SDPA_PLAIN_ATTRS: tuple[dict, ...] = (
+    {},
+    {"arg4": "DP"},
+    {"arg5": False},
+    {"arg4": "DP", "arg5": False},
+    {"is_causal": False},
+    {"scale": "SC"},
+    {"arg4": "DP", "scale": "SC"},
+)
+
+#: sdpa-over-concat laws: the causal-flag unfold plus the unmasked
+#: companion, over both concat attr spellings.
+SDPA_CAT_LAWS: list[Rewrite] = [
+    *(_sdpa_cat(f"sdpa_cat_causal_{i}_{ak}", ak, dict(attrs), True)
+      for i, attrs in enumerate(_SDPA_CAUSAL_ATTRS)
+      for ak in ("dim", "arg1")),
+    *(_sdpa_cat(f"sdpa_cat_{i}_{ak}", ak, dict(attrs), False)
+      for i, attrs in enumerate(_SDPA_PLAIN_ATTRS)
+      for ak in ("dim", "arg1")),
+]
+
+
+# ---------------------------------------------------------------------------
 #  Law set
 # ---------------------------------------------------------------------------
 
@@ -690,4 +921,5 @@ OM_LAWS: list[Rewrite] = [
     *CONCAT_BINARIZE,
     MATMUL_T_CONCAT, MATMUL_T_CONCAT_ARG1,
     *OM_MASK_LAWS,
+    *SDPA_CAT_LAWS,
 ]
