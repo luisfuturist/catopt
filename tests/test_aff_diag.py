@@ -34,25 +34,17 @@ Findings encoded as tests:
 
 * ``meta.stratified_run`` reaches the same log-depth form: the lift's
   operand-position variants (``affd_lift_swap`` etc.) cover the
-  comm-normalised operand order ``canonicalize`` produces.  Two meta.py
-  gaps remain (hardcoded, not fixed here):
-    - ``meta._ASSOC_ONLY`` = {"matmul", "aff_compose"} lacks
-      ``affd_compose`` — ``canonicalize`` will NOT rebalance a
-      right-leaning diagonal compose chain post-hoc.  Harmless in
-      practice: the assoc rules run as contentful rules during
-      saturation, so extraction still returns the balanced tree.
-    - ``meta.COHERENT_RULE_NAMES`` lacks ``affd_assoc``/``affd_assoc_rev``,
-      so they are classified contentful (stored, not computed) — the
-      same position ``aff_assoc`` holds for the dense carrier.
+  comm-normalised operand order ``canonicalize`` produces.
+  ``affd_compose`` is in ``meta._ASSOC_ONLY`` — ``canonicalize``
+  rebalances diagonal compose chains directly — and
+  ``affd_assoc``/``affd_assoc_rev`` are classified coherent.
 
-* ``scan_lower.BatchedScanModule`` does NOT recognise the diagonal
-  term: ``is_scan_apply_term`` requires root ``apply`` over an
-  ``aff``/``aff_compose`` tree, so ``applyd(affd_compose-tree, h)``
-  falls back to the serial tuple-passing evaluator (still exact).  A
-  batched executor for applyd trees would be simpler than the dense
-  one — diagonal maps batch as two stacked (d,) vectors and compose is
-  broadcasted mul/add, no homogeneous-matrix trick needed — but
-  scan_lower.py would need an applyd-aware plan builder.
+* ``scan_lower.BatchedScanModule`` DOES recognise the diagonal term:
+  ``is_scan_apply_term`` accepts ``applyd`` over an
+  ``aff_diag``/``affd_compose`` tree (nested ``applyd`` segments are
+  folded into the compose spine first) and executes it with
+  elementwise batched ops — two stacked (d,) vectors, compose is
+  broadcasted mul/add, no homogeneous-matrix trick needed.
 """
 
 import math
@@ -245,15 +237,11 @@ def test_stratified_run_reaches_log_depth():
 
 
 def test_stratified_run_documents_meta_gap():
-    """``meta.canonicalize``'s balanced-ops list is a hardcoded
-    frozenset (``meta._ASSOC_ONLY``) that does not include
-    ``affd_compose`` — a right-leaning diagonal compose chain is NOT
-    rebalanced by canonicalize.  The stratified pipeline compensates:
-    ``affd_assoc``/``affd_assoc_rev`` are classified contentful (they
-    are absent from ``COHERENT_RULE_NAMES``) and the balanced form is
-    found by search + depth extraction instead.  If meta.py later
-    learns the op, this test still passes — it only asserts the
-    pipeline's *output* is balanced."""
+    """``meta.canonicalize`` knows ``affd_compose`` (in
+    ``meta._ASSOC_ONLY``) and ``affd_assoc``/``affd_assoc_rev`` are
+    classified coherent — the balanced diagonal scan is computed as
+    a normal form, not searched.  This test asserts that fixed
+    classification and that the output stays balanced."""
     torch.manual_seed(0)
     T, D = 8, 8
     m = DiagonalSSM(D, D, T).eval().double()
@@ -266,10 +254,12 @@ def test_stratified_run_documents_meta_gap():
         max_nodes=200_000,
         extract_fn=eg.extract_min_depth)
 
-    # The assoc pair ran as contentful rules (not dropped as coherent):
-    assert "affd_assoc" in out["contentful_used"]
-    assert "affd_assoc" not in out["coherent_dropped"]
-    # ...yet the extracted term is still the balanced scan.
+    # The assoc pair is now classified coherent — canonicalize
+    # rebalances affd_compose chains post-hoc (meta._ASSOC_ONLY
+    # learned the op), and the balanced scan still extracts.
+    assert "affd_assoc" in out["coherent_dropped"]
+    assert "affd_assoc" not in out["contentful_used"]
+    # ...and the extracted term is still the balanced scan.
     rep = op_repr(out["canonical_best"])
     assert "affd_compose" in rep
     assert _opdepth(out["canonical_best"], {}) <= \
@@ -280,23 +270,22 @@ def test_stratified_run_documents_meta_gap():
 #  Lowering: BatchedScanModule falls back to serial eval on applyd trees
 # ---------------------------------------------------------------------------
 
-def test_batched_scan_module_serial_fallback_on_applyd():
-    """``is_scan_apply_term`` requires ``apply`` over an ``aff`` tree —
-    the diagonal ``applyd`` root is not recognised, so the module
-    delegates to the tuple-passing IRModule path.  The fallback is
-    still fp64-exact; a batched executor for applyd trees is future
-    work (see module docstring)."""
+def test_batched_scan_module_handles_applyd():
+    """``is_scan_apply_term`` recognises the diagonal ``applyd`` root —
+    the batched executor handles aff_diag/affd_compose trees
+    elementwise (no homogeneous-matrix trick needed) and stays
+    fp64-exact."""
     torch.manual_seed(0)
     T, D = 16, 16
     m = DiagonalSSM(D, D, T).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
     ir, st, best, _ = _scan(m, x)
 
-    assert not is_scan_apply_term(best)
+    assert is_scan_apply_term(best)
     opt_ir = IR(root=best, inputs=ir.inputs,
                 input_names=ir.input_names, params=ir.params)
     mod = to_batched_scan_module(opt_ir, param_values=st)
-    assert not mod.is_batched
+    assert mod.is_batched
     mod.eval()
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()

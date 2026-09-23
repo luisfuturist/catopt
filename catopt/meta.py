@@ -89,6 +89,7 @@ COHERENT_RULE_NAMES: frozenset[str] = frozenset({
     "double_neg",                    # involution
     "assoc_matmul", "assoc_matmul_rev",   # associativity of composition
     "aff_assoc", "aff_assoc_rev",         # affine-map monoid associativity
+    "affd_assoc", "affd_assoc_rev",       # diagonal-affine monoid assoc.
     "om_assoc", "om_assoc_rev",           # online-softmax monoid assoc.
 })
 
@@ -139,7 +140,8 @@ _AC_IDENTITY: dict[str, float] = {"add": 0.0, "mul": 1.0}
 #: Associative but NOT commutative ops: chains flatten in order and
 #: rebuild balanced.  For ``aff_compose`` the balanced form is the
 #: parallel-scan (Blelloch) bracketing — computed here, not searched.
-_ASSOC_ONLY: frozenset[str] = frozenset({"matmul", "aff_compose"})
+_ASSOC_ONLY: frozenset[str] = frozenset(
+    {"matmul", "aff_compose", "affd_compose"})
 
 
 def _sort_key(t: Any) -> str:

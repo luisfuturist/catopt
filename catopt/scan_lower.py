@@ -48,38 +48,81 @@ __all__ = [
 ]
 
 
-def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
-    """True if ``term`` is a pure aff / aff_compose tree.
+def _fold_nested_apply(term: Any) -> Any:
+    """``apply(f, apply(g, h))`` → ``apply(aff_compose(f, g), h)``
+    (and the ``applyd``/``affd_compose`` diagonal pair).
 
-    Leaves are ``aff(A, b)`` (the map h ↦ A·h + b); internal nodes are
-    ``aff_compose(f, g)``.  Anything else — including a bare ``apply`` —
-    disqualifies the map subtree.  Memoised on id() because extracted
-    terms are DAGs with shared subtrees.
+    Extracted terms are often hybrids — a compose spine with nested
+    ``apply`` segments.  Folding them bottom-up turns the whole map
+    into a single compose tree the plan builder understands.
+    Idempotent and semantics-preserving (composition IS sequential
+    application).
+    """
+    memo: dict[int, Any] = {}
+
+    def go(t: Any) -> Any:
+        if not isinstance(t, Op):
+            return t
+        k = id(t)
+        if k in memo:
+            return memo[k]
+        args = [go(a) for a in t.args]
+        t = Op.make(t.op, *args, **t.attrs) if args else t
+        if t.op in ("apply", "applyd"):
+            comp = ("affd_compose" if t.op == "applyd"
+                    else "aff_compose")
+            f, h = t.args
+            while isinstance(h, Op) and h.op == t.op:
+                f = Op.make(comp, f, h.args[0])
+                h = h.args[1]
+            t = Op.make(t.op, f, h)
+        memo[k] = t
+        return t
+
+    return go(term)
+
+
+def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
+    """True if ``term`` is a pure map tree in ONE carrier domain.
+
+    Dense: leaves ``aff(A, b)``, internal ``aff_compose``.  Diagonal:
+    leaves ``aff_diag(a, b)``, internal ``affd_compose``.  Mixed or
+    foreign nodes disqualify the subtree.  Memoised on id() because
+    extracted terms are DAGs with shared subtrees.
     """
     memo = {} if memo is None else memo
     key = id(term)
     if key in memo:
         return memo[key]
-    ok = (
-        isinstance(term, Op)
-        and len(term.args) == 2
-        and (
-            term.op == "aff"
-            or (term.op == "aff_compose"
-                and all(_is_aff_tree(a, memo) for a in term.args))
-        )
-    )
-    memo[key] = ok
-    return ok
+    dom = None
+    if isinstance(term, Op) and len(term.args) == 2:
+        if term.op in ("aff", "aff_diag"):
+            dom = term.op
+        elif term.op in ("aff_compose", "affd_compose"):
+            kids = [_is_aff_tree(a, memo) for a in term.args]
+            # Domain purity: all leaves one carrier, and the compose
+            # op must match it (aff_compose over aff leaves, etc.).
+            want = {"aff": "aff_compose",
+                    "aff_diag": "affd_compose"}
+            ok = (kids[0] is not None and kids[0] == kids[1]
+                  and term.op == want[kids[0]])
+            dom = kids[0] if ok else None
+    memo[key] = dom
+    return dom
 
 
 def is_scan_apply_term(root: Any) -> bool:
-    """True if ``root`` is ``apply(<aff/aff_compose tree>, h)``."""
+    """True if ``root`` is ``apply[d](<map tree>, h)`` — dense or
+    diagonal affine scan application (nested ``apply`` segments are
+    first folded into the compose spine)."""
+    root = _fold_nested_apply(root)
     return (
         isinstance(root, Op)
-        and root.op == "apply"
+        and root.op in ("apply", "applyd")
         and len(root.args) == 2
-        and _is_aff_tree(root.args[0])
+        and _is_aff_tree(root.args[0]) is not None
+        and {"apply": "aff", "applyd": "aff_diag"}[root.op]
+        == _is_aff_tree(root.args[0])
     )
 
 
@@ -94,10 +137,16 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
         return False
     a0 = _shape_of(leaves[0].args[0])
     b0 = _shape_of(leaves[0].args[1])
-    if not (isinstance(a0, tuple) and len(a0) >= 2
-            and all(isinstance(d, int) for d in a0)):
-        return False
-    if not (isinstance(b0, tuple) and b0 == a0[:-1]):
+    if leaves[0].op == "aff_diag":
+        # Diagonal carrier: a and b are both (d,) vectors.
+        ok = (isinstance(a0, tuple) and isinstance(b0, tuple)
+              and a0 == b0
+              and all(isinstance(d, int) for d in a0))
+    else:
+        ok = (isinstance(a0, tuple) and len(a0) >= 2
+              and all(isinstance(d, int) for d in a0)
+              and isinstance(b0, tuple) and b0 == a0[:-1])
+    if not ok:
         return False
     for leaf in leaves[1:]:
         if (_shape_of(leaf.args[0]) != a0
@@ -166,19 +215,22 @@ def build_scan_plan(root: Any) -> dict | None:
       batch view instead of stacking T copies.
     * ``"f"`` / ``"h"`` — the map term and the applied-to term.
     """
+    root = _fold_nested_apply(root)
     if not is_scan_apply_term(root):
         return None
     f_term, h_term = root.args
+    diag = root.op == "applyd"
 
     leaves: list[Op] = []
     levels: list[list[Op]] = []
     level_of: dict[int, int] = {}
+    leaf_op = "aff_diag" if root.op == "applyd" else "aff"
 
     def visit(t: Op) -> int:
         tid = id(t)
         if tid in level_of:
             return level_of[tid]
-        if t.op == "aff":
+        if t.op == leaf_op:
             level_of[tid] = 0
             leaves.append(t)
             return 0
@@ -218,6 +270,7 @@ def build_scan_plan(root: Any) -> dict | None:
             "root_slot": slot[id(f_term)],
             "leaf_b_gather": _leaf_b_gather(leaves),
             "leaf_a_shared": leaf_a_shared,
+            "diagonal": diag,
             "f": f_term, "h": h_term}
 
 
@@ -397,6 +450,25 @@ class BatchedScanModule(torch.nn.Module):
                 b_vals = b_vals.movedim(dim, 0)
         else:
             b_vals = torch.stack([ev(leaf.args[1]) for leaf in leaves])
+
+        if self._plan["diagonal"]:
+            # Diagonal carrier: pairs (a, b) of (d,) vectors; compose is
+            # broadcasted elementwise — (a_f⊙a_g, a_f⊙b_g + b_f).
+            a_all, b_all = a_vals, b_vals
+            for f_idx, g_idx in self._plan["level_gather"]:
+                a_f = a_all.index_select(
+                    0, self._gather_idx(f_idx, a_all))
+                a_g = a_all.index_select(
+                    0, self._gather_idx(g_idx, a_all))
+                b_f = b_all.index_select(
+                    0, self._gather_idx(f_idx, b_all))
+                b_g = b_all.index_select(
+                    0, self._gather_idx(g_idx, b_all))
+                a_all = torch.cat([a_all, a_f * a_g])
+                b_all = torch.cat([b_all, a_f * b_g + b_f])
+            h = ev(self._plan["h"])
+            r = self._plan["root_slot"]
+            return a_all[r] * h + b_all[r]
 
         # M_leaf = [[A, b], [0, …, 0, 1]]  (n, d+1, d+1)
         d = a_vals.shape[-1]
