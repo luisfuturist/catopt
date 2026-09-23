@@ -193,6 +193,12 @@ Novelty has levels, and the frontier report makes them inspectable:
   the **diagonal-affine carrier** `aff_diag`/`affd_compose`/
   `applyd` (`SCAN_DIAG_LAWS`) — the same monoid restricted to
   diagonal linear parts, O(d) per compose instead of O(d³).
+  `BatchedScanModule` handles both domains (the diagonal tree
+  batches as elementwise ops — two stacked (d,) vectors, no
+  matrix packing): T=64 DiagonalSSM **0.97ms → 0.22ms
+  CUDA-graph (4.4×)**, fp64-exact, and `affd_compose` is in the
+  coherent registry so its balanced form is a *normal form*,
+  not a search result.
 
 - **The same mechanism discovers chunked attention** (nonlinear
   recurrence): the online-softmax monoid `om(m,l,a)` — running
@@ -335,7 +341,7 @@ lowering overhead visible on real blocks.
 | `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
 | `catopt/om.py` | Online-softmax monoid laws (chunked attention) |
 | `catopt/om_lower.py` | Level-batched chunked-attention executor + CUDA graphs/compile |
-| `catopt/scan_lower.py` | Level-batched parallel-scan executor + CUDA graphs |
+| `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective SSMs) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
 | `tests/` | 185 tests: equivalence, soundness, pairing, monoid domains |
