@@ -1110,7 +1110,8 @@ def synthesize_rules(rules: list[Rewrite],
 
     def offer(lhs: Any, rhs: Any, r1: Rewrite, r2: Rewrite,
               via: str, check=None, derive=None,
-              witness: dict | None = None) -> None:
+              witness: dict | None = None,
+              pats: tuple[dict, dict] | None = None) -> None:
         if _is_tautology(lhs, rhs):
             return
         key = _alpha_key(lhs, rhs)
@@ -1133,6 +1134,11 @@ def synthesize_rules(rules: list[Rewrite],
         # the module-level registry.
         object.__setattr__(cand, "parents", (r1.name, r2.name))
         SYNTH_PARENTS[cand.name] = (r1.name, r2.name)
+        # The guard re-expression maps (pat1, pat2) are pure data — kept
+        # on the rule so catopt.rulecache can serialize them and rebuild
+        # the composite check/derive at load time via _compose_guards.
+        if pats is not None:
+            object.__setattr__(cand, "guard_pats", pats)
         if not emit_subsumed and _subsumed(
                 cand, usable + derived):
             return
@@ -1235,7 +1241,8 @@ def synthesize_rules(rules: list[Rewrite],
                         chk, drv = _compose_guards(r1, r2, pat1, pat2)
                         witness = {v: leaf for leaf, v in names.items()}
                         offer(lhs_pat, rhs_pat, r1, r2, "seed",
-                              check=chk, derive=drv, witness=witness)
+                              check=chk, derive=drv, witness=witness,
+                              pats=(pat1, pat2))
 
     # -- symbolic path: r1 applied to its own lhs -------------------------
     for r1 in usable:
@@ -1284,7 +1291,7 @@ def synthesize_rules(rules: list[Rewrite],
                 t2 = _replace(t1, q, rhs2)
                 chk, drv = _compose_guards(r1, r2, pat1, m2)
                 offer(r1.lhs, t2, r1, r2, "symbolic",
-                      check=chk, derive=drv)
+                      check=chk, derive=drv, pats=(pat1, m2))
 
 
     return derived
