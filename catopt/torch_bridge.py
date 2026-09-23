@@ -85,7 +85,14 @@ def _canon_aten_name(name: str) -> str:
         return _ATEN_TO_IR[stripped]
     if name in _IR_TO_TORCH_EXTRA:
         return _IR_TO_TORCH_EXTRA[name]
-    return stripped
+    # Generic overload stripping: 'flatten.using_ints' → 'flatten',
+    # 'to.dtype' → 'to'.  Try the base packet name against both maps.
+    base = name.split(".")[0]
+    if base in _ATEN_TO_IR:
+        return _ATEN_TO_IR[base]
+    if base in _IR_TO_TORCH_EXTRA:
+        return _IR_TO_TORCH_EXTRA[base]
+    return base if base in _IR_TO_TORCH else stripped
 
 
 def _aten_name(target: Any) -> str:
@@ -108,16 +115,23 @@ def _infer_shape(node_or_value: Any) -> tuple:
     return (None,)
 
 
-def export_to_ir(model: torch.nn.Module, example_input: torch.Tensor) -> IR:
+def export_to_ir(
+    model: torch.nn.Module,
+    example_input: torch.Tensor | tuple,
+) -> IR:
     """Export a PyTorch model to a catopt IR via torch.export.
+
+    ``example_input`` may be a single tensor or a tuple of positional
+    args for multi-input modules.
 
     Uses exported._graph_signature.inputs_to_parameters to map graph
     placeholder node targets (e.g. 'p_w1') to actual model attribute
     names (e.g. 'W1'), so we can retrieve parameter shapes correctly.
     """
     model.eval()
+    args = example_input if isinstance(example_input, tuple) else (example_input,)
     with torch.no_grad():
-        exported = torch.export.export(model, (example_input,))
+        exported = torch.export.export(model, args)
 
     graph = exported.graph
     mod = exported.module()  # the actual Module instance
@@ -157,8 +171,17 @@ def export_to_ir(model: torch.nn.Module, example_input: torch.Tensor) -> IR:
                 params[node.name] = param
                 source_tensors[node.name] = tensor.clone()
             else:
-                # It's a model input (user-provided tensor)
-                shape = _infer_shape(example_input)
+                # It's a model input (user-provided tensor).  Prefer the
+                # exported node's own metadata shape — correct for
+                # multi-input graphs where placeholders differ.
+                meta_shape = getattr(
+                    getattr(node, "meta", {}), "get", lambda k: None)("val")
+                if meta_shape is not None and hasattr(meta_shape, "shape"):
+                    shape = tuple(int(d) for d in meta_shape.shape)
+                elif len(inputs) < len(args):
+                    shape = _infer_shape(args[len(inputs)])
+                else:
+                    shape = _infer_shape(args[0])
                 var = Var(name=node.name, typ=TensorType(shape))
                 env[node.name] = var
                 inputs.append(var)
@@ -187,14 +210,27 @@ def export_to_ir(model: torch.nn.Module, example_input: torch.Tensor) -> IR:
                 elif isinstance(arg_node, str):
                     continue
                 elif isinstance(arg_node, (list, tuple)):
+                    if any(hasattr(a, "name") for a in arg_node):
+                        # A list of FX nodes (stack/cat take tensor lists)
+                        # — each element is an operand.
+                        for a in arg_node:
+                            key = a.name if hasattr(a, "name") else str(a)
+                            if key in env:
+                                args.append(env[key])
                     # e.g. dim=[-1] lists for reductions; for view/reshape
                     # the list is the target SHAPE, not a dim.
-                    if ir_op == "reshape":
+                    elif ir_op == "reshape":
+                        attrs["shape"] = tuple(arg_node)
+                    elif ir_op in ("expand", "repeat"):
                         attrs["shape"] = tuple(arg_node)
                     else:
                         attrs["dim"] = tuple(arg_node)
                 elif isinstance(arg_node, bool):
-                    attrs["keepdim"] = arg_node
+                    if ir_op in ("mean", "sum", "max", "min", "prod",
+                                 "var", "std", "amax", "amin"):
+                        attrs["keepdim"] = arg_node
+                    else:
+                        attrs[f"arg{i}"] = arg_node
                 else:
                     key = arg_node.name if hasattr(arg_node, "name") else str(arg_node)
                     if key in env:
@@ -268,7 +304,12 @@ _IR_TO_TORCH: dict[str, Any] = {
     "sdpa": lambda q, k, v, **kw: torch.nn.functional
         .scaled_dot_product_attention(
             q, k, v,
-            **{kk: vv for kk, vv in kw.items() if vv is not None},
+            **{("attn_mask" if kk == "arg3" else
+                "dropout_p" if kk == "arg4" else
+                "is_causal" if kk == "arg5" else
+                "scale" if kk == "arg6" else
+                "enable_gqa" if kk == "arg7" else kk): vv
+               for kk, vv in kw.items() if vv is not None},
         ),
     "broadcast": lambda x, *a, **kw: x,
     "linear": lambda x, w, *a, **kw: torch.nn.functional.linear(
@@ -281,6 +322,45 @@ _IR_TO_TORCH: dict[str, Any] = {
     "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
         t, list(sizes), dim=dim
     )[index],
+    # torch.export emits aten.dropout with train=False in eval mode —
+    # the op is a semantic identity there.  This binding is only valid
+    # because export_to_ir always exports eval()-mode graphs.
+    "dropout": lambda x, *a, **kw: x,
+    # dtype casts are identity at the precision we verify (float32)
+    "to": lambda x, *a, **kw: x,
+    "clone": lambda x, *a, **kw: x.clone(),
+    "getitem": lambda t, **kw: t[kw.get("arg1", kw.get("index", 0))],
+    "unbind": lambda t, *a, **kw: torch.unbind(
+        t, dim=int(kw.get("dim", kw.get("arg1", -1)))
+    ),
+    "stack": lambda *ts, **kw: torch.stack(
+        list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))
+    ),
+    "expand": lambda t, *a, **kw: t.expand(
+        *tuple(kw.get("shape") or kw.get("dim") or a)
+    ),
+    "flatten": lambda x, *a, **kw: x.flatten(
+        int(kw.get("arg1", kw.get("start_dim", 0))),
+        int(kw.get("arg2", kw.get("end_dim", -1))),
+    ),
+    "slice": lambda t, *a, **kw: t[
+        (slice(None),) * int(kw.get("arg1", kw.get("dim", 0)))
+        + (slice(kw.get("arg2"), kw.get("arg3")),)
+    ],
+    "unsqueeze": lambda t, *a, **kw: t.unsqueeze(
+        int(kw.get("dim", kw.get("arg1", -1)))
+    ),
+    "squeeze": lambda t, *a, **kw: t.squeeze(
+        int(kw.get("dim", kw.get("arg1", -1)))
+    ),
+    "select": lambda t, *a, **kw: t.select(
+        int(kw.get("arg1", kw.get("dim", 0))),
+        int(kw.get("arg2", kw.get("index", 0))),
+    ),
+    "type_as": lambda x, t, *a, **kw: x.type_as(t),
+    "cos": torch.cos,
+    "sin": torch.sin,
+    "float": lambda x, *a, **kw: x.float(),
 }
 
 
@@ -441,12 +521,12 @@ class IRModule(torch.nn.Module):
             setattr(self, name, p)
             self._param_map[name] = p
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+        x = xs[0]
         env: dict[str, torch.Tensor] = {"self": x}
-        # Fill env with input placeholders
-        for inp in self._inputs:
-            if inp.name == "x" or not inp.name.startswith("p_"):
-                env[inp.name] = x
+        # Map input placeholders positionally to forward args
+        for i, inp in enumerate(self._inputs):
+            env[inp.name] = xs[i] if i < len(xs) else x
         return self._eval(self._root, env, x, {})
 
     def _eval(

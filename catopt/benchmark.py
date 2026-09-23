@@ -27,19 +27,31 @@ class BenchResult:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+def _call_model(model: torch.nn.Module, x: Any) -> Any:
+    if isinstance(x, (tuple, list)):
+        return model(*x)
+    return model(x)
+
+
+def _first_tensor(x: Any) -> torch.Tensor:
+    if isinstance(x, (tuple, list)):
+        return _first_tensor(x[0])
+    return x
+
+
 def _bench_once(model: torch.nn.Module, x: torch.Tensor,
                 warmup: int = 5, repeats: int = 20) -> BenchResult:
     """Run a model *repeats* times and return timing statistics."""
         # Warmup
     for _ in range(warmup):
         with torch.no_grad():
-            _ = model(x)
+            _ = _call_model(model, x)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
     times: list[float] = []
-    is_cuda = torch.cuda.is_available() and x.is_cuda
+    is_cuda = torch.cuda.is_available() and _first_tensor(x).is_cuda
     for _ in range(repeats):
         # CUDA calls are async: sync before AND after so the measured
         # interval covers kernel execution, not just submission.
@@ -47,7 +59,7 @@ def _bench_once(model: torch.nn.Module, x: torch.Tensor,
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.no_grad():
-            _ = model(x)
+            _ = _call_model(model, x)
         if is_cuda:
             torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1000)  # ms
@@ -103,8 +115,9 @@ def benchmark_comparison(
     """
     # Verify semantic equivalence
     with torch.no_grad():
-        orig_out = original_model(x.clone())
-        opt_out = optimized_model(x.clone())
+        xc = tuple(t.clone() for t in x) if isinstance(x, tuple) else x.clone()
+        orig_out = _call_model(original_model, xc)
+        opt_out = _call_model(optimized_model, xc)
         max_diff = (orig_out - opt_out).abs().max().item()
         rel_diff = max_diff / (orig_out.abs().max().item() + 1e-8)
         print(f"  [verify] max_rel_diff = {rel_diff:.2e}")

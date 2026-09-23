@@ -145,8 +145,12 @@ def optimize_model(
         model.eval()
         optimized_module.eval()
         with torch.no_grad():
-            original_out = model(example_input.clone())
-            opt_out = optimized_module(example_input.clone())
+            if isinstance(example_input, tuple):
+                original_out = model(*[a.clone() for a in example_input])
+                opt_out = optimized_module(*[a.clone() for a in example_input])
+            else:
+                original_out = model(example_input.clone())
+                opt_out = optimized_module(example_input.clone())
             max_diff = (original_out - opt_out).abs().max().item()
             rel_diff = max_diff / (original_out.abs().max().item() + 1e-8)
             print(f"  Max abs diff:  {max_diff:.6e}")

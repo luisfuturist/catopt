@@ -297,6 +297,27 @@ representation expose?"*: composing **two** laws where the second is only
 constraint the cost model cannot see. Both got caught not by inspection but by
 the e-graph's equivalence check.
 
+### It runs on community code unmodified — llama2.c
+
+The pipeline is not specific to our test modules.  Pointed at
+**Karpathy's `llama2.c` `model.py`** — the reference Llama 2 inference
+implementation, with *unfused* `wq`/`wk`/`wv` (GQA: 8 q-heads, 2
+kv-heads) and *unfused* `w1`/`w3` — the same pipeline, unchanged:
+
+| llama2.c module (verbatim) | Found | Verified | GPU (b=4) | GPU (b=64) |
+|---|---|---|---|---|
+| `FeedForward` | w1/w3 → one GEMM + 2 splits | 1.3e-07 | 1.04× | 1.06× |
+| `Attention` | wq/wk/wv → one GEMM + uneven splits | 3.3e-07 | 1.00× | 0.97× |
+| `TransformerBlock` | **4 pairing groups** in one pass | 4.8e-07 | 0.97× | 0.98× |
+
+That is `MergedColumnParallelLinear` (w1/w3) and `QKVParallelLinear`
+(wq/wk/wv, asymmetric) **rediscovered automatically in code we did not
+write** — the same transformations vLLM and TensorRT-LLM implement by
+hand.  The runtime value is regime-dependent as established (parity at
+compute-bound sizes, small gains launch-bound); the discovery is the
+point: the fusions are derivable consequences of the product law, not
+per-architecture hacks.
+
 ### The product law is non-local — that's why pattern matchers miss it
 
 `⟨f₁,…,f_k⟩ = (f₁ × … × f_k) ∘ Δ` is a statement about the *whole
@@ -453,7 +474,7 @@ instrument reports which is which rather than assuming.**
 python main.py                     # associativity, parallel merges, fused
                                    # projections (SwiGLU/QKV/norm), naturality
 python main.py --large-batch 4096  # measured large-batch timing
-python -m pytest tests/ -q         # 77 tests
+python -m pytest tests/ -q         # 80 tests
 python bench_gpu.py                # same table on CUDA
 ```
 

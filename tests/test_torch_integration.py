@@ -779,3 +779,79 @@ def test_channel_scale_rejects_row_scale():
         if n.op == "linear":
             # only the original linear should exist
             pass
+
+
+def test_multi_input_module():
+    from catopt.optimize import optimize_model
+    """Modules with several tensor inputs export, optimize, and verify."""
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class TwoInput(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Linear(16, 16, bias=False)
+        def forward(self, x, scale):
+            return self.w(x * scale)
+
+    torch.manual_seed(0)
+    m = TwoInput().eval()
+    x = torch.randn(4, 16)
+    s = torch.randn(4, 16)
+    opt, stats = optimize_model(m, (x, s), verbose=False)
+    with torch.no_grad():
+        diff = (m(x, s) - opt(x, s)).abs().max().item()
+    assert diff < 1e-4
+
+
+def test_dropout_eval_is_identity():
+    from catopt.optimize import optimize_model
+    """Dropout exported in eval mode is a semantic identity and must lower."""
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class WithDropout(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = nn.Linear(16, 32, bias=False)
+            self.w3 = nn.Linear(16, 32, bias=False)
+            self.w2 = nn.Linear(32, 16, bias=False)
+            self.drop = nn.Dropout(0.5)  # p>0 but eval() makes it identity
+        def forward(self, x):
+            return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+    torch.manual_seed(0)
+    m = WithDropout().eval()
+    x = torch.randn(8, 16)
+    opt, stats = optimize_model(m, x, verbose=False)
+    with torch.no_grad():
+        diff = (m(x) - opt(x)).abs().max().item()
+    assert diff < 1e-4
+    # w1/w3 share an input — the pairing pass should have fired
+    assert stats.get("pairing_groups", 0) >= 1
+
+
+def test_rope_style_ops_roundtrip():
+    from catopt.optimize import optimize_model
+    """RoPE-shaped graphs (unbind/stack/expand/flatten/slice) lower and run."""
+    import torch.nn as nn
+
+    class MiniRope(nn.Module):
+        def forward(self, x, fc, fs):
+            b, t, h, d = x.shape
+            xr, xi = x.reshape(b, t, h, d // 2, 2).unbind(-1)
+            fc = fc.view(1, t, 1, d // 2)
+            fs = fs.view(1, t, 1, d // 2)
+            out_r = xr * fc - xi * fs
+            out_i = xr * fs + xi * fc
+            return torch.stack([out_r, out_i], dim=-1).flatten(3)
+
+    torch.manual_seed(0)
+    m = MiniRope().eval()
+    x = torch.randn(2, 8, 4, 16)
+    fc = torch.randn(8, 8)
+    fs = torch.randn(8, 8)
+    opt, stats = optimize_model(m, (x, fc, fs), verbose=False)
+    with torch.no_grad():
+        diff = (m(x, fc, fs) - opt(x, fc, fs)).abs().max().item()
+    assert diff < 1e-4
