@@ -229,13 +229,33 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "apply":
             # apply(f, h) evaluates back to tensor-land: h's shape.
             return shapes[1]
+        case "om":
+            # The carrier triple (m, l, a); its "shape" is the
+            # accumulator's — what consumers' costs are priced from.
+            return shapes[2] if len(shapes) > 2 else shapes[0]
+        case "om_elem":
+            # elem(s[...,K], v[...,K,d]) reports the applied output
+            # shape (...,T,d) — like `aff`, the carrier is priced as
+            # the tensor it will become under om_apply.
+            s, v = shapes[0], shapes[1]
+            if (isinstance(s, tuple) and isinstance(v, tuple)
+                    and len(s) >= 1 and len(v) >= 1):
+                return tuple(s[:-1]) + (v[-1],)
+            return s
+        case "om_compose" | "om_apply":
+            return shapes[0]
         case "concat":
-            a, b = shapes[0], shapes[1]
-            if a is None or b is None:
+            # Variadic cat: sum every operand along the cat axis.
+            a = shapes[0]
+            if a is None or len(a) == 0:
                 return a
-            dim = op.attrs.get("dim", 0) % len(a)
+            dim = op.attrs.get("dim", op.attrs.get("arg1", 0)) % len(a)
             out = list(a)
-            out[dim] = (a[dim] or 0) + (b[dim] or 0)
+            out[dim] = 0
+            for s in shapes:
+                if not isinstance(s, tuple) or len(s) != len(a):
+                    return a
+                out[dim] += (s[dim] or 0)
             return tuple(out)
         case "chunk":
             base = shapes[0]
@@ -333,7 +353,7 @@ _OP_FLOPS: dict[str, int] = {
 #: runtime cat() is a real copy kernel — it is only free when the whole
 #: subtree is param-only (compile-time fold, handled by extraction).
 _VIEW_OPS = {"transpose", "reshape", "broadcast", "chunk",
-             "split", "leaf", "aff"}
+             "split", "leaf", "aff", "om"}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.
@@ -399,6 +419,23 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
                 and isinstance(f[-1], int)):
             return float(2 * n_out * f[-1])
         return float(2 * n_out)
+    if term.op == "om":
+        # Packaging the (m, l, a) triple — no runtime work.
+        return 0.0
+    if term.op == "om_elem":
+        # rowmax + (s−m) + exp + rowsum ≈ 3·numel(s), plus the
+        # exp(s−m) @ v GEMM at 2·n_out·K (K = scores' last dim).
+        shapes = [_shape_of(a, memo) for a in term.args]
+        s = shapes[0] if shapes else None
+        k = (s[-1] if isinstance(s, tuple) and s
+             and isinstance(s[-1], int) else 1)
+        return float(2 * n_out * k + 3 * _numel(s))
+    if term.op == "om_compose":
+        # max + 2 rescale exps + 2 mul-adds per accumulator element.
+        return float(6 * n_out)
+    if term.op == "om_apply":
+        # One division per output element.
+        return float(n_out)
     if term.op == "sdpa":
         # attention: ~2 * (T * d + T * T) per head ≈ 2*T*max(d,T)*B*h
         shapes = [_shape_of(a, memo) for a in term.args]

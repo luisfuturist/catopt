@@ -427,7 +427,47 @@ _IR_TO_TORCH: dict[str, Any] = {
     "aff_compose": lambda f, g, *a, **kw: (f[0] @ g[0],
                                            f[0] @ g[1] + f[1]),
     "apply": lambda f, h, *a, **kw: f[0] @ h + f[1],
+    # Online-softmax monoid (FlashAttention's combine as a monoid law —
+    # see catopt/om.py).  An ``om`` value is a triple (m, l, a):
+    # running row-max, running exp-sum denominator, running weighted
+    # numerator.  Only ``om_apply`` returns a tensor — a / l, UNCLAMPED,
+    # so a fully-masked row yields NaN exactly like dense softmax.
+    "om": lambda m, l, a, *x, **kw: (m, l, a),
+    "om_elem": lambda s, v, *a, **kw: _om_elem(s, v),
+    "om_compose": lambda f, g, *a, **kw: _om_compose(f, g),
+    "om_apply": lambda f, *a, **kw: f[2] / f[1],
 }
+
+
+def _om_elem(s: torch.Tensor, v: torch.Tensor):
+    """elem(s, v) = (rowmax s, Σ exp(s−m), exp(s−m) @ v) — the
+    online-softmax monoid element for one key block."""
+    m = s.amax(dim=-1, keepdim=True)
+    e = torch.exp(s - m)
+    return (m, e.sum(dim=-1, keepdim=True), e @ v)
+
+
+def _om_compose(f, g):
+    """(m1,l1,a1) ⊕ (m2,l2,a2): the FlashAttention combine.
+
+    The ``isfinite`` guard covers the −inf − −inf case: a fully-masked
+    block has m = −inf (and NaN l/a from elem's exp(s−m)); the where
+    contributes 0 for it instead of exp(NaN)·NaN, so a masked block
+    contaminates nothing — while a fully-masked ROW still produces
+    l = 0 and a = 0, and om_apply's 0/0 = NaN preserves dense softmax's
+    NaN semantics.
+    """
+    m1, l1, a1 = f
+    m2, l2, a2 = g
+    mx = torch.maximum(m1, m2)
+    fin1, fin2 = torch.isfinite(m1), torch.isfinite(m2)
+    e1 = torch.where(fin1, torch.exp(m1 - mx), torch.zeros_like(mx))
+    e2 = torch.where(fin2, torch.exp(m2 - mx), torch.zeros_like(mx))
+    l = (torch.where(fin1, l1 * e1, torch.zeros_like(l1))
+         + torch.where(fin2, l2 * e2, torch.zeros_like(l2)))
+    a = (torch.where(fin1, a1 * e1, torch.zeros_like(a1))
+         + torch.where(fin2, a2 * e2, torch.zeros_like(a2)))
+    return (mx, l, a)
 
 
 def _split_sizes(sizes: Any, kw: dict):

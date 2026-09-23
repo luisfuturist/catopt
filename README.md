@@ -30,6 +30,7 @@ semantically equivalent.
 | **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
 | **Attention fold** (flash-attention transform) | `softmax(masked qk^T·s) @ v` → `sdpa(is_causal)` — nanoGPT eager path | **1.8–4.6×** eager; **1.1–2.5×** under Inductor | — |
 | **Asymptotic reassociation** | LinearAttention `(QK^T)V → Q(K^TV)`: O(T²d) → O(Td²) | **8.0×** at T=2048, d=64 | — |
+| **Parallel-scan discovery** (affine monoid) | `h_t = A h_{t-1} + x_t` → balanced Blelloch tree; fires on input-dependent selective SSMs (`A_t = I+Δ_t·A`) | **2.8×** level-batched; **6.3×** CUDA-graph at T=64 | — |
 | **Diagonal absorption** | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | **1.12×** at T=512 | — |
 | **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound; **1.19× launch-bound toy**; 0.82–0.99× real llama2.c blocks | ~1.0× |
 | **Same-FLOP conv pairing** | 4× parallel conv1×1 branches | **1.24–1.33× at all batch sizes** | — |
@@ -179,12 +180,62 @@ Novelty has levels, and the frontier report makes them inspectable:
   balanced Blelloch tree: **depth 2T → ~2·log₂T** (T=64: 128→12),
   fp64-exact.  Same laws, richer domain, asymptotically different
   reachable set — that is the "search cannot exceed its language"
-  thesis demonstrated, not asserted.  Honest caveat: the extracted
-  scan is *slower* wall-clock on a serial GPU stream (2.1ms vs
-  1.6ms at T=32,d=16) — Blelloch trades O(T·d²) work for
-  O(T·d³) at log depth; the payoff needs a parallel executor
-  (level-batched composes or streams), which is backend work,
-  not a semantics problem.
+  thesis demonstrated, not asserted.  And the payoff is real now:
+  `scan_lower.BatchedScanModule` packs each affine map into a
+  homogeneous matrix `[[A,b],[0,1]]` — aff_compose becomes a
+  **batched matmul per tree level** — so the discovered tree
+  executes in ~log T launches: **2.8× faster than the sequential
+  recurrence** (6.3× with CUDA-graph capture) at T=64, d=32.
+  It fires unprompted on **input-dependent selective dynamics**
+  (`SelectiveSSM`: `A_t = I + Δ_t·A`, `B_t = B_θ(x_t)` — the
+  Mamba-style core): depth 70→17 at T=32, fp64-exact.  Gap:
+  diagonal `a_t⊙h` SSMs export as `mul` not `matmul` and need an
+  `aff_diag` carrier (specced, not yet implemented).
+
+- **The same mechanism discovers chunked attention** (nonlinear
+  recurrence): the online-softmax monoid `om(m,l,a)` — running
+  max, exp-sum, weighted numerator — composes by the
+  FlashAttention combine law, and `om_elem` is a *monoid
+  homomorphism* over concat'd key blocks (`catopt/om.py`).  Dense
+  `softmax(q·cat(kᵢ)ᵀ)@cat(vᵢ)` splits into
+  `om_apply(⊕ᵢ om_elem(...))` — the streaming/chunked
+  decomposition falls out of homomorphism + associativity, with
+  no `flash_attention` rule written.  fp64-verified 8.9e-15.
+  Honest caveat: extracted chunked form is currently slower
+  wall-clock (many small eager kernels vs one fused softmax) —
+  it proves *reachability*; a batched/tiling executor like the
+  scan's is the missing backend work.
+
+**2-morphisms are first-class data; 3-morphisms are computed, not
+stored.** Every `union` records a `ProofEdge` witness and every
+instantiated enode carries its creating rule (`track_proofs`,
+~4% overhead). `certificate(src, dst)` reconstructs an ordered
+positional derivation and `verify_certificate` replays each step
+on real terms independent of the e-graph — *derivational*
+equivalence, not just numerical agreement. 100% of merges are
+replayable on rule-driven cases; non-local passes (the pairing
+pass) are honestly flagged `egraph_dependent`, and `strict=True`
+surfaces exactly those gaps.
+
+**Coherence stratification eliminates the saturation wall.**
+`meta.py` classifies laws as *coherent* (assoc/comm/id — the
+spaces they generate are contractible, so a canonical form
+suffices) vs *contentful* (distribute/lift/fold — saturate
+these). `canonicalize` computes normal forms eagerly (balanced
+bracketings — the Blelloch shape *is* the canonical form), then
+only contentful laws run. On the T=8 recurrence: **2,011,701 →
+351 enodes (~5,700×), 182s → 0.05s**, same fp64-exact result.
+This is Mac Lane coherence operationalized as a scheduler —
+empirically it is the difference between unusable and instant.
+
+**Rules synthesize themselves.** `meta.synthesize_rules` does
+critical-pair completion: compose ordered rule pairs symbolically
+or on seed terms, filter tautologies/duplicates, validate each
+candidate by replay + fp64 evaluation. Fed
+`SCAN_LAWS \ {aff_lift_step}`, it emits the unfolded equivalent
+of `AFF_LIFT_STEP` — a rule previously hand-written is now
+derived. This is the meta-optimization loop: certified composite
+paths distill back into the law set.
 
 **The calibrated cost model predicts the crossover.** `roofline_cost`
 constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
@@ -221,10 +272,12 @@ lowering overhead visible on real blocks.
 - **Scaling required three DAG-aware fixes** — `add_term`, cost fns, and
   lowering's `_uses_input`/`collect` all used unmemoised tree walks that
   are exponential on shared-subterm DAGs (llama2.c n≥4 hung for
-  minutes; now linear). Saturation itself remains the scaling wall:
-  AC/distributive rules explode combinatorially on real graphs, so the
-  profitable path at scale is the O(n) pairing pass + bounded
-  saturation, not full eqsat.
+  minutes; now linear). Saturation scaling has a name now —
+  **commutativity is the explosive law** (permutation space): the
+  order-preserving fragment saturates in O(T²) enodes where the
+  full AC set blew past 100k.  The profitable paths at scale are
+  the O(n) pairing pass, order-preserving law sets, and monoid
+  domains (`aff`, `om`) that move structure into carriers.
 
 ## Honest limitations
 
@@ -268,21 +321,24 @@ lowering overhead visible on real blocks.
 | Path | Role |
 |---|---|
 | `catopt/ir.py` | Typed term algebra, symmetric-monoidal generator registry |
-| `catopt/egraph.py` | Union-find, e-matching, saturation, attr metavariables, `check`/`derive` hooks, DAG-aware + coordinated extraction |
+| `catopt/egraph.py` | Union-find, e-matching, saturation, attr metavariables, `check`/`derive` hooks, DAG-aware + coordinated extraction, proof-carrying merges (`certificate`/`verify_certificate`) |
+| `catopt/meta.py` | Coherence stratification (`canonicalize`, `stratified_run`) + critical-pair rule synthesis (`synthesize_rules`) |
 | `catopt/rules.py` | 35 laws + `pair_shared_input_linears` non-local pass |
-| `catopt/cost.py` | `count_cost`, `flops_cost`, `launch_aware_cost`, `roofline_cost`, `dag_cost` |
+| `catopt/cost.py` | `count_cost`, `flops_cost`, `launch_aware_cost`, calibrated `roofline_cost`, `depth_cost` (critical path), `dag_cost` |
 | `catopt/torch_bridge.py` | `torch.export` → IR, IR → `IRModule`, compile-time weight folding |
 | `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
-| `catopt/models/` | Benchmark modules (incl. llama2.c-compatible blocks) |
+| `catopt/om.py` | Online-softmax monoid laws (chunked attention) |
+| `catopt/scan_lower.py` | Level-batched parallel-scan executor + CUDA graphs |
+| `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective SSMs) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 80 tests: equivalence, soundness regressions, pairing |
+| `tests/` | 158 tests: equivalence, soundness, pairing, monoid domains |
 
 ## Reproduce
 
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 93 tests
+python -m pytest tests/ -q         # 158 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

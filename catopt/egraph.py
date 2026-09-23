@@ -121,15 +121,147 @@ class _LeafRegistry:
         return cls._key_to_term.get(key, key)
 
 
-class EGraph:
-    """The equality-saturation data structure."""
+# ---------------------------------------------------------------------------
+#  Proof-carrying merges — 2-morphisms as first-class data
+# ---------------------------------------------------------------------------
+#
+#  Every merge records WHY it happened: ``apply_rule`` appends one
+#  :class:`ProofEdge` per successful union (the canonical e-class ids on
+#  the matched and produced sides plus the fired binding) and tags every
+#  enode it instantiates with the creating rule application.  The
+#  e-graph quotients the proof space — we keep a single witness per
+#  merge (the first discovered), not all proofs.
+#
+#  :meth:`EGraph.certificate` replays that provenance into a positional
+#  derivation — an ordered list of single-rule rewrites — connecting
+#  the source term to an extracted member.  :func:`verify_certificate`
+#  replays the steps on real terms, independent of the e-graph.  A step
+#  that has no standalone justification (non-local merges such as the
+#  diagram-level pairing pass, or manual unions) is recorded but flagged
+#  ``egraph_dependent`` rather than silently trusted.
 
-    def __init__(self) -> None:
+
+@dataclass
+class ProofEdge:
+    """One recorded merge: the 2-morphism witnessing two e-classes.
+
+    ``rule`` is the ``Rewrite.name`` that fired — ``None`` for merges
+    performed outside rule application (non-local passes such as
+    ``pair_shared_input_linears``, or direct ``union`` calls).
+    ``a``/``b`` are the canonical e-class ids of the matched (LHS) and
+    produced (RHS) sides *before* the merge; ``subst`` is the fired
+    binding as ``(key, value)`` pairs — metavariables map to e-class
+    ids, ``"$attr:"`` keys carry concrete attribute values.
+    """
+    rule: str | None
+    a: int
+    b: int
+    subst: tuple = ()
+    note: str = ""
+
+
+@dataclass
+class CertStep:
+    """A single derivation step: ``rule`` applied at ``path``.
+
+    ``path`` is a tuple of child indices locating the rewritten subterm
+    inside the evolving term.  ``lhs``/``rhs`` are the concrete matched
+    and produced term instances; ``bindings`` records metavariable ->
+    term and ``"$attr:"`` -> value exactly as fired.
+
+    ``egraph_dependent`` marks steps that cannot be replayed as a
+    standalone rewrite — context-dependent merges (the pairing pass,
+    manual unions) or derivation-budget exhaustion.  Verification
+    substitutes them as trusted assertions: they are counted in
+    ``Certificate.stats`` and rejected under ``strict=True``, never
+    silently passed.
+    """
+    rule: str
+    path: tuple
+    lhs: Any = None
+    rhs: Any = None
+    bindings: dict = field(default_factory=dict)
+    egraph_dependent: bool = False
+    note: str = ""
+
+
+class CertificateVerificationError(Exception):
+    """The recorded derivation does not connect its claimed endpoints."""
+
+
+@dataclass
+class Certificate:
+    """A proof-carrying derivation ``src`` -> ``dst``.
+
+    ``steps``, applied in order, rewrite ``src`` into ``dst``: each is
+    one rule application located by ``path``.  ``rules`` carries the
+    :class:`Rewrite` objects used, so the certificate is self-contained
+    for :func:`verify_certificate`.  ``stats`` summarises coverage —
+    ``n_egraph_dependent`` counts steps the e-graph witnessed but that
+    cannot replay standalone.
+    """
+    src: Any
+    dst: Any
+    root_eid: int | None
+    steps: list = field(default_factory=list)
+    rules: dict = field(default_factory=dict)
+    stats: dict = field(default_factory=dict)
+
+    @property
+    def n_steps(self) -> int:
+        return len(self.steps)
+
+    @property
+    def n_egraph_dependent(self) -> int:
+        return sum(1 for s in self.steps if s.egraph_dependent)
+
+    @property
+    def replayable(self) -> bool:
+        """True when every step is a standalone-replayable rewrite."""
+        return self.n_egraph_dependent == 0
+
+    @property
+    def rules_used(self) -> list[str]:
+        return sorted({s.rule for s in self.steps
+                       if not s.egraph_dependent})
+
+    def render(self) -> str:
+        lines = [f"certificate: {op_repr(self.src)}",
+                 f"        ==> {op_repr(self.dst)}"]
+        for i, s in enumerate(self.steps):
+            tag = "  [e-graph-dependent]" if s.egraph_dependent else ""
+            lines.append(
+                f"  {i:>3}. {s.rule} @{list(s.path)}: "
+                f"{op_repr(s.lhs)} -> {op_repr(s.rhs)}{tag}")
+        return "\n".join(lines)
+
+
+class EGraph:
+    """The equality-saturation data structure.
+
+    ``track_proofs`` (default on) records one :class:`ProofEdge` per
+    merge plus per-enode rule provenance — the data :meth:`certificate`
+    needs.  The cost is O(1) per union/enode: a small record per edge,
+    never a second pass over the proof space.
+    """
+
+    def __init__(self, track_proofs: bool = True) -> None:
         self._uf = UnionFind()
         self._classes: dict[int, EClass] = {}
         self._node_to_class: dict[ENode, int] = {}
         self._next_id = 0
         self.rule_fires: dict[str, int] = {}
+        # -- proof tracking --
+        self._track = track_proofs
+        self._merge_log: list[ProofEdge] = []
+        self._applications: list[dict] = []
+        self._enode_origin: dict[ENode, str] = {}
+        self._enode_birth: dict[ENode, int] = {}
+        self._enode_app: dict[ENode, int] = {}
+        self._rule_objs: dict[str, Rewrite] = {}
+        self._tag_rule: str | None = None      # rule context (RHS instantiate)
+        self._collect: list | None = None      # enodes born mid-instantiate
+        self._inst_last_enode: ENode | None = None
 
     @property
     def n_classes(self) -> int:
@@ -149,23 +281,30 @@ class EGraph:
     def get_class(self, eid: int) -> EClass:
         return self._classes[self.find(eid)]
 
-    def add_leaf(self, key: str) -> int:
+    def add_leaf(self, key: str, provenance: str | None = None) -> int:
         """Add a leaf (Var/Const/Param) identified by *key*."""
         enode = ENode("leaf", (), (("key", key),))
         if enode in self._node_to_class:
             return self.find(self._node_to_class[enode])
-        return self._add_enode(enode)
+        return self._add_enode(enode, provenance)
 
     def add_enode(self, op: str, children: tuple[int, ...],
-                  attrs: dict[str, Any] | None = None) -> int:
-        """Add an ENode with already-resolved child e-class IDs."""
+                  attrs: dict[str, Any] | None = None,
+                  provenance: str | None = None) -> int:
+        """Add an ENode with already-resolved child e-class IDs.
+
+        ``provenance`` optionally names what introduced the enode
+        (e.g. a non-local pass); enodes born inside a rule application
+        are tagged with the firing rule regardless.
+        """
         attr_t = tuple(sorted((attrs or {}).items()))
         enode = ENode(op, tuple(self.find(c) for c in children), attr_t)
         if enode in self._node_to_class:
             return self.find(self._node_to_class[enode])
-        return self._add_enode(enode)
+        return self._add_enode(enode, provenance)
 
-    def _add_enode(self, enode: ENode) -> int:
+    def _add_enode(self, enode: ENode,
+                   provenance: str | None = None) -> int:
         eid = self._next_id
         self._next_id += 1
         self._uf.parent.append(eid)
@@ -173,34 +312,54 @@ class EGraph:
         self._classes[eid] = EClass(id=eid)
         self._node_to_class[enode] = eid
         self._classes[eid].nodes.add(enode)
+        if self._track:
+            self._enode_birth[enode] = eid
+            self._enode_origin[enode] = (
+                self._tag_rule or provenance or "external")
+            if self._collect is not None:
+                self._collect.append(enode)
         return eid
 
-    def add_term(self, term: Any, _memo: dict | None = None) -> int:
+    def add_term(self, term: Any, _memo: dict | None = None,
+                 provenance: str = "input") -> int:
         """Add a term (Var/Const/Param/Op) to the e-graph.
 
         ``_memo`` is an ``id()``-keyed cache: exported IR terms are DAGs
         with heavy sharing (residual streams, RoPE tables), and without
         memoisation the recursion re-walks shared subtrees
         exponentially.
+
+        ``provenance`` tags every enode the term creates — ``"input"``
+        for the source program, distinguishing it from rule-introduced
+        and pass-introduced enodes in certificate generation.
         """
         memo = {} if _memo is None else _memo
         key = id(term)
         if key in memo:
             return memo[key]
         if isinstance(term, Op):
-            child_eids = tuple(self.add_term(a, memo) for a in term.args)
+            child_eids = tuple(
+                self.add_term(a, memo, provenance) for a in term.args)
             attr_t = _pattern_attrs(term)
             enode = ENode(term.op, child_eids, attr_t)
             if enode in self._node_to_class:
                 memo[key] = self.find(self._node_to_class[enode])
             else:
-                memo[key] = self._add_enode(enode)
+                memo[key] = self._add_enode(enode, provenance)
             return memo[key]
         _LeafRegistry.register(term)
-        memo[key] = self.add_leaf(repr(term))
+        memo[key] = self.add_leaf(repr(term), provenance)
         return memo[key]
 
-    def union(self, a: int, b: int) -> bool:
+    def union(self, a: int, b: int, rule: str | None = None,
+              subst: dict | None = None, note: str = "") -> bool:
+        """Merge the e-classes of ``a`` and ``b``.
+
+        ``rule``/``subst`` optionally record the 2-morphism witnessing
+        the merge: which rewrite fired and under what binding.  Only the
+        first witness per merge is kept — the e-graph quotients the
+        proof space.
+        """
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
             return False
@@ -212,8 +371,28 @@ class EGraph:
             target.nodes |= source.nodes
             target.cache.clear()
             del self._classes[old_canon]
+            if self._track:
+                fs = (tuple(sorted(subst.items(), key=lambda kv: kv[0]))
+                      if subst else ())
+                self._merge_log.append(ProofEdge(rule, ra, rb, fs, note))
             return True
         return False
+
+    # -- proof-log accessors ----------------------------------------------
+
+    @property
+    def merge_log(self) -> list[ProofEdge]:
+        """Every recorded merge witness, in order of application."""
+        return list(self._merge_log)
+
+    @property
+    def n_proof_edges(self) -> int:
+        return len(self._merge_log)
+
+    @property
+    def applications(self) -> list[dict]:
+        """Every rule application recorded during saturation."""
+        return list(self._applications)
 
     # -- pattern matching --
 
@@ -324,7 +503,21 @@ class EGraph:
                     canon = tuple(self.find(c) for c in node.children)
                     if canon != node.children:
                         changed = True
-                    new_nodes.add(ENode(node.op, canon, node.attrs))
+                    nn = ENode(node.op, canon, node.attrs)
+                    new_nodes.add(nn)
+                    if self._track and nn != node:
+                        # The canonicalized enode inherits the original's
+                        # provenance — same term, fresh child ids.
+                        if node in self._enode_origin:
+                            self._enode_origin.setdefault(
+                                nn, self._enode_origin[node])
+                        if node in self._enode_birth:
+                            self._enode_birth.setdefault(
+                                nn, self._enode_birth[node])
+                        if node in self._enode_app:
+                            self._enode_app.setdefault(
+                                nn, self._enode_app[node])
+                        self._node_to_class.setdefault(nn, eid)
                 else:
                     new_nodes.add(node)
             eclass.nodes = new_nodes
@@ -333,8 +526,16 @@ class EGraph:
     # -- rule application --
 
     def _instantiate(self, pattern: Any, subst: dict[str, int]) -> int:
-        """Instantiate a pattern (RHS) with a substitution."""
+        """Instantiate a pattern (RHS) with a substitution.
+
+        When proof tracking is on, ``self._inst_last_enode`` records the
+        enode realising the pattern's root (post-order: the outermost
+        call assigns last), so the caller can tell which enode the
+        instantiated RHS is headed by — or ``None`` when the RHS is a
+        bare metavariable/leaf binding.
+        """
         if isinstance(pattern, str):
+            self._inst_last_enode = None
             return subst[pattern]
         if isinstance(pattern, Op):
             child_eids = tuple(self._instantiate(a, subst) for a in pattern.args)
@@ -347,9 +548,20 @@ class EGraph:
                     attrs[k] = subst.get("$attr:" + v, v)
                 else:
                     attrs[k] = v
-            return self.add_enode(pattern.op, child_eids, attrs)
+            enode = ENode(pattern.op,
+                          tuple(self.find(c) for c in child_eids),
+                          tuple(sorted(attrs.items())))
+            if enode in self._node_to_class:
+                eid = self.find(self._node_to_class[enode])
+            else:
+                eid = self._add_enode(enode)
+            self._inst_last_enode = enode
+            return eid
         else:
-            return self.add_leaf(repr(pattern))
+            eid = self.add_leaf(repr(pattern))
+            self._inst_last_enode = ENode("leaf", (),
+                                          (("key", repr(pattern)),))
+            return eid
 
     def any_term(self, eid: int, _seen: frozenset = frozenset()) -> Any:
         """Return any acyclic representative term of an e-class.
@@ -402,8 +614,40 @@ class EGraph:
                         if extra is None:
                             continue
                         subst = {**subst, **extra}
-                rhs_eid = self._instantiate(rule.rhs, subst)
-                if self.union(eid, rhs_eid):
+                created = None
+                if self._track:
+                    self._tag_rule = rule.name
+                    self._collect = []
+                    self._inst_last_enode = None
+                    try:
+                        rhs_eid = self._instantiate(rule.rhs, subst)
+                    finally:
+                        self._tag_rule = None
+                        created = self._collect
+                        self._collect = None
+                else:
+                    rhs_eid = self._instantiate(rule.rhs, subst)
+                self._rule_objs.setdefault(rule.name, rule)
+                merged = self.union(eid, rhs_eid,
+                                    rule=rule.name, subst=subst)
+                if self._track and (merged or created):
+                    # A real merge or freshly-instantiated enodes — the
+                    # application is a witness worth keeping.  A no-op
+                    # firing (RHS already in the class, nothing created)
+                    # adds no 2-morphism, so it is not recorded.
+                    app_idx = len(self._applications)
+                    self._applications.append({
+                        "rule": rule.name,
+                        "matched_eid": self.find(eid),
+                        "rhs_eid": self.find(rhs_eid),
+                        "subst": dict(subst),
+                        "rhs_root_enode": self._inst_last_enode,
+                    })
+                    # First discovered witness wins — a hash-consed
+                    # enode keeps the application that created it.
+                    for en in created or ():
+                        self._enode_app.setdefault(en, app_idx)
+                if merged:
                     changed = True
                     self.rule_fires[rule.name] = (
                         self.rule_fires.get(rule.name, 0) + 1)
@@ -431,6 +675,7 @@ class EGraph:
             "iterations": iteration + 1,
             "n_enodes": self.n_enodes,
             "n_classes": self.n_classes,
+            "n_proof_edges": len(self._merge_log),
         }
 
     # -- extraction --
@@ -740,6 +985,303 @@ class EGraph:
 
         return self.extract_best(root_eid, cost_fn, overrides=overrides)
 
+    # -- certificates: derivations reconstructed from proof data ----------
+
+    _CERT_MAX_DEPTH = 400
+    _CERT_MAX_STEPS = 20_000
+
+    def _class_of_term(self, term: Any) -> int | None:
+        """Canonical e-class id realising *term*, without mutating the graph."""
+        if isinstance(term, Op):
+            cids = []
+            for a in term.args:
+                c = self._class_of_term(a)
+                if c is None:
+                    return None
+                cids.append(c)
+            en = ENode(term.op, tuple(cids), _pattern_attrs(term))
+        else:
+            en = ENode("leaf", (), (("key", repr(term)),))
+        eid = self._node_to_class.get(en)
+        return self.find(eid) if eid is not None else None
+
+    def _locate(self, term: Any, eid: int | None = None):
+        """``(eid, enode)`` realising *term* inside its e-class.
+
+        The enode is matched by structure — op, attrs, and per-child
+        e-classes — so it pins down exactly which member of the class
+        the term uses.  ``enode`` is ``None`` when no member matches.
+        """
+        if eid is None:
+            eid = self._class_of_term(term)
+        if eid is None:
+            return None, None
+        eid = self.find(eid)
+        ec = self._classes.get(eid)
+        if ec is None:
+            return eid, None
+        if not isinstance(term, Op):
+            for n in ec.nodes:
+                if (n.op == "leaf" and n.attrs
+                        and n.attrs[0][1] == repr(term)):
+                    return eid, n
+            return eid, None
+        child_cls = [self._class_of_term(a) for a in term.args]
+        for n in ec.nodes:
+            if n.op != term.op or len(n.children) != len(term.args):
+                continue
+            if dict(n.attrs) != term.attrs:
+                continue
+            if all(cc is not None and self.find(c) == cc
+                   for c, cc in zip(n.children, child_cls)):
+                return eid, n
+        return eid, None
+
+    def _birth(self, enode: ENode) -> int:
+        """Creation order of an enode (its birth eid); huge if unknown."""
+        b = self._enode_birth.get(enode)
+        if b is not None:
+            return b
+        eid = self._node_to_class.get(enode)
+        return eid if eid is not None else 1 << 60
+
+    def _oldest_term(self, eid: int, _stack: frozenset = frozenset()):
+        """The earliest-created representative term of an e-class.
+
+        Proof-time analogue of :meth:`any_term`: picking the minimum-
+        birth enode at every level makes target-side expansion in
+        :meth:`_connect` a strictly descending recursion — every rule
+        instance's LHS was matched on enodes older than the RHS enodes
+        it created.
+        """
+        eid = self.find(eid)
+        if eid in _stack:
+            return None
+        ec = self._classes.get(eid)
+        if ec is None:
+            return None
+        for node in sorted(ec.nodes, key=self._birth):
+            if node.op == "leaf":
+                key = node.attrs[0][1] if node.attrs else "??"
+                return _LeafRegistry.decode(key)
+            args = []
+            ok = True
+            for c in node.children:
+                t = self._oldest_term(c, _stack | {eid})
+                if t is None:
+                    ok = False
+                    break
+                args.append(t)
+            if ok:
+                return Op.make(node.op, *args, **dict(node.attrs))
+        return None
+
+    def _app_for_member(self, term: Any):
+        """The rule application whose RHS root realises *term*'s root.
+
+        Returns ``(app, enode)`` — ``app`` is ``None`` when the member
+        enode is not the RHS root of any recorded application (input
+        term, internal RHS node, or pass-introduced).
+        """
+        eid, en = self._locate(term)
+        if en is None:
+            return None, None
+        ai = self._enode_app.get(en)
+        if ai is None:
+            return None, en
+        app = self._applications[ai]
+        root_en = app["rhs_root_enode"]
+        if root_en is None:
+            return None, en
+        # ``en`` must be the application's RHS root — children compare
+        # modulo canonicalisation (rebuild may have rewritten ids).
+        if (root_en.op != en.op or root_en.attrs != en.attrs
+                or len(root_en.children) != len(en.children)):
+            return None, en
+        if not all(self.find(a) == self.find(b)
+                   for a, b in zip(root_en.children, en.children)):
+            return None, en
+        return app, en
+
+    def _resolve_subst(self, subst: dict) -> dict | None:
+        """Resolve a fired binding to concrete terms.
+
+        Metavariable eids map to their class's :meth:`_oldest_term`;
+        ``"$attr:"`` keys carry their concrete value through.  ``None``
+        when a bound class is unresolvable (cyclic).
+        """
+        out = {}
+        for k, v in subst.items():
+            if k.startswith("$attr:"):
+                out[k] = v
+            else:
+                t = self._oldest_term(v)
+                if t is None:
+                    return None
+                out[k] = t
+        return out
+
+    def _connect(self, s: Any, t: Any, pos: tuple,
+                 steps: list, depth: int) -> bool:
+        """Emit steps rewriting the subterm at ``pos`` from ``s`` to ``t``.
+
+        Both terms are members of one e-class.  Returns True when every
+        emitted step is a standalone-replayable rule application; False
+        means at least one ``egraph_dependent`` stub was emitted.  The
+        strategy, in order:
+
+        1. **Expand the target** through the rule application that
+           created its root enode: recursively bridge ``s`` to the
+           application's LHS instance, emit the rewrite, then fix the
+           produced children pairwise.
+        2. **Congruence**: same head op/attrs and pairwise-equivalent
+           children — descend without emitting a step.
+        3. **Edge search**: a short bounded search over the rules that
+           fired, covering merges whose RHS is a bare metavariable or a
+           pre-existing hash-consed enode (no expandable enode exists).
+        4. **e-graph-dependent stub**: the merge is real but has no
+           standalone derivation (non-local pass, manual union).
+        """
+        if op_repr(s) == op_repr(t):
+            return True
+        if depth > self._CERT_MAX_DEPTH or len(steps) > self._CERT_MAX_STEPS:
+            steps.append(CertStep("<budget>", pos, s, t, {},
+                                  egraph_dependent=True,
+                                  note="derivation budget exceeded"))
+            return False
+
+        app, _en = self._app_for_member(t)
+        if app is not None:
+            rule = self._rule_objs.get(app["rule"])
+            bound = (self._resolve_subst(app["subst"])
+                     if rule is not None else None)
+            if bound is not None:
+                L = _term_instantiate(rule.lhs, bound)
+                R = _term_instantiate(rule.rhs, bound)
+                ok = self._connect(s, L, pos, steps, depth + 1)
+                steps.append(CertStep(rule.name, pos, L, R, bound))
+                if isinstance(R, Op) and isinstance(t, Op):
+                    for i in range(len(t.args)):
+                        if not self._connect(R.args[i], t.args[i],
+                                             pos + (i,), steps, depth + 1):
+                            ok = False
+                return ok
+
+        if (isinstance(s, Op) and isinstance(t, Op)
+                and s.op == t.op and s.attrs == t.attrs
+                and len(s.args) == len(t.args)):
+            cs = [self._class_of_term(a) for a in s.args]
+            ct = [self._class_of_term(a) for a in t.args]
+            if all(a is not None and a == b for a, b in zip(cs, ct)):
+                ok = True
+                for i in range(len(s.args)):
+                    if not self._connect(s.args[i], t.args[i],
+                                         pos + (i,), steps, depth + 1):
+                        ok = False
+                return ok
+
+        path = self._edge_path(s, t, pos)
+        if path is not None:
+            steps.extend(path)
+            return True
+
+        steps.append(CertStep("<egraph>", pos, s, t, {},
+                              egraph_dependent=True,
+                              note=self._explain_gap(s, t)))
+        return False
+
+    def _edge_path(self, s: Any, t: Any, pos: tuple, depth: int = 0,
+                   _seen: set | None = None,
+                   _budget: list | None = None) -> list | None:
+        """Bounded search for a replayable step sequence ``s -> t``.
+
+        Transitions are the rules that actually fired during this run,
+        re-matched directly against the real term ``s`` — each emitted
+        step is a genuine rule instance, so any path found is a valid
+        derivation.  Returns the list of steps (all located at ``pos``),
+        or ``None`` when no short path exists.
+        """
+        if op_repr(s) == op_repr(t):
+            return []
+        if _seen is None:
+            _seen, _budget = set(), [512]
+        if depth > 16 or _budget[0] <= 0:
+            return None
+        _seen.add(op_repr(s))
+        for rule in self._rule_objs.values():
+            m = _term_match(rule.lhs, s)
+            if m is None:
+                continue
+            if rule.check is not None and not rule.check(m):
+                continue
+            inst = dict(m)
+            if rule.derive is not None:
+                extra = rule.derive(m)
+                if extra is None:
+                    continue
+                inst.update(extra)
+            r = _term_instantiate(rule.rhs, inst)
+            if op_repr(r) in _seen:
+                continue
+            _budget[0] -= 1
+            rest = self._edge_path(r, t, pos, depth + 1, _seen, _budget)
+            if rest is not None:
+                return [CertStep(rule.name, pos, s, r, inst)] + rest
+        return None
+
+    def _explain_gap(self, s: Any, t: Any) -> str:
+        """Why a ``connect`` gap is e-graph-dependent, for the cert note."""
+        _eid, en_t = self._locate(t)
+        if en_t is not None:
+            org = self._enode_origin.get(en_t)
+            if org == "external":
+                return ("target enode introduced outside rule "
+                        "application (non-local pass such as "
+                        "pair_shared_input_*, or a manual union)")
+            if org == "input":
+                return ("both members predate saturation but no fired "
+                        "rule links them at this position")
+        return "no replayable derivation found"
+
+    def certificate(self, src_term: Any, dst_term: Any = None, *,
+                    root_eid: int | None = None,
+                    cost_fn=None) -> Certificate:
+        """Build a proof-carrying derivation ``src_term`` -> ``dst_term``.
+
+        ``src_term`` is the term originally added to the e-graph (the
+        certificate's anchor — *not* an arbitrary class member).
+        ``dst_term`` defaults to ``extract_best`` under ``cost_fn``
+        (``count_cost`` if neither is given).  The certificate's steps
+        replay positionally on real terms; ``egraph_dependent`` steps
+        mark where the e-graph witnessed an equality that has no
+        standalone rule derivation.
+        """
+        if root_eid is None:
+            root_eid = self._class_of_term(src_term)
+        if dst_term is None:
+            if root_eid is None:
+                raise ValueError("src_term is not in this e-graph")
+            if cost_fn is None:
+                from catopt.cost import count_cost
+                cost_fn = count_cost
+            dst_term = self.extract_best(root_eid, cost_fn)
+        steps: list = []
+        self._connect(src_term, dst_term, (), steps, 0)
+        used = sorted({s.rule for s in steps if not s.egraph_dependent})
+        cert = Certificate(
+            src=src_term, dst=dst_term, root_eid=root_eid, steps=steps,
+            rules={n: self._rule_objs[n] for n in used
+                   if n in self._rule_objs},
+            stats={
+                "n_steps": len(steps),
+                "n_egraph_dependent": sum(
+                    1 for s in steps if s.egraph_dependent),
+                "rules_used": used,
+                "n_proof_edges": len(self._merge_log),
+                "n_rule_applications": len(self._applications),
+            })
+        return cert
+
 
 def _iter_ops(term: Any):
     """Yield every Op node in a term (for the structural-size tie-break)."""
@@ -747,3 +1289,180 @@ def _iter_ops(term: Any):
         yield term
         for a in term.args:
             yield from _iter_ops(a)
+
+
+# ---------------------------------------------------------------------------
+#  Certificate verification — replay on real terms, no e-graph
+# ---------------------------------------------------------------------------
+
+
+def _term_match(pattern: Any, term: Any,
+                _subst: dict | None = None) -> dict | None:
+    """Structural match of a pattern against a plain *term* (no e-graph).
+
+    Mirrors :meth:`EGraph._match` semantics at term granularity: string
+    leaves in the pattern are metavariables bound to subterms (repeated
+    metavariables must bind structurally equal terms); string-valued
+    attributes are attribute metavariables bound under ``"$attr:"``
+    keys; concrete leaves (Var/Const/Param) match by ``repr``.
+    Returns the bindings dict, or ``None`` on mismatch.
+    """
+    subst = {} if _subst is None else _subst
+    if isinstance(pattern, str):
+        prev = subst.get(pattern)
+        if prev is None:
+            subst[pattern] = term
+            return subst
+        return subst if op_repr(prev) == op_repr(term) else None
+    if isinstance(pattern, Op):
+        if not isinstance(term, Op) or term.op != pattern.op:
+            return None
+        if len(term.args) != len(pattern.args):
+            return None
+        if set(term.attrs) != set(pattern.attrs):
+            return None
+        for k, pv in pattern.attrs.items():
+            nv = term.attrs[k]
+            if isinstance(pv, str):
+                key = "$attr:" + pv
+                if key in subst:
+                    if subst[key] != nv:
+                        return None
+                else:
+                    subst[key] = nv
+            elif nv != pv:
+                return None
+        for pa, ta in zip(pattern.args, term.args):
+            if _term_match(pa, ta, subst) is None:
+                return None
+        return subst
+    # concrete leaf (Const/Param/Var embedded in the pattern)
+    return subst if repr(pattern) == repr(term) else None
+
+
+def _term_instantiate(pattern: Any, subst: dict) -> Any:
+    """Instantiate a pattern with term-valued bindings (pure terms).
+
+    The term-level analogue of :meth:`EGraph._instantiate`: metavariable
+    strings map to terms, ``"$attr:"`` keys resolve attribute
+    metavariables, concrete leaves pass through unchanged.
+    """
+    if isinstance(pattern, str):
+        return subst[pattern]
+    if isinstance(pattern, Op):
+        args = [_term_instantiate(a, subst) for a in pattern.args]
+        attrs = {}
+        for k, v in pattern.attrs.items():
+            if isinstance(v, str):
+                attrs[k] = subst.get("$attr:" + v, v)
+            else:
+                attrs[k] = v
+        return Op.make(pattern.op, *args, **attrs)
+    return pattern
+
+
+def _subterm(term: Any, path: tuple) -> Any:
+    """The subterm of *term* at child-index path, or None if absent."""
+    for i in path:
+        if not isinstance(term, Op) or i >= len(term.args):
+            return None
+        term = term.args[i]
+    return term
+
+
+def _replace_subterm(term: Any, path: tuple, new: Any) -> Any:
+    """*term* with the subterm at *path* replaced by *new*."""
+    if not path:
+        return new
+    if not isinstance(term, Op) or path[0] >= len(term.args):
+        raise CertificateVerificationError(
+            f"cannot descend path {list(path)} in {op_repr(term)}")
+    i = path[0]
+    args = list(term.args)
+    args[i] = _replace_subterm(args[i], path[1:], new)
+    return Op.make(term.op, *args, **dict(term.attrs))
+
+
+def verify_certificate(src_term: Any, cert: Certificate, *,
+                       strict: bool = False) -> Any:
+    """Replay a certificate's rule applications on real terms.
+
+    For each step: descend to ``path`` in the evolving term, re-match
+    the rule's LHS against the subterm found there, check the recorded
+    bindings and the recorded LHS/RHS instances, re-run ``check``/
+    ``derive`` side conditions, instantiate the RHS, and substitute.
+    ``egraph_dependent`` steps cannot be replayed standalone — the
+    recorded ``lhs`` must still be present at ``path``, then ``rhs`` is
+    substituted as a trusted assertion; ``strict=True`` rejects any
+    certificate containing them.
+
+    Returns the reconstructed term — ``cert.dst`` on success.
+    Raises :class:`CertificateVerificationError` on any mismatch.
+    """
+    if strict and cert.n_egraph_dependent:
+        raise CertificateVerificationError(
+            f"{cert.n_egraph_dependent} e-graph-dependent step(s) "
+            "cannot be replayed standalone")
+    if cert.src is not None and op_repr(src_term) != op_repr(cert.src):
+        raise CertificateVerificationError(
+            f"source mismatch: certificate proves {op_repr(cert.src)}, "
+            f"got {op_repr(src_term)}")
+    current = src_term
+    for i, step in enumerate(cert.steps):
+        sub = _subterm(current, step.path)
+        if sub is None:
+            raise CertificateVerificationError(
+                f"step {i} ({step.rule}): path {list(step.path)} "
+                f"absent in {op_repr(current)}")
+        if step.egraph_dependent:
+            if op_repr(sub) != op_repr(step.lhs):
+                raise CertificateVerificationError(
+                    f"step {i} (e-graph-dependent): expected "
+                    f"{op_repr(step.lhs)} at {list(step.path)}, "
+                    f"found {op_repr(sub)}")
+            current = _replace_subterm(current, step.path, step.rhs)
+            continue
+        rule = cert.rules.get(step.rule)
+        if rule is None:
+            raise CertificateVerificationError(
+                f"step {i}: unknown rule {step.rule!r}")
+        if op_repr(step.lhs) != op_repr(sub):
+            raise CertificateVerificationError(
+                f"step {i} ({step.rule}): recorded LHS instance "
+                f"{op_repr(step.lhs)} != subterm {op_repr(sub)}")
+        m = _term_match(rule.lhs, sub)
+        if m is None:
+            raise CertificateVerificationError(
+                f"step {i} ({step.rule}): LHS does not match "
+                f"{op_repr(sub)}")
+        for k, v in step.bindings.items():
+            if k not in m:
+                continue  # derived binding — checked via derive/rhs below
+            same = (m[k] == v if k.startswith("$attr:")
+                    else op_repr(m[k]) == op_repr(v))
+            if not same:
+                raise CertificateVerificationError(
+                    f"step {i} ({step.rule}): binding {k} tampered")
+        if rule.check is not None and not rule.check(m):
+            raise CertificateVerificationError(
+                f"step {i} ({step.rule}): side condition fails on replay")
+        inst = dict(m)
+        for k, v in step.bindings.items():
+            inst.setdefault(k, v)      # derived $attr bindings
+        if rule.derive is not None:
+            extra = rule.derive(m)
+            if extra is None:
+                raise CertificateVerificationError(
+                    f"step {i} ({step.rule}): derive vetoed on replay")
+            inst.update(extra)
+        rhs = _term_instantiate(rule.rhs, inst)
+        if op_repr(rhs) != op_repr(step.rhs):
+            raise CertificateVerificationError(
+                f"step {i} ({step.rule}): recorded RHS "
+                f"{op_repr(step.rhs)} != instantiated {op_repr(rhs)}")
+        current = _replace_subterm(current, step.path, rhs)
+    if op_repr(current) != op_repr(cert.dst):
+        raise CertificateVerificationError(
+            f"replay produced {op_repr(current)}, "
+            f"certificate claims {op_repr(cert.dst)}")
+    return current
