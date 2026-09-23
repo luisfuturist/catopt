@@ -71,6 +71,25 @@ _POSITIONAL_ATTRS: dict[str, dict[int, str]] = {
     "conv2d": {3: "stride", 4: "padding", 5: "dilation", 6: "groups"},
 }
 
+#: Canonical attribute names the rule side (rules.py, om.py) and the
+#: cost model's ``_shape_of`` pattern-match.  torch.export emits
+#: trailing positional args as ``arg{i}`` attributes — ``cat(ts, -2)``
+#: arrives as ``concat(arg1=-2)`` and ``t.chunk(n, -2)`` as
+#: ``chunk(arg1=n, arg2=-2)`` — while every rule-produced term spells
+#: these ``dim=``/``chunks=``.  Renaming at the bridge boundary lands
+#: exports in the canonical spelling so rewrite LHSs (OM_SPLIT,
+#: MATMUL_T_CONCAT, ...) match raw exported graphs and ``_shape_of``
+#: reads chunk dims correctly.  Semantically a no-op: the
+#: ``_IR_TO_TORCH`` lowerings accept both spellings.  Deliberately
+#: narrow — ops whose positional spellings ARE the canonical rule-side
+#: ones (transpose/unsqueeze/softmax arg1/arg2, split's arg1 size) are
+#: left untouched.
+_ATTR_RENAMES: dict[str, dict[str, str]] = {
+    "concat": {"arg1": "dim"},
+    "chunk": {"arg1": "chunks", "arg2": "dim"},
+    "split": {"arg2": "dim"},
+}
+
 
 #: Ops where a numeric argument is a scalar OPERAND (not an attribute).
 _SCALAR_OPERAND_OPS: set[str] = {
@@ -272,6 +291,12 @@ def export_to_ir(
                     attrs[k] = v
                 elif isinstance(v, list):
                     attrs[k] = tuple(v)
+            # Land exported positional spellings in the canonical
+            # rule-side form (concat arg1→dim, chunk arg1→chunks /
+            # arg2→dim, split arg2→dim).  Existing named attrs win.
+            for old, new in _ATTR_RENAMES.get(ir_op, {}).items():
+                if old in attrs and new not in attrs:
+                    attrs[new] = attrs.pop(old)
             if (ir_op == "getitem" and args
                     and isinstance(args[0], Op)
                     and args[0].op in ("split", "chunk", "unbind")

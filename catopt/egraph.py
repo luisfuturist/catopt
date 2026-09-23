@@ -239,20 +239,48 @@ class Certificate:
 class EGraph:
     """The equality-saturation data structure.
 
-    ``track_proofs`` (default on) records one :class:`ProofEdge` per
-    merge plus per-enode rule provenance — the data :meth:`certificate`
-    needs.  The cost is O(1) per union/enode: a small record per edge,
-    never a second pass over the proof space.
+    The e-graph is a *truncation* of the program ∞-groupoid, and
+    ``truncation_level`` selects how much of it is materialised:
+
+    - **1 — pure quotient.**  Only the partition into e-classes is
+      kept: no :class:`ProofEdge` records, no per-enode rule
+      provenance.  Minimal memory; :meth:`certificate` degrades to a
+      proof-free marker and :meth:`all_proofs` is unavailable.
+    - **2 — witnesses (default).**  One :class:`ProofEdge` per merge
+      plus per-enode provenance — the data :meth:`certificate` needs.
+      The cost is O(1) per union/enode: a small record per edge, never
+      a second pass over the proof space.
+    - **3 — lazy coherences.**  Same storage as level 2, plus
+      :meth:`all_proofs` / :meth:`coherent_paths` materialise
+      *alternate derivations* between two terms on demand — bounded
+      enumeration over the rules that fired, stored nowhere.  (The
+      level-2 merge log is a forest — one witness per merge — so
+      coherence between proofs is a property of the term-rewriting
+      space, computed lazily rather than enumerated eagerly.)
+
+    Backward compatibility: an explicit ``track_proofs`` flag overrides
+    the dial — ``True`` selects level 2, ``False`` selects level 1.
     """
 
-    def __init__(self, track_proofs: bool = True) -> None:
+    def __init__(self, track_proofs: bool | None = None,
+                 truncation_level: int = 2) -> None:
+        if truncation_level not in (1, 2, 3):
+            raise ValueError(
+                f"truncation_level must be 1, 2, or 3, "
+                f"got {truncation_level!r}")
+        if track_proofs is not None:
+            # Backward-compat override: the old boolean flag maps onto
+            # the dial — True -> level 2 (witnesses), False -> level 1
+            # (pure quotient).
+            truncation_level = 2 if track_proofs else 1
+        self.truncation_level = truncation_level
         self._uf = UnionFind()
         self._classes: dict[int, EClass] = {}
         self._node_to_class: dict[ENode, int] = {}
         self._next_id = 0
         self.rule_fires: dict[str, int] = {}
-        # -- proof tracking --
-        self._track = track_proofs
+        # -- proof tracking (level >= 2 only) --
+        self._track = truncation_level >= 2
         self._merge_log: list[ProofEdge] = []
         self._applications: list[dict] = []
         self._enode_origin: dict[ENode, str] = {}
@@ -676,6 +704,7 @@ class EGraph:
             "n_enodes": self.n_enodes,
             "n_classes": self.n_classes,
             "n_proof_edges": len(self._merge_log),
+            "truncation_level": self.truncation_level,
         }
 
     # -- extraction --
@@ -1303,6 +1332,20 @@ class EGraph:
                         "rule links them at this position")
         return "no replayable derivation found"
 
+    def _resolve_dst(self, src_term: Any, dst_term: Any,
+                     root_eid: int | None, cost_fn) -> tuple[int | None, Any]:
+        """Shared endpoint resolution for certificates and coherence."""
+        if root_eid is None:
+            root_eid = self._class_of_term(src_term)
+        if dst_term is None:
+            if root_eid is None:
+                raise ValueError("src_term is not in this e-graph")
+            if cost_fn is None:
+                from catopt.cost import count_cost
+                cost_fn = count_cost
+            dst_term = self.extract_best(root_eid, cost_fn)
+        return root_eid, dst_term
+
     def certificate(self, src_term: Any, dst_term: Any = None, *,
                     root_eid: int | None = None,
                     cost_fn=None) -> Certificate:
@@ -1315,16 +1358,37 @@ class EGraph:
         replay positionally on real terms; ``egraph_dependent`` steps
         mark where the e-graph witnessed an equality that has no
         standalone rule derivation.
+
+        At ``truncation_level == 1`` no proof witnesses were recorded,
+        so the certificate degrades to a proof-free marker: a single
+        ``egraph_dependent`` step asserting ``src == dst`` (or zero
+        steps when the terms are already identical).  It replays under
+        :func:`verify_certificate` as a trusted assertion and is
+        rejected under ``strict=True``.
         """
-        if root_eid is None:
-            root_eid = self._class_of_term(src_term)
-        if dst_term is None:
-            if root_eid is None:
-                raise ValueError("src_term is not in this e-graph")
-            if cost_fn is None:
-                from catopt.cost import count_cost
-                cost_fn = count_cost
-            dst_term = self.extract_best(root_eid, cost_fn)
+        root_eid, dst_term = self._resolve_dst(
+            src_term, dst_term, root_eid, cost_fn)
+        if not self._track:
+            if op_repr(src_term) == op_repr(dst_term):
+                steps0: list = []
+            else:
+                steps0 = [CertStep(
+                    "<truncated>", (), src_term, dst_term, {},
+                    egraph_dependent=True,
+                    note="truncation level 1: proof witnesses "
+                         "were not recorded")]
+            return Certificate(
+                src=src_term, dst=dst_term, root_eid=root_eid,
+                steps=steps0, rules={},
+                stats={
+                    "proof_free": True,
+                    "truncation_level": self.truncation_level,
+                    "n_steps": len(steps0),
+                    "n_egraph_dependent": len(steps0),
+                    "rules_used": [],
+                    "n_proof_edges": 0,
+                    "n_rule_applications": 0,
+                })
         steps: list = []
         self._connect(src_term, dst_term, (), steps, 0)
         used = sorted({s.rule for s in steps if not s.egraph_dependent})
@@ -1341,6 +1405,145 @@ class EGraph:
                 "n_rule_applications": len(self._applications),
             })
         return cert
+
+    # -- level 3: lazily-materialised coherences --------------------------
+    #
+    #  The level-2 merge log is a *forest*: ``union`` only records an
+    #  edge between two previously-disconnected classes, so exactly one
+    #  class-level witness path exists between any two members.  The
+    #  alternate proofs that level 3 cares about live in the
+    #  term-rewriting space — different orders/locations of rule
+    #  application connecting the same endpoints.  ``all_proofs``
+    #  enumerates them on demand by re-firing the recorded rules on
+    #  real terms (the same machinery ``_edge_path`` uses), with a fuel
+    #  cap and a per-path loop check.  Nothing is stored: coherence is
+    #  computed when asked, then thrown away.
+
+    def all_proofs(self, src_term: Any, dst_term: Any = None, *,
+                   root_eid: int | None = None, cost_fn=None,
+                   max_paths: int = 32, max_steps: int = 8,
+                   fuel: int = 8192) -> list:
+        """Enumerate distinct derivations ``src_term`` -> ``dst_term``.
+
+        Bounded BFS over the term-rewriting space generated by the rules
+        that actually fired during this run (``self._rule_objs``): each
+        step is a genuine rule instance — ``_term_match`` on the LHS,
+        ``check``/``derive`` honoured, RHS instantiated — located by a
+        child-index ``path``, exactly like a :class:`CertStep`.  So
+        every returned derivation is a standalone-replayable proof.
+
+        ``max_paths`` caps the number of derivations returned,
+        ``max_steps`` caps derivation length, and ``fuel`` bounds total
+        match attempts.  Within one derivation a term is never
+        revisited (a loop proves nothing new).  Two derivations are
+        *distinct* when their ``(rule, path)`` step signatures differ.
+
+        Returns a list of derivations, each a list of :class:`CertStep`.
+        ``[[]]`` — one empty derivation — when ``src == dst``.
+        Raises ``RuntimeError`` at truncation level 1, where no rule
+        provenance exists to enumerate over.
+        """
+        if not self._track:
+            raise RuntimeError(
+                "all_proofs requires truncation_level >= 2: level 1 "
+                "records no proof witnesses to enumerate over")
+        root_eid, dst_term = self._resolve_dst(
+            src_term, dst_term, root_eid, cost_fn)
+        dst_repr = op_repr(dst_term)
+        if op_repr(src_term) == dst_repr:
+            return [[]]
+
+        rules = list(self._rule_objs.values())
+        # frontier entries: (term, steps_so_far, seen_term_reprs)
+        frontier: list[tuple[Any, list, frozenset]] = [
+            (src_term, [], frozenset({op_repr(src_term)}))]
+        paths: list[list] = []
+        sigs: set = set()
+        while frontier and fuel > 0 and len(paths) < max_paths:
+            nxt: list[tuple[Any, list, frozenset]] = []
+            for term, steps, seen in frontier:
+                if fuel <= 0 or len(paths) >= max_paths:
+                    break
+                if len(steps) >= max_steps:
+                    continue
+                for path in _term_paths(term):
+                    if fuel <= 0:
+                        break
+                    sub = _subterm(term, path)
+                    for rule in rules:
+                        fuel -= 1
+                        if fuel < 0:
+                            break
+                        m = _term_match(rule.lhs, sub)
+                        if m is None:
+                            continue
+                        if (rule.check is not None
+                                and not rule.check(m)):
+                            continue
+                        inst = dict(m)
+                        if rule.derive is not None:
+                            extra = rule.derive(m)
+                            if extra is None:
+                                continue
+                            inst.update(extra)
+                        r = _term_instantiate(rule.rhs, inst)
+                        new_term = _replace_subterm(term, path, r)
+                        new_repr = op_repr(new_term)
+                        nsteps = steps + [CertStep(
+                            rule.name, path, sub, r, inst)]
+                        if new_repr == dst_repr:
+                            sig = tuple(
+                                (s.rule, s.path) for s in nsteps)
+                            if sig not in sigs:
+                                sigs.add(sig)
+                                paths.append(nsteps)
+                        elif new_repr not in seen:
+                            nxt.append((new_term, nsteps,
+                                        seen | {new_repr}))
+            frontier = nxt
+        return paths
+
+    def coherent_paths(self, src_term: Any, dst_term: Any = None, *,
+                       root_eid: int | None = None, cost_fn=None,
+                       max_paths: int = 32, max_steps: int = 8,
+                       fuel: int = 8192) -> dict:
+        """Coherence summary between two terms: how many distinct ways
+        does the rewrite space prove them equal?
+
+        Thin wrapper over :meth:`all_proofs` (which requires
+        ``truncation_level >= 2``).  Returns a dict with the resolved
+        endpoints, ``same_eclass`` (whether the e-graph itself judges
+        the terms equal — independent evidence for the derivations),
+        ``n_paths``, the ``paths`` themselves, and ``truncated`` —
+        True when the ``max_paths`` cap was hit, i.e. more coherences
+        may exist than reported.
+        """
+        root_eid, dst_term = self._resolve_dst(
+            src_term, dst_term, root_eid, cost_fn)
+        paths = self.all_proofs(
+            src_term, dst_term, root_eid=root_eid,
+            max_paths=max_paths, max_steps=max_steps, fuel=fuel)
+        cs = self._class_of_term(src_term)
+        cd = self._class_of_term(dst_term)
+        same = (cs is not None and cd is not None
+                and self.find(cs) == self.find(cd))
+        return {
+            "src": src_term,
+            "dst": dst_term,
+            "root_eid": root_eid,
+            "same_eclass": same,
+            "n_paths": len(paths),
+            "paths": paths,
+            "truncated": len(paths) >= max_paths,
+        }
+
+
+def _term_paths(term: Any, prefix: tuple = ()):
+    """Yield the child-index path of every subterm, root first."""
+    yield prefix
+    if isinstance(term, Op):
+        for i, a in enumerate(term.args):
+            yield from _term_paths(a, prefix + (i,))
 
 
 def _iter_ops(term: Any):
