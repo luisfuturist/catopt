@@ -796,3 +796,63 @@ def test_om_compose_still_exact_on_affine_values():
     blocked = om_apply(om_compose(om_elem(s1, a1 * h + b1),
                                   om_elem(s2, a2 * h + b2)))
     assert torch.allclose(whole, blocked, atol=1e-13, rtol=1e-13)
+
+
+# ---------------------------------------------------------------------------
+#  End-to-end: export → carrier laws → non-local lifts → omd member
+# ---------------------------------------------------------------------------
+
+class _ScanAttn(torch.nn.Module):
+    """h_t = a_t⊙h + x_t (diagonal scan); out = softmax(qkᵀ) @ stack(h).
+
+    The attention VALUES are the scan's emitted sequence — the exact
+    shape ``omd_tree_lift`` was built for.  h0 is a parameter so the
+    first step does not degenerate to x_0."""
+
+    def __init__(self, T: int, D: int):
+        super().__init__()
+        self.a = torch.nn.Parameter(torch.randn(T, D) * 0.1)
+        self.h0 = torch.nn.Parameter(torch.randn(D) * 0.1)
+        self.wq = torch.nn.Linear(D, D, bias=False)
+        self.wk = torch.nn.Linear(D, D, bias=False)
+
+    def forward(self, x):
+        h = self.h0
+        outs = []
+        for t in range(x.shape[0]):
+            h = self.a[t] * h + x[t]
+            outs.append(h)
+        v = torch.stack(outs)
+        s = self.wq(x) @ self.wk(x).transpose(-1, -2)
+        return torch.softmax(s, dim=-1) @ v
+
+
+def test_scan_to_attention_lifts_into_omd_end_to_end():
+    """build_egraph on an exported scan→attention model produces an
+    ``omd_apply`` member at the root class — chunked attention over
+    scanned values as ONE affine-in-h0 recurrence — and the member
+    evaluates fp64-exact."""
+    from catopt.regime import build_egraph
+    from catopt.torch_bridge import ir_to_torch_module
+    from catopt.ir import IR
+    torch.manual_seed(0)
+    m = _ScanAttn(8, 8).eval().double()
+    x = torch.randn(8, 8, dtype=torch.float64)
+    eg, root, ir, src, stats = build_egraph(m, x)
+    assert stats.get("nonlocal_lifts", 0) > 0
+
+    # locate the omd_apply enode in the root class and extract its term
+    term = None
+    for n in eg.get_class(eg.find(root)).nodes:
+        if n.op == "omd_apply":
+            args = [eg.any_term(eg.find(c)) for c in n.children]
+            term = Op.make("omd_apply", *args, **dict(n.attrs))
+            break
+    assert term is not None, "omd_tree_lift did not fire end-to-end"
+
+    mod = ir_to_torch_module(IR(root=term, params=ir.params,
+                                inputs=ir.inputs), src)
+    ref = m(x)
+    with torch.no_grad():
+        out = mod(x)
+    assert (out - ref).abs().max().item() < 1e-12
