@@ -432,7 +432,8 @@ class EGraph:
     # -- extraction --
 
     def extract_best(self, eid: int, cost_fn,
-                     overrides: dict[int, Any] | None = None) -> Any:
+                     overrides: dict[int, Any] | None = None,
+                     _cache_out: dict | None = None) -> Any:
         """Extract the minimum-cost term from the e-class at *eid*.
 
         ``overrides`` maps canonical e-class ids to a specific ENode:
@@ -573,6 +574,8 @@ class EGraph:
             return cache[eclass_id]
 
         _, term, _, _, _ = best(eid)
+        if _cache_out is not None:
+            _cache_out.update(cache)
         return term
 
     # -- coordinated (group) extraction ----------------------------------
@@ -626,6 +629,38 @@ class EGraph:
                     return True
             return False
 
+        # First pass under member overrides gives a cost table used to
+        # score steering candidates: picking member_reaching[0] can grab
+        # an arbitrarily expensive alternative (e.g. a distributed form)
+        # and inflate the forced term's true DAG cost.
+        import inspect
+        cost_memo: dict = {}
+        takes_memo = "memo" in inspect.signature(cost_fn).parameters
+
+        def cfn(t: Any) -> float:
+            return cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
+
+        pass1_cache: dict = {}
+        self.extract_best(root_eid, cost_fn, overrides=member_over,
+                          _cache_out=pass1_cache)
+
+        keepalive: list = []
+
+        def steered_score(node: Any) -> float:
+            """local cost + children best totals (member-routed pass)."""
+            child_terms = []
+            sub = 0.0
+            for ch in node.children:
+                entry = pass1_cache.get(self.find(ch))
+                if entry is None or entry[1] is None:
+                    return float("inf")
+                child_terms.append(entry[1])
+                sub += entry[0]
+            term = Op.make(node.op, *child_terms, **dict(node.attrs))
+            keepalive.append(term)  # id()-keyed memo: prevent GC reuse
+            local = cfn(term) - sum(cfn(c) for c in child_terms)
+            return max(local, 0.0) + sub
+
         overrides: dict[int, Any] = dict(member_over)
         for cid, ec in list(self._classes.items()):
             cid = self.find(cid)
@@ -635,8 +670,9 @@ class EGraph:
                                if enode_reaches_member(n)]
             if member_reaching and len(member_reaching) < len(ec.nodes):
                 # class has both member-reaching and bypassing enodes —
-                # force the member route so the shared GEMM is used
-                overrides[cid] = member_reaching[0]
+                # force the cheapest member route so the shared GEMM
+                # is used without dragging in junk subtrees
+                overrides[cid] = min(member_reaching, key=steered_score)
 
         return self.extract_best(root_eid, cost_fn, overrides=overrides)
 

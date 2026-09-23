@@ -108,7 +108,23 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "reshape":
             shape = op.attrs.get("shape")
             if shape is not None:
-                return tuple(shape)
+                shape = tuple(shape)
+                # Exported graphs keep literal -1 dims ("infer from
+                # numel").  Resolve them: a -1 dim equals
+                # numel(input)/numel(known dims); if unresolvable,
+                # treat as unknown rather than propagating a negative
+                # dim that poisons downstream broadcasting (_INVALID).
+                if -1 in shape:
+                    base_n = _numel(shapes[0])
+                    known = 1
+                    for d in shape:
+                        if d != -1:
+                            known *= (d if d is not None and d > 0 else 1)
+                    inferred = (base_n // known
+                                if known and base_n % known == 0 else None)
+                    shape = tuple(inferred if d == -1 else d
+                                  for d in shape)
+                return shape
             return shapes[0]
         case "contiguous":
             return shapes[0]
@@ -168,6 +184,10 @@ def _broadcast(a, b):
     b_pad = (1,) * (ndim - len(b)) + tuple(b)
     out = []
     for da, db in zip(a_pad, b_pad):
+        if da is not None and da < 0:
+            da = None  # unresolved -1: treat as unknown, not a mismatch
+        if db is not None and db < 0:
+            db = None
         if da is None or db is None:
             out.append(None)
         elif da == 1:
@@ -208,9 +228,13 @@ _OP_FLOPS: dict[str, int] = {
     "contiguous": 0, "sdpa": 2,
 }
 
-#: Ops that produce no kernel — views or wire bookkeeping.  Exempt from
-#: the launch penalty and from count_cost.
-_VIEW_OPS = {"transpose", "reshape", "broadcast", "concat", "chunk",
+#: Ops that produce no kernel — true views or wire bookkeeping.
+#: torch.split/chunk/transpose/reshape return views: no launch, no
+#: memory traffic; their only runtime effect is the stride they leave
+#: for consumers (priced via _STRIDE_PENALTY).  concat is NOT here: a
+#: runtime cat() is a real copy kernel — it is only free when the whole
+#: subtree is param-only (compile-time fold, handled by extraction).
+_VIEW_OPS = {"transpose", "reshape", "broadcast", "chunk",
              "split", "leaf"}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
@@ -316,12 +340,35 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     seen: set[int] = set()
     total = 0.0
 
+    var_memo: dict[int, bool] = {}
+
+    def has_var(t: Any) -> bool:
+        """True if the subtree reads a data input (Var leaf).
+
+        Subtrees over only Param/Const leaves are compile-time work —
+        lowering folds them into a materialised parameter — so they are
+        charged 0, matching extract_best's param-only discount.
+        """
+        k = id(t)
+        if k in var_memo:
+            return var_memo[k]
+        if isinstance(t, Var):
+            out = True
+        elif isinstance(t, Op):
+            out = any(has_var(a) for a in t.args)
+        else:
+            out = False
+        var_memo[k] = out
+        return out
+
     def rec(t: Any) -> None:
         nonlocal total
         if id(t) in seen:
             return
         seen.add(id(t))
         if isinstance(t, Op):
+            if not has_var(t):
+                return  # folds at compile time — free at runtime
             for a in t.args:
                 rec(a)
             local = c(t) - sum(c(a) for a in t.args)
@@ -387,10 +434,17 @@ def count_cost(term: Any, memo: dict | None = None) -> float:
 # elementwise and copy ops are bandwidth-bound (bytes term wins), and
 # non-contiguous chunk views multiply the bytes a consumer must move.
 
-_PEAK_FLOPS = 2.0e11    # ~200 GFLOP/s (CPU-class, order-of-magnitude)
-_PEAK_BW = 4.0e10       # ~40 GB/s DRAM bandwidth
-_LAUNCH_S = 5.0e-6      # ~5 µs kernel-launch / scheduling overhead
-_STRIDE_PENALTY = 2.0   # strided reads waste ~half of each cache line
+# Calibrated on the dev GPU (RTX 2050 mobile, fp32): measured sustained
+# matmul throughput ~2.5 TFLOPS, device copy bandwidth ~89 GB/s, eager
+# kernel-launch overhead ~8.7 µs.  Raw strided copies measured ~1.0x
+# (no penalty), so _STRIDE_PENALTY is set to 1.0 — the *real* cost of a
+# strided view is not slower reads but forced materialisation when a
+# layout-strict consumer (e.g. SDPA) needs contiguous input, priced in
+# _local_roofline as an extra copy kernel.
+_PEAK_FLOPS = 2.5e12    # measured: ~2.5 TFLOPS fp32 GEMM (RTX 2050)
+_PEAK_BW = 8.9e10       # measured: ~89 GB/s copy bandwidth
+_LAUNCH_S = 8.7e-6      # measured: ~8.7 µs eager launch overhead
+_STRIDE_PENALTY = 1.0   # measured: strided copies ~1.0x on this GPU
 
 
 def _is_strided(term: Any, memo: dict | None = None) -> bool:
@@ -433,6 +487,10 @@ def _local_roofline(term: Op, memo: dict | None = None) -> float:
     compute_s = flops / _PEAK_FLOPS
     memory_s = _bytes_of(term, memo) / _PEAK_BW
     launch = 0.0 if term.op in _VIEW_OPS else _LAUNCH_S
+    # True views emit no kernel: no launch AND no memory traffic — the
+    # read happens at the consumer, priced there via _STRIDE_PENALTY.
+    if term.op in _VIEW_OPS:
+        return 0.0
     return (max(compute_s, memory_s) + launch) * 1e9
 
 
