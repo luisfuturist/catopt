@@ -98,6 +98,68 @@ class ResidualMLP(nn.Module):
         return h + x
 
 
+class ParallelLinear(nn.Module):
+    """Two projections of the SAME input, summed: ``x@W1 + x@W2``.
+
+    This is a real, non-degenerate pattern: LoRA / parallel adapters /
+    model-soup ensembles.  Deployment tooling merges the weights by hand
+    (``peft``'s ``merge_and_unload``), but the compiler does not — Inductor
+    keeps two separate matmuls because folding weight matrices together
+    requires compile-time arithmetic on *parameters*, not kernel fusion.
+
+    The categorical law is bilinearity of linear maps in the second slot:
+
+        x @ W1 + x @ W2  =  x @ (W1 + W2)
+
+    which needs the e-graph matcher to enforce that both matmuls share the
+    SAME input (a repeated metavariable).
+    """
+
+    def __init__(self, dim: int, n_experts: int = 2, expert_dim: int | None = None) -> None:
+        super().__init__()
+        out = expert_dim or dim
+        self.linears = nn.ModuleList(
+            nn.Linear(dim, out, bias=False) for _ in range(n_experts)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Sum of parallel projections — NOT a stack, so it cannot be
+        # reduced by trivially concatenating weights without summing them.
+        out = self.linears[0](x)
+        for lin in self.linears[1:]:
+            out = out + lin(x)
+        return out
+
+    @staticmethod
+    def flops(dims: tuple[int, int], batch: int) -> int:
+        """Two (or more) matmuls: 2 * batch * dim * out * n_experts."""
+        d, o = dims
+        return 2 * batch * d * o  # per expert; caller multiplies
+
+
+class DeepParallel(nn.Module):
+    """Composed case: ``(x@W1 + x@W2) @ W3``.
+
+    Requires TWO categorical laws in sequence plus compile-time folding:
+
+    1. ``weight_factor_matmul``  — merge to ``x @ (W1+W2)``
+    2. ``assoc_matmul``          — reassociate to ``x @ ((W1+W2) @ W3)``
+    3. IRModule weight folding   — materialise ``(W1+W2) @ W3`` once
+
+    No single pattern-matching pass finds this: it needs the distributive
+    merge AND the reassociation to interact before folding is even legal.
+    """
+
+    def __init__(self, dim: int, mid: int, out: int) -> None:
+        super().__init__()
+        self.W1 = nn.Linear(dim, mid, bias=False)
+        self.W2 = nn.Linear(dim, mid, bias=False)
+        self.W3 = nn.Linear(mid, out, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.W3(self.W1(x) + self.W2(x))
+
+
 class MatrixChain(nn.Module):
     """Three sequential matmuls — demonstrates associativity optimization.
 

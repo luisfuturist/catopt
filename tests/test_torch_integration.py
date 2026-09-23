@@ -15,7 +15,7 @@ from catopt.torch_bridge import (
     _canon_aten_name,
     _SCALAR_OPERAND_OPS,
 )
-from catopt.ir import IR, Op, Const, op_repr
+from catopt.ir import IR, Op, Const, Var, Param, TensorType, op_repr
 from catopt.egraph import EGraph
 from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
 from catopt.cost import flops_cost
@@ -252,3 +252,119 @@ def test_silu_mul_form_rule():
     ops = ops_in(eid)
     assert "mul" in ops
     assert "sigmoid" in ops
+
+
+# ---------------------------------------------------------------------------
+#  Parallel projections: weight merging (bilinearity) — the composed win
+# ---------------------------------------------------------------------------
+
+from catopt.models import ParallelLinear, DeepParallel  # noqa: E402
+
+
+def _eqsat_best(model, x):
+    """Export, saturate with all rules, return (orig_ir, best_term, source)."""
+    ir, source = export_to_ir(model, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=30, max_nodes=50000)
+    best = eg.extract_best(eid, flops_cost)
+    return ir, best, source
+
+
+def _lower(ir, best, source):
+    return ir_to_torch_module(
+        IR(root=best, inputs=ir.inputs,
+           input_names=ir.input_names, params=ir.params),
+        param_values=source,
+    )
+
+
+def test_weight_factor_linear_halves_flops():
+    """x@W1 + x@W2 merges to one matmul: exactly 2x fewer FLOPs."""
+    torch.manual_seed(0)
+    m = ParallelLinear(64, n_experts=2)
+    # batch must be large enough that one matmul beats two even after
+    # counting the (one-time) weight-add in the cost model.
+    x = torch.randn(4096, 64)
+    ir, best, source = _eqsat_best(m, x)
+    assert flops_cost(best) == pytest.approx(flops_cost(ir.root) / 2, rel=0.01)
+    low = _lower(ir, best, source)
+    # merged to a single runtime parameter
+    assert len(list(low.named_parameters())) == 1
+    m.eval(); low.eval()
+    with torch.no_grad():
+        assert (m(x.clone()) - low(x.clone())).abs().max() < 1e-4
+
+
+def test_deepparallel_composed_win():
+    """Two laws (weight merge + reassociation) compose into one runtime op."""
+    torch.manual_seed(0)
+    d = DeepParallel(64, 64, 64)
+    # Large batch amortises the one-time W3@(W1+W2) precompute; below the
+    # break-even the cost model correctly keeps the outer linear separate.
+    x = torch.randn(4096, 64)
+    ir, best, source = _eqsat_best(d, x)
+    # 3 linears -> 1: expect a large FLOP reduction (>2x)
+    assert flops_cost(best) < flops_cost(ir.root) / 2
+    low = _lower(ir, best, source)
+    assert len(list(low.named_parameters())) == 1
+    d.eval(); low.eval()
+    with torch.no_grad():
+        assert (d(x.clone()) - low(x.clone())).abs().max() < 1e-4
+
+
+def test_assoc_linear_transpose_order():
+    """fused weight must be B @ A (transposes flip the order), not A @ B.
+
+    This is the subtlety that made a hand-derived reference wrong twice;
+    the rule must get it right or the result is silently incorrect.
+    """
+    torch.manual_seed(0)
+    d = DeepParallel(8, 12, 16)
+    # closed form for stacked F.linear(linear(linear(x,A),B)) with
+    # weights A=(12,8), B=(16,12): fused = B @ A  (shapes: 16x8)
+    closed = d.W3.weight @ (d.W1.weight + d.W2.weight)
+    assert closed.shape == (16, 8)
+
+    x = torch.randn(4096, 8)
+    ir, best, source = _eqsat_best(d, x)
+    low = _lower(ir, best, source)
+    fused = next(p for _, p in low.named_parameters())
+    assert torch.allclose(fused, closed, atol=1e-5)
+
+    # The naive order (A @ B) does not merely give wrong VALUES here —
+    # with distinct dims it is not even shape-valid (12x8 @ 16x12), so a
+    # hand-written merge that gets the order wrong fails loudly or silently
+    # broadcasts.  catopt's assoc_linear rule (fused = B @ A) got it right.
+    naive_shape_possible = (d.W1.weight.shape[1] == d.W3.weight.shape[0])
+    if not naive_shape_possible:
+        with pytest.raises(RuntimeError):
+            _ = (d.W1.weight + d.W2.weight) @ d.W3.weight
+
+
+def test_weight_merge_does_not_fire_on_distinct_inputs():
+    """Soundness: x@W1 + y@W2 (x != y) must stay unmerged."""
+    torch.manual_seed(0)
+    x = Var("x", TensorType((4, 4)))
+    y = Var("y", TensorType((4, 4)))
+    w1 = Param("W1", TensorType((4, 4)))
+    w2 = Param("W2", TensorType((4, 4)))
+    from catopt.rules import WEIGHT_FACTOR
+
+    different = Op.make("add", Op.make("matmul", x, w1),
+                        Op.make("matmul", y, w2))
+    eg = EGraph()
+    eid = eg.add_term(different)
+    eg.run([WEIGHT_FACTOR], eid, max_iterations=5, max_nodes=500)
+
+    # The root must still be an `add` of two matmuls — the rule must NOT
+    # have collapsed it into a single merged projection.
+    root_ops = {n.op for n in eg.get_class(eid).nodes}
+    assert "add" in root_ops
+    # No merged single-matmul representative may have been added
+    # (a merged form would appear as a lone `matmul` leaf-pair).
+    matmul_nodes = [
+        n for n in eg.get_class(eid).nodes if n.op == "matmul"
+    ]
+    assert len(matmul_nodes) == 0

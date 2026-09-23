@@ -221,12 +221,37 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | ------- | ----------: | ------------: | ---------------------: | ------: |
 | MatrixChain b=128  | yes (7e-09) | 0.048 | 0.030 | **1.60×** |
 | MatrixChain b=4096 | yes (5e-09) | 0.240 | 0.039 | **6.22×** |
+| **DeepParallel b=4096** | yes (2e-06) | 1.362 | 0.451 | **3.02×** |
+| **ParallelLinear b=4096** | yes (3e-06) | 0.878 | 0.393 | **2.24×** |
 | SwiGLU   | yes (0.0)   | — | — | 1.00× (cost unchanged, 802,816 FLOPs) |
 | RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
 
 Both paths go through `torch.compile`, so the comparison isolates the
 representation: same backend, same model, same weights — only the graph
 handed to TorchInductor differs.
+
+`DeepParallel` is the strongest result: `(W1(x) + W2(x)) @ W3` collapses to a
+single `linear` via **two composed rules** (`weight_factor_linear` then
+`assoc_linear`) plus compile-time weight folding. No single pattern-matching
+pass finds it — the distributive merge must fire *before* reassociation makes
+folding legal. Hand-derived reference, measured: 0.406 ms (3.35×), so catopt
+lands within 11% of what a human can achieve.
+
+### The algebra is error-prone, which is the interesting part
+
+Deriving the closed form for `DeepParallel` by hand, I got the transpose order
+wrong **twice** — `F.linear(x, W) = x @ W.T` means the stacked composition
+fuses to `B @ A`, not `A @ B`, and with distinct dims the naive order
+`(W1+W2) @ W3` isn't even shape-valid (12×8 @ 16×12). catopt's
+`assoc_linear` rule encodes `fused = B @ A` and its equivalence verifier
+caught both of my errors (`catopt fused == closed form: True`,
+`closed form == original: True`).
+
+That is the concrete answer to *"what structural property did the categorical
+representation expose?"*: composing **two** laws where the second is only
+*applicable* after the first fires, plus a type-level (transpose-order)
+constraint the cost model cannot see. Both got caught not by inspection but by
+the e-graph's equivalence check.
 
 ### Honest reading of the numbers
 
@@ -249,28 +274,39 @@ handed to TorchInductor differs.
 
 ### Known limitations of the current results
 
-* **MatrixChain is a degenerate model.** Three consecutive linear layers with
-  no nonlinearity between them are exactly equivalent to one linear layer, so
-  a practitioner would merge them by hand (measured: hand-fusing gives 5.88×,
-  essentially the same as what catopt finds). The transformation catopt
-  discovers is matrix-chain reordering — a textbook dynamic-programming
-  problem. So condition 3 of the 5-point claim holds (Inductor does *not*
-  produce it), but condition 4's premise — that it is *difficult* for
-  conventional optimizers — is **not** yet demonstrated. Inductor plausibly
-  could do this and doesn't; it is not shown to be unable to.
+* **Every win so far collapses a *linear-only* DAG to one linear layer.**
+  Three stacked linears (MatrixChain) and two parallel plus one (DeepParallel)
+  both satisfy `no nonlinearity in between ⇒ equals a single linear`, and a
+  domain expert would specify that in one line. So condition 4's premise —
+  *difficult* for conventional optimizers — is still **not** demonstrated for
+  the models themselves. What *is* demonstrated: Inductor genuinely does not
+  find it (measured 3.02×–3.35× miss), the derivation is error-prone for
+  humans, and two categorical laws must compose to produce it.
 * **Weight folding is inference-only.** `x @ (W1@W2@W3)` is value-preserving
   during training, but folding destroys per-layer gradients, so it is only
-  sound on frozen graphs.
-* **The hypothesis is still open.** No transformation has yet been found that
-  is non-obvious to a human, genuinely missed by pattern-matching optimizers,
-  and confirmed by a correct cost model. That is the actual bar.
+  sound on frozen graphs. The cost model deliberately counts the one-time
+  precompute as if it were runtime, so it only fully fuses above the
+  break-even batch — at small batch it correctly keeps the outer layer
+  separate (this is why tests use `batch=4096`).
+* **The real target is a *nonlinear* case.** The hypothesis is only tested
+  once a transformation is found where a nonlinearity sits in between, so the
+  graph does **not** collapse trivially — e.g. `silu(x@W1) + x@W2` (MoE-style),
+  or RMSNorm fused with a following projection where the per-row scale must
+  commute through the matmul (`naturality_scalar`) *while* reassociating the
+  reduction above it. Those rules exist; they do not yet compose into a win.
+* **Two soundness bugs were found and fixed in this work**, which is the
+  strongest evidence the instrument is trustworthy: (1) the matcher did not
+  enforce repeated metavariables as "same e-class", so `x@W1 + y@W2` would
+  have matched a pattern requiring `x@W1 + x@W2` and emitted a false proof;
+  (2) `cost._infer_op_shape` took `shapes[0]` instead of the broadcast shape,
+  which had fabricated a spurious 1.98× RMSNorm "win". Both are regression-tested.
 
 ### Reproduce
 
 ```bash
-python main.py                     # 4 demos: associativity, SwiGLU/RMSNorm, naturality
+python main.py                     # associativity, SwiGLU/RMSNorm, naturality
 python main.py --large-batch 4096  # measured large-batch timing
-python -m pytest tests/ -q         # 55 tests
+python -m pytest tests/ -q         # 61 tests
 ```
 
 ---

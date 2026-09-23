@@ -93,6 +93,38 @@ def test_pattern_match_metavar():
     assert "b" in m
 
 
+def test_repeated_metavar_enforces_same_eclass():
+    """A repeated metavariable must bind ONE e-class everywhere.
+
+    Soundness regression test: x@W1 + y@W2 (different inputs) must NOT
+    match add(matmul(x,W1), matmul(x,W2)), because accepting it would let
+    a rule conclude x@W1 + y@W2 == x@(W1+W2) — a false proof.
+    """
+    x = Var("x", TensorType((4, 4)))
+    y = Var("y", TensorType((4, 4)))
+    w1 = Param("W1", TensorType((4, 4)))
+    w2 = Param("W2", TensorType((4, 4)))
+
+    # Pattern requiring the same input twice.
+    pattern = Op.make(
+        "add", Op.make("matmul", "x", "W1"), Op.make("matmul", "x", "W2")
+    )
+
+    # Case 1: same input x in both — must match.
+    same = Op.make("add", Op.make("matmul", x, w1),
+                   Op.make("matmul", x, w2))
+    eg_same = EGraph()
+    eid_same = eg_same.add_term(same)
+    assert len(eg_same.matches(pattern, eg_same.find(eid_same))) >= 1
+
+    # Case 2: different inputs x and y — must NOT match.
+    diff = Op.make("add", Op.make("matmul", x, w1),
+                   Op.make("matmul", y, w2))
+    eg_diff = EGraph()
+    eid_diff = eg_diff.add_term(diff)
+    assert len(eg_diff.matches(pattern, eg_diff.find(eid_diff))) == 0
+
+
 def test_extract_best():
     """Extract the minimum-cost term from an e-class."""
     x = Var("x", TensorType((1, 4)))

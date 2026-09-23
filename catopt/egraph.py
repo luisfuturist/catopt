@@ -217,7 +217,12 @@ class EGraph:
                     continue
                 if len(node.children) != len(pattern.args):
                     continue
-                child_substs: list[dict[str, int]] = [{}]
+                # Thread the incoming bindings so that a metavariable which
+                # appears at several positions (e.g. the shared input x in
+                # x@W1 + x@W2) is checked for consistency everywhere.
+                # Starting from {} would silently rebind it, turning an
+                # unSound rewrite into an apparent match.
+                child_substs: list[dict[str, int]] = [dict(subst)]
                 ok = True
                 for i, pat_arg in enumerate(pattern.args):
                     new_substs: list[dict[str, int]] = []
@@ -231,10 +236,9 @@ class EGraph:
                         break
                     child_substs = new_substs
                 if ok:
-                    for cs in child_substs:
-                        full = dict(subst)
-                        full.update(cs)
-                        results.append(full)
+                    # child_substs already contain the incoming bindings;
+                    # conflicts were rejected inside the metavar branch.
+                    results.extend(child_substs)
             return
 
         # Leaf (Const/Param/Var) — match by key

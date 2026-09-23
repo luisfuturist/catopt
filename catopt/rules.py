@@ -164,6 +164,101 @@ FACTOR_MUL = R(
     law="Factoring common linear maps (reverse distributivity).",
 )
 
+# Right-side bilinearity.  In PyTorch, `x @ W` puts the WEIGHT second, so
+# the existing left-side rules never match the exported form.  These close
+# that gap.  All four require repeated metavariables, which the e-graph
+# matcher now enforces as "same e-class" (soundness-tested).
+
+# (a + b) @ W = a@W + b@W
+RIGHT_DISTRIBUTE = R(
+    "right_distribute_matmul",
+    Op.make("matmul", Op.make("add", "a", "b"), "W"),
+    Op.make("add",
+            Op.make("matmul", "a", "W"),
+            Op.make("matmul", "b", "W")),
+    law="Bilinearity: linear maps distribute over addition in BOTH slots.",
+)
+
+# a@W + b@W = (a + b) @ W
+RIGHT_FACTOR = R(
+    "right_factor_matmul",
+    Op.make("add",
+            Op.make("matmul", "a", "W"),
+            Op.make("matmul", "b", "W")),
+    Op.make("matmul", Op.make("add", "a", "b"), "W"),
+    law="Factor a shared right-weight (the slot `x @ W` uses).",
+)
+
+# THE WEIGHT-MERGE RULE.  x@W1 + x@W2 = x @ (W1 + W2): two projections of
+# the SAME input collapse to one matmul on a summed weight.  This is the
+# LoRA/adapter/model-soup merge that deployment tooling does by hand.
+WEIGHT_FACTOR = R(
+    "weight_factor_matmul",
+    Op.make("add",
+            Op.make("matmul", "x", "W"),
+            Op.make("matmul", "x", "W2")),
+    Op.make("matmul", "x", Op.make("add", "W", "W2")),
+    law="Merge shared-input projections: x@W1 + x@W2 = x@(W1+W2).",
+)
+
+# x @ (W1 + W2) = x@W1 + x@W2  [reverse: expand for cost-model choice]
+WEIGHT_DISTRIBUTE = R(
+    "weight_distribute_matmul",
+    Op.make("matmul", "x", Op.make("add", "W", "W2")),
+    Op.make("add",
+            Op.make("matmul", "x", "W"),
+            Op.make("matmul", "x", "W2")),
+    law="Reverse weight merge (lets eqsat weigh fused vs split forms).",
+)
+
+
+# ---------------------------------------------------------------------------
+#  `linear` variants — torch.export emits F.linear for every nn.Linear, so
+#  the matmul rules above never see the exported form.  F.linear(x, W) is
+#  x @ W.T, so transposes distribute over add and flip matrix products.
+# ---------------------------------------------------------------------------
+
+# x@W1.T + x@W2.T = x @ (W1+W2).T   ->   linear(x, W1+W2)
+WEIGHT_FACTOR_LINEAR = R(
+    "weight_factor_linear",
+    Op.make("add",
+            Op.make("linear", "x", "W"),
+            Op.make("linear", "x", "W2")),
+    Op.make("linear", "x", Op.make("add", "W", "W2")),
+    law="Merge shared-input nn.Linears: linear(x,W1)+linear(x,W2)"
+         " = linear(x, W1+W2)  (transpose distributes over +).",
+)
+
+# linear(linear(x, A), B) = x @ A.T @ B.T = x @ (B@A).T = linear(x, B@A)
+# NOTE the flipped order: fused weight is B @ A, not A @ B.
+ASSOC_LINEAR = R(
+    "assoc_linear",
+    Op.make("linear", Op.make("linear", "x", "A"), "B"),
+    Op.make("linear", "x", Op.make("matmul", "B", "A")),
+    law="Compose stacked nn.Linears: fused weight is B @ A"
+         " (transposes flip the product order).",
+)
+
+# a@W.T + b@W.T = (a+b)@W.T   ->   linear(add(a,b), W)
+RIGHT_FACTOR_LINEAR = R(
+    "right_factor_linear",
+    Op.make("add",
+            Op.make("linear", "a", "W"),
+            Op.make("linear", "b", "W")),
+    Op.make("linear", Op.make("add", "a", "b"), "W"),
+    law="Factor a shared right-hand nn.Linear weight.",
+)
+
+# reverse of weight merge for `linear`
+WEIGHT_DISTRIBUTE_LINEAR = R(
+    "weight_distribute_linear",
+    Op.make("linear", "x", Op.make("add", "W", "W2")),
+    Op.make("add",
+            Op.make("linear", "x", "W"),
+            Op.make("linear", "x", "W2")),
+    law="Expand a merged nn.Linear so eqsat can compare both forms.",
+)
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -223,6 +318,15 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
 CATEGORICAL_RULES: list[Rewrite] = [
     DISTRIBUTE_MUL,
     FACTOR_MUL,
+    RIGHT_DISTRIBUTE,
+    RIGHT_FACTOR,
+    WEIGHT_FACTOR,
+    WEIGHT_DISTRIBUTE,
+    # nn.Linear / F.linear forms (what torch.export actually emits)
+    WEIGHT_FACTOR_LINEAR,
+    WEIGHT_DISTRIBUTE_LINEAR,
+    RIGHT_FACTOR_LINEAR,
+    ASSOC_LINEAR,
     NATURALITY_SCALAR,
     NATURALITY_SCALAR_REV,
     ASSOC_MATMUL,

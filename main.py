@@ -127,6 +127,53 @@ def demo_large_batch(batch: int = 4096, verbose: bool = True) -> None:
         print(f"{'='*70}")
 
 
+def demo_parallel_projections(batch: int = 4096, verbose: bool = True) -> None:
+    """The composed win: two categorical laws + weight folding.
+
+    ParallelLinear:  x@W1 + x@W2            ->  x @ (W1+W2)   [2.00x FLOPs]
+    DeepParallel:    (W1(x) + W2(x)) @ W3   ->  x @ (W3 @ (W1+W2))  [2.91x]
+
+    DeepParallel needs `weight_factor_linear` to fire BEFORE
+    `assoc_linear` can rewrite the stack, then IRModule folds the
+    weight-only product once at construction time.  Measured against
+    torch.compile on the unmodified graph: Inductor does not find it.
+    """
+    from catopt.models import ParallelLinear, DeepParallel
+
+    torch.manual_seed(0)
+    print(f"\n{'='*70}")
+    print("  Case: parallel projections (weight merging / bilinearity)")
+    print(f"{'='*70}")
+
+    for label, model, x in (
+        ("ParallelLinear", ParallelLinear(128, n_experts=2),
+         torch.randn(batch, 128)),
+        ("DeepParallel", DeepParallel(128, 128, 128),
+         torch.randn(batch, 128)),
+    ):
+        ir, source_tensors = export_to_ir(model, x)
+        eg = EGraph()
+        eid = eg.add_term(ir.root)
+        eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+               max_iterations=30, max_nodes=50000)
+        best = eg.extract_best(eid, flops_cost)
+        ratio = flops_cost(ir.root) / max(flops_cost(best), 1)
+        if verbose:
+            print(f"\n  {label} IR:  {op_repr(ir.root)}")
+            print(f"  orig FLOPs:  {flops_cost(ir.root):,.0f}")
+            print(f"  best term:   {op_repr(best)}")
+            print(f"  best FLOPs:  {flops_cost(best):,.0f}   ratio {ratio:.2f}x")
+        lowered = ir_to_torch_module(IR(
+            root=best, inputs=ir.inputs,
+            input_names=ir.input_names, params=ir.params,
+        ), param_values=source_tensors)
+        model.eval(); lowered.eval()
+        with torch.no_grad():
+            diff = (model(x.clone()) - lowered(x.clone())).abs().max().item()
+        print(f"  \u2713 {label}: equiv diff {diff:.3e}, "
+              f"runtime params {[n for n, _ in lowered.named_parameters()]}")
+
+
 def demo_naturality(batch: int = 64, verbose: bool = True) -> None:
     """Demonstrate naturality of scalar multiplication w.r.t. matmul.
 
@@ -243,6 +290,7 @@ def main() -> None:
     if args.large_batch:
         demo_large_batch(batch=args.large_batch)
     demo_swiglu_rmsnorm()
+    demo_parallel_projections(batch=max(args.batch, 4096))
     demo_naturality(batch=64)
 
     if args.bench:
