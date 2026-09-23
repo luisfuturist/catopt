@@ -49,14 +49,20 @@ from typing import Any
 import torch
 
 from catopt.ir import IR, Op, Param
-from catopt.torch_bridge import IRModule
+from catopt.torch_bridge import IRModule, _om_elem, _om_compose
 from catopt.cost import _shape_of
 
 __all__ = [
     "BatchedOMModule",
+    "StreamingOMModule",
     "to_batched_om_module",
+    "to_streaming_om_module",
     "is_om_apply_term",
     "build_om_plan",
+    "om_empty_state",
+    "om_step",
+    "om_step_qk",
+    "om_apply_state",
 ]
 
 
@@ -783,3 +789,177 @@ def to_batched_om_module(
     serial IRModule evaluator (check ``mod.is_batched``).
     """
     return BatchedOMModule(ir, param_values=param_values)
+
+
+# ---------------------------------------------------------------------------
+#  Streaming schedule — bounded-working-set left fold over the om tree
+# ---------------------------------------------------------------------------
+#
+# BatchedOMModule stacks EVERY leaf's score block into one
+# (n, ..., T, K) tensor — one dense q@Kᵀ GEMM, but the whole q×T_kv
+# score matrix is resident at once.  The streaming schedule below runs
+# the SAME term as a left fold over leaves: each om_elem's score/value
+# block is evaluated, composed into a running (m, l, a) carrier, and
+# released before the next block is touched.  Working set is
+# O(one block + carrier), independent of block count — the schedule
+# FlashAttention assumes but no executor emitted (benchmarked in
+# /tmp/bench_om_regime.py: flat ~89 MiB at 2M keys, where materialising
+# K,V or the score matrix is impossible).
+
+def om_empty_state(
+    shape: tuple, dv: int,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The ⊕-identity carrier ``(m, l, a) = (-inf, 0, 0)``.
+
+    ``shape`` is the carrier's broadcast tail excluding the trailing
+    component dim — e.g. ``(B, H, Tq)`` gives ``m, l: (B,H,Tq,1)`` and
+    ``a: (B,H,Tq,dv)``.  Composing it with any carrier returns that
+    carrier, so a decode loop can start from it instead of ``None``.
+    """
+    m = torch.full((*shape, 1), float("-inf"),
+                   device=device, dtype=dtype)
+    l = torch.zeros(*shape, 1, device=device, dtype=dtype)
+    a = torch.zeros(*shape, dv, device=device, dtype=dtype)
+    return (m, l, a)
+
+
+def om_step(
+    state: tuple | None, s: torch.Tensor, v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Incremental step: ``state ⊕ om_elem(s, v)`` in O(block) work.
+
+    ``state`` is a running ``(m, l, a)`` carrier (or ``None``/the
+    :func:`om_empty_state` identity for the first block); ``s`` is the
+    new block's score tensor ``(..., Tq, K_blk)`` and ``v`` its value
+    block ``(..., K_blk, dv)``.  Work and memory are proportional to
+    the block, NOT to the total keys seen so far — the decode /
+    growing-cache regime (~260x vs sdpa-recompute at 65k, measured).
+    """
+    e = _om_elem(s, v)
+    return e if state is None else _om_compose(state, e)
+
+
+def om_step_qk(
+    state: tuple | None, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """om_step for the canonical ``s = q @ k.T`` score form."""
+    return om_step(state, q @ k.transpose(-2, -1), v)
+
+
+def om_apply_state(state: tuple) -> torch.Tensor:
+    """The ``om_apply`` readout: ``a / l`` (unclamped — NaN kept)."""
+    return state[2] / state[1]
+
+
+class StreamingOMModule(torch.nn.Module):
+    """nn.Module running ``om_apply(<om tree>)`` as a bounded fold.
+
+    Same term as :class:`BatchedOMModule`, different schedule: instead
+    of materialising every leaf's carrier and reducing level-by-level,
+    the tree is folded left-to-right — each ``om_elem`` leaf's score
+    and value operands are evaluated through the embedded IRModule
+    (with a *fresh* eval memo per leaf, so block intermediates die with
+    the iteration), composed into a running ``(m, l, a)`` state via the
+    serial ``om_compose`` binding, then released.
+
+    Peak memory is O(max block size + carrier), not O(total keys): the
+    q×K_blk score matrix of ONE block is the largest transient, and the
+    input tensors themselves are the only thing that scales with the
+    sequence.  Per-leaf operand evaluation recomputes subterms shared
+    between leaves (the price of dropping the shared memo) — the right
+    tradeoff for the bounded-memory regime.
+
+    For non-om roots the module delegates to serial IRModule eval —
+    a drop-in for ``ir_to_torch_module`` on any IR (check
+    ``mod.is_streaming``).
+
+    The incremental decode step is exposed both as module-level
+    functions (:func:`om_step`, :func:`om_step_qk`,
+    :func:`om_empty_state`, :func:`om_apply_state` — pure tensor ops,
+    CUDA-graph capturable) and as the staticmethods ``step`` /
+    ``step_qk`` / ``apply`` here.
+    """
+
+    def __init__(
+        self,
+        ir: IR,
+        param_values: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        super().__init__()
+        self._inputs = ir.inputs
+        self.eval_mod = IRModule(ir, param_values)
+        # Plan from the FOLDED root, exactly like BatchedOMModule.
+        self._plan = build_om_plan(self.eval_mod._root)
+
+    @property
+    def is_streaming(self) -> bool:
+        """True when the root matched the om_apply pattern."""
+        return self._plan is not None
+
+    @property
+    def n_blocks(self) -> int:
+        """Number of om carrier leaves (0 when not streaming)."""
+        return 0 if self._plan is None else len(self._plan["leaves"])
+
+    # -- incremental decode API (module-level helpers as statics) -----
+
+    step = staticmethod(om_step)
+    step_qk = staticmethod(om_step_qk)
+    apply = staticmethod(om_apply_state)
+    empty_state = staticmethod(om_empty_state)
+
+    # -- execution ----------------------------------------------------
+
+    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+        """Streaming fold → ``a / l`` (the om_apply readout)."""
+        if self._plan is None:
+            return self.eval_mod(*xs)
+        return om_apply_state(self.forward_state(*xs))
+
+    def forward_state(
+        self, *xs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Streaming fold → the raw ``(m, l, a)`` carrier.
+
+        This is the state a decode loop checkpoints: feed it to
+        :func:`om_step`/`om_step_qk` as further blocks arrive, and read
+        out with :func:`om_apply_state`.  For a non-om root the term
+        isn't a carrier — this returns whatever serial eval produces
+        (a triple for bare om trees), matching ``eval_mod``.
+        """
+        if self._plan is None:
+            return self.eval_mod(*xs)
+
+        x = xs[0]
+        env: dict[str, torch.Tensor] = {"self": x}
+        for i, inp in enumerate(self._inputs):
+            env[inp.name] = xs[i] if i < len(xs) else x
+
+        state: tuple | None = None
+        for grp in self._plan["leaf_groups"]:
+            for leaf, c in zip(grp["members"], grp["mults"]):
+                # Fresh memo per leaf: score blocks / per-leaf
+                # intermediates are dropped with the dict at the next
+                # iteration — the bounded-working-set property.  Inputs
+                # (Var lookups) and params never enter the memo.
+                memo: dict[int, Any] = {}
+                e = self.eval_mod._eval(leaf, env, x, memo)
+                # A DAG-shared leaf contributes once per occurrence.
+                for _ in range(c):
+                    state = e if state is None else _om_compose(state, e)
+        return state
+
+
+def to_streaming_om_module(
+    ir: IR,
+    param_values: dict[str, torch.Tensor] | None = None,
+) -> StreamingOMModule:
+    """Lower ``ir`` to a module running the streaming om schedule.
+
+    Always returns a :class:`StreamingOMModule`; when ``ir.root`` is
+    not ``om_apply(<om tree>)`` it delegates to serial IRModule eval
+    (check ``mod.is_streaming``).
+    """
+    return StreamingOMModule(ir, param_values=param_values)

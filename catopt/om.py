@@ -47,6 +47,13 @@ positional ``arg1`` attribute, while rule-produced concats (and
 hand-built terms, following rules.py convention) use ``dim``.  LHS
 patterns are generated in both spellings; all RHS-produced concats use
 ``dim``.
+
+MASKED ATTENTION
+    A causal/additive mask wraps the score concat in ``masked_fill`` /
+    ``add`` / ``where`` and blocks OM_SPLIT.  The law that unblocks it
+    is that masking distributes over concat (see the section below):
+    each block takes the matching *slice* of the mask, and for causal
+    masks the block's positional offset lives inside that slice.
 """
 
 from typing import Any
@@ -321,6 +328,354 @@ MATMUL_T_CONCAT_ARG1 = _matmul_t_concat("matmul_t_concat_arg1", "arg1")
 
 
 # ---------------------------------------------------------------------------
+#  Masks distribute over concat — the law masked chunked attention needs.
+#
+#  OM_SPLIT needs the score operand to be a literal concat; a causal or
+#  additive mask wraps that concat in ``masked_fill``/``add``/``where``
+#  and the homomorphism cannot see through it.  The law that unblocks
+#  it: masking COMMUTES with concatenation,
+#
+#      mask(cat(s1, s2), M) = cat(mask(s1, M1), mask(s2, M2))
+#
+#  where M_i is block i's slice of the full mask along the cat axis —
+#  ``split(M, (K1, K2), d, i)`` (the IR's existing projection op; no new
+#  generator is needed).  For a causal mask this slice IS the
+#  positional dependency: block i's mask columns are the global mask's
+#  columns [o_i, o_i + K_i), so the block offset lives inside the
+#  slice — no index arithmetic appears in the rewrite.  When the mask
+#  broadcasts along the cat axis (extent 1, or the axis absent from the
+#  mask entirely) the SAME operand serves both blocks unsliced.
+#
+#  What this IR still cannot express (documented, not hacked):
+#  * synthesising a block-local mask from positions — there are no
+#    arange/iota/tril/ones generators, so the offset law
+#    ``mask_i = lt(arange(K_i) + o_i, arange(T))`` cannot be written;
+#    only slicing a MATERIALISED mask distributes;
+#  * implicit masks — ``sdpa(..., is_causal=True)`` has no mask operand
+#    to slice; the flag would need its own chunking law;
+#  * masks that are not axis-aligned slices of the cat'd operand (e.g.
+#    interleaved/block-diagonal layouts) — which don't arise from key
+#    chunking anyway.
+# ---------------------------------------------------------------------------
+
+def _cat_axis_plan(bound: dict, sliced_key: str,
+                   fixed_keys: tuple = ()) -> dict | None:
+    """Plan how an elementwise op's operands distribute over
+    ``concat(s1, s2, dim=D)``.
+
+    The sliceable operand (``sliced_key`` — the mask/bias) is classified
+    by its extent on the cat axis:
+
+    * extent ``K1 + K2`` (the whole concatenated axis) → ``"slice"``:
+      block i gets ``split(m, (K1, K2), md, i)`` — for causal masks the
+      column slice is exactly the absolute-position offset;
+    * extent 1, or the axis absent from the operand (lower rank /
+      scalar) → ``"reuse"``: the operand broadcasts, unchanged, into
+      both blocks;
+    * anything else, or unknown extents → ``None`` (veto: the rule may
+      not fire).
+
+    ``fixed_keys`` are other operands that must broadcast along the cat
+    axis to be reused (e.g. ``masked_fill``'s fill value, ``where``'s
+    other branch): extent 1 — or exactly the block size when both
+    blocks are equal — is fine; covering the whole axis would need its
+    own slice, which these rules do not build → veto.
+
+    Returns ``{"mode", "sizes", "md", "do"}``: ``md`` is the cat axis in
+    the sliced operand's OWN coordinates (mask rank may differ from the
+    score rank under broadcasting), ``do`` the cat axis of the
+    broadcast result (output rank = max operand rank — a bigger-rank
+    mask broadcasts the output up).
+    """
+    s1, s2 = _shape_of(bound.get("s1")), _shape_of(bound.get("s2"))
+    D = bound.get("$attr:D")
+    if not (isinstance(s1, tuple) and isinstance(s2, tuple)
+            and s1 and len(s1) == len(s2)):
+        return None
+    if not isinstance(D, int):
+        return None
+    r, d = len(s1), D % len(s1)
+    if not all(_dim_eq(s1[i], s2[i]) for i in range(r) if i != d):
+        return None                          # ill-typed cat
+    k1, k2 = s1[d], s2[d]
+    if not (isinstance(k1, int) and isinstance(k2, int)):
+        return None                          # unknown block extents
+
+    shapes: dict[str, tuple] = {}
+    out_rank = r
+    for key in (sliced_key, *fixed_keys):
+        sh = _shape_of(bound.get(key))
+        if not isinstance(sh, tuple):
+            return None                      # unknown shape: can't prove
+        shapes[key] = sh
+        out_rank = max(out_rank, len(sh))
+
+    def _off_axis_ok(sh) -> bool:
+        """Every operand dim OFF the cat axis must broadcast against the
+        blocks (extra leading dims are fine — they rank up the output
+        identically on both sides)."""
+        for j, ext in enumerate(sh):
+            dj = j + r - len(sh)             # operand dim → score dim
+            if dj < 0 or dj == d:
+                continue
+            if not (ext is None or ext == 1 or _dim_eq(ext, s1[dj])):
+                return False
+        return True
+
+    for key in fixed_keys:
+        fs = shapes[key]
+        if not _off_axis_ok(fs):
+            return None
+        fd = d + len(fs) - r                 # cat axis in f's coords
+        if fd >= 0:
+            ext = fs[fd]
+            if not (ext == 1 or (k1 == k2 and ext == k1)):
+                return None                  # needs its own slice
+
+    ms = shapes[sliced_key]
+    if not _off_axis_ok(ms):
+        return None
+    md = d + len(ms) - r                     # cat axis in mask coords
+    do = d + out_rank - r                    # cat axis of the result
+    if md < 0:
+        return {"mode": "reuse", "sizes": None, "md": None, "do": do}
+    ext = ms[md]
+    if ext is None:
+        return None
+    if ext == k1 + k2:
+        return {"mode": "slice", "sizes": (k1, k2), "md": md, "do": do}
+    if ext == 1 or (k1 == k2 and ext == k1):
+        return {"mode": "reuse", "sizes": None, "md": None, "do": do}
+    return None
+
+
+def _check_mask_cat(sliced_key: str, fixed_keys: tuple, mode: str):
+    def check(bound: dict) -> bool:
+        plan = _cat_axis_plan(bound, sliced_key, fixed_keys)
+        return plan is not None and plan["mode"] == mode
+    return check
+
+
+def _derive_mask_cat(sliced_key: str, fixed_keys: tuple):
+    def derive(bound: dict) -> dict | None:
+        plan = _cat_axis_plan(bound, sliced_key, fixed_keys)
+        if plan is None:
+            return None
+        out = {"$attr:DO": plan["do"]}
+        if plan["mode"] == "slice":
+            out["$attr:SZ"] = plan["sizes"]
+            out["$attr:MD"] = plan["md"]
+        return out
+    return derive
+
+
+def _mask_slice(key: str, i: int) -> Op:
+    """Block i's slice of a mask/bias along the cat axis — a projection
+    of the full mask, which is exactly where the positional offset of
+    block i lives (causal masks included)."""
+    return Op.make("split", key, sizes="SZ", dim="MD", index=i)
+
+
+def _masked_fill_cat(name: str, attr_key: str, mode: str) -> Rewrite:
+    """masked_fill(cat(s1,s2,D), m, v) → cat(masked_fill(s_i, m_i, v), D).
+
+    ``m_i`` is the mask's slice on the cat axis (mode "slice") or the
+    mask itself when it broadcasts along that axis (mode "reuse")."""
+    m1 = _mask_slice("m", 0) if mode == "slice" else "m"
+    m2 = _mask_slice("m", 1) if mode == "slice" else "m"
+    return R(
+        name,
+        Op.make("masked_fill",
+                Op.make("concat", "s1", "s2", **{attr_key: "D"}),
+                "m", "v"),
+        Op.make("concat",
+                Op.make("masked_fill", "s1", m1, "v"),
+                Op.make("masked_fill", "s2", m2, "v"),
+                dim="DO"),
+        check=_check_mask_cat("m", ("v",), mode),
+        derive=_derive_mask_cat("m", ("v",)),
+        law="masked_fill distributes over concat: masking a "
+            "concatenated score matrix equals concatenating the masked "
+            "blocks, each with its slice of the mask — a causal mask's "
+            "block offset lives inside the slice.")
+
+
+def _add_cat(name: str, attr_key: str, mode: str,
+             mask_first: bool) -> Rewrite:
+    """add(cat(s1,s2,D), m) / add(m, cat(s1,s2,D)) → cat of per-block
+    adds — the additive-mask counterpart of masked_fill_cat.  add is
+    commutative, but COMM_ADD is deliberately absent from OM_LAWS, so
+    both operand orders get a rule."""
+    m1 = _mask_slice("m", 0) if mode == "slice" else "m"
+    m2 = _mask_slice("m", 1) if mode == "slice" else "m"
+    cat = Op.make("concat", "s1", "s2", **{attr_key: "D"})
+    lhs = (Op.make("add", "m", cat) if mask_first
+           else Op.make("add", cat, "m"))
+    b1 = Op.make("add", m1, "s1") if mask_first else Op.make("add", "s1", m1)
+    b2 = Op.make("add", m2, "s2") if mask_first else Op.make("add", "s2", m2)
+    return R(
+        name, lhs,
+        Op.make("concat", b1, b2, dim="DO"),
+        check=_check_mask_cat("m", (), mode),
+        derive=_derive_mask_cat("m", ()),
+        law="An additive mask distributes over concat: add(cat s, m) = "
+            "cat(add(s_i, m_i)) — concat is a homomorphism for "
+            "elementwise ops, with the mask sliced on the cat axis.")
+
+
+def _where_cat(name: str, attr_key: str, mode: str,
+               cat_in_x: bool) -> Rewrite:
+    """where(m, cat(s1,s2,D), v) / where(m, v, cat(s1,s2,D)) → cat of
+    per-block wheres — the torch.where masking idiom."""
+    m1 = _mask_slice("m", 0) if mode == "slice" else "m"
+    m2 = _mask_slice("m", 1) if mode == "slice" else "m"
+    cat = Op.make("concat", "s1", "s2", **{attr_key: "D"})
+    if cat_in_x:
+        lhs = Op.make("where", "m", cat, "v")
+        b1 = Op.make("where", m1, "s1", "v")
+        b2 = Op.make("where", m2, "s2", "v")
+    else:
+        lhs = Op.make("where", "m", "v", cat)
+        b1 = Op.make("where", m1, "v", "s1")
+        b2 = Op.make("where", m2, "v", "s2")
+    return R(
+        name, lhs,
+        Op.make("concat", b1, b2, dim="DO"),
+        check=_check_mask_cat("m", ("v",), mode),
+        derive=_derive_mask_cat("m", ("v",)),
+        law="where distributes over concat in the masked operand: "
+            "where(m, cat s, v) = cat(where(m_i, s_i, v)).")
+
+
+def _check_cat_pair(bound: dict) -> int | None:
+    """For ``op(cat(a1,a2,DA), cat(b1,b2,DB)) → cat(op(a1,b1), op(a2,b2))``.
+
+    Both cat axes must be the SAME axis of the broadcast result (ranks
+    may differ — a lower-rank mask's cat axis is shifted), each operand
+    pair must be cat-compatible on its own axis, and the per-block
+    broadcast results must be cat-compatible on the shared axis.
+    Returns the result cat dim, or None to veto."""
+    a1, a2 = _shape_of(bound.get("a1")), _shape_of(bound.get("a2"))
+    b1, b2 = _shape_of(bound.get("b1")), _shape_of(bound.get("b2"))
+    DA, DB = bound.get("$attr:DA"), bound.get("$attr:DB")
+    if not all(isinstance(s, tuple) and s for s in (a1, a2, b1, b2)):
+        return None
+    if not (isinstance(DA, int) and isinstance(DB, int)):
+        return None
+    ra, rb = len(a1), len(b1)
+    if len(a2) != ra or len(b2) != rb:
+        return None
+    da, db = DA % ra, DB % rb
+    ro = max(ra, rb)
+    oa, ob = da + ro - ra, db + ro - rb
+    if oa != ob:
+        return None                          # different axes — wrong
+    if not all(_dim_eq(a1[i], a2[i]) for i in range(ra) if i != da):
+        return None
+    if not all(_dim_eq(b1[i], b2[i]) for i in range(rb) if i != db):
+        return None
+    from catopt.cost import _broadcast, _INVALID
+    ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
+    if ba is _INVALID or bb is _INVALID:
+        return None
+    if not all(_dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa):
+        return None
+    return oa
+
+
+def _cat_pair_check(bound: dict) -> bool:
+    return _check_cat_pair(bound) is not None
+
+
+def _cat_pair_derive(bound: dict) -> dict | None:
+    oa = _check_cat_pair(bound)
+    return None if oa is None else {"$attr:DO": oa}
+
+
+def _cat_hom_add(name: str, attr_key: str) -> Rewrite:
+    """add(cat(a1,a2,D), cat(b1,b2,D)) = cat(add(a1,b1), add(a2,b2), D)
+    — concat is a homomorphism for elementwise add.  This is the pure
+    form of the additive-mask law when the mask is itself concat'd."""
+    return R(
+        name,
+        Op.make("add",
+                Op.make("concat", "a1", "a2", **{attr_key: "DA"}),
+                Op.make("concat", "b1", "b2", **{attr_key: "DB"})),
+        Op.make("concat",
+                Op.make("add", "a1", "b1"),
+                Op.make("add", "a2", "b2"),
+                dim="DO"),
+        check=_cat_pair_check,
+        derive=_cat_pair_derive,
+        law="concat homomorphism over add: cat(a1,a2)+cat(b1,b2) = "
+            "cat(a1+b1, a2+b2) — the free case of mask distribution.")
+
+
+def _cat_hom_masked_fill(name: str, attr_key: str) -> Rewrite:
+    """masked_fill(cat(s1,s2,D), cat(m1,m2,DM), v) → cat of per-block
+    masked_fills — the mask arrives already concat'd (e.g. chunked
+    masks); block i pairs s_i with m_i directly, no split needed."""
+    return R(
+        name,
+        Op.make("masked_fill",
+                Op.make("concat", "a1", "a2", **{attr_key: "DA"}),
+                Op.make("concat", "b1", "b2", **{attr_key: "DB"}),
+                "v"),
+        Op.make("concat",
+                Op.make("masked_fill", "a1", "b1", "v"),
+                Op.make("masked_fill", "a2", "b2", "v"),
+                dim="DO"),
+        check=_cat_pair_check,
+        derive=_cat_pair_derive,
+        law="masked_fill over two concat'd operands: the score concat "
+            "and mask concat share an axis, so block i's mask is just "
+            "m_i — the offset was already paid when the mask was "
+            "concatenated.")
+
+
+#: Elementwise-mask ops pushed through a concat'd operand.  "slice"
+#: variants emit ``split`` projections of the mask; "reuse" variants
+#: fire when the mask broadcasts along the cat axis.  Both concat attr
+#: spellings, both ``add`` operand orders, both ``where`` positions.
+MASKED_FILL_CAT: list[Rewrite] = [
+    _masked_fill_cat(f"masked_fill_cat_{mode}_{ak}", ak, mode)
+    for mode in ("slice", "reuse") for ak in ("dim", "arg1")
+]
+
+ADD_MASK_CAT: list[Rewrite] = [
+    _add_cat(f"add_{'m' if mask_first else 'cat'}_"
+             f"{'cat' if mask_first else 'm'}_{mode}_{ak}",
+             ak, mode, mask_first)
+    for mode in ("slice", "reuse") for mask_first in (False, True)
+    for ak in ("dim", "arg1")
+]
+
+WHERE_CAT: list[Rewrite] = [
+    _where_cat(f"where_cat_{'x' if cat_in_x else 'y'}_{mode}_{ak}",
+               ak, mode, cat_in_x)
+    for mode in ("slice", "reuse") for cat_in_x in (True, False)
+    for ak in ("dim", "arg1")
+]
+
+#: Concat homomorphism when BOTH operands arrive concat'd (a mask that
+#: was itself built blockwise).  Same check as the single-operand
+#: rules: the two cat axes must coincide on the broadcast result.
+CAT_HOM: list[Rewrite] = [
+    _cat_hom_add("cat_hom_add_dim", "dim"),
+    _cat_hom_add("cat_hom_add_arg1", "arg1"),
+    _cat_hom_masked_fill("cat_hom_masked_fill_dim", "dim"),
+    _cat_hom_masked_fill("cat_hom_masked_fill_arg1", "arg1"),
+]
+
+#: The mask-distribution law set.  Together with OM_SPLIT these turn
+#: ``softmax(mask(q @ cat kᵢ.T)) @ cat vᵢ`` — masked or causal — into
+#: ``om_apply(⊕ᵢ om_elem(masked sᵢ, vᵢ))``.
+OM_MASK_LAWS: list[Rewrite] = [
+    *CAT_HOM, *MASKED_FILL_CAT, *ADD_MASK_CAT, *WHERE_CAT,
+]
+
+
+# ---------------------------------------------------------------------------
 #  Law set
 # ---------------------------------------------------------------------------
 
@@ -334,4 +689,5 @@ OM_LAWS: list[Rewrite] = [
     OM_ASSOC, OM_ASSOC_REV,
     *CONCAT_BINARIZE,
     MATMUL_T_CONCAT, MATMUL_T_CONCAT_ARG1,
+    *OM_MASK_LAWS,
 ]
