@@ -1213,6 +1213,114 @@ AFFD_LIFT_STEP_POST_SWAP = R(
             "h"),
     law="remaining operand position of affd_lift_step")
 
+# --- unit lift: pure accumulation -----------------------------------
+# ``add(h, x)`` — the recurrence ``h_t = h_{t-1} + x_t`` (cumsum,
+# running statistics, linear attention's KV state ``S_t = S_{t-1} +
+# k_t v_tᵀ``) — is the ``a ≡ 1`` degenerate case of the diagonal step:
+# ``1⊙h + x = h + x``.  No ``mul`` enode exists for ``AFFD_LIFT`` to
+# see, so additive accumulations were unreachable by the scan monoid.
+# The unit lift writes the step as ``applyd(aff_diag(1, x), h)``; once
+# carried, the ordinary step/assoc machinery (affd_compose balancing,
+# trace lift, the batched executor) applies verbatim.
+#
+# The unit ``1`` is spelled ``expand(Const(1.0), shape=US)`` — the
+# broadcast shape of the add — NOT a bare scalar: ``aff_diag`` leaves
+# must carry the state's ``(d,)`` shape for ``scan_lower``'s
+# ``_leaf_shapes_consistent`` (the batched executor *stacks* leaf
+# a-parts; a scalar-shaped a would fail the check and bar the whole
+# carrier tree from BatchedScanModule AND trace_lift's carrier path).
+# ``US`` is an attribute metavariable filled by ``_derive_affd_unit``,
+# which also vetoes the firing when the bound shapes are not concrete.
+
+
+def _affd_unit_state_like(bound: dict) -> bool:
+    """Side condition for the unit lifts: the ``h`` binding must be
+    state-shaped — a previous step's ``add``/``sub`` spine, an already
+    lifted application (``applyd``/``apply``), or a leaf (the h0 Param
+    or a free Var).  Same economy guard as ``_affd_state_like``, plus a
+    ``Const`` exclusion: a scalar offset is not an accumulating state.
+    Per-step increments (select/mul terms) are NOT states."""
+    t = bound.get("h")
+    if isinstance(t, Op):
+        return t.op in ("add", "sub", "apply", "applyd")
+    return not isinstance(t, Const)
+
+
+def _derive_affd_unit(bound: dict) -> dict | None:
+    """``US`` := broadcast(shape(h), shape(x)) — the unit diagonal must
+    materialise at the add's output shape (all ones).  Vetoes the
+    firing when either bound term's shape is non-concrete."""
+    from catopt.cost import _broadcast
+    s = _broadcast(_shape_of(bound.get("h")), _shape_of(bound.get("x")))
+    if not (isinstance(s, tuple)
+            and all(isinstance(d, int) for d in s)):
+        return None
+    # The RHS embeds ``Const(1.0)`` as a leaf; ``_instantiate`` adds
+    # leaf enodes keyed by repr WITHOUT registering the term, so
+    # ``any_term``/extraction would decode the raw string "1.0" unless
+    # the leaf is registered here, ahead of instantiation.
+    from catopt.egraph import _LeafRegistry
+    _LeafRegistry.register(Const(1.0))
+    return {"$attr:US": tuple(s)}
+
+
+#: The unit diagonal as a shared pattern fragment: ones of the add's
+#: broadcast shape, spelled as a Const broadcast so the carrier leaf
+#: reports the same ``(d,)`` shape as every other ``aff_diag``.
+_AFFD_UNIT = Op.make("expand", Const(1.0), shape="US")
+
+# Two operand positions — add is commutative and ``canonicalize``
+# sorts children by op_repr, so the state operand can sit in either
+# slot (mirroring affd_lift / affd_lift_post; there is no ``mul`` and
+# hence no ``_swap`` dimension).  ``_affd_unit_state_like`` suppresses
+# the sideways bindings.
+AFFD_LIFT_UNIT = R(
+    "affd_lift_unit",
+    Op.make("add", "h", "x"),
+    Op.make("applyd", Op.make("aff_diag", _AFFD_UNIT, "x"), "h"),
+    law="Unit introduction: pure accumulation h + x IS the diagonal "
+        "affine map with a ≡ 1 — applyd(aff_diag(1, x), h).",
+    check=_affd_unit_state_like,
+    derive=_derive_affd_unit)
+
+AFFD_LIFT_UNIT_POST = R(
+    "affd_lift_unit_post",
+    Op.make("add", "x", "h"),
+    Op.make("applyd", Op.make("aff_diag", _AFFD_UNIT, "x"), "h"),
+    law="add-order variant of affd_lift_unit (state operand in the "
+        "second add slot)",
+    check=_affd_unit_state_like,
+    derive=_derive_affd_unit)
+
+# The step rules need no side condition: the ``applyd`` inside the add
+# already pins the state operand — an input e-class contains no
+# ``applyd`` enode, so only the true direction matches.  The map
+# ordering mirrors AFFD_LIFT_STEP: compose(aff_diag(1,x), f) applies f
+# first, then h ↦ 1⊙(f·h) + x = f(h) + x.
+AFFD_LIFT_UNIT_STEP = R(
+    "affd_lift_unit_step",
+    Op.make("add",
+            Op.make("applyd", "f", "h"),
+            "x"),
+    Op.make("applyd",
+            Op.make("affd_compose",
+                    Op.make("aff_diag", _AFFD_UNIT, "x"), "f"),
+            "h"),
+    law="compose a unit (pure-accumulation) step with the preceding "
+        "map — the h ↦ h + x analogue of affd_lift_step",
+    derive=_derive_affd_unit)
+
+AFFD_LIFT_UNIT_STEP_POST = R(
+    "affd_lift_unit_step_post",
+    Op.make("add", "x",
+            Op.make("applyd", "f", "h")),
+    Op.make("applyd",
+            Op.make("affd_compose",
+                    Op.make("aff_diag", _AFFD_UNIT, "x"), "f"),
+            "h"),
+    law="add-order variant of affd_lift_unit_step",
+    derive=_derive_affd_unit)
+
 AFFD_UNLIFT = R("affd_unlift",
                 Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
                 Op.make("add", Op.make("mul", "a", "h"), "x"),
@@ -1240,13 +1348,16 @@ AFFD_ASSOC_REV = R("affd_assoc_rev",
                    law="diagonal-affine composition is associative")
 
 #: Minimal law set for diagonal-scan discovery — the mul-form mirror of
-#: ``SCAN_LAWS``.  Covers every operand position the state-mul can take
-#: under comm-normalisation; ``_affd_state_like`` suppresses the
-#: sideways firings.
+#: ``SCAN_LAWS``, plus the unit lift for pure accumulations.  Covers
+#: every operand position the state-mul can take under
+#: comm-normalisation; ``_affd_state_like``/``_affd_unit_state_like``
+#: suppress the sideways firings.
 SCAN_DIAG_LAWS: list[Rewrite] = [
     AFFD_LIFT, AFFD_LIFT_SWAP, AFFD_LIFT_POST, AFFD_LIFT_POST_SWAP,
     AFFD_LIFT_STEP, AFFD_LIFT_STEP_SWAP,
     AFFD_LIFT_STEP_POST, AFFD_LIFT_STEP_POST_SWAP,
+    AFFD_LIFT_UNIT, AFFD_LIFT_UNIT_POST,
+    AFFD_LIFT_UNIT_STEP, AFFD_LIFT_UNIT_STEP_POST,
     AFFD_UNLIFT, AFFD_COMPOSE_UNFOLD, AFFD_ASSOC, AFFD_ASSOC_REV,
 ]
 
