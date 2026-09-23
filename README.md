@@ -1,7 +1,22 @@
 # catopt
 
-**A categorical-semantics compiler for neural-network graphs: equality
-saturation over semantic carriers, with proofs.**
+**A verified search engine over equivalent computational architectures.**
+
+Given a specification of what a computation *means* (a PyTorch model),
+catopt automatically discovers semantically-equivalent architectures —
+scans, chunked/streaming attention, fused projections, resolvent
+closed-forms — attaches a replayable equivalence certificate to each,
+and selects the fastest implementation for the target deployment regime.
+
+```text
+semantic program → equivalent architectures → verify → cost-select
+```
+
+The split is deliberate: **discovery and verification are
+hardware-independent** (laws and certificates don't know the GPU);
+**selection is target-dependent** through a calibrated cost model. The
+same equivalence space serves every backend — discover once, optimize
+per target.
 
 `catopt` translates PyTorch models into a typed symmetric-monoidal IR,
 explores semantics-preserving rewrites with an e-graph, extracts a
