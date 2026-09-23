@@ -522,6 +522,104 @@ QKV_FUSE_ASYM = R(
     derive=_derive_split_sizes,
 )
 
+
+# ---------------------------------------------------------------------------
+#  Copy-map absorption:  unsqueeze -> expand -> reshape  is the diagonal
+#  Delta_r (duplicate along a new axis, then merge it back = PyTorch's
+#  repeat_kv / repeat_interleave).  The diagonal is a *natural* map: it
+#  can be pushed inside a consumer that implements the broadcast
+#  internally.  SDPA's enable_gqa flag IS that consumer — feeding it the
+#  unexpanded k/v computes the same attention without materialising
+#  the duplicated heads.  A term-local tensor pass cannot see this: the
+#  pattern lives across three view ops plus a fused kernel flag.
+# ---------------------------------------------------------------------------
+
+def _check_repeat_chain(bound: dict, pre: str) -> bool:
+    """reshape(expand(unsqueeze(t, d))) must be exactly repeat_interleave
+    on dim d-1: unsqueeze inserts a 1, expand broadcasts only that dim
+    by r, and the reshape merges dims d-1,d into one."""
+    from catopt.cost import _shape_of as _so
+    d = bound.get(f"$attr:UD{pre}")
+    es = bound.get(f"$attr:ES{pre}")
+    rs = bound.get(f"$attr:RS{pre}")
+    base = bound.get(pre)
+    bs = _so(base)
+    if not (isinstance(d, int) and isinstance(es, tuple)
+            and isinstance(rs, tuple) and isinstance(bs, tuple)):
+        return False
+    if any(x is None for x in bs):
+        return False
+    nd = len(bs)
+    d = d % (nd + 1)
+    us = bs[:d] + (1,) + bs[d:]
+    if len(es) != len(us) or len(rs) != nd or d == 0:
+        return False
+    r = es[d]
+    if not isinstance(r, int) or r <= 1:
+        return False
+    if any(es[i] != us[i] for i in range(len(us)) if i != d):
+        return False  # expand may only grow the inserted dim
+    merged = us[:d - 1] + ((us[d - 1] or 0) * r,) + us[d + 1:]
+    return rs == merged
+
+
+def _check_gqa_absorb(bound: dict) -> bool:
+    """Both k and v must be repeat-chains with the SAME repeat factor r,
+    and q's head count must equal kv_heads * r."""
+    from catopt.cost import _shape_of as _so
+    for side in ("k", "v"):
+        if not _check_repeat_chain(bound, side):
+            return False
+    if bound["$attr:ESk"] != bound["$attr:ESv"]:
+        return False
+    d = bound["$attr:UDk"] % (len(_so(bound["k"])) + 1)
+    r = bound["$attr:ESk"][d]
+    qs, ks = _so(bound["q"]), _so(bound["k"])
+    if not (isinstance(qs, tuple) and isinstance(ks, tuple)
+            and len(qs) >= 2 and len(ks) >= 2):
+        return False
+    if None in qs or None in ks:
+        return False
+    return qs[-2] == ks[-2] * r  # hq == hkv * n_rep
+
+
+_REPEAT_KV = Op.make(
+    "transpose",
+    Op.make("reshape",
+            Op.make("expand",
+                    Op.make("unsqueeze", "k", arg1="UDk"),
+                    shape="ESk"),
+            shape="RSk"),
+    arg1=1, arg2=2)
+
+_REPEAT_V = Op.make(
+    "transpose",
+    Op.make("reshape",
+            Op.make("expand",
+                    Op.make("unsqueeze", "v", arg1="UDv"),
+                    shape="ESv"),
+            shape="RSv"),
+    arg1=1, arg2=2)
+
+GQA_ABSORB = R(
+    "gqa_absorb_repeat",
+    Op.make("sdpa",
+            Op.make("transpose", "q", arg1=1, arg2=2),
+            _REPEAT_KV,
+            _REPEAT_V,
+            arg4="D", arg5="C"),
+    Op.make("sdpa",
+            Op.make("transpose", "q", arg1=1, arg2=2),
+            Op.make("transpose", "k", arg1=1, arg2=2),
+            Op.make("transpose", "v", arg1=1, arg2=2),
+            arg4="D", arg5="C", arg7=True),
+    law="The diagonal is natural: unsqueeze->expand->reshape copies each "
+        "kv head r times (repeat_kv).  SDPA implements that copy inside "
+        "the kernel via enable_gqa — pushing Delta into the consumer "
+        "deletes the materialisation entirely.",
+    check=_check_gqa_absorb,
+)
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -793,6 +891,8 @@ CATEGORICAL_RULES: list[Rewrite] = [
     LINEAR_CHANNEL_SCALE_REV,
     LINEAR_ROW_SCALE,
     LINEAR_ROW_SCALE_REV,
+    # Diagonal-map absorption (copy pushed inside the kernel)
+    GQA_ABSORB,
 ]
 
 #: All rules combined.

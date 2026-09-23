@@ -956,3 +956,62 @@ def test_reshape_negative_dim_shape_inference():
     assert _infer_op_shape(r) == (4, 2, 4)  # numel 32 / (2*4) = 4
     # unresolved -1 must broadcast as unknown (None), not _INVALID
     assert _broadcast((4, -1), (4, 8)) == (4, None)
+
+
+def test_gqa_absorb_repeat_kv():
+    """unsqueeze->expand->reshape before sdpa is repeat_kv (the
+    diagonal); the rule must absorb it into enable_gqa and the soundness
+    check must verify the repeat structure."""
+    from catopt.models import RepeatKVAttention
+    from catopt.optimize import optimize_model
+
+    torch.manual_seed(0)
+    m = RepeatKVAttention(dim=128, n_heads=8, n_kv_heads=2).eval()
+    x = torch.randn(1, 16, 128)
+    opt, _ = optimize_model(m, x, ruleset="categorical",
+                            max_iterations=4, verbose=False)
+    with torch.no_grad():
+        diff = (m(x) - opt(x)).abs().max().item()
+    assert diff < 1e-4
+
+
+def test_gqa_absorb_rejects_bad_repeat():
+    """The check must veto chains that are NOT repeat_interleave —
+    e.g. expand growing a non-inserted dim."""
+    from catopt.rules import _check_gqa_absorb, _REPEAT_KV
+    # Forge a bad binding: expand grows dim 2 (a real dim), not the
+    # unsqueezed dim 3.
+    x = Var("k", TensorType((1, 8, 2, 32)))
+    bad = {
+        "$attr:UDk": 3,
+        "$attr:ESk": (1, 8, 4, 4, 32),  # grew dim 2 too — not a copy
+        "$attr:RSk": (1, 8, 8, 32),
+        "$attr:UDv": 3,
+        "$attr:ESv": (1, 8, 2, 4, 32),
+        "$attr:RSv": (1, 8, 8, 32),
+        "k": x, "v": Var("v", TensorType((1, 8, 2, 32))),
+        "q": Var("q", TensorType((1, 8, 8, 32))),
+    }
+    assert _check_gqa_absorb(bad) is False
+    # and the honest chain passes
+    good = dict(bad)
+    good["$attr:ESk"] = (1, 8, 2, 4, 32)
+    assert _check_gqa_absorb(good) is True
+
+
+def test_linear_attention_reassociation():
+    """(Q K^T) V reassociates to Q (K^T V) — O(T^2 d) -> O(T d^2).
+    Exact identity (verified in fp64); the cost model must pick it."""
+    from catopt.models import LinearAttention
+    from catopt.optimize import optimize_model
+    from catopt.cost import roofline_cost
+
+    m = LinearAttention().eval()
+    t, d = 512, 64
+    q = k = v = torch.randn(1, t, d, dtype=torch.float64)
+    opt, _ = optimize_model(m, (q, k, v), ruleset="categorical",
+                            max_iterations=4, cost_fn=roofline_cost,
+                            verbose=False)
+    with torch.no_grad():
+        diff = (m(q, k, v) - opt(q, k, v)).abs().max().item()
+    assert diff < 1e-8  # fp64: reassociation is exact up to rounding

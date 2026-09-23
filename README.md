@@ -28,6 +28,8 @@ semantically equivalent.
 | Transform family | Examples | GPU | CPU |
 |---|---|---|---|
 | **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
+| **Asymptotic reassociation** | LinearAttention `(QK^T)V → Q(K^TV)`: O(T²d) → O(Td²) | **8.0×** at T=2048, d=64 | — |
+| **Diagonal absorption** | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | **1.12×** at T=512 | — |
 | **Same-FLOP pairing** (fused projections) | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity at compute-bound; **1.19× launch-bound toy**; 0.82–0.99× real llama2.c blocks | ~1.0× |
 | **Same-FLOP conv pairing** | 4× parallel conv1×1 branches | **1.24–1.33× at all batch sizes** | — |
 | **Norm folding** | NormLinear | 0.98× (controlled negative) | 0.90× |
@@ -127,6 +129,20 @@ over projection signatures (linear, conv2d), with a compat cluster key
 per op (conv members must share stride/padding/dilation/groups and
 kernel dims; asymmetric out-channels supported).
 
+**Two nonlinear-boundary transforms landed.** (a) *Diagonal
+absorption*: `unsqueeze→expand→reshape` before SDPA is the copy map
+Δ (llama2.c's `repeat_kv`); the `gqa_absorb_repeat` rule pushes the
+duplication inside the kernel via `enable_gqa`, deleting the
+materialisation — discovered automatically on unmodified community
+code, 1.12× at T=512 (the saving scales with T). (b) *Linear-attention
+reassociation*: `(QK^T)V` → `Q(K^TV)` is the O(T²d) → O(Td²) identity
+the linear-transformer literature is built on — the e-graph finds it
+from associativity alone and the cost model picks it by shape:
+**8.0× at T=2048, d=64**, verified exact in fp64 (rel err 8e-16).
+Neither transform is expressible by Inductor: one requires recognising
+that a view chain equals a kernel flag, the other requires reordering
+matmul composition — both outside local pattern fusion.
+
 **The calibrated cost model predicts the crossover.** `roofline_cost`
 constants are measured on the target GPU (2.5 TFLOPS, 89 GB/s,
 8.7 µs launch). Predicted vs measured direction agrees on all tested
@@ -169,9 +185,11 @@ lowering overhead visible on real blocks.
 
 ## Honest limitations
 
-- **Nothing found yet is novel to practitioners.** Fused QKV and merged
-  gate/up are textbook deployment tricks — the contribution is
-  automatic discovery + formal verification, not new optimizations.
+- **Nothing found yet is novel to practitioners.** Fused QKV, merged
+  gate/up, `enable_gqa` absorption, and the linear-attention identity
+  are all known — the contribution is automatic discovery + formal
+  verification + cost-driven choice, including one transform with
+  *asymptotic* (not constant-factor) impact.
 - **The FLOP-reducing wins are degenerate cases** — linear-only DAGs
   collapse to one linear, which a domain expert writes in one line.
   What is demonstrated is that Inductor misses them and the derivation
@@ -179,10 +197,20 @@ lowering overhead visible on real blocks.
   twice).
 - **Weight folding is inference-only** — folding destroys per-layer
   gradients; sound only on frozen graphs.
-- **Pairing is restricted to `linear`** — `conv2d`, `matmul`+bias, and
-  learned-scale norms are not yet pairable; the mechanism is generic.
-- **`roofline_cost` constants are uncalibrated** order-of-magnitude
-  estimates — a candidate-ranking tool, not a wall-clock predictor.
+- **Pairing covers `linear` and `conv2d`** — `matmul`+bias, grouped
+  convs, and learned-scale norms are not yet pairable; the mechanism is
+  generic (per-op compat cluster key).
+- **Reassociation applies only to unnormalised attention** — softmax in
+  the middle blocks the `(QK^T)V → Q(K^TV)` law, so it benefits
+  linear-attention-style models and generic 3-matmul chains, not
+  standard softmax attention.
+- **`enable_gqa` absorption requires the exact repeat pattern** —
+  `unsqueeze→expand→reshape` merging the head dim; other duplication
+  shapes (repeat vs repeat_interleave orderings) are correctly rejected
+  but not optimised.
+- **`roofline_cost` is calibrated to this GPU** (RTX 2050) — other
+  hardware needs the constants re-measured; and it prices the
+  transform, not the ~5% `IRModule` lowering overhead on real blocks.
 - **Small absolute timings** on a 4 GB mobile GPU; magnitudes should
   not be extrapolated to datacenter hardware.
 
@@ -205,7 +233,7 @@ lowering overhead visible on real blocks.
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # 84 tests
+python -m pytest tests/ -q         # 87 tests
 python bench_gpu.py                # GPU table (requires CUDA)
 ```
 

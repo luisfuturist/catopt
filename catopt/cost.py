@@ -126,7 +126,69 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                                   for d in shape)
                 return shape
             return shapes[0]
-        case "contiguous":
+        case "unsqueeze":
+            base = shapes[0]
+            if base is None:
+                return None
+            d = op.attrs.get("arg1", op.attrs.get("dim", -1))
+            d = d % (len(base) + 1)
+            return tuple(base[:d]) + (1,) + tuple(base[d:])
+        case "squeeze":
+            base = shapes[0]
+            if base is None:
+                return None
+            d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(base)
+            return tuple(x for i, x in enumerate(base) if i != d)
+        case "expand":
+            s = op.attrs.get("shape")
+            return tuple(s) if s is not None else shapes[0]
+        case "stack":
+            # stack(ts, dim): all inputs share a shape; insert dim.
+            base = shapes[0]
+            if base is None:
+                return None
+            d = op.attrs.get("arg1", op.attrs.get("dim", 0))
+            d = d % (len(base) + 1)
+            n = len(op.args)
+            return tuple(base[:d]) + (n,) + tuple(base[d:])
+        case "unbind":
+            # Element shape: base with the unbound dim removed.  The
+            # tuple arity lives in getitem/select consumers.
+            base = shapes[0]
+            if base is None or not base:
+                return base
+            d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(base)
+            return tuple(x for i, x in enumerate(base) if i != d)
+        case "getitem":
+            # After unbind the element shape is already the arg's shape.
+            return shapes[0]
+        case "select":
+            base = shapes[0]
+            if base is None or not base:
+                return base
+            d = op.attrs.get("arg1", op.attrs.get("dim", 0)) % len(base)
+            return tuple(x for i, x in enumerate(base) if i != d)
+        case "slice":
+            base = shapes[0]
+            if base is None:
+                return None
+            d = op.attrs.get("arg1", op.attrs.get("dim", 0)) % len(base)
+            lo = op.attrs.get("arg2", 0)
+            hi = op.attrs.get("arg3")
+            out = list(base)
+            if isinstance(base[d], int) and isinstance(hi, int):
+                out[d] = min(hi, base[d]) - (lo or 0)
+            return tuple(out)
+        case "flatten":
+            base = shapes[0]
+            if base is None:
+                return None
+            d0 = op.attrs.get("arg1", op.attrs.get("start_dim", 0))
+            d1 = op.attrs.get("arg2", op.attrs.get("end_dim", -1))
+            d0, d1 = d0 % len(base), d1 % len(base)
+            merged = _numel(base[d0:d1 + 1])
+            return tuple(base[:d0]) + (merged,) + tuple(base[d1 + 1:])
+        case "contiguous" | "to" | "type_as" | "float" | "dropout":
             return shapes[0]
         case "sdpa":
             # out has q's shape (B, h, T, d)

@@ -351,3 +351,55 @@ class ParallelConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return sum(c(x) for c in self.convs)
 
+
+class LinearAttention(nn.Module):
+    """Unnormalised attention: ``(Q K^T) V`` with no softmax.
+
+    Associativity of composition gives two bracketings:
+
+    * ``(Q @ K^T) @ V`` — O(T^2 d)   (scores materialised)
+    * ``Q @ (K^T @ V)`` — O(T d^2)   (the linear-attention identity)
+
+    For T >> d the second is asymptotically cheaper — the rewrite the
+    linear-transformer literature is built on.  The e-graph finds it
+    automatically and the calibrated cost model picks by shape.
+    """
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor,
+                v: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(torch.matmul(q, k.transpose(-2, -1)), v)
+
+
+def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """llama2.c-style KV head duplication: the diagonal Delta_r."""
+    b, t, h, d = x.shape
+    return (x[:, :, :, None, :]
+            .expand(b, t, h, n_rep, d)
+            .reshape(b, t, h * n_rep, d))
+
+
+class RepeatKVAttention(nn.Module):
+    """GQA attention with materialised ``repeat_kv`` — the llama2.c
+    pattern.  ``enable_gqa`` inside SDPA computes the same broadcast for
+    free; the absorb rule pushes the copy map into the kernel."""
+
+    def __init__(self, dim: int = 128, n_heads: int = 8,
+                 n_kv_heads: int = 2) -> None:
+        super().__init__()
+        self.h, self.hk = n_heads, n_kv_heads
+        self.dh = dim // n_heads
+        self.n_rep = n_heads // n_kv_heads
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, n_kv_heads * self.dh, bias=False)
+        self.wv = nn.Linear(dim, n_kv_heads * self.dh, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x.shape
+        q = self.wq(x).view(b, t, self.h, self.dh).transpose(1, 2)
+        k = self.wk(x).view(b, t, self.hk, self.dh)
+        v = self.wv(x).view(b, t, self.hk, self.dh)
+        k = _repeat_kv(k, self.n_rep).transpose(1, 2)
+        v = _repeat_kv(v, self.n_rep).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return o.transpose(1, 2).reshape(b, t, -1)
+

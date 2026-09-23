@@ -387,11 +387,12 @@ class EGraph:
             for subst in self.matches(rule.lhs, eid):
                 if rule.check is not None or rule.derive is not None:
                     bound = {
-                        k: self.any_term(v)
+                        k: (v if k.startswith("$attr:")
+                            else self.any_term(v))
                         for k, v in subst.items()
-                        if not k.startswith("$attr:")
                     }
-                    if any(v is None for v in bound.values()):
+                    if any(v is None for k, v in bound.items()
+                           if not k.startswith("$attr:")):
                         continue
                     if rule.check is not None and not rule.check(bound):
                         continue
