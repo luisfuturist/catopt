@@ -118,7 +118,11 @@ critical-pair completion: compose rule pairs on seed terms, validate
 each candidate by replay + fp64 evaluation. Guarded rules participate
 soundly — parent `check`s re-express on the derived rule's
 substitution, `derive` outputs flow as namespaced placeholders — so
-**all 109 rules** now feed synthesis. Fed `SCAN_LAWS \
+**all 109 rules** now feed synthesis. Guarded compositions prefer
+**seed witnesses** (`seed_terms=`): bindings mined from real terms the
+parents actually fired on — tight side conditions (sdpa_fold's Const
+scale, mask shapes) that bounded random instantiation can't satisfy
+emit only via seeds. Fed `SCAN_LAWS \
 {aff_lift_step}`, it emits the unfolded equivalent of a previously
 hand-written derived rule; om/attention lemmas (the chunked-attention
 homomorphism, score-concat lift, mask-distribution composites) derive
