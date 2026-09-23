@@ -19,7 +19,7 @@ import torch
 from catopt.ir import IR, Op, Var, Const, Param
 from catopt.egraph import EGraph
 from catopt.rules import all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES
-from catopt.cost import flops_cost, count_cost, CostModel
+from catopt.cost import flops_cost, count_cost, launch_aware_cost, CostModel
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.ir import op_repr
 
@@ -49,7 +49,9 @@ def optimize_model(
     max_enodes : int
         Stop if the e-graph exceeds this many e-nodes.
     cost_fn : callable
-        Cost function for term extraction.  Defaults to :func:`flops_cost`.
+        Cost function for term extraction.  Defaults to
+        :func:`launch_aware_cost` (FLOPs + a small per-kernel penalty so
+        that forms with identical FLOPs but fewer launches win).
     verbose : bool
         Print progress.
 
@@ -59,7 +61,7 @@ def optimize_model(
         The optimized ``torch.nn.Module`` and a dictionary of e-graph stats.
     """
     if cost_fn is None:
-        cost_fn = flops_cost
+        cost_fn = launch_aware_cost
 
     # -- Phase 1: Export to IR -------------------------------------------
     if verbose:

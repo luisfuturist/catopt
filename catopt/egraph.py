@@ -318,49 +318,124 @@ class EGraph:
     # -- extraction --
 
     def extract_best(self, eid: int, cost_fn) -> Any:
-        """Extract the minimum-cost term from the e-class at *eid*."""
-        cache: dict[int, tuple[float, Any]] = {}
+        """Extract the minimum-cost term from the e-class at *eid*.
 
-        def best(eclass_id: int) -> tuple[float, Any]:
+        Cost accounting is DAG-aware: each e-class in the extracted
+        expression is charged exactly once, even when several parents
+        share it (e.g. one fused GEMM feeding two chunk projections).
+        A node's *local* cost is recovered as ``cost_fn(term) - sum of
+        cost_fn(children)`` — exact for additive cost functions such as
+        ``flops_cost`` and ``count_cost``.
+
+        Classes whose extracted subtree contains no data input (only
+        ``Param``/``Const`` leaves) are compile-time work: lowering
+        folds them into a materialised parameter, so they are charged
+        at zero.  This is what lets the extractor prefer rewrites that
+        move computation onto the weights (e.g. ``x@(W1@W2@W3)``) even
+        though the weight product itself is not free in FLOP terms.
+
+        Cyclic nodes (a class reachable from itself through rewrite-
+        introduced unions) are skipped: they cannot be extracted.
+        """
+        # eid -> (total_cost, term, used_eclass_ids, subtree_is_param_only)
+        cache: dict[int, tuple[float, Any, frozenset, bool]] = {}
+        local_of: dict[int, float] = {}
+        param_only_of: dict[int, bool] = {}
+        in_progress: set[int] = set()
+
+        def best(eclass_id: int) -> tuple[float, Any, frozenset, bool]:
             eclass_id = self.find(eclass_id)
             if eclass_id in cache:
                 return cache[eclass_id]
+            if eclass_id in in_progress:
+                # Cycle back to an ancestor — not extractable.
+                return (float("inf"), None, frozenset(), False)
+            in_progress.add(eclass_id)
             eclass = self._classes[eclass_id]
-            best_cost: float | None = None
+            best_total: float | None = None
             best_term: Any = None
+            best_used: frozenset = frozenset({eclass_id})
+            best_local = 0.0
+            best_param_only = False
+            best_nops = 0
             for node in eclass.nodes:
                 if node.op == "leaf":
                     key = node.attrs[0][1] if node.attrs else "??"
                     term = _LeafRegistry.decode(key)
-                    cost = cost_fn(term)
-                    if best_cost is None or cost < best_cost:
-                        best_cost = cost
+                    total = cost_fn(term)
+                    if best_total is None or total < best_total:
+                        from catopt.ir import Var as _Var
+                        best_total = total
                         best_term = term
-                else:
-                    child_terms = []
-                    child_cost = 0.0
-                    valid = True
-                    for child_eid in node.children:
-                        canon_child = self.find(child_eid)
-                        if canon_child == eclass_id:
-                            # Self-reference — skip this node
-                            valid = False
-                            break
-                        ccost, cterm = best(canon_child)
-                        if cterm is None:
-                            valid = False
-                            break
-                        child_terms.append(cterm)
-                        child_cost += ccost
-                    if not valid:
-                        continue
-                    term = Op.make(node.op, *child_terms, **dict(node.attrs))
-                    total = child_cost + cost_fn(term)
-                    if best_cost is None or total < best_cost:
-                        best_cost = total
-                        best_term = term
-            cache[eclass_id] = (best_cost or 0.0, best_term)
+                        best_used = frozenset({eclass_id})
+                        best_local = total
+                        best_param_only = not isinstance(term, _Var)
+                    continue
+
+                child_terms: list[Any] = []
+                used: set[int] = {eclass_id}
+                sub_cost = 0.0
+                param_only = True
+                valid = True
+                for child_eid in node.children:
+                    canon_child = self.find(child_eid)
+                    if canon_child == eclass_id:
+                        valid = False  # direct self-reference
+                        break
+                    ctotal, cterm, cused, cpo = best(canon_child)
+                    if cterm is None:
+                        valid = False
+                        break
+                    child_terms.append(cterm)
+                    param_only = param_only and cpo
+                    # Charge each distinct e-class in the DAG once:
+                    # a shared child contributes its subtree cost only
+                    # for the classes not already accounted for.
+                    # Compile-time (param-only) classes are free.
+                    for u in cused - used:
+                        if not param_only_of.get(u, False):
+                            sub_cost += local_of.get(u, 0.0)
+                    used |= cused
+                if not valid:
+                    continue
+                term = Op.make(node.op, *child_terms, **dict(node.attrs))
+                local = cost_fn(term) - sum(
+                    cost_fn(c) for c in child_terms
+                )
+                local = max(local, 0.0)
+                if param_only:
+                    local = 0.0  # whole subtree folds at compile time
+                total = local + sub_cost
+                # Secondary key: among equal-cost candidates prefer the
+                # structurally smallest term (a leaf over add(W, 0) in a
+                # param-only class, for example).
+                nops = sum(1 for _ in _iter_ops(term))
+                if (best_total is None
+                        or total < best_total
+                        or (total == best_total and nops < best_nops)):
+                    best_total = total
+                    best_term = term
+                    best_used = frozenset(used)
+                    best_local = local
+                    best_param_only = param_only
+                    best_nops = nops
+            in_progress.discard(eclass_id)
+            if best_term is None:
+                best_total = float("inf")
+            local_of[eclass_id] = best_local
+            param_only_of[eclass_id] = best_param_only
+            cache[eclass_id] = (
+                best_total or 0.0, best_term, best_used, best_param_only,
+            )
             return cache[eclass_id]
 
-        _, term = best(eid)
+        _, term, _, _ = best(eid)
         return term
+
+
+def _iter_ops(term: Any):
+    """Yield every Op node in a term (for the structural-size tie-break)."""
+    if isinstance(term, Op):
+        yield term
+        for a in term.args:
+            yield from _iter_ops(a)

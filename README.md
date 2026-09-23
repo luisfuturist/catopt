@@ -208,11 +208,11 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 
 | Layer | Module | What it does |
 | ----- | ------ | ------------ |
-| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws |
-| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, cycle-safe extraction |
-| Rules | `catopt/rules.py` | 18 rules: monoid/group laws, `silu`/`pow` bridges, matmul distributivity, naturality, associativity |
-| Cost | `catopt/cost.py` | `count_cost` + shape-aware `flops_cost` (proper `2·M·N·K` matmul/linear) |
-| Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion** |
+| IR | `catopt/ir.py` | Typed term algebra + symmetric-monoidal generator registry with declared laws (incl. `concat`/`chunk` for the product structure) |
+| E-graph | `catopt/egraph.py` | Union-find, e-matching, equality saturation, **DAG-aware extraction**: shared e-classes charged once, param-only classes charged at compile-time cost 0, cycle-safe |
+| Rules | `catopt/rules.py` | 29 rules: monoid/group laws, `silu`/`pow` bridges, bilinearity/weight-merge, naturality, associativity, **product-structure fusion** (`swiglu_fuse`, `parallel_mul_fuse`) |
+| Cost | `catopt/cost.py` | `count_cost`, shape-aware `flops_cost` (`2·M·N·K`), `launch_aware_cost` (FLOPs + per-kernel penalty) |
+| Bridge | `catopt/torch_bridge.py` | `torch.export` → IR; IR → `IRModule`; ATen overload canonicalisation; **compile-time weight fusion**; shared-subterm memoisation |
 | Pipeline | `catopt/optimize.py` | 4-phase `optimize_model` with equivalence verification |
 
 ### Measured results (CPU, run on this machine)
@@ -223,7 +223,8 @@ Otherwise we're just demonstrating that optimization beats no optimization.
 | MatrixChain b=4096 | yes (5e-09) | 0.240 | 0.039 | **6.22×** |
 | **DeepParallel b=4096** | yes (2e-06) | 1.362 | 0.451 | **3.02×** |
 | **ParallelLinear b=4096** | yes (3e-06) | 0.878 | 0.393 | **2.24×** |
-| SwiGLU   | yes (0.0)   | — | — | 1.00× (cost unchanged, 802,816 FLOPs) |
+| **SwiGLU b=128 (fused gate/up)** | yes (0.0) | 2.800 | 2.642 | **1.06×** |
+| SwiGLU b=4096 (same fused form) | yes (6e-08) | 94.93 | 97.18 | 0.98× (see note) |
 | RMSNorm  | yes (2e-07) | — | — | 1.00× (cost unchanged, 2,128 FLOPs) |
 
 Both paths go through `torch.compile`, so the comparison isolates the
@@ -236,6 +237,21 @@ single `linear` via **two composed rules** (`weight_factor_linear` then
 pass finds it — the distributive merge must fire *before* reassociation makes
 folding legal. Hand-derived reference, measured: 0.406 ms (3.35×), so catopt
 lands within 11% of what a human can achieve.
+
+`SwiGLU` is the first result that is **not** a linear-only collapse. The
+`swiglu_fuse` rule applies the *product universal property*: two maps
+`f, g : X → V` with the same source pair into one map `⟨f,g⟩ : X → V×V`. On
+tensors that is `cat(Wg, Wu)` along the output dim — **one wide GEMM** — with
+zero-cost `chunk` views as the projections πᵢ. This is precisely the
+`MergedColumnParallelLinear` / fused-QKV transformation that inference stacks
+perform by hand; Inductor cannot produce it because it must *reshape
+parameters*, which lies outside kernel fusion. The extracted form shares the
+fused GEMM as a single e-class read by both chunk parents, and lowering runs
+it exactly once (memoised eval, regression-tested). Profitability on CPU is
+batch-dependent (1.06× at b=128, 0.98× at b=4096 — the fused GEMM saves a
+launch but chunk yields non-contiguous views for the elementwise ops); on GPU,
+where launches dominate and fused QKV is standard practice, this is the
+expected regime for a win — untested here (no CUDA device).
 
 ### The algebra is error-prone, which is the interesting part
 
@@ -261,10 +277,14 @@ the e-graph's equivalence check.
   measured gain climbs to **6.22×**, approaching the runtime-only matmul-FLOP
   ratio of 10.2×. This is exactly the predicted behaviour, and it is why the
   demo prints both.
-* **SwiGLU shows 1.00×.** With this cost model the categorical rules confirm
-  equivalence but find no strictly cheaper form. Reporting that is the point:
-  a rule system that always "wins" would be measuring its cost model, not the
-  compiler.
+* **SwiGLU's fused form is found, verified, and marginal on CPU.** The
+  e-graph now produces the gate/up-fused form (2 GEMMs → 1). Its DAG cost is
+  identical FLOPs minus one kernel launch; measured on CPU that is a wash
+  (1.06× at b=128 → 0.98× at b=4096, because strided chunk views cost the
+  elementwise ops what the launch saves). The transformation is real and
+  Inductor cannot express it; whether it pays is a hardware/cost-model
+  question, which is exactly the question a compiler should be answering
+  rather than assuming.
 * **RMSNorm reports 1.00×, and an earlier 1.98× claim was a cost-model bug.**
   A version of this table showed 1.98× because `cost._infer_op_shape` returned
   `shapes[0]` for elementwise ops instead of the broadcast shape, so
@@ -284,16 +304,29 @@ the e-graph's equivalence check.
   humans, and two categorical laws must compose to produce it.
 * **Weight folding is inference-only.** `x @ (W1@W2@W3)` is value-preserving
   during training, but folding destroys per-layer gradients, so it is only
-  sound on frozen graphs. The cost model deliberately counts the one-time
-  precompute as if it were runtime, so it only fully fuses above the
-  break-even batch — at small batch it correctly keeps the outer layer
-  separate (this is why tests use `batch=4096`).
-* **The real target is a *nonlinear* case.** The hypothesis is only tested
-  once a transformation is found where a nonlinearity sits in between, so the
-  graph does **not** collapse trivially — e.g. `silu(x@W1) + x@W2` (MoE-style),
-  or RMSNorm fused with a following projection where the per-row scale must
-  commute through the matmul (`naturality_scalar`) *while* reassociating the
-  reduction above it. Those rules exist; they do not yet compose into a win.
+  sound on frozen graphs. The extraction model now charges param-only
+  subtrees at zero — the amortised-inference assumption — so fusion is
+  chosen whenever it is *semantically* available; the earlier break-even
+  behaviour (partial fusion at small batch) was an artifact of charging
+  compile-time work at runtime rates.
+* **The nonlinear barrier is now partially breached — but not profitably
+  yet.** `swiglu_fuse` is a real nonlinear-adjacent transform (the two
+  projections feed *different* nonlinear consumers, so the graph cannot
+  collapse — it can only *restructure* the weights), discovered by the
+  product rule rather than by linear algebra. What remains undemonstrated:
+  a case where the fused form is unambiguously profitable on the measured
+  backend, and deeper composed wins (e.g. RMSNorm's per-row scale commuting
+  through a following projection via `naturality_scalar` while the reduction
+  reassociates above it). Those rules exist; they do not yet compose into
+  a win.
+* **The cost model now knows about compile time and sharing.** Extraction
+  charges param-only classes at 0 (they fold at compile time) and charges
+  shared e-classes once (the fused GEMM feeds two chunk parents but runs
+  once). It does **not** yet model memory layout — it cannot see that a
+  strided `chunk` view slows the downstream elementwise kernel, which is
+  why the SwiGLU fuse is predicted as a small win and measured as a wash
+  on CPU. A layout/memory-traffic-aware cost model is the obvious next
+  improvement.
 * **Two soundness bugs were found and fixed in this work**, which is the
   strongest evidence the instrument is trustworthy: (1) the matcher did not
   enforce repeated metavariables as "same e-class", so `x@W1 + y@W2` would
@@ -304,9 +337,9 @@ the e-graph's equivalence check.
 ### Reproduce
 
 ```bash
-python main.py                     # associativity, SwiGLU/RMSNorm, naturality
+python main.py                     # associativity, SwiGLU fusion, RMSNorm, naturality
 python main.py --large-batch 4096  # measured large-batch timing
-python -m pytest tests/ -q         # 61 tests
+python -m pytest tests/ -q         # 65 tests
 ```
 
 ---

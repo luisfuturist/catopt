@@ -88,6 +88,24 @@ def test_cost_model_matmul_heavier():
     assert cm(op) == pytest.approx(524288)
 
 
+def test_concat_chunk_shapes():
+    """concat joins along dim; chunk splits it — shape inference."""
+    from catopt.cost import _infer_op_shape
+
+    a = Param("A", TensorType((8, 4)))
+    b = Param("B", TensorType((8, 4)))
+    cat = Op.make("concat", a, b, dim=0)
+    assert _infer_op_shape(cat) == (16, 4)
+
+    x = Var("x", TensorType((32, 16)))
+    y = Op.make("chunk", x, chunks=2, dim=-1, index=0)
+    assert _infer_op_shape(y) == (32, 8)
+
+    # data-movement ops cost nothing
+    assert flops_cost(cat) == 0.0
+    assert flops_cost(y) == 0.0
+
+
 def test_cost_preference_for_fewer_ops():
     """Cost model should prefer matmul chains with fewer total FLOPs.
 

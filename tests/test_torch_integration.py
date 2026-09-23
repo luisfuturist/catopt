@@ -368,3 +368,110 @@ def test_weight_merge_does_not_fire_on_distinct_inputs():
         n for n in eg.get_class(eid).nodes if n.op == "matmul"
     ]
     assert len(matmul_nodes) == 0
+
+
+# ---------------------------------------------------------------------------
+#  Product structure: fused projections (SwiGLU gate/up)
+# ---------------------------------------------------------------------------
+
+def _find_ops(term, name, out=None):
+    if out is None:
+        out = []
+    if isinstance(term, Op):
+        if term.op == name:
+            out.append(term)
+        for a in term.args:
+            _find_ops(a, name, out)
+    return out
+
+
+def test_swiglu_fuse_produces_shared_gemm():
+    """swiglu_fuse merges gate/up into one wide GEMM + two chunk views.
+
+    The extracted form must be
+        mul(silu(chunk0(linear(x, cat(Wg,Wu)))), chunk1(linear(x, cat)))
+    where the two `linear` subterms are literally the SAME object — the
+    e-graph stores the fused projection once and lowering runs one GEMM.
+    """
+    from catopt.cost import launch_aware_cost
+    torch.manual_seed(0)
+    m = SwiGLU(32, hidden_mult=2)
+    x = torch.randn(128, 32)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=30, max_nodes=50000)
+    best = eg.extract_best(eid, launch_aware_cost)
+
+    chunks = _find_ops(best, "chunk")
+    assert len(chunks) == 2
+    # Both chunk projections read the SAME fused linear (one GEMM).
+    assert chunks[0].args[0] is chunks[1].args[0]
+    fused_lin = chunks[0].args[0]
+    assert fused_lin.op == "linear"
+    cat = fused_lin.args[1]
+    assert cat.op == "concat"
+
+    # Lowering folds cat(Wg,Wu) into one fused runtime parameter and
+    # remains numerically equivalent.
+    low = _lower(ir, best, source)
+    names = [n for n, _ in low.named_parameters()]
+    assert any(n.startswith("fused_") for n in names)
+    assert "p_gate_weight" not in names
+    assert "p_up_weight" not in names
+    m.eval(); low.eval()
+    with torch.no_grad():
+        d = (m(x.clone()) - low(x.clone())).abs().max().item()
+    assert d < 1e-5
+
+
+def test_swiglu_fuse_evals_fused_gemm_once():
+    """_eval memoization: the shared fused linear runs exactly once."""
+    from catopt.cost import launch_aware_cost
+    torch.manual_seed(0)
+    m = SwiGLU(32, hidden_mult=2)
+    x = torch.randn(64, 32)
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
+           max_iterations=30, max_nodes=50000)
+    best = eg.extract_best(eid, launch_aware_cost)
+    low = _lower(ir, best, source)
+
+    calls = []
+    orig_linear = torch.nn.functional.linear
+    def counting(*a, **kw):
+        calls.append(1)
+        return orig_linear(*a, **kw)
+    import catopt.torch_bridge as tb
+    saved = tb._IR_TO_TORCH["linear"]
+    tb._IR_TO_TORCH["linear"] = counting
+    try:
+        low.eval()
+        with torch.no_grad():
+            low(x.clone())
+    finally:
+        tb._IR_TO_TORCH["linear"] = saved
+    # gate/up fused -> 1 wide GEMM; + down projection = 2 linear calls
+    assert len(calls) == 2
+
+
+def test_swiglu_fuse_requires_shared_input():
+    """The pairing rule must not fire when gate/up read DIFFERENT inputs."""
+    from catopt.rules import SWIGLU_FUSE
+    x = Var("x", TensorType((4, 4)))
+    y = Var("y", TensorType((4, 4)))
+    wa = Param("Wa", TensorType((4, 4)))
+    wb = Param("Wb", TensorType((4, 4)))
+    t = Op.make("mul",
+                Op.make("silu", Op.make("linear", x, wa)),
+                Op.make("linear", y, wb))
+    eg = EGraph()
+    eid = eg.add_term(t)
+    eg.run([SWIGLU_FUSE], eid, max_iterations=5, max_nodes=500)
+    # No chunk/concat nodes may appear: the product rewrite is invalid
+    # without the shared source object.
+    ops = {n.op for n in eg.get_class(eid).nodes}
+    assert "chunk" not in ops and "concat" not in ops

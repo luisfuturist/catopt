@@ -83,6 +83,23 @@ def _infer_op_shape(op: Op) -> tuple | None:
             return tuple(d for i, d in enumerate(base) if i not in norm)
         case "transpose":
             return tuple(reversed(shapes[0])) if shapes[0] else shapes[0]
+        case "concat":
+            a, b = shapes[0], shapes[1]
+            if a is None or b is None:
+                return a
+            dim = op.attrs.get("dim", 0) % len(a)
+            out = list(a)
+            out[dim] = (a[dim] or 0) + (b[dim] or 0)
+            return tuple(out)
+        case "chunk":
+            base = shapes[0]
+            if base is None:
+                return None
+            dim = op.attrs.get("dim", -1) % len(base)
+            n = op.attrs.get("chunks", 2)
+            out = list(base)
+            out[dim] = (base[dim] or 0) // n
+            return tuple(out)
         case _:
             return shapes[0]
 
@@ -130,7 +147,49 @@ _OP_FLOPS: dict[str, int] = {
     "sigmoid": 2, "silu": 3, "tanh": 2, "gelu": 3, "rsqrt": 2, "exp": 1,
     "sum": 1, "mean": 2, "max": 1,
     "transpose": 0, "reshape": 0, "broadcast": 0, "linear": 2,
+    # concat/chunk are wire juxtaposition / projection: pure data
+    # movement, zero FLOPs.  On weights they are compile-time work.
+    "concat": 0, "chunk": 0,
 }
+
+#: Ops that produce no kernel — views or wire bookkeeping.  Exempt from
+#: the launch penalty and from count_cost.
+_VIEW_OPS = {"transpose", "reshape", "broadcast", "concat", "chunk", "leaf"}
+
+#: Small per-op penalty modeling kernel-launch / scheduling overhead.
+#: Two forms can have identical FLOPs yet differ in kernel count (e.g.
+#: one fused GEMM vs two half-size GEMMs); the penalty breaks such ties
+#: deterministically toward fewer launches.
+_LAUNCH_PENALTY = 1.0
+
+
+def _local_cost(term: Op, launch_penalty: float = 0.0) -> float:
+    """Cost contribution of a single op node (excludes children).
+
+    = op FLOPs on the inferred output shape + launch penalty.
+    """
+    shape = _infer_op_shape(term)
+    n_out = _numel(shape)
+    if term.op == "matmul":
+        # Standard matmul: 2 * M * N * K
+        shapes = [_shape_of(a) for a in term.args]
+        if shapes and shapes[1] is not None:
+            k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
+            base = 2 * n_out * k_dim
+        else:
+            base = 2 * n_out
+    elif term.op == "linear":
+        # F.linear(x[..,in], W[out,in]) -> 2 * M * out * in
+        shapes = [_shape_of(a) for a in term.args]
+        if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
+            base = 2 * n_out * shapes[0][-1]
+        else:
+            base = 2 * n_out
+    else:
+        base = _OP_FLOPS.get(term.op, 1) * n_out
+    if term.op not in _VIEW_OPS:
+        base += launch_penalty
+    return float(base)
 
 
 def flops_cost(term: Any) -> float:
@@ -140,27 +199,25 @@ def flops_cost(term: Any) -> float:
     For element-wise ops, uses 1 FLOP per output element.
     """
     if isinstance(term, Op):
-        shape = _infer_op_shape(term)
-        n_out = _numel(shape)
-        if term.op == "matmul":
-            # Standard matmul: 2 * M * N * K
-            shapes = [_shape_of(a) for a in term.args]
-            if shapes and shapes[1] is not None:
-                k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
-                base = 2 * n_out * k_dim
-            else:
-                base = 2 * n_out
-        elif term.op == "linear":
-            # F.linear(x[..,in], W[out,in]) -> 2 * M * out * in
-            shapes = [_shape_of(a) for a in term.args]
-            if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
-                base = 2 * n_out * shapes[0][-1]
-            else:
-                base = 2 * n_out
-        else:
-            base = _OP_FLOPS.get(term.op, 1) * n_out
+        base = _local_cost(term)
         for arg in term.args:
             base += flops_cost(arg)
+        return float(base)
+    return 0.0
+
+
+def launch_aware_cost(term: Any) -> float:
+    """flops_cost + _LAUNCH_PENALTY per non-view op.
+
+    Two equivalent forms can have identical FLOPs yet differ in kernel
+    count (one fused GEMM vs two half-size GEMMs).  The penalty breaks
+    such ties deterministically toward fewer launches.  This is the
+    default extraction cost in :func:`catopt.optimize.optimize_model`.
+    """
+    if isinstance(term, Op):
+        base = _local_cost(term, _LAUNCH_PENALTY)
+        for arg in term.args:
+            base += launch_aware_cost(arg)
         return float(base)
     return 0.0
 
@@ -168,7 +225,7 @@ def flops_cost(term: Any) -> float:
 def count_cost(term: Any) -> float:
     """Cost = number of non-view operations in the term tree."""
     if isinstance(term, Op):
-        n = 1 if term.op not in ("transpose", "reshape", "broadcast", "leaf") else 0
+        n = 0 if term.op in _VIEW_OPS else 1
         for arg in term.args:
             n += count_cost(arg)
         return float(n)

@@ -259,6 +259,64 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
     law="Expand a merged nn.Linear so eqsat can compare both forms.",
 )
 
+# ---------------------------------------------------------------------------
+#  Product structure — the fused-projection rules.
+#
+#  Categorically: in a category with products, two maps f,g : X -> V with
+#  the SAME source pair into a single map <f,g> : X -> V x V (the
+#  universal property of the product, mediated by the diagonal Delta).
+#  On tensors, pairing two nn.Linears on one input is concatenating the
+#  weights along the output dim (one wide GEMM), and the projections
+#  pi_i are zero-cost chunks.  This is the MergedColumnParallelLinear /
+#  fused-QKV transformation deployment stacks perform manually; a tensor
+#  compiler cannot produce it because it must RESHAPE PARAMETERS, which
+#  lies outside kernel fusion.
+# ---------------------------------------------------------------------------
+
+# silu(x@A.T) * (x@B.T)  ->  y = x@[A;B].T ; silu(y[..., :d]) * y[..., d:]
+# The fused linear term is shared (the e-graph stores it once); both
+# chunk projections read the same e-class.
+SWIGLU_FUSE = R(
+    "swiglu_fuse",
+    Op.make("mul",
+            Op.make("silu", Op.make("linear", "x", "A")),
+            Op.make("linear", "x", "B")),
+    Op.make("mul",
+            Op.make("silu",
+                    Op.make("chunk",
+                            Op.make("linear", "x",
+                                    Op.make("concat", "A", "B", dim=0)),
+                            chunks=2, dim=-1, index=0)),
+            Op.make("chunk",
+                    Op.make("linear", "x",
+                            Op.make("concat", "A", "B", dim=0)),
+                    chunks=2, dim=-1, index=1)),
+    law="Product universal property: <f,g> = (f x g) . Delta.  Two "
+        "projections of the same input are ONE GEMM into V x V, then "
+        "project.  (Fused SwiGLU gate/up — MergedColumnParallelLinear.)",
+)
+
+# (x@A.T) * (x@B.T)  ->  chunk form without the gate nonlinearity.
+# Covers GLU-style variants and any elementwise-mul pair of parallel
+# projections.
+PARALLEL_MUL_FUSE = R(
+    "parallel_mul_fuse",
+    Op.make("mul",
+            Op.make("linear", "x", "A"),
+            Op.make("linear", "x", "B")),
+    Op.make("mul",
+            Op.make("chunk",
+                    Op.make("linear", "x",
+                            Op.make("concat", "A", "B", dim=0)),
+                    chunks=2, dim=-1, index=0),
+            Op.make("chunk",
+                    Op.make("linear", "x",
+                            Op.make("concat", "A", "B", dim=0)),
+                    chunks=2, dim=-1, index=1)),
+    law="Pairing without a gate nonlinearity: mul(<pi1 f>, <pi2 g>) "
+        "recovers the parallel-product form.",
+)
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -331,6 +389,9 @@ CATEGORICAL_RULES: list[Rewrite] = [
     NATURALITY_SCALAR_REV,
     ASSOC_MATMUL,
     ASSOC_MATMUL_REV,
+    # Product structure (fused projections)
+    SWIGLU_FUSE,
+    PARALLEL_MUL_FUSE,
 ]
 
 #: All rules combined.

@@ -13,7 +13,7 @@ import torch
 from catopt.egraph import EGraph
 from catopt.ir import Op, Var, Param, TensorType, IR, op_repr
 from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
-from catopt.cost import flops_cost
+from catopt.cost import flops_cost, launch_aware_cost
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.models import MatrixChain
 
@@ -242,13 +242,14 @@ def demo_swiglu_rmsnorm(
         root_eid = eg.add_term(ir.root)
         stats = eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, root_eid,
                        max_iterations=30, max_nodes=20000)
-        best = eg.extract_best(root_eid, flops_cost)
+        best = eg.extract_best(root_eid, launch_aware_cost)
         if verbose:
             print(f"\n  {name} IR:      {op_repr(ir.root)}")
             print(f"  {name} cost:    {flops_cost(ir.root):.0f} FLOPs")
             print(f"  E-graph stats:  {stats}")
             print(f"  Best term:      {op_repr(best)}")
-            print(f"  Best cost:      {flops_cost(best):.0f} FLOPs")
+            print(f"  Best cost:      {flops_cost(best):.0f} FLOPs"
+                  "  (tree count; shared subterms counted per use)")
         model.eval()
         lowered = ir_to_torch_module(IR(
             root=best, inputs=ir.inputs,

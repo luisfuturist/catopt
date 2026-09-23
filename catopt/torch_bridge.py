@@ -255,6 +255,10 @@ _IR_TO_TORCH: dict[str, Any] = {
     "linear": lambda x, w, *a, **kw: torch.nn.functional.linear(
         x, w, (a[0] if a else kw.get("bias"))
     ),
+    "concat": lambda a, b, dim=0, **kw: torch.cat((a, b), dim=dim),
+    "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
+        t, chunks, dim=dim
+    )[index],
 }
 
 
@@ -297,6 +301,7 @@ class IRModule(torch.nn.Module):
         self._param_values = param_values or {}
         # Phase 3b: materialize weight-only subtrees (e.g. W1 @ (W2 @ W3))
         # at construction time, so runtime is a single matmul per fused chain.
+        self._fold_memo: dict[int, Any] = {}
         self._root = self._fold_weight_chains(ir.root)
         self._build_params()
 
@@ -322,6 +327,16 @@ class IRModule(torch.nn.Module):
         from catopt.ir import Op as _Op
         from catopt.ir import Param as _Param
 
+        # Memoize by identity of the CALLER's term object: the extracted
+        # term may share a subtree object between several parents (e.g.
+        # one fused GEMM under two chunk projections).  Returning the
+        # same folded object preserves that sharing for _eval.  Must
+        # capture id() before `term` is rebound to the rebuilt node.
+        orig_id = id(term)
+        memo_hit = self._fold_memo.get(orig_id)
+        if memo_hit is not None:
+            return memo_hit
+
         if isinstance(term, _Op):
             folded_args = tuple(self._fold_weight_chains(a) for a in term.args)
             term = _Op.make(term.op, *folded_args, **dict(term.attrs))
@@ -338,10 +353,13 @@ class IRModule(torch.nn.Module):
                         self._param_values[fused_name] = fused.detach().clone()
                         shape = tuple(int(d) for d in fused.shape)
                         from catopt.ir import TensorType
-                        return _Param(name=fused_name, typ=TensorType(shape))
+                        result = _Param(name=fused_name, typ=TensorType(shape))
+                        self._fold_memo[orig_id] = result
+                        return result
                 elif term.op in (
                     "add", "mul", "sub", "div", "neg", "square", "sqrt",
                     "sigmoid", "silu", "tanh", "gelu", "exp", "pow",
+                    "concat",
                 ):
                     # Try eager compile-time fold via _IR_TO_TORCH bindings
                     vals: list[torch.Tensor] = []
@@ -366,9 +384,12 @@ class IRModule(torch.nn.Module):
                                 self._param_values[fused_name] = fused.detach().clone()
                                 shape = tuple(int(d) for d in fused.shape)
                                 from catopt.ir import TensorType
-                                return _Param(name=fused_name, typ=TensorType(shape))
+                                result = _Param(name=fused_name, typ=TensorType(shape))
+                                self._fold_memo[orig_id] = result
+                                return result
                         except Exception:
                             pass
+        self._fold_memo[orig_id] = term
         return term
 
     def _build_params(self) -> None:
@@ -404,10 +425,11 @@ class IRModule(torch.nn.Module):
         for inp in self._inputs:
             if inp.name == "x" or not inp.name.startswith("p_"):
                 env[inp.name] = x
-        return self._eval(self._root, env, x)
+        return self._eval(self._root, env, x, {})
 
     def _eval(
-        self, term: Any, env: dict[str, torch.Tensor], x: torch.Tensor
+        self, term: Any, env: dict[str, torch.Tensor], x: torch.Tensor,
+        memo: dict[int, torch.Tensor],
     ) -> torch.Tensor:
         if isinstance(term, Var):
             return env.get(term.name, env.get("self", x))
@@ -420,12 +442,19 @@ class IRModule(torch.nn.Module):
             shape = tuple(d if d is not None else 1 for d in term.typ.shape)
             return torch.randn(*shape)
         if isinstance(term, Op):
+            # Shared subtrees (e.g. one fused GEMM read by two chunk
+            # projections) are the SAME object — compute once.
+            hit = memo.get(id(term))
+            if hit is not None:
+                return hit
             fn = _IR_TO_TORCH.get(term.op)
             if fn is None:
                 raise ValueError(f"No torch binding for op '{term.op}'")
-            args = [self._eval(a, env, x) for a in term.args]
+            args = [self._eval(a, env, x, memo) for a in term.args]
             kwargs = dict(term.attrs) if term.attrs else {}
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            memo[id(term)] = result
+            return result
         raise TypeError(f"Cannot evaluate term: {term}")
 
 

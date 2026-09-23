@@ -216,6 +216,18 @@ op_def("reshape", 1, 1,
 op_def("broadcast", 1, 1,
        law="Monoidal coherence: copy then f = f in parallel.")
 
+# Product structure: pairing and projections.
+# concat(A, B, dim) is the monoidal product on objects — juxtaposing the
+# output spaces of two maps.  chunk(t, n, dim, i) is the projection pi_i
+# that selects the i-th component.  Together they express the universal
+# property of the product: <f, g> = (f x g) ∘ Δ.
+op_def("concat", 2, 1,
+       law="Pairing on objects: concat(W1, W2) builds the product map "
+           "weight.  Wire juxtaposition — a data-movement op.")
+op_def("chunk", 1, 1,
+       law="Projection pi_i of a paired output; a zero-cost view like "
+           "transpose/reshape.")
+
 
 # ---------------------------------------------------------------------------
 #  IR  — top-level program (a single term with free variables)
