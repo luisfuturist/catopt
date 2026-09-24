@@ -294,6 +294,32 @@ def test_eps_families_compose():
     assert mb["bound"] >= err or mb["bound"] == float("inf")
 
 
+def test_optimize_weight_program():
+    """A weight IS a program: optimize_weight builds an e-graph over
+    the leaf, offers certified realizations, saturates them under the
+    ordinary laws, and extracts the cheapest under storage cost."""
+    from catopt.eps import optimize_weight
+    from catopt.torch_bridge import IRModule
+    from catopt.ir import IR, Var, TensorType
+    torch.manual_seed(0)
+    W = (torch.randn(128, 6) @ torch.randn(6, 128)
+         + 0.01 * torch.randn(128, 128)).double()
+    res = optimize_weight("W", W, rtol=0.02)
+    assert res["offers"]                       # something was offered
+    assert res["bytes"] < res["orig_bytes"]    # storage shrank
+    cert = res["certificate"]
+    assert cert.replayable
+    # the extracted program *executes* and meets its bound
+    mod = IRModule(
+        IR(root=res["term"], params={},
+           inputs=[Var("x", TensorType((1,)))]),
+        res["source_tensors"])
+    with torch.no_grad():
+        What = mod(torch.randn(1, dtype=torch.float64))
+    err = float(torch.linalg.norm(What - W, 2))
+    assert err <= cert.error_bound + 1e-9
+
+
 def test_kron_rejects_dense_random():
     """A random full-rank weight has no compressible rearrangement."""
     torch.manual_seed(7)

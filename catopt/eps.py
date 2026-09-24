@@ -42,13 +42,185 @@ from __future__ import annotations
 
 from typing import Any
 
+import math
+
 import torch
 
 from catopt.egraph import EGraph, Rewrite
 from catopt.ir import Op, Param, Const, TensorType
 
 __all__ = ["low_rank_params", "kron_linear_params",
-           "low_rank_gather", "quant_params", "model_bound"]
+           "low_rank_gather", "quant_params", "model_bound",
+           "optimize_weight"]
+
+
+def optimize_weight(name: str, W: torch.Tensor, *,
+                    rtol: float = 0.05, bits: int = 8,
+                    rules=None, witness: bool = True) -> dict:
+    """A weight *is* a program — searched by catopt itself.
+
+    Builds an e-graph over the leaf ``Param(name)``, offers every
+    certified compressed representation the ε-passes know — low-rank
+    ``matmul(U_r, V_rᵀ)``, sum-of-Kronecker (executable
+    ``reshape/transpose/matmul`` chains), int8 ``mul(float(q), s)`` —
+    then saturates with the ordinary rule set (the offers are
+    *members*, rewritten by the same laws as any other term) and
+    extracts the cheapest under ``param_bytes_cost(by_bytes=True)``.
+
+    Returns ``{term, certificate, source_tensors, bound, bytes,
+    offers}`` — the cheapest program for ``W`` plus the proof of how
+    wrong it is.
+
+    Caveat: representation search, not task-aware compression —
+    Phase-5 showed norm bounds do not predict perplexity.  Use where a
+    norm bound IS the contract (activation paths, certified
+    deployment, exact structural sharing).
+    """
+    from catopt.rules import all_rules
+    from catopt.cost import param_bytes_cost_for
+
+    src: dict = {name: W}
+    eg = EGraph()
+    typ = TensorType(tuple(W.shape))
+    leaf = Param(name, typ)
+    root = eg.add_term(leaf)
+    offers = []
+
+    if W.ndim == 2 and W.is_floating_point():
+        o, i = W.shape
+        Wd = W.detach().double()
+        try:
+            U, S, Vt = torch.linalg.svd(Wd, full_matrices=False)
+        except Exception:
+            S = None
+        # ---- low-rank offer -----------------------------------------
+        if S is not None and S.numel() > 1 and S[0] > 0:
+            budget = rtol * float(S[0])
+            tail = torch.cat([S, S.new_zeros(1)])
+            below = (tail[1:] <= budget).nonzero()
+            if len(below):
+                r = int(below[0].item()) + 1
+                if r * (o + i) < 0.9 * o * i:
+                    bound = float(tail[r])
+                    un, vn = f"w_{name}_u", f"w_{name}_v"
+                    src[un] = (U[:, :r] * S[:r]).to(W.dtype)
+                    src[vn] = Vt[:r].contiguous().to(W.dtype)
+                    member = Op.make(
+                        "matmul",
+                        Param(un, TensorType((o, r))),
+                        Param(vn, TensorType((r, i))))
+                    meid = eg.add_term(member)
+                    wit = Rewrite(
+                        name=f"wlr#{meid}", lhs=leaf, rhs=member,
+                        law=f"W ≈ U_rΣVᵀ, ‖ΔW‖₂ = σ_{r + 1}",
+                        error_bound=bound,
+                        bound_norm="spectral") if witness else None
+                    eg.union(root, meid, witness=wit)
+                    offers.append(("lowrank", r, bound))
+        # ---- Kronecker-sum offer (executable form) -------------------
+        # A⊗B = reshape(transpose(reshape(Avec@Bvecᵀ,(m1,n1,m2,n2)),
+        #               dims 1↔2), (o,i))
+        for m1 in range(2, int(o ** 0.5) + 2):
+            if o % m1:
+                continue
+            m2 = o // m1
+            for n1 in range(2, int(i ** 0.5) + 2):
+                if i % n1:
+                    continue
+                n2 = i // n1
+                R = (Wd.reshape(m1, m2, n1, n2)
+                     .permute(0, 2, 1, 3)
+                     .reshape(m1 * n1, m2 * n2))
+                try:
+                    Ur, S2, Vr = torch.linalg.svd(
+                        R, full_matrices=False)
+                except Exception:
+                    continue
+                e = torch.cumsum(S2 ** 2, 0) / (S2 ** 2).sum()
+                ok = (1 - e <= rtol ** 2).nonzero()
+                if not len(ok):
+                    continue
+                K = int(ok[0].item()) + 1
+                if K * (m1 * n1 + m2 * n2) >= 0.9 * o * i:
+                    continue
+                resid = float(torch.sqrt((S2[K:] ** 2).sum()))
+                acc = None
+                for t in range(K):
+                    an, bn = f"w_{name}_k{t}a", f"w_{name}_k{t}b"
+                    src[an] = (Ur[:, t] * S2[t]).reshape(
+                        m1, n1).to(W.dtype).contiguous()
+                    src[bn] = Vr[t].reshape(
+                        m2, n2).to(W.dtype).contiguous()
+                    kt = Op.make(
+                        "reshape",
+                        Op.make(
+                            "transpose",
+                            Op.make(
+                                "reshape",
+                                Op.make(
+                                    "matmul",
+                                    Op.make(
+                                        "reshape",
+                                        Param(an,
+                                              TensorType((m1, n1))),
+                                        shape=(m1 * n1, 1)),
+                                    Op.make(
+                                        "reshape",
+                                        Param(bn,
+                                              TensorType((m2, n2))),
+                                        shape=(1, m2 * n2))),
+                                shape=(m1, n1, m2, n2)),
+                            arg1=1, arg2=2),
+                        shape=(o, i))
+                    acc = kt if acc is None else Op.make(
+                        "add", acc, kt)
+                meid = eg.add_term(acc)
+                wit = Rewrite(
+                    name=f"wkron#{meid}", lhs=leaf, rhs=acc,
+                    law=f"W ≈ Σ_{K} Aᵢ⊗Bᵢ, ‖ΔW‖_F = {resid:.3e}",
+                    error_bound=resid,
+                    bound_norm="frobenius") if witness else None
+                eg.union(root, meid, witness=wit)
+                offers.append(("kron", K, resid))
+                break
+            else:
+                continue
+            break
+        # ---- quantization offer --------------------------------------
+        amax = float(Wd.abs().max())
+        if amax > 0:
+            lv = 2 ** (bits - 1) - 1
+            s = amax / lv
+            q = torch.clip(torch.round(Wd / s), -lv - 1, lv)
+            qname = f"w_{name}_q{bits}"
+            src[qname] = q.to(torch.int8)
+            bound = float(s / 2 * math.sqrt(W.numel()))
+            member = Op.make(
+                "mul",
+                Op.make("float", Param(qname, typ),
+                        dtype=str(W.dtype).split(".")[-1]),
+                Const(float(s)))
+            meid = eg.add_term(member)
+            wit = Rewrite(
+                name=f"wquant#{meid}", lhs=leaf, rhs=member,
+                law=f"W ≈ int{bits}·s, ‖ΔW‖_F ≤ (s/2)·√n",
+                error_bound=bound,
+                bound_norm="frobenius") if witness else None
+            eg.union(root, meid, witness=wit)
+            offers.append(("quant", bits, bound))
+
+    # saturate the generator programs themselves with the ordinary
+    # laws — the offers are members, not endpoints
+    eg.run(all_rules() if rules is None else rules, root,
+           max_iterations=3)
+    term = eg.extract_best(
+        root, param_bytes_cost_for(src, by_bytes=True))
+    cert = eg.certificate(leaf, term, root_eid=root)
+    nbytes = param_bytes_cost_for(src, by_bytes=True)(term)
+    return {"term": term, "certificate": cert,
+            "source_tensors": src, "bound": cert.error_bound,
+            "bytes": int(nbytes), "orig_bytes": int(
+                W.numel() * W.element_size()), "offers": offers}
 
 
 _LIP_ELEM = {"sigmoid": 0.25, "tanh": 1.0, "relu": 1.0,
