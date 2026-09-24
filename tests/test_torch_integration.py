@@ -343,6 +343,66 @@ def test_assoc_linear_transpose_order():
             _ = (d.W1.weight + d.W2.weight) @ d.W3.weight
 
 
+def test_assoc_linear_bias_composes():
+    """linear(linear(x,A,b1),B,b2) ≡ linear(x, BA, B·b1) + b2 —
+    affine-map composition including biases.  Fires on the 3-ary
+    linear torch.export emits for bias=True, where assoc_linear
+    cannot reach."""
+    from catopt.rules import ASSOC_LINEAR_BIAS
+    torch.manual_seed(0)
+    i, h, o = 32, 128, 32
+    x = Var("x", TensorType((4, i)))
+    A = Param("A", TensorType((h, i)))
+    B = Param("B", TensorType((o, h)))
+    b1 = Param("b1", TensorType((h,)))
+    b2 = Param("b2", TensorType((o,)))
+    src = Op.make("linear", Op.make("linear", x, A, b1), B, b2)
+
+    eg = EGraph()
+    eid = eg.add_term(src)
+    eg.run([ASSOC_LINEAR_BIAS], eid, max_iterations=4, max_nodes=1000)
+    assert eg.rule_fires.get("assoc_linear_bias", 0) >= 1
+    assert len(eg.get_class(eid).nodes) >= 2
+
+    # fp64 verify both directions of the equivalence
+    xv = torch.randn(4, i, dtype=torch.float64)
+    Av = torch.randn(h, i, dtype=torch.float64)
+    Bv = torch.randn(o, h, dtype=torch.float64)
+    b1v = torch.randn(h, dtype=torch.float64)
+    b2v = torch.randn(o, dtype=torch.float64)
+    lhs = torch.nn.functional.linear(
+        torch.nn.functional.linear(xv, Av, b1v), Bv, b2v)
+    rhs = torch.nn.functional.linear(xv, Bv @ Av, Bv @ b1v) + b2v
+    assert (lhs - rhs).abs().max() < 1e-12
+
+
+def test_assoc_linear_bias_end_to_end_param_drop():
+    """A biased 2-layer chain collapses to one fused weight + fused
+    bias when the hidden dim sits above the break-even — real
+    parameter storage reduction, not just a rewrite."""
+    from catopt.optimize import optimize_model
+    torch.manual_seed(0)
+
+    class BiasedMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = torch.nn.Linear(32, 128)
+            self.fc2 = torch.nn.Linear(128, 32)
+
+        def forward(self, x):
+            return self.fc2(self.fc1(x))
+
+    m = BiasedMLP().eval().double()
+    x = torch.randn(4, 32, dtype=torch.float64)
+    low, _stats = optimize_model(m, x, cost_fn=flops_cost)
+    with torch.no_grad():
+        ref = m(x)
+        y = low(x)
+    assert (y - ref).abs().max() < 1e-9
+    n_params = sum(p.numel() for p in low.parameters())
+    assert n_params < sum(p.numel() for p in m.parameters())
+
+
 def test_weight_merge_does_not_fire_on_distinct_inputs():
     """Soundness: x@W1 + y@W2 (x != y) must stay unmerged."""
     torch.manual_seed(0)
