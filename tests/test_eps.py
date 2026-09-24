@@ -13,7 +13,8 @@ from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Var, TensorType, op_repr
 from catopt.rules import all_rules
 from catopt.eps import (low_rank_params, kron_linear_params,
-                        low_rank_gather)
+                        low_rank_gather, quant_params)
+from catopt.cost import param_bytes_cost_for
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 
@@ -174,6 +175,39 @@ def test_kron_offer_executes_within_frobenius_bound():
     assert "eps_kron" in " ".join(cert.rules_used)
     # factor params only — the dense weight is gone
     assert sum(t.numel() for t in mod.parameters()) == o["stored"]
+
+
+def test_quant_params_int8_certified():
+    """Quantization-as-rewrite: W -> mul(float(W_int8), s) with a
+    certified Frobenius bound (s/2)·√n.  Byte-aware storage cost
+    selects it; the extracted module stores an int8 tensor."""
+    torch.manual_seed(0)
+    m = nn.Linear(64, 64, bias=False).eval().double()
+    x = torch.randn(4, 64, dtype=torch.float64)
+    ir, src = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(all_rules(), root, max_iterations=2)
+    offers = quant_params(eg, src, bits=8)
+    assert offers
+    o = offers[0]
+    assert o["bound"] > 0
+
+    term = eg.extract_best(root, param_bytes_cost_for(src,
+                                                    by_bytes=True))
+    xv = Var("x", TensorType((4, 64)))
+    mod = ir_to_torch_module(
+        IR(root=term, params={}, inputs=[xv]), src)
+    with torch.no_grad():
+        err = (mod(x) - m(x)).abs().max().item()
+    assert err <= o["bound"] + 1e-9
+    assert any(p.dtype == torch.int8 for p in mod.parameters())
+    assert (sum(t.numel() * t.element_size()
+                for t in mod.parameters())
+            < 64 * 64 * 8 / 2)  # int8 < fp64
+    cert = eg.certificate(ir.root, term, root_eid=root)
+    assert cert.error_bound == o["bound"] and cert.replayable
+    assert not cert.exact
 
 
 def test_kron_rejects_dense_random():

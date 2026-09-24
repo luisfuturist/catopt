@@ -239,6 +239,9 @@ op_def("index_select", 1, 1,
 op_def("embedding", 2, 1,
        law="Row gather: embedding(W, idx) selects rows of the table; "
            "low-rank tables factor as gather-then-project.")
+op_def("float", 1, 1,
+       law="Dtype coercion to working precision — the decode half of "
+           "quantization-as-rewrite: mul(float(q), s).")
 
 # Attention
 op_def("contiguous", 1, 1,

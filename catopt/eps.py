@@ -45,10 +45,83 @@ from typing import Any
 import torch
 
 from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Op, Param, TensorType
+from catopt.ir import Op, Param, Const, TensorType
 
 __all__ = ["low_rank_params", "kron_linear_params",
-           "low_rank_gather"]
+           "low_rank_gather", "quant_params"]
+
+
+def quant_params(eg: EGraph, source_tensors: dict, *,
+                 bits: int = 8,
+                 witness: bool = True) -> list[dict]:
+    """Quantization-as-ε: offer ``mul(float(W_q), s)`` for every Param
+    leaf in the e-graph, where ``W_q`` is per-tensor symmetric int
+    (``bits``) and ``s = absmax/levels``.
+
+    Certified bound: each entry rounds off by ≤ s/2, so
+    ``‖W − Ŵ‖_F ≤ s/2·√numel`` — Frobenius, exact.  The quantized
+    tensor is stored as its integer dtype (``by_bytes`` pricing sees
+    the width reduction; ``param_bytes_cost``'s default value count
+    does not).  ``float()`` restores the working dtype at use sites.
+
+    This is the third member of the unified object: low-rank, tying,
+    and quantization are all rewrites with an error bound.
+    """
+    levels = 2 ** (bits - 1) - 1
+    dtype = {8: torch.int8, 4: torch.int8}[bits]  # int4 stored as int8
+    offers: list[dict] = []
+    seen: set[str] = set()
+    for cid in list(eg._classes.keys()):
+        c = eg.find(cid)
+        ec = eg._classes.get(c)
+        if ec is None:
+            continue
+        for node in list(ec.nodes):
+            if node.op != "leaf":
+                continue
+            wt = eg.any_term(c)
+            if not (isinstance(wt, Param)
+                    and wt.name in source_tensors
+                    and wt.name not in seen):
+                continue
+            seen.add(wt.name)
+            W = source_tensors[wt.name]
+            if not (isinstance(W, torch.Tensor)
+                    and W.is_floating_point() and W.numel() > 1):
+                continue
+            Wd = W.detach()
+            amax = float(Wd.abs().max())
+            if amax == 0:
+                continue
+            s = amax / levels
+            q = torch.round(Wd / s).clamp(-levels - 1, levels).to(dtype)
+            qname = f"eps_q{bits}_{wt.name}"
+            source_tensors[qname] = q
+            member = Op.make(
+                "mul",
+                Op.make("float", Param(qname, wt.typ),
+                        dtype=str(W.dtype).split(".")[-1]),
+                Const(float(s)))
+            member_eid = eg.add_term(member)
+            wit = None
+            if witness:
+                bound = s / 2 * (W.numel() ** 0.5)
+                wit = Rewrite(
+                    name=f"eps_q{bits}#{member_eid}",
+                    lhs=wt, rhs=member,
+                    law=(f"symmetric int{bits} quantization of "
+                         f"{wt.name}: ‖W−Ŵ‖_F ≤ (s/2)·√n = "
+                         f"{bound:.3e} (s={s:.3e})"),
+                    error_bound=bound, bound_norm="frobenius")
+            eg.union(c, member_eid, witness=wit,
+                     note=(f"eps_quant: {wt.name} -> int{bits} "
+                           f"(s={s:.3e})"))
+            offers.append({"name": wt.name, "bits": bits,
+                           "bound": wit.error_bound if wit else
+                                    s / 2 * (W.numel() ** 0.5),
+                           "stored": q.numel(), "original": W.numel(),
+                           "eid": member_eid})
+    return offers
 
 
 def low_rank_gather(eg: EGraph, source_tensors: dict, *,

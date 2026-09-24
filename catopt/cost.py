@@ -719,7 +719,8 @@ def count_cost(term: Any, memo: dict | None = None) -> float:
 # ---------------------------------------------------------------------------
 
 def param_bytes_cost(term: Any, source_tensors: dict | None = None,
-                     memo: dict | None = None) -> float:
+                     memo: dict | None = None,
+                     by_bytes: bool = False) -> float:
     """Cost = number of stored parameter values referenced by Param leaves.
 
     The storage axis the flop-based models cannot see: a low-rank
@@ -747,7 +748,8 @@ def param_bytes_cost(term: Any, source_tensors: dict | None = None,
     values — folding shrinks FLOPs, not the weights file.
     """
     memo = {} if memo is None else memo
-    return float(sum(_param_index(term, source_tensors, memo).values()))
+    return float(sum(_param_index(term, source_tensors, memo,
+                                  by_bytes).values()))
 
 
 # Marker read by EGraph.extract_best / dag_cost: storage pricing does
@@ -755,36 +757,48 @@ def param_bytes_cost(term: Any, source_tensors: dict | None = None,
 param_bytes_cost.charges_param_only = True
 
 
-def param_bytes_cost_for(source_tensors: dict | None = None):
+def param_bytes_cost_for(source_tensors: dict | None = None,
+                         by_bytes: bool = False):
     """Bind ``source_tensors`` and return a standard cost fn.
 
     Same closure convention as :func:`roofline_cost_for`: the result
     has signature ``fn(term, memo=None)`` — dropping straight into
     ``EGraph.extract_best`` / ``dag_cost`` — and carries the
-    ``charges_param_only`` marker through to extraction.
+    ``charges_param_only`` marker through to extraction.  ``by_bytes``
+    weights each stored value by its dtype width — the axis under
+    which quantized params price below fp32.
     """
 
     def cost(term: Any, memo: dict | None = None) -> float:
-        return param_bytes_cost(term, source_tensors, memo)
+        return param_bytes_cost(term, source_tensors, memo,
+                                by_bytes)
 
     cost.__name__ = "param_bytes_cost_for"
     cost.charges_param_only = True
     return cost
 
 
-def _param_numel(p: Param, source_tensors: dict | None) -> float:
+def _param_numel(p: Param, source_tensors: dict | None,
+                 by_bytes: bool = False) -> float:
     """Stored scalar count for one Param leaf.
 
     ``source_tensors`` (name -> tensor, e.g. from ``export_to_ir`` plus
     any ``eps_*`` factors a pass injected) is authoritative when the
-    name resolves there; else the declared ``TensorType``.
+    name resolves there; else the declared ``TensorType``.  With
+    ``by_bytes`` the count is weighted by the stored dtype's width
+    (``numel * element_size``) — the axis under which int8 quantization
+    prices 4× below fp32; unknown widths default to 4 bytes.
     """
     if source_tensors is not None:
         t = source_tensors.get(p.name)
         if t is not None:
             n = getattr(t, "numel", None)
             if callable(n):
-                return float(n())          # torch.Tensor / jax / etc.
+                numel = float(n())
+                if by_bytes:
+                    esz = getattr(t, "element_size", None)
+                    return numel * (esz() if callable(esz) else 4)
+                return numel              # torch.Tensor / jax / etc.
             s = getattr(t, "size", None)
             if isinstance(s, (int, float)):
                 return float(s)            # numpy .size
@@ -793,7 +807,7 @@ def _param_numel(p: Param, source_tensors: dict | None) -> float:
 
 
 def _param_index(term: Any, source_tensors: dict | None,
-                 memo: dict) -> dict[str, float]:
+                 memo: dict, by_bytes: bool = False) -> dict[str, float]:
     """``{name: numel}`` for every Param leaf in a term DAG.
 
     Memoised per subtree id — merging is keyed on *name*, so a shared
@@ -805,11 +819,13 @@ def _param_index(term: Any, source_tensors: dict | None,
     if hit is not None:
         return hit
     if isinstance(term, Param):
-        out = {term.name: _param_numel(term, source_tensors)}
+        out = {term.name: _param_numel(term, source_tensors,
+                                       by_bytes)}
     elif isinstance(term, Op):
         out = {}
         for a in term.args:
-            for n, v in _param_index(a, source_tensors, memo).items():
+            for n, v in _param_index(a, source_tensors, memo,
+                                     by_bytes).items():
                 out.setdefault(n, v)
     else:
         out = {}

@@ -450,7 +450,10 @@ _IR_TO_TORCH: dict[str, Any] = {
     "type_as": lambda x, t, *a, **kw: x.type_as(t),
     "cos": torch.cos,
     "sin": torch.sin,
-    "float": lambda x, *a, **kw: x.float(),
+    "float": lambda x, *a, **kw: x.to(
+        getattr(torch, str(kw.get("dtype", "float32")))
+        if isinstance(kw.get("dtype"), str)
+        else torch.float32),
     "alias": lambda x, *a, **kw: x,
     "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
         x, dim=int(kw.get("arg1", kw.get("dim", -1)))
@@ -695,8 +698,13 @@ class IRModule(torch.nn.Module):
         collect(self._root)
         for name, shape in param_shapes.items():
             if name in self._param_values:
-                # Use the original model's parameter value
-                p = torch.nn.Parameter(self._param_values[name].clone())
+                # Use the original model's parameter value.  Integer
+                # tensors (quantized params offered by eps passes) are
+                # registered without grad — Parameters require float.
+                v = self._param_values[name].clone()
+                p = torch.nn.Parameter(
+                    v, requires_grad=v.is_floating_point()
+                    or v.is_complex())
             else:
                 p = torch.nn.Parameter(torch.randn(*shape) * 0.02)
             # Use the IR name (e.g. p_w1) so _eval can find it
