@@ -402,6 +402,14 @@ def test_assoc_linear_bias_end_to_end_param_drop():
     n_params = sum(p.numel() for p in low.parameters())
     assert n_params < sum(p.numel() for p in m.parameters())
 
+    # the optimized weights file: eliminated originals + derived folds
+    from catopt.optimize import param_report
+    r = param_report(m, low)
+    assert r["optimized_bytes"] < r["original_bytes"]
+    assert r["eliminated"]  # fc1/fc2 weights folded away
+    assert r["derived"]     # fused_ materialized params
+    assert (y - ref).abs().max() < 1e-9
+
 
 def test_weight_merge_does_not_fire_on_distinct_inputs():
     """Soundness: x@W1 + y@W2 (x != y) must stay unmerged."""

@@ -322,6 +322,45 @@ def optimize_model(
     return optimized_module, stats
 
 
+def param_report(model: torch.nn.Module,
+                 optimized_module: torch.nn.Module) -> dict:
+    """Joint graph+parameter view: which original parameters survive in
+    the optimized realization, which were eliminated, and which were
+    derived (folded) — the 'optimized weights file' diff.
+
+    The optimized module's state_dict IS the smaller weights file:
+    ``_fold_weight_chains`` materialises derived tensors (``fused_*``)
+    and ``_build_params`` registers only parameters the extracted term
+    actually references, so eliminated subgraphs drop their weights
+    automatically.  This function makes that auditable.
+    """
+    orig = {n: p for n, p in model.state_dict().items()}
+    opt = {n: p for n, p in optimized_module.state_dict().items()}
+    orig_names = {f"p_{n.replace('.', '_')}" for n in orig}
+    opt_names = set(opt)
+    eliminated = sorted(orig_names - opt_names)
+    derived = sorted(n for n in opt_names if n not in orig_names)
+    orig_bytes = sum(p.numel() * p.element_size() for p in orig.values())
+    opt_bytes = sum(p.numel() * p.element_size() for p in opt.values())
+    return {
+        "original_params": len(orig),
+        "optimized_params": len(opt),
+        "original_bytes": orig_bytes,
+        "optimized_bytes": opt_bytes,
+        "eliminated": eliminated,
+        "derived": derived,
+        "bytes_saved": orig_bytes - opt_bytes,
+        "ratio": opt_bytes / orig_bytes if orig_bytes else 1.0,
+    }
+
+
+def save_optimized_weights(optimized_module: torch.nn.Module,
+                           path: str) -> None:
+    """Emit the optimized weights file — only the parameters the
+    certified form actually needs (folded derived tensors included)."""
+    torch.save(optimized_module.state_dict(), path)
+
+
 def ir_to_string(term: Any) -> str:
     """Pretty-print an IR term as an S-expression."""
     return op_repr(term)

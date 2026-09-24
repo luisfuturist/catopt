@@ -434,13 +434,18 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 - **More weight-preserving dualities**: RepVGG-style branch merging,
   conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
   architecture over the same parameters.
-- **Joint graph+parameter optimization**: today the laws rewrite the
-  graph *over* parameters; the deeper target is rewriting the
-  parameter realization itself — exact composed-linear collapse
-  (`W₂W₁x`, smaller iff `o·i < h(o+i)`), provably-dead parameter
-  elimination (null-space annihilation), and weight sharing/factoring
-  — all under exact equivalence, complementary to approximate
-  compression (quantization, low-rank).
+- **Joint graph+parameter optimization** *(partially landed)*: the
+  optimizer already rewrites the parameter *realization*, not just the
+  graph over it — `assoc_linear(_bias)` composes `W₂(W₁x+b₁)+b₂` into
+  `linear(x, W₂W₁, W₂b₁)+b₂`, `_fold_weight_chains` materializes the
+  fused tensors, and `_build_params` registers only what the extracted
+  term references, so eliminated subgraphs drop their weights from the
+  state dict. `param_report(model, opt)` audits it: on a biased
+  `Linear(32→128)→Linear(128→32)` chain the optimized weights file is
+  **87% smaller** (66.8KB → 8.7KB), fp64-exact. Open: null-space dead
+  parameter detection (needs a value-level decision procedure),
+  weight sharing/factoring, and a parameter-storage cost axis so
+  extraction can *prefer* smaller realizations.
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.
