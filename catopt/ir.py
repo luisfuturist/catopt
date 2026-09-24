@@ -231,6 +231,11 @@ op_def("split", 1, 1,
        law="Projection pi_i with explicit (possibly unequal) section "
            "sizes — the asymmetric counterpart of chunk, for pairing "
            "maps with different output dimensions (e.g. GQA fused QKV).")
+op_def("index_select", 1, 1,
+       law="Reindexing along one axis (a gather of rows/blocks): the "
+           "generalised projection.  With a repeated-index map it "
+           "realises slice-level sharing — the copy map Delta applied "
+           "per row-block.")
 
 # Attention
 op_def("contiguous", 1, 1,

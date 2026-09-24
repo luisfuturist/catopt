@@ -3,9 +3,11 @@
 The cost model assigns a scalar "cost" to a term, used by
 EGraph.extract_best to find the minimum-cost representative.
 
-Two models are provided:
+Models provided include:
 * count_cost - counts the number of operations (simplest).
 * flops_cost - estimates FLOPs using shape information.
+* param_bytes_cost - counts stored parameter values (the storage
+  axis; what lets extraction prefer certified compressed members).
 
 For the "killer experiment", the FLOPs-based model matters: it rewards
 the associativity / distributivity / naturality rewrites that produce
@@ -195,6 +197,16 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             out = list(base)
             if isinstance(base[d], int) and isinstance(hi, int):
                 out[d] = min(hi, base[d]) - (lo or 0)
+            return tuple(out)
+        case "index_select":
+            # Gather along dim: that axis resizes to len(index).
+            base = shapes[0]
+            if base is None or not base:
+                return base
+            d = op.attrs.get("dim", op.attrs.get("arg1", 0)) % len(base)
+            idx = op.attrs.get("index", op.attrs.get("arg2"))
+            out = list(base)
+            out[d] = len(idx) if isinstance(idx, (tuple, list)) else None
             return tuple(out)
         case "flatten":
             base = shapes[0]
@@ -387,6 +399,8 @@ _OP_FLOPS: dict[str, int] = {
     # concat/chunk are wire juxtaposition / projection: pure data
     # movement, zero FLOPs.  On weights they are compile-time work.
     "concat": 0, "chunk": 0, "split": 0,
+    # index_select is a gather: memory traffic, no arithmetic.
+    "index_select": 0,
     # contiguous copies memory (0 FLOPs but real bandwidth — the
     # roofline model prices it); sdpa ~2*T work per output element.
     "contiguous": 0, "sdpa": 2,
@@ -570,10 +584,18 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
 
     ``memo`` is forwarded to cost functions that accept it (the
     built-in models do), so children already costed are O(1) lookups.
+
+    Cost models that price parameter *storage* (``param_bytes_cost``)
+    opt out of the param-only discount by setting
+    ``charges_param_only`` on the function: a folded subtree still
+    stores its leaves' values.
     """
     import inspect
     memo = {} if memo is None else memo
     takes_memo = "memo" in inspect.signature(cost_fn).parameters
+    # getattr(..., "func", ...) unwraps functools.partial bindings.
+    bill_params = getattr(getattr(cost_fn, "func", cost_fn),
+                          "charges_param_only", False)
 
     def c(t: Any) -> float:
         return cost_fn(t, memo=memo) if takes_memo else cost_fn(t)
@@ -608,7 +630,7 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
             return
         seen.add(id(t))
         if isinstance(t, Op):
-            if not has_var(t):
+            if not has_var(t) and not bill_params:
                 return  # folds at compile time — free at runtime
             for a in t.args:
                 rec(a)
@@ -684,6 +706,109 @@ def count_cost(term: Any, memo: dict | None = None) -> float:
         return memo[ck]
     memo[ck] = 0.0
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+#  Parameter-storage cost model — the ε axis's pricing side
+# ---------------------------------------------------------------------------
+
+def param_bytes_cost(term: Any, source_tensors: dict | None = None,
+                     memo: dict | None = None) -> float:
+    """Cost = number of stored parameter values referenced by Param leaves.
+
+    The storage axis the flop-based models cannot see: a low-rank
+    factorisation or a shared (tied) weight computes the same function
+    from fewer stored scalars.  The unit is *values* (bytes at unit
+    width — multiply by dtype size for true bytes); ``eps_*`` factor
+    params introduced by :func:`catopt.eps.low_rank_params` count
+    normally, which is what lets extraction prefer the certified
+    compressed member.
+
+    Leaves are deduplicated *by name* — a weight read by two consumers
+    is stored once (two ``Param`` objects spelled identically are the
+    same leaf in the e-graph anyway: ``repr(Param)`` is the name).  A
+    Param's numel comes from ``source_tensors[name]`` when the name
+    resolves there — the actual tensor, authoritative for derived
+    ``eps_*`` params — else from its ``TensorType`` (unknown dims
+    count 1, matching ``_numel``'s best-effort convention).
+
+    Follows the standard ``(term, memo=None)`` cost-fn convention;
+    ``source_tensors`` is bound with :func:`param_bytes_cost_for` (or
+    ``functools.partial(param_bytes_cost, source_tensors=...)``) for
+    use in :meth:`EGraph.extract_best`.  The model sets
+    ``charges_param_only`` so extraction does NOT apply the param-only
+    discount: a compile-time-folded subtree still stores its leaves'
+    values — folding shrinks FLOPs, not the weights file.
+    """
+    memo = {} if memo is None else memo
+    return float(sum(_param_index(term, source_tensors, memo).values()))
+
+
+# Marker read by EGraph.extract_best / dag_cost: storage pricing does
+# not fold away at compile time, so param-only subtrees stay billed.
+param_bytes_cost.charges_param_only = True
+
+
+def param_bytes_cost_for(source_tensors: dict | None = None):
+    """Bind ``source_tensors`` and return a standard cost fn.
+
+    Same closure convention as :func:`roofline_cost_for`: the result
+    has signature ``fn(term, memo=None)`` — dropping straight into
+    ``EGraph.extract_best`` / ``dag_cost`` — and carries the
+    ``charges_param_only`` marker through to extraction.
+    """
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        return param_bytes_cost(term, source_tensors, memo)
+
+    cost.__name__ = "param_bytes_cost_for"
+    cost.charges_param_only = True
+    return cost
+
+
+def _param_numel(p: Param, source_tensors: dict | None) -> float:
+    """Stored scalar count for one Param leaf.
+
+    ``source_tensors`` (name -> tensor, e.g. from ``export_to_ir`` plus
+    any ``eps_*`` factors a pass injected) is authoritative when the
+    name resolves there; else the declared ``TensorType``.
+    """
+    if source_tensors is not None:
+        t = source_tensors.get(p.name)
+        if t is not None:
+            n = getattr(t, "numel", None)
+            if callable(n):
+                return float(n())          # torch.Tensor / jax / etc.
+            s = getattr(t, "size", None)
+            if isinstance(s, (int, float)):
+                return float(s)            # numpy .size
+    shape = getattr(getattr(p, "typ", None), "shape", None)
+    return float(_numel(shape))
+
+
+def _param_index(term: Any, source_tensors: dict | None,
+                 memo: dict) -> dict[str, float]:
+    """``{name: numel}`` for every Param leaf in a term DAG.
+
+    Memoised per subtree id — merging is keyed on *name*, so a shared
+    weight (one Param leaf reached through several parents, or two
+    leaves spelled identically) is stored once.
+    """
+    key = ("pbi", id(term))
+    hit = memo.get(key)
+    if hit is not None:
+        return hit
+    if isinstance(term, Param):
+        out = {term.name: _param_numel(term, source_tensors)}
+    elif isinstance(term, Op):
+        out = {}
+        for a in term.args:
+            for n, v in _param_index(a, source_tensors, memo).items():
+                out.setdefault(n, v)
+    else:
+        out = {}
+    memo[key] = out
+    return out
 
 
 # ---------------------------------------------------------------------------

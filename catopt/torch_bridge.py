@@ -434,6 +434,15 @@ _IR_TO_TORCH: dict[str, Any] = {
         int(kw.get("arg1", kw.get("dim", 0))),
         int(kw.get("arg2", kw.get("index", 0))),
     ),
+    # gather along one axis.  The index is normally an attr (a tuple of
+    # ints produced by share_duplicate_param_slices); a second tensor
+    # operand (the raw aten spelling) is accepted too.
+    "index_select": lambda t, *a, **kw: torch.index_select(
+        t, int(kw.get("dim", kw.get("arg1", 0))),
+        (a[0] if a and torch.is_tensor(a[0]) else torch.as_tensor(
+            [int(v) for v in kw.get(
+                "index", kw.get("arg2", a[0] if a else ()))],
+            dtype=torch.long, device=t.device))),
     "type_as": lambda x, t, *a, **kw: x.type_as(t),
     "cos": torch.cos,
     "sin": torch.sin,

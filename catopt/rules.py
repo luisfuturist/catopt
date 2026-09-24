@@ -1147,6 +1147,148 @@ def share_duplicate_params(eg: Any, source_tensors: dict,
     return groups
 
 
+def share_duplicate_param_slices(
+        eg: Any, source_tensors: dict, *,
+        witness: bool = True,
+        head_counts: range = range(2, 65)) -> list[dict]:
+    """Slice-level weight sharing: deduplicate bitwise-equal row-blocks
+    INSIDE a single 2-D parameter — the intra-tensor analogue of
+    :func:`share_duplicate_params`.
+
+    A projection weight W (o×i) in a multi-head architecture packs h
+    per-head row-blocks of ``d_head = o / h`` rows (GQA/MHA QKV, fused
+    per-head gates).  When two heads are bitwise equal — tied heads,
+    duplicated branches, GQA replication baked into the checkpoint —
+    they need only one storage copy:
+
+        W = reshape(index_select(D, dim=0, index=map), (o, i))
+
+    where ``D`` is a NEW ``(k, d_head, i)`` parameter stacking the
+    ``k < h`` distinct head-blocks in first-occurrence order and
+    ``map`` sends each head slot to its surviving block.  The member is
+    offered to W's e-class with a pointwise witness — an exact equality
+    (``error_bound=None``), so certificates replay it as a rule step.
+
+    Two representation notes:
+
+    * ``index_select`` gathers at HEAD granularity (dim 0 of the
+      stacked ``(k, d_head, i)`` dedup tensor, index length h), not per
+      row — the index map stays a readable per-head permutation.
+    * The deduplicated tensor is REGISTERED INTO ``source_tensors``
+      under a fresh ``{name}__heads{h}`` key.  Lowering passes the same
+      dict as ``param_values`` to ``ir_to_torch_module``, so the
+      offered member materialises with the correct values and the
+      extracted module's state dict holds only the unique blocks.
+
+    Guards: 2-D params only; only head counts in ``head_counts``
+    dividing ``o``; fires only when the stored values strictly shrink
+    (``k·d_head·i < o·i``, i.e. some head group has ≥ 2 members); the
+    param must actually appear in the e-graph.  Equality is BITWISE —
+    chunks are grouped by their raw bytes, stricter than
+    ``torch.equal`` (which conflates −0.0/+0.0 and treats NaN payloads
+    as never equal).
+
+    Extraction note: flop/count cost models charge param-only subtrees
+    0, so under them the plain leaf always ties and wins on size — the
+    member is then selectable only via ``extract_best`` overrides (the
+    same coordinated-extraction contract as the diagram pairing pass).
+    Under the storage axis — ``catopt.cost.param_bytes_cost_for``
+    (``charges_param_only``) — the member prices at k·d_head·i against
+    the leaf's o·i and wins directly, no override needed.
+
+    Returns one record per offered member:
+    ``{param, heads, head_dim, unique, index_map, dedup_param,
+      stored_before, stored_after, eid}``.
+    """
+    import torch as _t
+    from catopt.egraph import ENode
+    from catopt.ir import Param, TensorType
+
+    offers: list[dict] = []
+    for name, t in list(source_tensors.items()):
+        if not isinstance(t, _t.Tensor) or t.dim() != 2:
+            continue
+        o, i = int(t.shape[0]), int(t.shape[1])
+        leaf = ENode("leaf", (), (("key", name),))
+        w_eid = eg._node_to_class.get(leaf)
+        if w_eid is None:
+            continue  # param not in the graph — nothing to offer to
+
+        # Try each candidate head count; keep the factorisation with
+        # the smallest surviving storage (k·d_head·i).
+        best = None  # (stored, h, d_head, imap, unique_chunks)
+        for h in head_counts:
+            if h < 2 or h > o or o % h != 0:
+                continue
+            d = o // h
+            # Group head-blocks by raw bytes — bitwise equality, not
+            # torch.equal's value equality.
+            sigs = [
+                t[j * d:(j + 1) * d].detach().cpu().contiguous()
+                .numpy().tobytes()
+                for j in range(h)]
+            uniq: list[bytes] = []
+            imap: list[int] = []
+            for s in sigs:
+                try:
+                    imap.append(uniq.index(s))
+                except ValueError:
+                    imap.append(len(uniq))
+                    uniq.append(s)
+            k = len(uniq)
+            stored = k * d * i
+            if k < h and (best is None or stored < best[0]):
+                first = [imap.index(u) for u in range(k)]
+                best = (stored, h, d, tuple(imap),
+                        [t[f * d:(f + 1) * d] for f in first])
+        if best is None:
+            continue
+        stored, h, d, imap, uniques = best
+        k = len(uniques)
+
+        with _t.no_grad():
+            dedup = _t.stack(uniques, dim=0).detach().clone()
+        dedup_name = f"{name}__heads{h}"
+        # Fresh registration; reuse an identical prior entry on re-run.
+        if not (dedup_name in source_tensors
+                and _t.equal(source_tensors[dedup_name], dedup)):
+            base_name, n = dedup_name, 0
+            while dedup_name in source_tensors:
+                n += 1
+                dedup_name = f"{base_name}_{n}"
+            source_tensors[dedup_name] = dedup
+
+        p_dedup = Param(dedup_name, TensorType((k, d, i)))
+        member = Op.make(
+            "reshape",
+            Op.make("index_select", p_dedup, dim=0, index=imap),
+            shape=(o, i))
+        member_eid = eg.add_term(
+            member, provenance="share_duplicate_param_slices")
+        w_term = Param(name, TensorType((o, i)))
+        wit = None
+        if witness:
+            wit = Rewrite(
+                name=f"share_slices#{member_eid}",
+                lhs=w_term, rhs=member,
+                law=("pointwise witness for slice-level weight sharing: "
+                     "the parameter's head row-blocks are bitwise-equal "
+                     "to blocks of the deduplicated stack under "
+                     "index_map (equality established by the sharing "
+                     "pass over source tensors)"),
+                error_bound=None)
+        eg.union(w_eid, member_eid, witness=wit,
+                 note=(f"share_duplicate_param_slices: {name} (o={o}) "
+                       f"= {h} heads x {d} rows -> {k} unique"))
+        offers.append({
+            "param": name, "heads": h, "head_dim": d, "unique": k,
+            "index_map": imap, "dedup_param": dedup_name,
+            "stored_before": o * i, "stored_after": k * d * i,
+            "eid": member_eid,
+        })
+    return offers
+
+
 # ---------------------------------------------------------------------------
 #  Rule collections
 # ---------------------------------------------------------------------------

@@ -904,6 +904,7 @@ class EGraph:
 
     def extract_best(self, eid: int, cost_fn,
                      overrides: dict[int, Any] | None = None,
+                     bans: dict[int, set] | None = None,
                      _cache_out: dict | None = None) -> Any:
         """Extract the minimum-cost term from the e-class at *eid*.
 
@@ -914,6 +915,11 @@ class EGraph:
         that k members each selecting `split_i(fused)` share ONE fused
         GEMM, since each split's subtree alone looks more expensive than
         the member's own linear.
+
+        ``bans`` is the dual: canonical e-class id -> set of ENodes the
+        extraction must skip — the mechanism behind
+        :meth:`extract_best_bounded`, which bans the enodes that
+        bound-carrying certificate steps produced.
 
         Cost accounting is DAG-aware: each e-class in the extracted
         expression is charged exactly once, even when several parents
@@ -928,6 +934,10 @@ class EGraph:
         at zero.  This is what lets the extractor prefer rewrites that
         move computation onto the weights (e.g. ``x@(W1@W2@W3)``) even
         though the weight product itself is not free in FLOP terms.
+        Cost models that price parameter *storage*
+        (``catopt.cost.param_bytes_cost``) opt out of that discount by
+        setting ``charges_param_only`` on the function — a folded
+        subtree still stores its leaves' values.
 
         Cyclic nodes (a class reachable from itself through rewrite-
         introduced unions) are skipped: they cannot be extracted.
@@ -946,6 +956,12 @@ class EGraph:
         cost_memo: dict = {}
         keepalive: list = []
         takes_memo = "memo" in inspect.signature(cost_fn).parameters
+        # Storage-style cost models (param_bytes_cost) bill Param leaves
+        # — folding does not shrink the weights file — so the param-only
+        # discount does not apply.  getattr(..., "func", ...) unwraps
+        # functools.partial bindings of the flagged function.
+        bill_params = getattr(getattr(cost_fn, "func", cost_fn),
+                              "charges_param_only", False)
 
         def cfn(t: Any) -> float:
             return cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
@@ -967,6 +983,7 @@ class EGraph:
             nodes = (override,) if override is not None else sorted(
                 eclass.nodes,
                 key=lambda n: (n.op, n.children, repr(n.attrs)))
+            banned = bans.get(eclass_id) if bans else None
             best_total: float | None = None
             best_term: Any = None
             best_used: frozenset = frozenset({eclass_id})
@@ -974,6 +991,8 @@ class EGraph:
             best_param_only = False
             best_nops = 0
             for node in nodes:
+                if banned and node in banned:
+                    continue  # excluded enode (extract_best_bounded)
                 if node.op == "leaf":
                     key = node.attrs[0][1] if node.attrs else "??"
                     term = _LeafRegistry.decode(key)
@@ -1009,9 +1028,11 @@ class EGraph:
                     # Charge each distinct e-class in the DAG once:
                     # a shared child contributes its subtree cost only
                     # for the classes not already accounted for.
-                    # Compile-time (param-only) classes are free.
+                    # Compile-time (param-only) classes are free —
+                    # unless the cost model prices storage, in which
+                    # case every class's local is billed.
                     for u in cused - used:
-                        if not param_only_of.get(u, False):
+                        if bill_params or not param_only_of.get(u, False):
                             sub_cost += local_of.get(u, 0.0)
                     used |= cused
                 if not valid:
@@ -1022,7 +1043,7 @@ class EGraph:
                     cfn(c) for c in child_terms
                 )
                 local = max(local, 0.0)
-                if param_only:
+                if param_only and not bill_params:
                     local = 0.0  # whole subtree folds at compile time
                 total = local + sub_cost
                 # Secondary key: among equal-cost candidates prefer the
@@ -1054,6 +1075,77 @@ class EGraph:
         if _cache_out is not None:
             _cache_out.update(cache)
         return term
+
+    def extract_best_bounded(self, eid: int, cost_fn,
+                             max_error: float | None = None, *,
+                             src_term: Any = None,
+                             _cache_out: dict | None = None) -> Any:
+        """Extract the minimum-cost member whose derivation certifies
+        within ``max_error``.
+
+        A member's ε lives on its *derivation*, not on the member
+        itself — the certificate is what knows which bound-carrying
+        rewrites (``Rewrite.error_bound``) produced it.  So this uses
+        the pragmatic extract-then-filter design: the bound is looked
+        up per extracted candidate through :meth:`certificate` (which
+        aggregates the per-step bounds, triangle-inequality style),
+        and extraction iterates:
+
+        1. extract the minimum-cost member under ``cost_fn``;
+        2. build its certificate from ``src_term`` (default: the
+           class's oldest member — normally the term originally added);
+        3. ``cert.error_bound <= max_error`` -> return it;
+        4. otherwise *ban* every enode a bound-carrying step produced
+           (located via ``_locate(step.rhs)``) and repeat.  Bans
+           accumulate, each round removes at least one enode, and the
+           loop is additionally capped at ``n_enodes`` rounds.
+
+        ``max_error=None`` is unconstrained extraction.  ``None`` is
+        returned when no member satisfies the budget — including when
+        an offending member's enode cannot be located to ban.
+
+        Caveats: at ``truncation_level == 1`` no proof witnesses were
+        recorded, so every member certifies at bound 0 and the
+        constraint is vacuous; and members introduced by *unwitnessed*
+        unions (``egraph_dependent`` steps) carry no rule and so
+        contribute no bound — the filter trusts only certified bounds,
+        matching ``Certificate.error_bound``.
+        """
+        if max_error is None:
+            return self.extract_best(eid, cost_fn,
+                                     _cache_out=_cache_out)
+        root = self.find(eid)
+        if src_term is None:
+            src_term = self._oldest_term(root)
+            if src_term is None:
+                src_term = self.any_term(root)
+        bans: dict[int, set] = {}
+        for _ in range(self.n_enodes + 1):
+            term = self.extract_best(root, cost_fn, bans=bans,
+                                     _cache_out=_cache_out)
+            if term is None:
+                return None
+            cert = self.certificate(src_term, term, root_eid=root)
+            if cert.error_bound <= max_error:
+                return term
+            # Ban the member each bound-carrying step produced; the
+            # next round re-extracts through exact members only (or
+            # members under a smaller accumulated ε).
+            progress = False
+            for step in cert.steps:
+                rule = cert.rules.get(step.rule)
+                if rule is None or not rule.error_bound:
+                    continue
+                ceid, en = self._locate(step.rhs)
+                if en is None:
+                    continue
+                ceid = self.find(ceid)
+                if en not in bans.setdefault(ceid, set()):
+                    bans[ceid].add(en)
+                    progress = True
+            if not progress:
+                return None  # bounded member we cannot locate/exclude
+        return None
 
     # -- coordinated (group) extraction ----------------------------------
 

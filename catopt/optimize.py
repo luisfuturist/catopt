@@ -23,7 +23,8 @@ from catopt.egraph import EGraph
 from catopt.rules import (all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
                           pair_shared_input_linears,
                           pair_shared_input_convs,
-                          share_duplicate_params)
+                          share_duplicate_params,
+                          share_duplicate_param_slices)
 from catopt.trace_lift import lift_scan_to_trace
 from catopt.xcarrier import (gather_applyd_stack, gather_apply_stack,
                              omd_tree_lift)
@@ -149,7 +150,8 @@ def discover_alternatives(
              + gather_applyd_stack(eg)
              + gather_apply_stack(eg)
              + omd_tree_lift(eg)
-             + share_duplicate_params(eg, source_tensors))
+             + share_duplicate_params(eg, source_tensors)
+             + share_duplicate_param_slices(eg, source_tensors))
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
@@ -264,7 +266,8 @@ def optimize_model(
              + gather_applyd_stack(eg)
              + gather_apply_stack(eg)
              + omd_tree_lift(eg)
-             + share_duplicate_params(eg, source_tensors))
+             + share_duplicate_params(eg, source_tensors)
+             + share_duplicate_param_slices(eg, source_tensors))
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
@@ -497,7 +500,7 @@ def optimize_compositional(
        verifying the lowered block against the original on that input —
        a block that fails to export, saturate, lower, or verify keeps its
        original implementation,
-    4. clones the model and grafts the optimized ``IRModule``\s back in
+    4. clones the model and grafts the optimized ``IRModule`` back in
        place, preserving the original forward structure, then verifies
        end-to-end equivalence on ``example_input``.
 

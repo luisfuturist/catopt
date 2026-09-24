@@ -133,3 +133,149 @@ def test_matmul_associativity():
     root_class = eg.get_class(eid)
     # Both association orders should be present
     assert len(root_class.nodes) >= 2
+
+
+# ---------------------------------------------------------------------------
+#  share_duplicate_param_slices — slice-level (per-head) weight sharing
+# ---------------------------------------------------------------------------
+
+
+def _forced_member_term(eg, eid, op_name):
+    """Extract the offered (non-leaf) member of a class by forcing the
+    override to the enode with the given op — the same coordinated-
+    extraction mechanism the pipeline uses for pairing offers."""
+    from catopt.cost import count_cost
+    cls = eg.get_class(eid)
+    node = next(n for n in cls.nodes if n.op == op_name)
+    return eg.extract_best(eid, count_cost,
+                           overrides={eg.find(eid): node})
+
+
+def test_share_duplicate_param_slices_offers_dedup_member():
+    """Heads 0,2 bitwise-equal / 1,3 distinct -> the W class gains a
+    member that stores only the unique head-blocks and evaluates
+    fp64-exact through ir_to_torch_module."""
+    import torch
+    from catopt.egraph import EGraph
+    from catopt.rules import share_duplicate_param_slices
+    from catopt.torch_bridge import ir_to_torch_module
+    from catopt.ir import IR
+
+    torch.manual_seed(0)
+    h, d, i = 4, 3, 5
+    o = h * d
+    a = torch.randn(d, i, dtype=torch.float64)
+    b = torch.randn(d, i, dtype=torch.float64)
+    c = torch.randn(d, i, dtype=torch.float64)
+    W = torch.cat([a, b, a, c], dim=0)          # heads 0 and 2 tied
+    source = {"W": W}
+
+    eg = EGraph()
+    w_eid = eg.add_term(Param("W", TensorType((o, i))))
+    offers = share_duplicate_param_slices(eg, source)
+
+    assert len(offers) == 1
+    off = offers[0]
+    assert off["param"] == "W"
+    assert off["heads"] == h
+    assert off["head_dim"] == d
+    assert off["unique"] == 3                    # {a, b, c}
+    assert off["index_map"] == (0, 1, 0, 2)
+    assert off["stored_after"] == 3 * d * i
+    assert off["stored_after"] < off["stored_before"] == o * i
+
+    # The deduplicated tensor was registered for lowering.
+    dedup = source[off["dedup_param"]]
+    assert tuple(dedup.shape) == (3, d, i)
+    assert torch.equal(dedup[0], a) and torch.equal(dedup[1], b)
+    assert torch.equal(dedup[2], c)
+
+    # W's e-class now holds the reshape(index_select(D)) member.
+    member = _forced_member_term(eg, w_eid, "reshape")
+    assert member.op == "reshape"
+    assert member.args[0].op == "index_select"
+    assert member.args[0].args[0].name == off["dedup_param"]
+
+    # The offered member stores fewer values than the original param.
+    ir = IR(root=member, inputs=[], input_names=set(), params={})
+    mod = ir_to_torch_module(ir, param_values=source)
+    stored = sum(p.numel() for p in mod.parameters())
+    assert stored == 3 * d * i < o * i
+
+    # ... and evaluates bitwise-equal to W (float64, exact gather).
+    out = mod(torch.zeros(1))                    # no Var leaves: arg unused
+    assert out.dtype == torch.float64
+    assert torch.equal(out, W)
+
+    # The merge carried a replayable exact witness.
+    edge = eg.merge_log[-1]
+    assert edge.rule.startswith("share_slices#")
+    wit = eg._rule_objs[edge.rule]
+    assert wit.error_bound is None
+    assert wit.lhs == Param("W", TensorType((o, i)))
+    assert wit.rhs == member
+
+    # Under the storage cost model the member wins extraction on its
+    # own — 45 stored values < 60 — no coordinated override needed.
+    from catopt.cost import param_bytes_cost_for
+    best = eg.extract_best(w_eid, param_bytes_cost_for(source))
+    assert best == member
+
+
+def test_share_duplicate_param_slices_no_offer_when_all_distinct():
+    """All-distinct head slices -> no member offered, no dedup tensor
+    registered, the class keeps only its leaf."""
+    import torch
+    from catopt.egraph import EGraph
+    from catopt.rules import share_duplicate_param_slices
+
+    torch.manual_seed(1)
+    W = torch.randn(12, 5, dtype=torch.float64)  # 4 heads x 3 rows, all distinct
+    source = {"W": W}
+
+    eg = EGraph()
+    w_eid = eg.add_term(Param("W", TensorType((12, 5))))
+    offers = share_duplicate_param_slices(eg, source)
+
+    assert offers == []
+    assert {n.op for n in eg.get_class(w_eid).nodes} == {"leaf"}
+    assert list(source) == ["W"]                 # nothing registered
+
+
+def test_share_duplicate_param_slices_guards():
+    """Only 2-D params that actually appear in the e-graph are
+    considered; a dedup form must strictly shrink storage."""
+    import torch
+    from catopt.egraph import EGraph
+    from catopt.rules import share_duplicate_param_slices
+
+    torch.manual_seed(2)
+    # A 1-D "weight" (bias-like) with a duplicated half — not 2-D, skip.
+    v = torch.randn(4, dtype=torch.float64)
+    v1 = torch.cat([v, v])
+    # A 2-D param whose duplicated halves don't fit head_counts: o=2,
+    # the only divisor in range is h=2 with d=1 — two equal rows DO
+    # qualify, so use o=1*2... simplest non-shrinking case: W whose
+    # only equal-block factorisation is h=o (all rows unique under it).
+    W2 = torch.randn(6, 4, dtype=torch.float64)
+    W2[3:] = W2[:3]                              # halves equal: h=2 works
+    # W3 is 2-D with duplicated rows but never appears in the e-graph.
+    W3 = torch.cat([v.reshape(2, 2), v.reshape(2, 2)], dim=0)
+    source = {"bias": v1, "W": W2, "absent": W3}
+
+    eg = EGraph()
+    eg.add_term(Param("bias", TensorType((8,))))
+    w_eid = eg.add_term(Param("W", TensorType((6, 4))))
+    offers = share_duplicate_param_slices(eg, source)
+
+    # Only W qualifies: h=2 splits it into two equal (3,4) halves ->
+    # one unique block, index_map (0, 0).
+    assert len(offers) == 1
+    off = offers[0]
+    assert off["param"] == "W" and off["heads"] == 2
+    assert off["unique"] == 1 and off["index_map"] == (0, 0)
+    assert off["stored_after"] == 3 * 4 < 6 * 4
+    # 'bias' (1-D) and 'absent' (not in graph) produced no dedup params.
+    assert [n for n in source if n != "W" and n != off["dedup_param"]
+            and n != "bias"] == ["absent"]
+    assert off["dedup_param"] in source

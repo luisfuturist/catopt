@@ -2,7 +2,8 @@
 
 import pytest
 from catopt.ir import Op, Var, Const, Param, TensorType
-from catopt.cost import count_cost, flops_cost, CostModel
+from catopt.cost import (count_cost, flops_cost, CostModel,
+                         param_bytes_cost, param_bytes_cost_for)
 
 
 def test_count_cost_leaves():
@@ -104,6 +105,57 @@ def test_concat_chunk_shapes():
     # data-movement ops cost nothing
     assert flops_cost(cat) == 0.0
     assert flops_cost(y) == 0.0
+
+
+def test_param_bytes_counts_values():
+    """param_bytes_cost = number of stored values under Param leaves."""
+    x = Var("x", TensorType((4, 64)))
+    W = Param("W", TensorType((64, 64)))
+    assert param_bytes_cost(Op.make("linear", x, W)) == 64 * 64
+    # vars, consts, and bare leaves other than Param store nothing
+    assert param_bytes_cost(x) == 0.0
+    assert param_bytes_cost(Const(2.0)) == 0.0
+
+
+def test_param_bytes_dedups_shared_names():
+    """A weight read by two consumers is stored once — dedup by name."""
+    x = Var("x", TensorType((4, 64)))
+    y = Var("y", TensorType((4, 64)))
+    W = Param("W", TensorType((64, 64)))
+    t = Op.make("add", Op.make("linear", x, W), Op.make("linear", y, W))
+    assert param_bytes_cost(t) == 64 * 64
+    # Two distinct Param objects spelled the same are still one weight.
+    W2 = Param("W", TensorType((64, 64)))
+    t2 = Op.make("add", Op.make("linear", x, W), Op.make("linear", y, W2))
+    assert param_bytes_cost(t2) == 64 * 64
+
+
+def test_param_bytes_source_tensors():
+    """source_tensors is authoritative for numel; TensorType is fallback."""
+    import torch
+    x = Var("x", TensorType((4, 8)))
+    W = Param("W", TensorType((None, None)))   # shape unknown at type level
+    t = Op.make("linear", x, W)
+    src = {"W": torch.zeros(8, 16)}
+    assert param_bytes_cost(t, src) == 8 * 16
+    # names absent from source_tensors fall back to the TensorType
+    U = Param("U", TensorType((3, 5)))
+    t2 = Op.make("add", Op.make("linear", x, W), Op.make("linear", x, U))
+    assert param_bytes_cost(t2, src) == 8 * 16 + 3 * 5
+    # the bound-closure form prices identically
+    assert param_bytes_cost_for(src)(t2) == 8 * 16 + 3 * 5
+
+
+def test_param_bytes_factorised_cheaper():
+    """The eps axis: chained low-rank factors beat the dense weight."""
+    x = Var("x", TensorType((4, 64)))
+    W = Param("W", TensorType((64, 64)))
+    V = Param("eps_v_W_0", TensorType((8, 64)))
+    U = Param("eps_u_W_0", TensorType((64, 8)))
+    dense = Op.make("linear", x, W)
+    chained = Op.make("linear", Op.make("linear", x, V), U)
+    assert param_bytes_cost(chained) == 8 * 64 + 64 * 8
+    assert param_bytes_cost(chained) < param_bytes_cost(dense)
 
 
 def test_cost_preference_for_fewer_ops():
