@@ -266,6 +266,14 @@ The 29-rule `XC_LAWS` set is opt-in (`CARRIER_X_LAWS`): bidirectional
 pairs double the rule set and blow up default saturation — the
 non-local passes run regardless.
 
+**omd runtime honesty** (`/tmp/bench_omd.py`): the `omd_apply` member
+*is* what `flops_cost` selects at every size — but through the generic
+evaluator it runs **0.54–0.71× slower than eager**: the O(T²) carrier
+maps unroll as per-leaf IR nodes and `_fold_weight_chains` can't fold
+`stack`/`select`/`affd_a`. A dedicated executor (blocked assoc scan +
+hoisted coefficient maps, ~8 kernels) is estimated at **2–9×** vs
+eager at small T — the win is structural, not yet realized.
+
 ## Full measurements
 
 ### GPU (RTX 2050, synced timing)
@@ -424,6 +432,32 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   makes re-targeting mechanical, but magnitudes should not be
   extrapolated to datacenter hardware.
 
+## The ε axis — certified approximation (`eps.py`)
+
+Exact laws preserve semantics; **ε-laws preserve semantics up to a
+certified bound**. `Rewrite.error_bound` marks a bounded rewrite;
+certificates accumulate per-step bounds (triangle inequality) and
+report `cert.error_bound` / `cert.exact`. Quantization, low-rank, and
+tying become one object: *a rewrite with an error bound*.
+
+- `eps.low_rank_params` — truncated-SVD factorization at `linear`
+  sites: `linear(x,W) → linear(linear(x,V_r), U_rΣ_r)`, bound =
+  `σ_{r+1}` (exact Eckart–Young). Offered only when it truly shrinks
+  storage.
+- `param_bytes_cost` — first cost axis pricing *stored parameter
+  values*, so compressed realizations win extraction.
+- `extract_best_bounded(max_error=…)` — extraction under an ε budget:
+  candidates whose certificate exceeds the bound get their
+  bound-carrying enodes banned and extraction retries.
+- Exact sharing: `share_duplicate_params` (bitwise-equal params tie
+  into one e-class — tied embeddings, duplicated adapters) and
+  `share_duplicate_param_slices` (head-granular dedup inside one
+  weight via `index_select` — GQA head sharing materialized as
+  separate tensors). Both witnessed, exact, state-dict-shrinking.
+
+Bounds are site-local spectral norms; propagating to model outputs
+needs per-op Lipschitz constants — not yet computed.
+
 ## Roadmap
 
 - **Regime-adaptive architecture**: one weight set, multiple certified
@@ -484,8 +518,10 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/xcarrier.py` | Cross-carrier laws + `omd` deferred carrier: readouts exit scans, scans fold inside om elements |
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
-| `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 450 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks (incl. `attn_mask` chunking), synthesis, regimes, trace, cross-carrier |
+| `catopt/eps.py` | ε axis: `low_rank_params` (certified truncated-SVD at linear sites) |
+| `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
+| `measure_weights.py` | Phase-0 weight-structure falsification harness |
+| `tests/` | 474 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
 
