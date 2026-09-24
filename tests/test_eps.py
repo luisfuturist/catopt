@@ -12,7 +12,7 @@ import torch.nn as nn
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Var, TensorType, op_repr
 from catopt.rules import all_rules
-from catopt.eps import low_rank_params
+from catopt.eps import low_rank_params, kron_linear_params
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 
@@ -114,3 +114,83 @@ def test_eps_bound_certified_and_honoured():
     assert cert.error_bound >= o["bound"]
     assert not cert.exact
     assert "eps_lr" in " ".join(cert.rules_used)
+
+
+def _kron_model(seed=0):
+    """Linear whose weight is near-Kronecker (A⊗B + small noise)."""
+    torch.manual_seed(seed)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            A = torch.randn(16, 16)
+            B = torch.randn(4, 4)
+            self.lin = nn.Linear(64, 64, bias=False)
+            self.lin.weight.data = torch.kron(A, B) \
+                + 0.02 * torch.randn(64, 64)
+
+        def forward(self, x):
+            return self.lin(x)
+
+    return M().eval().double()
+
+
+def test_kron_offer_executes_within_frobenius_bound():
+    m = _kron_model()
+    x = torch.randn(3, 64, dtype=torch.float64)
+    ir, src = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(all_rules(), root, max_iterations=4)
+    offers = kron_linear_params(eg, src, rtol=0.05)
+    assert offers, "expected a Kronecker-sum offer"
+    o = offers[0]
+    assert o["stored"] < o["original"]
+    assert all(n.startswith("eps_k") for n in src
+               if "eps_" in n)
+
+    cand = None
+    for n in eg.get_class(o["site_eid"]).nodes:
+        if n.op in ("add", "reshape", "matmul"):
+            cand = Op.make(
+                n.op,
+                *[eg.any_term(eg.find(c)) for c in n.children],
+                **dict(n.attrs))
+            break
+    assert cand is not None
+
+    xv = Var("x", TensorType((3, 64)))
+    mod = ir_to_torch_module(
+        IR(root=cand, params={}, inputs=[xv]), src)
+    with torch.no_grad():
+        err = (mod(x) - m(x)).abs().max().item()
+    x_norm = torch.linalg.norm(x, dim=-1).max().item()
+    assert err <= o["bound"] * x_norm + 1e-9
+
+    cert = eg.certificate(ir.root, cand, root_eid=root)
+    assert cert.error_bound == o["bound"]
+    assert cert.replayable and not cert.exact
+    assert "eps_kron" in " ".join(cert.rules_used)
+    # factor params only — the dense weight is gone
+    assert sum(t.numel() for t in mod.parameters()) == o["stored"]
+
+
+def test_kron_rejects_dense_random():
+    """A random full-rank weight has no compressible rearrangement."""
+    torch.manual_seed(7)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(64, 64, bias=False)
+
+        def forward(self, x):
+            return self.lin(x)
+
+    m = M().eval().double()
+    x = torch.randn(3, 64, dtype=torch.float64)
+    ir, src = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(all_rules(), root, max_iterations=3)
+    assert kron_linear_params(eg, src, rtol=1e-6) == []

@@ -178,6 +178,7 @@ def optimize_model(
     max_iterations: int = 100,
     max_enodes: int = 100_000,
     cost_fn=None,
+    eps_rtol: float | None = None,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -198,6 +199,14 @@ def optimize_model(
         Cost function for term extraction.  Defaults to
         :func:`launch_aware_cost` (FLOPs + a small per-kernel penalty so
         that forms with identical FLOPs but fewer launches win).
+    eps_rtol : float, optional
+        When set, also run the certified-approximation passes
+        (``eps.low_rank_params`` + ``eps.kron_linear_params``): each
+        offer carries an exact Eckart–Young / Frobenius bound and is
+        recorded in ``stats["eps_offers"]``.  The offers only *win*
+        under a storage-aware cost model (``param_bytes_cost``) or
+        explicit selection — the default launch-aware cost keeps the
+        exact member, so this never silently trades accuracy.
     verbose : bool
         Print progress.
 
@@ -268,6 +277,13 @@ def optimize_model(
              + omd_tree_lift(eg)
              + share_duplicate_params(eg, source_tensors)
              + share_duplicate_param_slices(eg, source_tensors))
+    if eps_rtol is not None:
+        from catopt.eps import low_rank_params, kron_linear_params
+        eps_offers = (low_rank_params(eg, source_tensors, rtol=eps_rtol)
+                      + kron_linear_params(eg, source_tensors,
+                                           rtol=eps_rtol))
+        lifts += eps_offers
+        stats["eps_offers"] = eps_offers
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)

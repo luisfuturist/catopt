@@ -47,7 +47,142 @@ import torch
 from catopt.egraph import EGraph, Rewrite
 from catopt.ir import Op, Param, TensorType
 
-__all__ = ["low_rank_params"]
+__all__ = ["low_rank_params", "kron_linear_params"]
+
+
+def _kron_member(eg, x_eid, terms, spec):
+    """Assemble ``add`` over K ``reshape(matmul(matmul(A, reshape x),
+    transpose B), out)`` members — the executable form of
+    ``linear(x, Σᵢ Aᵢ⊗Bᵢ)``.  A is (m1×n1), B is (m2×n2):
+    ``y[(a2,b2)] = (A·X·Bᵀ)[a2,b2]`` where ``X = reshape(x,(n1,n2))``.
+    Batch dims are preserved.  Returns the combined enode id."""
+    m1, n1, m2, n2, x_batch, K = spec
+    acc = None
+    for t in range(K):
+        A_t, B_t = terms[t]
+        xr = eg.add_enode("reshape", (x_eid,),
+                          {"shape": (*x_batch, n1, n2)})
+        ax = eg.add_enode("matmul", (eg.add_term(A_t), xr))
+        axb = eg.add_enode("matmul", (ax, eg.add_enode(
+            "transpose", (eg.add_term(B_t),),
+            {"arg1": -2, "arg2": -1})))
+        y = eg.add_enode("reshape", (axb,),
+                         {"shape": (*x_batch, m1 * m2)})
+        acc = y if acc is None else eg.add_enode("add", (acc, y))
+    return acc
+
+
+def kron_linear_params(eg: EGraph, source_tensors: dict, *,
+                       rtol: float = 0.05,
+                       min_saving: float = 0.8,
+                       witness: bool = True) -> list[dict]:
+    """Offer a **sum-of-Kronecker** factorisation at each ``linear``
+    site:  ``W ≈ Σᵢ Aᵢ⊗Bᵢ``  executes as
+
+        reshape(x, (n1,n2)) → matmul(Aᵢ, ·) → matmul(·, Bᵢᵀ) →
+        reshape(·, (m1m2)) →  summed over i, (+ bias)
+
+    chosen over factor pairs (m1·m2=o, n1·n2=i) minimising stored
+    values ``K·(m1n1+m2n2)`` subject to the relative Frobenius
+    residual ≤ ``rtol`` (the rearrangement is a Frobenius isometry, so
+    the bound is exact and certifies ``‖W − Ŵ‖_F``).
+
+    The offered member is a *program* — K composed maps — exactly the
+    "weights as programs" object: no dense W materialises, only the
+    ``eps_k*`` factor params (injected into ``source_tensors``).
+    """
+    offers: list[dict] = []
+    for cid in list(eg._classes.keys()):
+        c = eg.find(cid)
+        ec = eg._classes.get(c)
+        if ec is None:
+            continue
+        for node in list(ec.nodes):
+            if node.op != "linear" or len(node.children) not in (2, 3):
+                continue
+            wt = eg.any_term(eg.find(node.children[1]))
+            if not isinstance(wt, Param) or wt.name not in source_tensors:
+                continue
+            W = source_tensors[wt.name]
+            if not (isinstance(W, torch.Tensor) and W.ndim == 2):
+                continue
+            o, i = W.shape
+            Wd = W.detach().double()
+            # choose the (m1,n1) split minimising storage at rtol
+            best = None
+            for m1 in range(2, int(o ** 0.5) + 2):
+                if o % m1:
+                    continue
+                m2 = o // m1
+                for n1 in range(2, int(i ** 0.5) + 2):
+                    if i % n1:
+                        continue
+                    n2 = i // n1
+                    R = (Wd.reshape(m1, m2, n1, n2)
+                         .permute(0, 2, 1, 3)
+                         .reshape(m1 * n1, m2 * n2))
+                    try:
+                        Ur, S, Vr = torch.linalg.svd(R,
+                                                     full_matrices=False)
+                    except Exception:
+                        continue
+                    if S[0] == 0:
+                        continue
+                    e = torch.cumsum(S ** 2, 0) / (S ** 2).sum()
+                    K = int((e < 1 - rtol ** 2).sum().item()) + 1
+                    K = min(K, S.numel())
+                    stored = K * (m1 * n1 + m2 * n2)
+                    if stored < min_saving * o * i and (
+                            best is None or stored < best[0]):
+                        resid = float(torch.sqrt(
+                            (S[K:] ** 2).sum()).item())
+                        best = (stored, m1, m2, n1, n2, K, resid,
+                                Ur, S, Vr)
+            if best is None:
+                continue
+            stored, m1, m2, n1, n2, K, resid, Ur, S, Vr = best
+            terms = []
+            for t in range(K):
+                aname = f"eps_k{t}_a_{wt.name}_{c}"
+                bname = f"eps_k{t}_b_{wt.name}_{c}"
+                # R = UΣVᵀ term t :  A_t = reshape(U[:,t]·σ_t, (m1,n1))
+                #                     B_t = reshape(V[t],   (m2,n2))
+                source_tensors[aname] = (Ur[:, t] * S[t]).reshape(
+                    m1, n1).to(W.dtype).contiguous()
+                source_tensors[bname] = Vr[t, :].reshape(
+                    m2, n2).to(W.dtype).contiguous()
+                terms.append((Param(aname, TensorType((m1, n1))),
+                              Param(bname, TensorType((m2, n2)))))
+            x_eid = node.children[0]
+            x_term = eg.any_term(x_eid)
+            x_batch = (x_term.typ.shape[:-1]
+                       if getattr(x_term, "typ", None) is not None
+                       else ())
+            outer = _kron_member(eg, x_eid, terms,
+                                 (m1, n1, m2, n2, x_batch, K))
+            if len(node.children) == 3:
+                outer = eg.add_enode("add",
+                                     (outer, node.children[2]))
+            offer_term = eg.any_term(outer)
+            src_term = eg._oldest_term(c) or eg.any_term(c)
+            wit = None
+            if witness and offer_term is not None and src_term is not None:
+                wit = Rewrite(
+                    name=f"eps_kron#{outer}",
+                    lhs=src_term, rhs=offer_term,
+                    law=(f"Kronecker-sum factorisation of {wt.name}: "
+                         f"W ≈ Σ_{K} Aᵢ⊗Bᵢ, rearranged SVD residual "
+                         f"‖W−Ŵ‖_F = {resid:.3e} (exact)"),
+                    error_bound=resid, bound_norm="frobenius")
+            eg.union(c, outer, witness=wit,
+                     note=(f"eps_kron: {wt.name} ({o}x{i}) -> "
+                           f"{K} terms ({m1}x{n1})x({m2}x{n2}), "
+                           f"ε_F={resid:.3e}"))
+            offers.append({"name": wt.name, "K": K, "bound": resid,
+                           "stored": stored, "original": o * i,
+                           "site_eid": c,
+                           "factors": (m1, n1, m2, n2)})
+    return offers
 
 
 def _shape_of(t: Any):
