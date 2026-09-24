@@ -135,6 +135,13 @@ than a dense GEMM).
 ## 10. Phase 5 — Validation status
 
 - Real-weight measurement: done (Phases 0/0b above).
+- **Real embedding, through the actual pass**: stories15M
+  `token_embedding` (32000×288, 60% of params) → `low_rank_gather`
+  gives **rank 2 at 5% spectral residual = 142× storage**
+  (9.2M → 64.6k values), certified bound, replayable certificate,
+  factor params only in the lowered state dict.
+- Kronecker at real scale: 1.3× at 35% residual — marginal; the pass
+  works but the signal is weak on trained attention weights.
 - End-to-end rate–distortion vs GPTQ/AWQ: **not yet** — the
   differentiator is the certificate, so the bar is "comparable
   compression *with* a bound," not beating GPTQ's raw ratio.
