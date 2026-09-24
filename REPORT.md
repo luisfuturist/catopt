@@ -104,6 +104,11 @@ an error bound**.
   s)`, certified Frobenius bound `(s/2)·√n`. Byte-aware
   `param_bytes_cost(by_bytes=True)` prices the width reduction;
   verified end-to-end (32KB → 4KB, err within bound).
+- `model_bound`: **output-level certificates** — each site bound ×
+  its Lipschitz path sensitivity to the output (weight-side edges
+  resolve via `input_norm` × input-sensitivity). Verified: quantized
+  2-layer model, err 0.0034 vs certified 0.397 (spectral products are
+  ~100× conservative — honest).
 
 Both inject derived factor params into `source_tensors`, so the
 lowered module's state dict contains only the factor tensors.
