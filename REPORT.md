@@ -187,9 +187,13 @@ than a dense GEMM).
 
 ## 12. What's next
 
-1. `kron_linear_params` at real scale — apply to stories15M attention
-   weights and report the model-level rate–distortion curve.
-2. An `omd` executor (blocked associative scan + hoisted coefficient
-   maps).
-3. Lipschitz propagation for output-level ε bounds.
-4. GPTQ/AWQ comparison on the same checkpoint.
+1. **`omd` executor** (in progress): batched deferred-carrier lowering —
+   the selected-but-slow member becomes an actual runtime win.
+2. **Real-scale rate–distortion**: apply the full ε pipeline to a
+   stories15M-class model end-to-end (needs a model definition; the
+   per-matrix evidence is in §3/§10).
+3. **GPTQ/AWQ comparison**: needs the quantized checkpoint — blocked
+   on `auto-gptq`/`huggingface_hub` deps (PEP 668). The honest claim
+   is *comparable compression with a certificate*, not a ratio win.
+4. Tighter bounds: `model_bound`'s spectral Lipschitz products are
+   ~100× conservative — interval/IBP bounds would tighten.
