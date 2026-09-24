@@ -488,6 +488,11 @@ needs per-op Lipschitz constants — not yet computed.
   99% energy stores 96.3% of params — **exact weight-space structure
   is absent; only the ε-bounded direction is live** (spectral decay
   exists: 90% energy at ~40% rank, but that requires certified error).
+  Phase-0b extended the probe to a family of algebras: H-matrix
+  off-diagonals are full-rank and sparsity is mild, but the
+  **Kronecker rearrangement is compressible** — ~4 terms capture 95%
+  Frobenius energy (~24× storage), an ε-certified candidate via the
+  `eps.py` axis.
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.

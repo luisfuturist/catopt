@@ -100,6 +100,82 @@ def analyze(W: np.ndarray) -> dict:
     }
 
 
+def _best_kron(W: np.ndarray) -> dict:
+    """Kronecker-product test: W (m×n) is A⊗B with A (m1×n1),
+    B (m2×n2) iff the rearranged matrix R (m1·n1 × m2·n2) is rank-1.
+    Try a few balanced factorisations; report the best rank-1 energy
+    share — the decisive *product*-structure probe."""
+    m, n = W.shape
+    best = None
+    for m1 in range(2, int(m ** 0.5) + 2):
+        if m % m1:
+            continue
+        m2 = m // m1
+        for n1 in range(2, int(n ** 0.5) + 2):
+            if n % n1:
+                continue
+            n2 = n // n1
+            R = (W.reshape(m1, m2, n1, n2)
+                   .transpose(0, 2, 1, 3)
+                   .reshape(m1 * n1, m2 * n2))
+            sv = np.linalg.svd(R, compute_uv=False)
+            e1 = float(sv[0] ** 2 / (sv ** 2).sum())
+            if best is None or e1 > best["e1"]:
+                best = {"e1": e1, "factors": f"{m1}x{n1}⊗{m2}x{n2}",
+                        "r95": int(np.searchsorted(
+                            np.cumsum(sv ** 2) / (sv ** 2).sum(),
+                            0.95) + 1)}
+    return best or {"e1": 0.0, "factors": "-", "r95": -1}
+
+
+def _hmat_rank(W: np.ndarray) -> dict:
+    """H-matrix probe: split W into 2×2 blocks recursively; a
+    hierarchical-low-rank matrix has numerically-low-rank off-diagonal
+    blocks at every level.  Report the worst relative rank of
+    off-diagonal blocks at the finest split."""
+    m, n = W.shape
+    lvl = 1
+    worst = 0.0
+    while min(m // (2 ** lvl), n // (2 ** lvl)) >= 16 and lvl <= 4:
+        bs_m, bs_n = m // (2 ** lvl), n // (2 ** lvl)
+        ranks = []
+        for i in range(2 ** lvl):
+            for j in range(2 ** lvl):
+                if i == j:
+                    continue
+                B = W[i * bs_m:(i + 1) * bs_m, j * bs_n:(j + 1) * bs_n]
+                sv = np.linalg.svd(B, compute_uv=False)
+                if sv[0] > 0:
+                    ranks.append(int((sv > 1e-2 * sv[0]).sum())
+                                 / min(B.shape))
+        if ranks:
+            worst = max(worst, max(ranks))
+        lvl += 1
+    return {"h_offdiag_rel": round(worst, 3)}
+
+
+def _sparsity(W: np.ndarray) -> dict:
+    """Sparse+low-rank probe: what fraction of Frobenius energy sits in
+    the largest 10%/1% of entries (a sparse top plus a small residual
+    is itself a program: W ≈ sparse(S) + lowrank)."""
+    a = np.abs(W).ravel()
+    a.sort()
+    a = a[::-1]
+    e = a ** 2
+    tot = e.sum()
+    return {"top10%": round(float(e[:len(a) // 10].sum() / tot), 3),
+            "top1%": round(float(e[:max(1, len(a) // 100)].sum() / tot),
+                           3)}
+
+
+def analyze2(W: np.ndarray) -> dict:
+    """The structured-algebra family: beyond Toeplitz displacement."""
+    out = _best_kron(W)
+    out.update(_hmat_rank(W))
+    out.update(_sparsity(W))
+    return out
+
+
 def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/stories15M.bin"
     w = load_llama2c(path)
@@ -136,6 +212,21 @@ def main() -> None:
     print(f"total matrix params: {tot:,}")
     print(f"low-rank storage at 99% energy: {r99_total:,} "
           f"({r99_total/tot:.1%} of params)")
+
+    # ---- the structured-algebra family -------------------------------------
+    print("\n=== Phase 0b: structured algebras (Kronecker / H-matrix / "
+          "sparse) ===")
+    print(f"{'matrix':<22} {'shape':>9} {'kron_e1':>8} {'kron95':>7} "
+          f"{'H-rel':>6} {'top10%':>7} {'top1%':>7}")
+    print("-" * 70)
+    for name, W in rows:
+        if max(W.shape) > 4096:
+            continue  # skip the embedding table — SVD cost dominates
+        a2 = analyze2(W)
+        print(f"{name:<22} {W.shape[0]}x{W.shape[1]:<5} "
+              f"{a2['e1']:>8.3f} {a2['r95']:>7} "
+              f"{a2['h_offdiag_rel']:>6} {a2['top10%']:>7} "
+              f"{a2['top1%']:>7}")
 
 
 if __name__ == "__main__":
