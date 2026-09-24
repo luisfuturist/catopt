@@ -158,8 +158,9 @@ than a dense GEMM).
 
 ## 11. Honest limits
 
-- Bounds are site-local (spectral / Frobenius); whole-model
-  propagation needs per-op Lipschitz constants — not yet computed.
+- `model_bound` propagates site bounds via per-op Lipschitz constants
+  — finite for linear/elementwise paths; `sdpa`/`exp` and unknown ops
+  report ∞ rather than fabricate a bound.
 - Monolithic saturation doesn't scale past ~2 blocks;
   `optimize_compositional` is the per-block workaround.
 - Monarch ALS was inconclusive — deeper butterfly structure may exist

@@ -48,7 +48,204 @@ from catopt.egraph import EGraph, Rewrite
 from catopt.ir import Op, Param, Const, TensorType
 
 __all__ = ["low_rank_params", "kron_linear_params",
-           "low_rank_gather", "quant_params"]
+           "low_rank_gather", "quant_params", "model_bound"]
+
+
+_LIP_ELEM = {"sigmoid": 0.25, "tanh": 1.0, "relu": 1.0,
+             "silu": 1.1, "gelu": 1.13, "exp": None}
+_LIP_FREE = {"add", "sub", "neg", "reshape", "transpose", "view",
+             "contiguous", "broadcast", "concat", "cat", "stack",
+             "index_select", "select", "float", "to", "alias",
+             "embedding"}
+
+
+def _term_spectral(t: Any, source_tensors: dict) -> float | None:
+    """Spectral norm of a term when determinable: Param -> its tensor;
+    Const -> |value|; param-only Op -> evaluate then measure."""
+    if isinstance(t, Param):
+        W = source_tensors.get(t.name)
+        if isinstance(W, torch.Tensor):
+            if W.ndim == 2:
+                return float(torch.linalg.norm(
+                    W.detach().double(), 2))
+            return float(W.detach().abs().max())
+        return None
+    if isinstance(t, Const):
+        return abs(float(t.value))
+    if isinstance(t, Op):
+        # only fold if every leaf is a param/const
+        leaves = _leaves(t)
+        if all(isinstance(l, (Param, Const)) for l in leaves):
+            try:
+                from catopt.torch_bridge import _IR_TO_TORCH
+                env = {l.name: source_tensors[l.name]
+                       for l in leaves if isinstance(l, Param)
+                       and l.name in source_tensors}
+
+                def ev(x):
+                    if isinstance(x, Param):
+                        return env[x.name]
+                    if isinstance(x, Const):
+                        return torch.tensor(x.value)
+                    fn = _IR_TO_TORCH.get(x.op)
+                    if fn is None:
+                        return None
+                    args = [ev(a) for a in x.args]
+                    if any(a is None for a in args):
+                        return None
+                    return fn(*args, **dict(x.attrs))
+                v = ev(t)
+                if isinstance(v, torch.Tensor):
+                    return float(torch.linalg.norm(v.double(), 2)) \
+                        if v.ndim == 2 else float(v.abs().max())
+            except Exception:
+                return None
+    return None
+
+
+def _leaves(t: Any) -> list:
+    if isinstance(t, Op):
+        out = []
+        for a in t.args:
+            out.extend(_leaves(a))
+        return out
+    return [t]
+
+
+def _lip_wrt(node_op: str, i: int, children: list,
+             source_tensors: dict,
+             act_norm: float | None = None) -> float | None:
+    """Upper bound on ‖∂f/∂child_i‖ — Lipschitz constant of an op w.r.t.
+    one input, using spectral norms of the *sibling* operands.
+    ``None`` = unknown/unbounded → the caller reports ∞.
+
+    Weight-side edges (``linear(x,W)`` wrt W) are data-dependent:
+    ``‖Δy‖ ≤ ‖ΔW‖·‖x‖``.  When ``act_norm`` bounds the sibling
+    activation's norm they resolve to a finite constant."""
+    if node_op in _LIP_FREE:
+        return 1.0
+    if node_op in _LIP_ELEM:
+        return _LIP_ELEM[node_op]
+    if node_op in ("mul", "div"):
+        sib = children[1 - i] if len(children) == 2 else None
+        return _term_spectral(sib, source_tensors) if sib is not None \
+            else None
+    if node_op in ("matmul", "linear", "conv2d"):
+        if len(children) >= 2:
+            if i == 0:
+                return _term_spectral(children[1], source_tensors)
+            # weight side: multiplier is the activation norm
+            return act_norm
+    if node_op == "softmax":
+        return 1.0
+    if node_op == "sdpa":
+        return None
+    return None
+
+
+def _input_sensitivity(term: Any, source_tensors: dict,
+                       input_norm: float,
+                       _path=(), _best=0.0) -> float:
+    """Max over Var-leaf paths of the Lipschitz product — an upper
+    bound on ``‖term(x)‖ ≤ input_norm × this`` (activation norm bound).
+    """
+    from catopt.ir import Var as _Var
+    if isinstance(term, _Var):
+        return max(_best, 1.0)
+    if isinstance(term, Op):
+        best = _best
+        for i, a in enumerate(term.args):
+            lip = _lip_wrt(term.op, i, list(term.args),
+                           source_tensors, input_norm)
+            if lip is None:
+                continue
+            best = max(best, _input_sensitivity(
+                a, source_tensors, input_norm) * lip)
+        return best
+    return _best
+
+
+def _path_sensitivity(term: Any, path: tuple,
+                      source_tensors: dict,
+                      input_norm: float | None = None) -> float | None:
+    """Product of per-op Lipschitz constants along ``path`` — the
+    multiplier from a perturbation at that subterm to the output.
+    Data-dependent weight-side edges resolve via ``input_norm`` × the
+    input-to-activation sensitivity when provided."""
+    sens = 1.0
+    t = term
+    for i in path:
+        if not isinstance(t, Op) or i >= len(t.args):
+            return None
+        lip = _lip_wrt(t.op, i, list(t.args), source_tensors)
+        if lip is None and input_norm is not None \
+                and t.op in ("linear", "matmul", "conv2d") and i == 1:
+            # weight perturbation: ‖Δy‖ ≤ ‖ΔW‖·‖activation‖ and the
+            # activation is bounded by input_norm × input sensitivity
+            act = _input_sensitivity(t.args[0], source_tensors,
+                                     input_norm)
+            lip = input_norm * act if act > 0 else None
+        if lip is None:
+            return None
+        sens *= lip
+        t = t.args[i]
+    return sens
+
+
+def _find_subterms(term: Any, target: Any, _path=(), _acc=None):
+    """All paths at which ``target`` occurs structurally in ``term``."""
+    if _acc is None:
+        _acc = []
+    if term == target:
+        _acc.append(_path)
+    if isinstance(term, Op):
+        for i, a in enumerate(term.args):
+            _find_subterms(a, target, _path + (i,), _acc)
+    return _acc
+
+
+def model_bound(root_term: Any, cert: Any, source_tensors: dict,
+                input_norm: float | None = None) -> dict:
+    """Whole-model certified error bound for an extracted term.
+
+    For each bound-carrying certificate step, locate its produced
+    subterm in the final term and multiply the step's local bound by
+    the Lipschitz sensitivity of that position.  Steps whose site
+    cannot be located (further-rewritten members) contribute at
+    program-Lipschitz strength — reported separately as 'unlocated'
+    so the total stays honest (inf when unbounded ops intervene).
+    """
+    total = 0.0
+    unlocated = 0.0
+    contributions = []
+    for step in cert.steps:
+        rule = cert.rules.get(step.rule)
+        if rule is None or not rule.error_bound:
+            continue
+        paths = _find_subterms(root_term, step.rhs)
+        if not paths:
+            unlocated += rule.error_bound
+            contributions.append({"rule": step.rule,
+                                  "bound": rule.error_bound,
+                                  "site_sensitivity": None})
+            continue
+        for p in paths:
+            s = _path_sensitivity(root_term, p, source_tensors,
+                                  input_norm)
+            contrib = (rule.error_bound * s
+                       if s is not None else float("inf"))
+            total += contrib
+            contributions.append({"rule": step.rule,
+                                  "bound": rule.error_bound,
+                                  "path": p,
+                                  "site_sensitivity": s,
+                                  "contribution": contrib})
+    return {"bound": total + unlocated,
+            "site_contributions": contributions,
+            "n_bounded_steps": sum(
+                1 for s in cert.steps
+                if cert.rules.get(s.rule)
+                and cert.rules[s.rule].error_bound)}
 
 
 def quant_params(eg: EGraph, source_tensors: dict, *,

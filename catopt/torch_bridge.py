@@ -353,6 +353,7 @@ _IR_TO_TORCH: dict[str, Any] = {
     "sub": torch.sub,
     "neg": torch.neg,
     "silu": torch.nn.functional.silu,
+    "relu": torch.nn.functional.relu,
     "sigmoid": torch.sigmoid,
     "tanh": torch.tanh,
     "gelu": torch.nn.functional.gelu,

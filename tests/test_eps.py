@@ -210,6 +210,46 @@ def test_quant_params_int8_certified():
     assert not cert.exact
 
 
+def test_model_bound_propagates_through_graph():
+    """eps.model_bound: site-local bounds × Lipschitz path
+    sensitivities -> a finite whole-model certificate."""
+    from catopt.eps import model_bound
+    torch.manual_seed(0)
+
+    class M(nn.Module):
+        def __init__(s):
+            super().__init__()
+            s.l1 = nn.Linear(32, 64, bias=False)
+            s.l2 = nn.Linear(64, 32, bias=False)
+
+        def forward(s, x):
+            return s.l2(torch.relu(s.l1(x)))
+
+    m = M().eval().double()
+    x = torch.randn(4, 32, dtype=torch.float64)
+    ir, src = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(all_rules(), root, max_iterations=2)
+    offers = quant_params(eg, src, bits=8)
+    assert len(offers) == 2
+    term = eg.extract_best(root, param_bytes_cost_for(src,
+                                                    by_bytes=True))
+    xv = Var("x", TensorType((4, 32)))
+    mod = ir_to_torch_module(
+        IR(root=term, params={}, inputs=[xv]), src)
+    with torch.no_grad():
+        err = (mod(x) - m(x)).abs().max().item()
+    cert = eg.certificate(ir.root, term, root_eid=root)
+    mb = model_bound(term, cert, src,
+                     input_norm=torch.linalg.norm(x, dim=-1)
+                     .max().item())
+    # finite, certified, and above the measured error
+    assert mb["bound"] != float("inf")
+    assert mb["bound"] >= err
+    assert mb["n_bounded_steps"] == 2
+
+
 def test_kron_rejects_dense_random():
     """A random full-rank weight has no compressible rearrangement."""
     torch.manual_seed(7)
