@@ -25,6 +25,15 @@ lower-cost program, and lowers it back through
 model, weights, backend, and inputs — only the graph representation
 differs.
 
+**The weights are part of the program.** Parameters are `Param` leaves
+in the same term language as compute, so "unused weight" is just a
+leaf no extracted member references — and the state dict drops it
+automatically. Composition, tying, slice-sharing, and ε-certified
+factorization are the same event at different bound values: *a param
+becomes unreachable in the extracted program → the weights file
+shrinks*. The equivalence space is over the whole computational
+object — graph and realization together — not the graph alone.
+
 ```text
 PyTorch model
     → torch.export
