@@ -278,6 +278,94 @@ ASSOC_LINEAR = R(
          " (transposes flip the product order).",
 )
 
+# ------------------------------------------------------------------
+#  Biased composition — the affine-map law on the 3-ary `linear`.
+#
+#  torch.export emits nn.Linear(bias=True) as linear(x, W, b), so the
+#  2-ary assoc_linear above never sees the most common stacked-Linear
+#  graph.  The composed-bias law is still exact:
+#
+#      B(Ax + b1) + b2 = (BA)x + (B b1 + b2)
+#
+#  with the SAME transposed-order weight product B @ A, plus the push
+#  of the inner bias through the outer map:  B·b1 + b2.
+#
+#  NOTE on the RHS spelling.  The textbook form is
+#      linear(x, B@A, B@b1 + b2)
+#  but that term is unselectable under the cost model: _shape_of has
+#  no matvec case, so matmul(B, b1) on a rank-1 bias infers (o, h)
+#  instead of (o,), which makes add(B·b1, b2) provably ill-typed
+#  (_INVALID) whenever h != o and prices the whole composed member at
+#  _INVALID_COST — it could never be extracted.  The associativity-
+#  equivalent spelling below keeps every subterm well-typed for ALL
+#  h, o: the matvec sits in the linear's bias SLOT (whose inferred
+#  shape is ignored by the linear case) and b2 is added at the top
+#  level, where the broadcast (…, o) + (o,) is valid.  Both
+#  B-products are parameter-only, so _fold_weight_chains materialises
+#  (B@A) and (B·b1) at compile time; the runtime keeps one GEMM, one
+#  broadcast add, and the b2 leaf.
+# ------------------------------------------------------------------
+
+def _check_linear_bias_compose(bound: dict) -> bool:
+    """Shape guard: the chain dims must compose for B·b1 + b2 to be
+    well-typed — A (h, i), B (o, h), b1 (h,), b2 (o,) or scalar.
+
+    The matcher cannot see tensor types; without this the rule would
+    also fire on e-nodes whose "bias" slot holds a non-vector term.
+    Unknown dims pass through as equalities on None (the rewrite is
+    exact wherever the LHS is a real computation — the check only
+    vetoes PROVABLE mismatches)."""
+    x = _shape_of(bound.get("x"))
+    a = _shape_of(bound.get("A"))
+    b = _shape_of(bound.get("B"))
+    b1 = _shape_of(bound.get("b1"))
+    b2 = _shape_of(bound.get("b2"))
+    if not (isinstance(a, tuple) and isinstance(b, tuple)
+            and len(a) == 2 and len(b) == 2):
+        return False
+    h, i, o = a[0], a[1], b[0]
+    if b[1] != h:                               # B consumes A's out dim
+        return False
+    if not (isinstance(b1, tuple) and len(b1) == 1 and b1[0] == h):
+        return False                            # inner bias: exactly (h,)
+    if b2 != () and not (isinstance(b2, tuple)
+                         and len(b2) == 1 and b2[0] == o):
+        return False                            # outer bias: scalar|(o,)
+    if not (isinstance(x, tuple) and len(x) >= 1 and x[-1] == i):
+        return False                            # x feeds A's input dim
+    return True
+
+
+ASSOC_LINEAR_BIAS = R(
+    "assoc_linear_bias",
+    Op.make("linear", Op.make("linear", "x", "A", "b1"), "B", "b2"),
+    Op.make("add",
+            Op.make("linear", "x",
+                    Op.make("matmul", "B", "A"),
+                    Op.make("matmul", "B", "b1")),
+            "b2"),
+    law="Affine-map composition: (B,b2)∘(A,b1) = (BA, B·b1 + b2).  "
+        "Fused weight is B @ A (same transpose flip as assoc_linear); "
+        "the fused bias is spelled linear(x, BA, B·b1) + b2 so both "
+        "B-products fold at compile time — one GEMM plus one "
+        "broadcast add at runtime.",
+    check=_check_linear_bias_compose,
+)
+
+# Reverse: expand a fused affine member back into the biased chain —
+# wins when the hidden dim sits below the oi/(i+o) break-even.
+ASSOC_LINEAR_BIAS_REV = R(
+    "assoc_linear_bias_rev",
+    Op.make("add",
+            Op.make("linear", "x",
+                    Op.make("matmul", "B", "A"),
+                    Op.make("matmul", "B", "b1")),
+            "b2"),
+    Op.make("linear", Op.make("linear", "x", "A", "b1"), "B", "b2"),
+    law="Reverse affine composition (eqsat weighs fused vs split).",
+    check=_check_linear_bias_compose,
+)
+
 # a@W.T + b@W.T = (a+b)@W.T   ->   linear(add(a,b), W)
 RIGHT_FACTOR_LINEAR = R(
     "right_factor_linear",
@@ -1015,6 +1103,8 @@ CATEGORICAL_RULES: list[Rewrite] = [
     WEIGHT_DISTRIBUTE_LINEAR,
     RIGHT_FACTOR_LINEAR,
     ASSOC_LINEAR,
+    ASSOC_LINEAR_BIAS,
+    ASSOC_LINEAR_BIAS_REV,
     NATURALITY_SCALAR,
     NATURALITY_SCALAR_REV,
     ASSOC_MATMUL,
