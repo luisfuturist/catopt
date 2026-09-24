@@ -488,11 +488,15 @@ needs per-op Lipschitz constants — not yet computed.
   99% energy stores 96.3% of params — **exact weight-space structure
   is absent; only the ε-bounded direction is live** (spectral decay
   exists: 90% energy at ~40% rank, but that requires certified error).
-  Phase-0b extended the probe to a family of algebras: H-matrix
-  off-diagonals are full-rank and sparsity is mild, but the
-  **Kronecker rearrangement is compressible** — ~4 terms capture 95%
-  Frobenius energy (~24× storage), an ε-certified candidate via the
-  `eps.py` axis.
+  Phase-0b extended the probe to a family of algebras with a
+  rate–distortion gate against plain SVD. Verdicts: H-matrix
+  off-diagonals full-rank (dead), sparse parity, monarch ALS
+  diverged (inconclusive), INR coordinate-fit fails (no smooth
+  manifold). **Two live signals**: the token embedding (60% of
+  params) is genuinely low-rank — rank 19 captures 95% energy,
+  ~15× storage — and attention/MLP weights are Kronecker-
+  rearrangement-compressible (~4 terms @95%, beating SVD ~15–31%).
+  Both are ε-certified candidates via the `eps.py` axis.
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.
