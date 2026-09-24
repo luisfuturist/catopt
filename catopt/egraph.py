@@ -96,6 +96,14 @@ class Rewrite:
     law: str = ""
     check: Any = None   # Callable[[dict[str, Any]], bool] | None
     derive: Any = None  # Callable[[dict], dict | None] | None
+    # Bounded-error axis (ε-laws): when set, this rewrite is a
+    # *certified approximation* — ``‖lhs − rhs‖ ≤ error_bound`` in the
+    # norm named by ``bound_norm`` (e.g. spectral on a substituted
+    # weight).  Exact rules leave it None.  Certificates aggregate the
+    # per-step bounds conservatively (triangle inequality); extraction
+    # can constrain or report the total.
+    error_bound: float | None = None
+    bound_norm: str = "spectral"
 
     def __repr__(self) -> str:
         return f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
@@ -229,14 +237,41 @@ class Certificate:
         return sorted({s.rule for s in self.steps
                        if not s.egraph_dependent})
 
+    @property
+    def error_bound(self) -> float:
+        """Conservative accumulated error bound: the triangle-inequality
+        sum of every step's ``Rewrite.error_bound`` (steps lacking a
+        bound contribute 0 — they are exact).  The bound is in whatever
+        norm the contributing rules declared; today that is the
+        spectral norm on the substituted subterm.  Propagating
+        site-local bounds to the model output requires per-op Lipschitz
+        constants — not yet computed."""
+        total = 0.0
+        for s in self.steps:
+            r = self.rules.get(s.rule)
+            if r is not None and r.error_bound:
+                total += r.error_bound
+        return total
+
+    @property
+    def exact(self) -> bool:
+        """True when no step carries an error bound — the derivation is
+        an exact equivalence, not a certified approximation."""
+        return self.error_bound == 0.0
+
     def render(self) -> str:
         lines = [f"certificate: {op_repr(self.src)}",
                  f"        ==> {op_repr(self.dst)}"]
         for i, s in enumerate(self.steps):
             tag = "  [e-graph-dependent]" if s.egraph_dependent else ""
+            r = self.rules.get(s.rule)
+            if r is not None and r.error_bound:
+                tag += f"  [ε≤{r.error_bound:.3e} {r.bound_norm}]"
             lines.append(
                 f"  {i:>3}. {s.rule} @{list(s.path)}: "
                 f"{op_repr(s.lhs)} -> {op_repr(s.rhs)}{tag}")
+        if not self.exact:
+            lines.append(f"  total ε bound: {self.error_bound:.3e}")
         return "\n".join(lines)
 
 
