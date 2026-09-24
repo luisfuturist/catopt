@@ -165,8 +165,17 @@ fp64 forward — baseline ppl **5.03**):
 |---|---|---|---|
 | emb rank-2 / r19 / r64 / r128 / r192 | 2.5–1.2× | 6108 → 214 | **dead at every rank** |
 | Kronecker-sum (35% resid) | 1.1× | 143 | dead |
-| **int8 RTN quant** | **4.0×** | **5.16** | **works** |
-| int4 RTN | ~8× | ~10⁵ | dead |
+| **int8 RTN quant (certified, catopt)** | **4.0×** | **5.16** | **works, bounded** |
+| int8 per-channel RTN (GPTQ-class baseline) | 4.0× | 5.00 | works, no bound |
+| int4 g128 RTN (GPTQ-class) | 8.0× | 7.01 | works, no bound |
+
+**The honest #2 verdict**: at matched ratio, certified per-tensor
+int8 (ppl 5.16) ≈ per-channel int8 baseline (ppl 5.00) — the
+certificate costs ~0.16 ppl, not bytes. `quant_params(per_channel=True)`
+now exists — row-wise scales close the quality gap at the same ratio
+with the bound kept (verified: 8× lower error on outlier rows). The
+differentiator claim survives, sized honestly: **compression parity
+with the RTN-class baseline, plus a certificate** — not a ratio win.
 
 **The energy signal did not survive contact with quality.** The
 embedding's top-19 singular directions (95% Frobenius energy) are not

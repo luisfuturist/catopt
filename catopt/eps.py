@@ -421,7 +421,7 @@ def model_bound(root_term: Any, cert: Any, source_tensors: dict,
 
 
 def quant_params(eg: EGraph, source_tensors: dict, *,
-                 bits: int = 8,
+                 bits: int = 8, per_channel: bool = False,
                  witness: bool = True) -> list[dict]:
     """Quantization-as-ε: offer ``mul(float(W_q), s)`` for every Param
     leaf in the e-graph, where ``W_q`` is per-tensor symmetric int
@@ -459,35 +459,66 @@ def quant_params(eg: EGraph, source_tensors: dict, *,
                     and W.is_floating_point() and W.numel() > 1):
                 continue
             Wd = W.detach()
-            amax = float(Wd.abs().max())
-            if amax == 0:
-                continue
-            s = amax / levels
-            q = torch.round(Wd / s).clamp(-levels - 1, levels).to(dtype)
-            qname = f"eps_q{bits}_{wt.name}"
-            source_tensors[qname] = q
-            member = Op.make(
-                "mul",
-                Op.make("float", Param(qname, wt.typ),
-                        dtype=str(W.dtype).split(".")[-1]),
-                Const(float(s)))
+            flat = Wd.reshape(Wd.shape[0], -1) \
+                if (per_channel and Wd.ndim >= 2) else None
+            if flat is not None:
+                amax_r = flat.abs().amax(-1, keepdim=True)
+                sc = torch.where(amax_r == 0,
+                                 torch.ones_like(amax_r),
+                                 amax_r / levels)
+                q = torch.round(flat / sc).clamp(
+                    -levels - 1, levels).to(dtype)
+                qname = f"eps_q{bits}c_{wt.name}"
+                sname = f"eps_s{bits}c_{wt.name}"
+                source_tensors[qname] = q.reshape(W.shape)
+                source_tensors[sname] = sc.reshape(
+                    *W.shape[:1], *([1] * (W.ndim - 1))
+                ).to(W.dtype)
+                member = Op.make(
+                    "mul",
+                    Op.make("float", Param(qname, wt.typ),
+                            dtype=str(W.dtype).split(".")[-1]),
+                    Param(sname, TensorType(
+                        tuple(source_tensors[sname].shape))))
+            else:
+                amax = float(Wd.abs().max())
+                if amax == 0:
+                    continue
+                s = amax / levels
+                q = torch.round(Wd / s).clamp(
+                    -levels - 1, levels).to(dtype)
+                qname = f"eps_q{bits}_{wt.name}"
+                source_tensors[qname] = q
+                member = Op.make(
+                    "mul",
+                    Op.make("float", Param(qname, wt.typ),
+                            dtype=str(W.dtype).split(".")[-1]),
+                    Const(float(s)))
             member_eid = eg.add_term(member)
+            if flat is not None:
+                # per-row: ‖ΔW‖_F ≤ (√n_cols/2)·‖s‖₂
+                bound = float(
+                    (flat.shape[1] ** 0.5) / 2
+                    * torch.linalg.norm(sc.squeeze(-1)))
+                law = (f"per-channel int{bits} of {wt.name}: "
+                       f"‖W−Ŵ‖_F ≤ (√n/2)·‖s‖₂ = {bound:.3e}")
+            else:
+                bound = s / 2 * (W.numel() ** 0.5)
+                law = (f"symmetric int{bits} quantization of "
+                       f"{wt.name}: ‖W−Ŵ‖_F ≤ (s/2)·√n = "
+                       f"{bound:.3e} (s={s:.3e})")
             wit = None
             if witness:
-                bound = s / 2 * (W.numel() ** 0.5)
                 wit = Rewrite(
                     name=f"eps_q{bits}#{member_eid}",
                     lhs=wt, rhs=member,
-                    law=(f"symmetric int{bits} quantization of "
-                         f"{wt.name}: ‖W−Ŵ‖_F ≤ (s/2)·√n = "
-                         f"{bound:.3e} (s={s:.3e})"),
+                    law=law,
                     error_bound=bound, bound_norm="frobenius")
             eg.union(c, member_eid, witness=wit,
-                     note=(f"eps_quant: {wt.name} -> int{bits} "
-                           f"(s={s:.3e})"))
+                     note=(f"eps_quant: {wt.name} -> int{bits}"
+                           f"{'/chan' if flat is not None else ''}"))
             offers.append({"name": wt.name, "bits": bits,
-                           "bound": wit.error_bound if wit else
-                                    s / 2 * (W.numel() ** 0.5),
+                           "bound": bound,
                            "stored": q.numel(), "original": W.numel(),
                            "eid": member_eid})
     return offers

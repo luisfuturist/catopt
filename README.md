@@ -455,12 +455,15 @@ tying become one object: *a rewrite with an error bound*.
   (exact Eckart–Young).
 - `eps.low_rank_gather` — low-rank at `embedding` sites:
   `embedding(W,idx) → matmul(embedding(U_r,idx), V_r)`. On the real
-  stories15M embedding (60% of params): **rank 2 @ 5% → 142×**.
+  stories15M embedding: rank 2 @ 5% → 142× *storage* — **but Phase-5
+  showed this destroys perplexity** (norm bound ≠ quality); useful
+  where a norm bound is the contract, not for task quality.
 - `eps.kron_linear_params` — sum-of-Kronecker as a program of K
   composed maps; Frobenius bound via the rearranged-SVD isometry.
 - `eps.quant_params` — quantization-as-rewrite:
-  `W → mul(float(W_int8), s)`, bound `(s/2)·√n`; `by_bytes` pricing
-  sees the width reduction.
+  `W → mul(float(W_int8), s)`, bound `(s/2)·√n`; `per_channel=True`
+  gives row-wise scales (same bytes, tighter quality, bound kept);
+  `by_bytes` pricing sees the width reduction.
 - `eps.model_bound` — **output-level certificates**: site bounds ×
   Lipschitz path sensitivities to the output.
 - `param_bytes_cost` (`by_bytes`) — prices stored parameter bytes;
