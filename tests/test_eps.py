@@ -250,6 +250,50 @@ def test_model_bound_propagates_through_graph():
     assert mb["n_bounded_steps"] == 2
 
 
+def test_eps_families_compose():
+    """The unifying claim: gather-low-rank + quantization + exact
+    sharing coexist in one e-graph, one extraction, one certificate."""
+    from catopt.eps import model_bound
+    torch.manual_seed(0)
+
+    class M(nn.Module):
+        def __init__(s):
+            super().__init__()
+            U = torch.randn(1000, 8)
+            V = torch.randn(8, 64)
+            s.emb = nn.Embedding(1000, 64)
+            s.emb.weight.data = U @ V + 0.02 * torch.randn(1000, 64)
+            s.l1 = nn.Linear(64, 64, bias=False)
+            s.l2 = nn.Linear(64, 64, bias=False)
+
+        def forward(s, x):
+            return s.l2(torch.relu(s.l1(s.emb(x))))
+
+    m = M().eval().double()
+    idx = torch.randint(0, 1000, (8,))
+    orig = sum(p.numel() * p.element_size() for p in m.parameters())
+    ir, src = export_to_ir(m, idx)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(all_rules(), root, max_iterations=3)
+    g = low_rank_gather(eg, src, rtol=0.05)
+    q = quant_params(eg, src, bits=8)
+    assert g and q
+    term = eg.extract_best(root, param_bytes_cost_for(src,
+                                                    by_bytes=True))
+    xv = Var("x", TensorType((8,)))
+    mod = ir_to_torch_module(
+        IR(root=term, params={}, inputs=[xv]), src)
+    with torch.no_grad():
+        err = (mod(idx) - m(idx)).abs().max().item()
+    nb = sum(t.numel() * t.element_size() for t in mod.parameters())
+    assert nb < orig / 4                     # real compression
+    cert = eg.certificate(ir.root, term, root_eid=root)
+    assert cert.replayable and not cert.exact
+    mb = model_bound(term, cert, src, input_norm=1.0)
+    assert mb["bound"] >= err or mb["bound"] == float("inf")
+
+
 def test_kron_rejects_dense_random():
     """A random full-rank weight has no compressible rearrangement."""
     torch.manual_seed(7)
