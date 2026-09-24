@@ -215,6 +215,14 @@ Karpathy's `llama2.c` — the pipeline automatically rediscovers
 (asymmetric wq/wk/wv fusion), the transforms vLLM and TensorRT-LLM
 implement by hand. Verified to float noise.
 
+**End-to-end** (`bench_e2e.py`): a 2-layer PaLM-style stacked model
+(2.2M params, fp32, RTX 2050) runs **1.40× vs eager and 1.24× vs
+Inductor** through the full pipeline — the pairing pass fuses all
+five shared-input projections per block into single GEMMs that
+Inductor alone does not create. Honest limit: whole-model saturation
+scales poorly past ~2 layers (per-block compositional optimization is
+the fix).
+
 **Hybrid models compose carriers.** On a Jamba-style SSM→attention
 block, both carriers coexist in one e-graph (444 enodes, saturates in
 0.7s) and extraction produces terms mixing `applyd` and `om_apply`
