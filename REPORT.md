@@ -97,6 +97,13 @@ an error bound**.
   rearranged-SVD residual (Frobenius isometry → exact). The offered
   member is a *program of K composed maps* — weights-as-programs in
   the literal sense.
+- `low_rank_gather`: `embedding(W,idx) → matmul(embedding(U_r,idx),
+  V_r)` — gather the small factor, then project. On the real
+  stories15M embedding: **rank 2 at 5% spectral = 142× storage**.
+- `quant_params`: quantization-as-rewrite — `W → mul(float(W_int8),
+  s)`, certified Frobenius bound `(s/2)·√n`. Byte-aware
+  `param_bytes_cost(by_bytes=True)` prices the width reduction;
+  verified end-to-end (32KB → 4KB, err within bound).
 
 Both inject derived factor params into `source_tensors`, so the
 lowered module's state dict contains only the factor tensors.
