@@ -117,6 +117,11 @@ Rate–distortion through the full pipeline (2-layer MLP, fp64):
 | int8 quant | 16,384 B | 8.0× | 5.3e-3 | 0.076 (site) / 0.79 (model) |
 | low-rank @10% | — | no offer | — | (weights are full-rank) |
 
+Composite (low-rank embedding + int8 quant on all params, one
+e-graph, one extraction): **577 KB → 16.7 KB (34.6×)**, measured err
+2.8e-2 within the certified model bound — all three rewrite families
+composing in a single certificate.
+
 Both inject derived factor params into `source_tensors`, so the
 lowered module's state dict contains only the factor tensors.
 

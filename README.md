@@ -541,7 +541,7 @@ tying become one object: *a rewrite with an error bound*.
 | `catopt/eps.py` | ε axis: `low_rank_params` (certified truncated-SVD at linear sites) |
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
 | `measure_weights.py` | Phase-0 weight-structure falsification harness |
-| `tests/` | 474 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
+| `tests/` | 480 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
 
