@@ -449,23 +449,24 @@ certificates accumulate per-step bounds (triangle inequality) and
 report `cert.error_bound` / `cert.exact`. Quantization, low-rank, and
 tying become one object: *a rewrite with an error bound*.
 
-- `eps.low_rank_params` — truncated-SVD factorization at `linear`
-  sites: `linear(x,W) → linear(linear(x,V_r), U_rΣ_r)`, bound =
-  `σ_{r+1}` (exact Eckart–Young). Offered only when it truly shrinks
-  storage.
-- `param_bytes_cost` — first cost axis pricing *stored parameter
-  values*, so compressed realizations win extraction.
-- `extract_best_bounded(max_error=…)` — extraction under an ε budget:
-  candidates whose certificate exceeds the bound get their
-  bound-carrying enodes banned and extraction retries.
-- Exact sharing: `share_duplicate_params` (bitwise-equal params tie
-  into one e-class — tied embeddings, duplicated adapters) and
-  `share_duplicate_param_slices` (head-granular dedup inside one
-  weight via `index_select` — GQA head sharing materialized as
-  separate tensors). Both witnessed, exact, state-dict-shrinking.
-
-Bounds are site-local spectral norms; propagating to model outputs
-needs per-op Lipschitz constants — not yet computed.
+- `eps.low_rank_params` — truncated-SVD at `linear` sites:
+  `linear(x,W) → linear(linear(x,V_r), U_rΣ_r)`, bound `σ_{r+1}`
+  (exact Eckart–Young).
+- `eps.low_rank_gather` — low-rank at `embedding` sites:
+  `embedding(W,idx) → matmul(embedding(U_r,idx), V_r)`. On the real
+  stories15M embedding (60% of params): **rank 2 @ 5% → 142×**.
+- `eps.kron_linear_params` — sum-of-Kronecker as a program of K
+  composed maps; Frobenius bound via the rearranged-SVD isometry.
+- `eps.quant_params` — quantization-as-rewrite:
+  `W → mul(float(W_int8), s)`, bound `(s/2)·√n`; `by_bytes` pricing
+  sees the width reduction.
+- `eps.model_bound` — **output-level certificates**: site bounds ×
+  Lipschitz path sensitivities to the output.
+- `param_bytes_cost` (`by_bytes`) — prices stored parameter bytes;
+  `extract_best_bounded(max_error=…)` — extraction under an ε budget.
+- Exact sharing: `share_duplicate_params` (tied params) and
+  `share_duplicate_param_slices` (head-granular dedup via
+  `index_select` — GQA sharing). Both witnessed, exact.
 
 ## Roadmap
 
