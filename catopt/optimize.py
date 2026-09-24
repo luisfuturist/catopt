@@ -12,7 +12,9 @@ The main entry point is :func:`optimize_model`.
 
 from __future__ import annotations
 
-from typing import Any
+import copy
+import time
+from typing import Any, Callable
 
 import torch
 
@@ -376,3 +378,252 @@ def term_cost(term: Any, cost_fn=None) -> float:
     if cost_fn is None:
         cost_fn = flops_cost
     return cost_fn(term)
+
+
+# ---------------------------------------------------------------------------
+#  Compositional optimization — per-block eqsat, then recompose
+# ---------------------------------------------------------------------------
+
+def _default_block_pred(parent: torch.nn.Module, name: str,
+                        module: torch.nn.Module) -> bool:
+    """Default block selector: direct children of ``nn.ModuleList`` /
+    ``nn.Sequential`` — the standard 'stacked blocks' structure."""
+    return isinstance(parent, (torch.nn.ModuleList, torch.nn.Sequential))
+
+
+def _select_blocks(model: torch.nn.Module,
+                   block_pred: Callable | None) -> list[tuple[str, torch.nn.Module]]:
+    """Walk the module tree and pick the top-most submodules to optimize
+    independently.
+
+    A child is selected when it is a leaf (no children of its own) or when
+    ``block_pred(parent, child_name, child)`` is true.  Selected blocks are
+    opaque: we never descend into them, so e.g. the ``nn.Linear`` leaves
+    inside a matched ``ParallelBlock`` are not optimized separately.
+    """
+    pred = block_pred or _default_block_pred
+    blocks: list[tuple[str, torch.nn.Module]] = []
+
+    def visit(module: torch.nn.Module, prefix: str) -> None:
+        for child_name, child in module.named_children():
+            full = f"{prefix}.{child_name}" if prefix else child_name
+            is_leaf = next(child.children(), None) is None
+            if is_leaf or pred(module, child_name, child):
+                blocks.append((full, child))
+            else:
+                visit(child, full)
+
+    visit(model, "")
+    return blocks
+
+
+def _capture_block_inputs(
+    model: torch.nn.Module,
+    blocks: list[tuple[str, torch.nn.Module]],
+    example_input: torch.Tensor | tuple,
+) -> dict[str, tuple[tuple, dict]]:
+    """Run the ORIGINAL model once and record each selected block's first
+    forward inputs via hooks.  Returns ``{name: (args, kwargs)}``."""
+    captured: dict[str, tuple[tuple, dict]] = {}
+    handles = []
+
+    def make_hook(name: str):
+        def hook(mod, args, kwargs, out):
+            if name not in captured:
+                captured[name] = (
+                    tuple(a.detach().clone() if isinstance(a, torch.Tensor)
+                          else a for a in args),
+                    {k: (v.detach().clone() if isinstance(v, torch.Tensor)
+                         else v) for k, v in kwargs.items()},
+                )
+        return hook
+
+    for name, mod in blocks:
+        handles.append(mod.register_forward_hook(make_hook(name),
+                                                 with_kwargs=True))
+    args = example_input if isinstance(example_input, tuple) else (example_input,)
+    try:
+        model.eval()
+        with torch.no_grad():
+            model(*args)
+    finally:
+        for h in handles:
+            h.remove()
+    return captured
+
+
+def _rel_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+    return ((a - b).abs().max().item()
+            / (a.abs().max().item() + 1e-8))
+
+
+def _replace_submodule(model: torch.nn.Module, dotted: str,
+                       new_mod: torch.nn.Module) -> None:
+    """Set ``model.<dotted>`` to ``new_mod``, handling ModuleList /
+    Sequential integer children."""
+    parent_name, _, child_name = dotted.rpartition(".")
+    parent = model.get_submodule(parent_name) if parent_name else model
+    if child_name.isdigit() and isinstance(
+            parent, (torch.nn.ModuleList, torch.nn.Sequential)):
+        parent[int(child_name)] = new_mod
+    else:
+        setattr(parent, child_name, new_mod)
+
+
+def optimize_compositional(
+    model: torch.nn.Module,
+    example_input: torch.Tensor | tuple,
+    *,
+    block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool] | None = None,
+    cost_fn=None,
+    ruleset: str = "all",
+    max_iterations: int = 100,
+    max_enodes: int = 100_000,
+    verify_tol: float = 1e-4,
+    verbose: bool = True,
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Optimize a stacked/multi-block model one block at a time.
+
+    Whole-model equality saturation is monolithic: the e-graph grows with
+    the product of block structures, so deep stacks saturate slowly.
+    This driver instead
+
+    1. walks the module tree and selects *blocks* — leaf submodules, plus
+       any child where ``block_pred(parent, name, child)`` holds
+       (default: children of ``nn.ModuleList``/``nn.Sequential``),
+    2. runs the ORIGINAL model once with forward hooks to capture each
+       block's real input (a block's input is not the model input),
+    3. runs :func:`optimize_model` on each block with its captured input,
+       verifying the lowered block against the original on that input —
+       a block that fails to export, saturate, lower, or verify keeps its
+       original implementation,
+    4. clones the model and grafts the optimized ``IRModule``\s back in
+       place, preserving the original forward structure, then verifies
+       end-to-end equivalence on ``example_input``.
+
+    Returns ``(recomposed_module, stats)`` where ``stats["blocks"]`` maps
+    each block's dotted name to ``{"status", "stats", "param_report",
+    "time_s", ...}`` and ``stats["param_report"]`` aggregates the
+    per-block parameter diffs (eliminated/derived names are prefixed by
+    block name for auditability).
+    """
+    t_start = time.time()
+    if cost_fn is None:
+        cost_fn = launch_aware_cost
+
+    blocks = _select_blocks(model, block_pred)
+    if verbose:
+        print(f"[Compositional] {len(blocks)} candidate blocks: "
+              f"{[n for n, _ in blocks]}")
+
+    captured = _capture_block_inputs(model, blocks, example_input)
+
+    replacements: dict[str, torch.nn.Module] = {}
+    block_stats: dict[str, dict[str, Any]] = {}
+    agg = {"original_params": 0, "optimized_params": 0,
+           "original_bytes": 0, "optimized_bytes": 0,
+           "eliminated": [], "derived": []}
+
+    for name, block in blocks:
+        entry: dict[str, Any] = {}
+        block_stats[name] = entry
+        cap = captured.get(name)
+        if cap is None:
+            entry["status"] = "not_executed"
+            continue
+        args, kwargs = cap
+        if kwargs:
+            entry["status"] = "skipped"
+            entry["reason"] = f"non-positional kwargs {sorted(kwargs)}"
+            continue
+        ex = args[0] if len(args) == 1 else args
+        t0 = time.time()
+        try:
+            opt_mod, st = optimize_model(
+                block, ex,
+                ruleset=ruleset, max_iterations=max_iterations,
+                max_enodes=max_enodes, cost_fn=cost_fn,
+                verbose=verbose)
+            # Per-block verification on the captured input — soundness
+            # gate independent of optimize_model's own (verbose-gated)
+            # check.  Any mismatch or eval failure falls back.
+            with torch.no_grad():
+                ref = block(*args)
+                got = opt_mod(*args)
+            rd = _rel_diff(ref, got)
+            entry["rel_diff"] = rd
+            if not (rd < verify_tol):
+                raise RuntimeError(
+                    f"block verification failed: rel diff {rd:.3e}")
+            replacements[name] = opt_mod
+            entry["status"] = "optimized"
+            entry["stats"] = st
+            pr = param_report(block, opt_mod)
+            entry["param_report"] = pr
+            agg["original_params"] += pr["original_params"]
+            agg["optimized_params"] += pr["optimized_params"]
+            agg["original_bytes"] += pr["original_bytes"]
+            agg["optimized_bytes"] += pr["optimized_bytes"]
+            agg["eliminated"] += [f"{name}:{n}" for n in pr["eliminated"]]
+            agg["derived"] += [f"{name}:{n}" for n in pr["derived"]]
+            if verbose:
+                print(f"[Compositional] {name}: optimized "
+                      f"({entry['rel_diff']:.2e})")
+        except Exception as e:  # noqa: BLE001 — fallback keeps original
+            entry["status"] = "failed"
+            entry["error"] = f"{type(e).__name__}: {e}"
+            if verbose:
+                print(f"[Compositional] {name}: keeping original ({e})")
+        entry["time_s"] = time.time() - t0
+
+    # -- Recompose -------------------------------------------------------
+    in_place = False
+    try:
+        new_model = copy.deepcopy(model)
+    except Exception:
+        new_model = model
+        in_place = True
+    for name, opt_mod in replacements.items():
+        _replace_submodule(new_model, name, opt_mod)
+
+    # -- End-to-end verification ----------------------------------------
+    stats: dict[str, Any] = {
+        "compositional": True,
+        "n_blocks": len(blocks),
+        "n_optimized": len(replacements),
+        "n_failed": sum(1 for e in block_stats.values()
+                        if e.get("status") == "failed"),
+        "n_skipped": sum(1 for e in block_stats.values()
+                         if e.get("status") in ("skipped", "not_executed")),
+        "blocks": block_stats,
+        "in_place": in_place,
+    }
+    agg["bytes_saved"] = agg["original_bytes"] - agg["optimized_bytes"]
+    agg["ratio"] = (agg["optimized_bytes"] / agg["original_bytes"]
+                    if agg["original_bytes"] else 1.0)
+    stats["param_report"] = agg
+
+    args = (example_input if isinstance(example_input, tuple)
+            else (example_input,))
+    model.eval()
+    new_model.eval()
+    try:
+        with torch.no_grad():
+            ref = model(*[a.clone() if isinstance(a, torch.Tensor) else a
+                          for a in args])
+            out = new_model(*[a.clone() if isinstance(a, torch.Tensor) else a
+                              for a in args])
+        stats["end_to_end"] = {
+            "max_abs_diff": (ref - out).abs().max().item(),
+            "max_rel_diff": _rel_diff(ref, out),
+        }
+        if verbose:
+            print(f"[Compositional] end-to-end rel diff: "
+                  f"{stats['end_to_end']['max_rel_diff']:.3e}")
+    except Exception as e:  # noqa: BLE001
+        stats["end_to_end"] = {"error": f"{type(e).__name__}: {e}"}
+        if verbose:
+            print(f"[Compositional] end-to-end check failed: {e}")
+
+    stats["wall_time_s"] = time.time() - t_start
+    return new_model, stats

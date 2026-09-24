@@ -219,9 +219,11 @@ implement by hand. Verified to float noise.
 (2.2M params, fp32, RTX 2050) runs **1.40× vs eager and 1.24× vs
 Inductor** through the full pipeline — the pairing pass fuses all
 five shared-input projections per block into single GEMMs that
-Inductor alone does not create. Honest limit: whole-model saturation
-scales poorly past ~2 layers (per-block compositional optimization is
-the fix).
+Inductor alone does not create. `optimize_compositional` scales this
+past the monolithic-saturation limit: it captures each block's input
+via forward hooks, optimizes blocks independently, and recomposes —
+a 4-layer stack completes in ~2s with per-block verification and
+automatic fallback for blocks that fail export.
 
 **Hybrid models compose carriers.** On a Jamba-style SSM→attention
 block, both carriers coexist in one e-graph (444 enodes, saturates in
@@ -446,6 +448,12 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   parameter detection (needs a value-level decision procedure),
   weight sharing/factoring, and a parameter-storage cost axis so
   extraction can *prefer* smaller realizations.
+  **`measure_weights.py` Phase-0 falsification on real trained weights
+  (stories15M)**: numerical rank is ~full at 1e-2 tolerance,
+  displacement rank ~n (no Toeplitz/generator structure), low-rank at
+  99% energy stores 96.3% of params — **exact weight-space structure
+  is absent; only the ε-bounded direction is live** (spectral decay
+  exists: 90% energy at ~40% rank, but that requires certified error).
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.
