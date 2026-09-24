@@ -426,10 +426,16 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 - **More weight-preserving dualities**: RepVGG-style branch merging,
   conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
   architecture over the same parameters.
-- **Mask synthesis + `attn_mask` chunking**: `OM_MASK_LAWS` distribute
-  materialized masks and `SDPA_CAT_LAWS` chunk the `is_causal` flag;
-  generating masks from positions (`arange`/`tril`) and chunking an
-  explicit `attn_mask` operand remain open.
+- **Joint graph+parameter optimization**: today the laws rewrite the
+  graph *over* parameters; the deeper target is rewriting the
+  parameter realization itself — exact composed-linear collapse
+  (`W₂W₁x`, smaller iff `o·i < h(o+i)`), provably-dead parameter
+  elimination (null-space annihilation), and weight sharing/factoring
+  — all under exact equivalence, complementary to approximate
+  compression (quantization, low-rank).
+- **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
+  coercion (float/bool masks, one law); generating masks from
+  positions (`arange`/`tril`) remains open.
 - **Trace beyond linear bodies**: affine/nonlinear loop bodies need
   constant-1 augmentation or function-valued objects; delay-loop
   trace with init state needs a stream-function category.
@@ -458,7 +464,7 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `main.py`, `bench_gpu.py` | Demos and benchmark drivers |
-| `tests/` | 420 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier |
+| `tests/` | 450 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks (incl. `attn_mask` chunking), synthesis, regimes, trace, cross-carrier |
 
 ## Reproduce
 
