@@ -125,7 +125,7 @@ from typing import Any
 import torch
 
 from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Op
+from catopt.ir import Op, Var, TensorType
 from catopt.rules import R
 from catopt.torch_bridge import _IR_TO_TORCH
 
@@ -165,8 +165,120 @@ def _vec(t) -> bool:
     return _concrete(s) and len(s) == 1
 
 
+def _xshape(t: Any, _memo: dict | None = None):
+    """The TRUE value shape of a bound term — for the XC guards.
+
+    ``catopt.cost._shape_of`` prices the carriers by convention:
+    ``apply``/``applyd`` report h's (state) shape, ``aff``/``aff_diag``
+    report the map's linear part.  That convention is exact on the
+    recurrence spine, where state and value shapes coincide — but it
+    lies for cross-carrier members: a stacked or promoted map's value
+    (…,o) differs from the state (i,).  ``EGraph.any_term`` resolves a
+    metavariable to an ARBITRARY class member, so a tensor e-class may
+    resolve through a carrier member whose convention shape vetoes a
+    legal rewrite (observed: ``xc_om_elem_aff`` on HybridBlock — the
+    score block's matmul reads through a promoted ``apply`` and
+    reports ``(d,)`` instead of ``(T,d)``).
+
+    This resolver computes the *value* shape for the carrier-
+    application ops and the fused/deferred om family (absent from the
+    cost model's dispatch), then re-dispatches ``_shape_of`` over
+    surrogate leaves carrying the corrected child shapes — so carrier
+    members nested inside an ordinary tensor term cannot poison the
+    result.  Map terms (``aff``/``aff_diag``/the composes) keep the
+    cost convention — the checks rely on it.
+    """
+    if _memo is None:
+        _memo = {}
+    key = id(t)
+    if key in _memo:
+        return _memo[key]
+    out = _xshape_rec(t, _memo)
+    _memo[key] = out
+    return out
+
+
+def _xshape_rec(t: Any, memo: dict):
+    if not isinstance(t, Op):
+        return _shape_of(t)
+    op, args = t.op, t.args
+    if op == "applyd" and len(args) == 2:
+        # value = a⊙h + b — broadcast of all three factors
+        f, h = args
+        hs = _xshape(h, memo)
+        if isinstance(f, Op) and f.op == "aff_diag" and len(f.args) == 2:
+            return _bc(_bc(_xshape(f.args[0], memo), hs),
+                       _xshape(f.args[1], memo))
+        fs = _shape_of(f)      # opaque map: a-part convention
+        return _bc(fs, hs)
+    if op == "apply" and len(args) == 2:
+        # value = A@h + c — A (…,o,i) contracts h's axis, + c
+        f, _h = args
+        if isinstance(f, Op) and f.op == "aff" and len(f.args) == 2:
+            As = _xshape(f.args[0], memo)
+            cs = _xshape(f.args[1], memo)
+            if isinstance(As, tuple) and len(As) >= 1:
+                return _bc(tuple(As[:-1]), cs)
+            return cs
+        fs = _shape_of(f)      # dense map convention: (…,o,i)
+        if isinstance(fs, tuple) and len(fs) >= 2:
+            return tuple(fs[:-1])
+        return _shape_of(t)
+    if op in ("affd_a", "aff_A") and len(args) == 1:
+        f = args[0]
+        if isinstance(f, Op) and f.args:
+            return _xshape(f.args[0], memo)
+        return _shape_of(f)
+    if op in ("affd_b", "aff_b") and len(args) == 1:
+        f = args[0]
+        if isinstance(f, Op) and len(f.args) >= 2:
+            return _xshape(f.args[1], memo)
+        fs = _shape_of(f)
+        if op == "aff_b" and isinstance(fs, tuple) and len(fs) >= 2:
+            return tuple(fs[:-1])       # dense b-part ≈ output shape
+        return fs                        # diag b-part ≈ a-part shape
+    # The fused/deferred om family — the applied VALUE shape, the same
+    # convention om_elem uses: score prefix ++ value's last dim.
+    if op == "om_elem_affd" and len(args) == 4:
+        ss, sa = _xshape(args[0], memo), _xshape(args[1], memo)
+        if _concrete(ss) and _concrete(sa):
+            return tuple(ss[:-1]) + (sa[-1],)
+        return _shape_of(t)
+    if op == "om_elem_aff" and len(args) == 4:
+        ss, sa = _xshape(args[0], memo), _xshape(args[1], memo)
+        if _concrete(ss) and _concrete(sa) and len(sa) >= 2:
+            return tuple(ss[:-1]) + (sa[-2],)
+        return _shape_of(t)
+    if op == "omd_elem" and len(args) == 3:
+        ss, sa = _xshape(args[0], memo), _xshape(args[1], memo)
+        if _concrete(ss) and _concrete(sa):
+            # dense fiber a (…,K,d,i) → applied value (…,Tq,d)
+            last = sa[-2] if len(sa) >= 3 else sa[-1]
+            return tuple(ss[:-1]) + (last,)
+        return _shape_of(t)
+    if op == "omd_compose" and len(args) == 2:
+        return _xshape(args[0], memo)
+    if op in ("omd_apply", "omd_applym") and len(args) == 2:
+        return _xshape(args[0], memo)
+    if op == "omd" and len(args) == 4:
+        return _xshape(args[3], memo)    # fb — applied numerator shape
+    # generic op: re-dispatch _shape_of on surrogate leaves carrying
+    # the corrected child shapes.
+    fixed = list(args)
+    touched = False
+    for i, a in enumerate(fixed):
+        if isinstance(a, Op):
+            s = _xshape(a, memo)
+            if _concrete(s):
+                fixed[i] = Var("_xs", TensorType(tuple(s)))
+                touched = True
+    if touched:
+        return _shape_of(Op.make(op, *fixed, **t.attrs))
+    return _shape_of(t)
+
+
 def _shape(t):
-    s = _shape_of(t)
+    s = _xshape(t)
     return s if isinstance(s, tuple) else None
 
 
@@ -332,9 +444,31 @@ def _scalar_or_broadcast(bound: dict, rkey: str, tshape) -> bool:
         len(rs) == 0 or rs == tshape or rs == (tshape[-1],))
 
 
+def _named_scale(bound: dict, rkey: str) -> bool:
+    """The scale operand must resolve to a LEAF — a named scalar or
+    gain (Var/Param/Const), not a computed factor.
+
+    A *computed* r (any Op term — e.g. the per-step decay a_t on a
+    recurrence spine) makes this law replay the carrier's own step
+    composition as a concrete map: the minted ``mul(f.a, r)`` factors
+    unfold via ``affd_unlift`` and re-match this same rule against
+    EVERY applyd member of the state class — a cross-product per step,
+    hence exponential e-graph growth.  A leaf r cannot create that
+    loop: the factors a firing mints are always Op terms, which this
+    guard then vetoes.  Computed scales are not lost coverage either —
+    ``r ⊙ applyd(f, h)`` is already reachable through the carrier's
+    own ``affd_compose``/``aff_compose`` machinery; the leaf case
+    (readout scales like 1/√d, learned gains) is the one that needs a
+    concrete map."""
+    return not isinstance(bound.get(rkey), Op)
+
+
 def _check_scale_applyd(bound: dict) -> bool:
     """mul(applyd(aff_diag(a,b),h), r) = applyd((r⊙a, r⊙b),h): r must
-    broadcast against the state shape (scalar, (d,), or full shape)."""
+    be a leaf (named scalar/gain) broadcasting against the state shape
+    (scalar, (d,), or full shape)."""
+    if not _named_scale(bound, "r"):
+        return False
     a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
     if not all(_concrete(s) for s in (a, b, h)):
         return False
@@ -350,6 +484,8 @@ def _check_scale_apply(bound: dict) -> bool:
     (…,1)-shaped broadcastable."""
     A, c, h = (_shape(bound.get(k)) for k in ("A", "c", "h"))
     if not all(_concrete(s) for s in (A, c, h)):
+        return False
+    if not _named_scale(bound, "r"):
         return False
     if not (len(A) >= 2 and A[-1] == A[-2] and len(h) == 1
             and h[-1] == A[-1]):
@@ -715,8 +851,11 @@ def _scale_applyd(name, r_first):
                         Op.make("mul", "a", "r"),
                         Op.make("mul", "b", "r")),
                 "h"),
-        law="A broadcast scale commutes into the carrier: "
-            "r⊙(a⊙h+b) = (r⊙a)⊙h + r⊙b.",
+        law="A named (leaf) scale commutes into the carrier: "
+            "r⊙(a⊙h+b) = (r⊙a)⊙h + r⊙b.  r must resolve to a leaf — a "
+            "computed factor (e.g. a per-step decay on a recurrence "
+            "spine) is already reachable through affd_compose and "
+            "would loop with affd_unlift.",
         check=_check_scale_applyd)
 
 
@@ -736,7 +875,8 @@ def _scale_apply(name, r_first):
                         Op.make("mul", "c", "r")),
                 "h"),
         law="Scalar/row scale commutes into the dense carrier: "
-            "r·(Ah+c) = (rA)h + rc.",
+            "r·(Ah+c) = (rA)h + rc.  Same leaf restriction as the "
+            "diagonal variant.",
         check=_check_scale_apply)
 
 

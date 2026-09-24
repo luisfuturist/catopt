@@ -1008,10 +1008,11 @@ class RegimeDispatch(nn.Module):
 #: carriers, the om numerator is such a readout, and the deferred omd
 #: carrier keeps chunked attention affine in the scan's initial state.
 CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS
-#: Opt-in: the cross-carrier readout laws roughly double the rule set
-#: (mostly bidirectional pairs) and blow up default saturation on
-#: carrier-heavy graphs — attach them per-call via ``rules=`` where the
-#: seam matters.  The non-local xcarrier passes run regardless.
+#: Core carriers + the cross-carrier seam laws interleaved — for
+#: callers that want one saturating ruleset.  ``build_egraph`` keeps
+#: XC in a bounded second tier instead (see its ``xc`` flag): the set
+#: is mostly bidirectional pairs minting fresh enodes, so it gets its
+#: own iteration budget after the carriers are established.
 CARRIER_X_LAWS = CARRIER_LAWS + XC_LAWS
 
 
@@ -1021,16 +1022,28 @@ def default_rules() -> list:
 
 def build_egraph(model: nn.Module, example_input: Any, *,
                  rules: Optional[list] = None,
+                 xc: bool = True,
                  max_iterations: int = 14,
                  max_nodes: int = 400_000):
     """Export ``model`` and saturate an e-graph with carrier laws.
 
     Returns ``(eg, root_eid, ir, source_tensors, stats)``.
+
+    ``rules`` selects the core saturating set (default
+    ``CARRIER_LAWS``).  ``xc`` (default on) adds a bounded second tier:
+    after the non-local lifts have established the carriers, the
+    cross-carrier seam laws (``XC_LAWS``) run with their own small
+    iteration budget, then a short core pass integrates the seam
+    members — looped at most twice.  Keeping XC out of the saturating
+    tier bounds the blast radius of its bidirectional promotion pairs
+    on carrier-heavy graphs while still letting om_elem_affd / the
+    readout and omd lift rules fire.
     """
     ir, source = export_to_ir(model, example_input)
     eg = EGraph()
     root = eg.add_term(ir.root)
-    stats = eg.run(default_rules() if rules is None else rules, root,
+    core = default_rules() if rules is None else rules
+    stats = eg.run(core, root,
                    max_iterations=max_iterations, max_nodes=max_nodes)
     # Non-local lifts: recurrences -> trace(F), stacks of same-state
     # carrier applications -> one application, om trees over scanned
@@ -1038,21 +1051,49 @@ def build_egraph(model: nn.Module, example_input: Any, *,
     from catopt.trace_lift import lift_scan_to_trace
     from catopt.xcarrier import (gather_applyd_stack,
                                  gather_apply_stack, omd_tree_lift)
-    lifts = (lift_scan_to_trace(eg)
-             + gather_applyd_stack(eg)
-             + gather_apply_stack(eg)
-             + omd_tree_lift(eg))
+
+    def _lifts():
+        return (lift_scan_to_trace(eg)
+                + gather_applyd_stack(eg)
+                + gather_apply_stack(eg)
+                + omd_tree_lift(eg))
+
+    lifts = _lifts()
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
-        eg.run(default_rules() if rules is None else rules, root,
-               max_iterations=5, max_nodes=max_nodes)
+        eg.run(core, root, max_iterations=5, max_nodes=max_nodes)
+    if xc:
+        xc_rounds = 0
+        for _ in range(2):
+            before = eg.n_enodes
+            eg.run(XC_LAWS, root, max_iterations=4,
+                   max_nodes=max_nodes)
+            grew = eg.n_enodes != before
+            # XC-minted members can enable new non-local offers (e.g.
+            # chunk_apply putting affine maps into om leaf values, which
+            # omd_tree_lift then lifts whole) — re-run the passes.
+            more = _lifts()
+            if more:
+                eg.rebuild()
+                stats["nonlocal_lifts"] = (
+                    stats.get("nonlocal_lifts", 0) + len(more))
+            if not grew and not more:
+                break
+            xc_rounds += 1
+            # let the core laws absorb the seam members
+            eg.run(core, root, max_iterations=2,
+                   max_nodes=max_nodes)
+        stats["xc_rounds"] = xc_rounds
+        stats["xc_fires"] = sum(
+            eg.rule_fires.get(r.name, 0) for r in XC_LAWS)
     return eg, root, ir, source, stats
 
 
 def regime_dispatch(model: nn.Module, example_input: Any,
                     regimes: Any = None, *,
                     rules: Optional[list] = None,
+                    xc: bool = True,
                     max_iterations: int = 14,
                     max_nodes: int = 400_000,
                     default: Optional[str] = None,
@@ -1081,7 +1122,7 @@ def regime_dispatch(model: nn.Module, example_input: Any,
     args = (example_input if isinstance(example_input, tuple)
             else (example_input,))
     eg, root, ir, source, stats = build_egraph(
-        model, example_input, rules=rules,
+        model, example_input, rules=rules, xc=xc,
         max_iterations=max_iterations, max_nodes=max_nodes)
     regime_list = _attach_profiles(_normalise_regimes(regimes), profiles)
     if calibrate:
