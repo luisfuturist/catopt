@@ -198,6 +198,12 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if isinstance(base[d], int) and isinstance(hi, int):
                 out[d] = min(hi, base[d]) - (lo or 0)
             return tuple(out)
+        case "embedding":
+            # Row gather: out = idx.shape + (d,) where W is (v, d).
+            wsh, ishape = shapes[0], shapes[1]
+            if wsh is None or len(wsh) != 2:
+                return None
+            return tuple(ishape or ()) + (wsh[1],)
         case "index_select":
             # Gather along dim: that axis resizes to len(index).
             base = shapes[0]

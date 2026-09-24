@@ -278,8 +278,11 @@ def optimize_model(
              + share_duplicate_params(eg, source_tensors)
              + share_duplicate_param_slices(eg, source_tensors))
     if eps_rtol is not None:
-        from catopt.eps import low_rank_params, kron_linear_params
+        from catopt.eps import (low_rank_params, kron_linear_params,
+                                low_rank_gather)
         eps_offers = (low_rank_params(eg, source_tensors, rtol=eps_rtol)
+                      + low_rank_gather(eg, source_tensors,
+                                        rtol=eps_rtol)
                       + kron_linear_params(eg, source_tensors,
                                            rtol=eps_rtol))
         lifts += eps_offers

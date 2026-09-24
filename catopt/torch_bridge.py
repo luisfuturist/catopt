@@ -434,6 +434,10 @@ _IR_TO_TORCH: dict[str, Any] = {
         int(kw.get("arg1", kw.get("dim", 0))),
         int(kw.get("arg2", kw.get("index", 0))),
     ),
+    # embedding(W, idx) — row gather; factorised form gathers the small
+    # factor then projects (eps.low_rank_gather).
+    "embedding": lambda w, idx, *a, **kw:
+        torch.nn.functional.embedding(idx, w),
     # gather along one axis.  The index is normally an attr (a tuple of
     # ints produced by share_duplicate_param_slices); a second tensor
     # operand (the raw aten spelling) is accepted too.

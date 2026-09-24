@@ -501,11 +501,12 @@ needs per-op Lipschitz constants — not yet computed.
   rate–distortion gate against plain SVD. Verdicts: H-matrix
   off-diagonals full-rank (dead), sparse parity, monarch ALS
   diverged (inconclusive), INR coordinate-fit fails (no smooth
-  manifold). **Two live signals**: the token embedding (60% of
-  params) is genuinely low-rank — rank 19 captures 95% energy,
-  ~15× storage — and attention/MLP weights are Kronecker-
-  rearrangement-compressible (~4 terms @95%, beating SVD ~15–31%).
-  Both are ε-certified candidates via the `eps.py` axis.
+  manifold). **Live signals, honestly sized**: the token embedding
+  (60% of params) is genuinely low-rank — rank 19 captures 95%
+  energy, ~15× storage. Kronecker-sum on attention/MLP weights is
+  marginal at real budgets — ~1.3× storage at 35% Frobenius residual
+  via `kron_linear_params`; earlier "4 terms" measured the best-e1
+  split's rank, not the storage-optimal split.
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.

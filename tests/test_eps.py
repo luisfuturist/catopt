@@ -12,7 +12,8 @@ import torch.nn as nn
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Var, TensorType, op_repr
 from catopt.rules import all_rules
-from catopt.eps import low_rank_params, kron_linear_params
+from catopt.eps import (low_rank_params, kron_linear_params,
+                        low_rank_gather)
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 
@@ -194,3 +195,50 @@ def test_kron_rejects_dense_random():
     root = eg.add_term(ir.root)
     eg.run(all_rules(), root, max_iterations=3)
     assert kron_linear_params(eg, src, rtol=1e-6) == []
+
+
+def test_low_rank_gather_factors_embedding():
+    """embedding(W, idx) -> matmul(embedding(U_r, idx), V_r): gather
+    the small factor, project — the measured real-weight win."""
+    torch.manual_seed(0)
+
+    class M(nn.Module):
+        def __init__(s):
+            super().__init__()
+            U = torch.randn(1000, 12)
+            V = torch.randn(12, 64)
+            s.emb = nn.Embedding(1000, 64)
+            s.emb.weight.data = U @ V + 0.01 * torch.randn(1000, 64)
+
+        def forward(s, x):
+            return s.emb(x)
+
+    m = M().eval().double()
+    idx = torch.randint(0, 1000, (8,))
+    ir, src = export_to_ir(m, idx)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    eg.run(all_rules(), root, max_iterations=3)
+    offers = low_rank_gather(eg, src, rtol=0.05)
+    assert offers
+    o = offers[0]
+    assert o["stored"] < o["original"]
+
+    cand = None
+    for n in eg.get_class(o["site_eid"]).nodes:
+        if n.op == "matmul":
+            cand = Op.make(
+                n.op,
+                *[eg.any_term(eg.find(c)) for c in n.children])
+            break
+    assert cand is not None
+    xv = Var("x", TensorType((8,)))
+    mod = ir_to_torch_module(
+        IR(root=cand, params={}, inputs=[xv]), src)
+    with torch.no_grad():
+        err = (mod(idx) - m(idx)).abs().max().item()
+    # per-row spectral bound is conservative here
+    assert err <= o["bound"] + 1e-9
+    cert = eg.certificate(ir.root, cand, root_eid=root)
+    assert cert.error_bound == o["bound"] and cert.replayable
+    assert sum(t.numel() for t in mod.parameters()) == o["stored"]

@@ -47,7 +47,88 @@ import torch
 from catopt.egraph import EGraph, Rewrite
 from catopt.ir import Op, Param, TensorType
 
-__all__ = ["low_rank_params", "kron_linear_params"]
+__all__ = ["low_rank_params", "kron_linear_params",
+           "low_rank_gather"]
+
+
+def low_rank_gather(eg: EGraph, source_tensors: dict, *,
+                    rtol: float = 0.05,
+                    min_saving: float = 0.8,
+                    witness: bool = True) -> list[dict]:
+    """Low-rank factorisation at ``embedding``/row-gather sites —
+    the biggest measured real-weight win (the token embedding is
+    ~60% of stories15M and genuinely low-rank).
+
+        embedding(W, idx)  →  matmul(embedding(U_r, idx), V_r)
+
+    gathers ``r``-dimensional rows then projects — storage
+    ``r(v+d)`` vs ``v·d``, bound ``σ_{r+1}`` spectral (Eckart–Young),
+    propagated: ``‖gathered row − ŵ_j‖₂ ≤ σ_{r+1}``.
+    """
+    offers: list[dict] = []
+    for cid in list(eg._classes.keys()):
+        c = eg.find(cid)
+        ec = eg._classes.get(c)
+        if ec is None:
+            continue
+        for node in list(ec.nodes):
+            if node.op != "embedding" or len(node.children) != 2:
+                continue
+            wt = eg.any_term(eg.find(node.children[0]))
+            if not isinstance(wt, Param) or wt.name not in source_tensors:
+                continue
+            W = source_tensors[wt.name]
+            if not (isinstance(W, torch.Tensor) and W.ndim == 2):
+                continue
+            v, d = W.shape
+            Wd = W.detach().double()
+            try:
+                U, S, Vt = torch.linalg.svd(Wd, full_matrices=False)
+            except Exception:
+                continue
+            if S.numel() == 0 or S[0] == 0:
+                continue
+            budget = rtol * S[0]
+            tail = torch.cat([S, S.new_zeros(1)])
+            below = (tail[1:] <= budget).nonzero()
+            if len(below) == 0:
+                continue
+            r = min(int(below[0].item()) + 1, S.numel() - 1)
+            if r < 1 or r * (v + d) >= min_saving * v * d:
+                continue
+            bound = float(tail[r])
+            uname = f"eps_eu_{wt.name}_{c}"
+            vname = f"eps_ev_{wt.name}_{c}"
+            source_tensors[uname] = U[:, :r].contiguous().to(W.dtype)
+            source_tensors[vname] = (S[:r, None]
+                                     * Vt[:r]).contiguous().to(W.dtype)
+            g = eg.add_enode("embedding",
+                             (eg.add_term(Param(uname,
+                                                TensorType((v, r)))),
+                              node.children[1]),
+                             dict(node.attrs))
+            outer = eg.add_enode(
+                "matmul", (g, eg.add_term(Param(vname,
+                                                TensorType((r, d))))))
+            offer_term = eg.any_term(outer)
+            src_term = eg._oldest_term(c) or eg.any_term(c)
+            wit = None
+            if witness and offer_term is not None and src_term is not None:
+                wit = Rewrite(
+                    name=f"eps_emb#{outer}",
+                    lhs=src_term, rhs=offer_term,
+                    law=(f"low-rank embedding of {wt.name}: "
+                         f"W ≈ U_rΣ_rV_rᵀ, ‖W−Ŵ‖₂ = σ_{r + 1} = "
+                         f"{bound:.3e} (Eckart–Young; per-row error "
+                         "≤ bound)"),
+                    error_bound=bound, bound_norm="spectral")
+            eg.union(c, outer, witness=wit,
+                     note=(f"eps_low_rank_gather: {wt.name} "
+                           f"({v}x{d}) -> rank {r}, ε={bound:.3e}"))
+            offers.append({"name": wt.name, "rank": r, "bound": bound,
+                           "stored": r * (v + d), "original": v * d,
+                           "site_eid": c})
+    return offers
 
 
 def _kron_member(eg, x_eid, terms, spec):
@@ -234,7 +315,7 @@ def low_rank_params(eg: EGraph, source_tensors: dict, *,
             below = (tail[1:] <= budget).nonzero()
             if len(below) == 0:
                 continue
-            r = min(int(below[0].item()), S.numel() - 1)
+            r = min(int(below[0].item()) + 1, S.numel() - 1)
             if r < 1 or r * (o + i) >= min_saving * o * i:
                 continue
             bound = float(tail[r])        # σ_{r+1}: Eckart–Young

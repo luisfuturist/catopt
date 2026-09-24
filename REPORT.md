@@ -58,14 +58,17 @@ relative Frobenius error against plain SVD*:
 | Probe | Result | Verdict |
 |---|---|---|
 | **Token embedding** (60% of params) | **rank 19 @ 95% energy** | **~15× — live** |
-| **Kronecker-sum** (attn/MLP) | ~4 terms @95% | **beats SVD 15–31% — live** |
+| Kronecker-sum (attn/MLP) | 1.3× @ 35% residual | marginal — real, small |
 | H-matrix off-diagonals | rel. rank 1.0 | dead |
 | Sparse concentration | top10% ≈ 46% energy | mild |
 | Monarch/butterfly ALS | diverged | inconclusive |
 | INR coordinate-fit | rel err ≈ 1.0 | dead (no smooth manifold) |
 
-**Gate outcome: two live signals, both ε-approximate.** The weights
-aren't structured — they're *compressible*.
+**Gate outcome: one strong signal, one marginal.** The embedding is
+genuinely compressible ~15×; Kronecker on the dense weights is real
+but weak (the earlier "4 terms" was the best-e1 split's rank — the
+storage-optimal split needs K~28, giving ~1.3× at 35% residual).
+Correction applied honestly.
 
 ## 4. The ε axis (`catopt/eps.py`, `egraph.py`)
 

@@ -236,6 +236,9 @@ op_def("index_select", 1, 1,
            "generalised projection.  With a repeated-index map it "
            "realises slice-level sharing — the copy map Delta applied "
            "per row-block.")
+op_def("embedding", 2, 1,
+       law="Row gather: embedding(W, idx) selects rows of the table; "
+           "low-rank tables factor as gather-then-project.")
 
 # Attention
 op_def("contiguous", 1, 1,
