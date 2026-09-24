@@ -728,7 +728,40 @@ OM_MASK_LAWS: list[Rewrite] = [
 #  kwarg form and torch.export's positional ``arg4`` (dropout_p) /
 #  ``arg5`` (is_causal) / ``arg6`` (scale) form.  A nonzero dropout_p
 #  or a non-numeric scale vetoes the rewrite; sdpa with an explicit
-#  attn_mask (a 4th operand) never matches by arity.
+#  attn_mask (a 4th operand) has its own law below — the mask slices
+#  on the key axis in parallel with the k/v blocks.
+#
+#  EXPLICIT ATTN_MASK
+#      ``sdpa(q, cat(k_i), cat(v_i), m, ...)`` chunks by composing the
+#      mask into the score concat in ADDITIVE-BIAS form:
+#
+#          sdpa(q, cat k, cat v, m)
+#            = om_apply(om_elem(
+#                  add(cat(qs @ k_i.T), attnbias(m)), cat v))
+#
+#      ``attnbias`` is a one-input generator materialising torch's own
+#      mask coercion — a float mask IS the additive bias, a bool mask
+#      is a keep-mask torch internally rewrites to a 0/−inf bias:
+#
+#          attnbias(m) = m                     (m floating)
+#          attnbias(m) = where(m, 0, −inf)     (m bool)
+#
+#      The term level carries no dtype (TensorType is shape-only), so
+#      the dispatch lives in the lowering — this is what lets ONE law
+#      cover both mask vocabularies soundly: add(s, attnbias(m)) is
+#      exactly sdpa's masked-score semantics for either dtype.  Without
+#      it the choice between add(s, m) and masked_fill(s, ~m, −inf)
+#      would be a dtype guess the e-graph could not retract.  Once the
+#      mask is in add-form the existing ADD_MASK_CAT laws slice it on
+#      the key axis — ``split(attnbias(m), (K1,K2), -1, i)`` is block
+#      i's mask columns, the same offset story as every other sliced
+#      mask — and OM_SPLIT chunks the carrier.
+#
+#      Guard: the mask must broadcast against the (…,Tq,K1+K2) score
+#      matrix with the key axis on its last dim — extent K1+K2 (sliced
+#      per block) or 1/absent (broadcast reuse through ADD_MASK_CAT's
+#      reuse mode).  The dropout veto is unchanged; is_causal=True
+#      alongside a mask matches no pattern (torch forbids the combo).
 # ---------------------------------------------------------------------------
 
 op_def(
@@ -740,6 +773,12 @@ op_def(
     "fill", 1, 1,
     law="Constant map x ↦ c·1 (full_like): the vehicle for derived "
         "scalar constants, which can only occupy attribute positions.")
+op_def(
+    "attnbias", 1, 1,
+    law="sdpa's attn_mask in additive-bias form: a float mask passes "
+        "through, a bool keep-mask becomes where(m, 0, -inf) — torch's "
+        "own coercion, which the untyped (shape-only) term cannot "
+        "spell.  Lets ONE sdpa-cat law serve both mask dtypes.")
 
 
 def _cmask_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
@@ -754,8 +793,23 @@ def _fill_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
     return torch.full_like(x, float(kw.get("value", kw.get("arg1", 0))))
 
 
+def _attnbias_torch(m: torch.Tensor, *a, **kw) -> torch.Tensor:
+    """Torch's documented attn_mask coercion: float masks ARE the
+    additive bias; bool keep-masks become the 0/-inf bias (positions
+    with False are disallowed).  Shape-preserving and elementwise, so
+    slicing commutes with it — split(attnbias(m)) is the bias of the
+    slice."""
+    if m.dtype == torch.bool:
+        return torch.where(
+            m,
+            torch.zeros((), device=m.device),
+            torch.full((), float("-inf"), device=m.device))
+    return m
+
+
 _IR_TO_TORCH["cmask"] = _cmask_torch
 _IR_TO_TORCH["fill"] = _fill_torch
+_IR_TO_TORCH["attnbias"] = _attnbias_torch
 
 #: The masked_fill fill-value in rule RHSs.  _instantiate turns a
 #: non-Op RHS leaf into a repr-keyed leaf enode; registering the Const
@@ -894,14 +948,107 @@ _SDPA_PLAIN_ATTRS: tuple[dict, ...] = (
     {"arg4": "DP", "scale": "SC"},
 )
 
-#: sdpa-over-concat laws: the causal-flag unfold plus the unmasked
-#: companion, over both concat attr spellings.
+
+def _check_sdpa_mask_cat(bound: dict) -> bool:
+    """Everything ``_check_sdpa_cat`` requires (sequence-axis cats,
+    per-block k_i/v_i pairing, batch broadcast, benign flags), plus:
+    the explicit attn_mask must broadcast against the concatenated
+    score matrix ``(…, Tq, K1+K2)`` with the key axis on its last dim —
+    extent ``K1+K2`` (per-block slices) or 1 (broadcast reuse).  Any
+    other extent, a broadcast-incompatible mask, or unknown key extents
+    vetoes the rewrite — the split sizes could not be derived."""
+    if not _check_sdpa_cat(bound):
+        return False
+    ms = _shape_of(bound.get("m"))
+    qs = _shape_of(bound.get("q"))
+    k1s, k2s = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
+    if not isinstance(ms, tuple):
+        return False
+    k1, k2 = k1s[-2], k2s[-2]
+    if not (isinstance(k1, int) and isinstance(k2, int)):
+        return False                          # can't derive split sizes
+    from catopt.cost import _broadcast, _INVALID
+    bb = _broadcast(qs[:-2], k1s[:-2])
+    if bb is _INVALID:
+        return False
+    scores = tuple(bb) + (qs[-2], k1 + k2)
+    b = _broadcast(scores, ms)
+    if b is _INVALID or not isinstance(b, tuple) or not b:
+        return False
+    # Broadcast-compatible mask whose key-axis extent is Tk or 1.
+    return b[-1] == k1 + k2
+
+
+def _sdpa_cat_mask_rhs() -> Op:
+    """om_apply(om_elem(add(cat scaled-scores, attnbias(m)), cat v)).
+
+    The mask enters the score concat through ``attnbias`` — torch's own
+    coercion to additive-bias form — so ONE law serves both mask dtypes
+    and the EXISTING ADD_MASK_CAT laws do the slicing:
+    ``split(attnbias(m), (K1,K2), -1, i)`` is block i's mask columns.
+    Chunking then proceeds exactly like the cmask path: OM_SPLIT splits
+    the carrier and fully-masked blocks exercise om_compose's isfinite
+    guard."""
+    qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
+    mm1 = Op.make("matmul", qs,
+                  Op.make("transpose", "k1", arg1=-2, arg2=-1))
+    mm2 = Op.make("matmul", qs,
+                  Op.make("transpose", "k2", arg1=-2, arg2=-1))
+    scores = Op.make("concat", mm1, mm2, dim=-1)
+    masked = Op.make("add", scores, Op.make("attnbias", "m"))
+    return Op.make(
+        "om_apply",
+        Op.make("om_elem", masked,
+                Op.make("concat", "v1", "v2", dim="VD")))
+
+
+def _sdpa_cat_masked(name: str, attr_key: str,
+                     sdpa_attrs: dict) -> Rewrite:
+    return R(
+        name,
+        Op.make("sdpa", "q",
+                Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
+                Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
+                "m", **sdpa_attrs),
+        _sdpa_cat_mask_rhs(),
+        check=_check_sdpa_mask_cat,
+        derive=_derive_sdpa_cat,
+        law="explicit attn_mask over concatenated keys/values: "
+            "sdpa(q, cat k, cat v, m) = om_apply(om_elem(add(cat "
+            "scaled-scores, attnbias(m)), cat v)) — the mask slices on "
+            "the key axis in parallel with the k/v blocks, dtype-"
+            "agnostic through the attnbias coercion.")
+
+
+#: Attr spellings for the masked form: torch.export emits the mask as
+#: the 4th positional operand and omits defaulted flags; hand-built
+#: terms may spell dropout/is_causal positionally or as kwargs.  No
+#: is_causal=True pattern — torch forbids mask+causal together.
+_SDPA_MASK_ATTRS: tuple[dict, ...] = (
+    {},
+    {"scale": "SC"},
+    {"is_causal": False},
+    {"is_causal": False, "scale": "SC"},
+    {"arg4": "DP"},
+    {"arg5": False},
+    {"arg4": "DP", "arg5": False},
+    {"arg4": "DP", "scale": "SC"},
+    {"arg4": "DP", "arg5": False, "arg6": "SC"},
+    {"arg5": False, "arg6": "SC"},
+)
+
+#: sdpa-over-concat laws: the causal-flag unfold, the unmasked
+#: companion, and the explicit-attn_mask form — over both concat attr
+#: spellings.
 SDPA_CAT_LAWS: list[Rewrite] = [
     *(_sdpa_cat(f"sdpa_cat_causal_{i}_{ak}", ak, dict(attrs), True)
       for i, attrs in enumerate(_SDPA_CAUSAL_ATTRS)
       for ak in ("dim", "arg1")),
     *(_sdpa_cat(f"sdpa_cat_{i}_{ak}", ak, dict(attrs), False)
       for i, attrs in enumerate(_SDPA_PLAIN_ATTRS)
+      for ak in ("dim", "arg1")),
+    *(_sdpa_cat_masked(f"sdpa_cat_mask_{i}_{ak}", ak, dict(attrs))
+      for i, attrs in enumerate(_SDPA_MASK_ATTRS)
       for ak in ("dim", "arg1")),
 ]
 
