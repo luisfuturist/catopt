@@ -169,9 +169,10 @@ than a dense GEMM).
 - End-to-end rate–distortion vs GPTQ/AWQ: **not yet** — the
   differentiator is the certificate, so the bar is "comparable
   compression *with* a bound," not beating GPTQ's raw ratio.
-- omd executor: the cross-carrier `omd` member wins flops/launch
-  extraction but runs 0.54–0.71× slower than eager through the generic
-  evaluator — needs a dedicated blocked-scan executor (est. 2–9×).
+- omd executor: **landed** (`omd_lower.py`). The `omd` member now runs
+  1.2–3.3× faster than generic eval (2.4–5.8× with CUDA graphs),
+  fp64-exact, beating raw eager on GPU at T≥64 — the selected form is
+  also the fast one.
 
 ## 11. Honest limits
 
@@ -187,8 +188,8 @@ than a dense GEMM).
 
 ## 12. What's next
 
-1. **`omd` executor** (in progress): batched deferred-carrier lowering —
-   the selected-but-slow member becomes an actual runtime win.
+1. ~~**`omd` executor**~~ — **landed** (`omd_lower.py`): 1.2–3.3× vs
+   generic eval, 2.4–5.8× CUDA-graph, fp64-exact.
 2. **Real-scale rate–distortion**: apply the full ε pipeline to a
    stories15M-class model end-to-end (needs a model definition; the
    per-matrix evidence is in §3/§10).

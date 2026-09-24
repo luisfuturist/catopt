@@ -275,13 +275,14 @@ The 29-rule `XC_LAWS` set is opt-in (`CARRIER_X_LAWS`): bidirectional
 pairs double the rule set and blow up default saturation — the
 non-local passes run regardless.
 
-**omd runtime honesty** (`/tmp/bench_omd.py`): the `omd_apply` member
-*is* what `flops_cost` selects at every size — but through the generic
-evaluator it runs **0.54–0.71× slower than eager**: the O(T²) carrier
-maps unroll as per-leaf IR nodes and `_fold_weight_chains` can't fold
-`stack`/`select`/`affd_a`. A dedicated executor (blocked assoc scan +
-hoisted coefficient maps, ~8 kernels) is estimated at **2–9×** vs
-eager at small T — the win is structural, not yet realized.
+**omd runtime** (`omd_lower.py`): the `omd_apply` member *is* what
+`flops_cost` selects at every size. Through the generic evaluator it
+ran 0.54–0.71× slower than eager (O(T²) carrier maps unrolled as IR
+nodes); `to_batched_omd_module` computes the coefficient maps with a
+blocked associative scan + level-batched compose — **1.2–3.3× vs
+generic eval, 2.4–5.8× with CUDA-graph capture**, fp64-exact, and
+faster than raw torch-eager at T≥64 on GPU. Falls back to serial eval
+on unrecognized shapes (counted in `mod.fallbacks`).
 
 ## Full measurements
 
@@ -541,7 +542,7 @@ tying become one object: *a rewrite with an error bound*.
 | `catopt/eps.py` | ε axis: `low_rank_params` (certified truncated-SVD at linear sites) |
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
 | `measure_weights.py` | Phase-0 weight-structure falsification harness |
-| `tests/` | 480 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
+| `tests/` | 495 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
 
