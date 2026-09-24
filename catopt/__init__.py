@@ -21,6 +21,10 @@ from catopt.rules import all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES  # n
 from catopt.cost import CostModel, count_cost, flops_cost  # noqa: E401,F401
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module, IRModule  # noqa: E401,F401
 from catopt.optimize import optimize_model  # noqa: E401,F401
+from catopt.omd_lower import (  # noqa: E401,F401
+    BatchedOmdModule, to_batched_omd_module, is_omd_apply_term,
+    build_omd_plan,
+)
 
 __version__ = "0.1.0dev"
 __all__ = [
@@ -30,4 +34,6 @@ __all__ = [
     "CostModel", "count_cost", "flops_cost",
     "export_to_ir", "ir_to_torch_module", "IRModule",
     "optimize_model",
+    "BatchedOmdModule", "to_batched_omd_module", "is_omd_apply_term",
+    "build_omd_plan",
 ]
