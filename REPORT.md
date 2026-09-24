@@ -110,6 +110,13 @@ an error bound**.
   2-layer model, err 0.0034 vs certified 0.397 (spectral products are
   ~100× conservative — honest).
 
+Rate–distortion through the full pipeline (2-layer MLP, fp64):
+
+| method | stored | ratio | measured err | certified bound |
+|---|---|---|---|---|
+| int8 quant | 16,384 B | 8.0× | 5.3e-3 | 0.076 (site) / 0.79 (model) |
+| low-rank @10% | — | no offer | — | (weights are full-rank) |
+
 Both inject derived factor params into `source_tensors`, so the
 lowered module's state dict contains only the factor tensors.
 
