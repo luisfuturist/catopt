@@ -503,12 +503,15 @@ tying become one object: *a rewrite with an error bound*.
   rate–distortion gate against plain SVD. Verdicts: H-matrix
   off-diagonals full-rank (dead), sparse parity, monarch ALS
   diverged (inconclusive), INR coordinate-fit fails (no smooth
-  manifold). **Live signals, honestly sized**: the token embedding
-  (60% of params) is genuinely low-rank — rank 19 captures 95%
-  energy, ~15× storage. Kronecker-sum on attention/MLP weights is
-  marginal at real budgets — ~1.3× storage at 35% Frobenius residual
-  via `kron_linear_params`; earlier "4 terms" measured the best-e1
-  split's rank, not the storage-optimal split.
+  manifold). **Phase-5 verdict on real perplexity (TinyStories,
+  stories15M)**: the energy signals do NOT survive contact with
+  quality — embedding low-rank destroys ppl at every rank tested
+  (rank 192/288 → ppl 214 vs baseline 5.03), Kronecker gives 143 ppl
+  at 1.1×; only plain int8 quantization preserves quality (4×,
+  ppl 5.16). **Norm bounds don't predict perplexity** — the ε
+  machinery is sound but certifies the wrong quantity for weight
+  compression on trained weights. The exact corner (tying, sharing,
+  folding) is what survives.
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.

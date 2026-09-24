@@ -156,23 +156,31 @@ coexist in one e-graph, one extraction. The remaining work is
 optimal (e.g., a Kronecker-factored linear wants a different schedule
 than a dense GEMM).
 
-## 10. Phase 5 — Validation status
+## 10. Phase 5 — Validation status: **falsified for quality**
 
-- Real-weight measurement: done (Phases 0/0b above).
-- **Real embedding, through the actual pass**: stories15M
-  `token_embedding` (32000×288, 60% of params) → `low_rank_gather`
-  gives **rank 2 at 5% spectral residual = 142× storage**
-  (9.2M → 64.6k values), certified bound, replayable certificate,
-  factor params only in the lowered state dict.
-- Kronecker at real scale: 1.3× at 35% residual — marginal; the pass
-  works but the signal is weak on trained attention weights.
-- End-to-end rate–distortion vs GPTQ/AWQ: **not yet** — the
-  differentiator is the certificate, so the bar is "comparable
-  compression *with* a bound," not beating GPTQ's raw ratio.
-- omd executor: **landed** (`omd_lower.py`). The `omd` member now runs
-  1.2–3.3× faster than generic eval (2.4–5.8× with CUDA graphs),
-  fp64-exact, beating raw eager on GPU at T≥64 — the selected form is
-  also the fast one.
+Real perplexity on TinyStories validation (stories15M, 2819 tokens,
+fp64 forward — baseline ppl **5.03**):
+
+| config | storage | perplexity | verdict |
+|---|---|---|---|
+| emb rank-2 / r19 / r64 / r128 / r192 | 2.5–1.2× | 6108 → 214 | **dead at every rank** |
+| Kronecker-sum (35% resid) | 1.1× | 143 | dead |
+| **int8 RTN quant** | **4.0×** | **5.16** | **works** |
+| int4 RTN | ~8× | ~10⁵ | dead |
+
+**The energy signal did not survive contact with quality.** The
+embedding's top-19 singular directions (95% Frobenius energy) are not
+the ones next-token prediction needs — `‖ΔW‖` bounds don't predict
+`Δppl`. Certified compression is real but certifies the wrong
+quantity for weight space.
+
+**What survives**: exact structure only — tying, sharing, folding,
+composed-linear collapse (all verified, all exact). The ε machinery is
+sound and useful where a norm bound IS the contract (activation
+paths, verification, certified deployment); it does not rescue
+post-hoc weight compression on this checkpoint.
+
+This is the honest negative the kill-gates were for.
 
 ## 11. Honest limits
 
