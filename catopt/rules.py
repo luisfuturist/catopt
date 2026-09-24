@@ -1069,6 +1069,84 @@ def pair_shared_input_convs(eg: Any) -> list[dict[int, Any]]:
                               cluster_key=key)
 
 
+def share_duplicate_params(eg: Any, source_tensors: dict,
+                           *, witness: bool = True) -> list[list[str]]:
+    """Union the e-classes of Param leaves holding identical tensors —
+    exact weight *tying* discovered, not declared.
+
+    If ``p_i`` and ``p_j`` contain equal values, substituting either for
+    the other is an exact semantic equality.  After the merge,
+    deterministic extraction keeps one representative everywhere; the
+    dropped name never enters the extracted term, so ``_build_params``
+    omits it from the optimized module's state dict — the stored
+    weights file shrinks by the duplicate's size with zero cost.
+
+    This catches the real-world cases: tied embeddings/classifiers
+    (llama2.c ``wcls``), duplicated adapter or branch weights, and any
+    GQA head sharing the checkpoint materialised as separate tensors.
+
+    ``source_tensors`` maps Param names to their tensors (as
+    ``export_to_ir`` returns).  Returns the groups of names merged.
+    Each merge carries a pointwise witness, like the other non-local
+    passes — certificates replay it as a rule step.
+    """
+    import torch as _t
+    from catopt.ir import Param, TensorType
+
+    by_sig: dict[tuple, list[str]] = {}
+    for name, t in source_tensors.items():
+        if not isinstance(t, _t.Tensor):
+            continue
+        key = (tuple(t.shape), str(t.dtype))
+        by_sig.setdefault(key, []).append(name)
+
+    groups: list[list[str]] = []
+    for key, names in by_sig.items():
+        if len(names) < 2:
+            continue
+        # split by exact value equality (cheap: hash first, confirm)
+        reps: list[str] = []
+        clusters: list[list[str]] = []
+        for name in names:
+            placed = False
+            for ci, rep in enumerate(reps):
+                if _t.equal(source_tensors[name], source_tensors[rep]):
+                    clusters[ci].append(name)
+                    placed = True
+                    break
+            if not placed:
+                reps.append(name)
+                clusters.append([name])
+        for cluster in clusters:
+            if len(cluster) > 1:
+                groups.append(cluster)
+
+    for cluster in groups:
+        canon = cluster[0]
+        ct = source_tensors[canon]
+        canon_term = Param(canon, TensorType(tuple(int(d)
+                                               for d in ct.shape)))
+        canon_eid = eg.add_term(canon_term)
+        for name in cluster[1:]:
+            t = source_tensors[name]
+            p = Param(name, TensorType(tuple(int(d) for d in t.shape)))
+            eid = eg.add_term(p)
+            wit = None
+            if witness:
+                wit = Rewrite(
+                    name=f"share#{eid}",
+                    lhs=p,
+                    rhs=canon_term,
+                    law=(
+                        "pointwise witness for exact weight tying: "
+                        "the two parameter leaves hold bitwise-equal "
+                        "tensors (equality established by the sharing "
+                        "pass over source tensors)"))
+            eg.union(eid, canon_eid, witness=wit,
+                     note=f"share_duplicate_params: {name} == {canon}")
+    return groups
+
+
 # ---------------------------------------------------------------------------
 #  Rule collections
 # ---------------------------------------------------------------------------

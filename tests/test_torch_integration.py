@@ -411,6 +411,39 @@ def test_assoc_linear_bias_end_to_end_param_drop():
     assert (y - ref).abs().max() < 1e-9
 
 
+def test_share_duplicate_params_drops_tied_weight():
+    """Two Param leaves with bitwise-equal tensors merge into one
+    e-class — the duplicate name never reaches the extracted term, so
+    the optimized state dict stores one copy.  Exact weight tying,
+    discovered rather than declared."""
+    from catopt.optimize import optimize_model, param_report
+    torch.manual_seed(0)
+
+    class SharedUse(torch.nn.Module):
+        """Same values applied to different activations — no
+        compose/factor law can collapse the two uses, so the only
+        exact win is sharing the parameter itself."""
+
+        def __init__(self):
+            super().__init__()
+            self.w1 = torch.nn.Linear(64, 64, bias=False)
+            self.w2 = torch.nn.Linear(64, 64, bias=False)
+            self.w2.weight.data = self.w1.weight.data.clone()
+
+        def forward(self, x):
+            a, b = x[..., :64], x[..., 64:]
+            return self.w1(a) + self.w2(b)
+
+    m = SharedUse().eval().double()
+    x = torch.randn(4, 128, dtype=torch.float64)
+    low, _ = optimize_model(m, x, cost_fn=flops_cost)
+    with torch.no_grad():
+        assert (m(x) - low(x)).abs().max() < 1e-9
+    r = param_report(m, low)
+    assert r["eliminated"] == ["p_w2_weight"]
+    assert r["optimized_bytes"] == r["original_bytes"] // 2
+
+
 def test_weight_merge_does_not_fire_on_distinct_inputs():
     """Soundness: x@W1 + y@W2 (x != y) must stay unmerged."""
     torch.manual_seed(0)

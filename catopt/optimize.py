@@ -20,7 +20,8 @@ from catopt.ir import IR, Op, Var, Const, Param
 from catopt.egraph import EGraph
 from catopt.rules import (all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
                           pair_shared_input_linears,
-                          pair_shared_input_convs)
+                          pair_shared_input_convs,
+                          share_duplicate_params)
 from catopt.trace_lift import lift_scan_to_trace
 from catopt.xcarrier import (gather_applyd_stack, gather_apply_stack,
                              omd_tree_lift)
@@ -138,13 +139,15 @@ def discover_alternatives(
         stats["pairing_groups"] = len(groups)
         eg.run(rules, root_eid, max_iterations=5)
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
-    # same-state carrier applications -> one application, and whole
-    # om trees over scanned values -> the deferred omd carrier.
+    # same-state carrier applications -> one application, whole om
+    # trees over scanned values -> the deferred omd carrier, and exact
+    # weight tying (duplicate Param leaves share one class).
     # All witnessed so certificates stay replayable.
     lifts = (lift_scan_to_trace(eg)
              + gather_applyd_stack(eg)
              + gather_apply_stack(eg)
-             + omd_tree_lift(eg))
+             + omd_tree_lift(eg)
+             + share_duplicate_params(eg, source_tensors))
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
@@ -251,13 +254,15 @@ def optimize_model(
         eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
 
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
-    # same-state carrier applications -> one application, and whole
-    # om trees over scanned values -> the deferred omd carrier.
+    # same-state carrier applications -> one application, whole om
+    # trees over scanned values -> the deferred omd carrier, and exact
+    # weight tying (duplicate Param leaves share one class).
     # All witnessed so certificates stay replayable.
     lifts = (lift_scan_to_trace(eg)
              + gather_applyd_stack(eg)
              + gather_apply_stack(eg)
-             + omd_tree_lift(eg))
+             + omd_tree_lift(eg)
+             + share_duplicate_params(eg, source_tensors))
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
