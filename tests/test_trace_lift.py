@@ -388,7 +388,68 @@ class TestPostLiftSaturation:
 
 
 # ---------------------------------------------------------------------------
-#  (d) graceful no-op
+#  (d) minted-F storage bound — one F per horizon, not one per step
+# ---------------------------------------------------------------------------
+
+class TestStorageBound:
+    def test_saturated_prefixes_do_not_multiply_F(self):
+        """maximal_only must drop carrier-path prefix offers.
+
+        After SCAN_DIAG_LAWS saturation every prefix class h_2…h_T
+        carries an applyd member, hence a plan.  Carrier plans record
+        no step_states, so without structural prefix detection each of
+        them mints its own block-matrix F: ~2T offers (joint + split
+        per prefix) instead of the ~2 for the whole horizon — the
+        ~2T× storage blow-up the raw-spine path's step_states already
+        prevented.
+        """
+        T, d = 14, 4
+        term, _, _ = _diag_term(T, d)
+        eg = EGraph()
+        root = eg.add_term(term)
+        eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=6)
+        n0 = eg.n_enodes
+        lifts = TL.lift_scan_to_trace(eg)
+        # one joint F + one channel-split F — not ~2T prefix copies
+        assert 1 <= len(lifts) <= 2
+        assert max(l.T for l in lifts) == T
+        minted = eg.n_enodes - n0
+        # the two offered members are O(T) structure each — far below
+        # the ~2T Fs a per-prefix mint produced (~4·T² enodes).
+        assert minted < 40 * T
+
+    def test_maximal_only_false_still_offers_prefixes(self):
+        """The bound is maximal_only's documented semantics — opting
+        out restores per-prefix offers, so the guard is behavioural,
+        not a recognition failure."""
+        T, d = 10, 4
+        term, _, _ = _diag_term(T, d)
+        eg = EGraph()
+        root = eg.add_term(term)
+        eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=6)
+        lifts = TL.lift_scan_to_trace(eg, maximal_only=False)
+        assert len(lifts) > T            # per-prefix minting returns
+        lifts_max = TL.lift_scan_to_trace(eg)
+        assert len(lifts_max) <= 2
+
+    def test_lifted_param_storage_parity(self):
+        """The lifted member stores the same leaves as the loop body —
+        no per-step F param materialises in the weights file."""
+        from catopt.cost import param_bytes_cost
+        T, d = 10, 6
+        term, _, _ = _diag_term(T, d)
+        eg = EGraph()
+        eg.add_term(term)
+        lifts = TL.lift_scan_to_trace(eg)
+        orig = param_bytes_cost(term)
+        for l in lifts:
+            got = param_bytes_cost(l.term)
+            assert got <= 2 * orig       # ~parity, never ~2T×
+            assert got == orig           # same named leaves, in fact
+
+
+# ---------------------------------------------------------------------------
+#  (e) graceful no-op
 # ---------------------------------------------------------------------------
 
 class TestNoOp:

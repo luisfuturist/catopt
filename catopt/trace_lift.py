@@ -614,6 +614,34 @@ def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
             for st in p.step_states:
                 if st in plans and plans[st].T < p.T:
                     interior.add(st)
+        # Carrier-path plans record no step_states (the carrier tree
+        # is a term, not an e-class chain), so the walk above misses
+        # every prefix class that only carries an apply/applyd
+        # member.  Detect them structurally: a plan is interior to a
+        # strictly longer plan when both share the same h0 e-class
+        # AND the shorter plan's chronological (maps, ins) eid
+        # sequence is a literal prefix of the longer's — same map and
+        # input e-classes over the same init compute the same
+        # intermediate value, so the shorter chain's class IS a state
+        # of the longer one.  Without this, every saturated prefix
+        # class mints its own block-matrix F (~2T offers instead of
+        # the ~2 for the whole horizon — the ~2T× storage blow-up).
+        items = list(plans.items())
+        for qc, q in items:
+            if qc in interior:
+                continue
+            qh0 = eg.find(q.h0)
+            qmaps = [eg.find(m) for m in q.maps]
+            qins = [eg.find(i) for i in q.ins]
+            for pc, p in items:
+                if p.T <= q.T or p.kind != q.kind:
+                    continue
+                if eg.find(p.h0) != qh0:
+                    continue
+                if ([eg.find(m) for m in p.maps[:q.T]] == qmaps
+                        and [eg.find(i) for i in p.ins[:q.T]] == qins):
+                    interior.add(qc)
+                    break
 
     lifts: list[TraceLift] = []
     for c, p in plans.items():

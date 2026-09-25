@@ -72,6 +72,17 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             a, b = shapes[0], shapes[1]
             if len(a) >= 2 and len(b) >= 2:
                 return a[:-1] + (b[-1],)
+            # Rank-1 operands (torch.matmul semantics): matrix-vector
+            # (m,k)@(k,) -> (m,), vector-matrix (k,)@(…,k,n) -> (…,n),
+            # dot product (k,)@(k,) -> ().  Without these a matvec
+            # infers the MATRIX's shape (o,h), which then poisons any
+            # broadcast consumer to _INVALID.
+            if len(a) >= 2 and len(b) == 1:
+                return tuple(a[:-1])
+            if len(a) == 1 and len(b) >= 2:
+                return tuple(b[:-2]) + (b[-1],)
+            if len(a) == 1 and len(b) == 1:
+                return ()
             return shapes[0]
         case "add" | "mul" | "sub" | "div":
             # Element-wise ops broadcast: result is the broadcast shape,
@@ -95,7 +106,18 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if len(shapes) >= 2 and shapes[0] is not None and shapes[1] is not None:
                 w = shapes[1]
                 if len(w) >= 1:
-                    return tuple(shapes[0][:-1]) + (w[0],)
+                    out = tuple(shapes[0][:-1]) + (w[0],)
+                    if len(shapes) >= 3:
+                        b = shapes[2]
+                        out_b = _broadcast(out, b)
+                        if (out_b is _INVALID and len(b) >= 2
+                                and b[-1] == 1):
+                            # A column bias (o,1) is a rank-1 bias in
+                            # disguise — squeeze the trailing
+                            # singleton and broadcast as (o,).
+                            out_b = _broadcast(out, b[:-1])
+                        return out_b
+                    return out
             return shapes[0]
         case "sum" | "mean":
             # Honor keepdim/dim when available, else reduce to scalar.
@@ -452,7 +474,8 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
         # Standard matmul: 2 * M * N * K
         shapes = [_shape_of(a, memo) for a in term.args]
         if shapes and shapes[1] is not None and shapes[1] is not _INVALID:
-            k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
+            k_dim = (shapes[1][-2] if len(shapes[1]) >= 2
+                     else (shapes[1][0] if len(shapes[1]) == 1 else 1))
             return float(2 * n_out * k_dim)
         return float(2 * n_out)
     if term.op == "linear":

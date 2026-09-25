@@ -158,6 +158,108 @@ def test_param_bytes_factorised_cheaper():
     assert param_bytes_cost(chained) < param_bytes_cost(dense)
 
 
+def test_rank1_matmul_shapes():
+    """matvec/vec-mat/dot infer real shapes, not the matrix's shape.
+
+    Regression test: matmul(B, b1) with B (o,h), b1 (h,) previously
+    inferred (o,h) — the MATRIX's shape — so the fused bias in
+    assoc_linear_bias's RHS broadcast _INVALID against the (…,o)
+    linear output and priced at _INVALID_COST.
+    """
+    from catopt.cost import _infer_op_shape
+
+    A = Param("A", TensorType((8, 4)))
+    M = Param("M", TensorType((4, 8)))
+    v = Param("v", TensorType((4,)))
+    w = Param("w", TensorType((8,)))
+    assert _infer_op_shape(Op.make("matmul", A, v)) == (8,)   # matvec
+    assert _infer_op_shape(Op.make("matmul", v, M)) == (8,)   # vec-mat
+    assert _infer_op_shape(Op.make("matmul", v, v)) == ()     # dot
+    # batched matrix-vector keeps the batch dims
+    B = Param("B", TensorType((2, 8, 4)))
+    assert _infer_op_shape(Op.make("matmul", B, v)) == (2, 8)
+
+
+def test_linear_bias_broadcast_shapes():
+    """linear(x, W, b) broadcasts the bias slot: (o,) and the
+    column-vector disguise (o,1) are rank-1 biases; a provably
+    wrong bias is ill-typed (_INVALID), not silently ignored."""
+    from catopt.cost import _infer_op_shape, _INVALID
+
+    x = Var("x", TensorType((4, 16)))
+    W = Param("W", TensorType((8, 16)))
+    b = Param("b", TensorType((8,)))
+    bc = Param("bc", TensorType((8, 1)))
+    assert _infer_op_shape(Op.make("linear", x, W, b)) == (4, 8)
+    assert _infer_op_shape(Op.make("linear", x, W, bc)) == (4, 8)
+    bad = Param("bad", TensorType((7,)))
+    assert _infer_op_shape(Op.make("linear", x, W, bad)) is _INVALID
+
+
+def test_assoc_linear_bias_rhs_finite_cost():
+    """The composed biased-linear rewrite prices finite.
+
+    linear(linear(x,A,b1),B,b2) == linear(x, B@A, B·b1) + b2 — the
+    RHS must infer a VALID shape (…,o) and cost real FLOPs under
+    every model.  Before the matvec case existed, matmul(B, b1)
+    inferred (o,h) and the outer add went _INVALID, so this member
+    could never win extraction on cost — the rule existed but its
+    product was unselectable except via the bias-slot dodge.
+    """
+    from catopt.cost import (_infer_op_shape, _INVALID_COST,
+                             depth_cost, roofline_cost, dag_cost)
+
+    i, h, o = 32, 128, 32
+    x = Var("x", TensorType((4, i)))
+    A = Param("A", TensorType((h, i)))
+    B = Param("B", TensorType((o, h)))
+    b1 = Param("b1", TensorType((h,)))
+    b2 = Param("b2", TensorType((o,)))
+    rhs = Op.make(
+        "add",
+        Op.make("linear", x,
+                Op.make("matmul", B, A),
+                Op.make("matmul", B, b1)),
+        b2)
+    assert _infer_op_shape(rhs) == (4, o)
+    for cost in (flops_cost, depth_cost, roofline_cost):
+        assert 0 < dag_cost(rhs, cost) < _INVALID_COST
+
+    # … and the natural spelling add(linear(x, BA), B·b1) — which the
+    # workaround bias-slot spelling existed to avoid — is valid too.
+    alt = Op.make(
+        "add",
+        Op.make("linear", x, Op.make("matmul", B, A)),
+        Op.make("matmul", B, b1))
+    assert _infer_op_shape(alt) == (4, o)
+    assert 0 < flops_cost(alt) < _INVALID_COST
+
+
+def test_assoc_linear_bias_rule_member_extracts_finite():
+    """End-to-end through the e-graph: the assoc_linear_bias rewrite
+    fires and its RHS member sits in the class with a finite cost —
+    extraction must never see _INVALID_COST on the real shape."""
+    from catopt.egraph import EGraph
+    from catopt.rules import ASSOC_LINEAR_BIAS
+    from catopt.cost import _INVALID_COST, _shape_of
+
+    i, h, o = 8, 16, 8
+    x = Var("x", TensorType((4, i)))
+    A = Param("A", TensorType((h, i)))
+    B = Param("B", TensorType((o, h)))
+    b1 = Param("b1", TensorType((h,)))
+    b2 = Param("b2", TensorType((o,)))
+    src = Op.make("linear", Op.make("linear", x, A, b1), B, b2)
+
+    eg = EGraph()
+    eid = eg.add_term(src)
+    eg.run([ASSOC_LINEAR_BIAS], eid, max_iterations=4, max_nodes=2000)
+    assert eg.rule_fires.get("assoc_linear_bias", 0) >= 1
+    best = eg.extract_best(eid, flops_cost)
+    assert _shape_of(best) == (4, o)
+    assert 0 < flops_cost(best) < _INVALID_COST
+
+
 def test_cost_preference_for_fewer_ops():
     """Cost model should prefer matmul chains with fewer total FLOPs.
 
