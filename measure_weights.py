@@ -602,9 +602,212 @@ def relational(path: str = "/tmp/stories15M.bin",
 
 
 
+# ---------------------------------------------------------------------------
+# Symmetry probes — the remaining untested hypothesis classes for
+# EXACT structure.  Probe A (equivariance) and C (polynomial identity)
+# are cheap; B (learned displacement operators) is the real bet.
+# Exact hit = zero residual / small exact rank; approximate does not
+# count (Phase 5).
+# ---------------------------------------------------------------------------
+
+def _cyclic_matrix(n: int, shift: int = 1) -> np.ndarray:
+    P = np.zeros((n, n))
+    for i in range(n):
+        P[i, (i + shift) % n] = 1.0
+    return P
+
+
+def _reversal_matrix(n: int) -> np.ndarray:
+    return np.eye(n)[::-1]
+
+
+def _equivariance(W: np.ndarray) -> dict:
+    """Probe A: search group families for G with WG = GW exactly.
+
+    Cyclic shifts C^k (circulant case = C^1), the reversal R
+    (dihedral), and block-cyclic shifts.  Exact hit = residual ~0."""
+    n = min(W.shape)
+    Wf = W[:n, :n].astype(np.float64)
+    wnorm = np.linalg.norm(Wf)
+    if wnorm == 0:
+        return {"skip": "zero"}
+    out = {}
+
+    def resid(G):
+        return float(np.linalg.norm(Wf @ G - G @ Wf) / wnorm)
+
+    cres = {}
+    for k in range(1, n):
+        if n % k == 0 or k == 1:
+            cres[k] = resid(_cyclic_matrix(n, k))
+    best_c = min(cres, key=cres.get)
+    out["cyclic"] = {"best_shift": best_c, "resid": cres[best_c],
+                     "circulant_resid": cres[1],
+                     "all_under_1e3":
+                         [k for k, r in cres.items() if r < 1e-3]}
+    out["reversal"] = resid(_reversal_matrix(n))
+    bres = {}
+    for b in (2, 4, 8, 16):
+        if n % b:
+            continue
+        nb = n // b
+        Pb = np.zeros((n, n))
+        for i in range(nb):
+            for j in range(b):
+                Pb[i * b + j, ((i + 1) % nb) * b + j] = 1.0
+        bres[b] = resid(Pb)
+    out["block_shift"] = bres
+    out["n"] = n
+    return out
+
+
+def _poly_identity(W: np.ndarray, max_deg: int = 6) -> dict:
+    """Probe C: minimal-polynomial evidence.
+
+    (a) Krylov dimension: rank of [vec I, vec W, vec W², …] — degree
+    at which it saturates bounds the minimal poly degree.
+    (b) explicit low-degree fits p(W)=0 via least squares; exact hit
+    = resid ≈ 0.  (c) distinct-eigenvalue cluster count (loose bound
+    on minimal poly degree)."""
+    n = min(W.shape)
+    Wf = W[:n, :n].astype(np.float64)
+    out = {}
+    vecs = [np.eye(n).ravel()]
+    P = np.eye(n)
+    kry_rank = []
+    for d in range(max_deg + 1):
+        if d:
+            P = P @ Wf
+            vecs.append(P.ravel())
+        kry_rank.append(_exact_rank(np.stack(vecs)))
+    out["krylov_rank_by_degree"] = kry_rank
+    fits = {}
+    for d in range(1, min(max_deg, n) + 1):
+        P = np.eye(n)
+        basis = [np.eye(n).ravel()]
+        for _k in range(1, d):
+            P = P @ Wf
+            basis.append(P.ravel())
+        P = P @ Wf                      # W^d
+        A = np.stack(basis).T           # (n², d)
+        b = -P.ravel()
+        c, _res, *_ = np.linalg.lstsq(A, b, rcond=None)
+        pred = A @ c
+        fits[d] = float(np.linalg.norm(pred - b)) / (
+            np.linalg.norm(b) or 1.0)
+    out["poly_fits"] = fits
+    try:
+        ev = np.linalg.eigvals(Wf)
+        tol = np.abs(ev).max() * 1e-4
+        clusters = []
+        for e in sorted(ev, key=lambda z: (z.real, z.imag)):
+            if not clusters or abs(e - clusters[-1][0]) > tol:
+                clusters.append([e])
+            else:
+                clusters[-1].append(e)
+        out["n_eig_clusters_1e4"] = len(clusters)
+        out["n_eigs"] = len(ev)
+    except Exception:
+        out["eig_error"] = True
+    return out
+
+
+def _learned_displacement(W: np.ndarray, fam: str = "diag",
+                          iters: int = 40, inits: int = 4,
+                          seed: int = 0) -> dict:
+    """Probe B: minimize rank(AW − WB) over LEARNED structured A, B —
+    diagonal (Stein-lite) and circulant parameterizations.  Gradient
+    descent, multi-init, divergence reported honestly."""
+    n = min(W.shape)
+    Wf = W[:n, :n].astype(np.float64)
+    wnorm = np.linalg.norm(Wf) or 1.0
+    rng = np.random.default_rng(seed)
+
+    def params_to_ops(p):
+        if fam == "diag":
+            return np.diag(p[:n]), np.diag(p[n:])
+        a = np.zeros((n, n))
+        b = np.zeros((n, n))
+        for k in range(n):
+            a += p[k] * _cyclic_matrix(n, k)
+            b += p[n + k] * _cyclic_matrix(n, k)
+        return a, b
+
+    def resid_rank(A, B):
+        R = A @ Wf - Wf @ B
+        rn = np.linalg.norm(R)
+        tol = rn * 1e-3 if rn > 0 else 1e-12
+        return rn / wnorm, int(np.linalg.matrix_rank(R, tol=tol))
+
+    best = {"resid": np.inf}
+    for init in range(inits):
+        p = rng.standard_normal(2 * n) * 0.1
+        hist, diverged = [], False
+        for _it in range(iters):
+            A, B = params_to_ops(p)
+            R = A @ Wf - Wf @ B
+            res = float(np.linalg.norm(R)) / wnorm
+            hist.append(res)
+            if not np.isfinite(res) or res > 1e6:
+                diverged = True
+                break
+            gA = R @ Wf.T
+            gB = -Wf.T @ R
+            if fam == "diag":
+                grad = np.concatenate([np.diag(gA), np.diag(gB)])
+            else:
+                grad = np.concatenate([
+                    [np.trace(_cyclic_matrix(n, k).T @ gA)
+                     for k in range(n)],
+                    [np.trace(_cyclic_matrix(n, k).T @ gB)
+                     for k in range(n)]])
+            step = 0.01 / (np.linalg.norm(grad) + 1e-12)
+            p = p - step * grad
+        A, B = params_to_ops(p)
+        res, rr = resid_rank(A, B)
+        if res < best["resid"]:
+            best = {"resid": float(res), "rank_resid": rr, "n": n,
+                    "hist": [round(x, 4) for x in hist],
+                    "diverged": diverged, "init": init}
+    return best
+
+
+def symmetries(path: str = "/tmp/stories15M.bin") -> None:
+    w = load_llama2c(path)
+    print(f"{'=' * 64}\n{path} — symmetry probes (EXACT only)\n"
+          f"{'=' * 64}")
+    mats = {"token_embedding": w["token_embedding"]}
+    for fam in ("wq", "wv", "w1", "w2"):
+        if fam in w:
+            mats[fam + "[0]"] = w[fam][0]
+    for name, W in mats.items():
+        print(f"\n--- {name} {W.shape} ---")
+        e = _equivariance(W)
+        if "skip" not in e:
+            print(f"[A] circulant resid={e['cyclic']['circulant_resid']:.4f}"
+                  f" best_cyclic=shift{e['cyclic']['best_shift']}:"
+                  f"{e['cyclic']['resid']:.4f}"
+                  f" reversal={e['reversal']:.4f}"
+                  f" block={e['block_shift']}")
+        p = _poly_identity(W)
+        print(f"[C] krylov rank by deg: {p['krylov_rank_by_degree']}")
+        print(f"    poly fits (resid): "
+              f"{ {d: round(r, 4) for d, r in p['poly_fits'].items()} }")
+        if "n_eig_clusters_1e4" in p:
+            print(f"    distinct eigenvalues (1e-4): "
+                  f"{p['n_eig_clusters_1e4']}/{p['n_eigs']}")
+        for fam2 in ("diag", "circ"):
+            b = _learned_displacement(W, fam=fam2)
+            print(f"[B] learned {fam2}: resid={b['resid']:.4f} "
+                  f"disp_rank≈{b['rank_resid']}/{b['n']} "
+                  f"diverged={b['diverged']}")
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "relational":
         relational(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "symmetries":
+        symmetries(*(sys.argv[2:] or ["/tmp/stories15M.bin"]))
     else:
         main()
