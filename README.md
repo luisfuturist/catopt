@@ -464,8 +464,10 @@ tying become one object: *a rewrite with an error bound*.
   `W → mul(float(W_int8), s)`, bound `(s/2)·√n`; `per_channel=True`
   gives row-wise scales (same bytes, tighter quality, bound kept);
   `by_bytes` pricing sees the width reduction.
-- `eps.model_bound` — **output-level certificates**: site bounds ×
-  Lipschitz path sensitivities to the output.
+- `eps.model_bound` — output-level certificates: site bounds ×
+  Lipschitz path sensitivities. **Caveat**: unsound for low-rank
+  (activation-position) sites — `ibp.tight_model_bound` is the sound
+  one (118×→3× tightness, flags `spectral_unsafe`).
 - `param_bytes_cost` (`by_bytes`) — prices stored parameter bytes;
   `extract_best_bounded(max_error=…)` — extraction under an ε budget.
 - Exact sharing: `share_duplicate_params` (tied params) and

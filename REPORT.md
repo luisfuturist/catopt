@@ -194,8 +194,12 @@ This is the honest negative the kill-gates were for.
 ## 11. Honest limits
 
 - `model_bound` propagates site bounds via per-op Lipschitz constants
-  — finite for linear/elementwise paths; `sdpa`/`exp` and unknown ops
-  report ∞ rather than fabricate a bound.
+  — **known unsound for spectral sites at activation positions**
+  (low-rank `eps_lr` members: it misses the ‖activation‖ factor;
+  reported 0.14 vs measured 0.246). Use `ibp.tight_model_bound`
+  instead — it flags `spectral_unsafe` and gives sound bounds
+  (118×→3× on quant sites via realized-delta propagation).
+  `sdpa`/`exp`/unknown ops report ∞ rather than fabricate a bound.
 - Monolithic saturation doesn't scale past ~2 blocks;
   `optimize_compositional` is the per-block workaround.
 - Monarch ALS was inconclusive — deeper butterfly structure may exist
