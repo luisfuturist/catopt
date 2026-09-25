@@ -25,10 +25,22 @@ def R(name: str, lhs: Any, rhs: Any, law: str = "", check=None,
                    derive=derive)
 
 
+#: id()-keyed shape memo for the check-hook path.  The bound terms it
+#: sees are ``EGraph.any_term`` resolutions — DAG-shared Op objects —
+#: and ``cost._shape_of`` is already memo-aware: threading one memo
+#: turns an exponential DAG re-walk into a linear one.  ``_SHAPE_KEEP``
+#: pins every term the memo covers so ids can never be recycled into a
+#: stale (id -> wrong shape) binding — soundness over memory (the set
+#: stays small: unique resolved terms, not per-subst copies).
+_SHAPE_MEMO: dict = {}
+_SHAPE_KEEP: dict[int, Any] = {}
+
+
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
     from catopt.cost import _shape_of as _so
-    return _so(t)
+    _SHAPE_KEEP[id(t)] = t
+    return _so(t, _SHAPE_MEMO)
 
 
 def _is_scalar(t: Any) -> bool:
@@ -956,7 +968,11 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
         clusters: dict[Any, list[tuple[ENode, int, int]]] = {}
         for entry in members:
             node, cid, w = entry
-            wt = eg.any_term(w)
+            # ``_any_term_cached`` resolves to the class's minimum-size
+            # member and returns a STABLE object across calls — the
+            # id()-keyed ``_SHAPE_MEMO`` in ``_so`` then dedupes shape
+            # inference on repeated weights.
+            wt = eg._any_term_cached(w)
             if wt is None:
                 continue
             k = cluster_key(node, wt)
@@ -970,7 +986,7 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
                 continue
             if any(cls_has_var(w) for w in weights):
                 continue  # fused weight must fold at compile time
-            wts = [eg.any_term(w) for w in weights]
+            wts = [eg._any_term_cached(w) for w in weights]
             if any(t is None for t in wts):
                 continue
             sizes: list[int] = []
@@ -1000,7 +1016,7 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
                 # its section of the fused GEMM.  Pointwise honesty —
                 # asserts this instance, exactly what the pass proved.
                 src = getattr(eg, "_oldest_term", eg.any_term)(cid)
-                split_term = eg.any_term(split_eid)
+                split_term = eg._any_term_cached(split_eid)
                 wit = None
                 if src is not None and split_term is not None:
                     wit = Rewrite(

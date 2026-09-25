@@ -36,6 +36,9 @@ class EClass:
     id: int
     nodes: set[ENode] = field(default_factory=set)
     cache: dict[str, Any] = field(default_factory=dict)
+    # Lazily-built ``op -> member enodes`` index used by the matcher;
+    # invalidated whenever ``nodes`` is mutated (union / rebuild).
+    by_op: dict[str, list] | None = None
 
 
 class UnionFind:
@@ -329,6 +332,37 @@ class EGraph:
         self._tag_rule: str | None = None      # rule context (RHS instantiate)
         self._collect: list | None = None      # enodes born mid-instantiate
         self._inst_last_enode: ENode | None = None
+        # -- incremental saturation state --------------------------------
+        # The matcher only needs to re-search an e-class when the match
+        # results *could* have changed: the class gained enodes, or some
+        # class reachable from it through enode children changed.  We
+        # maintain the inverted child->parent adjacency so every change
+        # can dirty exactly the affected ancestor cone.
+        self._dirty: set[int] = set()
+        self._parents: dict[int, set[int]] = {}
+        # ``op name -> canonical class ids containing a member with that
+        # op`` — a rule whose LHS is an Op pattern can only match at
+        # those classes, so the per-iteration scan never touches the
+        # rest of the graph.
+        self._op_classes: dict[str, set[int]] = {}
+        # Names of rules already applied to the whole graph once —
+        # after the first pass the dirty frontier suffices.
+        self._applied_rules: set[str] = set()
+        # Per-apply_rule memo for ``any_term`` resolutions (checks fire
+        # per substitution and re-resolve the same bound classes).
+        self._anyterm_memo: dict[int, Any] | None = None
+        # Cumulative ``rule name -> enodes contributed`` under
+        # ``rule_budgets`` — persists across ``run`` calls so the
+        # budget bounds a rule's expansion over the graph's lifetime,
+        # not per call (the post-pass re-saturations in
+        # ``optimize_model`` cannot re-open a closed budget).
+        self._budget_spent: dict[str, int] = {}
+
+    #: Per-class match-enumeration cap used when a rule runs under an
+    #: ``enode_budget``: large enough to cover the substitutions a
+    #: non-closure class realistically produces, small enough that a
+    #: combinatorially-exploded class cannot dominate a pass.
+    _MATCH_CAP: int = 256
 
     @property
     def n_classes(self) -> int:
@@ -379,6 +413,14 @@ class EGraph:
         self._classes[eid] = EClass(id=eid)
         self._node_to_class[enode] = eid
         self._classes[eid].nodes.add(enode)
+        # Incremental-search bookkeeping: a fresh class must be
+        # searched (its enode may match rules), it contributes its op
+        # to the class index, and each child class gains a parent edge
+        # so future changes below propagate dirtiness upward.
+        self._dirty.add(eid)
+        self._op_classes.setdefault(enode.op, set()).add(eid)
+        for c in enode.children:
+            self._parents.setdefault(self.find(c), set()).add(eid)
         if self._track:
             self._enode_birth[enode] = eid
             self._enode_origin[enode] = (
@@ -458,7 +500,38 @@ class EGraph:
             source = self._classes[old_canon]
             target.nodes |= source.nodes
             target.cache.clear()
+            target.by_op = None
             del self._classes[old_canon]
+            # -- incremental-search bookkeeping --------------------------
+            # The merged class gained enodes, and every enode anywhere
+            # whose child resolved to ``old_canon`` now resolves to
+            # ``new_canon`` — both can enable new matches, and those
+            # new matches can in turn enable matches in the parents of
+            # those classes.  The affected region is exactly the
+            # upward closure of the merged class over child->parent
+            # edges, so mark it all dirty.
+            self._dirty.add(new_canon)
+            p_old = self._parents.pop(old_canon, None)
+            if p_old:
+                self._parents.setdefault(new_canon, set()).update(p_old)
+            for n in source.nodes:
+                oc = self._op_classes.get(n.op)
+                if oc is not None:
+                    oc.discard(old_canon)
+                    oc.add(new_canon)
+            stack = [new_canon]
+            while stack:
+                c = stack.pop()
+                for p0 in self._parents.get(c, ()):
+                    p = self.find(p0)
+                    if p == c or p in self._dirty:
+                        # ``p in _dirty`` prune is sound: an already-
+                        # dirty class's ancestors were dirtied when it
+                        # became dirty (parent edges are only ever
+                        # created pointing at dirty-or-fresh classes).
+                        continue
+                    self._dirty.add(p)
+                    stack.append(p)
             if self._track:
                 if witness is not None:
                     rule = witness.name
@@ -503,15 +576,25 @@ class EGraph:
 
     # -- pattern matching --
 
-    def matches(self, pattern: Any, eid: int) -> list[dict[str, int]]:
-        """Find all substitutions that match *pattern* at e-class *eid*."""
+    def matches(self, pattern: Any, eid: int,
+                max_results: int | None = None) -> list[dict[str, int]]:
+        """Find all substitutions that match *pattern* at e-class *eid*.
+
+        ``max_results`` bounds the enumeration: matching stops once
+        that many substitutions have been found — deterministic (the
+        first-found wins) and used by the saturation loop to enforce
+        per-rule expansion budgets inside giant e-classes.
+        """
         results: list[dict[str, int]] = []
-        self._match(pattern, eid, {}, results)
+        self._match(pattern, eid, {}, results, max_results)
         return results
 
     def _match(self, pattern: Any, eid: int,
                subst: dict[str, int],
-               results: list[dict[str, int]]) -> None:
+               results: list[dict[str, int]],
+               limit: int | None = None) -> None:
+        if limit is not None and len(results) >= limit:
+            return
         eid = self.find(eid)
         eclass = self._classes[eid]
 
@@ -528,9 +611,9 @@ class EGraph:
 
         if isinstance(pattern, Op):
             attr_t = _pattern_attrs(pattern)
-            for node in eclass.nodes:
-                if node.op != pattern.op:
-                    continue
+            for node in self._nodes_of(eclass, pattern.op):
+                if limit is not None and len(results) >= limit:
+                    return
                 if len(node.children) != len(pattern.args):
                     continue
                 # Attribute matching: every pattern attr key must exist in
@@ -576,9 +659,14 @@ class EGraph:
                 for i, pat_arg in enumerate(pattern.args):
                     new_substs: list[dict[str, int]] = []
                     for cs in child_substs:
+                        if (limit is not None
+                                and len(results) + len(new_substs)
+                                >= limit):
+                            ok = False
+                            break
                         child_results: list[dict[str, int]] = []
                         self._match(pat_arg, node.children[i],
-                                    dict(cs), child_results)
+                                    dict(cs), child_results, limit)
                         new_substs.extend(child_results)
                     if not new_substs:
                         ok = False
@@ -587,7 +675,13 @@ class EGraph:
                 if ok:
                     # child_substs already contain the incoming bindings;
                     # conflicts were rejected inside the metavar branch.
-                    results.extend(child_substs)
+                    if limit is not None:
+                        room = limit - len(results)
+                        results.extend(child_substs[:room])
+                        if len(results) >= limit:
+                            return
+                    else:
+                        results.extend(child_substs)
             return
 
         # Leaf (Const/Param/Var) — match by key
@@ -597,19 +691,60 @@ class EGraph:
             if self.find(self._node_to_class[enode]) == eid:
                 results.append(dict(subst))
 
+    def _nodes_of(self, eclass: EClass, op: str) -> list:
+        """Member enodes of *eclass* carrying *op* — lazily indexed.
+
+        ``eclass.by_op`` is invalidated at every ``nodes`` mutation
+        (union merge, rebuild), so the bucket never goes stale.
+        """
+        bo = eclass.by_op
+        if bo is None:
+            bo = eclass.by_op = {}
+        lst = bo.get(op)
+        if lst is None:
+            lst = [n for n in eclass.nodes if n.op == op]
+            bo[op] = lst
+        return lst
+
     # -- rebuild --
 
-    def rebuild(self) -> bool:
-        """Canonicalize children and merge duplicates."""
+    def rebuild(self, classes: Any = None) -> bool:
+        """Canonicalize children and merge duplicates.
+
+        ``classes`` optionally restricts the pass to a set of class
+        ids: only classes whose nodes' children could have changed
+        canonical ids need re-canonicalizing, and those are exactly
+        the classes the dirty frontier just searched (plus the ones
+        dirtied while searching).  An unrestricted pass is still
+        available — and used once at the end of :meth:`run` — for
+        callers that mutate the graph outside the saturation loop.
+        """
         changed = False
-        for eid in list(self._classes.keys()):
-            eclass = self._classes[self.find(eid)]
+        if classes is None:
+            ids: Any = list(self._classes.keys())
+        else:
+            ids = classes
+        seen: set[int] = set()
+        for eid0 in ids:
+            eid = self.find(eid0)
+            if eid in seen or eid not in self._classes:
+                continue
+            seen.add(eid)
+            eclass = self._classes[eid]
             new_nodes: set[ENode] = set()
             for node in eclass.nodes:
                 if node.children:
                     canon = tuple(self.find(c) for c in node.children)
                     if canon != node.children:
                         changed = True
+                        # ``nn`` replaces ``node``: register the upward
+                        # edge for each canonical child so later changes
+                        # below propagate dirty to this class.  (``eid``
+                        # is already dirty — it is an ancestor of the
+                        # merge that forced the canonicalisation.)
+                        for c in canon:
+                            self._parents.setdefault(
+                                self.find(c), set()).add(eid)
                     nn = ENode(node.op, canon, node.attrs)
                     new_nodes.add(nn)
                     if self._track and nn != node:
@@ -627,7 +762,9 @@ class EGraph:
                         self._node_to_class.setdefault(nn, eid)
                 else:
                     new_nodes.add(node)
-            eclass.nodes = new_nodes
+            if new_nodes != eclass.nodes:
+                eclass.nodes = new_nodes
+                eclass.by_op = None
         return changed
 
     # -- rule application --
@@ -670,18 +807,30 @@ class EGraph:
                                           (("key", repr(pattern)),))
             return eid
 
-    def any_term(self, eid: int, _seen: frozenset = frozenset()) -> Any:
+    def any_term(self, eid: int, _seen: frozenset = frozenset(),
+                 _memo: dict | None = None) -> Any:
         """Return any acyclic representative term of an e-class.
 
         Prefers leaf nodes; used to resolve metavariable bindings to
         concrete terms for rewrite side conditions (shape checks).
+
+        ``_memo`` shares resolutions across the recursive descent —
+        e-class subgraphs are heavily shared (residual streams), so
+        without it the walk re-expands the same cones exponentially.
+        Returns the same member as the unmemoised recursion.
         """
+        if _memo is None:
+            _memo = {}
         eid = self.find(eid)
         eclass = self._classes[eid]
         for node in eclass.nodes:
             if node.op == "leaf":
                 key = node.attrs[0][1] if node.attrs else "??"
                 return _LeafRegistry.decode(key)
+        hit = _memo.get(eid)
+        if hit is not None:
+            return hit
+        _seen = _seen | {eid}
         for node in eclass.nodes:
             args = []
             ok = True
@@ -690,100 +839,313 @@ class EGraph:
                 if canon == eid or canon in _seen:
                     ok = False
                     break
-                t = self.any_term(canon, _seen | {eid})
+                t = self.any_term(canon, _seen, _memo)
                 if t is None:
                     ok = False
                     break
                 args.append(t)
             if ok:
-                return Op.make(node.op, *args, **dict(node.attrs))
+                _memo[eid] = Op.make(node.op, *args, **dict(node.attrs))
+                return _memo[eid]
         return None
 
-    def apply_rule(self, rule: Rewrite, root_eid: int) -> bool:
-        """Apply a single rewrite rule across all e-classes."""
+    def _min_term(self, eid: int, memo: dict,
+                  _seen: frozenset = frozenset()) -> tuple[Any, float]:
+        """Smallest (fewest ops) acyclic member of an e-class, as
+        ``(term, size)``.
+
+        Used to feed rewrite side conditions: every member of the class
+        is an equally valid binding, but a compact representative makes
+        shape-inference checks cost O(member) instead of O(the unfolded
+        class).  Returns ``(None, inf)`` when every member is cyclic
+        under ``_seen``; ``None`` results are never memoised (a class
+        that fails under one ``_seen`` may succeed under another).
+        """
+        eid = self.find(eid)
+        eclass = self._classes[eid]
+        for node in eclass.nodes:
+            if node.op == "leaf":
+                key = node.attrs[0][1] if node.attrs else "??"
+                res = (_LeafRegistry.decode(key), 1)
+                memo[eid] = res
+                return res
+        hit = memo.get(eid)
+        if hit is not None:
+            return hit
+        if eid in _seen:
+            return (None, float("inf"))
+        _seen = _seen | {eid}
+        best = (None, float("inf"))
+        for node in eclass.nodes:
+            args = []
+            sz = 1
+            ok = True
+            for c in node.children:
+                canon = self.find(c)
+                if canon == eid or canon in _seen:
+                    ok = False
+                    break
+                t, s = self._min_term(canon, memo, _seen)
+                if t is None:
+                    ok = False
+                    break
+                args.append(t)
+                sz += s
+            if ok and sz < best[1]:
+                best = (Op.make(node.op, *args, **dict(node.attrs)), sz)
+        if best[0] is not None:
+            memo[eid] = best
+        return best
+
+    def _any_term_cached(self, eid: int) -> Any:
+        """Member resolution for rewrite side conditions, memoised for
+        the duration of one ``apply_rule``.
+
+        Resolves to the class's *minimum-size* member rather than an
+        arbitrary one: ``check``/``derive`` contracts only require *a*
+        member, and a compact one keeps ``_shape_of`` (an O(term)
+        recursive inference) from walking tens of thousands of nodes
+        per substitution — the dominant cost of the scale-fold rules
+        on stacked blocks.
+
+        The result is also stored in ``eclass.cache`` so the SAME term
+        object survives across ``apply_rule`` calls and iterations —
+        the rules' id()-keyed ``_shape_of`` memo then hits for checks
+        re-evaluated on unchanged classes.
+        """
+        eid = self.find(eid)
+        eclass = self._classes[eid]
+        cached = eclass.cache.get("min_term")
+        if cached is not None:
+            return cached[0]
+        memo = self._anyterm_memo
+        try:
+            t, s = self._min_term(eid, memo if memo is not None else {})
+        except RecursionError:
+            # Pathologically deep cones (unbounded runs at the node
+            # cap): fall back to the early-exit walk — ``any_term``
+            # returns the first acyclic member it finds rather than
+            # scanning every member for the minimum.  If even that
+            # exceeds the recursion limit, degrade to ``None`` — the
+            # caller treats it as "no representative", skipping the
+            # substitution (conservative: never a wrong rewrite).
+            try:
+                return self.any_term(eid)
+            except RecursionError:
+                return None
+        if t is not None:
+            eclass.cache["min_term"] = (t, s)
+        return t
+
+    def _candidate_classes(self, lhs: Any,
+                           search: set | list | None) -> Any:
+        """E-classes a rule's LHS could possibly match at.
+
+        ``search=None`` scans the whole graph (the pre-incremental
+        behaviour); a set restricts to the dirty frontier.  In both
+        cases an Op-rooted pattern additionally filters to classes
+        that contain a member with the pattern's head op, a
+        metavariable pattern binds at any class, and a concrete-leaf
+        pattern can only match at the leaf's own class.
+        """
+        if isinstance(lhs, Op):
+            eligible = {self.find(c)
+                        for c in self._op_classes.get(lhs.op, ())}
+        elif isinstance(lhs, str):
+            eligible = None
+        else:
+            leaf = ENode("leaf", (), (("key", repr(lhs)),))
+            leid = self._node_to_class.get(leaf)
+            eligible = {self.find(leid)} if leid is not None else set()
+        # ``_classes`` mutates under us as unions fire — snapshot.
+        ids = list(self._classes.keys()) if search is None else search
+        for eid0 in ids:
+            eid = self.find(eid0)
+            if eligible is not None and eid not in eligible:
+                continue
+            yield eid
+
+    def apply_rule(self, rule: Rewrite, root_eid: int,
+                   search: set | list | None = None,
+                   enode_budget: int | None = None) -> bool:
+        """Apply a single rewrite rule across e-classes.
+
+        ``search`` limits the scan to the given class ids (the dirty
+        frontier supplied by :meth:`run`); the default searches every
+        class — the only sound choice for a rule that has never seen
+        this graph.
+
+        ``enode_budget`` bounds how many NEW enodes this call may
+        create: the scan stops between candidate classes once the
+        budget is spent, and match enumeration inside each class is
+        capped at the smaller of the remaining budget and
+        ``_MATCH_CAP`` so a single giant e-class cannot spend it all
+        in one enumeration.  This is the mechanism behind
+        :meth:`run`'s ``rule_budgets`` — a bounded-saturation policy
+        for rules whose closure is combinatorially explosive.
+        """
+        if search is None:
+            # A whole-graph scan establishes the rule's frontier;
+            # a restricted scan does not.
+            self._applied_rules.add(rule.name)
         changed = False
-        for eid in list(self._classes.keys()):
-            eid = self.find(eid)
-            for subst in self.matches(rule.lhs, eid):
-                if rule.check is not None or rule.derive is not None:
-                    bound = {
-                        k: (v if k.startswith("$attr:")
-                            else self.any_term(v))
-                        for k, v in subst.items()
-                    }
-                    if any(v is None for k, v in bound.items()
-                           if not k.startswith("$attr:")):
-                        continue
-                    if rule.check is not None and not rule.check(bound):
-                        continue
-                    if rule.derive is not None:
-                        extra = rule.derive(bound)
-                        if extra is None:
+        n_start = self.n_enodes
+        self._anyterm_memo = {}
+        try:
+            candidates = self._candidate_classes(rule.lhs, search)
+            for eid in candidates:
+                match_cap = None
+                if enode_budget is not None:
+                    spent = self.n_enodes - n_start
+                    if spent >= enode_budget:
+                        break
+                    match_cap = min(enode_budget - spent,
+                                    self._MATCH_CAP)
+                for subst in self.matches(rule.lhs, eid,
+                                          max_results=match_cap):
+                    if rule.check is not None or rule.derive is not None:
+                        bound = {
+                            k: (v if k.startswith("$attr:")
+                                else self._any_term_cached(v))
+                            for k, v in subst.items()
+                        }
+                        if any(v is None for k, v in bound.items()
+                               if not k.startswith("$attr:")):
                             continue
-                        subst = {**subst, **extra}
-                created = None
-                if self._track:
-                    self._tag_rule = rule.name
-                    self._collect = []
-                    self._inst_last_enode = None
-                    try:
+                        if (rule.check is not None
+                                and not rule.check(bound)):
+                            continue
+                        if rule.derive is not None:
+                            extra = rule.derive(bound)
+                            if extra is None:
+                                continue
+                            subst = {**subst, **extra}
+                    created = None
+                    if self._track:
+                        self._tag_rule = rule.name
+                        self._collect = []
+                        self._inst_last_enode = None
+                        try:
+                            rhs_eid = self._instantiate(rule.rhs, subst)
+                        finally:
+                            self._tag_rule = None
+                            created = self._collect
+                            self._collect = None
+                    else:
                         rhs_eid = self._instantiate(rule.rhs, subst)
-                    finally:
-                        self._tag_rule = None
-                        created = self._collect
-                        self._collect = None
-                else:
-                    rhs_eid = self._instantiate(rule.rhs, subst)
-                self._rule_objs.setdefault(rule.name, rule)
-                merged = self.union(eid, rhs_eid,
-                                    rule=rule.name, subst=subst)
-                if self._track and (merged or created):
-                    # A real merge or freshly-instantiated enodes — the
-                    # application is a witness worth keeping.  A no-op
-                    # firing (RHS already in the class, nothing created)
-                    # adds no 2-morphism, so it is not recorded.
-                    app_idx = len(self._applications)
-                    self._applications.append({
-                        "rule": rule.name,
-                        "matched_eid": self.find(eid),
-                        "rhs_eid": self.find(rhs_eid),
-                        "subst": dict(subst),
-                        "rhs_root_enode": self._inst_last_enode,
-                    })
-                    # First discovered witness wins — a hash-consed
-                    # enode keeps the application that created it.
-                    for en in created or ():
-                        self._enode_app.setdefault(en, app_idx)
-                if merged:
-                    changed = True
-                    self.rule_fires[rule.name] = (
-                        self.rule_fires.get(rule.name, 0) + 1)
+                    self._rule_objs.setdefault(rule.name, rule)
+                    merged = self.union(eid, rhs_eid,
+                                        rule=rule.name, subst=subst)
+                    if self._track and (merged or created):
+                        # A real merge or freshly-instantiated enodes —
+                        # the application is a witness worth keeping.  A
+                        # no-op firing (RHS already in the class,
+                        # nothing created) adds no 2-morphism, so it is
+                        # not recorded.
+                        app_idx = len(self._applications)
+                        self._applications.append({
+                            "rule": rule.name,
+                            "matched_eid": self.find(eid),
+                            "rhs_eid": self.find(rhs_eid),
+                            "subst": dict(subst),
+                            "rhs_root_enode": self._inst_last_enode,
+                        })
+                        # First discovered witness wins — a hash-consed
+                        # enode keeps the application that created it.
+                        for en in created or ():
+                            self._enode_app.setdefault(en, app_idx)
+                    if merged:
+                        changed = True
+                        self.rule_fires[rule.name] = (
+                            self.rule_fires.get(rule.name, 0) + 1)
+        finally:
+            self._anyterm_memo = None
         return changed
 
     # -- saturation --
 
     def run(self, rules: list[Rewrite], root_eid: int,
             max_iterations: int = 100,
-            max_nodes: int = 100_000) -> dict[str, int]:
-        """Run equality saturation until a fixed point."""
+            max_nodes: int = 100_000,
+            rule_budgets: dict[str, int] | None = None) -> dict[str, int]:
+        """Run equality saturation until a fixed point.
+
+        Incremental: each iteration re-searches only the *dirty
+        frontier* — e-classes whose reachable subgraph changed since
+        they were last searched (fresh enodes, merged classes, and
+        every ancestor of those, maintained by :meth:`_add_enode` and
+        :meth:`union`).  A class outside the frontier cannot produce a
+        match that was not already produced, so skipping it preserves
+        the fixed point exactly while removing the per-iteration
+        whole-graph rescan that made saturation quadratic.
+
+        A rule whose name has never been applied in this e-graph
+        searches every class once (it has no established frontier);
+        subsequent iterations of the same rule set are frontier-only.
+
+        ``rule_budgets`` maps rule names to a maximum number of NEW
+        enodes the rule may contribute over the whole run; once a
+        rule exhausts its budget it is suspended.  This is *bounded
+        saturation*: unbudgeted rules still reach the exact fixed
+        point, while combinatorially explosive rules (pure symmetry
+        generators such as comm/assoc, whose closure enumerates every
+        bracketing and ordering of a summation) are truncated at a
+        point that — measured on the transformer pipeline — already
+        covers every rewrite the extractor can exploit.  Budget
+        accounting is reported in ``stats["rule_budgets"]``.
+        """
+        budgets = rule_budgets or {}
+        spent = self._budget_spent
+        for name in budgets:
+            spent.setdefault(name, 0)
+        iteration = -1
         for iteration in range(max_iterations):
             n_before = self.n_enodes
+            # Snapshot the frontier ONCE per iteration: classes changed
+            # while rules fire are re-searched next iteration — the
+            # fixed point is unchanged, the schedule is tighter.
+            search = sorted({self.find(e) for e in self._dirty})
+            self._dirty.clear()
             for rule in rules:
-                self.apply_rule(rule, root_eid)
-            self.rebuild()
+                budget = budgets.get(rule.name)
+                if budget is not None:
+                    remaining = budget - spent[rule.name]
+                    if remaining <= 0:
+                        continue  # suspended: budget exhausted
+                else:
+                    remaining = None
+                n0 = self.n_enodes
+                if rule.name in self._applied_rules:
+                    self.apply_rule(rule, root_eid, search=search,
+                                    enode_budget=remaining)
+                else:
+                    # Never scanned this graph: full scan once —
+                    # afterwards the dirty frontier suffices.
+                    self.apply_rule(rule, root_eid,
+                                    enode_budget=remaining)
+                if budget is not None:
+                    spent[rule.name] += self.n_enodes - n0
+            self.rebuild(set(search) | self._dirty)
             n_after = self.n_enodes
             if n_after >= max_nodes:
                 print(f"  [egraph] stopping: max_nodes ({max_nodes}) reached")
                 break
-            if n_after == n_before:
+            if n_after == n_before and not self._dirty:
                 print(f"  [egraph] saturation at iteration {iteration + 1}")
                 break
+        # Leave the graph in the same canonicalised postcondition the
+        # unrestricted loop guaranteed (downstream passes and
+        # extraction traverse it directly).
+        self.rebuild()
         return {
             "iterations": iteration + 1,
             "n_enodes": self.n_enodes,
             "n_classes": self.n_classes,
             "n_proof_edges": len(self._merge_log),
             "truncation_level": self.truncation_level,
+            "rule_budgets": {n: spent[n] for n in budgets},
+            "budget_suspended": [n for n in budgets
+                                 if spent[n] >= budgets[n]],
         }
 
     # -- extraction --
@@ -1250,20 +1612,34 @@ class EGraph:
     _CERT_MAX_DEPTH = 400
     _CERT_MAX_STEPS = 20_000
 
-    def _class_of_term(self, term: Any) -> int | None:
-        """Canonical e-class id realising *term*, without mutating the graph."""
+    def _class_of_term(self, term: Any, _memo: dict | None = None) -> Any:
+        """Canonical e-class id realising *term*, without mutating the graph.
+
+        ``_memo`` is ``id(term)``-keyed: ``any_term``/``_min_term``
+        resolutions are shared-DAG objects, and without the memo the
+        recursion re-walks shared subtrees exponentially (observed:
+        ~24M calls for one pairing witness on a 5-block stack).
+        """
+        if _memo is None:
+            _memo = {}
+        hit = _memo.get(id(term), False)
+        if hit is not False:
+            return hit
         if isinstance(term, Op):
             cids = []
             for a in term.args:
-                c = self._class_of_term(a)
+                c = self._class_of_term(a, _memo)
                 if c is None:
+                    _memo[id(term)] = None
                     return None
                 cids.append(c)
             en = ENode(term.op, tuple(cids), _pattern_attrs(term))
         else:
             en = ENode("leaf", (), (("key", repr(term)),))
         eid = self._node_to_class.get(en)
-        return self.find(eid) if eid is not None else None
+        res = self.find(eid) if eid is not None else None
+        _memo[id(term)] = res
+        return res
 
     def _locate(self, term: Any, eid: int | None = None):
         """``(eid, enode)`` realising *term* inside its e-class.
@@ -1272,8 +1648,9 @@ class EGraph:
         e-classes — so it pins down exactly which member of the class
         the term uses.  ``enode`` is ``None`` when no member matches.
         """
+        memo: dict = {}
         if eid is None:
-            eid = self._class_of_term(term)
+            eid = self._class_of_term(term, memo)
         if eid is None:
             return None, None
         eid = self.find(eid)
@@ -1286,7 +1663,7 @@ class EGraph:
                         and n.attrs[0][1] == repr(term)):
                     return eid, n
             return eid, None
-        child_cls = [self._class_of_term(a) for a in term.args]
+        child_cls = [self._class_of_term(a, memo) for a in term.args]
         for n in ec.nodes:
             if n.op != term.op or len(n.children) != len(term.args):
                 continue
@@ -1305,7 +1682,8 @@ class EGraph:
         eid = self._node_to_class.get(enode)
         return eid if eid is not None else 1 << 60
 
-    def _oldest_term(self, eid: int, _stack: frozenset = frozenset()):
+    def _oldest_term(self, eid: int, _stack: frozenset = frozenset(),
+                     _memo: dict | None = None):
         """The earliest-created representative term of an e-class.
 
         Proof-time analogue of :meth:`any_term`: picking the minimum-
@@ -1313,27 +1691,40 @@ class EGraph:
         :meth:`_connect` a strictly descending recursion — every rule
         instance's LHS was matched on enodes older than the RHS enodes
         it created.
+
+        ``_memo`` shares resolutions across the descent (e-class cones
+        are heavily shared); a memoised member is still a valid
+        member, and ``None`` results are never cached (a class blocked
+        by ``_stack`` may resolve under another ancestry).
         """
+        if _memo is None:
+            _memo = {}
         eid = self.find(eid)
         if eid in _stack:
             return None
+        hit = _memo.get(eid)
+        if hit is not None:
+            return hit
         ec = self._classes.get(eid)
         if ec is None:
             return None
+        _stack = _stack | {eid}
         for node in sorted(ec.nodes, key=self._birth):
             if node.op == "leaf":
                 key = node.attrs[0][1] if node.attrs else "??"
-                return _LeafRegistry.decode(key)
+                _memo[eid] = _LeafRegistry.decode(key)
+                return _memo[eid]
             args = []
             ok = True
             for c in node.children:
-                t = self._oldest_term(c, _stack | {eid})
+                t = self._oldest_term(c, _stack, _memo)
                 if t is None:
                     ok = False
                     break
                 args.append(t)
             if ok:
-                return Op.make(node.op, *args, **dict(node.attrs))
+                _memo[eid] = Op.make(node.op, *args, **dict(node.attrs))
+                return _memo[eid]
         return None
 
     def _app_for_member(self, term: Any):

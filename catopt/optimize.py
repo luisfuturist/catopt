@@ -13,6 +13,7 @@ The main entry point is :func:`optimize_model`.
 from __future__ import annotations
 
 import copy
+import sys
 import time
 from typing import Any, Callable
 
@@ -32,6 +33,42 @@ from catopt.cost import (flops_cost, count_cost, launch_aware_cost,
                          CostModel, dag_cost)
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.ir import op_repr
+
+
+#: Rules whose saturation closure is combinatorially explosive on
+#: stacked blocks: the pure-symmetry monoid laws enumerate every
+#: bracketing/ordering of a summation (Catalan-scale on the residual
+#: accumulator), the scale-hoist laws pair every scale member with
+#: every linear, and the distribute/factor/naturality/assoc algebra
+#: generates cross-product closures (distribute splits a sum into two
+#: matmuls that factor rules then re-pair against *every other*
+#: summand — enodes grew 337 → 40k in four iterations on a
+#: DeepParallel stack).  ``optimize_model`` runs these under a
+#: per-rule enode budget — *bounded saturation* — which truncates the
+#: reordering closure but leaves every content-bearing rewrite at the
+#: exact fixed point.  Structural fusions (qkv/swiglu/sdpa folds,
+#: gqa_absorb) and the simplification singletons stay unbudgeted:
+#: their matches are pattern-specific, not closure-generating.
+#: Measured on stacked ParallelBlocks (the model that motivated
+#: ``optimize_compositional``): identical extracted cost at every
+#: budget ≥ 512 while saturation drops from minutes to ~1s.
+_EXPANSIVE_RULES = frozenset({
+    # monoid symmetries
+    "comm_add", "comm_mul", "assoc_add", "assoc_mul",
+    # diagonal-scale naturality (norm folding)
+    "linear_row_scale", "linear_row_scale_rev",
+    "linear_channel_scale", "linear_channel_scale_rev",
+    # bilinearity: distribute / factor pairs (both directions)
+    "distribute_matmul_over_add", "factor_matmul",
+    "right_distribute_matmul", "right_factor_matmul",
+    "weight_factor_matmul", "weight_distribute_matmul",
+    "weight_factor_linear", "weight_distribute_linear",
+    "right_factor_linear",
+    # composition chains / scalar naturality
+    "assoc_linear", "assoc_linear_bias", "assoc_linear_bias_rev",
+    "naturality_scalar", "naturality_scalar_rev",
+    "assoc_matmul", "assoc_matmul_rev",
+})
 
 
 def _eval_const(term: Any, params: dict) -> torch.Tensor | None:
@@ -134,13 +171,18 @@ def discover_alternatives(
         _SUBSUMED = {"swiglu_fuse", "qkv_fuse", "qkv_fuse_asym",
                      "parallel_mul_fuse"}
         rules = [r for r in rules if r.name not in _SUBSUMED]
-    stats = eg.run(rules, root_eid, max_iterations=max_iterations)
+    # Same bounded-saturation policy as optimize_model — the frontier
+    # stays representative but the call returns in bounded time.
+    rule_budgets = {n: 8192 for n in _EXPANSIVE_RULES}
+    stats = eg.run(rules, root_eid, max_iterations=max_iterations,
+                   rule_budgets=rule_budgets)
     groups = (pair_shared_input_linears(eg)
               + pair_shared_input_convs(eg))
     if groups:
         eg.rebuild()
         stats["pairing_groups"] = len(groups)
-        eg.run(rules, root_eid, max_iterations=5)
+        eg.run(rules, root_eid, max_iterations=5,
+               rule_budgets=rule_budgets)
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
     # same-state carrier applications -> one application, whole om
     # trees over scanned values -> the deferred omd carrier, and exact
@@ -155,7 +197,8 @@ def discover_alternatives(
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
-        eg.run(rules, root_eid, max_iterations=5)
+        eg.run(rules, root_eid, max_iterations=5,
+               rule_budgets=rule_budgets)
     alts = eg.extract_alternatives(root_eid, cost_fn, top_k=top_k)
     return {
         "alternatives": alts,
@@ -179,6 +222,7 @@ def optimize_model(
     max_enodes: int = 100_000,
     cost_fn=None,
     eps_rtol: float | None = None,
+    symmetry_budget: int | None = 8192,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -199,6 +243,16 @@ def optimize_model(
         Cost function for term extraction.  Defaults to
         :func:`launch_aware_cost` (FLOPs + a small per-kernel penalty so
         that forms with identical FLOPs but fewer launches win).
+    symmetry_budget : int, optional
+        Per-rule enode budget for the expansive rules in
+        ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
+        bounded saturation.  The reordering closure these rules
+        generate grows Catalan-fast on stacked blocks (the residual
+        accumulator's bracketings), which is what pushed monolithic
+        eqsat past ~2 blocks.  ``None`` restores unbounded
+        saturation.  The bound can only *miss* optimizations, never
+        introduce wrong ones — every recorded merge is still a real
+        equality.
     eps_rtol : float, optional
         Optional certified-approximation toolkit — off by default and
         not part of the core optimizer.  When set, also run the
@@ -219,6 +273,12 @@ def optimize_model(
     """
     if cost_fn is None:
         cost_fn = launch_aware_cost
+
+    # Recursive walks (extraction, member resolution) descend the
+    # e-class DAG, whose depth grows with the saturation closure —
+    # thousands of levels on deep stacks.
+    if sys.getrecursionlimit() < 40_000:
+        sys.setrecursionlimit(40_000)
 
     # -- Phase 1: Export to IR -------------------------------------------
     if verbose:
@@ -255,8 +315,15 @@ def optimize_model(
     if verbose:
         print(f"  Rules: {[r.name for r in rules]}")
 
+    # Bounded-saturation budget for the expansive rules (see
+    # ``_EXPANSIVE_RULES``); enforced inside the matcher so a giant
+    # e-class cannot spend the whole budget in one enumeration.
+    rule_budgets = ({n: symmetry_budget for n in _EXPANSIVE_RULES}
+                    if symmetry_budget is not None else None)
+
     stats = eg.run(rules, root_eid,
-                   max_iterations=max_iterations, max_nodes=max_enodes)
+                   max_iterations=max_iterations, max_nodes=max_enodes,
+                   rule_budgets=rule_budgets)
 
     # Diagram-level product law: pair every linear sharing an input into
     # one GEMM + split views.  Non-local — no consumer pattern needed.
@@ -266,7 +333,8 @@ def optimize_model(
         eg.rebuild()
         stats["pairing_groups"] = len(groups)
         # brief second saturation so other rules see the new enodes
-        eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
+        eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes,
+               rule_budgets=rule_budgets)
 
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
     # same-state carrier applications -> one application, whole om
@@ -292,7 +360,8 @@ def optimize_model(
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
-        eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes)
+        eg.run(rules, root_eid, max_iterations=5, max_nodes=max_enodes,
+               rule_budgets=rule_budgets)
 
     stats["rule_fires"] = dict(eg.rule_fires)
     if verbose:
