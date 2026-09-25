@@ -173,7 +173,7 @@ def discover_alternatives(
         rules = [r for r in rules if r.name not in _SUBSUMED]
     # Same bounded-saturation policy as optimize_model — the frontier
     # stays representative but the call returns in bounded time.
-    rule_budgets = {n: 8192 for n in _EXPANSIVE_RULES}
+    rule_budgets = {n: 2048 for n in _EXPANSIVE_RULES}
     stats = eg.run(rules, root_eid, max_iterations=max_iterations,
                    rule_budgets=rule_budgets)
     groups = (pair_shared_input_linears(eg)
@@ -222,7 +222,7 @@ def optimize_model(
     max_enodes: int = 100_000,
     cost_fn=None,
     eps_rtol: float | None = None,
-    symmetry_budget: int | None = 8192,
+    symmetry_budget: int | None = 2048,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
