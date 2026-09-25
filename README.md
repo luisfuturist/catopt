@@ -121,14 +121,15 @@ The honest regime map, all measured:
 | GEMM pairing on transformer blocks | **Parity** — ~40 non-GEMM kernels/layer dilute it |
 | Real trained checkpoints (stories15M/110M) | **Parity** — all blocks transform and verify, no win at these sizes |
 | Launch-bound decode cells (B=1, T≤64) | **Loses 4–15%** — split-view copies cost more than saved launches |
+| Large cells (B≥8, T≥128, stories110M) | **Parity** — GEMM-shape efficiency washes out at ~1% |
 
 Real checkpoints (`bench/stories15m_bench.py`): stories15M and
 stories110M pass the full pipeline — 8/8 and 14/14 blocks optimize,
 QKV + gate·up fuse, outputs verify to ~2e-5 — at parity with Inductor
 (3.0 ms / 17.0 ms both ways). The mechanism is real (−37% GEMM launches,
 profiler-verified); at these dimensions it just doesn't pay. The
-launch-bound hypothesis was falsified twice — on blocks and on whole
-models (`bench/decode_bench.py`).
+launch-bound hypothesis was falsified — on blocks, on whole models,
+and on the large-cell crossover sweep (`bench/decode_bench.py`).
 
 **Controlled negative**: NormLinear loses slightly (0.98×) — Inductor
 already fuses `x·rms·wn` into the GEMM's input read, so restructuring

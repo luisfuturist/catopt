@@ -210,6 +210,8 @@ def main():
     ap.add_argument("--ckpt", default="/tmp/stories15M.bin")
     ap.add_argument("--quick", action="store_true",
                     help="B{1,4} x T{16,64}, min_run_time=0.5")
+    ap.add_argument("--large", action="store_true",
+                    help="B{8,16,32} x T{128,256,512} — the crossover sweep")
     ap.add_argument("--min-run-time", type=float, default=None)
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
@@ -217,6 +219,9 @@ def main():
     if args.quick:
         batches, seqs = [1, 4], [16, 64]
         min_run = args.min_run_time or 0.5
+    elif args.large:
+        batches, seqs = [8, 16, 32], [128, 256, 512]
+        min_run = args.min_run_time or 1.0
     else:
         batches, seqs = [1, 4, 16], [16, 64, 256]
         min_run = args.min_run_time or 1.0
