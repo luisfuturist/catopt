@@ -28,11 +28,11 @@ differs.
 **The weights are part of the program.** Parameters are `Param` leaves
 in the same term language as compute, so "unused weight" is just a
 leaf no extracted member references — and the state dict drops it
-automatically. Composition, tying, slice-sharing, and ε-certified
-factorization are the same event at different bound values: *a param
-becomes unreachable in the extracted program → the weights file
-shrinks*. The equivalence space is over the whole computational
-object — graph and realization together — not the graph alone.
+automatically. Composition, tying, slice-sharing, and weight folding
+are the same event: *a param becomes unreachable in the extracted
+program → the weights file shrinks*. The equivalence space is over
+the whole computational object — graph and realization together — not
+the graph alone.
 
 ```text
 PyTorch model
@@ -449,13 +449,21 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
   makes re-targeting mechanical, but magnitudes should not be
   extrapolated to datacenter hardware.
 
-## The ε axis — certified approximation (`eps.py`)
+## Optional: certified-approximation toolkit (not core)
 
-Exact laws preserve semantics; **ε-laws preserve semantics up to a
-certified bound**. `Rewrite.error_bound` marks a bounded rewrite;
-certificates accumulate per-step bounds (triangle inequality) and
-report `cert.error_bound` / `cert.exact`. Quantization, low-rank, and
-tying become one object: *a rewrite with an error bound*.
+**Status: opt-in, off by default.** The ε machinery (`eps.py`,
+`act_eps.py`, `ibp.py`) rides on catopt but is *not* part of the core
+optimizer — it only runs when `optimize_model(eps_rtol=…)` is set or
+the module is called directly. Phase 5 showed certified norm bounds do
+**not** predict task quality on trained checkpoints, so it is kept as
+a toolkit for where a norm bound IS the contract — activation paths,
+verification, certified deployment — not as a weight-compression
+feature.
+
+The machinery itself: exact laws preserve semantics; **ε-laws preserve
+semantics up to a certified bound**. `Rewrite.error_bound` marks a
+bounded rewrite; certificates accumulate per-step bounds (triangle
+inequality) and report `cert.error_bound` / `cert.exact`.
 
 - `eps.low_rank_params` — truncated-SVD at `linear` sites:
   `linear(x,W) → linear(linear(x,V_r), U_rΣ_r)`, bound `σ_{r+1}`
@@ -475,11 +483,15 @@ tying become one object: *a rewrite with an error bound*.
   Lipschitz path sensitivities. **Caveat**: unsound for low-rank
   (activation-position) sites — `ibp.tight_model_bound` is the sound
   one (118×→3× tightness, flags `spectral_unsafe`).
+- `act_eps.act_quant` / `act_eps.act_low_rank` — dynamic
+  quantize/bottleneck wraps on activation edges (int8-KV-cache-style
+  contracts), calibrated bounds via `act_eps.calibrate`. Activation
+  side is where a norm bound genuinely is the contract.
 - `param_bytes_cost` (`by_bytes`) — prices stored parameter bytes;
   `extract_best_bounded(max_error=…)` — extraction under an ε budget.
-- Exact sharing: `share_duplicate_params` (tied params) and
-  `share_duplicate_param_slices` (head-granular dedup via
-  `index_select` — GQA sharing). Both witnessed, exact.
+- Exact sharing (`share_duplicate_params`, `share_duplicate_param_slices`)
+  is **core**, not part of this toolkit — it runs in the default
+  pipeline and is ε=0 exact.
 
 ## Roadmap
 
@@ -554,7 +566,7 @@ tying become one object: *a rewrite with an error bound*.
 | `catopt/xcarrier.py` | Cross-carrier laws + `omd` deferred carrier: readouts exit scans, scans fold inside om elements |
 | `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
-| `catopt/eps.py` | ε axis: `low_rank_params` (certified truncated-SVD at linear sites) |
+| `catopt/eps.py` + `act_eps.py` + `ibp.py` | Optional certified-approximation toolkit — opt-in, off by default |
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
 | `measure_weights.py` | Phase-0 weight-structure falsification harness |
 | `tests/` | 495 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |

@@ -72,6 +72,13 @@ Correction applied honestly.
 
 ## 4. The ε axis (`catopt/eps.py`, `egraph.py`)
 
+> **Status: optional toolkit, not core.** The ε-passes are opt-in
+> (`optimize_model(eps_rtol=…)`, off by default) and ride on catopt
+> rather than being a core capability. Phase 5 (§10) falsified norm
+> bounds as a predictor of weight-compression quality on real
+> checkpoints — the machinery is retained for activation-path and
+> verification use, where a norm bound IS the contract.
+
 The machinery that makes approximation a first-class object:
 
 - `Rewrite.error_bound` / `bound_norm` — a bounded rewrite is an

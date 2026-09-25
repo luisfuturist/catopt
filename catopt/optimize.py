@@ -200,7 +200,9 @@ def optimize_model(
         :func:`launch_aware_cost` (FLOPs + a small per-kernel penalty so
         that forms with identical FLOPs but fewer launches win).
     eps_rtol : float, optional
-        When set, also run the certified-approximation passes
+        Optional certified-approximation toolkit — off by default and
+        not part of the core optimizer.  When set, also run the
+        certified-approximation passes
         (``eps.low_rank_params`` + ``eps.kron_linear_params``): each
         offer carries an exact Eckart–Young / Frobenius bound and is
         recorded in ``stats["eps_offers"]``.  The offers only *win*

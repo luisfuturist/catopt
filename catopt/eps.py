@@ -1,5 +1,12 @@
 """The ε axis — certified approximations inside the e-graph.
 
+Optional toolkit: off by default and not part of the core optimizer —
+it runs only when ``optimize_model(eps_rtol=…)`` is set or these
+functions are called directly.  Phase-5 showed norm bounds do not
+predict task quality on trained checkpoints, so this module is kept
+for where a norm bound IS the contract (activation paths,
+verification, certified deployment).
+
 Exact laws preserve semantics; **ε-laws preserve semantics up to a
 certified bound**.  A bounded rewrite is an ordinary :class:`Rewrite`
 carrying ``error_bound``/``bound_norm``: it enters the e-graph like

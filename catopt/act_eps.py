@@ -1,5 +1,9 @@
 """Activation-space ε: certified bounded-error rewrites on *activations*.
 
+Optional toolkit, not part of the core optimizer — nothing here runs
+unless this module is called directly (``optimize_model`` never
+invokes it).
+
 The ε machinery in :mod:`catopt.eps` certifies *weight* substitutions —
 the tensor is known at compile time, so the bound is a constant.  This
 module is the activation-side counterpart, the place where a norm bound
