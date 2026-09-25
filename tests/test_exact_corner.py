@@ -12,18 +12,23 @@ cost axis (``param_bytes_cost_for``), fp64 outputs checked every run:
   * tied embedding/classifier stored twice -> 50% (whole-tensor tying).
   * adapter-merged (W + B·A stored, biased) -> 11.0% (param-only fold).
   * MoE with weight-tied routed experts -> 75% (whole-tensor tying).
+  * MoE with weight-tied experts on a SHARED input -> 75% too.
+  * composed dense linears w2(w1·x) -> 50% (the fused weight W2·W1
+    materialises once, replacing both spellings).
   * dead param -> the unused tensor drops out of the weights file.
 
-Honest limits pinned too:
+Honest behaviour on the formerly-regressed corner:
 
-  * the UNmerged adapter form (base(x) + B·A·x) currently REGRESSES in
-    stored bytes — pair_shared_input_linears' forced extraction
-    concatenates phantom weight classes that the dag_cost leaf billing
-    prices as free; the lowered module materialises them anyway.
-  * weight-tied experts on a SHARED input save only 37.5% (not the
-    routed 75%) — pairing re-materialises the up-projections.
-  * composed dense linears w2(w1·x) fold exactly but net 0 B — the
-    stacked-concat member stores both spellings.
+  * the UNmerged adapter form (base(x) + B·A·x) neither shrinks nor
+    grows the file — 0 B.  ``param_bytes_cost`` now prices what
+    lowering stores: a param-only subtree ``_fold_weight_chains``
+    materialises is billed at its OUTPUT numel (a ``concat`` re-stores
+    every argument's rows per occurrence; a folded ``matmul(B,A)``
+    stores the dense product), while Param leaves outside folds still
+    dedup by name.  The paired forced extraction therefore prices its
+    concat'd copy honestly and LOSES to the unfused member — and the
+    ``linear(x, B@A)`` member loses too (materialising B·A costs more
+    than storing the factors).
 """
 
 import os
@@ -199,8 +204,9 @@ class _MoERouted(nn.Module):
 
 class _MoEShared(nn.Module):
     """Same tied experts, ALL consuming the same tokens — the textbook
-    top-k shared-input layout.  Honest middle case: the tying IS found,
-    but shared-input pairing re-materialises part of it as a fused GEMM."""
+    top-k shared-input layout.  The shared-input pairing pass still
+    offers its fused concat, but under materialisation-aware storage
+    pricing it loses to the tied member — same 75% as routing."""
 
     def __init__(self, n=4, d=64, hidden=64, seed=0):
         super().__init__()
@@ -225,8 +231,8 @@ class _MoEShared(nn.Module):
 class _ComposedChain(nn.Module):
     """Two stacked dense square projections, NO nonlinearity between —
     the folded composed-linears case.  assoc_linear offers the single
-    fused weight; measured: paired extraction stores both spellings,
-    so the weights file does not shrink."""
+    fused weight; billed at its materialised d² it now wins extraction,
+    halving the file."""
 
     def __init__(self, d=128, seed=0):
         super().__init__()
@@ -353,17 +359,20 @@ def test_adapter_merged_fold_11pct():
     assert fused and fused[0].shape == (128, 128)
 
 
-def test_adapter_unmerged_currently_regresses():
-    """HONEST LIMIT pinned: base(x) + B·A·x through the full pipeline
-    grows the file — pair_shared_input_linears' forced extraction
-    concatenates the phantom composed weight class B@A next to A, and
-    lowering materialises the concatenation (dag_cost bills leaf names
-    and cannot see it).  fp64-exact output, negative storage delta.
-    If a future change makes this non-negative, UPDATE the claim."""
+def test_adapter_unmerged_does_not_regress():
+    """base(x) + B·A·x now prices honestly: the paired forced extraction
+    stores concat(A, B@A) = (8+128)·128 materialised values — worse than
+    the original W+b+A+B — and the fused member ``linear(x, B@A)`` alone
+    materialises the dense product (16384 > 2048 factor values), so
+    extraction keeps the unmerged form.  Saved bytes are exactly 0 (was
+    −82.8% when leaf-name dedup made the materialised copies look
+    free).  fp64-exact output."""
     torch.manual_seed(0)
     low, stats, r, rel = _opt(_AdapterUnmerged(), torch.randn(4, 128))
     assert rel < 1e-12
-    assert r["bytes_saved"] < 0
+    assert r["bytes_saved"] == 0
+    assert r["eliminated"] == []
+    assert not any(n.startswith("fused_") for n in low.state_dict())
 
 
 def test_moe_tied_routed_experts_75pct():
@@ -378,34 +387,38 @@ def test_moe_tied_routed_experts_75pct():
     assert len(r["eliminated"]) == 6
 
 
-def test_moe_tied_shared_input_partial():
-    """Same four tied experts, all reading the SAME tokens: tying is
-    found, but the shared-input pairing law forces a fused concat that
-    re-materialises the four up-projection copies — measured saving is
-    only the three spare DOWN weights: 3·64·64·8 = 98,304 B (37.5%),
-    not the routed case's 75%.  Bitwise-exact output.  If extraction
-    ever learns to keep the dedup under pairing, UPDATE this pin."""
+def test_moe_tied_shared_input_75pct():
+    """Same four tied experts, all reading the SAME tokens — the shared-
+    input pairing no longer destroys the tying.  The pairing pass still
+    offers its fused concat (built before share_duplicate_params merges
+    the four weight classes, so it catenates four copies of ONE class),
+    but param_bytes_cost now bills that concat at its materialised
+    output numel — 4 copies — so forced extraction honestly loses to the
+    tied member.  Saving matches the routed case: 3 of 4 weight sets
+    drop out, 3·2·64·64·8 = 196,608 B (the (4,) gate param explains the
+    32 B over an exact quarter), fp64-exact."""
     torch.manual_seed(0)
     low, stats, r, rel = _opt(_MoEShared(n=4), torch.randn(4, 64))
     assert rel == 0.0
-    # 3 of 4 down-projections dedup'd; up-projections re-materialised
-    # inside a fused_* concat parameter (measured, not intended).
-    assert r["bytes_saved"] == 3 * 64 * 64 * BYTES            # 98,304 B
-    assert 0 < r["bytes_saved"] < 0.75 * r["original_bytes"]
-    assert any(n.startswith("fused_") for n in low.state_dict())
+    assert r["bytes_saved"] == (4 - 1) * 2 * 64 * 64 * BYTES  # 196,608 B
+    assert len(r["eliminated"]) == 6
+    # no materialised concat survives — the tied canonical pair is all
+    # the file holds (plus the tiny gate vector).
+    assert not any(n.startswith("fused_") for n in low.state_dict())
 
 
-def test_composed_linears_fold_zero_bytes():
-    """Two stacked dense projections, no nonlinearity: assoc_linear
-    offers the single fused weight W2@W1 and the fold IS exact — but
-    pair_shared_input_linears' coordinated extraction prefers the
-    stacked-concat GEMM, which stores BOTH spellings (W1 next to
-    W2·W1).  Net: 0 B saved — the fold exists, the file does not
-    shrink.  fp64-exact output (reassociation noise only)."""
+def test_composed_linears_fold_saves_half():
+    """Two stacked dense projections, no nonlinearity: assoc_linear's
+    fused weight W2·W1 materialises at compile time — honestly priced at
+    numel(W2·W1) = d² < 2·d² for W1+W2, so the fold wins extraction AND
+    beats the paired stacked-concat member (which would store both
+    spellings: d² for W1 plus d² for the fused product).  Net: the file
+    halves — 131,072 B saved, both original weights eliminated.
+    fp64-exact output (reassociation noise only)."""
     torch.manual_seed(0)
     low, stats, r, rel = _opt(_ComposedChain(d=128), torch.randn(4, 128))
     assert rel < 1e-12
-    assert r["bytes_saved"] == 0
+    assert r["bytes_saved"] == 128 * 128 * BYTES               # 131,072 B
     assert {"p_w1_weight", "p_w2_weight"} <= set(r["eliminated"])
     assert any(n.startswith("fused_") for n in low.state_dict())
 
@@ -420,3 +433,52 @@ def test_dead_param_dropped():
     assert "p_unused" in r["eliminated"]
     assert r["bytes_saved"] == 4096 * 64 * BYTES           # 2,097,152 B
     assert "p_unused" not in low.state_dict()
+
+
+# ---------------------------------------------------------------------------
+#  Unit pin for the materialised-storage billing rule
+# ---------------------------------------------------------------------------
+
+def test_param_bytes_bills_materialised_folds():
+    """The billing rule behind the fixed regressions, at unit level:
+
+    * ``concat(W, W)`` — a param-only concat the lowerer materialises —
+      stores 2·numel(W): occurrences under a fold are COPIES.
+    * ``matmul(B, A)`` folds to the dense product: billed numel(B@A),
+      not numel(B)+numel(A).
+    * The same weight read by two CONSUMERS (no replication) still
+      dedups by name — shared reads are stored once.
+    * ``dag_cost`` agrees (it defers to the DAG-indexed sum rather than
+      its subtractive per-node decomposition, which would subtract a
+      leaf at every ancestor fold and erase the copies).
+    """
+    from catopt.cost import param_bytes_cost, dag_cost
+    from catopt.ir import Op, Param, TensorType, Var
+
+    W = Param("W", TensorType((64, 64)))
+    A = Param("A", TensorType((8, 128)))
+    B = Param("B", TensorType((128, 8)))
+    x = Var("x", TensorType((4, 64)))
+    y = Var("y", TensorType((4, 64)))
+
+    cat = Op.make("concat", W, W, dim=0)
+    assert param_bytes_cost(cat) == 2 * 64 * 64
+    assert dag_cost(cat, param_bytes_cost) == 2 * 64 * 64
+
+    mm = Op.make("matmul", B, A)
+    assert param_bytes_cost(mm) == 128 * 128          # the dense product
+
+    # concat over a foldable child bills the whole materialisation once
+    assert param_bytes_cost(Op.make("concat", A, mm, dim=0)) \
+        == (8 + 128) * 128
+
+    # shared READ: two consumers of one weight — one storage entry
+    shared = Op.make("add", Op.make("linear", x, W),
+                     Op.make("linear", y, W))
+    assert param_bytes_cost(shared) == 64 * 64
+    assert dag_cost(shared, param_bytes_cost) == 64 * 64
+
+    # a leaf inside a fold AND read elsewhere is stored twice — once as
+    # itself, once inside the materialised copy
+    both = Op.make("add", Op.make("linear", x, W), cat)
+    assert param_bytes_cost(both) == 3 * 64 * 64

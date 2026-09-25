@@ -423,7 +423,7 @@ _IR_TO_TORCH: dict[str, Any] = {
     ),
     "slice": lambda t, *a, **kw: t[
         (slice(None),) * int(kw.get("arg1", kw.get("dim", 0)))
-        + (slice(kw.get("arg2"), kw.get("arg3")),)
+        + (slice(kw.get("arg2"), kw.get("arg3"), kw.get("arg4")),)
     ],
     "unsqueeze": lambda t, *a, **kw: t.unsqueeze(
         int(kw.get("dim", kw.get("arg1", -1)))
@@ -459,6 +459,17 @@ _IR_TO_TORCH: dict[str, Any] = {
     "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
         x, dim=int(kw.get("arg1", kw.get("dim", -1)))
     ),
+    # aten.rms_norm(x, weight) with attrs dim=normalized_shape,
+    # arg3=eps — the normalization Llama-family blocks are built on.
+    "rms_norm": lambda x, w=None, *a, **kw: torch.nn.functional
+        .rms_norm(x, tuple(kw.get("dim", kw.get("normalized_shape"))),
+                  weight=w,
+                  eps=float(kw.get("arg3", kw.get("eps", 1e-6)))),
+    "layer_norm": lambda x, w=None, b=None, *a, **kw: (
+        torch.nn.functional.layer_norm(
+            x, tuple(kw.get("dim", kw.get("normalized_shape"))),
+            weight=w, bias=b,
+            eps=float(kw.get("arg5", kw.get("eps", 1e-5))))),
     "masked_fill": lambda x, m, v, *a, **kw: x.masked_fill(m, v),
     "eq": lambda x, y, *a, **kw: x == y,
     "ne": lambda x, y, *a, **kw: x != y,

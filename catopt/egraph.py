@@ -1603,7 +1603,9 @@ class EGraph:
                 # class has both member-reaching and bypassing enodes —
                 # force the cheapest member route so the shared GEMM
                 # is used without dragging in junk subtrees
-                overrides[cid] = min(member_reaching, key=steered_score)
+                route = min(member_reaching, key=steered_score)
+                if steered_score(route) != float("inf"):
+                    overrides[cid] = route
 
         return self.extract_best(root_eid, cost_fn, overrides=overrides)
 

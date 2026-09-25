@@ -219,15 +219,21 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             d = op.attrs.get("arg1", op.attrs.get("dim", 0)) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
         case "slice":
+            # aten.slice(t, dim, start, end, step) — arg4 is the step
+            # (torch.export spells it positionally).  Ignoring it makes
+            # strided slices (x[..., ::2], RoPE) report the unsliced
+            # shape and poisons every downstream broadcast as _INVALID.
             base = shapes[0]
             if base is None:
                 return None
             d = op.attrs.get("arg1", op.attrs.get("dim", 0)) % len(base)
-            lo = op.attrs.get("arg2", 0)
+            lo = op.attrs.get("arg2", 0) or 0
             hi = op.attrs.get("arg3")
+            step = op.attrs.get("arg4", 1) or 1
             out = list(base)
-            if isinstance(base[d], int) and isinstance(hi, int):
-                out[d] = min(hi, base[d]) - (lo or 0)
+            if isinstance(base[d], int):
+                n = (min(hi, base[d]) if isinstance(hi, int) else base[d]) - lo
+                out[d] = max(0, -(-n // step))
             return tuple(out)
         case "embedding":
             # Row gather: out = idx.shape + (d,) where W is (v, d).
@@ -626,7 +632,11 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     Cost models that price parameter *storage* (``param_bytes_cost``)
     opt out of the param-only discount by setting
     ``charges_param_only`` on the function: a folded subtree still
-    stores its leaves' values.
+    stores its leaves' values.  Models that already index the whole
+    term DAG (``param_bytes_cost`` again — by leaf name plus
+    materialised-subtree identity) set ``dag_exact`` instead: the
+    function's value on the root IS the DAG cost, so the subtractive
+    per-node decomposition below is skipped — it would mis-bill them.
     """
     import inspect
     memo = {} if memo is None else memo
@@ -637,6 +647,16 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
 
     def c(t: Any) -> float:
         return cost_fn(t, memo=memo) if takes_memo else cost_fn(t)
+
+    # Cost models that already index the whole term DAG — by leaf name
+    # and by materialised-subtree identity (``param_bytes_cost``) —
+    # compute the true DAG cost directly.  The per-node decomposition
+    # ``local = c(t) − Σc(children)`` below would mis-bill them: a leaf
+    # nested inside a folded subtree is subtracted at every ancestor
+    # fold yet charged once as a leaf, erasing exactly the materialised
+    # copies the model exists to count.
+    if getattr(getattr(cost_fn, "func", cost_fn), "dag_exact", False):
+        return c(term)
 
     seen: set[int] = set()
     total = 0.0
@@ -753,7 +773,7 @@ def count_cost(term: Any, memo: dict | None = None) -> float:
 def param_bytes_cost(term: Any, source_tensors: dict | None = None,
                      memo: dict | None = None,
                      by_bytes: bool = False) -> float:
-    """Cost = number of stored parameter values referenced by Param leaves.
+    """Cost = stored parameter values — what the LOWERED module keeps.
 
     The storage axis the flop-based models cannot see: a low-rank
     factorisation or a shared (tied) weight computes the same function
@@ -763,10 +783,23 @@ def param_bytes_cost(term: Any, source_tensors: dict | None = None,
     normally, which is what lets extraction prefer the certified
     compressed member.
 
-    Leaves are deduplicated *by name* — a weight read by two consumers
-    is stored once (two ``Param`` objects spelled identically are the
-    same leaf in the e-graph anyway: ``repr(Param)`` is the name).  A
-    Param's numel comes from ``source_tensors[name]`` when the name
+    Pricing mirrors ``IRModule._fold_weight_chains`` /
+    ``_build_params`` (catopt.torch_bridge), not the term's leaf list:
+
+    * a ``Param`` leaf reachable after folding is one storage entry,
+      deduplicated *by name* — a weight read by two consumers is
+      stored once (two ``Param`` objects spelled identically are the
+      same leaf in the e-graph anyway: ``repr(Param)`` is the name);
+    * a param-only subtree the lowerer materialises (``matmul`` over
+      stored weights, elementwise ops, ``concat`` — see
+      ``_folds_to_param``) is billed at the fold's OUTPUT numel, once
+      per subtree object.  Inside such a fold, occurrences are copies,
+      not reads: ``concat(W, W)`` stores ``2·numel(W)`` and a folded
+      ``matmul(B, A)`` stores ``numel(B@A)`` — billing the deduped
+      leaf names would price phantom storage the weights file never
+      had (and hide copies it does).
+
+    A Param's numel comes from ``source_tensors[name]`` when the name
     resolves there — the actual tensor, authoritative for derived
     ``eps_*`` params — else from its ``TensorType`` (unknown dims
     count 1, matching ``_numel``'s best-effort convention).
@@ -776,17 +809,21 @@ def param_bytes_cost(term: Any, source_tensors: dict | None = None,
     ``functools.partial(param_bytes_cost, source_tensors=...)``) for
     use in :meth:`EGraph.extract_best`.  The model sets
     ``charges_param_only`` so extraction does NOT apply the param-only
-    discount: a compile-time-folded subtree still stores its leaves'
-    values — folding shrinks FLOPs, not the weights file.
+    discount — a compile-time-folded subtree still stores values —
+    and ``dag_exact`` so :func:`dag_cost` returns this DAG-indexed sum
+    verbatim instead of re-deriving it per node.
     """
     memo = {} if memo is None else memo
     return float(sum(_param_index(term, source_tensors, memo,
                                   by_bytes).values()))
 
 
-# Marker read by EGraph.extract_best / dag_cost: storage pricing does
-# not fold away at compile time, so param-only subtrees stay billed.
+# Markers read by EGraph.extract_best / dag_cost: storage pricing does
+# not fold away at compile time, so param-only subtrees stay billed;
+# and the leaf/fold index is already a true DAG cost, so dag_cost
+# must not apply its subtractive per-node decomposition.
 param_bytes_cost.charges_param_only = True
+param_bytes_cost.dag_exact = True
 
 
 def param_bytes_cost_for(source_tensors: dict | None = None,
@@ -807,6 +844,7 @@ def param_bytes_cost_for(source_tensors: dict | None = None,
 
     cost.__name__ = "param_bytes_cost_for"
     cost.charges_param_only = True
+    cost.dag_exact = True
     return cost
 
 
@@ -838,13 +876,130 @@ def _param_numel(p: Param, source_tensors: dict | None,
     return float(_numel(shape))
 
 
+#: Elementwise ops ``IRModule._fold_weight_chains`` (catopt.torch_bridge)
+#: folds eagerly through the ``_IR_TO_TORCH`` bindings when the whole
+#: subtree is param-only.  ``matmul`` and ``concat`` are spelled out
+#: separately in ``_folds_to_param`` because they fold under tighter arg
+#: rules (real tensor operands, not Consts).  Keep in lock-step.
+_FOLDABLE_ELEMWISE = frozenset({
+    "add", "mul", "sub", "div", "neg", "square", "sqrt",
+    "sigmoid", "silu", "tanh", "gelu", "exp", "pow",
+})
+
+
+def _has_var_leaf(term: Any, memo: dict) -> bool:
+    """True iff the subtree reads a data input (Var leaf).
+
+    Mirrors ``IRModule._uses_input``; id-keyed so the shared-subterm
+    DAG stays a linear walk.
+    """
+    k = ("hv", id(term))
+    hit = memo.get(k)
+    if hit is not None:
+        return hit
+    if isinstance(term, Var):
+        out = True
+    elif isinstance(term, Op):
+        out = any(_has_var_leaf(a, memo) for a in term.args)
+    else:
+        out = False
+    memo[k] = out
+    return out
+
+
+def _param_resolves(p: Param, source_tensors: dict | None) -> bool:
+    """Would ``p.name`` land in ``_param_values`` at lowering?
+
+    ``optimize_model`` hands the whole ``source_tensors`` dict to the
+    lowerer as ``param_values`` (sharing/eps passes register their
+    derived names into it), so an unbound ``source_tensors`` —
+    ``param_bytes_cost_for()`` — assumes every leaf resolves.  With a
+    bound dict the check is exact: a leaf absent from it cannot fold
+    (it is still stored — ``_build_params`` registers it regardless).
+    """
+    return source_tensors is None or p.name in source_tensors
+
+
+def _folds_to_param(term: Any, source_tensors: dict | None,
+                    memo: dict) -> bool:
+    """True iff ``_fold_weight_chains`` rewrites *term* to a fused Param.
+
+    Mirrors the lowerer bottom-up: a param-only subtree folds when
+    every argument reduces to a stored parameter — a resolvable
+    ``Param`` leaf or a subtree that itself folds (folded intermediates
+    are registered into ``_param_values`` before their parents are
+    considered).  ``Const`` operands are allowed only where the
+    lowering accepts them: elementwise ops, but not the ``matmul``
+    two-Param fold nor ``concat`` (``torch.cat`` has no scalar form).
+    """
+    if not isinstance(term, Op):
+        return False
+    k = ("pf", id(term))
+    hit = memo.get(k)
+    if hit is not None:
+        return hit
+    res = False
+    if not _has_var_leaf(term, memo):
+        def to_param(a: Any, allow_const: bool) -> bool:
+            if isinstance(a, Param):
+                return _param_resolves(a, source_tensors)
+            if isinstance(a, Const):
+                return allow_const
+            return _folds_to_param(a, source_tensors, memo)
+
+        if term.op in ("matmul", "concat") and len(term.args) >= 2:
+            res = all(to_param(a, False) for a in term.args)
+        elif term.op in _FOLDABLE_ELEMWISE:
+            res = all(to_param(a, True) for a in term.args)
+    memo[k] = res
+    return res
+
+
+def _fold_ewidth(term: Any, source_tensors: dict | None) -> float | None:
+    """Element width of a materialised fold — the widest resolvable
+    leaf's dtype (the fused tensor inherits arg dtypes); ``None`` when
+    no leaf carries one, letting the caller default to fp32."""
+    if isinstance(term, Param):
+        if source_tensors is not None:
+            t = source_tensors.get(term.name)
+            esz = getattr(t, "element_size", None)
+            if callable(esz):
+                return float(esz())
+        return 4.0
+    if isinstance(term, Op):
+        ws = [w for a in term.args
+              if (w := _fold_ewidth(a, source_tensors)) is not None]
+        return max(ws) if ws else None
+    return None
+
+
+def _fold_numel(term: Op, source_tensors: dict | None, memo: dict,
+                by_bytes: bool) -> float:
+    """Stored size of the tensor a folding subtree materialises to —
+    the OUTPUT numel: ``concat`` re-stores every argument's rows, a
+    weight ``matmul`` stores the dense product.
+    """
+    n = float(_numel(_shape_of(term, memo)))
+    if by_bytes:
+        n *= _fold_ewidth(term, source_tensors) or 4.0
+    return n
+
+
 def _param_index(term: Any, source_tensors: dict | None,
                  memo: dict, by_bytes: bool = False) -> dict[str, float]:
-    """``{name: numel}`` for every Param leaf in a term DAG.
+    """``{key: numel}`` for every *stored* parameter entry in a term DAG.
 
-    Memoised per subtree id — merging is keyed on *name*, so a shared
-    weight (one Param leaf reached through several parents, or two
-    leaves spelled identically) is stored once.
+    Two kinds of entries, mirroring the lowered weights file:
+
+    * ``{param_name: numel}`` — a Param leaf that survives folding;
+      deduped by name, so a weight read by several consumers (or by
+      several identically-spelled leaves) is stored once;
+    * ``{"\\x00fold:<id>": out_numel}`` — a param-only subtree the
+      lowerer materialises (``_folds_to_param``); keyed by subtree
+      object identity, matching ``_fold_memo``/``_build_params``: the
+      same object reached twice is one stored tensor, and each
+      materialisation is billed at output size regardless of how the
+      leaves underneath dedup.
     """
     key = ("pbi", id(term))
     hit = memo.get(key)
@@ -854,11 +1009,15 @@ def _param_index(term: Any, source_tensors: dict | None,
         out = {term.name: _param_numel(term, source_tensors,
                                        by_bytes)}
     elif isinstance(term, Op):
-        out = {}
-        for a in term.args:
-            for n, v in _param_index(a, source_tensors, memo,
-                                     by_bytes).items():
-                out.setdefault(n, v)
+        if _folds_to_param(term, source_tensors, memo):
+            out = {f"\x00fold:{id(term)}": _fold_numel(
+                term, source_tensors, memo, by_bytes)}
+        else:
+            out = {}
+            for a in term.args:
+                for n, v in _param_index(a, source_tensors, memo,
+                                         by_bytes).items():
+                    out.setdefault(n, v)
     else:
         out = {}
     memo[key] = out

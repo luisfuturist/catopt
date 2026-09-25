@@ -975,6 +975,12 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
             wt = eg._any_term_cached(w)
             if wt is None:
                 continue
+            # An already-fused member (weight is itself a concat, e.g.
+            # produced by swiglu_fuse or an earlier pairing) must not
+            # join the group: it would widen the fused GEMM by its own
+            # sub-members' outputs — computing them twice.
+            if getattr(wt, "op", None) == "concat":
+                continue
             k = cluster_key(node, wt)
             if k is None:
                 continue

@@ -287,9 +287,10 @@ generic eval, 2.4–5.8× with CUDA-graph capture** on the toy
 4-head MQA stack the batched executor gives 1.15–1.5× vs generic on
 CUDA but **loses to eager/Inductor everywhere** (Inductor 5–20×).
 omd's value is semantic (output stays affine in h0), not raw speed.
-MHA/sdpa don't fire omd at all — no commute law for
-`reshape`/`transpose` through `apply`, and `_check_om_elem_aff`
-vetoes rank-4 batched maps (bindings already support them).
+MHA now lifts: `xc_reshape_apply`/`xc_transpose_apply` commute view
+ops through carrier applications and rank-4 batched maps are accepted
+(fp64-exact, tests/test_xcarrier_mha.py). The omd member lands nested
+inside the attention class, not at root.
 
 ## Full measurements
 
@@ -330,6 +331,24 @@ block): original issues 40 GEMM + 10 SDPA calls; optimized issues
 | `FeedForward` | w1/w3 → 1 GEMM + 2 splits | 1.3e-07 | 1.04× | 1.06× |
 | `Attention` | wq/wk/wv → 1 GEMM + uneven splits | 3.3e-07 | 1.00× | 0.97× |
 | `TransformerBlock` | 4 pairing groups in one pass | 4.8e-07 | 0.97× | 0.98× |
+
+### Real trained checkpoints (llama2.c `.bin`, `bench/stories15m_bench.py`)
+
+The full pipeline — real downloaded weights, `optimize_compositional`,
+`torch.utils.benchmark`, CUDA — verifies and runs end-to-end:
+
+| Checkpoint | Blocks | Max abs diff | Eager | CatOpt | Inductor | CatOpt+Inductor |
+|---|---|---|---:|---:|---:|---:|
+| stories15M (288-d, T=128) | 8/8, all QKV+gate·up paired | 2.6e-05 | 3.16 ms | 3.09 | 3.01 | 3.02 |
+| stories110M (768-d, T=128) | 14/14, all paired | 1.9e-05 | 17.5 ms | 17.3 | 17.1 | 17.0 |
+
+**Honest verdict: parity, not a win.** The transform lands on real
+weights — every block's QKV and gate·up projections fuse into single
+GEMMs — but at these dimensions the consolidation is inside the noise;
+the launch-bound/GEMM-dominated regime boundary above is what decides.
+The value demonstrated here is that a real trained SLM survives the
+pipeline intact: exported, saturated, paired, lowered, verified, and
+Inductor-compilable — without fallback.
 
 **The decode-regime hypothesis was falsified on real blocks.** Pairing
 pays where *projections dominate* the kernel count (toy ParallelBlock:
@@ -548,7 +567,8 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
 | `measure_weights.py`, `exact_probe.py` | Weight-structure measurement harnesses |
 | `project/` (worktree) | Orphan `project` branch — ADRs + retrospectives, gitignored on main |
-| `tests/` | 549 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
+| `bench/stories15m_bench.py` | Real-checkpoint benchmark: stories15M/110M through the full pipeline, `torch.utils.benchmark` |
+| `tests/` | 565 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
 

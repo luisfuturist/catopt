@@ -251,30 +251,33 @@ Under `param_bytes_cost_for` with fp64 output equality verified:
 | adapter-merged (W+B·A stored) | 11.03% | `_fold_weight_chains` param-only fold |
 | tied embed/classifier stored twice | **50.00%** | `share_duplicate_params` |
 | MoE: 4 weight-tied routed experts | **75.00%** | `share_duplicate_params` |
-| MoE: 4 weight-tied shared-input | 37.50% | tying found; fused GEMM re-materialises |
-| composed linears w2(w1·x), no act | 0.00% | fold exact; paired concat stores both spellings |
+| MoE: 4 weight-tied shared-input | 75.00% | tying found; concat copies billed per-occurrence |
+| composed linears w2(w1·x), no act | 50.00% | fold exact: fused W₂·W₁ materialises at d² < 2d² |
 | dead param (unused tensor) | 98.46% | unreachable leaf dropped |
-| adapter UNmerged (Wx+BAx) | **−82.76%** | regression: paired-GEMM materialises phantom cat'd weight |
+| adapter UNmerged (Wx+BAx) | 0.00% | pairing honestly declines: materialised concat costs more than it saves |
 
 The claim, plainly: **the exact corner is ~0% on dense trained
 checkpoints and real on structured ones** — GQA replication,
-double-stored ties, weight-tied experts, merged adapters. Two honest
-caveats: savings only materialize under the storage cost axis, and
-shared-input structures expose a **billing gap** — `param_bytes_cost`
-prices Param leaves by name while `pair_shared_input_linears`' forced
-extraction materialises concat'd copies at lowering, so copies priced
-once get stored k times (unmerged adapter −82.8%, shared-input MoE
-37.5% not 75%, composed fold nets 0). Every row fp64-verified
-output-equal.
+double-stored ties, weight-tied experts, merged adapters. The billing
+gap is closed: `param_bytes_cost` now simulates
+`_fold_weight_chains` materialisation, so concat'd copies are billed
+per-occurrence — the unmerged-adapter regression is gone (pairing
+correctly declines it), tied-MoE prices at the true 75%, and the
+composed fold nets 50%. Savings only materialize under the storage
+cost axis. Every row fp64-verified output-equal.
 
 ## 11. Honest limits
 
 - **omd at realistic scale** (`bench_omd2.py`): MQA fires
   (`omd_applym`) but the dense-fiber numerator is ~dv/dim× oversized —
   batched executor only 1.15–1.5× vs generic on CUDA, loses to
-  Inductor 5–20× everywhere. MHA/sdpa don't lift at all (no
-  reshape/transpose-through-`apply` law; `_check_om_elem_aff` vetoes
-  rank-4 batched maps — fixable). Semantic value real, speed not.
+  Inductor 5–20× everywhere. MHA now lifts — view-commute laws
+  (`xc_reshape_apply`/`xc_transpose_apply`, both fibers) push
+  reshape/transpose through `apply`/`applyd`, and rank-4 batched maps
+  are accepted (`_omd_compose` broadcast fix included). The member
+  lands nested inside the attention class — surfacing it at root and
+  the `om_lift` T=32 veto (resolves score class through a `()`-shaped
+  carrier member) remain open. Semantic value real, speed not.
 - `model_bound` propagates site bounds via per-op Lipschitz constants
   — **known unsound for spectral sites at activation positions**
   (low-rank `eps_lr` members: it misses the ‖activation‖ factor;

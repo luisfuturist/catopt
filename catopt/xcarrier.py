@@ -40,6 +40,17 @@ THE POSITIVE RESULT — the value/readout side is crossable
             = applyd((affd_a f + affd_a g, affd_b f + affd_b g), h)
         chunk(applyd(aff_diag(a,b),h), ·, D, i)
             = applyd(aff_diag(chunk a, chunk b), h)     (D ≠ feature axis)
+        reshape(apply(aff(A,b),h), S)
+            = apply(aff(reshape(A, S+(i,)), reshape(b,S)), h)
+        transpose(apply(aff(A,b),h), d1, d2)
+            = apply(aff(transpose(A), transpose(b)), h) (dims mod
+                value rank — the map's input axis is always last)
+            — the dense view laws are exact for ANY well-typed view:
+            a multi-head ``view(T,nh,hd).transpose(0,1)`` over a
+            scanned value block keeps the affine member reachable
+            under the view wrapper.  Diagonal variants exist but are
+            restricted to views that keep the feature axis last
+            (h is never permuted).
 
     THE HETEROGENEOUS ELEMENT
         The om numerator is ``e @ v`` — a matmul in the value slot, and
@@ -308,13 +319,15 @@ def _om_elem_affd(s: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
 def _om_elem_aff(s: torch.Tensor, A: torch.Tensor, b: torch.Tensor,
                  h: torch.Tensor):
     """om_elem with dense-affine values: v = A@h + b with per-key
-    A : (K, d, i).  numerator = (e@A)@h + e@b where e@A contracts the
-    key axis — computed via reshape (the IR has no einsum)."""
+    A : (…,K, d, i).  numerator = (e@A)@h + e@b where e@A contracts the
+    key axis — computed via reshape (the IR has no einsum).  Leading
+    axes of A (e.g. attention heads) are batch dims for the matmul and
+    are preserved through the flattening reshape."""
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
-    K, d, i = A.shape[-3], A.shape[-2], A.shape[-1]
-    ea = e @ A.reshape(K, d * i)            # (…,Tq,d·i)
-    ea = ea.reshape(*ea.shape[:-1], d, i)   # (…,Tq,d,i)
+    d, i = A.shape[-2], A.shape[-1]
+    ea = e @ A.reshape(*A.shape[:-2], d * i)   # (…,Tq,d·i)
+    ea = ea.reshape(*ea.shape[:-1], d, i)      # (…,Tq,d,i)
     return m, e.sum(dim=-1, keepdim=True), ea @ h + e @ b
 
 
@@ -354,12 +367,19 @@ def _omd_compose(f, g):
     fin1, fin2 = torch.isfinite(m1), torch.isfinite(m2)
     e1 = torch.where(fin1, torch.exp(m1 - mx), torch.zeros_like(mx))
     e2 = torch.where(fin2, torch.exp(m2 - mx), torch.zeros_like(mx))
+    # fa may carry extra trailing axes past e's (…,Tq,1) — the dense
+    # fiber's coefficient is (…,Tq,d,i) — so the row weight needs
+    # trailing 1-dims to broadcast (diag fiber: a no-op reshape).
+    e1f = e1.reshape(*e1.shape, *([1] * (fa1.dim() - e1.dim())))
+    e2f = e2.reshape(*e2.shape, *([1] * (fa2.dim() - e2.dim())))
+    fin1f = fin1.reshape(*fin1.shape, *([1] * (fa1.dim() - fin1.dim())))
+    fin2f = fin2.reshape(*fin2.shape, *([1] * (fa2.dim() - fin2.dim())))
     zl1, zl2 = torch.zeros_like(l1), torch.zeros_like(l2)
     za1, za2 = torch.zeros_like(fa1), torch.zeros_like(fa2)
     zb1, zb2 = torch.zeros_like(fb1), torch.zeros_like(fb2)
     l = torch.where(fin1, l1 * e1, zl1) + torch.where(fin2, l2 * e2, zl2)
-    fa = torch.where(fin1, fa1 * e1, za1) + torch.where(
-        fin2, fa2 * e2, za2)
+    fa = torch.where(fin1f, fa1 * e1f, za1) + torch.where(
+        fin2f, fa2 * e2f, za2)
     fb = torch.where(fin1, fb1 * e1, zb1) + torch.where(
         fin2, fb2 * e2, zb2)
     return mx, l, fa, fb
@@ -595,13 +615,18 @@ def _check_om_elem_affd(bound: dict) -> bool:
 
 
 def _check_om_elem_aff(bound: dict) -> bool:
-    """om_elem(s, apply(aff(A,b),h)) — v = A@h+b, A (K,d,i) rank-3,
-    b (K,d), h (i,), s (…,Tq,K)."""
+    """om_elem(s, apply(aff(A,b),h)) — v = A@h+b, A (…,K,d,i) rank-≥3,
+    b == A[:-1], h (i,), s (…,Tq,K).  Leading axes of A beyond
+    (K,d,i) are BATCH dims — a per-head map (nh,K,d,i) is fine
+    because the torch bindings matmul over them; they only have to
+    broadcast against s's leading dims."""
     s, A, b, h = (_shape(bound.get(k)) for k in ("s", "A", "b", "h"))
     if not all(_concrete(x) for x in (s, A, b, h)):
         return False
-    return (len(s) >= 2 and len(A) == 3 and s[-1] == A[0]
-            and b == A[:2] and len(h) == 1 and h[-1] == A[-1])
+    if not (len(s) >= 2 and len(A) >= 3 and s[-1] == A[-3]
+            and b == A[:-1] and len(h) == 1 and h[-1] == A[-1]):
+        return False
+    return _broadcast_ok(s[:-2], A[:-3])
 
 
 def _check_omd_lift(bound: dict) -> bool:
@@ -985,6 +1010,429 @@ XC_SPLIT_APPLY = _chunk_apply("xc_split_apply", "split",
 
 
 # ---------------------------------------------------------------------------
+#  View ops (reshape/transpose) commute through a carrier application
+# ---------------------------------------------------------------------------
+#
+#  A carrier application's VALUE is the map's output: apply(aff(A,b),h)
+#  is A@h+b with A (…, out axes …, i) — the map's input axis is LAST,
+#  so every value axis is a leading axis of A.  A view op that only
+#  relabels/permutates VALUE axes therefore sinks through the
+#  application and lands on the map unchanged in kind:
+#
+#      reshape(apply(aff(A,b),h), S)
+#          = apply(aff(reshape(A, S+(i,)), reshape(b, S)), h)
+#      transpose(apply(aff(A,b),h), d1, d2)
+#          = apply(aff(transpose(A, d1', d2'),
+#                      transpose(b, d1', d2')), h)   (d' = dims mod value rank)
+#
+#  EXACT for the dense carrier on ANY well-typed view: flat order is
+#  preserved, the contracted axis stays last, so (A@h+b).view equals
+#  (A.view)@h + b.view pointwise.  THIS IS THE MHA FORM — a natural
+#  ``wv(scan).view(T,nh,hd).transpose(0,1)`` leaves the affine member
+#  one view below the om leaf's value class; these two laws surface it.
+#
+#  The diagonal carrier is more delicate: ``applyd``'s h broadcasts
+#  onto the value's LAST axis, which is the feature axis — a view may
+#  not touch it:
+#
+#      transpose(applyd(aff_diag(a,b),h), d1, d2)  — only when neither
+#          dim is the last (feature) axis; h is NOT permuted.
+#      reshape(applyd(aff_diag(a,b),h), S)        — only when the
+#          resolved S[-1] stays the feature dim d (head-PACKING views
+#          like (T,d)->(T,1,d) pass; head-SPLITTING (T,d)->(T,nh,hd)
+#          does NOT — d splits across axes and h can no longer
+#          broadcast; that case must go through the dense promotion).
+#
+#  LIMITATIONS (vetoed, documented):
+#    * b must be exactly value-shaped (b == A[:-1] / b == a).  A
+#      broadcast-smaller b would need broadcast-then-view on the
+#      coefficient — the IR has broadcast, but the fused form is not
+#      minted; rare in practice (projections produce full-shaped b).
+#    * No view may touch the map's INPUT axis (it is never a value
+#      axis for apply; for applyd the last-axis restriction above).
+#    * Non-sound directions are not minted: e.g. transpose of the
+#      feature axis under applyd is a DIFFERENT affine map (h would
+#      have to permute too), not expressible here.
+
+def _numel_of(s) -> int:
+    n = 1
+    for d in s:
+        n *= d
+    return n
+
+
+def _resolve_view_shape(S, numel_in: int):
+    """Concrete resolution of a reshape ``shape`` attr against the
+    input's numel — the same convention ``cost._shape_of`` uses (one
+    literal -1 may appear in exported graphs and is inferred).
+    Returns the resolved tuple, or None when the shape is ill-formed
+    or numel-inconsistent (then the view — and the law — is not
+    well-typed)."""
+    if not isinstance(S, (tuple, list)) or len(S) == 0:
+        return None
+    if not all(isinstance(d, int) and (d == -1 or d > 0) for d in S):
+        return None
+    negs = sum(1 for d in S if d == -1)
+    if negs > 1:
+        return None
+    known = 1
+    for d in S:
+        if d != -1:
+            known *= d
+    if negs:
+        if known <= 0 or numel_in % known:
+            return None
+        return tuple(numel_in // known if d == -1 else int(d)
+                     for d in S)
+    if known != numel_in:
+        return None
+    return tuple(int(d) for d in S)
+
+
+def _view_dims(bound: dict, rank: int):
+    """The transpose's two dims normalised mod *rank* — the value's
+    rank, so the same numbers also index the map's leading axes."""
+    d1, d2 = bound.get("$attr:D1"), bound.get("$attr:D2")
+    if not (isinstance(d1, int) and isinstance(d2, int)):
+        return None
+    return d1 % rank, d2 % rank
+
+
+def _apply_value_shapes(bound: dict):
+    """Shared contract for the dense view laws: A (…, value, i) with
+    b exactly value-shaped (b == A[:-1]) and h a matching (i,) vector.
+    Returns A's shape, or None."""
+    A, b, h = (_shape(bound.get(k)) for k in ("A", "b", "h"))
+    if not all(_concrete(s) for s in (A, b, h)):
+        return None
+    if not (len(A) >= 2 and b == A[:-1]
+            and len(h) == 1 and h[-1] == A[-1]):
+        return None
+    return A
+
+
+def _applyd_value_shapes(bound: dict):
+    """Same for the diagonal carrier: a == b value-shaped, h (d,)
+    matching the feature (last) axis."""
+    a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
+    if not all(_concrete(s) for s in (a, b, h)):
+        return None
+    if not (a == b and len(a) >= 1
+            and len(h) == 1 and h[-1] == a[-1]):
+        return None
+    return a
+
+
+def _check_reshape_apply(bound: dict) -> bool:
+    A = _apply_value_shapes(bound)
+    if A is None:
+        return False
+    return _resolve_view_shape(bound.get("$attr:S"),
+                               _numel_of(A[:-1])) is not None
+
+
+def _derive_reshape_apply(bound: dict):
+    """The map's input axis stays LAST: A reshapes to S+(i,).  A -1 in
+    S is carried through verbatim — numel(A) = numel(v)·i so the
+    inferred dim resolves identically on the map."""
+    A = _apply_value_shapes(bound)
+    S = bound.get("$attr:S")
+    if A is None or _resolve_view_shape(S, _numel_of(A[:-1])) is None:
+        return None
+    return {"$attr:SA": tuple(S) + (A[-1],)}
+
+
+def _check_transpose_apply(bound: dict) -> bool:
+    A = _apply_value_shapes(bound)
+    if A is None:
+        return False
+    return _view_dims(bound, len(A) - 1) is not None
+
+
+def _derive_transpose_apply(bound: dict):
+    """Transpose dims are bound on the VALUE (rank len(A)-1) but are
+    stored on the map (rank len(A)) — normalise mod the value rank so
+    the map's last (input) axis can never be permuted."""
+    A = _apply_value_shapes(bound)
+    if A is None:
+        return None
+    dd = _view_dims(bound, len(A) - 1)
+    if dd is None:
+        return None
+    return {"$attr:DA1": dd[0], "$attr:DA2": dd[1]}
+
+
+def _check_reshape_applyd(bound: dict) -> bool:
+    """Diagonal reshape: sound iff the resolved view keeps the LAST
+    axis at size d — numel preservation plus S[-1] == V[-1] means the
+    flat-order relabel never mixes a feature component into a leading
+    axis, so h still multiplies the right components."""
+    V = _applyd_value_shapes(bound)
+    if V is None:
+        return False
+    rs = _resolve_view_shape(bound.get("$attr:S"), _numel_of(V))
+    return rs is not None and rs[-1] == V[-1]
+
+
+def _check_transpose_applyd(bound: dict) -> bool:
+    a = _applyd_value_shapes(bound)
+    if a is None or len(a) < 2:
+        return False
+    dd = _view_dims(bound, len(a))
+    # h broadcasts onto the last (feature) axis — a permutation that
+    # moves it would permute the h-components themselves; vetoed.
+    return dd is not None and dd[0] < len(a) - 1 and dd[1] < len(a) - 1
+
+
+def _derive_transpose_applyd(bound: dict):
+    a = _applyd_value_shapes(bound)
+    if a is None:
+        return None
+    dd = _view_dims(bound, len(a))
+    if dd is None:
+        return None
+    return {"$attr:DA1": dd[0], "$attr:DA2": dd[1]}
+
+
+#: Dense forward laws — the view sinks into the map, the apply rises
+#: to the value class (this is what makes the affine member visible
+#: to ``_elem_affine_options`` under MHA's reshape/transpose head
+#: split).
+XC_RESHAPE_APPLY = R(
+    "xc_reshape_apply",
+    Op.make("reshape",
+            Op.make("apply", Op.make("aff", "A", "b"), "h"),
+            shape="S"),
+    Op.make("apply",
+            Op.make("aff",
+                    Op.make("reshape", "A", shape="SA"),
+                    Op.make("reshape", "b", shape="S")),
+            "h"),
+    law="A view on the VALUE axes of a dense-affine application sinks "
+        "into the map: reshape(A@h+b, S) = reshape(A, S+(i,))@h + "
+        "reshape(b, S) — the contracted axis is last and never "
+        "relabelled, so this is exact for ANY well-typed S (the MHA "
+        "head-split: (T,nh·hd) -> (T,nh,hd)).  Requires b == A[:-1] "
+        "exactly (a broadcast-smaller b is vetoed — documented).",
+    check=_check_reshape_apply, derive=_derive_reshape_apply)
+
+XC_TRANSPOSE_APPLY = R(
+    "xc_transpose_apply",
+    Op.make("transpose",
+            Op.make("apply", Op.make("aff", "A", "b"), "h"),
+            arg1="D1", arg2="D2"),
+    Op.make("apply",
+            Op.make("aff",
+                    Op.make("transpose", "A", arg1="DA1", arg2="DA2"),
+                    Op.make("transpose", "b", arg1="DA1", arg2="DA2")),
+            "h"),
+    law="transpose(A@h+b, d1, d2) = transpose(A, d1', d2')@h + "
+        "transpose(b, d1', d2') — a permutation of the value axes "
+        "permutes the map's output axes (dims are normalised mod the "
+        "value rank so the stored map dims never touch the input "
+        "axis).  Exact — the MHA (T,nh,hd)->(nh,T,hd) head swap.",
+    check=_check_transpose_apply, derive=_derive_transpose_apply)
+
+#: Diagonal forward laws — restricted to views that keep the feature
+#: axis LAST (h is not permuted).
+XC_RESHAPE_APPLYD = R(
+    "xc_reshape_applyd",
+    Op.make("reshape",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+            shape="S"),
+    Op.make("applyd",
+            Op.make("aff_diag",
+                    Op.make("reshape", "a", shape="S"),
+                    Op.make("reshape", "b", shape="S")),
+            "h"),
+    law="reshape(a⊙h+b, S) = reshape(a,S)⊙h + reshape(b,S) — sound "
+        "ONLY when the resolved S[-1] stays the feature dim d: then "
+        "the flat-order relabel never mixes feature components into "
+        "leading axes and h still broadcasts correctly.  Head-PACKING "
+        "views pass; head-SPLITTING ones (d -> nh×hd) are vetoed — "
+        "use the dense promotion for those.",
+    check=_check_reshape_applyd)
+
+XC_TRANSPOSE_APPLYD = R(
+    "xc_transpose_applyd",
+    Op.make("transpose",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+            arg1="D1", arg2="D2"),
+    Op.make("applyd",
+            Op.make("aff_diag",
+                    Op.make("transpose", "a", arg1="DA1", arg2="DA2"),
+                    Op.make("transpose", "b", arg1="DA1", arg2="DA2")),
+            "h"),
+    law="transpose(a⊙h+b, d1, d2) = transpose(a,d1',d2')⊙h + "
+        "transpose(b,d1',d2') — the per-element diagonal map commutes "
+        "with any permutation that leaves the feature axis last "
+        "(h is NOT permuted; a transpose touching it is vetoed).",
+    check=_check_transpose_applyd, derive=_derive_transpose_applyd)
+
+
+# --- reverse forms: the pushed-through member re-fuses ---------------
+
+def _transpose_apply_rev_dims(bound: dict):
+    """For the dense reverse: the dims stored on the map's transpose
+    (rank len(A)) and on b's transpose (rank len(b)) must agree as
+    VALUE axes — i.e. normalise to the same pair, never touching A's
+    last (input) axis.  Returns the value-rank dims, or None."""
+    A = _apply_value_shapes(bound)
+    if A is None:
+        return None
+    n1, n = len(A), len(A) - 1
+    p1, p2 = bound.get("$attr:P1"), bound.get("$attr:P2")
+    q1, q2 = bound.get("$attr:Q1"), bound.get("$attr:Q2")
+    if not all(isinstance(d, int) for d in (p1, p2, q1, q2)):
+        return None
+    d1, d2 = p1 % n1, p2 % n1
+    if d1 >= n or d2 >= n:            # permutes the map's input axis
+        return None
+    if {d1, d2} != {q1 % n, q2 % n}:  # A and b permute different axes
+        # (transpose(x,a,b) == transpose(x,b,a) — unordered compare)
+        return None
+    return d1, d2
+
+
+def _check_transpose_apply_rev(bound: dict) -> bool:
+    return _transpose_apply_rev_dims(bound) is not None
+
+
+def _derive_transpose_apply_rev(bound: dict):
+    dd = _transpose_apply_rev_dims(bound)
+    if dd is None:
+        return None
+    return {"$attr:RD1": dd[0], "$attr:RD2": dd[1]}
+
+
+XC_TRANSPOSE_APPLY_REV = R(
+    "xc_transpose_apply_rev",
+    Op.make("apply",
+            Op.make("aff",
+                    Op.make("transpose", "A", arg1="P1", arg2="P2"),
+                    Op.make("transpose", "b", arg1="Q1", arg2="Q2")),
+            "h"),
+    Op.make("transpose",
+            Op.make("apply", Op.make("aff", "A", "b"), "h"),
+            arg1="RD1", arg2="RD2"),
+    law="reverse of xc_transpose_apply — the pushed-through form "
+        "re-fuses when both transposes agree on the same value axes.",
+    check=_check_transpose_apply_rev,
+    derive=_derive_transpose_apply_rev)
+
+
+def _transpose_applyd_rev_dims(bound: dict):
+    a = _applyd_value_shapes(bound)
+    if a is None or len(a) < 2:
+        return None
+    n = len(a)
+    p1, p2 = bound.get("$attr:P1"), bound.get("$attr:P2")
+    q1, q2 = bound.get("$attr:Q1"), bound.get("$attr:Q2")
+    if not all(isinstance(d, int) for d in (p1, p2, q1, q2)):
+        return None
+    d1, d2 = p1 % n, p2 % n
+    if {d1, d2} != {q1 % n, q2 % n}:
+        return None
+    if d1 >= n - 1 or d2 >= n - 1:    # feature axis moved — unsound
+        return None
+    return d1, d2
+
+
+def _check_transpose_applyd_rev(bound: dict) -> bool:
+    return _transpose_applyd_rev_dims(bound) is not None
+
+
+def _derive_transpose_applyd_rev(bound: dict):
+    dd = _transpose_applyd_rev_dims(bound)
+    if dd is None:
+        return None
+    return {"$attr:RD1": dd[0], "$attr:RD2": dd[1]}
+
+
+XC_TRANSPOSE_APPLYD_REV = R(
+    "xc_transpose_applyd_rev",
+    Op.make("applyd",
+            Op.make("aff_diag",
+                    Op.make("transpose", "a", arg1="P1", arg2="P2"),
+                    Op.make("transpose", "b", arg1="Q1", arg2="Q2")),
+            "h"),
+    Op.make("transpose",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+            arg1="RD1", arg2="RD2"),
+    law="reverse of xc_transpose_applyd — same feature-axis "
+        "restriction: the stored dims must agree and stay off the "
+        "last axis.",
+    check=_check_transpose_applyd_rev,
+    derive=_derive_transpose_applyd_rev)
+
+
+def _check_reshape_apply_rev(bound: dict) -> bool:
+    """apply(aff(reshape(A,SA), reshape(b,SB)), h) refolds to
+    reshape(apply(aff(A,b),h), SB) — requires SA == SB+(i,) literally
+    (the spelling the forward law mints; a semantically-equal but
+    differently-spelled SA is conservatively vetoed), plus the usual
+    map contract and a well-typed SB."""
+    A = _apply_value_shapes(bound)
+    if A is None:
+        return False
+    SA, SB = bound.get("$attr:SA"), bound.get("$attr:SB")
+    if not (isinstance(SA, (tuple, list))
+            and isinstance(SB, (tuple, list))):
+        return False
+    if len(SA) != len(SB) + 1 or tuple(SA[:-1]) != tuple(SB):
+        return False
+    if SA[-1] != A[-1]:
+        return False
+    return _resolve_view_shape(SB, _numel_of(A[:-1])) is not None
+
+
+XC_RESHAPE_APPLY_REV = R(
+    "xc_reshape_apply_rev",
+    Op.make("apply",
+            Op.make("aff",
+                    Op.make("reshape", "A", shape="SA"),
+                    Op.make("reshape", "b", shape="SB")),
+            "h"),
+    Op.make("reshape",
+            Op.make("apply", Op.make("aff", "A", "b"), "h"),
+            shape="SB"),
+    law="reverse of xc_reshape_apply — only matches when the map's "
+        "reshape is literally S+(i,), the spelling the forward law "
+        "produces.",
+    check=_check_reshape_apply_rev)
+
+
+def _check_reshape_applyd_rev(bound: dict) -> bool:
+    """Diagonal reverse: both coefficients must carry the same shape
+    attr, keeping the feature axis last."""
+    a = _applyd_value_shapes(bound)
+    if a is None:
+        return False
+    SA, SB = bound.get("$attr:SA"), bound.get("$attr:SB")
+    if not (isinstance(SA, (tuple, list))
+            and isinstance(SB, (tuple, list))
+            and tuple(SA) == tuple(SB)):
+        return False
+    rs = _resolve_view_shape(SA, _numel_of(a))
+    return rs is not None and rs[-1] == a[-1]
+
+
+XC_RESHAPE_APPLYD_REV = R(
+    "xc_reshape_applyd_rev",
+    Op.make("applyd",
+            Op.make("aff_diag",
+                    Op.make("reshape", "a", shape="SA"),
+                    Op.make("reshape", "b", shape="SB")),
+            "h"),
+    Op.make("reshape",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+            shape="SA"),
+    law="reverse of xc_reshape_applyd — same resolved-S[-1]==d "
+        "restriction.",
+    check=_check_reshape_applyd_rev)
+
+
+# ---------------------------------------------------------------------------
 #  The heterogeneous om element — scan folded INSIDE the om leaf
 # ---------------------------------------------------------------------------
 
@@ -1127,6 +1575,10 @@ XC_LAWS: list[Rewrite] = [
     XC_SCALE_APPLY, XC_SCALE_APPLY_PRE,
     XC_ADD_APPLYD, XC_ADD_APPLY,
     XC_CHUNK_APPLYD, XC_SPLIT_APPLYD, XC_CHUNK_APPLY, XC_SPLIT_APPLY,
+    XC_RESHAPE_APPLY, XC_TRANSPOSE_APPLY,
+    XC_RESHAPE_APPLYD, XC_TRANSPOSE_APPLYD,
+    XC_RESHAPE_APPLY_REV, XC_TRANSPOSE_APPLY_REV,
+    XC_RESHAPE_APPLYD_REV, XC_TRANSPOSE_APPLYD_REV,
     XC_OM_ELEM_AFFD, XC_OM_ELEM_AFFD_REV,
     XC_OM_ELEM_AFF, XC_OM_ELEM_AFF_REV,
     XC_OMD_LIFT, XC_OMD_UNLIFT,
