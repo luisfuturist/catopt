@@ -25,14 +25,12 @@ lower-cost program, and lowers it back through
 model, weights, backend, and inputs — only the graph representation
 differs.
 
-**The weights are part of the program — exactly.** Parameters are
-`Param` leaves in the same term language as compute: a param that no
+**The weights are part of the program.** Parameters are `Param`
+leaves in the same term language as compute: a param that no
 extracted member references drops from the state dict automatically.
 Composition, tying, slice-sharing, and weight folding are the same
 event — *a param becomes unreachable in the extracted program → the
-weights file shrinks*. (The stronger hypothesis — that trained
-weights hide *compressible* structure — was falsified end-to-end;
-see ADR 0001 on the `project` branch.)
+weights file shrinks*.
 
 ```text
 PyTorch model
@@ -471,10 +469,8 @@ inequality) and report `cert.error_bound` / `cert.exact`.
   `linear(x,W) → linear(linear(x,V_r), U_rΣ_r)`, bound `σ_{r+1}`
   (exact Eckart–Young).
 - `eps.low_rank_gather` — low-rank at `embedding` sites:
-  `embedding(W,idx) → matmul(embedding(U_r,idx), V_r)`. On the real
-  stories15M embedding: rank 2 @ 5% → 142× *storage* — **but Phase-5
-  showed this destroys perplexity** (norm bound ≠ quality); useful
-  where a norm bound is the contract, not for task quality.
+  `embedding(W,idx) → matmul(embedding(U_r,idx), V_r)` — useful where
+  a norm bound is the contract, not for task quality.
 - `eps.kron_linear_params` — sum-of-Kronecker as a program of K
   composed maps; Frobenius bound via the rearranged-SVD isometry.
 - `eps.quant_params` — quantization-as-rewrite:
@@ -507,38 +503,17 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 - **More weight-preserving dualities**: RepVGG-style branch merging,
   conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
   architecture over the same parameters.
-- **Joint graph+parameter optimization** *(partially landed)*: the
-  optimizer already rewrites the parameter *realization*, not just the
-  graph over it — `assoc_linear(_bias)` composes `W₂(W₁x+b₁)+b₂` into
+- **Joint graph+parameter optimization**: the optimizer rewrites the
+  parameter *realization*, not just the graph over it —
+  `assoc_linear(_bias)` composes `W₂(W₁x+b₁)+b₂` into
   `linear(x, W₂W₁, W₂b₁)+b₂`, `_fold_weight_chains` materializes the
-  fused tensors, and `_build_params` registers only what the extracted
-  term references, so eliminated subgraphs drop their weights from the
-  state dict. `param_report(model, opt)` audits it: on a biased
-  `Linear(32→128)→Linear(128→32)` chain the optimized weights file is
-  **87% smaller** (66.8KB → 8.7KB), fp64-exact. Sharing, head-slice
-  dedup, and a parameter-storage cost axis (`param_bytes_cost`) all
-  landed — measured across archetypes: ~0% on dense checkpoints, real
-  on structured ones (GQA 37.5%, tied 50%, MoE 75% — §10.2 in
-  REPORT). Open: null-space dead-parameter detection.
-  **`measure_weights.py` falsification on real trained weights**
-  (stories15M + stories110M): every hypothesis class for exact
-  weight-space structure is closed — full rank, no cross-layer
-  sharing, no equivariance, minimal polynomial at full degree, no
-  compressible displacement. See ADR 0001 on the `project` branch. Only architectural
-  structure (the exact corner above) survives.
-  Phase-0b extended the probe to a family of algebras with a
-  rate–distortion gate against plain SVD. Verdicts: H-matrix
-  off-diagonals full-rank (dead), sparse parity, monarch ALS
-  diverged (inconclusive), INR coordinate-fit fails (no smooth
-  manifold). **Phase-5 verdict on real perplexity (TinyStories,
-  stories15M)**: the energy signals do NOT survive contact with
-  quality — embedding low-rank destroys ppl at every rank tested
-  (rank 192/288 → ppl 214 vs baseline 5.03), Kronecker gives 143 ppl
-  at 1.1×; only plain int8 quantization preserves quality (4×,
-  ppl 5.16). **Norm bounds don't predict perplexity** — the ε
-  machinery is sound but certifies the wrong quantity for weight
-  compression on trained weights. The exact corner (tying, sharing,
-  folding) is what survives.
+  fused tensors, `_build_params` registers only what the extracted
+  term references, and eliminated subgraphs drop their weights from
+  the state dict (a biased `Linear(32→128)→Linear(128→32)` chain →
+  **87% smaller** weights file, fp64-exact; `param_report` audits it).
+  Exact structure — `share_duplicate_params` (tying) and
+  `share_duplicate_param_slices` (head-block dedup) — is selected
+  under the `param_bytes_cost` storage axis.
 - **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
   coercion (float/bool masks, one law); generating masks from
   positions (`arange`/`tril`) remains open.
@@ -571,8 +546,8 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `catopt/eps.py` + `act_eps.py` + `ibp.py` | Optional certified-approximation toolkit — opt-in, off by default |
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
-| `measure_weights.py`, `exact_probe.py` | Weight-structure falsification harnesses (intra-matrix, relational, symmetry probes) |
-| `project/` (worktree) | Orphan `project` branch — decision records (`adrs/0001`), gitignored on main |
+| `measure_weights.py`, `exact_probe.py` | Weight-structure measurement harnesses |
+| `project/` (worktree) | Orphan `project` branch — ADRs + retrospectives, gitignored on main |
 | `tests/` | 549 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
