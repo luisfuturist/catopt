@@ -577,6 +577,13 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 
 ## Reproduce
 
+```python
+from catopt.optimize import optimize_model
+
+opt, report = optimize_model(model, example_input)  # verify + extract
+out = opt(x)                        # equivalent, certificate-carrying
+```
+
 ```bash
 python main.py                     # full demo: all transform families
 python main.py --large-batch 4096  # large-batch timing
