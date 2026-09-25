@@ -32,7 +32,7 @@ Composition, tying, slice-sharing, and weight folding are the same
 event — *a param becomes unreachable in the extracted program → the
 weights file shrinks*. (The stronger hypothesis — that trained
 weights hide *compressible* structure — was falsified end-to-end;
-see `adrs/0001`.)
+see ADR 0001 on the `project` branch.)
 
 ```text
 PyTorch model
@@ -524,7 +524,7 @@ inequality) and report `cert.error_bound` / `cert.exact`.
   (stories15M + stories110M): every hypothesis class for exact
   weight-space structure is closed — full rank, no cross-layer
   sharing, no equivariance, minimal polynomial at full degree, no
-  compressible displacement. See `adrs/0001`. Only architectural
+  compressible displacement. See ADR 0001 on the `project` branch. Only architectural
   structure (the exact corner above) survives.
   Phase-0b extended the probe to a family of algebras with a
   rate–distortion gate against plain SVD. Verdicts: H-matrix
@@ -572,7 +572,7 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 | `catopt/eps.py` + `act_eps.py` + `ibp.py` | Optional certified-approximation toolkit — opt-in, off by default |
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
 | `measure_weights.py`, `exact_probe.py` | Weight-structure falsification harnesses (intra-matrix, relational, symmetry probes) |
-| `adrs/` | Decision records (0001: weight-space structure falsified) |
+| `project/` (worktree) | Orphan `project` branch — decision records (`adrs/0001`), gitignored on main |
 | `tests/` | 549 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
