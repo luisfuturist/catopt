@@ -25,14 +25,14 @@ lower-cost program, and lowers it back through
 model, weights, backend, and inputs — only the graph representation
 differs.
 
-**The weights are part of the program.** Parameters are `Param` leaves
-in the same term language as compute, so "unused weight" is just a
-leaf no extracted member references — and the state dict drops it
-automatically. Composition, tying, slice-sharing, and weight folding
-are the same event: *a param becomes unreachable in the extracted
-program → the weights file shrinks*. The equivalence space is over
-the whole computational object — graph and realization together — not
-the graph alone.
+**The weights are part of the program — exactly.** Parameters are
+`Param` leaves in the same term language as compute: a param that no
+extracted member references drops from the state dict automatically.
+Composition, tying, slice-sharing, and weight folding are the same
+event — *a param becomes unreachable in the extracted program → the
+weights file shrinks*. (The stronger hypothesis — that trained
+weights hide *compressible* structure — was falsified end-to-end;
+see `adrs/0001`.)
 
 ```text
 PyTorch model
@@ -515,16 +515,17 @@ inequality) and report `cert.error_bound` / `cert.exact`.
   term references, so eliminated subgraphs drop their weights from the
   state dict. `param_report(model, opt)` audits it: on a biased
   `Linear(32→128)→Linear(128→32)` chain the optimized weights file is
-  **87% smaller** (66.8KB → 8.7KB), fp64-exact. Open: null-space dead
-  parameter detection (needs a value-level decision procedure),
-  weight sharing/factoring, and a parameter-storage cost axis so
-  extraction can *prefer* smaller realizations.
-  **`measure_weights.py` Phase-0 falsification on real trained weights
-  (stories15M)**: numerical rank is ~full at 1e-2 tolerance,
-  displacement rank ~n (no Toeplitz/generator structure), low-rank at
-  99% energy stores 96.3% of params — **exact weight-space structure
-  is absent; only the ε-bounded direction is live** (spectral decay
-  exists: 90% energy at ~40% rank, but that requires certified error).
+  **87% smaller** (66.8KB → 8.7KB), fp64-exact. Sharing, head-slice
+  dedup, and a parameter-storage cost axis (`param_bytes_cost`) all
+  landed — measured across archetypes: ~0% on dense checkpoints, real
+  on structured ones (GQA 37.5%, tied 50%, MoE 75% — §10.2 in
+  REPORT). Open: null-space dead-parameter detection.
+  **`measure_weights.py` falsification on real trained weights**
+  (stories15M + stories110M): every hypothesis class for exact
+  weight-space structure is closed — full rank, no cross-layer
+  sharing, no equivariance, minimal polynomial at full degree, no
+  compressible displacement. See `adrs/0001`. Only architectural
+  structure (the exact corner above) survives.
   Phase-0b extended the probe to a family of algebras with a
   rate–distortion gate against plain SVD. Verdicts: H-matrix
   off-diagonals full-rank (dead), sparse parity, monarch ALS
@@ -570,8 +571,9 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 | `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
 | `catopt/eps.py` + `act_eps.py` + `ibp.py` | Optional certified-approximation toolkit — opt-in, off by default |
 | `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
-| `measure_weights.py` | Phase-0 weight-structure falsification harness |
-| `tests/` | 495 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
+| `measure_weights.py`, `exact_probe.py` | Weight-structure falsification harnesses (intra-matrix, relational, symmetry probes) |
+| `adrs/` | Decision records (0001: weight-space structure falsified) |
+| `tests/` | 549 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
 
 ## Reproduce
 
