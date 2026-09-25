@@ -198,7 +198,32 @@ post-hoc weight compression on this checkpoint.
 
 This is the honest negative the kill-gates were for.
 
-### 10.1 The exact corner, measured across archetypes
+### 10.1 Relational probe — the last untested class
+
+Exact **cross-layer** structure on stories15M **and** stories110M
+(`measure_weights.py relational`):
+
+| probe | stories15M | stories110M |
+|---|---|---|
+| 1. bitwise cross-layer dup rows/cols/head-blocks | **0 hits** | **0 hits** |
+| 2. shared subspace — rank(stack) vs ambient | **full rank everywhere** (288/288, 768/768, 2048/2048) | **full rank everywhere** |
+| 3. after Procrustes alignment | 0 aligned dup rows, still full rank | 0, still full rank |
+| 4. stacked spectrum (diagnostic) | r95 ≈ 242–265/288 (~85–92%) | r95 ≈ 655–714/768 (~85–93%) |
+| 5. shared dictionary (diagnostic) | k=64 → resid 0.70 @ 0.26× storage | k=64 → resid 0.74–0.93 @ 0.09× |
+
+**Verdict: negative on exact — the door closes.** Training
+genericizes: two independently-trained checkpoints carry zero
+bitwise-shared cross-layer structure, and the gauge-alignment test
+finds nothing the permutation/rotation freedom was hiding. Mild
+*approximate* redundancy exists (85–93% of dims for 95% energy;
+dictionary residual ~0.7 at high compression) — but Phase 5 already
+showed approximate ≠ quality-preserving. **The entropy bound is the
+final answer**: a trained checkpoint's weights are information-dense
+at the bit level; the only lossless wins are the architectural ones
+(tying, materialized replication, dead params — §10.2), not emergent
+cross-layer structure.
+
+### 10.2 The exact corner, measured across archetypes
 
 Under `param_bytes_cost_for` with fp64 output equality verified:
 

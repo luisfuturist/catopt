@@ -395,5 +395,216 @@ def main() -> None:
               f"{agg['svd99']:>8} {agg['kron99']:>8} {agg['sprs99']:>8}")
 
 
+# ---------------------------------------------------------------------------
+# Relational probes — EXACT cross-layer structure (the last untested
+# class).  Probes 1-3 are gates (any bitwise/exact hit = real lossless
+# win); 4-5 are diagnostics (approximate redundancy evidence).
+# ---------------------------------------------------------------------------
+
+def _row_hashes(A: np.ndarray) -> dict:
+    """{row_bytes: [indices]} — bitwise duplicate detection."""
+    out: dict[bytes, list[int]] = {}
+    fb = np.ascontiguousarray(A.reshape(len(A), -1))
+    for i in range(len(fb)):
+        out.setdefault(fb[i].tobytes(), []).append(i)
+    return {k: v for k, v in out.items() if len(v) > 1}
+
+
+def _cross_layer_dups(w: dict) -> dict:
+    """Probe 1: bitwise row/col/head-block matches ACROSS layers."""
+    hits = []
+    for fam in ("wq", "wk", "wv", "wo", "w1", "w2", "w3"):
+        if fam not in w:
+            continue
+        A = w[fam]                      # (L, out, in)
+        L, O, I = A.shape
+        # rows (out-features), cols (in-features), head-blocks (48-row)
+        rows = {i: {} for i in range(L)}
+        cols = {i: {} for i in range(L)}
+        for l in range(L):
+            rows[l] = _row_hashes(A[l])
+            cols[l] = _row_hashes(A[l].T)
+        for i in range(L):
+            for j in range(i + 1, L):
+                shared_r = set(rows[i]) & set(rows[j])
+                shared_c = set(cols[i]) & set(cols[j])
+                for k in shared_r:
+                    hits.append((fam, "row", i, j,
+                                 rows[i][k], rows[j][k]))
+                for k in shared_c:
+                    hits.append((fam, "col", i, j,
+                                 cols[i][k], cols[j][k]))
+    return {"hits": hits, "n": len(hits)}
+
+
+def _exact_rank(A: np.ndarray, tol_frac: float = 1e-6) -> int:
+    """Numerical rank at strict tolerance — σ_i < tol·σ_max means
+    linearly dependent to float precision."""
+    s = np.linalg.svd(A.astype(np.float64), compute_uv=False)
+    if s.size == 0 or s[0] == 0:
+        return 0
+    return int((s >= s[0] * tol_frac).sum())
+
+
+def _shared_subspace(w: dict) -> dict:
+    """Probe 2: stack all layers' rows; rank(stack) < Σ rank(layer)
+    means layers share an exact subspace (store basis + coeffs)."""
+    out = {}
+    for fam in ("wq", "wk", "wv", "wo", "w1", "w2", "w3"):
+        if fam not in w:
+            continue
+        A = w[fam]
+        L = A.shape[0]
+        stacked = A.reshape(L * A.shape[1], -1)
+        r_stack = _exact_rank(stacked)
+        r_sum = sum(_exact_rank(A[l]) for l in range(L))
+        # The gate is rank(stack) < min(#rows, #cols) — a stacked
+        # matrix that is FULL column rank shares no subspace; the
+        # Σ-layer comparison alone is degenerate (ambient dim caps
+        # the stack regardless).
+        ambient = min(stacked.shape)
+        out[fam] = {"stack_rank": r_stack, "sum_layer_rank": r_sum,
+                    "ambient": ambient,
+                    "saving_rows": ambient - r_stack}
+    return out
+
+
+def _procrustes(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    """Orthogonal Procrustes: Q minimizing ‖X − YQ‖_F.  Q = UVᵀ of
+    XᵀY — implemented directly (no scipy)."""
+    M = Y.T.astype(np.float64) @ X.astype(np.float64)
+    U, _, Vt = np.linalg.svd(M)
+    return (U @ Vt).T
+
+
+def _greedy_assign(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Greedy max-|inner-product| assignment of B's rows to A's —
+    approximation of Hungarian; enough for a diagnostic."""
+    An = A / np.linalg.norm(A, axis=1, keepdims=True).clip(1e-12)
+    Bn = B / np.linalg.norm(B, axis=1, keepdims=True).clip(1e-12)
+    C = np.abs(An @ Bn.T)
+    assign = np.full(len(A), -1)
+    order = np.argsort(-C.max(1))
+    used = set()
+    for i in order:
+        j = int(np.argmax(np.where(
+            np.isin(np.arange(len(B)), list(used), invert=True),
+            C[i], -1)))
+        assign[i] = j
+        used.add(j)
+    return assign
+
+
+def _alignment_probe(w: dict) -> dict:
+    """Probe 3: align layer j to layer i (orthogonal Procrustes on the
+    weight matrices + greedy row permutation), then re-check
+    duplicates / shared subspace."""
+    out = {}
+    for fam in ("wq", "wv", "w1"):
+        if fam not in w:
+            continue
+        A = w[fam].astype(np.float64)
+        L = A.shape[0]
+        aligned_dups = 0
+        for j in range(1, L):
+            Q = _procrustes(A[0], A[j])
+            Aj = A[j] @ Q
+            # bitwise near-duplicates after alignment (exact rel
+            # tolerance at fp32 rounding level)
+            scale = np.abs(A[0]).max() or 1.0
+            close = np.abs(A[0] - Aj) <= scale * 1e-6
+            aligned_dups += int(close.all(-1).any(-1).sum())
+            # shared subspace after alignment
+            st = np.vstack([A[0], Aj])
+            rs = _exact_rank(st)
+            r_sum = _exact_rank(A[0]) + _exact_rank(Aj)
+            out.setdefault(fam, []).append(
+                {"vs": (0, j), "aligned_dup_rows": int(
+                    close.all(-1).any(-1).sum()),
+                 "stack_rank": rs, "sum_rank": r_sum})
+        out[fam + "_total_aligned_dups"] = aligned_dups
+    return out
+
+
+def _stacked_spectrum(w: dict) -> dict:
+    """Probe 4 (diagnostic): rank of the stacked normalized matrix at
+    90/95/99% energy vs Σ dims — approximate cross-layer redundancy."""
+    out = {}
+    for fam in ("wq", "wk", "wv", "wo", "w1", "w2", "w3"):
+        if fam not in w:
+            continue
+        A = w[fam]
+        L = A.shape[0]
+        st = A.reshape(L * A.shape[1], -1)
+        st = st / np.linalg.norm(st, axis=1, keepdims=True).clip(1e-12)
+        s = np.linalg.svd(st.astype(np.float64), compute_uv=False)
+        e = np.cumsum(s ** 2) / (s ** 2).sum()
+        out[fam] = {f"r{int(p*100)}": int((e < p).sum()) + 1
+                    for p in (0.9, 0.95, 0.99)}
+        out[fam]["dims"] = st.shape[1]
+    return out
+
+
+def _shared_dictionary(w: dict, k: int = 64) -> dict:
+    """Probe 5 (diagnostic): cross-layer shared dictionary via SVD
+    basis of the stacked matrix + greedy sparse codes."""
+    out = {}
+    for fam in ("wq", "wk", "wv", "wo"):
+        if fam not in w:
+            continue
+        A = w[fam]
+        L = A.shape[0]
+        st = A.reshape(L * A.shape[1], -1).astype(np.float64)
+        U, S, Vt = np.linalg.svd(st, full_matrices=False)
+        D = Vt[:k]                                  # dictionary (k,in)
+        # codes: st ≈ C @ D — least squares per row
+        C = st @ D.T                                # (rows, k)
+        resid = st - C @ D
+        rel = float(np.linalg.norm(resid) / np.linalg.norm(st))
+        stored = D.size + C.size
+        out[fam] = {"k": k, "rel_resid": round(rel, 4),
+                    "storage_ratio": round(stored / st.size, 4)}
+    return out
+
+
+def relational(path: str = "/tmp/stories15M.bin",
+               path2: str | None = "/tmp/stories110M.bin") -> None:
+    for p in [path] + ([path2] if path2 else []):
+        try:
+            w = load_llama2c(p)
+        except Exception as e:
+            print(f"{p}: load failed: {e}")
+            continue
+        print(f"\n{'='*64}\n{p} — relational probes\n{'='*64}")
+        d = _cross_layer_dups(w)
+        print(f"[1] exact cross-layer duplicates: {d['n']} hits")
+        for h in d["hits"][:10]:
+            print(f"    {h}")
+        ss = _shared_subspace(w)
+        for fam, v in ss.items():
+            flag = " SHARED" if v["saving_rows"] > 0 else " full"
+            print(f"[2] {fam}: stack_rank={v['stack_rank']}/"
+                  f"{v['ambient']} Σlayer_rank={v['sum_layer_rank']}"
+                  f"{flag}")
+        al = _alignment_probe(w)
+        for fam in ("wq", "wv", "w1"):
+            tot = al.get(fam + "_total_aligned_dups", 0)
+            print(f"[3] {fam}: aligned dup rows total={tot}  "
+                  f"per-layer={al.get(fam)}")
+        sp = _stacked_spectrum(w)
+        for fam, v in sp.items():
+            print(f"[4] {fam}: dims={v['dims']} r90={v['r90']} "
+                  f"r95={v['r95']} r99={v['r99']}")
+        dc = _shared_dictionary(w)
+        for fam, v in dc.items():
+            print(f"[5] {fam}: dict k={v['k']} resid={v['rel_resid']} "
+                  f"storage={v['storage_ratio']}x")
+
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "relational":
+        relational(*sys.argv[2:])
+    else:
+        main()
