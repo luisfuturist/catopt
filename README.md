@@ -228,11 +228,13 @@ implement by hand. Verified to float noise.
 (2.2M params, fp32, RTX 2050) runs **1.40× vs eager and 1.24× vs
 Inductor** through the full pipeline — the pairing pass fuses all
 five shared-input projections per block into single GEMMs that
-Inductor alone does not create. `optimize_compositional` scales this
-past the monolithic-saturation limit: it captures each block's input
-via forward hooks, optimizes blocks independently, and recomposes —
-a 4-layer stack completes in ~2s with per-block verification and
-automatic fallback for blocks that fail export.
+Inductor alone does not create. Monolithic saturation now scales —
+incremental matching (dirty frontier), member-resolution memoization,
+and bounded expansive-rule saturation put a 4-layer model at **768s →
+4.9s** and reach ≥8 blocks (fp64-verified); `optimize_compositional`
+remains the deeper-depth path — it captures each block's input via
+forward hooks, optimizes blocks independently, and recomposes with
+per-block verification and automatic fallback.
 
 **Hybrid models compose carriers.** On a Jamba-style SSM→attention
 block, both carriers coexist in one e-graph (444 enodes, saturates in

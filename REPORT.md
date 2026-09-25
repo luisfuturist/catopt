@@ -241,8 +241,13 @@ output-equal.
   instead — it flags `spectral_unsafe` and gives sound bounds
   (118×→3× on quant sites via realized-delta propagation).
   `sdpa`/`exp`/unknown ops report ∞ rather than fabricate a bound.
-- Monolithic saturation doesn't scale past ~2 blocks;
-  `optimize_compositional` is the per-block workaround.
+- Monolithic saturation previously didn't scale past ~2 blocks —
+  **fixed**: incremental matching (dirty frontier) + member-resolution
+  memoization + bounded expansive-rule saturation put a 4-layer model
+  at **768s → 4.9s**, reaching ≥8 blocks monolithically. `optimize_compositional`
+  remains the deep-depth escape valve; `symmetry_budget=None`
+  restores unbounded exploration (budgeted rules can miss, never
+  mis-prove).
 - Monarch ALS was inconclusive — deeper butterfly structure may exist
   that naive alternating least squares can't reach.
 - ε-passes are opt-in (`eps_rtol`); default extraction is exact-only,
