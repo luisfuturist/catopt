@@ -14,10 +14,16 @@ cost axis (``param_bytes_cost_for``), fp64 outputs checked every run:
   * MoE with weight-tied routed experts -> 75% (whole-tensor tying).
   * dead param -> the unused tensor drops out of the weights file.
 
-Honest limit pinned too: the UNmerged adapter form (base(x) + B·A·x)
-currently REGRESSES in stored bytes — pair_shared_input_linears' forced
-extraction concatenates phantom weight classes that the dag_cost leaf
-billing prices as free; the lowered module materialises them anyway.
+Honest limits pinned too:
+
+  * the UNmerged adapter form (base(x) + B·A·x) currently REGRESSES in
+    stored bytes — pair_shared_input_linears' forced extraction
+    concatenates phantom weight classes that the dag_cost leaf billing
+    prices as free; the lowered module materialises them anyway.
+  * weight-tied experts on a SHARED input save only 37.5% (not the
+    routed 75%) — pairing re-materialises the up-projections.
+  * composed dense linears w2(w1·x) fold exactly but net 0 B — the
+    stacked-concat member stores both spellings.
 """
 
 import os
@@ -370,6 +376,38 @@ def test_moe_tied_routed_experts_75pct():
     assert r["bytes_saved"] == (4 - 1) * 2 * 64 * 64 * BYTES  # 196,608 B
     assert r["optimized_bytes"] * 4 == r["original_bytes"]
     assert len(r["eliminated"]) == 6
+
+
+def test_moe_tied_shared_input_partial():
+    """Same four tied experts, all reading the SAME tokens: tying is
+    found, but the shared-input pairing law forces a fused concat that
+    re-materialises the four up-projection copies — measured saving is
+    only the three spare DOWN weights: 3·64·64·8 = 98,304 B (37.5%),
+    not the routed case's 75%.  Bitwise-exact output.  If extraction
+    ever learns to keep the dedup under pairing, UPDATE this pin."""
+    torch.manual_seed(0)
+    low, stats, r, rel = _opt(_MoEShared(n=4), torch.randn(4, 64))
+    assert rel == 0.0
+    # 3 of 4 down-projections dedup'd; up-projections re-materialised
+    # inside a fused_* concat parameter (measured, not intended).
+    assert r["bytes_saved"] == 3 * 64 * 64 * BYTES            # 98,304 B
+    assert 0 < r["bytes_saved"] < 0.75 * r["original_bytes"]
+    assert any(n.startswith("fused_") for n in low.state_dict())
+
+
+def test_composed_linears_fold_zero_bytes():
+    """Two stacked dense projections, no nonlinearity: assoc_linear
+    offers the single fused weight W2@W1 and the fold IS exact — but
+    pair_shared_input_linears' coordinated extraction prefers the
+    stacked-concat GEMM, which stores BOTH spellings (W1 next to
+    W2·W1).  Net: 0 B saved — the fold exists, the file does not
+    shrink.  fp64-exact output (reassociation noise only)."""
+    torch.manual_seed(0)
+    low, stats, r, rel = _opt(_ComposedChain(d=128), torch.randn(4, 128))
+    assert rel < 1e-12
+    assert r["bytes_saved"] == 0
+    assert {"p_w1_weight", "p_w2_weight"} <= set(r["eliminated"])
+    assert any(n.startswith("fused_") for n in low.state_dict())
 
 
 def test_dead_param_dropped():
