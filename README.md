@@ -350,14 +350,19 @@ The value demonstrated here is that a real trained SLM survives the
 pipeline intact: exported, saturated, paired, lowered, verified, and
 Inductor-compilable — without fallback.
 
-**The decode-regime hypothesis was falsified on real blocks.** Pairing
-pays where *projections dominate* the kernel count (toy ParallelBlock:
-1.19× at b=4). In a real transformer block, RoPE + SDPA + norms +
-residuals contribute ~40 kernels per layer — fusing 3 GEMMs saves ~2
-launches of ~40. The honest regime boundary: pairing needs launch-bound
-**and** GEMM-dominated to pay. **Conv pairing is the exception** —
-1.24–1.33× at every size measured, because Inductor does not fuse cuDNN
-conv calls.
+**The launch-bound hypothesis was falsified — twice.** First on
+blocks: RoPE + SDPA + norms + residuals contribute ~40 kernels per
+layer, so fusing 3 GEMMs saves ~2 of ~40. Then on whole real
+checkpoints (`bench/decode_bench.py`, B∈{1,4,16} × T∈{16,64,256},
+true-batched forward): pairing *loses* 4–15% precisely in the most
+launch-bound cells (B=1 T=16/64) — split-view copies cost more than
+the ~2 saved launches/block — and *wins* ~4% only at the largest
+cells (B=4 T=256, B=16 T=64), where the effect is fused-GEMM shape
+efficiency, not launch amortization. Profiler confirms the mechanism
+is real (−37% GEMM launches, −9% total kernels on stories110M) — it
+just doesn't pay at these sizes. **Conv pairing is the exception** —
+1.24–1.33× at every size measured, because Inductor does not fuse
+cuDNN conv calls.
 
 **Three nonlinear-boundary transforms.** (a) *Attention fold* —
 `softmax(masked_fill(qk^T·s, mask, −inf)) @ v` is literally SDPA's
@@ -470,14 +475,14 @@ measured 1.08×). The pipeline *accepts* pairing where it wins and
 
 ## Optional: certified-approximation toolkit (not core)
 
-**Status: opt-in, off by default.** The ε machinery (`eps.py`,
-`act_eps.py`, `ibp.py`) rides on catopt but is *not* part of the core
-optimizer — it only runs when `optimize_model(eps_rtol=…)` is set or
-the module is called directly. Phase 5 showed certified norm bounds do
-**not** predict task quality on trained checkpoints, so it is kept as
-a toolkit for where a norm bound IS the contract — activation paths,
-verification, certified deployment — not as a weight-compression
-feature.
+**An optional side-toolkit, off by default** — `eps.py`, `act_eps.py`,
+`ibp.py` run only when `optimize_model(eps_rtol=…)` is set or the
+functions are called directly. On weights the premise was **falsified**:
+norm bounds measure energy, not quality — bounded compression destroyed
+task quality at every rank probed on real checkpoints. It survives only
+where a norm bound *is* the contract — activation paths
+(int8-KV-cache-style), verification, certified deployment — never as a
+weight-compression feature.
 
 The machinery itself: exact laws preserve semantics; **ε-laws preserve
 semantics up to a certified bound**. `Rewrite.error_bound` marks a
@@ -509,6 +514,19 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 - Exact sharing (`share_duplicate_params`, `share_duplicate_param_slices`)
   is **core**, not part of this toolkit — it runs in the default
   pipeline and is ε=0 exact.
+
+## Out of scope (falsified)
+
+**Weight-space compression is closed.** Every hypothesis class was
+probed on real trained checkpoints and came back negative — low-rank,
+Kronecker-sum, Toeplitz/displacement-rank, equivariance, cross-layer
+sharing/alignment, learned displacement operators, polynomial
+identities: all full-rank or generic. Trained weights are entropy-dense,
+and where approximate structure does exist it does not preserve task
+quality — norm bounds are not quality bounds. The measurements and the
+decision record live on the `project` orphan branch
+(`adrs/0001-weight-space-structure-falsified.md`,
+`retros/weight-as-programs.md`).
 
 ## Roadmap
 
@@ -568,7 +586,8 @@ inequality) and report `cert.error_bound` / `cert.exact`.
 | `measure_weights.py`, `exact_probe.py` | Weight-structure measurement harnesses |
 | `project/` (worktree) | Orphan `project` branch — ADRs + retrospectives, gitignored on main |
 | `bench/stories15m_bench.py` | Real-checkpoint benchmark: stories15M/110M through the full pipeline, `torch.utils.benchmark` |
-| `tests/` | 565 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional |
+| `bench/decode_bench.py` | Launch-bound regime sweep (B×T cells) on real checkpoints — falsification harness |
+| `tests/` | 572 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional, falsification pins |
 
 ## Reproduce
 

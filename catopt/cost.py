@@ -31,6 +31,22 @@ def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
     ``memo`` is an optional ``id()``-keyed dict shared across a whole
     traversal: extracted terms share Op objects (DAG structure), so
     memoising turns an exponential tree walk into a linear DAG walk.
+
+    Rank-0 (``()``) policy: a ``()``-shaped operand under an op that
+    cannot be scalar — axis-indexing ops (``transpose``/``select``/
+    ``slice``/``unbind``/``squeeze``/``concat``/``chunk``/``split``/
+    ``flatten``/``index_select``, ``sum``/``mean`` with an explicit
+    dim, ``matmul``/``linear``/``conv2d`` with a scalar operand) — or
+    a ``()`` produced by a carrier op's *convention* shape (``aff``/
+    ``apply``/``om`` family report map-part/state/accumulator slots)
+    means a carrier-internal member is being read as a plain tensor.
+    Its true value shape is unrecoverable at term level, so these
+    report ``None`` (unknown) — which propagates harmlessly
+    (``_broadcast`` treats it as wildcard, FLOP costs fall back to
+    numel-1) — rather than a fabricated ``()`` which both lies and
+    crashes ``d % len(base)`` divisions downstream.  Genuine scalar
+    results (``Const``, full-reduce ``sum``/``mean``, vector dot
+    ``matmul``, scalar elementwise) still report ``()``.
     """
     key = id(term)
     if memo is not None and key in memo:
@@ -83,7 +99,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 return tuple(b[:-2]) + (b[-1],)
             if len(a) == 1 and len(b) == 1:
                 return ()
-            return shapes[0]
+            # A scalar operand under matmul is ill-typed — almost
+            # always a carrier-internal member read as a tensor.
+            return shapes[0] or None
         case "add" | "mul" | "sub" | "div":
             # Element-wise ops broadcast: result is the broadcast shape,
             # not simply the first operand's shape.
@@ -103,7 +121,10 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return shapes[0] if shapes and shapes[0] is not None else ()
         case "linear":
             # F.linear(x[..., in], W[out, in]) -> [..., out]
-            if len(shapes) >= 2 and shapes[0] is not None and shapes[1] is not None:
+            # A scalar x () has no in-features axis — fall through to
+            # the unknown result rather than fabricating (w[0],).
+            if (len(shapes) >= 2 and shapes[0] is not None
+                    and shapes[0] and shapes[1] is not None):
                 w = shapes[1]
                 if len(w) >= 1:
                     out = tuple(shapes[0][:-1]) + (w[0],)
@@ -127,7 +148,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                             out_b = _broadcast(out, b)
                         return out_b
                     return out
-            return shapes[0]
+            return shapes[0] or None
         case "sum" | "mean":
             # Honor keepdim/dim when available, else reduce to scalar.
             dim = op.attrs.get("dim", op.attrs.get("axis", None))
@@ -137,6 +158,10 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 return ()
             if dim is None:
                 return ()
+            if not base:
+                # Explicit-dim reduce over a scalar operand — the
+                # carrier-internal ``()`` case (see _shape_of docstring).
+                return None
             dims = dim if isinstance(dim, (tuple, list)) else (dim,)
             ndim = len(base)
             norm = {d % ndim for d in dims}
@@ -147,7 +172,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return tuple(d for i, d in enumerate(base) if i not in norm)
         case "transpose":
             base = shapes[0]
-            if base is None:
+            if not base:
+                # () has no axes to permute (also guards d % len(base)).
                 return None
             d0 = op.attrs.get("arg1", op.attrs.get("dim0", -2))
             d1 = op.attrs.get("arg2", op.attrs.get("dim1", -1))
@@ -185,7 +211,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return tuple(base[:d]) + (1,) + tuple(base[d:])
         case "squeeze":
             base = shapes[0]
-            if base is None:
+            if not base:
                 return None
             d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
@@ -205,8 +231,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # Element shape: base with the unbound dim removed.  The
             # tuple arity lives in getitem/select consumers.
             base = shapes[0]
-            if base is None or not base:
-                return base
+            if not base:
+                # () has no dim to unbind — carrier-internal operand.
+                return None
             d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
         case "getitem":
@@ -214,8 +241,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return shapes[0]
         case "select":
             base = shapes[0]
-            if base is None or not base:
-                return base
+            if not base:
+                return None
             d = op.attrs.get("arg1", op.attrs.get("dim", 0)) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
         case "slice":
@@ -224,7 +251,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # strided slices (x[..., ::2], RoPE) report the unsliced
             # shape and poisons every downstream broadcast as _INVALID.
             base = shapes[0]
-            if base is None:
+            if not base:
                 return None
             d = op.attrs.get("arg1", op.attrs.get("dim", 0)) % len(base)
             lo = op.attrs.get("arg2", 0) or 0
@@ -244,8 +271,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "index_select":
             # Gather along dim: that axis resizes to len(index).
             base = shapes[0]
-            if base is None or not base:
-                return base
+            if not base:
+                return None
             d = op.attrs.get("dim", op.attrs.get("arg1", 0)) % len(base)
             idx = op.attrs.get("index", op.attrs.get("arg2"))
             out = list(base)
@@ -253,7 +280,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return tuple(out)
         case "flatten":
             base = shapes[0]
-            if base is None:
+            if not base:
                 return None
             d0 = op.attrs.get("arg1", op.attrs.get("start_dim", 0))
             d1 = op.attrs.get("arg2", op.attrs.get("end_dim", -1))
@@ -264,7 +291,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return shapes[0]
         case "sdpa":
             # out has q's shape (B, h, T, d)
-            return shapes[0]
+            return shapes[0] or None
         case "conv2d":
             # x (N,C,H,W) @ w (O,C,kh,kw) -> (N,O,H',W')
             x, w = shapes[0], shapes[1]
@@ -272,7 +299,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                     or isinstance(op.attrs.get("padding"), str)):
                 return (x[0], w[0], None, None) if (
                     x is not None and w is not None
-                    and len(x) >= 1 and len(w) >= 1) else x
+                    and len(x) >= 1 and len(w) >= 1) else (x or None)
             st = op.attrs.get("stride", 1)
             pd = op.attrs.get("padding", 0)
             dl = op.attrs.get("dilation", 1)
@@ -288,27 +315,30 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "aff":
             # The map h ↦ A·h + b is a pair value; its "shape" is the
             # linear part's — what consumers' costs are priced from.
-            return shapes[0]
+            # A () slot means a carrier member is being read as a
+            # tensor: unknown, not scalar (see _shape_of docstring).
+            return shapes[0] or None
         case "aff_compose":
             # f∘g keeps the outer map's linear-part shape (d×d).
-            return shapes[0]
+            return shapes[0] or None
         case "apply":
             # apply(f, h) evaluates back to tensor-land: h's shape.
-            return shapes[1]
+            return shapes[1] or None
         case "aff_diag":
             # The diagonal map h ↦ a⊙h + b is a pair value; its "shape"
             # is the scale part's — what consumers' costs price from.
-            return shapes[0]
+            return shapes[0] or None
         case "affd_compose":
             # f∘g keeps the outer map's diagonal shape.
-            return shapes[0]
+            return shapes[0] or None
         case "applyd":
             # applyd(f, h) evaluates back to tensor-land: h's shape.
-            return shapes[1]
+            return shapes[1] or None
         case "om":
             # The carrier triple (m, l, a); its "shape" is the
             # accumulator's — what consumers' costs are priced from.
-            return shapes[2] if len(shapes) > 2 else shapes[0]
+            out = shapes[2] if len(shapes) > 2 else shapes[0]
+            return out or None
         case "om_elem":
             # elem(s[...,K], v[...,K,d]) reports the applied output
             # shape (...,T,d) — like `aff`, the carrier is priced as
@@ -317,15 +347,17 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if (isinstance(s, tuple) and isinstance(v, tuple)
                     and len(s) >= 1 and len(v) >= 1):
                 return tuple(s[:-1]) + (v[-1],)
-            return s
+            # A ()-shaped operand is a carrier member read as a
+            # tensor — unknown, not scalar.
+            return None
         case "om_compose" | "om_apply":
-            return shapes[0]
+            return shapes[0] or None
         case "trace":
             # Tr(f): drop the first `usize` rows/cols of the block
             # matrix f : U⊗X → U⊗Y, leaving the X → Y map.
             s = shapes[0]
             if not (isinstance(s, tuple) and len(s) == 2):
-                return s
+                return s or None
             u = op.attrs.get("usize", 0)
             du = sum(u) if isinstance(u, (list, tuple)) else u
             if not isinstance(du, int):
@@ -342,14 +374,15 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                     and len(a) == 2 and len(b) == 2
                     and all(isinstance(d, int) for d in (*a, *b))):
                 return (a[0] + b[0], a[1] + b[1])
-            return a
+            return a or None
         case "inv":
             return shapes[0]
         case "concat":
             # Variadic cat: sum every operand along the cat axis.
             a = shapes[0]
-            if a is None or len(a) == 0:
-                return a
+            if not a:
+                # () has no cat axis — carrier-internal operand.
+                return None
             dim = op.attrs.get("dim", op.attrs.get("arg1", 0)) % len(a)
             out = list(a)
             out[dim] = 0
@@ -360,7 +393,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return tuple(out)
         case "chunk":
             base = shapes[0]
-            if base is None:
+            if not base:
                 return None
             dim = op.attrs.get("dim", -1) % len(base)
             n = op.attrs.get("chunks", 2)
@@ -369,7 +402,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return tuple(out)
         case "split":
             base = shapes[0]
-            if base is None:
+            if not base:
                 return None
             dim = op.attrs.get("dim", -1) % len(base)
             sizes = op.attrs.get("sizes", ())
@@ -378,7 +411,11 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             out[dim] = sizes[idx] if idx < len(sizes) else 0
             return tuple(out)
         case _:
-            return shapes[0]
+            # Unknown ops pass through the first operand's shape; a ()
+            # result from that is a carrier-internal member read as a
+            # tensor (omd_*/om_elem_aff*/attnbias/generator ops land
+            # here) — report unknown, not scalar.
+            return shapes[0] or None
 
 
 #: Sentinel returned by shape inference when two shapes are PROVABLY

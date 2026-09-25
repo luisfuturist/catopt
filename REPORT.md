@@ -275,9 +275,11 @@ cost axis. Every row fp64-verified output-equal.
   (`xc_reshape_apply`/`xc_transpose_apply`, both fibers) push
   reshape/transpose through `apply`/`applyd`, and rank-4 batched maps
   are accepted (`_omd_compose` broadcast fix included). The member
-  lands nested inside the attention class — surfacing it at root and
-  the `om_lift` T=32 veto (resolves score class through a `()`-shaped
-  carrier member) remain open. Semantic value real, speed not.
+  lands nested inside the attention class — surfacing it at root
+  remains open. The `om_lift` veto is fixed (om.py resolves value
+  shapes via `xcarrier._xshape`, not the carrier-convention
+  `_shape_of`); `flops_cost` no longer divides by `()`-shaped
+  carrier members (rank-0 policy). Semantic value real, speed not.
 - `model_bound` propagates site bounds via per-op Lipschitz constants
   — **known unsound for spectral sites at activation positions**
   (low-rank `eps_lr` members: it misses the ‖activation‖ factor;

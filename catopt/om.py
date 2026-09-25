@@ -67,9 +67,30 @@ from catopt.torch_bridge import _IR_TO_TORCH
 
 
 def _shape_of(t: Any):
-    """Best-effort shape of a bound term (delegates to cost model)."""
-    from catopt.cost import _shape_of as _so
-    return _so(t)
+    """The *value* shape of a bound term — carrier-aware.
+
+    Metavariable bindings resolve through ``EGraph``'s representative
+    member (``_min_term``/``any_term``), which may be a CARRIER member:
+    ``applyd``/``apply``/the om family report a *convention* shape
+    under ``catopt.cost._shape_of`` (the state slot, the map's linear
+    part — ``()`` when the slot resolves to a scalar member), not the
+    tensor value the e-class denotes.  Judging side conditions on
+    convention shapes vetoed legal rewrites — observed: ``om_lift``
+    on multi-head attention at T=32, where the score class's min-size
+    member is an ``applyd`` reporting ``()`` (and the value class's
+    an ``apply`` reporting the state shape) while both denote the
+    correct ``(nh,T,K)``/``(nh,T,d)`` tensors.
+
+    ``catopt.xcarrier._xshape`` computes the true value shape for the
+    carrier-application ops (map terms keep the cost convention — no
+    check here inspects them) and re-dispatches the cost model over
+    children carrying the corrected shapes, so every check below sees
+    the shape the term would have as a plain tensor.  Terms whose
+    value shape is genuinely unresolvable still veto — the checks are
+    load-bearing, only now on truthful shapes.
+    """
+    from catopt.xcarrier import _xshape
+    return _xshape(t)
 
 
 def _dim_eq(a: Any, b: Any) -> bool:
