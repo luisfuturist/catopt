@@ -109,13 +109,22 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                     out = tuple(shapes[0][:-1]) + (w[0],)
                     if len(shapes) >= 3:
                         b = shapes[2]
-                        out_b = _broadcast(out, b)
-                        if (out_b is _INVALID and len(b) >= 2
-                                and b[-1] == 1):
+                        if len(b) >= 2 and b[-1] == 1:
                             # A column bias (o,1) is a rank-1 bias in
-                            # disguise — squeeze the trailing
-                            # singleton and broadcast as (o,).
+                            # disguise — prefer the squeezed (o,)
+                            # broadcast so the bias lands on the
+                            # output's last axis rather than spawning
+                            # a phantom trailing one (vector-x case:
+                            # (o,) broadcast against (o,1) would
+                            # otherwise infer (o,o)).  Fall back to
+                            # the raw broadcast when the squeeze is
+                            # provably ill-typed — e.g. a real per-row
+                            # column (B,1) on a (B,o) output.
                             out_b = _broadcast(out, b[:-1])
+                            if out_b is _INVALID:
+                                out_b = _broadcast(out, b)
+                        else:
+                            out_b = _broadcast(out, b)
                         return out_b
                     return out
             return shapes[0]
