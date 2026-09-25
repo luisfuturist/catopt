@@ -53,10 +53,13 @@ O(T) step nodes and the post-saturation e-graph grows combinatorially,
 so builds are bounded (core sat 4 iters, XC 4 iters, 300k-node cap —
 the cap *stops* saturation at T>=128; the non-local lifts still run
 afterwards and still produce the omd member).  ``lift_scan_to_trace``
-is called but crash-guarded: scan_lower.build_scan_plan raises
-AttributeError on aff_diag leaves whose b-part is a bare Param
-(it hits ``term.op`` without an isinstance check — existing bug, out
-of scope; the omd path does not depend on trace members).
+is OFF by default here (build_egraph runs it): trace members are the
+JSV carrier family — they never feed the om/omd path — and the
+minted block-matrix terms are what blows the graph to ~3M enodes at
+T=256.  When enabled it is also crash-guarded: scan_lower.
+build_scan_plan raises AttributeError on aff_diag leaves whose b-part
+is a bare Param (``term.op`` without an isinstance check — existing
+bug, out of scope).
 """
 
 import argparse
@@ -125,14 +128,22 @@ class ScanAttnMQA(_CausalScan):
         self.wq = torch.nn.Linear(D, nh * hd, bias=False)
         self.wk = torch.nn.Linear(D, hd, bias=False)
         self.wv = torch.nn.Linear(D, dv, bias=False)
-        self.scale = hd ** -0.5
+        # NOTE: the scale is a registered BUFFER, not a Python float —
+        # torch.export serializes a bare float attribute through a
+        # fp32 rounding (measured: 32**-0.5 exports as
+        # 0.1767766952966369 vs the double 0.17677669529663687 —
+        # a uniform ~1e-8 output deviation, an export artifact, not a
+        # catopt issue; invisible at hd=16 where scale=0.25 is
+        # fp32-exact).  A buffer exports as a double Param — exact.
+        self.register_buffer(
+            "sq", torch.tensor(hd ** -0.5, dtype=torch.float64))
 
     def forward(self, x):
         T = x.shape[0]
         v = self.wv(self.scan(x))                    # (T, dv)
         q = self.wq(x).view(T, self.nh, self.hd).transpose(0, 1)
         k = self.wk(x)                               # (T, hd)
-        s = q @ k.transpose(-1, -2) * self.scale + self.cm
+        s = q @ k.transpose(-1, -2) * self.sq + self.cm
         return torch.softmax(s, dim=-1) @ v          # (nh,T,dv)
 
 
@@ -243,7 +254,7 @@ def distinct_ops(t):
 
 
 def bounded_build_xc(m, x, max_iter=4, xc_iter=4, max_nodes=300_000,
-                     xc_rounds=1):
+                     xc_rounds=1, trace=False):
     """build_egraph minus the explosive re-saturations.
 
     core sat → non-local lifts → rebuild → [bounded XC tier → gather/
@@ -254,6 +265,16 @@ def bounded_build_xc(m, x, max_iter=4, xc_iter=4, max_nodes=300_000,
     member observed in this benchmark (round 2 re-runs the gather
     passes on the enlarged graph — 100+ extra offers, minutes of
     build time, no new omd members).
+
+    ``trace`` controls ``lift_scan_to_trace``.  It defaults OFF here
+    (build_egraph has it on): trace members live in the JSV carrier
+    family — they never feed the om/omd path — and the minted
+    nilpotent block-matrix terms are what blows the e-graph to ~3M
+    enodes at T=256 (measured: 512 offers, enodes 2.9M, full-graph
+    extract_best OOM-killed).  The omd member is identical either
+    way — it needs only applyd members (SCAN_DIAG_LAWS), the gather
+    passes, the XC promotion, and omd_tree_lift.
+
     Returns (eg, root, ir, src, stats).
     """
     ir, src = export_to_ir(m, x)
@@ -264,10 +285,10 @@ def bounded_build_xc(m, x, max_iter=4, xc_iter=4, max_nodes=300_000,
                    max_nodes=max_nodes)
     stats["sat_s"] = time.perf_counter() - t0
 
-    def _lifts(trace=True):
+    def _lifts(with_trace=True):
         crashed = False
         tl = []
-        if trace:
+        if with_trace and trace:
             try:
                 tl = lift_scan_to_trace(eg)
             except AttributeError:
@@ -293,15 +314,18 @@ def bounded_build_xc(m, x, max_iter=4, xc_iter=4, max_nodes=300_000,
         eg.run(XC_LAWS, root, max_iterations=xc_iter,
                max_nodes=max_nodes)
         grew = eg.n_enodes != before
-        more, crash2 = _lifts(trace=False)
+        more, crash2 = _lifts(with_trace=False)
         stats["trace_lift_crashed"] |= crash2
         if more:
             eg.rebuild()
             stats["nonlocal_lifts"] += len(more)
         if not grew and not more:
             break
-        eg.run(default_rules(), root, max_iterations=2,
-               max_nodes=max_nodes)
+        # NOTE: deliberately no trailing core re-saturation (unlike
+        # build_egraph): one costs ~6min at T=64 (full CARRIER_LAWS
+        # e-match over the enlarged graph) and is unnecessary for the
+        # omd member, which lands in the root class via
+        # omd_tree_lift's union directly.
     stats["xc_s"] = time.perf_counter() - t0
     return eg, root, ir, src, stats
 
@@ -440,7 +464,7 @@ def make_omd_direct_mqa(m):
         b = B @ Wv.T                                   # (T,dv)
         q = m.wq(x).view(T, m.nh, m.hd).transpose(0, 1)
         k = m.wk(x)
-        s = q @ k.transpose(-1, -2) * m.scale + m.cm
+        s = q @ k.transpose(-1, -2) * m.sq + m.cm
         f = _IR_TO_TORCH["omd_elem"](s, A, b)
         return _IR_TO_TORCH["omd_applym"](f, h0)
     return fn
@@ -499,7 +523,8 @@ def run_mqa(args, devices):
         x = torch.randn(T, D, dtype=torch.float64)
 
         t0 = time.perf_counter()
-        eg, root, ir, src, stats = bounded_build_xc(m, x)
+        eg, root, ir, src, stats = bounded_build_xc(
+            m, x, max_nodes=args.max_nodes, trace=args.trace)
         build_s = time.perf_counter() - t0
         print(f"  build: {build_s:.1f}s enodes={eg.n_enodes} "
               f"lifts={stats.get('nonlocal_lifts')} "
@@ -510,17 +535,46 @@ def run_mqa(args, devices):
         omd_term, n_omd = extract_omd_term(eg, root)
         print(f"  omd enodes at root: {n_omd} "
               f"(extract {time.perf_counter()-t0:.1f}s)", flush=True)
+        # Node-cap truncation makes the lift's arrival ORDER-DEPENDENT
+        # at T>=128 (hash-seed dependent frontier — observed omd@root
+        # flip between runs at the same cap).  Retry with a larger
+        # saturation budget on the SAME graph before declaring miss.
+        retries = 0
+        while omd_term is None and retries < 2:
+            retries += 1
+            bigger = args.max_nodes * (2 ** retries)
+            print(f"  retry {retries}: saturating further "
+                  f"(max_nodes={bigger})", flush=True)
+            eg.run(default_rules(), root, max_iterations=2,
+                   max_nodes=bigger)
+            eg.run(XC_LAWS, root, max_iterations=2,
+                   max_nodes=bigger)
+            more = (gather_applyd_stack(eg) + gather_apply_stack(eg)
+                    + omd_tree_lift(eg))
+            if more:
+                eg.rebuild()
+            omd_term, n_omd = extract_omd_term(eg, root)
+            print(f"    -> omd enodes at root: {n_omd}", flush=True)
         if omd_term is None:
-            print("  !! no omd member — skipping sizes row", flush=True)
+            print("  !! no omd member after retries — skipping sizes "
+                  "row", flush=True)
             meta[T] = {"build_s": build_s, "enodes": eg.n_enodes,
                        "n_omd": 0}
             continue
 
         t0 = time.perf_counter()
-        best_term = eg.extract_best(eg.find(root), flops_cost)
-        print(f"  best-flops extract: {time.perf_counter()-t0:.1f}s "
-              f"root={best_term.op if isinstance(best_term, Op) else '?'}",
-              flush=True)
+        if eg.n_enodes <= args.extract_cap:
+            best_term = eg.extract_best(eg.find(root), flops_cost)
+            broot = (best_term.op if isinstance(best_term, Op)
+                     else "?")
+            print(f"  best-flops extract: {time.perf_counter()-t0:.1f}s"
+                  f" root={broot}", flush=True)
+        else:
+            best_term = None
+            print(f"  best-flops extract: SKIPPED "
+                  f"(enodes={eg.n_enodes} > {args.extract_cap} — "
+                  f"extract_best on the full graph was OOM-killed "
+                  f"at T=256/300k)", flush=True)
 
         terms = {"eager": ir.root, "omd": omd_term, "best": best_term}
         meta[T] = {
@@ -700,7 +754,15 @@ def main():
     ap.add_argument("--dv", type=int, default=24)
     ap.add_argument("--gap-size", type=int, default=32,
                     help="T for the structural (non-firing) variants")
+    ap.add_argument("--max-nodes", type=int, default=300_000)
+    ap.add_argument("--extract-cap", type=int, default=1_000_000,
+                    help="skip best-flops extraction above this many "
+                         "enodes (full-graph extract_best is OOM-prone)")
     ap.add_argument("--skip-gap", action="store_true")
+    ap.add_argument("--trace", action="store_true",
+                    help="also run lift_scan_to_trace (off: the JSV "
+                         "carrier never feeds omd and its block-matrix "
+                         "terms blow the graph to ~3M enodes at T=256)")
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--compile-timeout", type=float, default=240.0)
     args = ap.parse_args()

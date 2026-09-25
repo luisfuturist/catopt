@@ -280,9 +280,16 @@ non-local passes run regardless.
 ran 0.54–0.71× slower than eager (O(T²) carrier maps unrolled as IR
 nodes); `to_batched_omd_module` computes the coefficient maps with a
 blocked associative scan + level-batched compose — **1.2–3.3× vs
-generic eval, 2.4–5.8× with CUDA-graph capture**, fp64-exact, and
-faster than raw torch-eager at T≥64 on GPU. Falls back to serial eval
-on unrecognized shapes (counted in `mod.fallbacks`).
+generic eval, 2.4–5.8× with CUDA-graph capture** on the toy
+(diagonal-fiber) attention, fp64-exact. **Realistic caveat**
+(`bench_omd2.py`): a dense value projection forces the *dense fiber*
+(`omd_applym`) whose deferred numerator is ~dv/dim× bigger — at a
+4-head MQA stack the batched executor gives 1.15–1.5× vs generic on
+CUDA but **loses to eager/Inductor everywhere** (Inductor 5–20×).
+omd's value is semantic (output stays affine in h0), not raw speed.
+MHA/sdpa don't fire omd at all — no commute law for
+`reshape`/`transpose` through `apply`, and `_check_om_elem_aff`
+vetoes rank-4 batched maps (bindings already support them).
 
 ## Full measurements
 

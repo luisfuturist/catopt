@@ -162,7 +162,9 @@ def _select_index(term: Op) -> tuple[Any, int, int] | None:
     ``select(x, arg1=dim, arg2=i)`` shape torch.export emits for
     ``x[i]`` indexing.
     """
-    if term.op not in ("select", "getitem") or len(term.args) != 1:
+    if not isinstance(term, Op) \
+            or term.op not in ("select", "getitem") \
+            or len(term.args) != 1:
         return None
     dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
     idx = term.attrs.get("arg2", term.attrs.get("index"))

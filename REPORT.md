@@ -193,6 +193,12 @@ This is the honest negative the kill-gates were for.
 
 ## 11. Honest limits
 
+- **omd at realistic scale** (`bench_omd2.py`): MQA fires
+  (`omd_applym`) but the dense-fiber numerator is ~dv/dim× oversized —
+  batched executor only 1.15–1.5× vs generic on CUDA, loses to
+  Inductor 5–20× everywhere. MHA/sdpa don't lift at all (no
+  reshape/transpose-through-`apply` law; `_check_om_elem_aff` vetoes
+  rank-4 batched maps — fixable). Semantic value real, speed not.
 - `model_bound` propagates site bounds via per-op Lipschitz constants
   — **known unsound for spectral sites at activation positions**
   (low-rank `eps_lr` members: it misses the ‖activation‖ factor;
