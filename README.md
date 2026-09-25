@@ -1,610 +1,190 @@
 # catopt
 
-**A verified search engine over equivalent computational architectures.**
+**A verified search engine over faster, provably equivalent versions of
+your model.**
 
-Given a specification of what a computation *means* (a PyTorch model),
-catopt automatically discovers semantically-equivalent architectures —
-scans, chunked/streaming attention, fused projections, resolvent
-closed-forms — attaches a replayable equivalence certificate to each,
-and selects the fastest implementation for the target deployment regime.
-
-```text
-semantic program → equivalent architectures → verify → cost-select
-```
-
-The split is deliberate: **discovery and verification are
-hardware-independent** (laws and certificates don't know the GPU);
-**selection is target-dependent** through a calibrated cost model. The
-same equivalence space serves every backend — discover once, optimize
-per target.
-
-`catopt` translates PyTorch models into a typed symmetric-monoidal IR,
-explores semantics-preserving rewrites with an e-graph, extracts a
-lower-cost program, and lowers it back through
-`torch.compile`/TorchInductor. Every comparison below uses the same
-model, weights, backend, and inputs — only the graph representation
-differs.
-
-**The weights are part of the program.** Parameters are `Param`
-leaves in the same term language as compute: a param that no
-extracted member references drops from the state dict automatically.
-Composition, tying, slice-sharing, and weight folding are the same
-event — *a param becomes unreachable in the extracted program → the
-weights file shrinks*.
+catopt takes a PyTorch model, searches the space of semantics-preserving
+graph transformations, and returns a faster module with a replayable
+equivalence certificate — then hands it to `torch.compile` so Inductor
+does the codegen either way.
 
 ```text
 PyTorch model
-    → torch.export
-    → typed CatOpt IR                    (1-morphisms)
-    → e-graph / equality saturation      (2-morphisms as data)
-    → coherence stratification           (3-morphisms computed, not stored)
-    → cost-based extraction + certificate
-    → executable PyTorch module
-    → torch.compile / TorchInductor
-    → benchmark + equivalence check
+  → torch.export              (the graph, typed)
+  → e-graph saturation        (equivalent programs, enumerated)
+  → cost-based extraction     (the cheapest one, for your hardware)
+  → verified module           (certificate replayed, fp64-checked)
+  → torch.compile / Inductor  (same backend, fair fight)
 ```
-
-## The claim
-
-> A program optimizer's reachable set is bounded by its semantic
-> language, not by its search strategy.
-
-Tensor-level IRs (and pattern-matching compilers like Inductor) can only
-express rewrites over ops. `catopt` **lifts programs into semantic
-carriers** — monoids, diagonal maps, online-softmax states — where the
-*same associativity law* reaches structures the op-level language
-provably cannot. This is measured, not asserted:
-
-- An unrolled LTI recurrence `h_t = A h_{t-1} + x_t` under pure
-  matmul/add laws plateaus at **1.5·T critical-path depth** — the
-  balanced scan is unreachable because the pair (partial-product,
-  partial-sum) is a cross-class object no term law synthesises.
-- Lift the steps into the **affine-map monoid** `aff(A,b)` and *the same
-  associativity law alone* reaches the balanced Blelloch tree:
-  **depth 2T → ~2·log₂T**, fp64-exact.
-- The online-softmax monoid `om(m,l,a)` derives **FlashAttention's
-  combine as a law**: `softmax(q·cat(kᵢ)ᵀ)@cat(vᵢ)` →
-  `om_apply(⊕ᵢ om_elem(...))` falls out of homomorphism + associativity,
-  with no `flash_attention` rule written.
-
-The contribution is a **discovery engine**: laws in, verified +
-certified + measured transforms out — including structures whose
-*derivation* is emergent even when the destination is practitioner-known.
-
-## Mathematical foundations
-
-The category theory is load-bearing, not decoration — it determines
-what is *reachable*:
-
-- **Symmetric monoidal structure** — ops are morphisms; the pairing
-  pass is the product law `⟨f₁,…,f_k⟩ = (×fᵢ)∘Δ` applied as a
-  diagram-level rewrite, not a consumer-side pattern match.
-- **Monoid objects as carriers** — `aff`, `aff_diag`, `om` are monoid
-  objects; parallel scans and chunked attention fall out of
-  homomorphism + associativity, not handwritten rules.
-- **Traced monoidal category** — `trace` carries the Joyal–Street–
-  Verity axioms (vanishing, superposing, sliding, tightening, yanking)
-  as rewrite rules; feedback becomes a closed-form resolvent.
-- **Higher morphisms** — 2-cells are proof objects (certificates);
-  an e-class is a groupoid of programs; `truncation_level` is
-  n-truncation of the program ∞-groupoid.
-- **Coherence as scheduling** — Mac Lane's theorem operationalized:
-  contractible law-spaces are canonicalized, never searched
-  (the ~5,700× enode reduction).
-- **Completion as rule synthesis** — Knuth–Bendixson critical-pair
-  closure over the 2-cells; the law set grows its own lemmas.
-
-## Semantic carriers
-
-Each carrier is a monoid object in the IR; lifting and lowering rules
-connect it to the tensor domain. Associativity in the carrier is what
-produces the parallel/decomposed forms.
-
-| Carrier | Maps | Discovers | Wall-clock |
-|---|---|---|---|
-| `aff(A,b)` dense affine | `h ↦ Ah+b` | Blelloch parallel scan | **6.3×** (CUDA-graph, T=64) |
-| `aff_diag(a,b)` diagonal affine | `h ↦ a⊙h+b` | elementwise scan (Mamba-faithful SSMs); unit introduction `affd_lift_unit` also lifts *additive* accumulations — cumsum, running stats, linear-attention KV state | **4.4×** (CUDA-graph, T=64) |
-| `om(m,l,a)` online softmax | running max/exp-sum/numerator | chunked/flash attention, streaming KV | memory-feasibility win (below) |
-| `trace^U` feedback | `Tr(f) = P + Q(I−S)⁻¹R` | channel splitting, loop-boundary sliding | iterative↔closed forms |
-| tensor domain | — | folds, pairing, reassociations | up to **8×** |
-
-Executors (`scan_lower.py`, `om_lower.py`) lower discovered trees into
-level-batched GPU kernels: `aff_compose` becomes a batched matmul per
-tree level via homogeneous-matrix packing `[[A,b],[0,1]]`; the diagonal
-tree batches as elementwise ops; om trees batch `om_elem` scores into a
-single `q@Kᵀ` GEMM.
-
-## Higher morphisms
-
-**2-morphisms are first-class data; 3-morphisms are computed, not
-stored.** The e-graph is a truncation of the program ∞-groupoid, with a
-configurable `truncation_level`:
-
-- **Level 1 — pure quotient.** E-classes only; minimal memory.
-- **Level 2 — witnesses.** Every `union` records a `ProofEdge`
-  (rule + substitution); `certificate(src,dst)` reconstructs an ordered
-  positional derivation and `verify_certificate` replays it on real
-  terms — *derivational* equivalence, not numerical spot-checks.
-  Non-local passes attach a **pointwise witness rule** per offer
-  (`union(witness=…)`), so even `trace_lift`'s constructed members
-  replay standalone under `strict=True`. ~4–10% overhead.
-- **Level 3 — lazy coherences.** `all_proofs`/`coherent_paths` enumerate
-  *alternate derivations* between two terms on demand (bounded BFS over
-  the term-rewriting space). Nothing is stored: coherence is a property
-  of the rewriting space, computed when asked, then thrown away.
-
-**Coherence stratification eliminates the saturation wall.** Laws are
-classified *coherent* (assoc/comm/id — the spaces they generate are
-contractible, so a canonical form suffices) vs *contentful*
-(distribute/lift/fold — saturate these). `canonicalize` computes normal
-forms eagerly — the Blelloch shape *is* the canonical form — then only
-contentful laws run. On the T=8 recurrence: **2,011,701 → 351 enodes
-(~5,700×), 182s → 0.05s**, same fp64-exact result. This is Mac Lane
-coherence operationalized as a scheduler.
-
-**Feedback is first-class.** `trace^U` (catopt/trace.py) adds the
-traced-monoidal structure: `Tr^U(f) = P + Q(I−S)⁻¹R` — the linear
-fixpoint/resolvent — with all five Joyal–Street–Verity axioms as
-shape-checked rewrites (vanishing, superposing, sliding, tightening,
-yanking). `tr_superpose` splits a joint loop over independent
-recurrence channels into parallel-schedulable traces; `tr_slide`
-moves maps across the loop boundary; `tr_expand` bridges any trace
-into ordinary matmul/add/inv algebra — the same carrier laws then
-apply. Recurrences are traces *exactly* via nilpotent block-shift
-encoding: `Tr(F)·[x;h₀]` ≡ the unrolled loop ≡ the affine-scan fold.
-`trace_lift.lift_scan_to_trace` is the non-local bridge — it
-recognizes unrolled-recurrence spines (raw `add(mul…)` chains or
-`apply`/`applyd` carrier trees) in the e-graph and constructs `F`
-directly, unioning `matmul(trace(F, T·d), vec)` into the recurrence's
-e-class. Post-lift, the axioms fire on *real* recurrences: channel
-splitting produces `bdiag(trace(F₁), trace(F₂))`, `tr_expand` reaches
-the resolvent closed form — fp64-exact.
-
-**Rules synthesize themselves.** `meta.synthesize_rules` performs
-critical-pair completion: compose rule pairs on seed terms, validate
-each candidate by replay + fp64 evaluation. Guarded rules participate
-soundly — parent `check`s re-express on the derived rule's
-substitution, `derive` outputs flow as namespaced placeholders — so
-**all 109 rules** now feed synthesis. Guarded compositions prefer
-**seed witnesses** (`seed_terms=`): bindings mined from real terms the
-parents actually fired on — tight side conditions (sdpa_fold's Const
-scale, mask shapes) that bounded random instantiation can't satisfy
-emit only via seeds. Fed `SCAN_LAWS \
-{aff_lift_step}`, it emits the unfolded equivalent of a previously
-hand-written derived rule; om/attention lemmas (the chunked-attention
-homomorphism, score-concat lift, mask-distribution composites) derive
-themselves. Certified composite paths distill back into the law set —
-the meta-optimization loop is closed. `rulecache.py` persists
-synthesized rules (patterns + provenance as JSON; composed guards
-rebuilt from parents at load — callables never pickled), keyed by
-sha256 of ruleset+seeds+params: **58× faster reload**.
-
-## The mechanism: the product law is non-local
-
-`⟨f₁,…,f_k⟩ = (f₁ × … × f_k) ∘ Δ` — pair morphisms by shared domain. A
-term-local `lhs → rhs` rewrite can only express this through a consumer
-pattern (`mul(l₁,l₂)`, `sdpa(h₁,h₂,h₃)`), which is why pattern-matching
-compilers need a handwritten rule per consumer shape and still cannot
-generalize.
-
-`pair_shared_input_linears` is a **diagram-level pass**: it groups
-`linear` e-nodes by input e-class and offers each member
-`splitᵢ(linear(x, cat(W₁,…,W_k)))` — arbitrary arity, asymmetric output
-dims, consumer-agnostic. It subsumes the specialized `swiglu_fuse`,
-`qkv_fuse`, `qkv_fuse_asym`, `parallel_mul_fuse` rules; on a PaLM-style
-parallel block it produces **one GEMM feeding five uneven split views**,
-a shape no term-local rule combination reaches. Extraction stops being
-locally decomposable — `extract_paired` performs coordinated extraction
-and keeps the result only if true DAG cost beats the greedy term.
-
-## Results
-
-Measured on an RTX 2050 (per-iteration `cuda.synchronize`, interleaved
-baseline/optimized, lower quartile of 30 reps) and CPU. All rows
-verified semantically equivalent.
-
-| Transform family | Examples | GPU | CPU |
-|---|---|---|---|
-| **FLOP-reducing** (reassociation, weight merging, factorization) | MatrixChain, ParallelLinear, DeepParallel | **1.49–2.51×** | **1.60–6.22×** |
-| **Attention fold** | `softmax(masked qk^T·s) @ v` → `sdpa(is_causal)` — nanoGPT eager path | **1.8–4.6×** eager; **1.1–2.5×** under Inductor | — |
-| **Asymptotic reassociation** | LinearAttention `(QK^T)V → Q(K^TV)`: O(T²d) → O(Td²) | **8.0×** at T=2048, d=64 | — |
-| **Parallel-scan discovery** (affine monoid) | `h_t = A h_{t-1} + x_t` → balanced Blelloch tree; fires on input-dependent selective SSMs | **2.8×** batched; **6.3×** CUDA-graph | — |
-| **Diagonal-affine scan** | Mamba-faithful `a_t⊙h + b_t⊙x_t`, O(d)/compose | **4.4×** CUDA-graph at T=64 | — |
-| **Streaming / bounded-memory attention** (om monoid) | KV streams beyond VRAM: 89 MiB flat at 2M keys; O(1)/step incremental state | **260×** vs sdpa-recompute at 65k cache | — |
-| **Diagonal absorption** | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | **1.12×** at T=512 | — |
-| **Same-FLOP pairing** | SwiGLU gate/up, QKV, GQA, 5-way ParallelBlock | parity compute-bound; **1.19×** launch-bound | ~1.0× |
-| **Same-FLOP conv pairing** | 4× parallel conv1×1 branches | **1.24–1.33×** at all batch sizes | — |
-| **Norm folding** | NormLinear | 0.98× (controlled negative) | 0.90× |
-
-**Headline capability:** pointed at unmodified community code —
-Karpathy's `llama2.c` — the pipeline automatically rediscovers
-`MergedColumnParallelLinear` (w1/w3 fusion) and `QKVParallelLinear`
-(asymmetric wq/wk/wv fusion), the transforms vLLM and TensorRT-LLM
-implement by hand. Verified to float noise.
-
-**End-to-end** (`bench_e2e.py`): a 2-layer PaLM-style stacked model
-(2.2M params, fp32, RTX 2050) runs **1.40× vs eager and 1.24× vs
-Inductor** through the full pipeline — the pairing pass fuses all
-five shared-input projections per block into single GEMMs that
-Inductor alone does not create. Monolithic saturation now scales —
-incremental matching (dirty frontier), member-resolution memoization,
-and bounded expansive-rule saturation put a 4-layer model at **768s →
-4.9s** and reach ≥8 blocks (fp64-verified); `optimize_compositional`
-remains the deeper-depth path — it captures each block's input via
-forward hooks, optimizes blocks independently, and recomposes with
-per-block verification and automatic fallback.
-
-**Hybrid models compose carriers.** On a Jamba-style SSM→attention
-block, both carriers coexist in one e-graph (444 enodes, saturates in
-0.7s) and extraction produces terms mixing `applyd` and `om_apply`
-(fp64-exact). Cross-domain transforms fire unaided: `assoc_linear`
-fused attention `out_proj` into the *next* SSM's input projections —
-an inter-layer weight merge across the carrier seam.
-
-## Crossing the carrier seam (`xcarrier.py`)
-
-The deepest question: can a *sound* law move computation between
-carrier families? The answer splits cleanly:
-
-**The value/readout side crosses.** A carrier application is affine in
-its initial state, so linear maps push through affine evaluation —
-the scan analogue of the traced category's tightening axiom:
-
-```text
-matmul(E, applyd(aff_diag(a,b), h)) = applyd(aff_diag(Ea, Eb), h)
-matmul(W, apply(aff(A,c), h))      = apply(aff(WA, Wc), h)
-linear(applyd(aff_diag(a,b),h), W) = apply(aff(a⊙W, bW), h)  # promotion
-```
-
-The om numerator `e @ v` *is* such a readout: `om_elem(s, a⊙h+b)`
-fuses into `om_elem_affd(s,a,b,h)` — the scan folds **inside** the
-softmax element and composes under the ordinary om homomorphism.
-Stronger: the deferred `omd` carrier keeps the whole chunked-attention
-tree affine in `h` — step state `(m, l, fa, fb)` — so *attention over
-scanned values is one recurrence* (the exact S4/RWKV-style form), via
-the non-local `omd_tree_lift` pass under a global shared-state guard.
-And `gather_applyd_stack` collapses `stack(applyd(f_i, h))` into one
-application of the stacked map — "the sequence a scan emits is one map
-applied to h₀". All offers carry pointwise witnesses.
-
-**The score side is a wall — measured, not assumed.** With `q,k` both
-affine in `h`, `s = q·k` is *quadratic* in `h` — no affine carrier
-captures it, and `exp∘quadratic` has no finite carrier at all.
-Softmax ≠ linear attention exactly; the gap is quantified concretely.
-The 29-rule `XC_LAWS` set is opt-in (`CARRIER_X_LAWS`): bidirectional
-pairs double the rule set and blow up default saturation — the
-non-local passes run regardless.
-
-**omd runtime** (`omd_lower.py`): the `omd_apply` member *is* what
-`flops_cost` selects at every size. Through the generic evaluator it
-ran 0.54–0.71× slower than eager (O(T²) carrier maps unrolled as IR
-nodes); `to_batched_omd_module` computes the coefficient maps with a
-blocked associative scan + level-batched compose — **1.2–3.3× vs
-generic eval, 2.4–5.8× with CUDA-graph capture** on the toy
-(diagonal-fiber) attention, fp64-exact. **Realistic caveat**
-(`bench_omd2.py`): a dense value projection forces the *dense fiber*
-(`omd_applym`) whose deferred numerator is ~dv/dim× bigger — at a
-4-head MQA stack the batched executor gives 1.15–1.5× vs generic on
-CUDA but **loses to eager/Inductor everywhere** (Inductor 5–20×).
-omd's value is semantic (output stays affine in h0), not raw speed.
-MHA now lifts: `xc_reshape_apply`/`xc_transpose_apply` commute view
-ops through carrier applications and rank-4 batched maps are accepted
-(fp64-exact, tests/test_xcarrier_mha.py). The omd member lands nested
-inside the attention class, not at root.
-
-## Full measurements
-
-### GPU (RTX 2050, synced timing)
-
-| Program | Equiv | Inductor (ms) | CatOpt (ms) | Speedup |
-|---|---:|---:|---:|---:|
-| MatrixChain b=4096 | 8e-09 | 0.188 | 0.126 | **1.49×** |
-| ParallelLinear b=4096 | 3e-06 | 1.763 | 0.720 | **2.45×** |
-| DeepParallel b=4096 | 2e-06 | 5.420 | 2.159 | **2.51×** |
-| SwiGLU b=4096 / b=128 | 0.0 / 3e-07 | 12.51 / 0.780 | 12.49 / 0.751 | 1.00× / 1.04× |
-| Attention fused QKV b=64 T=256 | 0.0 | 23.71 | 24.47 | 0.97× |
-| GQA fused QKV b=64 T=256 | 0.0 | 17.42 | 17.99 | 0.97× |
-| TransformerBlock b=64 T=512 | 0.0 | 169.8 | 174.8 | 0.97× |
-| ParallelBlock b=64 T=256 (5 proj → 1 GEMM) | 5e-07 | 73.95 | 75.12 | 0.98× |
-| **ParallelBlock b=4 T=64 (launch-bound)** | 5e-07 | 1.193 | 1.004 | **1.19×** |
-| NormLinear b=256 | 8e-06 | 4.29 | 4.38 | 0.98× |
-
-Kernel-count evidence (`torch.profiler`, 10 forwards of an attention
-block): original issues 40 GEMM + 10 SDPA calls; optimized issues
-**20 GEMM + 10 SDPA** — fused QKV halves the GEMM count mechanically.
-
-### CPU
-
-| Program | Equiv | Inductor (ms) | CatOpt (ms) | Speedup |
-|---|---:|---:|---:|---:|
-| MatrixChain b=128 / b=4096 | 7e-09 / 5e-09 | 0.048 / 0.240 | 0.030 / 0.039 | **1.60× / 6.22×** |
-| DeepParallel b=4096 | 2e-06 | 1.362 | 0.451 | **3.02×** |
-| ParallelLinear b=4096 | 3e-06 | 0.878 | 0.393 | **2.24×** |
-| SwiGLU b=128 / b=4096 | 0.0 / 6e-08 | 2.800 / 94.93 | 2.642 / 97.18 | 1.06× / 0.98× |
-| Attention QKV b=64 T=256 | 3e-08 | 157.1 | 166.7 | 0.94× |
-| NormLinear b=256 | 3e-06 | 39.91 | 44.52 | 0.90× |
-
-### Community code, unmodified (llama2.c)
-
-| Module | Found | Verified | GPU b=4 | GPU b=64 |
-|---|---|---|---|---|
-| `FeedForward` | w1/w3 → 1 GEMM + 2 splits | 1.3e-07 | 1.04× | 1.06× |
-| `Attention` | wq/wk/wv → 1 GEMM + uneven splits | 3.3e-07 | 1.00× | 0.97× |
-| `TransformerBlock` | 4 pairing groups in one pass | 4.8e-07 | 0.97× | 0.98× |
-
-### Real trained checkpoints (llama2.c `.bin`, `bench/stories15m_bench.py`)
-
-The full pipeline — real downloaded weights, `optimize_compositional`,
-`torch.utils.benchmark`, CUDA — verifies and runs end-to-end:
-
-| Checkpoint | Blocks | Max abs diff | Eager | CatOpt | Inductor | CatOpt+Inductor |
-|---|---|---|---:|---:|---:|---:|
-| stories15M (288-d, T=128) | 8/8, all QKV+gate·up paired | 2.6e-05 | 3.16 ms | 3.09 | 3.01 | 3.02 |
-| stories110M (768-d, T=128) | 14/14, all paired | 1.9e-05 | 17.5 ms | 17.3 | 17.1 | 17.0 |
-
-**Honest verdict: parity, not a win.** The transform lands on real
-weights — every block's QKV and gate·up projections fuse into single
-GEMMs — but at these dimensions the consolidation is inside the noise;
-the launch-bound/GEMM-dominated regime boundary above is what decides.
-The value demonstrated here is that a real trained SLM survives the
-pipeline intact: exported, saturated, paired, lowered, verified, and
-Inductor-compilable — without fallback.
-
-**The launch-bound hypothesis was falsified — twice.** First on
-blocks: RoPE + SDPA + norms + residuals contribute ~40 kernels per
-layer, so fusing 3 GEMMs saves ~2 of ~40. Then on whole real
-checkpoints (`bench/decode_bench.py`, B∈{1,4,16} × T∈{16,64,256},
-true-batched forward): pairing *loses* 4–15% precisely in the most
-launch-bound cells (B=1 T=16/64) — split-view copies cost more than
-the ~2 saved launches/block — and *wins* ~4% only at the largest
-cells (B=4 T=256, B=16 T=64), where the effect is fused-GEMM shape
-efficiency, not launch amortization. Profiler confirms the mechanism
-is real (−37% GEMM launches, −9% total kernels on stories110M) — it
-just doesn't pay at these sizes. **Conv pairing is the exception** —
-1.24–1.33× at every size measured, because Inductor does not fuse
-cuDNN conv calls.
-
-**Three nonlinear-boundary transforms.** (a) *Attention fold* —
-`softmax(masked_fill(qk^T·s, mask, −inf)) @ v` is literally SDPA's
-semantics, so the fold is sound for *any* mask; a post-extraction pass
-evaluates the (parameter-only) mask and replaces it with
-`is_causal=True` when exactly lower-triangular. On unmodified nanoGPT:
-**4.6× vs eager, 2.5× under Inductor at T=2048** — Inductor's 17 SDPA
-patterns miss the `masked_fill` form. (b) *Diagonal absorption* —
-`unsqueeze→expand→reshape` before SDPA is the copy map Δ;
-`gqa_absorb_repeat` pushes it inside via `enable_gqa`. (c)
-*Linear-attention reassociation* — `(QK^T)V → Q(K^TV)`, **8.0× at
-T=2048**, fp64 rel err 8e-16.
-
-**The equivalence class is enumerable.** `discover_alternatives(model,
-x)` returns the top-k cheapest *distinct* members of [G] with
-`rule_fires` provenance and `diverse_classes` — e-classes holding
-structurally different but provably-equal programs. Novelty levels:
-
-- **Level 1–2** (known transform / generalization): fused QKV, merged
-  gate/up, conv pairing, `enable_gqa`, flash fold — all on unmodified
-  community code.
-- **Level 3** (emergent composition): "fused QKV with internal
-  head-broadcast" (product law ∘ diagonal absorption); `out_proj`
-  fused into the next SSM's projections in the hybrid model.
-- **Level 4** (transform nobody encoded): not yet — every *result*
-  remains practitioner-known even when the *derivation* is emergent.
-  The machinery where one could appear — monoid domains, completion,
-  certificates, frontier enumeration, cross-carrier models — is built.
-
-**The calibrated cost model predicts the crossover.** `roofline_cost`
-constants are measured on the target — `calibrate.calibrate()` measures
-peak FLOPS / bandwidth / launch overhead on any device and
-`roofline_cost_for(TargetProfile)` yields a per-target cost fn (this
-machine re-measured: 3.29 TFLOPS / 93.6 GB/s / 3.4 µs vs the original
-hardcoded 2.5 / 89 / 8.7). Predicted vs measured direction agrees on
-all tested cases; at
-the boundary the magnitude is right (ParallelBlock b=4: predicted 1.08×,
-measured 1.08×). The pipeline *accepts* pairing where it wins and
-*declines* it on real blocks where it loses — per-shape, cost-driven.
-
-## What the experiments establish
-
-- **Inductor genuinely misses these transforms** — measured, not
-  assumed (up to 3.35× headroom on DeepParallel, within 11% of a
-  hand-derived reference). They require creating new parameters, which
-  is outside kernel fusion's capability class.
-- **Value splits cleanly by regime.** FLOP-reducing laws pay on every
-  backend. Same-FLOP pairing pays where launches dominate and GEMMs
-  dominate the kernel count. The cost model, not a hard rule, decides
-  per shape.
-- **NormLinear is the controlled negative**: Inductor already fuses
-  `x·rms·wn` into the GEMM's input read, so graph-level folding loses —
-  restructuring cannot promise a bandwidth win that intra-kernel fusion
-  already delivers.
-- **The verifier is load-bearing.** It caught four real bugs: a matcher
-  that didn't enforce repeated-metavariable equality (would have
-  emitted a false proof), broadcast-shape misinference that fabricated
-  a 1.98× "win", unchecked scale-metavariable binding that produced a
-  well-typed but semantically wrong program (diff 9.83), and a
-  benchmark that measured CUDA submission time instead of execution
-  (fabricating 1.10–1.20× "wins"). All regression-tested.
-- **Saturation scaling is now understood and managed** — commutativity
-  is the explosive law (permutation space); coherence stratification
-  canonicalizes it rather than searching it. The profitable paths at
-  scale are the O(n) pairing pass, stratified law sets, and monoid
-  carriers that move structure out of the search entirely.
-
-## Honest limitations
-
-- **Nothing found yet is novel to practitioners.** Fused QKV, merged
-  gate/up, `enable_gqa`, flash attention, and the linear-attention
-  identity are all known — the contribution is automatic discovery +
-  formal verification + cost-driven choice, including transforms with
-  asymptotic impact.
-- **Inference-only.** Weight folding destroys per-layer gradients; all
-  wins are forward-pass. Backward-graph rewriting via joint
-  (AOTAutograd) graphs is unimplemented future work.
-- **Chunked attention loses to fused sdpa head-to-head** whenever K,V
-  fit on device (sdpa is already score-bounded; ~1.8–2× latency win for
-  sdpa). The om win is *feasibility* — `StreamingOMModule` evaluates the
-  om tree as a bounded-memory fold (~57 MiB transient flat in T_kv,
-  verified identical to the hand-written benchmark fold) and
-  `om_step_qk` gives O(block) incremental state updates (~40× vs
-  sdpa-recompute at 65k cache, CUDA-graph capturable). The fixed-query
-  incremental mode does not model per-token decode.
-- **Mask synthesis is out of IR scope** — `masked_fill`/`add`/`where`
-  distribute over concat with positional offsets (`OM_MASK_LAWS`:
-  block i's mask = `split` columns `[o_i, o_i+K_i)`), so causal chunked
-  attention verifies fp64-exact; but no `arange`/`tril` generators
-  exist, so masks must arrive materialized (buffer/param/computed —
-  all real export idioms). `SDPA_CAT_LAWS` also chunk
-  `sdpa(is_causal=True)` over concatenated K/V — the implicit mask
-  materializes as a `cmask` op and `split` carries the offsets;
-  an explicit `attn_mask` operand still doesn't chunk.
-- **SDPA-fold coverage is bounded** — mul/div score scaling,
-  masked_fill and additive masks, optional eval-mode dropout;
-  `is_causal` requires the mask to be parameter-only and exactly
-  lower-triangular.
-- **The FLOP-reducing wins are degenerate cases** — linear-only DAGs
-  collapse to one linear, which a domain expert writes in one line.
-  Demonstrated: Inductor misses them and hand derivation is error-prone
-  (the verifier caught transpose-order mistakes twice).
-- **Pairing covers `linear` and `conv2d`** — `matmul`+bias, grouped
-  convs, and learned-scale norms are not yet pairable.
-- **Reassociation applies only to unnormalised attention** — softmax
-  blocks the `(QK^T)V → Q(K^TV)` law.
-- **All measurements are on an RTX 2050 (4 GB)** — `calibrate()` now
-  makes re-targeting mechanical, but magnitudes should not be
-  extrapolated to datacenter hardware.
-
-## Optional: certified-approximation toolkit (not core)
-
-**An optional side-toolkit, off by default** — `eps.py`, `act_eps.py`,
-`ibp.py` run only when `optimize_model(eps_rtol=…)` is set or the
-functions are called directly. On weights the premise was **falsified**:
-norm bounds measure energy, not quality — bounded compression destroyed
-task quality at every rank probed on real checkpoints. It survives only
-where a norm bound *is* the contract — activation paths
-(int8-KV-cache-style), verification, certified deployment — never as a
-weight-compression feature.
-
-The machinery itself: exact laws preserve semantics; **ε-laws preserve
-semantics up to a certified bound**. `Rewrite.error_bound` marks a
-bounded rewrite; certificates accumulate per-step bounds (triangle
-inequality) and report `cert.error_bound` / `cert.exact`.
-
-- `eps.low_rank_params` — truncated-SVD at `linear` sites:
-  `linear(x,W) → linear(linear(x,V_r), U_rΣ_r)`, bound `σ_{r+1}`
-  (exact Eckart–Young).
-- `eps.low_rank_gather` — low-rank at `embedding` sites:
-  `embedding(W,idx) → matmul(embedding(U_r,idx), V_r)` — useful where
-  a norm bound is the contract, not for task quality.
-- `eps.kron_linear_params` — sum-of-Kronecker as a program of K
-  composed maps; Frobenius bound via the rearranged-SVD isometry.
-- `eps.quant_params` — quantization-as-rewrite:
-  `W → mul(float(W_int8), s)`, bound `(s/2)·√n`; `per_channel=True`
-  gives row-wise scales (same bytes, tighter quality, bound kept);
-  `by_bytes` pricing sees the width reduction.
-- `eps.model_bound` — output-level certificates: site bounds ×
-  Lipschitz path sensitivities. **Caveat**: unsound for low-rank
-  (activation-position) sites — `ibp.tight_model_bound` is the sound
-  one (118×→3× tightness, flags `spectral_unsafe`).
-- `act_eps.act_quant` / `act_eps.act_low_rank` — dynamic
-  quantize/bottleneck wraps on activation edges (int8-KV-cache-style
-  contracts), calibrated bounds via `act_eps.calibrate`. Activation
-  side is where a norm bound genuinely is the contract.
-- `param_bytes_cost` (`by_bytes`) — prices stored parameter bytes;
-  `extract_best_bounded(max_error=…)` — extraction under an ε budget.
-- Exact sharing (`share_duplicate_params`, `share_duplicate_param_slices`)
-  is **core**, not part of this toolkit — it runs in the default
-  pipeline and is ε=0 exact.
-
-## Out of scope (falsified)
-
-**Weight-space compression is closed.** Every hypothesis class was
-probed on real trained checkpoints and came back negative — low-rank,
-Kronecker-sum, Toeplitz/displacement-rank, equivariance, cross-layer
-sharing/alignment, learned displacement operators, polynomial
-identities: all full-rank or generic. Trained weights are entropy-dense,
-and where approximate structure does exist it does not preserve task
-quality — norm bounds are not quality bounds. The measurements and the
-decision record live on the `project` orphan branch
-(`adrs/0001-weight-space-structure-falsified.md`,
-`retros/weight-as-programs.md`).
-
-## Roadmap
-
-- **Regime-adaptive architecture**: one weight set, multiple certified
-  forms — recurrent (decode), parallel-scan (train/prefill), chunked
-  (bounded memory). Extract the Pareto frontier across cost models and
-  dispatch per deployment regime.
-- **Backward-graph rewriting**: joint fwd+bwd (AOTAutograd) graphs —
-  the only path to training-side wins; weight-merging laws currently
-  destroy gradients.
-- **More weight-preserving dualities**: RepVGG-style branch merging,
-  conv↔GEMM, head reshaping, MHA↔GQA directions — each a new
-  architecture over the same parameters.
-- **Joint graph+parameter optimization**: the optimizer rewrites the
-  parameter *realization*, not just the graph over it —
-  `assoc_linear(_bias)` composes `W₂(W₁x+b₁)+b₂` into
-  `linear(x, W₂W₁, W₂b₁)+b₂`, `_fold_weight_chains` materializes the
-  fused tensors, `_build_params` registers only what the extracted
-  term references, and eliminated subgraphs drop their weights from
-  the state dict (a biased `Linear(32→128)→Linear(128→32)` chain →
-  **87% smaller** weights file, fp64-exact; `param_report` audits it).
-  Exact structure — `share_duplicate_params` (tying) and
-  `share_duplicate_param_slices` (head-block dedup) — is selected
-  under the `param_bytes_cost` storage axis.
-- **Mask synthesis**: `attn_mask` chunking landed via the `attnbias`
-  coercion (float/bool masks, one law); generating masks from
-  positions (`arange`/`tril`) remains open.
-- **Trace beyond linear bodies**: affine/nonlinear loop bodies need
-  constant-1 augmentation or function-valued objects; delay-loop
-  trace with init state needs a stream-function category.
-- **Guarded-rule synthesis**: ✅ done — all 109 rules participate in
-  completion; om/attention lemmas derive themselves.
-
-## Repository layout
-
-| Path | Role |
-|---|---|
-| `catopt/ir.py` | Typed term algebra, symmetric-monoidal generator registry |
-| `catopt/egraph.py` | Union-find, e-matching, saturation, `truncation_level` (1–3), proof-carrying merges (`certificate`/`verify_certificate`/`coherent_paths`), DAG-aware + coordinated extraction |
-| `catopt/meta.py` | Coherence stratification (`canonicalize`, `stratified_run`) + critical-pair rule synthesis (`synthesize_rules`) |
-| `catopt/rules.py` | Laws + `pair_shared_input_linears` non-local pass |
-| `catopt/cost.py` | `count_cost`, `flops_cost`, `launch_aware_cost`, `roofline_cost`(+`_for(profile)`), `depth_cost`, `dag_cost` |
-| `catopt/calibrate.py` | `TargetProfile` + `calibrate()` — measure cost constants on any device |
-| `catopt/rulecache.py` | Persistent cache for synthesized rules (58× reload) |
-| `catopt/torch_bridge.py` | `torch.export` → IR, IR → `IRModule`, compile-time weight folding |
-| `catopt/optimize.py` | `optimize_model` pipeline with equivalence verification |
-| `catopt/om.py` | Online-softmax monoid laws (chunked/streaming attention) |
-| `catopt/om_lower.py` | Level-batched + streaming chunked-attention executors, incremental om state, CUDA graphs/compile |
-| `catopt/scan_lower.py` | Level-batched parallel-scan executor (dense + diagonal carriers) + CUDA graphs |
-| `catopt/trace.py` | Traced-monoidal structure: `trace`/`bdiag`/`parl`/`eye`/`cswap`/`inv` + JSV axioms |
-| `catopt/trace_lift.py` | Non-local lift: unrolled recurrences → `trace(F)` via nilpotent block-shift |
-| `catopt/xcarrier.py` | Cross-carrier laws + `omd` deferred carrier: readouts exit scans, scans fold inside om elements |
-| `catopt/regime.py` | Regime-adaptive extraction: Pareto frontier of certified forms + `RegimeDispatch` |
-| `catopt/models/` | Benchmark modules (llama2.c blocks, `ssm.py` selective/diagonal SSMs, `hybrid.py` SSM+attention) |
-| `catopt/eps.py` + `act_eps.py` + `ibp.py` | Optional certified-approximation toolkit — opt-in, off by default |
-| `main.py`, `bench_gpu.py`, `bench_e2e.py` | Demos and benchmark drivers |
-| `measure_weights.py`, `exact_probe.py` | Weight-structure measurement harnesses |
-| `project/` (worktree) | Orphan `project` branch — ADRs + retrospectives, gitignored on main |
-| `bench/stories15m_bench.py` | Real-checkpoint benchmark: stories15M/110M through the full pipeline, `torch.utils.benchmark` |
-| `bench/decode_bench.py` | Launch-bound regime sweep (B×T cells) on real checkpoints — falsification harness |
-| `tests/` | 572 tests: equivalence, soundness, pairing, carriers, certificates, truncation, hybrid, streaming, masks, synthesis, regimes, trace, cross-carrier, ε-bounds, sharing, compositional, falsification pins |
-
-## Reproduce
 
 ```python
 from catopt.optimize import optimize_model
 
-opt, report = optimize_model(model, example_input)  # verify + extract
-out = opt(x)                        # equivalent, certificate-carrying
+opt, report = optimize_model(model, example_input)
+out = opt(x)          # equivalent to model(x), certificate-backed
+opt = torch.compile(opt)
+```
+
+Deep stacks use `optimize_compositional`, which optimizes each block
+against its captured real input and recomposes with per-block
+verification and automatic fallback.
+
+## What it finds
+
+The transforms are not handwritten recipes — they fall out of the
+equivalence space, then a cost model decides per shape whether to take
+them. All rows verified semantically equivalent (fp64 where stated);
+RTX 2050, synced timing.
+
+| Transform | Example | Result |
+|---|---|---|
+| **Projection pairing** (QKV, gate·up, parallel branches → 1 GEMM) | PaLM-style block, 5 projections fused | **1.24× vs Inductor** end-to-end |
+| **FLOP reduction** (reassociation, weight merging, factorization) | DeepParallel b=4096 | **2.51×** GPU / **3.02×** CPU |
+| **Asymptotic reassociation** | LinearAttention `(QKᵀ)V → Q(KᵀV)`: O(T²d)→O(Td²) | **8.0×** at T=2048 |
+| **Attention fold** | `softmax(masked_fill(qkᵀ·s)) @ v` → `sdpa(is_causal)` | **4.6×** vs eager, **2.5×** under Inductor (nanoGPT, T=2048) |
+| **Parallel-scan discovery** | LTI recurrence → balanced Blelloch tree | **6.3×** CUDA-graph, T=64 |
+| **Diagonal-affine scan** | Mamba-faithful `a⊙h + b⊙x` | **4.4×** CUDA-graph, T=64 |
+| **Streaming attention** | om monoid: O(1) state per KV block | **260×** vs sdpa-recompute at 65k cache; 89 MiB flat at 2M keys |
+| **Conv pairing** | 4 parallel conv1×1 → 1 conv | **1.24–1.33×** all batch sizes |
+| **Diagonal absorption** | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | 1.12× at T=512 |
+
+On unmodified community code — Karpathy's `llama2.c` — it automatically
+rediscovers `MergedColumnParallelLinear` and `QKVParallelLinear`, the
+transforms vLLM and TensorRT-LLM implement by hand.
+
+## Why it finds what Inductor can't
+
+> A program optimizer's reachable set is bounded by its semantic
+> language, not its search strategy.
+
+Tensor IRs rewrite *ops*. catopt **lifts programs into carriers** —
+monoid objects where the same associativity law reaches structures no
+op-level pattern can express:
+
+- **Affine monoid `aff(A,b)`**: an unrolled recurrence
+  `h_t = Ah_{t-1} + x_t` under matmul/add laws plateaus at depth ~1.5T —
+  the balanced scan is unreachable because the partial-product pair is a
+  cross-class object no term law synthesizes. In the carrier, the *same*
+  associativity law produces the Blelloch tree: **depth 2T → ~2·log₂T**.
+- **Online-softmax monoid `om(m,l,a)`**: FlashAttention's combine falls
+  out of homomorphism + associativity — no `flash_attention` rule is
+  ever written.
+- **Product law `⟨f₁,…,f_k⟩ = (×fᵢ)∘Δ`**: `pair_shared_input_linears`
+  groups shared-input projections at diagram level — one GEMM feeding k
+  uneven split views, arbitrary arity, consumer-agnostic. Pattern
+  matchers need a rule per consumer shape; this needs none.
+- **`trace^U`** (traced monoidal structure): recurrences are fixpoints;
+  the Joyal–Street–Verity axioms are rewrites, so loops become
+  closed-form resolvents `P + Q(I−S)⁻¹R`.
+- **Cross-carrier laws** (`xcarrier.py`): readouts push through scan
+  evaluation, scans fold inside softmax elements, and attention over
+  scanned values stays one recurrence — measured where the wall actually
+  is (scores are quadratic in the state; no affine carrier reaches
+  them).
+
+Executors lower discovered carrier trees to level-batched GPU kernels
+(`scan_lower.py`, `om_lower.py`, `omd_lower.py`); the IR carries
+`Param` leaves as first-class terms, so a weight that no extracted
+member references drops out of the state dict on its own — folding,
+tying, and dedup are the same event.
+
+## Verified, not hoped
+
+Every extracted program carries a **certificate**: an ordered,
+replayable derivation of `original → optimized` that
+`verify_certificate` re-checks on real terms — derivational equivalence,
+not numerical spot-checks. Non-local passes attach pointwise witnesses
+so even constructed members replay standalone.
+
+The verifier is load-bearing, not ceremonial. It has caught: a matcher
+that skipped repeated-metavariable equality (a would-be false proof), a
+broadcast-shape misinference that fabricated a 1.98× "win", a
+well-typed but semantically wrong program (diff 9.83), and a benchmark
+measuring CUDA submission time instead of execution. All
+regression-tested.
+
+Saturation scales: coherence stratification canonicalizes the
+contractible law-spaces instead of searching them (2.0M → 351 enodes on
+the T=8 recurrence; 4-layer models 768s → 4.9s; ≥8 blocks monolithic),
+with `optimize_compositional` as the deeper path.
+
+## Where it wins — and where it doesn't
+
+The honest regime map, all measured:
+
+| Regime | Verdict |
+|---|---|
+| FLOP-reducing rewrites (assoc/fold/factorize) | **Wins everywhere** — pure work reduction |
+| Nonlinear-boundary folds (attention fold, reassociation) | **Wins** — up to 8×, asymptotic |
+| Carrier lifts (scans, streaming attention) | **Wins in their regime** — depth & memory, not raw latency |
+| Conv pairing | **Wins** — Inductor never fuses cuDNN calls |
+| GEMM pairing on transformer blocks | **Parity** — ~40 non-GEMM kernels/layer dilute it |
+| Real trained checkpoints (stories15M/110M) | **Parity** — all blocks transform and verify, no win at these sizes |
+| Launch-bound decode cells (B=1, T≤64) | **Loses 4–15%** — split-view copies cost more than saved launches |
+
+Real checkpoints (`bench/stories15m_bench.py`): stories15M and
+stories110M pass the full pipeline — 8/8 and 14/14 blocks optimize,
+QKV + gate·up fuse, outputs verify to ~2e-5 — at parity with Inductor
+(3.0 ms / 17.0 ms both ways). The mechanism is real (−37% GEMM launches,
+profiler-verified); at these dimensions it just doesn't pay. The
+launch-bound hypothesis was falsified twice — on blocks and on whole
+models (`bench/decode_bench.py`).
+
+**Controlled negative**: NormLinear loses slightly (0.98×) — Inductor
+already fuses `x·rms·wn` into the GEMM's input read, so restructuring
+can't promise a bandwidth win intra-kernel fusion already delivers.
+That's the boundary: catopt wins on transforms that *change the graph*;
+it can't beat a kernel-level fusion on the same graph.
+
+`calibrate()` measures your device's peak FLOPS / bandwidth / launch
+overhead and `roofline_cost_for(profile)` re-prices the search per
+target — the same equivalence space, selected per backend.
+
+## Limitations
+
+- **Nothing discovered is novel to practitioners** — fused QKV, flash
+  attention, the linear-attention identity are all known. The
+  contribution is automatic discovery + verification + per-shape choice,
+  not new math. (A transform nobody encoded hasn't appeared yet; the
+  machinery for one exists.)
+- **Inference only** — weight folding destroys per-layer gradients;
+  backward-graph rewriting (AOTAutograd) is unimplemented.
+- **Chunked attention loses to fused SDPA head-to-head** when K,V fit on
+  device — the om win is feasibility (bounded memory, incremental
+  state), not throughput.
+- **Coverage gaps** — `matmul`+bias and grouped convs aren't pairable;
+  reassociation needs unnormalized attention; masks must arrive
+  materialized.
+- **All numbers are an RTX 2050 (4 GB)** — `calibrate()` makes
+  re-targeting mechanical, but don't extrapolate magnitudes to
+  datacenter hardware.
+
+## Layout
+
+```
+catopt/          the engine: ir, egraph, rules, cost, optimize
+  torch_bridge   torch.export → IR → executable module (+weight folding)
+  om/om_lower    online-softmax monoid + chunked/streaming executors
+  scan_lower     level-batched parallel-scan executor
+  trace          traced-monoidal structure (fixpoints as rewrites)
+  xcarrier       cross-carrier laws + deferred omd carrier
+  meta           coherence stratification + rule synthesis
+  calibrate      per-device cost constants
+bench/           real-checkpoint benchmarks (stories15M/110M, decode sweep)
+tests/           572 tests
+REPORT.md        full measurements + the falsified directions
+project/         orphan branch: ADRs and retrospectives (worktree)
 ```
 
 ```bash
-python main.py                     # full demo: all transform families
-python main.py --large-batch 4096  # large-batch timing
-python -m pytest tests/ -q         # test suite
-python bench_gpu.py                # GPU table (requires CUDA)
+python main.py                # demo: all transform families
+python bench_gpu.py           # GPU table (needs CUDA)
+python bench/stories15m_bench.py --device cuda
+python -m pytest tests/ -q
 ```
 
 ## References
 
-- [Inductor passes — PyTorch dev discuss](https://dev-discuss.pytorch.org/t/inductor-passes/2742)
+E-graphs: Willsey et al., *egg*. Scans: Blelloch, *Prefix Sums and Their
+Applications*. FlashAttention: Dao et al. Traced categories:
+Joyal–Street–Verity. llama2.c: Karpathy.
