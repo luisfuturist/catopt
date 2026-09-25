@@ -198,6 +198,29 @@ post-hoc weight compression on this checkpoint.
 
 This is the honest negative the kill-gates were for.
 
+### 10.1 The exact corner, measured across archetypes
+
+Under `param_bytes_cost_for` with fp64 output equality verified:
+
+| archetype | saved | mechanism |
+|---|---:|---|
+| stories15M (real, dense) | 0.00% | nothing to dedup (46 tensors probed) |
+| dense transformer (synth) | 0.08% | `linear_channel_scale` fold |
+| GQA 8q/2kv (repeat_kv materialised) | **37.50%** | `share_duplicate_param_slices` |
+| adapter-merged (W+B·A stored) | 11.03% | `_fold_weight_chains` param-only fold |
+| tied embed/classifier stored twice | **50.00%** | `share_duplicate_params` |
+| MoE: 4 weight-tied routed experts | **75.00%** | `share_duplicate_params` |
+| dead param (unused tensor) | 98.46% | unreachable leaf dropped |
+| adapter UNmerged (Wx+BAx) | **−82.76%** | regression: paired-GEMM materialises phantom cat'd weight |
+
+The claim, plainly: **the exact corner is ~0% on dense trained
+checkpoints and real on structured ones** — GQA replication,
+double-stored ties, weight-tied experts, merged adapters. Two honest
+caveats: savings only materialize under the storage cost axis, and
+the unmerged-adapter form currently *regresses* (the paired GEMM
+materializes a phantom concatenated weight; pinned in
+`test_adapter_unmerged_currently_regresses`).
+
 ## 11. Honest limits
 
 - **omd at realistic scale** (`bench_omd2.py`): MQA fires
