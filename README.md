@@ -189,6 +189,8 @@ catopt/                     façade — public API + compat aliases;
                             to its new home via sys.modules
 bench/                      real-checkpoint benchmarks: stories15M/110M,
                             decode sweep, e2e smoke, omd attention stack
+                            + reassoc_scale (the head-to-head) and
+                            search_efficiency (exploration cost vs space)
 tests/                      1609 tests
 project/                    orphan branch: plans, ADRs, retrospectives
 ```

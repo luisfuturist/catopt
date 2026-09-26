@@ -82,3 +82,39 @@ Variants `mqa` (the firing case), `mha`, `mha-chunk`, `sdpa`; times
 torch-eager / IR / best / omd / omd-batched / CUDA-graph / Inductor /
 omd-direct where applicable. Bounded saturation (300k-node cap) —
 exploratory, not a certified path.
+
+## reassoc_scale.py — the head-to-head (the research claim)
+
+```bash
+python bench/reassoc_scale.py --device cpu
+python bench/reassoc_scale.py --device cuda --depths 4,8,16 --dims 512 --rows 65536
+```
+
+Deep linear-attention-style chain `x @ W1 @ … @ Wk`: the equivalent
+space is `k` bracketings of matmul; CatOpt's e-graph finds the
+weights-first form (all k−1 weight products folded into one parameter
+at compile time → one runtime GEMM), and the script **proves Inductor
+can't reach it** by capturing Inductor's post-grad FX graph — all `k`
+`aten.mm` nodes left-assoc, zero weight×weight mms — alongside
+CatOpt's lowered graph (1 mm). Times eager / Inductor / manual ref /
+catopt / catopt+inductor with `Timer`; verifies fp32 equivalence.
+
+**Measured (CPU, torch 2.14):** 8.93× vs Inductor at (k,d,R)=(8,512,4096);
+16.12× at k=16 — matching the modelled k× runtime-FLOP ratio.
+
+## search_efficiency.py — the "finds it cheaply" half
+
+```bash
+python bench/search_efficiency.py --device cpu                # k=4..24
+python bench/search_efficiency.py --exact-max 11              # exact saturation
+```
+
+For the k-chain the equivalent space is Catalan(k−1) (exact) /
+k!·Catalan under comm. Sweeps saturation stats vs k; reports enodes
+(bounded ~O(k³) live) vs the exponential program space, rule fires,
+wall/extract times, and the `optimize_model` end-to-end path.
+Honest about the limits: exact saturation re-enumerates substitutions
+over fragmented classes past k≈11 (k=11 ≈ 17s); production uses
+`rule_budgets`/`meta.canonicalize`, which is precisely why the
+codebase ships them — the bench says so rather than claiming exact
+eqsat scales.
