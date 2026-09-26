@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from catopt.attrs import ATTR_SCHEMA
+from catopt.attrs import ATTR_SCHEMA, attr_of
 from catopt.ir import IR, Const, Op, Param, TensorType, Var
 from catopt.ops import OpTable
 
@@ -432,8 +432,8 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         x.t()
         if x.dim() == 2 and "arg1" not in kw and "dim0" not in kw
         else x.transpose(
-            kw.get("dim0", kw.get("arg1", -2)),
-            kw.get("dim1", kw.get("arg2", -1)),
+            attr_of(kw, "dim0", "arg1", default=-2),
+            attr_of(kw, "dim1", "arg2", default=-1),
         )
     ),
     "reshape": lambda x, *a, **kw: x.reshape(
@@ -479,17 +479,17 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         groups=kw.get("groups", 1),
     ),
     "concat": lambda *ts, **kw: torch.cat(
-        list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))
+        list(ts), dim=int(attr_of(kw, "dim", "arg1", default=0))
     ),
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
         t,
-        int(kw.get("chunks", kw.get("arg1", chunks))),
-        dim=int(kw.get("dim", kw.get("arg2", dim))),
+        int(attr_of(kw, "chunks", "arg1", default=chunks)),
+        dim=int(attr_of(kw, "dim", "arg2", default=dim)),
     )[index],
     "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
         t,
         _split_sizes(sizes, kw),
-        dim=int(kw.get("dim", kw.get("arg2", dim))),
+        dim=int(attr_of(kw, "dim", "arg2", default=dim)),
     )[index],
     # torch.export emits aten.dropout with train=False in eval mode —
     # the op is a semantic identity there.  This binding is only valid
@@ -498,33 +498,33 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     # dtype casts are identity at the precision we verify (float32)
     "to": lambda x, *a, **kw: x,
     "clone": lambda x, *a, **kw: x.clone(),
-    "getitem": lambda t, **kw: t[kw.get("index", kw.get("arg1", 0))],
+    "getitem": lambda t, **kw: t[attr_of(kw, "index", "arg1", default=0)],
     "unbind": lambda t, *a, **kw: torch.unbind(
-        t, dim=int(kw.get("dim", kw.get("arg1", 0)))
+        t, dim=int(attr_of(kw, "dim", "arg1", default=0))
     )[int(kw.get("index", 0))],
     "stack": lambda *ts, **kw: torch.stack(
-        list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))
+        list(ts), dim=int(attr_of(kw, "dim", "arg1", default=0))
     ),
     "expand": lambda t, *a, **kw: t.expand(
         *tuple(kw.get("shape") or kw.get("dim") or a)
     ),
     "flatten": lambda x, *a, **kw: x.flatten(
-        int(kw.get("start_dim", kw.get("arg1", 0))),
-        int(kw.get("end_dim", kw.get("arg2", -1))),
+        int(attr_of(kw, "start_dim", "arg1", default=0)),
+        int(attr_of(kw, "end_dim", "arg2", default=-1)),
     ),
     "slice": lambda t, *a, **kw: t[
-        (slice(None),) * int(kw.get("dim", kw.get("arg1", 0)))
+        (slice(None),) * int(attr_of(kw, "dim", "arg1", default=0))
         + (slice(kw.get("arg2"), kw.get("arg3"), kw.get("arg4")),)
     ],
     "unsqueeze": lambda t, *a, **kw: t.unsqueeze(
-        int(kw.get("dim", kw.get("arg1", -1)))
+        int(attr_of(kw, "dim", "arg1", default=-1))
     ),
     "squeeze": lambda t, *a, **kw: t.squeeze(
-        int(kw.get("dim", kw.get("arg1", -1)))
+        int(attr_of(kw, "dim", "arg1", default=-1))
     ),
     "select": lambda t, *a, **kw: t.select(
-        int(kw.get("dim", kw.get("arg1", 0))),
-        int(kw.get("index", kw.get("arg2", 0))),
+        int(attr_of(kw, "dim", "arg1", default=0)),
+        int(attr_of(kw, "index", "arg2", default=0)),
     ),
     # embedding(W, idx) — row gather; factorised form gathers the small
     # factor then projects (eps.low_rank_gather).
@@ -536,15 +536,15 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     # operand (the raw aten spelling) is accepted too.
     "index_select": lambda t, *a, **kw: torch.index_select(
         t,
-        int(kw.get("dim", kw.get("arg1", 0))),
+        int(attr_of(kw, "dim", "arg1", default=0)),
         (
             a[0]
             if a and torch.is_tensor(a[0])
             else torch.as_tensor(
                 [
                     int(v)
-                    for v in kw.get(
-                        "index", kw.get("arg2", a[0] if a else ())
+                    for v in attr_of(
+                        kw, "index", "arg2", default=a[0] if a else ()
                     )
                 ],
                 dtype=torch.long,
@@ -562,7 +562,7 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     ),
     "alias": lambda x, *a, **kw: x,
     "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
-        x, dim=int(kw.get("dim", kw.get("arg1", -1)))
+        x, dim=int(attr_of(kw, "dim", "arg1", default=-1))
     ),
     # aten.rms_norm(x, normalized_shape, weight, eps) — canonical
     # attrs dim=normalized_shape, eps=eps (Llama-family normalization);
@@ -570,20 +570,20 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     "rms_norm": lambda x, w=None, *a, **kw: (
         torch.nn.functional.rms_norm(
             x,
-            tuple(kw.get("dim", kw.get("normalized_shape"))),
+            tuple(attr_of(kw, "dim", "normalized_shape")),
             weight=w,
-            eps=float(kw.get("eps", kw.get("arg3", 1e-6))),
+            eps=float(attr_of(kw, "eps", "arg3", default=1e-6)),
         )
     ),
     "layer_norm": lambda x, w=None, b=None, *a, **kw: (
         torch.nn.functional.layer_norm(
             x,
-            tuple(kw.get("dim", kw.get("normalized_shape"))),
+            tuple(attr_of(kw, "dim", "normalized_shape")),
             weight=w,
             bias=b,
             # eps is arg4 canonically — NOT arg5 (the cudnn flag):
             # reading arg5 silently produced eps=0.0 before.
-            eps=float(kw.get("eps", kw.get("arg4", 1e-5))),
+            eps=float(attr_of(kw, "eps", "arg4", default=1e-5)),
         )
     ),
     "masked_fill": lambda x, m, v, *a, **kw: x.masked_fill(m, v),
@@ -731,7 +731,7 @@ def _dim_args(args: tuple, kwargs: dict) -> tuple:
     """Extract a (dim, keepdim) argument tuple from IR attrs/args."""
     if args:
         return tuple(args)
-    dim = kwargs.get("dim", kwargs.get("axis", -1))
+    dim = attr_of(kwargs, "dim", "axis", default=-1)
     if isinstance(dim, (list, tuple)):
         dim = tuple(int(d) for d in dim)
     keep = kwargs.get("keepdim", False)
@@ -961,7 +961,7 @@ class IRModule(torch.nn.Module):
             self._param_map[name] = p
 
     def forward(self, *xs: torch.Tensor) -> torch.Tensor:
-        x = xs[0]
+        x = xs[0] if xs else None
         env: dict[str, torch.Tensor] = {"self": x}
         # Map input placeholders positionally to forward args
         for i, inp in enumerate(self._inputs):

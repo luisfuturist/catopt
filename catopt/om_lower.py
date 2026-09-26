@@ -49,6 +49,7 @@ from typing import Any
 
 import torch
 
+from catopt.executors import BatchedExecutorBase
 from catopt.ir import IR, Op, Param
 from catopt.torch_bridge import IRModule, _om_compose, _om_elem
 from catopt.typing import _shape_of
@@ -501,7 +502,7 @@ def _batched_compose(m1, l1, a1, m2, l2, a2):
 # ---------------------------------------------------------------------------
 
 
-class BatchedOMModule(torch.nn.Module):
+class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
     """nn.Module that runs an ``om_apply(<om tree>)`` term level-batched.
 
     Parameters
@@ -541,9 +542,7 @@ class BatchedOMModule(torch.nn.Module):
         # weight-only subtrees into fused Params during construction.
         self._plan = build_om_plan(self.eval_mod._root)
         self._const_cache: dict[tuple, torch.Tensor] = {}
-        self._graph = None
-        self._graph_inputs: list[torch.Tensor] = []
-        self._graph_out: torch.Tensor | None = None
+        self._init_graph_state()
         self._compiled = None
 
     @property
@@ -560,56 +559,6 @@ class BatchedOMModule(torch.nn.Module):
     def n_blocks(self) -> int:
         """Number of om carrier leaves (0 when not batched)."""
         return 0 if self._plan is None else len(self._plan["leaves"])
-
-    @property
-    def is_graph_captured(self) -> bool:
-        """True after :meth:`capture_cuda_graph` succeeded."""
-        return self._graph is not None
-
-    def capture_cuda_graph(  # pragma: no cover — CUDA-only body
-
-        self,
-        *example_inputs: torch.Tensor,
-        warmup: int = 3,
-    ) -> BatchedOMModule:
-        """Capture the batched forward into a CUDA graph.
-
-        After capture, ``forward`` copies each input into static
-        buffers and replays the graph — one launch total.  Returns
-        ``self``; a no-op when the module is not batched or CUDA is
-        unavailable.  Same caveats as
-        :meth:`BatchedScanModule.capture_cuda_graph`: fixed
-        shapes/dtypes/devices, parameters baked in by pointer, the
-        returned tensor is the static output buffer.
-        """
-        if self._plan is None or not torch.cuda.is_available():
-            return self
-        if not all(t.is_cuda for t in example_inputs):
-            raise ValueError("capture_cuda_graph requires CUDA inputs")
-        static_ins = [t.detach().clone() for t in example_inputs]
-        # Warm up on a side stream (also populates _const_cache so no
-        # host-side allocation happens during capture).
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(warmup):
-                self._forward_impl(*static_ins)
-        torch.cuda.current_stream().wait_stream(s)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            out = self._forward_impl(*static_ins)
-        self._graph, self._graph_inputs, self._graph_out = (
-            g,
-            static_ins,
-            out,
-        )
-        return self
-
-    def drop_cuda_graph(self) -> None:
-        """Release the captured graph, returning to eager execution."""
-        self._graph = None
-        self._graph_inputs = []
-        self._graph_out = None
 
     def compile(self, **kwargs) -> BatchedOMModule:
         """Compile the batched forward with ``torch.compile``.
@@ -646,21 +595,6 @@ class BatchedOMModule(torch.nn.Module):
         if self._compiled is not None:
             return self._compiled(*xs)
         return self._forward_impl(*xs)
-
-    def _cached(
-        self,
-        key: tuple,
-        like: torch.Tensor,
-        make,
-        dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        """Device/dtype-aware tensor cache (index tensors)."""
-        want = dtype or like.dtype
-        t = self._const_cache.get(key)
-        if t is None or t.device != like.device or t.dtype != want:
-            t = make(like)
-            self._const_cache[key] = t
-        return t
 
     def _repeat_idx(self, counts: list[int], like: torch.Tensor):
         """``[0]*c0 + [1]*c1 + ...`` as a cached index tensor — expands a
@@ -751,14 +685,10 @@ class BatchedOMModule(torch.nn.Module):
         if self._plan is None:
             return self.eval_mod(*xs)
 
-        x = xs[0] if xs else None
-        env: dict[str, torch.Tensor] = {"self": x}
-        for i, inp in enumerate(self._inputs):
-            env[inp.name] = xs[i] if i < len(xs) else x
+        x, env = self._input_env(xs)
         memo: dict[Any, torch.Tensor] = {}
 
-        def ev(t: Any) -> torch.Tensor:
-            return self.eval_mod._eval(t, env, x, memo)
+        ev = self.ev_factory(env, x, memo)
 
         # ---- Level 0: om_elem leaves → stacked (m, l, a) -------------
         m_parts: list[torch.Tensor] = []

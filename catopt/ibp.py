@@ -51,6 +51,7 @@ from typing import Any, NamedTuple
 
 import torch
 
+from catopt.attrs import attr_of
 from catopt.eps import _find_subterms, _path_sensitivity, model_bound
 from catopt.ir import IR, Const, Op, Param, Var
 from catopt.typing import _shape_of
@@ -380,7 +381,7 @@ def _ibp_eval(
                 unsupported.append("linear:1d-weight")
                 box = _inf_box(t)
         elif op == "softmax":
-            dim = int(attrs.get("arg1", attrs.get("dim", -1)))
+            dim = int(attr_of(attrs, "arg1", "dim", default=-1))
             box = _softmax(argboxes[0], dim)
         elif op in ("sum", "mean") and fn is not None:
             # reductions are monotone in every input
@@ -391,7 +392,7 @@ def _ibp_eval(
             # no torch binding for these names — apply amax/amin on the
             # declared dim (whole tensor when absent); monotone in input
             a = argboxes[0]
-            dim = attrs.get("dim", attrs.get("arg1"))
+            dim = attr_of(attrs, "dim", "arg1")
             keep = bool(attrs.get("keepdim", False))
             f = torch.amax if op == "max" else torch.amin
             if dim is None:
@@ -743,7 +744,7 @@ def _unary_lip(op: str, b: Box, attrs: dict) -> float | None:
 def _softmax_lip(b: Box, attrs: dict) -> float:
     """‖J_softmax‖₂ ≤ max_i p_i (J = diag(p) − ppᵀ ≼ diag(p)); bounded
     by the interval softmax's upper corner."""
-    dim = int(attrs.get("arg1", attrs.get("dim", -1)))
+    dim = int(attr_of(attrs, "arg1", "dim", default=-1))
     return float(_softmax(b, dim).hi.max())
 
 
@@ -816,8 +817,8 @@ def _hop(
         # transpose today; accept ``dim0``/``dim1`` as fallback like
         # other dual-spelling readers (torch_bridge, typing).
         nd = argb[0].lo.ndim
-        a1 = int(node.attrs.get("arg1", node.attrs.get("dim0", -2)))
-        a2 = int(node.attrs.get("arg2", node.attrs.get("dim1", -1)))
+        a1 = int(attr_of(node, "arg1", "dim0", default=-2))
+        a2 = int(attr_of(node, "arg2", "dim1", default=-1))
         a1, a2 = a1 % max(1, nd), a2 % max(1, nd)
         if {a1, a2} == {nd - 2, nd - 1}:
             return 1.0, kind
@@ -1231,7 +1232,7 @@ def _prop_delta(
         except Exception:
             return None
     if op in ("concat", "cat"):
-        dim = int(node.attrs.get("dim", node.attrs.get("arg1", 0)))
+        dim = int(attr_of(node, "dim", "arg1", default=0))
         parts = []
         for j, b in enumerate(argb):
             parts.append(
@@ -1239,7 +1240,7 @@ def _prop_delta(
             )
         return torch.cat(parts, dim=dim), mag
     if op == "stack":
-        dim = int(node.attrs.get("dim", node.attrs.get("arg1", 0)))
+        dim = int(attr_of(node, "dim", "arg1", default=0))
         parts = [
             cur if j == i else torch.zeros_like(b.lo.double())
             for j, b in enumerate(argb)

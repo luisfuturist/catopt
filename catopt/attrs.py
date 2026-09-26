@@ -55,11 +55,13 @@ deliberately mint non-canonical terms.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any
 
 __all__ = [
     "ATTR_REQUIRED",
     "ATTR_SCHEMA",
+    "attr_of",
     "canonicalize_attrs",
     "is_positional_attr",
     "validate_attrs",
@@ -154,6 +156,22 @@ ATTR_REQUIRED: dict[str, frozenset[str]] = {
 }
 
 _ARG_RE = re.compile(r"^arg(\d+)$")
+
+
+def attr_of(source: Any, *names: str, default: Any = None) -> Any:
+    """First present attr across names — the canonical + positional dual
+    spelling read.  `source` may be a term (reads .attrs) or a dict."""
+    attrs = (
+        source
+        if isinstance(source, Mapping)
+        else getattr(source, "attrs", None)
+    )
+    if not isinstance(attrs, Mapping):
+        return default
+    for name in names:
+        if name in attrs:
+            return attrs[name]
+    return default
 
 
 def is_positional_attr(key: Any) -> bool:

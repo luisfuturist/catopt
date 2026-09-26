@@ -56,6 +56,7 @@ from typing import Any
 import torch
 
 import catopt.xcarrier  # noqa: F401 — registers the omd_* / affd_*
+from catopt.executors import BatchedExecutorBase
 from catopt.ir import IR, Op
 from catopt.torch_bridge import _IR_TO_TORCH, IRModule
 from catopt.typing import _shape_of
@@ -97,6 +98,13 @@ def _select_index(term: Any):
         or len(term.args) != 1
     ):
         return None
+    if term.op == "getitem":
+        # t[i] — arg1/index IS the index; always dim 0 (matches
+        # scan_lower._select_index and the torch_bridge binding).
+        idx = term.attrs.get("arg1", term.attrs.get("index"))
+        if not isinstance(idx, int):
+            return None
+        return (term.args[0], 0, idx)
     dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
     idx = term.attrs.get("arg2", term.attrs.get("index"))
     if not isinstance(dim, int) or not isinstance(idx, int):
@@ -563,7 +571,7 @@ def build_omd_plan(root: Any) -> dict | None:
     return plan
 
 
-class BatchedOmdModule(torch.nn.Module):
+class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
     """nn.Module running an ``omd_apply[m](omd-tree, h)`` term batched.
 
     Parameters
@@ -602,9 +610,7 @@ class BatchedOmdModule(torch.nn.Module):
         # weight-only subtrees into fused Params at construction.
         self._plan = build_omd_plan(self.eval_mod._root)
         self._const_cache: dict[tuple, torch.Tensor] = {}
-        self._graph = None
-        self._graph_inputs: list[torch.Tensor] = []
-        self._graph_out: torch.Tensor | None = None
+        self._init_graph_state()
         self.fallbacks = 0  # times the batched path declined at runtime
 
     @property
@@ -618,49 +624,6 @@ class BatchedOmdModule(torch.nn.Module):
         maps inside the leaves are evaluated (None when the leaves hold
         no map projections or the term is not omd-shaped)."""
         return None if self._plan is None else self._plan["map_mode"]
-
-    @property
-    def is_graph_captured(self) -> bool:
-        return self._graph is not None
-
-    def capture_cuda_graph(  # pragma: no cover — CUDA-only body
-
-        self,
-        *example_inputs: torch.Tensor,
-        warmup: int = 3,
-    ) -> BatchedOmdModule:
-        """Record the batched forward into a CUDA graph.
-
-        Same contract as
-        :meth:`catopt.scan_lower.BatchedScanModule.capture_cuda_graph`:
-        static input buffers are copied into and the returned tensor is
-        the static output (clone it to keep it).
-        """
-        if self._plan is None or not torch.cuda.is_available():
-            return self
-        if not all(t.is_cuda for t in example_inputs):
-            raise ValueError("capture_cuda_graph requires CUDA inputs")
-        static_ins = [t.detach().clone() for t in example_inputs]
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(warmup):
-                self._forward_impl(*static_ins)
-        torch.cuda.current_stream().wait_stream(s)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            out = self._forward_impl(*static_ins)
-        self._graph, self._graph_inputs, self._graph_out = (
-            g,
-            static_ins,
-            out,
-        )
-        return self
-
-    def drop_cuda_graph(self) -> None:
-        self._graph = None
-        self._graph_inputs = []
-        self._graph_out = None
 
     # -- execution ----------------------------------------------------
 
@@ -681,20 +644,6 @@ class BatchedOmdModule(torch.nn.Module):
             g.replay()
             return self._graph_out
         return self._forward_impl(*xs)
-
-    def _cached(
-        self,
-        key: tuple,
-        like: torch.Tensor,
-        make,
-        dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        want = dtype or like.dtype
-        t = self._const_cache.get(key)
-        if t is None or t.device != like.device or t.dtype != want:
-            t = make(like)
-            self._const_cache[key] = t
-        return t
 
     def _gidx(self, slots, like: torch.Tensor) -> torch.Tensor:
         return self._cached(
@@ -826,14 +775,10 @@ class BatchedOmdModule(torch.nn.Module):
         plan = self._plan
         if plan is None:
             return self.eval_mod(*xs)
-        x = xs[0] if xs else None
-        env: dict[str, torch.Tensor] = {"self": x}
-        for i, inp in enumerate(self._inputs):
-            env[inp.name] = xs[i] if i < len(xs) else x
+        x, env = self._input_env(xs)
         memo: dict[Any, Any] = {}
 
-        def ev(t: Any):
-            return self.eval_mod._eval(t, env, x, memo)
+        ev = self.ev_factory(env, x, memo)
 
         try:
             # ---- 1. coefficient maps ---------------------------------
