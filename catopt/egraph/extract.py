@@ -2,6 +2,7 @@
 # ruff: noqa: RUF002 — math notation in comments
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from catopt.egraph.types import (
@@ -10,6 +11,8 @@ from catopt.egraph.types import (
     _pattern_attrs,
 )
 from catopt.ir import Op
+
+logger = logging.getLogger("catopt.egraph.extract")
 
 
 class _ExtractMixin:
@@ -327,7 +330,19 @@ class _ExtractMixin:
             )
             return cache[eclass_id]
 
-        _, term, _, _, _ = best(eid)
+        total, term, _, _, nops = best(eid)
+        if term is None:
+            logger.warning(
+                "extract_best: no extractable term in eclass %d",
+                self.find(eid),
+            )
+        else:
+            logger.info(
+                "extract_best: eclass %d -> cost %.4g",
+                self.find(eid),
+                total,
+                extra={"cost": total, "nops": nops},
+            )
         if _cache_out is not None:
             _cache_out.update(cache)
         return term

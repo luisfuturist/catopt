@@ -500,7 +500,7 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     "clone": lambda x, *a, **kw: x.clone(),
     "getitem": lambda t, **kw: t[kw.get("index", kw.get("arg1", 0))],
     "unbind": lambda t, *a, **kw: torch.unbind(
-        t, dim=int(kw.get("dim", kw.get("arg1", -1)))
+        t, dim=int(kw.get("dim", kw.get("arg1", 0)))
     )[int(kw.get("index", 0))],
     "stack": lambda *ts, **kw: torch.stack(
         list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))

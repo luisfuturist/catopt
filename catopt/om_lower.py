@@ -77,10 +77,11 @@ def _is_om_tree(term: Any, memo: dict | None = None) -> bool:
 
     Leaves are ``om_elem(s, v)`` (score block, value block) or the raw
     packaging node ``om(m, l, a)``; internal nodes are binary
-    ``om_compose(f, g)``.  Memoised on id() — extracted terms are DAGs.
+    ``om_compose(f, g)``.  Memoised on the term itself (hash-consed
+    terms are content-keyed) — extracted terms are DAGs.
     """
     memo = {} if memo is None else memo
-    key = id(term)
+    key = term
     if key in memo:
         return memo[key]
     ok = isinstance(term, Op) and (
@@ -344,10 +345,10 @@ def build_om_plan(root: Any) -> dict | None:
 
     leaves: list[Op] = []
     levels: list[list[Op]] = []
-    level_of: dict[int, int] = {}
+    level_of: dict[Any, int] = {}
 
     def visit(t: Op) -> int:
-        tid = id(t)
+        tid = t
         if tid in level_of:
             return level_of[tid]
         if t.op in ("om_elem", "om"):
@@ -368,10 +369,10 @@ def build_om_plan(root: Any) -> dict | None:
     # a block with itself doubles it — like duplicated keys).  Count
     # paths from the root, memoised per node so this is linear in the
     # DAG, not the expanded tree.
-    mult_memo: dict[int, dict[int, int]] = {}
+    mult_memo: dict[Any, dict[Any, int]] = {}
 
-    def leaf_counts(t: Op) -> dict[int, int]:
-        tid = id(t)
+    def leaf_counts(t: Op) -> dict[Any, int]:
+        tid = t
         if tid in mult_memo:
             return mult_memo[tid]
         if t.op in ("om_elem", "om"):
@@ -397,28 +398,28 @@ def build_om_plan(root: Any) -> dict | None:
             key = (
                 ("elem", ss, vs)
                 if (_concrete(ss) and _concrete(vs))
-                else ("serial", id(leaf))
+                else ("serial", leaf)
             )
         else:
-            key = ("serial", id(leaf))
+            key = ("serial", leaf)
         grp = by_key.get(key)
         if grp is None:
             grp = {"key": key, "members": [], "mults": []}
             by_key[key] = grp
             groups.append(grp)
         grp["members"].append(leaf)
-        grp["mults"].append(mults_of.get(id(leaf), 1))
+        grp["mults"].append(mults_of.get(leaf, 1))
 
     # Slot assignment: leaves occupy slots in group order, each taking
     # `mult` consecutive slots, then each level's outputs append —
     # operand slots are all < the level's own.  (Execution runs the
     # canonical adjacent-pair reduction, so the level gathers are
     # descriptive metadata about the extracted bracketing.)
-    slot: dict[int, int] = {}
+    slot: dict[Any, int] = {}
     next_slot = 0
     for grp in groups:
         for leaf, c in zip(grp["members"], grp["mults"], strict=True):
-            slot[id(leaf)] = next_slot
+            slot[leaf] = next_slot
             next_slot += c
         if grp["key"][0] == "elem":
             grp.update(_analyze_elem_group(grp["members"]))
@@ -427,11 +428,11 @@ def build_om_plan(root: Any) -> dict | None:
 
     level_gather: list[tuple[list[int], list[int]]] = []
     for nodes in levels:
-        f_idx = [slot[id(t.args[0])] for t in nodes]
-        g_idx = [slot[id(t.args[1])] for t in nodes]
+        f_idx = [slot[t.args[0]] for t in nodes]
+        g_idx = [slot[t.args[1]] for t in nodes]
         level_gather.append((f_idx, g_idx))
         for t in nodes:
-            slot[id(t)] = next_slot
+            slot[t] = next_slot
             next_slot += 1
 
     return {
@@ -439,7 +440,7 @@ def build_om_plan(root: Any) -> dict | None:
         "leaf_groups": groups,
         "levels": levels,
         "level_gather": level_gather,
-        "root_slot": slot[id(f_term)],
+        "root_slot": slot[f_term],
         "f": f_term,
     }
 
@@ -747,7 +748,7 @@ class BatchedOMModule(torch.nn.Module):
         env: dict[str, torch.Tensor] = {"self": x}
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x
-        memo: dict[int, torch.Tensor] = {}
+        memo: dict[Any, torch.Tensor] = {}
 
         def ev(t: Any) -> torch.Tensor:
             return self.eval_mod._eval(t, env, x, memo)
@@ -1017,7 +1018,7 @@ class StreamingOMModule(torch.nn.Module):
                 # intermediates are dropped with the dict at the next
                 # iteration — the bounded-working-set property.  Inputs
                 # (Var lookups) and params never enter the memo.
-                memo: dict[int, Any] = {}
+                memo: dict[Any, Any] = {}
                 e = self.eval_mod._eval(leaf, env, x, memo)
                 # A DAG-shared leaf contributes once per occurrence.
                 for _ in range(c):

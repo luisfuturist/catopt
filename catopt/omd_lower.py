@@ -116,10 +116,11 @@ def _is_omd_tree(t: Any, memo: dict | None = None) -> bool:
     """True if ``t`` is an ``omd_compose`` tree over omd leaves.
 
     Leaves are ``omd_elem`` (deferred affine element) or the ``omd``
-    tuple-packaging node; shared subtrees are memoised by id.
+    tuple-packaging node; shared subtrees are memoised on the term
+    itself (hash-consed terms are content-keyed).
     """
     memo = {} if memo is None else memo
-    k = id(t)
+    k = t
     if k in memo:
         return memo[k]
     ok = False
@@ -266,10 +267,10 @@ def build_omd_plan(root: Any) -> dict | None:
     # ---- om side: leaves + compose levels ----------------------------
     omd_leaves: list[Op] = []
     omd_levels: list[list[Op]] = []
-    level_of: dict[int, int] = {}
+    level_of: dict[Any, int] = {}
 
     def visit(t: Op) -> int:
-        tid = id(t)
+        tid = t
         if tid in level_of:
             return level_of[tid]
         if t.op == "omd_compose":
@@ -284,40 +285,40 @@ def build_omd_plan(root: Any) -> dict | None:
         return 0
 
     visit(f_term)
-    slot = {id(lf): i for i, lf in enumerate(omd_leaves)}
+    slot = {lf: i for i, lf in enumerate(omd_leaves)}
     nxt = len(omd_leaves)
     omd_gather = []
     for nodes in omd_levels:
         omd_gather.append(
             (
-                [slot[id(t.args[0])] for t in nodes],
-                [slot[id(t.args[1])] for t in nodes],
+                [slot[t.args[0]] for t in nodes],
+                [slot[t.args[1]] for t in nodes],
             )
         )
         for t in nodes:
-            slot[id(t)] = nxt
+            slot[t] = nxt
             nxt += 1
 
     # ---- scan leaf tensor args (and h) for map projections -----------
-    targets: dict[int, tuple[Any, str]] = {}  # map id -> (term, domain)
+    targets: dict[Any, tuple[Any, str]] = {}  # map term -> (term, domain)
     raw_proj: list[tuple[Op, int, Any]] = []  # (node, comp_idx, map)
     raw_stack: list[tuple[Op, int, str, list, int]] = []
-    scanned: set[int] = set()
+    scanned: set[Any] = set()
     bad = False
 
     def _register(mp: Any, dom: str) -> None:
         nonlocal bad
-        prev = targets.get(id(mp))
+        prev = targets.get(mp)
         if prev is None:
-            targets[id(mp)] = (mp, dom)
+            targets[mp] = (mp, dom)
         elif prev[1] != dom:
             bad = True
 
     def scan(t: Any, inside_map_leaf: bool = False) -> None:
         nonlocal bad
-        if not isinstance(t, Op) or id(t) in scanned:
+        if not isinstance(t, Op) or t in scanned:
             return
-        scanned.add(id(t))
+        scanned.add(t)
         pinfo = _PROJECTIONS.get(t.op)
         if pinfo is not None and len(t.args) == 1:
             if inside_map_leaf:
@@ -381,7 +382,7 @@ def build_omd_plan(root: Any) -> dict | None:
         stack = [(root_mp, expected, False)]
         while stack:
             mp, exp, done = stack.pop()
-            tid = id(mp)
+            tid = mp
             if (
                 isinstance(mp, Op)
                 and mp.op in _COMPOSE_OP
@@ -400,7 +401,7 @@ def build_omd_plan(root: Any) -> dict | None:
                         stack.append((a, dom, False))
                     continue
                 lv = (
-                    max(d["level_of"].get(id(a), 0) for a in mp.args)
+                    max(d["level_of"].get(a, 0) for a in mp.args)
                     + 1
                 )
                 d["level_of"][tid] = lv
@@ -454,7 +455,7 @@ def build_omd_plan(root: Any) -> dict | None:
         "h": h_term,
         "omd_leaves": omd_leaves,
         "omd_gather": omd_gather,
-        "omd_root": slot[id(f_term)],
+        "omd_root": slot[f_term],
         "map_mode": None,
         "proj_seeds": [],
         "stack_seeds": [],
@@ -508,10 +509,10 @@ def build_omd_plan(root: Any) -> dict | None:
         plan["chain_a_gather"] = _part_gather(base, 0)
         plan["chain_b_gather"] = _part_gather(base, 1)
         for node, ci, mp in raw_proj:
-            plan["proj_seeds"].append((node, ci, src, pos_of[id(mp)]))
+            plan["proj_seeds"].append((node, ci, src, pos_of[mp]))
         for node, ci, _d, maps, dim in raw_stack:
             plan["stack_seeds"].append(
-                (node, ci, src, [pos_of[id(m)] for m in maps], dim)
+                (node, ci, src, [pos_of[m] for m in maps], dim)
             )
         for tid, (mp, _d) in targets.items():
             plan["map_seeds"].append((mp, src, pos_of[tid]))
@@ -521,18 +522,18 @@ def build_omd_plan(root: Any) -> dict | None:
     for dom, d in domains.items():
         if not _sig_uniform(d["leaves"], dom):
             return None
-        slot_d = {id(lf): i for i, lf in enumerate(d["leaves"])}
+        slot_d = {lf: i for i, lf in enumerate(d["leaves"])}
         nxt_d = len(d["leaves"])
         gather = []
         for nodes in d["levels"]:
             gather.append(
                 (
-                    [slot_d[id(t.args[0])] for t in nodes],
-                    [slot_d[id(t.args[1])] for t in nodes],
+                    [slot_d[t.args[0]] for t in nodes],
+                    [slot_d[t.args[1]] for t in nodes],
                 )
             )
             for t in nodes:
-                slot_d[id(t)] = nxt_d
+                slot_d[t] = nxt_d
                 nxt_d += 1
         d["slot"] = slot_d
         d["gather"] = gather
@@ -541,9 +542,9 @@ def build_omd_plan(root: Any) -> dict | None:
     plan["map_mode"] = "forest"
     plan["forest"] = domains
     for node, ci, mp in raw_proj:
-        dom = targets[id(mp)][1]
+        dom = targets[mp][1]
         plan["proj_seeds"].append(
-            (node, ci, ("forest", dom), domains[dom]["slot"][id(mp)])
+            (node, ci, ("forest", dom), domains[dom]["slot"][mp])
         )
     for node, ci, dom, maps, dim in raw_stack:
         plan["stack_seeds"].append(
@@ -551,13 +552,13 @@ def build_omd_plan(root: Any) -> dict | None:
                 node,
                 ci,
                 ("forest", dom),
-                [domains[dom]["slot"][id(m)] for m in maps],
+                [domains[dom]["slot"][m] for m in maps],
                 dim,
             )
         )
     for _tid, (mp, dom) in targets.items():
         plan["map_seeds"].append(
-            (mp, ("forest", dom), domains[dom]["slot"][id(mp)])
+            (mp, ("forest", dom), domains[dom]["slot"][mp])
         )
     return plan
 
@@ -822,7 +823,7 @@ class BatchedOmdModule(torch.nn.Module):
         env: dict[str, torch.Tensor] = {"self": x}
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x
-        memo: dict[int, Any] = {}
+        memo: dict[Any, Any] = {}
 
         def ev(t: Any):
             return self.eval_mod._eval(t, env, x, memo)
@@ -866,16 +867,16 @@ class BatchedOmdModule(torch.nn.Module):
                 for k, v in stores.items()
             }
             for node, ci, src, pos in plan["proj_seeds"]:
-                memo[id(node)] = views[src][ci][pos]
+                memo[node] = views[src][ci][pos]
             for mp, src, pos in plan["map_seeds"]:
-                memo[id(mp)] = (views[src][0][pos], views[src][1][pos])
+                memo[mp] = (views[src][0][pos], views[src][1][pos])
             for node, ci, src, poss, dim in plan["stack_seeds"]:
                 srcs = stores[src][ci]
                 t = srcs.index_select(0, self._gidx(poss, srcs))
                 dn = dim % t.dim()
                 if dn != 0:
                     t = t.movedim(0, dn)
-                memo[id(node)] = t
+                memo[node] = t
 
             # ---- 3. omd leaves ---------------------------------------
             omd_elem = _IR_TO_TORCH["omd_elem"]

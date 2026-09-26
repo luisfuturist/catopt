@@ -152,7 +152,9 @@ def _has_var(t, _memo: dict | None = None) -> bool:
     compile time and belong to ``eps.quant_params``, not here)."""
     if _memo is None:
         _memo = {}
-    key = id(t)
+    # Terms are hash-consed content objects — key the memo on the term
+    # itself (no id()/GC hazards).
+    key = t
     if key in _memo:
         return _memo[key]
     if isinstance(t, Var):
@@ -376,10 +378,10 @@ def calibrate(
             env = dict(xs)
         else:
             env = {v.name: t for v, t in zip(ir.inputs, xs, strict=False)}
-        memo: dict[int, object] = {}
+        memo: dict[Any, object] = {}
 
         def ev(t):
-            key = id(t)
+            key = t
             if key in memo:
                 return memo[key]
             r = None

@@ -62,6 +62,7 @@ from stories15m_bench import (
     resolve_ckpt,
 )
 
+from catopt.report import CompositionalReport, verify_equiv
 from measure_weights import load_llama2c
 
 
@@ -148,10 +149,6 @@ def load_model(ckpt: str, device: str):
     return model, cfg
 
 
-def rel_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a - b).abs().max().item() / (a.abs().max().item() + 1e-8)
-
-
 def gemm_kernel_counts(fn, device: str, iters: int = 5):
     """torch.profiler: total CUDA kernels + GEMM-family kernel launches.
 
@@ -222,9 +219,11 @@ def bench_cell(model, opt, idx, ref, device, min_run_time, warmup=3):
             for _ in range(warmup):  # compile + autotune land here
                 fn()
             with torch.no_grad():
-                rd = rel_diff(ref, mod(idx))
-            if not (rd < 1e-4):
-                out[tag] = {"error": f"output rel diff {rd:.2e} ≥ 1e-4"}
+                vr = verify_equiv(ref, mod(idx), rtol=1e-4)
+            if not vr.passed:
+                out[tag] = {
+                    "error": f"output rel diff {vr.max_rel:.2e} ≥ 1e-4"
+                }
                 continue
         except Exception as e:
             out[tag] = {"error": f"{type(e).__name__}: {e}"}
@@ -332,17 +331,27 @@ def main():
                 )
                 t_opt = time.time() - t_opt
                 with torch.no_grad():
-                    rd = rel_diff(ref, opt(idx))
+                    vr = verify_equiv(ref, opt(idx), rtol=1e-4)
+                # Typed access alongside the raw stats dict — the
+                # compositional schema is code now, not convention.
+                crep = CompositionalReport.from_stats(rep)
                 paired = sum(
                     1
-                    for e in rep["blocks"].values()
-                    if (e.get("stats") or {}).get("paired_extract")
+                    for e in crep.blocks.values()
+                    if e.stats is not None and e.stats.paired_extract
                 )
-                if not (rd < 1e-4):
+                if not vr.passed:
                     rows.append(
-                        (tag, None, f"SKIP verify rel diff {rd:.2e}")
+                        (
+                            tag,
+                            None,
+                            f"SKIP verify rel diff {vr.max_rel:.2e}",
+                        )
                     )
-                    print(f"{tag}  SKIP — opt rel diff {rd:.2e} ≥ 1e-4")
+                    print(
+                        f"{tag}  SKIP — opt rel diff "
+                        f"{vr.max_rel:.2e} ≥ 1e-4"
+                    )
                     continue
             except Exception as e:
                 rows.append(
@@ -375,7 +384,7 @@ def main():
                     tag,
                     res,
                     f"{rep['n_optimized']}/{rep['n_blocks']} blocks"
-                    f" paired={paired} rel={rd:.1e} "
+                    f" paired={paired} rel={vr.max_rel:.1e} "
                     f"opt={t_opt:.0f}s",
                 )
             )

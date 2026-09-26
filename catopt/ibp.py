@@ -811,10 +811,14 @@ def _hop(
         return (1.0, kind) if i == 0 else (None, kind)
 
     if op in ("transpose",):
-        # preserving spectral norm only if swapping the last two dims
+        # preserving spectral norm only if swapping the last two dims.
+        # ``arg1``/``arg2`` are the canonical positional spelling for
+        # transpose today; accept ``dim0``/``dim1`` as fallback like
+        # other dual-spelling readers (torch_bridge, typing).
         nd = argb[0].lo.ndim
-        a1 = int(node.attrs.get("arg1", -2)) % max(1, nd)
-        a2 = int(node.attrs.get("arg2", -1)) % max(1, nd)
+        a1 = int(node.attrs.get("arg1", node.attrs.get("dim0", -2)))
+        a2 = int(node.attrs.get("arg2", node.attrs.get("dim1", -1)))
+        a1, a2 = a1 % max(1, nd), a2 % max(1, nd)
         if {a1, a2} == {nd - 2, nd - 1}:
             return 1.0, kind
         return _rearrange_mult(argb[0], out_box), "row"

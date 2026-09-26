@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import platform
 import time
@@ -45,6 +46,28 @@ __all__ = [
 
 #: Environment variable overriding the profile-store directory.
 PROFILE_DIR_ENV = "CATOPT_PROFILE_DIR"
+
+logger = logging.getLogger("catopt.calibrate")
+
+
+@contextlib.contextmanager
+def _verbose_ctx(log: logging.Logger, verbose: bool):
+    """Drop ``log``'s level to DEBUG for the block when ``verbose``.
+
+    Emission stays level-based — ``verbose=True`` only widens what the
+    module logger lets through, surfacing INFO/DEBUG records on whatever
+    handlers are configured (pytest's ``caplog`` included) without
+    permanently mutating logger state.
+    """
+    if not verbose:
+        yield
+        return
+    prev = log.level
+    log.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        log.setLevel(prev)
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +410,20 @@ def calibrate(
             "platform": platform.platform(),
         },
     )
-    if verbose:
-        print(
-            f"calibrated {profile.name} on {profile.device}: "
-            f"{profile.tflops:.3f} TFLOPS, {profile.gbps:.1f} GB/s, "
-            f"{profile.launch_us:.2f} µs launch"
+    with _verbose_ctx(logger, verbose):
+        logger.info(
+            "calibrated %s on %s: %.3f TFLOPS, %.1f GB/s, %.2f µs launch",
+            profile.name,
+            profile.device,
+            profile.tflops,
+            profile.gbps,
+            profile.launch_us,
+        )
+        logger.debug(
+            "calibration raw: flops=%g flop/s, bw=%g B/s, launch=%g s",
+            flops,
+            bw,
+            launch,
         )
     if save:
         save_profile(profile)

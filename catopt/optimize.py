@@ -30,6 +30,13 @@ from catopt.cost import (
 from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, Var, op_repr
 from catopt.ops import OpTable
+from catopt.report import (
+    BlockReport,
+    CompositionalReport,
+    OptReport,
+    rel_diff,
+    verify_module,
+)
 from catopt.rules import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
@@ -652,29 +659,15 @@ def optimize_model(
     # Verify semantic equivalence
     if verbose:
         print("[Verify] Checking output equivalence...")
-        model.eval()
-        optimized_module.eval()
-        with torch.no_grad():
-            if isinstance(example_input, tuple):
-                original_out = model(
-                    *[a.clone() for a in example_input]
-                )
-                opt_out = optimized_module(
-                    *[a.clone() for a in example_input]
-                )
-            else:
-                original_out = model(example_input.clone())
-                opt_out = optimized_module(example_input.clone())
-            max_diff = (original_out - opt_out).abs().max().item()
-            rel_diff = max_diff / (
-                original_out.abs().max().item() + 1e-8
-            )
-            print(f"  Max abs diff:  {max_diff:.6e}")
-            print(f"  Max rel diff:  {rel_diff:.6e}")
-            if rel_diff < 1e-4:
-                print("  ✓ Semantically equivalent (within tolerance)")
-            else:
-                print("  ✗ WARNING: large difference detected!")
+        vr = verify_module(
+            model, optimized_module, example_input, rtol=1e-4
+        )
+        print(f"  Max abs diff:  {vr.max_abs:.6e}")
+        print(f"  Max rel diff:  {vr.max_rel:.6e}")
+        if vr.passed:
+            print("  ✓ Semantically equivalent (within tolerance)")
+        else:
+            print("  ✗ WARNING: large difference detected!")
 
     return optimized_module, stats
 
@@ -828,7 +821,9 @@ def _capture_block_inputs(
 
 
 def _rel_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a - b).abs().max().item() / (a.abs().max().item() + 1e-8)
+    """Back-compat alias for :func:`catopt.report.rel_diff` — the
+    diff+tolerance computation now lives in the uniform verify gate."""
+    return rel_diff(a, b)
 
 
 def _replace_submodule(
@@ -902,7 +897,7 @@ def optimize_compositional(
     captured = _capture_block_inputs(model, blocks, example_input)
 
     replacements: dict[str, torch.nn.Module] = {}
-    block_stats: dict[str, dict[str, Any]] = {}
+    block_reports: dict[str, BlockReport] = {}
     agg = {
         "original_params": 0,
         "optimized_params": 0,
@@ -913,16 +908,15 @@ def optimize_compositional(
     }
 
     for name, block in blocks:
-        entry: dict[str, Any] = {}
-        block_stats[name] = entry
+        rep = BlockReport(name=name, status="not_executed")
+        block_reports[name] = rep
         cap = captured.get(name)
         if cap is None:
-            entry["status"] = "not_executed"
             continue
         args, kwargs = cap
         if kwargs:
-            entry["status"] = "skipped"
-            entry["reason"] = f"non-positional kwargs {sorted(kwargs)}"
+            rep.status = "skipped"
+            rep.reason = f"non-positional kwargs {sorted(kwargs)}"
             continue
         ex = args[0] if len(args) == 1 else args
         t0 = time.time()
@@ -941,20 +935,18 @@ def optimize_compositional(
             # Per-block verification on the captured input — soundness
             # gate independent of optimize_model's own (verbose-gated)
             # check.  Any mismatch or eval failure falls back.
-            with torch.no_grad():
-                ref = block(*args)
-                got = opt_mod(*args)
-            rd = _rel_diff(ref, got)
-            entry["rel_diff"] = rd
-            if not (rd < verify_tol):
+            vr = verify_module(block, opt_mod, args, rtol=verify_tol)
+            rep.rel_diff = vr.max_rel
+            if not vr.passed:
                 raise RuntimeError(
-                    f"block verification failed: rel diff {rd:.3e}"
+                    f"block verification failed: "
+                    f"rel diff {vr.max_rel:.3e}"
                 )
             replacements[name] = opt_mod
-            entry["status"] = "optimized"
-            entry["stats"] = st
+            rep.status = "optimized"
+            rep.stats = OptReport.from_stats(st)
             pr = param_report(block, opt_mod)
-            entry["param_report"] = pr
+            rep.param_report = pr
             agg["original_params"] += pr["original_params"]
             agg["optimized_params"] += pr["optimized_params"]
             agg["original_bytes"] += pr["original_bytes"]
@@ -966,18 +958,18 @@ def optimize_compositional(
             if verbose:
                 print(
                     f"[Compositional] {name}: optimized "
-                    f"({entry['rel_diff']:.2e})"
+                    f"({rep.rel_diff:.2e})"
                 )
         except Exception as e:
-            entry["status"] = "failed"
-            entry["error"] = f"{type(e).__name__}: {e}"
+            rep.status = "failed"
+            rep.error = f"{type(e).__name__}: {e}"
             if isinstance(
                 e, OptimizationResourceError
             ) or _looks_like_oom(e):
-                entry["reason"] = "resource_limit"
+                rep.reason = "resource_limit"
             if verbose:
                 print(f"[Compositional] {name}: keeping original ({e})")
-        entry["time_s"] = time.time() - t0
+        rep.time_s = time.time() - t0
 
     # -- Recompose -------------------------------------------------------
     in_place = False
@@ -995,65 +987,49 @@ def optimize_compositional(
         _replace_submodule(new_model, name, opt_mod)
 
     # -- End-to-end verification ----------------------------------------
-    stats: dict[str, Any] = {
-        "compositional": True,
-        "n_blocks": len(blocks),
-        "n_optimized": len(replacements),
-        "n_failed": sum(
-            1
-            for e in block_stats.values()
-            if e.get("status") == "failed"
+    report = CompositionalReport(
+        compositional=True,
+        n_blocks=len(blocks),
+        n_optimized=len(replacements),
+        n_failed=sum(
+            1 for r in block_reports.values() if r.status == "failed"
         ),
-        "n_skipped": sum(
+        n_skipped=sum(
             1
-            for e in block_stats.values()
-            if e.get("status") in ("skipped", "not_executed")
+            for r in block_reports.values()
+            if r.status in ("skipped", "not_executed")
         ),
-        "blocks": block_stats,
-        "in_place": in_place,
-    }
+        blocks=block_reports,
+        in_place=in_place,
+    )
     agg["bytes_saved"] = agg["original_bytes"] - agg["optimized_bytes"]
     agg["ratio"] = (
         agg["optimized_bytes"] / agg["original_bytes"]
         if agg["original_bytes"]
         else 1.0
     )
-    stats["param_report"] = agg
+    report.param_report = agg
 
     args = (
         example_input
         if isinstance(example_input, tuple)
         else (example_input,)
     )
-    model.eval()
-    new_model.eval()
     try:
-        with torch.no_grad():
-            ref = model(
-                *[
-                    a.clone() if isinstance(a, torch.Tensor) else a
-                    for a in args
-                ]
-            )
-            out = new_model(
-                *[
-                    a.clone() if isinstance(a, torch.Tensor) else a
-                    for a in args
-                ]
-            )
-        stats["end_to_end"] = {
-            "max_abs_diff": (ref - out).abs().max().item(),
-            "max_rel_diff": _rel_diff(ref, out),
+        vr = verify_module(model, new_model, args)
+        report.end_to_end = {
+            "max_abs_diff": vr.max_abs,
+            "max_rel_diff": vr.max_rel,
         }
         if verbose:
             print(
                 f"[Compositional] end-to-end rel diff: "
-                f"{stats['end_to_end']['max_rel_diff']:.3e}"
+                f"{report.end_to_end['max_rel_diff']:.3e}"
             )
     except Exception as e:
-        stats["end_to_end"] = {"error": f"{type(e).__name__}: {e}"}
+        report.end_to_end = {"error": f"{type(e).__name__}: {e}"}
         if verbose:
             print(f"[Compositional] end-to-end check failed: {e}")
 
-    stats["wall_time_s"] = time.time() - t_start
-    return new_model, stats
+    report.wall_time_s = time.time() - t_start
+    return new_model, report.to_dict()

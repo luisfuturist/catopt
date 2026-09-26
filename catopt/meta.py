@@ -221,13 +221,14 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
       canonical log-depth bracketing.
     * ``neg(neg(t))`` collapses to ``t``.
 
-    Memoised by ``id()`` so shared-subterm DAGs stay linear.  The
-    function is idempotent and semantics-preserving (all transforms are
-    instances of the coherent laws).
+    Memoised on the term itself (hash-consed terms are content-keyed)
+    so shared-subterm DAGs stay linear.  The function is idempotent
+    and semantics-preserving (all transforms are instances of the
+    coherent laws).
     """
     if memo is None:
         memo = {}
-    key = id(term)
+    key = term
     if key in memo:
         return memo[key]
     if not isinstance(term, Op):

@@ -1,6 +1,7 @@
 """Core e-graph: union-find, matching, saturation."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from catopt.egraph.certs import (
@@ -17,6 +18,8 @@ from catopt.egraph.types import (
     _pattern_attrs,
 )
 from catopt.ir import Op
+
+logger = logging.getLogger("catopt.egraph.core")
 
 
 class EGraph(_ExtractMixin, _ProofMixin):
@@ -960,16 +963,33 @@ class EGraph(_ExtractMixin, _ProofMixin):
                     )
                 if budget is not None:
                     spent[rule.name] += self.n_enodes - n0
+                logger.debug(
+                    "rule %s: %+d enodes",
+                    rule.name,
+                    self.n_enodes - n0,
+                )
             self.rebuild(set(search) | self._dirty)
             n_after = self.n_enodes
+            logger.debug(
+                "iteration %d: %d -> %d enodes",
+                iteration + 1,
+                n_before,
+                n_after,
+            )
             if n_after >= max_nodes:
-                print(
-                    f"  [egraph] stopping: max_nodes ({max_nodes}) reached"
+                logger.warning(
+                    "  [egraph] stopping: max_nodes (%d) reached",
+                    max_nodes,
                 )
                 break
             if n_after == n_before and not self._dirty:
-                print(
-                    f"  [egraph] saturation at iteration {iteration + 1}"
+                logger.info(
+                    "  [egraph] saturation at iteration %d",
+                    iteration + 1,
+                    extra={
+                        "enodes": n_after,
+                        "classes": self.n_classes,
+                    },
                 )
                 break
         # Leave the graph in the same canonicalised postcondition the
