@@ -29,30 +29,6 @@ Deep stacks use `optimize_compositional`, which optimizes each block
 against its captured real input and recomposes with per-block
 verification and automatic fallback.
 
-## Pluggable source and sink
-
-The pipeline's two ends are named ports, not hard-wired torch calls.
-A **`Source`** lifts a backend-native model to IR
-(`model → (IR, leaf values)`); a **`Sink`** lowers IR back to a
-runnable and owns the backend's op set and its equivalence gate.
-`optimize_model` and `discover_alternatives` take `source=` / `sink=`,
-defaulting to `TorchSource` / `TorchSink`.
-
-The sink's `supported_ops` bounds the search: extraction prices any
-member that uses an op the backend can't lower at `+inf`
-(`backend_cost`), so the optimizer only commits to forms the sink can
-execute — the backend counterpart of the semantic-language bound
-below. A non-torch backend is a `Sink` implementation and nothing in
-`catopt-core` changes; the torch-free core never imports it.
-
-```python
-from catopt import optimize_model, TorchSource
-
-# my_sink implements catopt.Sink (supported_ops / ops / lower / verify)
-opt, report = optimize_model(model, x, source=TorchSource(),
-                             sink=my_sink)
-```
-
 ## What it finds
 
 The transforms are not handwritten recipes — they fall out of the
@@ -220,6 +196,17 @@ project/                    orphan branch: plans, ADRs, retrospectives
 `catopt-core` installs standalone — the IR, e-graph, laws, and cost
 algebra run with zero dependencies (no torch). Integrations plug in
 per-domain: `pip install -e packages/catopt-core` for just the engine.
+
+**Ports.**  The pipeline's two ends are named ports, so the frontend and
+backend are swappable without touching the engine.  A `Source` lifts a
+model to IR (`model → (IR, leaf values)`); a `Sink` lowers IR back to a
+runnable and owns its op set and equivalence gate.  PyTorch is the
+shipped pair — `TorchSource` / `TorchSink` are the defaults for
+`optimize_model` and `discover_alternatives` (`source=` / `sink=`
+override them).  A sink's `supported_ops` bounds extraction: any member
+using an op the backend can't lower prices at `+inf` (`backend_cost`),
+so the optimizer only commits to forms the sink can execute.  A new
+backend implements `Sink`; `catopt-core` never imports it.
 
 ```bash
 uv sync                       # installs all workspace members editable
