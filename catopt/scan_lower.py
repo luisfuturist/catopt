@@ -178,6 +178,13 @@ def _select_index(term: Op) -> tuple[Any, int, int] | None:
         or len(term.args) != 1
     ):
         return None
+    if term.op == "getitem":
+        # t[i] — arg1/index IS the index; always dim 0 (see the
+        # torch_bridge binding).  Do not conflate with select.
+        idx = term.attrs.get("arg1", term.attrs.get("index"))
+        if not isinstance(idx, int):
+            return None
+        return (term.args[0], 0, idx)
     dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
     idx = term.attrs.get("arg2", term.attrs.get("index"))
     if not isinstance(dim, int) or not isinstance(idx, int):
@@ -451,7 +458,7 @@ class BatchedScanModule(torch.nn.Module):
         if self._plan is None:
             return self.eval_mod(*xs)
 
-        x = xs[0]
+        x = xs[0] if xs else None
         env: dict[str, torch.Tensor] = {"self": x}
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x

@@ -743,7 +743,7 @@ class BatchedOMModule(torch.nn.Module):
         if self._plan is None:
             return self.eval_mod(*xs)
 
-        x = xs[0]
+        x = xs[0] if xs else None
         env: dict[str, torch.Tensor] = {"self": x}
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x
@@ -1005,7 +1005,7 @@ class StreamingOMModule(torch.nn.Module):
         if self._plan is None:
             return self.eval_mod(*xs)
 
-        x = xs[0]
+        x = xs[0] if xs else None
         env: dict[str, torch.Tensor] = {"self": x}
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x

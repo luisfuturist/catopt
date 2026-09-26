@@ -159,10 +159,13 @@ def _matmul(a: Box, b: Box) -> Box:
     For A = Ac ± Ar, B = Bc ± Br the product set is enclosed by
     Ac·Bc ± (Ar|Bc| + |Ac|Br + Ar·Br).  Sound for batched matmuls —
     torch.matmul broadcasts the leading dims."""
-    ac = (a.lo + a.hi) / 2
-    ar = (a.hi - a.lo) / 2
-    bc = (b.lo + b.hi) / 2
-    br = (b.hi - b.lo) / 2
+    dt = torch.promote_types(a.lo.dtype, b.lo.dtype)
+    alo, ahi = a.lo.to(dt), a.hi.to(dt)
+    blo, bhi = b.lo.to(dt), b.hi.to(dt)
+    ac = (alo + ahi) / 2
+    ar = (ahi - alo) / 2
+    bc = (blo + bhi) / 2
+    br = (bhi - blo) / 2
     c = torch.matmul(ac, bc)
     r = (
         torch.matmul(ar, bc.abs())
@@ -286,7 +289,8 @@ def _eval_concrete(t: Any, env: dict, values: dict):
 def _inf_box(t: Any) -> Box:
     """±∞ box with the term's inferred shape (scalar when unknown)."""
     shape = _shape_of(t)
-    if shape is None or any(d is None for d in shape):
+    if (not isinstance(shape, tuple)
+            or any(d is None for d in shape)):
         inf = torch.tensor(float("inf"))
         return Box(-inf, inf)
     lo = torch.full(tuple(int(d) for d in shape), float("-inf"))

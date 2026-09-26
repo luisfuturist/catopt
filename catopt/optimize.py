@@ -441,10 +441,13 @@ def optimize_model(
         certified-approximation passes
         (``eps.low_rank_params`` + ``eps.kron_linear_params``): each
         offer carries an exact Eckart–Young / Frobenius bound and is
-        recorded in ``stats["eps_offers"]``.  The offers only *win*
-        under a storage-aware cost model (``param_bytes_cost``) or
-        explicit selection — the default launch-aware cost keeps the
-        exact member, so this never silently trades accuracy.
+        recorded in ``stats["eps_offers"]``.  Setting ``eps_rtol`` is
+        the opt-in: approximate members then compete in extraction
+        like any other — they win wherever the chosen cost model
+        prefers them (most often under ``param_bytes_cost``, but a
+        cheaper approximate member can win under the default
+        launch-aware cost too — the result is approximate by
+        construction, bounded by ``rtol`` per offer).
     ops : OpTable, optional
         The op table the optimized term is lowered through (plan 0001
         phase 2c) — passed to ``ir_to_torch_module`` and used for the
