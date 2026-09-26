@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Jamba-style hybrid blocks — a diagonal SSM and chunked attention in
 one module, so the e-graph sees BOTH monoid carriers simultaneously.
 

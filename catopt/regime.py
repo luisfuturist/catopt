@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Regime-adaptive architecture selection.
 
 A *regime* pairs a cost model with an executor.  ``regime_frontier``
@@ -762,7 +763,7 @@ class RegimeFrontier:
                     f"{'':<16} {'':<14} {'':>12} {'':>5}  "
                     f"note: {ch.note}"
                 )
-        for repr_, names in self.collapsed():
+        for _repr, names in self.collapsed():
             lines.append(f"collapsed: {names} extract the same member")
         return "\n".join(lines)
 

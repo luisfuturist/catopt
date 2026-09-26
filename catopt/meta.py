@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """3-cells as computed intelligence: coherence + completion, never stored.
 
 Two meta-level pieces on top of the e-graph kernel:
@@ -421,7 +422,7 @@ def match_pattern(
                     subst[key] = tv
             elif tv != pv:
                 return None
-        for pa, ta in zip(pat.args, term.args):
+        for pa, ta in zip(pat.args, term.args, strict=True):
             subst = match_pattern(pa, ta, subst)
             if subst is None:
                 return None
@@ -464,7 +465,7 @@ def _positions(
     yield path, term
     if isinstance(term, Op):
         for i, a in enumerate(term.args):
-            yield from _positions(a, path + (i,))
+            yield from _positions(a, (*path, i))
 
 
 def _subterm(term: Any, path: tuple) -> Any:
@@ -484,7 +485,7 @@ def _replace(term: Any, path: tuple, new: Any) -> Any:
 
 def _common_prefix(p: tuple, q: tuple) -> tuple:
     out = []
-    for a, b in zip(p, q):
+    for a, b in zip(p, q, strict=False):
         if a != b:
             break
         out.append(a)
@@ -494,7 +495,7 @@ def _common_prefix(p: tuple, q: tuple) -> tuple:
 def _overlapping(p: tuple, q: tuple) -> bool:
     """True when one position is an ancestor of (or equal to) the other."""
     lca = _common_prefix(p, q)
-    return lca == p or lca == q
+    return lca in (p, q)
 
 
 def apply_rewrite_at(
@@ -811,7 +812,7 @@ def _concrete_matched_leaves(
         return out  # metavar: bound subterm is free to generalize
     if isinstance(pat, Op):
         if isinstance(term, Op) and term.op == pat.op:
-            for pa, ta in zip(pat.args, term.args):
+            for pa, ta in zip(pat.args, term.args, strict=False):
                 _concrete_matched_leaves(pa, ta, out)
         return out
     out.add(term)  # concrete pattern leaf pinned this value
@@ -897,7 +898,7 @@ def _eval_allclose(a: Any, b: Any, tol: float = 1e-6) -> bool:
 
     if isinstance(a, tuple) and isinstance(b, tuple):
         return len(a) == len(b) and all(
-            _eval_allclose(x, y, tol) for x, y in zip(a, b)
+            _eval_allclose(x, y, tol) for x, y in zip(a, b, strict=True)
         )
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         return bool(torch.allclose(a, b, atol=tol, rtol=tol))
@@ -981,17 +982,15 @@ def _instantiation_stream(term_mvars: list[str], attr_mvars: list[str]):
 
     for shape in _LEAF_SHAPES:
         leaves = _fresh_leaves(len(term_mvars), shape)
-        base = dict(zip(term_mvars, leaves))
-        count = 0
-        for combo in itertools.product(
-            *([_ATTR_POOL] * len(attr_mvars))
+        base = dict(zip(term_mvars, leaves, strict=True))
+        for count, combo in enumerate(
+            itertools.product(*([_ATTR_POOL] * len(attr_mvars)))
         ):
             subst = dict(base)
-            for a, v in zip(attr_mvars, combo):
+            for a, v in zip(attr_mvars, combo, strict=True):
                 subst["$attr:" + a] = v
             yield subst
-            count += 1
-            if count >= _MAX_INSTANTIATIONS:
+            if count + 1 >= _MAX_INSTANTIATIONS:
                 break
 
 
@@ -1128,8 +1127,8 @@ def _validate_candidate(
 
 
 def _is_tautology(lhs: Any, rhs: Any) -> bool:
-    l, r = _alpha_key(lhs, rhs)
-    return l == r
+    lhs_key, rhs_key = _alpha_key(lhs, rhs)
+    return lhs_key == rhs_key
 
 
 def _subsumed(cand: Rewrite, existing: list[Rewrite]) -> bool:

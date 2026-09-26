@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Selective state-space model (SSM) blocks — Mamba/S4-style input-dependent
 dynamics, used as targets for the affine-map scan laws (``SCAN_LAWS``).
 

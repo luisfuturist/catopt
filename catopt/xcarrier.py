@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Cross-carrier laws — what can and cannot pass between the scan
 (``aff``/``aff_diag``) and online-softmax (``om``) monoid domains.
 
@@ -265,19 +266,19 @@ def _xshape_rec(t: Any, memo: dict):
     if op == "om_elem_affd" and len(args) == 4:
         ss, sa = _xshape(args[0], memo), _xshape(args[1], memo)
         if _concrete(ss) and _concrete(sa):
-            return tuple(ss[:-1]) + (sa[-1],)
+            return (*tuple(ss[:-1]), sa[-1])
         return _shape_of(t)
     if op == "om_elem_aff" and len(args) == 4:
         ss, sa = _xshape(args[0], memo), _xshape(args[1], memo)
         if _concrete(ss) and _concrete(sa) and len(sa) >= 2:
-            return tuple(ss[:-1]) + (sa[-2],)
+            return (*tuple(ss[:-1]), sa[-2])
         return _shape_of(t)
     if op == "omd_elem" and len(args) == 3:
         ss, sa = _xshape(args[0], memo), _xshape(args[1], memo)
         if _concrete(ss) and _concrete(sa):
             # dense fiber a (…,K,d,i) → applied value (…,Tq,d)
             last = sa[-2] if len(sa) >= 3 else sa[-1]
-            return tuple(ss[:-1]) + (last,)
+            return (*tuple(ss[:-1]), last)
         return _shape_of(t)
     if op == "omd_compose" and len(args) == 2:
         return _xshape(args[0], memo)
@@ -358,17 +359,17 @@ def _omd_elem(s: torch.Tensor, a: torch.Tensor, b: torch.Tensor):
     (consumed by ``omd_applym``)."""
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
-    l = e.sum(dim=-1, keepdim=True)
+    l_ = e.sum(dim=-1, keepdim=True)
     if a.dim() >= 3:
         d, i = a.shape[-2], a.shape[-1]
         ea = e @ a.reshape(*a.shape[:-2], d * i)
         ea = ea.reshape(*ea.shape[:-1], d, i)
-        return m, l, ea, e @ b
-    return m, l, e @ a, e @ b
+        return m, l_, ea, e @ b
+    return m, l_, e @ a, e @ b
 
 
-def _omd(m, l, fa, fb, *a, **kw):
-    return (m, l, fa, fb)
+def _omd(m, l_, fa, fb, *a, **kw):
+    return (m, l_, fa, fb)
 
 
 def _omd_compose(f, g):
@@ -392,7 +393,7 @@ def _omd_compose(f, g):
     zl1, zl2 = torch.zeros_like(l1), torch.zeros_like(l2)
     za1, za2 = torch.zeros_like(fa1), torch.zeros_like(fa2)
     zb1, zb2 = torch.zeros_like(fb1), torch.zeros_like(fb2)
-    l = torch.where(fin1, l1 * e1, zl1) + torch.where(
+    l_ = torch.where(fin1, l1 * e1, zl1) + torch.where(
         fin2, l2 * e2, zl2
     )
     fa = torch.where(fin1f, fa1 * e1f, za1) + torch.where(
@@ -401,7 +402,7 @@ def _omd_compose(f, g):
     fb = torch.where(fin1, fb1 * e1, zb1) + torch.where(
         fin2, fb2 * e2, zb2
     )
-    return mx, l, fa, fb
+    return mx, l_, fa, fb
 
 
 def _omd_apply(f, h, *a, **kw):
@@ -1000,7 +1001,8 @@ XC_LINEAR_APPLY_REV = R(
 
 
 def _scale_applyd(name, r_first):
-    mul = lambda x, y: Op.make("mul", x, y)
+    def mul(x, y):
+        return Op.make("mul", x, y)
     lhs = (
         mul("r", Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"))
         if r_first
@@ -1330,7 +1332,7 @@ def _derive_reshape_apply(bound: dict):
     S = bound.get("$attr:S")
     if A is None or _resolve_view_shape(S, _numel_of(A[:-1])) is None:
         return None
-    return {"$attr:SA": tuple(S) + (A[-1],)}
+    return {"$attr:SA": (*tuple(S), A[-1])}
 
 
 def _check_transpose_apply(bound: dict) -> bool:
@@ -2042,7 +2044,7 @@ def _gather_stack(
                         # dense: fs == vs + (i,) and h fills axis -1.
                         if (kind == "diag" and fs != vs) or (
                             kind == "dense"
-                            and fs != tuple(vs) + (hs[0],)
+                            and fs != (*tuple(vs), hs[0])
                         ):
                             continue
                         m[vs] = f
@@ -2254,7 +2256,11 @@ def omd_tree_lift(
             # candidate h's: union of leaf options under the carrier
             h_cands: set[int] = set()
 
-            def _collect(ccid: int, seen: frozenset = frozenset()):
+            def _collect(
+                ccid: int,
+                seen: frozenset = frozenset(),
+                h_cands=h_cands,
+            ):
                 ccid = eg.find(ccid)
                 if ccid in seen:
                     return

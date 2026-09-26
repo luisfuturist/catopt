@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF002, RUF003
 """The ε axis — certified approximations inside the e-graph.
 
 Optional toolkit: off by default and not part of the core optimizer —
@@ -330,14 +331,14 @@ def _term_spectral(t: Any, source_tensors: dict) -> float | None:
     if isinstance(t, Op):
         # only fold if every leaf is a param/const
         leaves = _leaves(t)
-        if all(isinstance(l, (Param, Const)) for l in leaves):
+        if all(isinstance(lf, (Param, Const)) for lf in leaves):
             try:
                 from catopt.torch_bridge import _IR_TO_TORCH
 
                 env = {
-                    l.name: source_tensors[l.name]
-                    for l in leaves
-                    if isinstance(l, Param) and l.name in source_tensors
+                    lf.name: source_tensors[lf.name]
+                    for lf in leaves
+                    if isinstance(lf, Param) and lf.name in source_tensors
                 }
 
                 def ev(x):
@@ -399,12 +400,11 @@ def _lip_wrt(
             if sib is not None
             else None
         )
-    if node_op in ("matmul", "linear", "conv2d"):
-        if len(children) >= 2:
-            if i == 0:
-                return _term_spectral(children[1], source_tensors)
-            # weight side: multiplier is the activation norm
-            return act_norm
+    if node_op in ("matmul", "linear", "conv2d") and len(children) >= 2:
+        if i == 0:
+            return _term_spectral(children[1], source_tensors)
+        # weight side: multiplier is the activation norm
+        return act_norm
     if node_op == "softmax":
         return 1.0
     if node_op == "sdpa":
@@ -485,7 +485,7 @@ def _find_subterms(term: Any, target: Any, _path=(), _acc=None):
         _acc.append(_path)
     if isinstance(term, Op):
         for i, a in enumerate(term.args):
-            _find_subterms(a, target, _path + (i,), _acc)
+            _find_subterms(a, target, (*_path, i), _acc)
     return _acc
 
 

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Interval bound propagation (IBP) — tighter whole-model ε certificates.
 
 ``eps.model_bound`` propagates each certified site's bound to the output
@@ -341,7 +342,7 @@ def _ibp_eval(
                 input_box,
                 values,
                 boxes,
-                path + (i,),
+                (*path, i),
                 unsupported,
                 site_boxes,
             )
@@ -577,7 +578,10 @@ def _norm_input_box(
     ):
         return {vars_[0].name: mk(input_box)}
     if isinstance(input_box, (tuple, list)):
-        return {v.name: mk(t) for v, t in zip(vars_, input_box)}
+        return {
+            v.name: mk(t)
+            for v, t in zip(vars_, input_box, strict=False)
+        }
     # single tensor
     return {vars_[0].name: mk(input_box)} if vars_ else {}
 
@@ -728,8 +732,7 @@ def _unary_lip(op: str, b: Box, attrs: dict) -> float | None:
     if op == "square":
         return 2.0 * float(b.maxabs.max())
     if op == "pow":
-        e = attrs.get("arg1", attrs.get("exponent"))
-        return None  # handled via sibling box in _hop
+        return None  # exponent handled via sibling box in _hop
     return None
 
 
@@ -938,9 +941,8 @@ def _spectral_path_ok(site: dict, term: Any) -> bool:
         a0 = s.args[0]
         if isinstance(a0, Op) and a0.op == "embedding":
             return True  # per-row bound — sound
-        if isinstance(a0, Param):
-            return True  # bound on the member value
-        return False  # activation matmul site
+        # Param → bound on the member value; else activation matmul site
+        return isinstance(a0, Param)
     return True
 
 
@@ -1005,10 +1007,10 @@ def _site_scalar(
         # eps_lr: site is linear(linear(x,V),U); output row err is
         # x_row·ΔWᵀ ≤ ‖x_row‖·b — x is the ORIGINAL site input, i.e.
         # the inner chain's operand at path p+(0,0).
-        xpath = p + (0,)
+        xpath = (*p, 0)
         inner = s.args[0]
         if isinstance(inner, Op) and inner.op == "linear":
-            xpath = p + (0, 0)
+            xpath = (*p, 0, 0)
         xb = boxes.get(xpath)
         if xb is not None:
             return b * _maxrow_bound(xb), "row"
@@ -1019,7 +1021,7 @@ def _site_scalar(
             return b, "row"  # eps_emb: per-row bound declared
         if isinstance(a0, Param):
             return b, "row"  # weight-program site: bound on value
-        xb = boxes.get(p + (0,))
+        xb = boxes.get((*p, 0))
         if xb is not None:
             return b * _maxrow_bound(xb), "row"
         return None
@@ -1040,7 +1042,7 @@ def _walk_site(
         if not isinstance(node, Op):
             return None
         argb = [
-            boxes.get(path[:d] + (j,)) for j in range(len(node.args))
+            boxes.get((*path[:d], j)) for j in range(len(node.args))
         ]
         outb = boxes.get(path[:d])
         if any(a is None for a in argb) or outb is None:
@@ -1265,7 +1267,7 @@ def _prop_delta(
         if s is None or float(s.abs().min()) <= 0:
             return None
         if i == 0:
-            return cur / (s if not mag else s), mag
+            return cur / s, mag
         a = sib(0)
         if a is None:
             return None
@@ -1330,7 +1332,7 @@ def _walk_site_artifact(
         if not isinstance(node, Op):
             return None
         argb = [
-            boxes.get(path[:d] + (j,)) for j in range(len(node.args))
+            boxes.get((*path[:d], j)) for j in range(len(node.args))
         ]
         outb = boxes.get(path[:d])
         res = _prop_delta(
@@ -1344,7 +1346,7 @@ def _walk_site_artifact(
             for dd in range(d, -1, -1):
                 nd = _subterm(term, path[:dd])
                 ab = [
-                    boxes.get(path[:dd] + (j,))
+                    boxes.get((*path[:dd], j))
                     for j in range(len(nd.args))
                 ]
                 ob = boxes.get(path[:dd])
@@ -1413,7 +1415,9 @@ def _vars_and_inputs(term: Any, example_input: Any):
         if isinstance(example_input, (tuple, list))
         else [example_input]
     )
-    values = {v.name: t for v, t in zip(vars_, inputs)}
+    values = {
+        v.name: t for v, t in zip(vars_, inputs, strict=False)
+    }
     return vars_, inputs, values
 
 
@@ -1497,14 +1501,19 @@ def tight_model_bound(
     vars_, inputs, values = _vars_and_inputs(term, example_input)
     input_box = (
         _norm_input_box(
-            {v.name: t for v, t in zip(vars_, inputs)} if vars_ else {},
+            {
+                v.name: t
+                for v, t in zip(vars_, inputs, strict=False)
+            }
+            if vars_
+            else {},
             term,
             input_radius,
         )
         if vars_
         else {}
     )
-    for v, t in zip(vars_, inputs):
+    for v, t in zip(vars_, inputs, strict=False):
         input_box.setdefault(
             v.name,
             Box(

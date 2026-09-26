@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Level-batched lowering for online-softmax monoid (om) IR terms.
 
 After eqsat with ``OM_LAWS`` (see :mod:`catopt.om`), chunked attention
@@ -416,7 +417,7 @@ def build_om_plan(root: Any) -> dict | None:
     slot: dict[int, int] = {}
     next_slot = 0
     for grp in groups:
-        for leaf, c in zip(grp["members"], grp["mults"]):
+        for leaf, c in zip(grp["members"], grp["mults"], strict=True):
             slot[id(leaf)] = next_slot
             next_slot += c
         if grp["key"][0] == "elem":
@@ -627,10 +628,10 @@ class BatchedOMModule(torch.nn.Module):
                 t.shape == b.shape
                 and t.dtype == b.dtype
                 and t.device == b.device
-                for t, b in zip(xs, self._graph_inputs)
+                for t, b in zip(xs, self._graph_inputs, strict=True)
             )
         ):
-            for buf, t in zip(self._graph_inputs, xs):
+            for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
             return self._graph_out
@@ -759,19 +760,19 @@ class BatchedOMModule(torch.nn.Module):
             if grp["kind"] == "elem":
                 s = self._stacked_scores(grp, ev)  # (g,...,T,K)
                 v = self._stacked_values(grp, ev)  # (g,...,K,d)
-                m, l, a = _batched_elem(s, v)
+                m, l_, a = _batched_elem(s, v)
                 mults = grp["mults"]
                 if any(c != 1 for c in mults):
                     # DAG-shared leaves contribute once per occurrence.
                     idx = self._repeat_idx(mults, m)
                     m = m.index_select(0, idx)
-                    l = l.index_select(0, idx)
+                    l_ = l_.index_select(0, idx)
                     a = a.index_select(0, idx)
                 m_parts.append(m)
-                l_parts.append(l)
+                l_parts.append(l_)
                 a_parts.append(a)
             else:
-                for leaf, c in zip(grp["members"], grp["mults"]):
+                for leaf, c in zip(grp["members"], grp["mults"], strict=True):
                     f = ev(leaf)  # (m, l, a) triple
                     for _ in range(c):
                         m_parts.append(f[0].unsqueeze(0))
@@ -886,9 +887,9 @@ def om_empty_state(
     m = torch.full(
         (*shape, 1), float("-inf"), device=device, dtype=dtype
     )
-    l = torch.zeros(*shape, 1, device=device, dtype=dtype)
+    l_ = torch.zeros(*shape, 1, device=device, dtype=dtype)
     a = torch.zeros(*shape, dv, device=device, dtype=dtype)
-    return (m, l, a)
+    return (m, l_, a)
 
 
 def om_step(
@@ -1011,7 +1012,7 @@ class StreamingOMModule(torch.nn.Module):
 
         state: tuple | None = None
         for grp in self._plan["leaf_groups"]:
-            for leaf, c in zip(grp["members"], grp["mults"]):
+            for leaf, c in zip(grp["members"], grp["mults"], strict=True):
                 # Fresh memo per leaf: score blocks / per-leaf
                 # intermediates are dropped with the dict at the next
                 # iteration — the bounded-working-set property.  Inputs

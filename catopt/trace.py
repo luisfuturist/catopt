@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF002, RUF003
 """Traced monoidal structure — feedback loops as first-class rewrite targets.
 
 THEORY

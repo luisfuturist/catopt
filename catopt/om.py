@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Online-softmax monoid — the nonlinear analogue of the scan carrier.
 
 The affine-map monoid (``SCAN_LAWS`` in :mod:`catopt.rules`) showed that
@@ -1003,9 +1004,8 @@ def _check_sdpa_cat(bound: dict) -> bool:
         isinstance(sc, bool) or not isinstance(sc, (int, float))
     ):
         return False  # non-numeric scale
-    if sc is None and not isinstance(qs[-1], int):
-        return False  # cannot derive 1/√E
-    return True
+    # cannot derive 1/√E unless qs[-1] gives a numeric head dim
+    return sc is not None or isinstance(qs[-1], int)
 
 
 def _derive_sdpa_cat(bound: dict) -> dict | None:
@@ -1122,7 +1122,7 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
     bb = _broadcast(qs[:-2], k1s[:-2])
     if bb is _INVALID:
         return False
-    scores = tuple(bb) + (qs[-2], k1 + k2)
+    scores = (*tuple(bb), qs[-2], k1 + k2)
     b = _broadcast(scores, ms)
     if b is _INVALID or not isinstance(b, tuple) or not b:
         return False

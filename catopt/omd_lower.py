@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Schedule-batched lowering for deferred-affine (omd) attention terms.
 
 After the cross-carrier lifts (:func:`catopt.xcarrier.omd_tree_lift`),
@@ -283,7 +284,7 @@ def build_omd_plan(root: Any) -> dict | None:
         return 0
 
     visit(f_term)
-    slot = {id(l): i for i, l in enumerate(omd_leaves)}
+    slot = {id(lf): i for i, lf in enumerate(omd_leaves)}
     nxt = len(omd_leaves)
     omd_gather = []
     for nodes in omd_levels:
@@ -493,8 +494,8 @@ def build_omd_plan(root: Any) -> dict | None:
     if chain:
         dom = next(iter(tdoms))
         if any(
-            isinstance(l, Op) and _LEAF_OP.get(l.op) not in (None, dom)
-            for l in base
+            isinstance(lf, Op) and _LEAF_OP.get(lf.op) not in (None, dom)
+            for lf in base
         ) or not _sig_uniform(base, dom):
             chain = False
 
@@ -520,7 +521,7 @@ def build_omd_plan(root: Any) -> dict | None:
     for dom, d in domains.items():
         if not _sig_uniform(d["leaves"], dom):
             return None
-        slot_d = {id(l): i for i, l in enumerate(d["leaves"])}
+        slot_d = {id(lf): i for i, lf in enumerate(d["leaves"])}
         nxt_d = len(d["leaves"])
         gather = []
         for nodes in d["levels"]:
@@ -554,7 +555,7 @@ def build_omd_plan(root: Any) -> dict | None:
                 dim,
             )
         )
-    for tid, (mp, dom) in targets.items():
+    for _tid, (mp, dom) in targets.items():
         plan["map_seeds"].append(
             (mp, ("forest", dom), domains[dom]["slot"][id(mp)])
         )
@@ -664,10 +665,10 @@ class BatchedOmdModule(torch.nn.Module):
                 t.shape == b.shape
                 and t.dtype == b.dtype
                 and t.device == b.device
-                for t, b in zip(xs, self._graph_inputs)
+                for t, b in zip(xs, self._graph_inputs, strict=True)
             )
         ):
-            for buf, t in zip(self._graph_inputs, xs):
+            for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
             return self._graph_out
@@ -722,7 +723,9 @@ class BatchedOmdModule(torch.nn.Module):
             if dim != 0:
                 A = A.movedim(dim, 0)
         else:
-            A = torch.stack([self._leaf_part(l, 0, ev) for l in leaves])
+            A = torch.stack(
+                [self._leaf_part(lf, 0, ev) for lf in leaves]
+            )
         if gather_b is not None:
             base, dim, idx = gather_b
             bt = ev(base)
@@ -733,7 +736,9 @@ class BatchedOmdModule(torch.nn.Module):
             if dim != 0:
                 B = B.movedim(dim, 0)
         else:
-            B = torch.stack([self._leaf_part(l, 1, ev) for l in leaves])
+            B = torch.stack(
+                [self._leaf_part(lf, 1, ev) for lf in leaves]
+            )
         return A, B
 
     @staticmethod
@@ -769,7 +774,7 @@ class BatchedOmdModule(torch.nn.Module):
         T = A.shape[0]
         if T == 1:
             return A, B
-        blk = int(math.ceil(math.sqrt(T)))
+        blk = math.ceil(math.sqrt(T))
         C = (T + blk - 1) // blk
         pad = C * blk - T
         shape_a, shape_b = A.shape[1:], B.shape[1:]
@@ -951,7 +956,7 @@ class BatchedOmdModule(torch.nn.Module):
             else:
                 omd_compose = _IR_TO_TORCH["omd_compose"]
                 for f_idx, g_idx in plan["omd_gather"]:
-                    for fi, gi in zip(f_idx, g_idx):
+                    for fi, gi in zip(f_idx, g_idx, strict=True):
                         vals.append(omd_compose(vals[fi], vals[gi]))
                 root_t = vals[plan["omd_root"]]
 

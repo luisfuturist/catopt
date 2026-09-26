@@ -22,6 +22,7 @@ Profiles round-trip through JSON and persist under
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -368,10 +369,8 @@ def calibrate(
         )
     finally:
         if prev_tf32 is not None:
-            try:
+            with contextlib.suppress(Exception):
                 torch.backends.cuda.matmul.allow_tf32 = prev_tf32
-            except Exception:
-                pass
 
     profile = TargetProfile(
         name=name or _default_name(dev),

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """The trm ↔ apply bridge: lifting unrolled recurrences into trace form.
 
 catopt/trace.py documents the gap this module closes: recognising an
@@ -460,7 +461,7 @@ def _assemble_F(em: _Emit, maps: list, d: int):
 def _emit_head(em: _Emit, F, ins: list, h0, d: int, usize):
     """``reshape(matmul(trace(F, usize), vec), (d,))`` — the member
     offered to the recurrence's e-class."""
-    vec = em.op("concat", list(ins) + [h0], {"dim": 0})
+    vec = em.op("concat", [*list(ins), h0], {"dim": 0})
     vec2 = em.op("unsqueeze", (vec,), {"dim": 1})
     tr = em.op("trace", (F,), {"usize": usize})
     mv = em.op("matmul", (tr, vec2))
@@ -627,7 +628,7 @@ def _offer(
             ic = [em.op("split", (em.ref(i),), at) for i in plan.ins]
             hc = em.op("split", (em.ref(plan.h0),), at)
             Fs.append(_channel_F(em, "diag", mc, dc))
-            vecs.append(em.op("concat", list(ic) + [hc], {"dim": 0}))
+            vecs.append(em.op("concat", [*list(ic), hc], {"dim": 0}))
         if em.broken:
             continue
         u1, u2 = T * part[0], T * part[1]
@@ -746,7 +747,7 @@ def lift_scan_to_trace(
             qh0 = eg.find(q.h0)
             qmaps = [eg.find(m) for m in q.maps]
             qins = [eg.find(i) for i in q.ins]
-            for pc, p in items:
+            for _pc, p in items:
                 if p.T <= q.T or p.kind != q.kind:
                     continue
                 if eg.find(p.h0) != qh0:

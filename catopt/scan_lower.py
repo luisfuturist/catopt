@@ -261,7 +261,9 @@ def build_scan_plan(root: Any) -> dict | None:
 
     # Slot assignment: leaves occupy 0..n-1, then each level appends its
     # outputs in order — so a level's operand slots are all < its own.
-    slot: dict[int, int] = {id(l): i for i, l in enumerate(leaves)}
+    slot: dict[int, int] = {
+        id(lf): i for i, lf in enumerate(leaves)
+    }
     next_slot = len(leaves)
     level_gather: list[tuple[list[int], list[int]]] = []
     for nodes in levels:
@@ -407,10 +409,10 @@ class BatchedScanModule(torch.nn.Module):
                 t.shape == b.shape
                 and t.dtype == b.dtype
                 and t.device == b.device
-                for t, b in zip(xs, self._graph_inputs)
+                for t, b in zip(xs, self._graph_inputs, strict=True)
             )
         ):
-            for buf, t in zip(self._graph_inputs, xs):
+            for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
             return self._graph_out

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF002
 """Activation-space ε: certified bounded-error rewrites on *activations*.
 
 Optional toolkit, not part of the core optimizer — nothing here runs
@@ -364,7 +365,7 @@ def calibrate(
         if isinstance(xs, dict):
             env = dict(xs)
         else:
-            env = {v.name: t for v, t in zip(ir.inputs, xs)}
+            env = {v.name: t for v, t in zip(ir.inputs, xs, strict=False)}
         memo: dict[int, object] = {}
 
         def ev(t):
@@ -606,7 +607,7 @@ def act_low_rank(
         return info[c][0], info[c][1]
 
     def law_of(c, i, node, bound):
-        amax, n, d, resid = (
+        amax, _n, d, resid = (
             info[c][2],
             info[c][3],
             info[c][4],
