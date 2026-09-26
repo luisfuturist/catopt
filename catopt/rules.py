@@ -35,7 +35,7 @@ def R(
 
 #: id()-keyed shape memo for the check-hook path.  The bound terms it
 #: sees are ``EGraph.any_term`` resolutions — DAG-shared Op objects —
-#: and ``cost._shape_of`` is already memo-aware: threading one memo
+#: and ``typing._shape_of`` is already memo-aware: threading one memo
 #: turns an exponential DAG re-walk into a linear one.  ``_SHAPE_KEEP``
 #: pins every term the memo covers so ids can never be recycled into a
 #: stale (id -> wrong shape) binding — soundness over memory (the set
@@ -46,7 +46,7 @@ _SHAPE_KEEP: dict[int, Any] = {}
 
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     _SHAPE_KEEP[id(t)] = t
     return _so(t, _SHAPE_MEMO)
@@ -758,7 +758,7 @@ def _check_repeat_chain(bound: dict, pre: str) -> bool:
     """reshape(expand(unsqueeze(t, d))) must be exactly repeat_interleave
     on dim d-1: unsqueeze inserts a 1, expand broadcasts only that dim
     by r, and the reshape merges dims d-1,d into one."""
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     d = bound.get(f"$attr:UD{pre}")
     es = bound.get(f"$attr:ES{pre}")
@@ -791,7 +791,7 @@ def _check_repeat_chain(bound: dict, pre: str) -> bool:
 def _check_gqa_absorb(bound: dict) -> bool:
     """Both k and v must be repeat-chains with the SAME repeat factor r,
     and q's head count must equal kv_heads * r."""
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     for side in ("k", "v"):
         if not _check_repeat_chain(bound, side):
@@ -1108,9 +1108,9 @@ def _pair_shared_input(
     exclude a member): for conv2d it captures stride/padding/dilation/
     groups and the trailing weight dims.
     """
-    from catopt.cost import _shape_of as _so
     from catopt.egraph import ENode, _LeafRegistry
     from catopt.ir import Var as _Var
+    from catopt.typing import _shape_of as _so
 
     # Per-class "can some representative reach a Var leaf" — memoized and
     # cycle-guarded.  Replaces materializing any_term + _term_has_var per
@@ -1245,7 +1245,7 @@ def _pair_shared_input(
 
 
 def _wshape(t: Any):
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     return _so(t)
 
@@ -1881,7 +1881,7 @@ def _derive_affd_unit(bound: dict) -> dict | None:
     """``US`` := broadcast(shape(h), shape(x)) — the unit diagonal must
     materialise at the add's output shape (all ones).  Vetoes the
     firing when either bound term's shape is non-concrete."""
-    from catopt.cost import _broadcast
+    from catopt.typing import _broadcast
 
     s = _broadcast(_shape_of(bound.get("h")), _shape_of(bound.get("x")))
     if not (

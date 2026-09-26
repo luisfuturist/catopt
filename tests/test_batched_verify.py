@@ -300,7 +300,7 @@ def test_compositional_inplace_fallback_preserves_model():
     orig = copy.deepcopy
     copy.deepcopy = flaky
     try:
-        opt, rep = optimize_compositional(model, idx64, verbose=False)
+        _opt, rep = optimize_compositional(model, idx64, verbose=False)
     finally:
         copy.deepcopy = orig
     assert rep["in_place"] is True

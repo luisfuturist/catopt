@@ -118,24 +118,24 @@ class Stories15M(nn.Module):
         with torch.no_grad():
             self.emb.weight.copy_(torch.tensor(w["token_embedding"]))
             self.head.weight.copy_(torch.tensor(w["token_embedding"]))
-            for l, b in enumerate(self.blocks):
-                b.rms_att.copy_(torch.tensor(w["rms_att"][l]))
-                b.rms_ffn.copy_(torch.tensor(w["rms_ffn"][l]))
-                b.wq.weight.copy_(torch.tensor(w["wq"][l]))
-                b.wk.weight.copy_(torch.tensor(w["wk"][l]))
-                b.wv.weight.copy_(torch.tensor(w["wv"][l]))
-                b.wo.weight.copy_(torch.tensor(w["wo"][l]))
+            for li, b in enumerate(self.blocks):
+                b.rms_att.copy_(torch.tensor(w["rms_att"][li]))
+                b.rms_ffn.copy_(torch.tensor(w["rms_ffn"][li]))
+                b.wq.weight.copy_(torch.tensor(w["wq"][li]))
+                b.wk.weight.copy_(torch.tensor(w["wk"][li]))
+                b.wv.weight.copy_(torch.tensor(w["wv"][li]))
+                b.wo.weight.copy_(torch.tensor(w["wo"][li]))
                 # llama2.c stores FFN weights (out,in) row-major; the
                 # loader's (dim,hidden)/(hidden,dim) reshape scrambles —
                 # reshape recovers the true nn.Linear orientation.
                 b.w1.weight.copy_(
-                    torch.tensor(w["w1"][l].reshape(hidden, dim))
+                    torch.tensor(w["w1"][li].reshape(hidden, dim))
                 )
                 b.w2.weight.copy_(
-                    torch.tensor(w["w2"][l].reshape(dim, hidden))
+                    torch.tensor(w["w2"][li].reshape(dim, hidden))
                 )
                 b.w3.weight.copy_(
-                    torch.tensor(w["w3"][l].reshape(hidden, dim))
+                    torch.tensor(w["w3"][li].reshape(hidden, dim))
                 )
             self.rms_final.copy_(torch.tensor(w["rms_final"]))
 

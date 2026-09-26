@@ -424,7 +424,7 @@ def test_batched_forest_mode_equivalence():
     ir = IR(root=term, inputs=[xv], params=_params_dict(s, h, *a, *b))
     pv = {
         p.name: _rand(p.typ.shape, 40 + i)
-        for i, p in enumerate([s, h] + a + b)
+        for i, p in enumerate([s, h, *a, *b])
     }
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(ir, pv).eval()

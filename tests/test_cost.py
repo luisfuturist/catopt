@@ -184,7 +184,7 @@ def test_rank1_matmul_shapes():
     A = Param("A", TensorType((8, 4)))
     M = Param("M", TensorType((4, 8)))
     v = Param("v", TensorType((4,)))
-    w = Param("w", TensorType((8,)))
+    _w = Param("w", TensorType((8,)))
     assert _infer_op_shape(Op.make("matmul", A, v)) == (8,)  # matvec
     assert _infer_op_shape(Op.make("matmul", v, M)) == (8,)  # vec-mat
     assert _infer_op_shape(Op.make("matmul", v, v)) == ()  # dot

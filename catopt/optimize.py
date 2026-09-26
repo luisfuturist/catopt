@@ -263,7 +263,7 @@ def _specialize_causal(
     """sdpa(q,k,v, mask) where mask is parameter-only and evaluates to
     a causal keep-mask → sdpa(q,k,v, is_causal=True).  Dropping the
     materialised mask unlocks the fused flash/mem-efficient kernels."""
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     if memo is None:
         memo = {}

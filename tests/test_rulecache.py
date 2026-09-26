@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Persistent cache for synthesized rules — catopt.rulecache.
 
 ``synthesize_rules`` is the expensive phase of meta-optimization, but
@@ -104,7 +105,7 @@ def test_roundtrip_rules_fire_identically_and_verify_fp64(tmp_path):
     loaded = cache.load(key, rules)
     assert loaded is not None and len(loaded) == len(derived)
 
-    for orig, rel in zip(derived, loaded):
+    for orig, rel in zip(derived, loaded, strict=True):
         assert rel.name == orig.name and rel.law == orig.law
         assert meta._alpha_key(rel.lhs, rel.rhs) == meta._alpha_key(
             orig.lhs, orig.rhs
@@ -166,7 +167,9 @@ def test_guarded_rule_roundtrip_check_vetoes_after_reload(tmp_path):
     cache = RuleCache(tmp_path)
     key = cache_key(rules, [seed], fuel=2000)
     cache.store(key, derived)
-    loaded = [x for x in cache.load(key, rules) if x.name == d.name][0]
+    loaded = next(
+        x for x in cache.load(key, rules) if x.name == d.name
+    )
     assert loaded.check is not None and loaded.derive is not None
     assert meta._rhs_derive_placeholders(loaded.rhs)
 
@@ -238,9 +241,9 @@ def test_derive_placeholder_recomputed_on_new_instance(tmp_path):
     cache = RuleCache(tmp_path)
     key = cache_key(rules, [seed], fuel=6000)
     cache.store(key, derived)
-    loaded = [
+    loaded = next(
         x for x in cache.load(key, rules) if x.name == lemma.name
-    ][0]
+    )
 
     q3 = Var("q3", _T(2, 5, 4))
     k13, k23 = Var("k13", _T(2, 3, 4)), Var("k23", _T(2, 4, 4))
@@ -297,7 +300,9 @@ def test_cache_key_misses_on_changed_inputs(tmp_path):
     assert cache.load(key, rules) is not None
     assert cache_key(rules, [seed], fuel=4000) == key
     assert cache_key(rules, [seed2], fuel=4000) != key
-    assert cache_key(rules + [OM.OM_UNLIFT], [seed], fuel=4000) != key
+    assert (
+        cache_key([*rules, OM.OM_UNLIFT], [seed], fuel=4000) != key
+    )
     assert cache_key(rules, [seed], fuel=8000) != key
     assert (
         cache_key(rules, [seed], fuel=4000, numeric_check=False) != key

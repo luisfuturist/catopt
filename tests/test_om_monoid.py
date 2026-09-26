@@ -130,7 +130,7 @@ def test_om_compose_associativity_fp64():
     torch.manual_seed(0)
     ss = [torch.randn(2, 5, k, dtype=torch.float64) for k in (3, 4, 6)]
     vs = [torch.randn(2, k, 7, dtype=torch.float64) for k in (3, 4, 6)]
-    es = [_om_elem(s, v) for s, v in zip(ss, vs)]
+    es = [_om_elem(s, v) for s, v in zip(ss, vs, strict=True)]
     left = _om_apply(_om_compose(_om_compose(es[0], es[1]), es[2]))
     right = _om_apply(_om_compose(es[0], _om_compose(es[1], es[2])))
     ref = torch.softmax(torch.cat(ss, -1), dim=-1) @ torch.cat(vs, -2)
@@ -187,10 +187,10 @@ def test_om_fully_masked_block_contributes_zero():
 def test_om_packaging_op_is_identity_triple():
     """om(m, l, a) is pure packaging — the identity on the triple."""
     m = torch.randn(4, 1)
-    l = torch.randn(4, 1)
+    lv = torch.randn(4, 1)
     a = torch.randn(4, 3)
-    f = _IR_TO_TORCH["om"](m, l, a)
-    assert f == (m, l, a)
+    f = _IR_TO_TORCH["om"](m, lv, a)
+    assert f == (m, lv, a)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ def test_chunked_attention_emerges_via_om_split():
     ]
     term = _dense_chunked_term(q, ks, vs)
 
-    eg, root, stats = _run_om(term)
+    eg, root, _stats = _run_om(term)
     root_ops = {n.op for n in eg.get_class(root).nodes}
     # The root class contains BOTH the dense matmul form and the lifted
     # om_apply form — softmax-form ≡ om-form in one e-class.
@@ -278,7 +278,7 @@ def test_chunked_attention_emerges_via_om_split():
     assert chunked_term is not None
     assert "om_compose" in op_repr(chunked_term)
 
-    inputs = [q] + ks + vs
+    inputs = [q, *ks, *vs]
     ir = IR(
         root=chunked_term,
         inputs=inputs,
@@ -323,7 +323,7 @@ def test_chunked_attention_batched():
     assert chunked
     chunked_term = _extract_chunked(eg, root)
     assert chunked_term is not None
-    inputs = [q] + ks + vs
+    inputs = [q, *ks, *vs]
     ir = IR(
         root=chunked_term,
         inputs=inputs,
@@ -353,7 +353,7 @@ def test_greedy_extraction_also_verifies():
     term = _dense_chunked_term(q, ks, vs)
     eg, root, _ = _run_om(term)
     best = eg.extract_best(root, flops_cost)
-    inputs = [q] + ks + vs
+    inputs = [q, *ks, *vs]
     ir = IR(
         root=best,
         inputs=inputs,
@@ -601,7 +601,7 @@ def test_concat_binarize_feeds_om_split():
     assert chunked, "n-ary concat never reached the chunked carrier"
     chunked_term = _extract_chunked(eg, root)
     assert chunked_term is not None
-    inputs = [q] + ks + vs
+    inputs = [q, *ks, *vs]
     ir = IR(
         root=chunked_term,
         inputs=inputs,
@@ -638,8 +638,8 @@ def test_om_cost_model_shapes_and_flops():
     assert flops_cost(out) > 0
     # om packaging is a view op: zero local cost.
     m = Var("m", TensorType((4, 1)))
-    l = Var("l", TensorType((4, 1)))
+    lv = Var("l", TensorType((4, 1)))
     a = Var("a", TensorType((4, 3)))
-    triple = Op.make("om", m, l, a)
+    triple = Op.make("om", m, lv, a)
     assert _shape_of(triple) == (4, 3)
     assert dag_cost(triple, flops_cost) == 0.0

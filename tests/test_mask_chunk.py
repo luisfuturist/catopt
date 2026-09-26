@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """sdpa with an EXPLICIT attn_mask over concatenated keys/values.
 
 SDPA_CAT_LAWS (catopt/om.py) already chunked the is_causal flag and the
@@ -187,9 +188,13 @@ def _mask_chunked_ok(
     reference then applies the same wrap to the tensor.
     """
     torch.manual_seed(seed)
-    qshape = (batch + (T, d)) if batch else (T, d)
-    kshape = lambda k: (batch + (k, d)) if batch else (k, d)
-    vshape = lambda k: (batch + (k, dv)) if batch else (k, dv)
+    qshape = (*batch, T, d) if batch else (T, d)
+
+    def kshape(k):
+        return (*batch, k, d) if batch else (k, d)
+
+    def vshape(k):
+        return (*batch, k, dv) if batch else (k, dv)
     tm_probe = mask_fn(T, sum(ksizes))
     q = Var("q", TensorType(qshape))
     ks = [
@@ -225,7 +230,7 @@ def _mask_chunked_ok(
     term = _extract_chunked(eg, root)
     assert term is not None and "om_compose" in op_repr(term)
 
-    inputs = [q] + ks + vs + [m]
+    inputs = [q, *ks, *vs, m]
     ir = IR(
         root=term,
         inputs=inputs,
@@ -263,7 +268,7 @@ def _fires_mask_law(spelling="export", attr_key="dim", scale=None):
     term = _sdpa_mask_term(
         q, ks, vs, m, attr_key=attr_key, spelling=spelling, scale=scale
     )
-    eg, root, _ = _run_om(term)
+    eg, _root, _ = _run_om(term)
     return eg
 
 
@@ -331,7 +336,7 @@ def _finite_bias_fn(T, K):
 def test_additive_mask_chunked_fp64():
     """THE law: sdpa(q, cat k, cat v, float_mask) ≡ om tree, fp64.
     The mask slices per block — block i's columns are the split."""
-    eg, term, out, ref, _ = _mask_chunked_ok([3, 6], _addmask_fn())
+    eg, term, _out, _ref, _ = _mask_chunked_ok([3, 6], _addmask_fn())
     assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
     assert eg.rule_fires.get("add_cat_m_slice_dim", 0) > 0
     assert eg.rule_fires.get("om_split", 0) > 0
@@ -401,7 +406,7 @@ def _boolmask_fn(T, K):
 def test_bool_mask_chunked_fp64():
     """attnbias turns the keep-mask into a 0/−inf bias — the same law,
     the same add-form slice, fp64-exact vs sdpa's bool path."""
-    eg, term, out, ref, _ = _mask_chunked_ok([3, 6], _boolmask_fn)
+    eg, term, _out, _ref, _ = _mask_chunked_ok([3, 6], _boolmask_fn)
     assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
     assert "split" in op_repr(term) and "attnbias" in op_repr(term)
 
@@ -461,7 +466,7 @@ def test_rowwise_bias_mask_fp64():
     def mask_fn(T, K):
         return torch.randn(T, 1, dtype=torch.float64)
 
-    eg, term, out, ref, _ = _mask_chunked_ok([3, 6], mask_fn)
+    _eg, _term, out, ref, _ = _mask_chunked_ok([3, 6], mask_fn)
     _assert_close_or_nan(out, ref)
 
 
@@ -496,7 +501,7 @@ def test_fully_masked_row_nan_parity():
         m[3] = float("-inf")
         return m
 
-    eg, term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
+    _eg, _term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
     assert torch.isnan(out[1]).all() and torch.isnan(out[3]).all()
     assert torch.equal(ref[1], torch.zeros_like(ref[1]))
     assert torch.equal(ref[3], torch.zeros_like(ref[3]))
@@ -512,7 +517,7 @@ def test_fully_masked_block_contributes_zero():
         m[:, 3:] = float("-inf")  # block 1 entirely masked
         return m
 
-    eg, term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
+    _eg, _term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
     assert torch.isfinite(ref).all()
     _assert_close_or_nan(out, ref)
 
@@ -526,7 +531,7 @@ def test_bool_fully_masked_row_nan_parity():
         m[2] = False  # fully-masked row
         return m
 
-    eg, term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
+    _eg, _term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
     assert torch.isnan(out[2]).all()
     assert torch.equal(ref[2], torch.zeros_like(ref[2]))
     _assert_close_or_nan(out, ref)

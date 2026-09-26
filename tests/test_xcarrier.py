@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Cross-carrier laws — the scan↔softmax seam, verified on fp64.
 
 This test file is the concrete companion to ``catopt/xcarrier.py``.
@@ -84,7 +85,7 @@ def _law(rule, t0, env, tol=1e-10):
 
 def _max_diff(a, b):
     if isinstance(a, tuple):
-        return max(_max_diff(x, y) for x, y in zip(a, b))
+        return max(_max_diff(x, y) for x, y in zip(a, b, strict=True))
     return (a - b).abs().max().item()
 
 
@@ -813,9 +814,12 @@ def test_omd_tree_lift_pass():
         b3: _rand((K3, d), 188),
         h: _rand((d,), 189),
     }
-    leaf = lambda s, a, b: Op.make(
-        "om_elem", s, Op.make("applyd", Op.make("aff_diag", a, b), h)
-    )
+    def leaf(s, a, b):
+        return Op.make(
+            "om_elem",
+            s,
+            Op.make("applyd", Op.make("aff_diag", a, b), h),
+        )
     t0 = Op.make(
         "om_apply",
         Op.make(
@@ -846,9 +850,12 @@ def test_omd_tree_lift_vetoes():
     a1, b1 = _V("a1", (K, d)), _V("b1", (K, d))
     a2, b2 = _V("a2", (K, d)), _V("b2", (K, d))
     h, h2, v = _V("h", (d,)), _V("h2", (d,)), _V("v", (K, d))
-    leaf = lambda s, a, b, hh: Op.make(
-        "om_elem", s, Op.make("applyd", Op.make("aff_diag", a, b), hh)
-    )
+    def leaf(s, a, b, hh):
+        return Op.make(
+            "om_elem",
+            s,
+            Op.make("applyd", Op.make("aff_diag", a, b), hh),
+        )
     # (i) mixed states
     t0 = Op.make(
         "om_apply",
@@ -947,7 +954,7 @@ def test_egraph_stack_then_omd_chain():
     )
     t0 = Op.make("om_apply", Op.make("om_elem", s, vseq))
     eg = EGraph(track_proofs=True)
-    root = _add(eg, t0)
+    _root = _add(eg, t0)
     st_offers = XC.gather_applyd_stack(eg)
     assert len(st_offers) == 1
     # after the union, the om_elem's value class has the fused applyd
@@ -1006,8 +1013,8 @@ def test_softmax_attention_is_not_linear_attention():
     assert gap > 1e-2
     # ...and even normalised linear attention differs from softmax:
     # softmax ≠ (s/l) @ v with l = s-sum — the weights are exp(s−m).
-    l = s.sum(dim=-1, keepdim=True)
-    normed_linear = (s / l.clamp_min(1e-9)) @ v
+    lv = s.sum(dim=-1, keepdim=True)
+    normed_linear = (s / lv.clamp_min(1e-9)) @ v
     assert not torch.allclose(normed_linear, softmax_out, atol=1e-6)
 
 

@@ -450,7 +450,7 @@ def act_quant(
     """
     levels = 2 ** (bits - 1) - 1
     act = _activation_classes(eg)
-    from catopt.cost import _shape_of
+    from catopt.typing import _shape_of
 
     # Per-site data + shared wrap class are built lazily by the factory —
     # an activation nobody consumes (e.g. the model output) gets no
@@ -543,7 +543,7 @@ def act_low_rank(
     lowered module.
     """
     act = _activation_classes(eg)
-    from catopt.cost import _shape_of
+    from catopt.typing import _shape_of
 
     gen = torch.Generator().manual_seed(seed)
 

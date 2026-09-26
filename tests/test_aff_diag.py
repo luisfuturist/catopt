@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """SCAN_DIAG_LAWS — the diagonal-affine monoid for elementwise SSMs.
 
 ``SCAN_LAWS`` lifts a dense recurrence step ``add(matmul(A,h), x)`` into
@@ -141,7 +142,7 @@ def test_diagonal_ssm_lifts_to_log_depth():
     m = DiagonalSSM(D, D, T).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
 
-    ir, st, best, stats = _scan(m, x)
+    ir, st, best, _stats = _scan(m, x)
     d_orig, d_best = _opdepth(ir.root, {}), _opdepth(best, {})
 
     rep = op_repr(best)

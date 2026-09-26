@@ -211,7 +211,7 @@ def test_om_lift_check_uses_value_shapes():
     classes — including the carrier members whose cost-convention
     shapes are ``()`` / ``(D,)`` — sees the true value shapes and
     admits the lift."""
-    eg, root, ir, src, m, x = _build_mha_egraph(T=32)
+    eg, _root, _ir, _src, _m, _x = _build_mha_egraph(T=32)
     pairs = _om_classes(eg)
     assert pairs, "no om_elem enode minted — om_lift did not fire"
     for sc, vc in pairs:

@@ -48,9 +48,9 @@ from typing import Any
 
 import torch
 
-from catopt.cost import _shape_of
 from catopt.ir import IR, Op, Param
 from catopt.torch_bridge import IRModule, _om_compose, _om_elem
+from catopt.typing import _shape_of
 
 __all__ = [
     "BatchedOMModule",

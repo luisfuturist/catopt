@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Truncation levels: the e-graph as a truncated program ∞-groupoid.
 
 Level 1 keeps only the quotient (e-classes — it forgets paths between
@@ -228,7 +229,7 @@ def test_coherent_paths_finds_alternate_derivations():
     """add(x, add(y,z)) -> add(add(z,y), x) has at least two distinct
     derivations: commute the root first vs. commute the inner pair
     first.  Both must be found — and both must replay."""
-    eg, src, root, (x, y, z) = _comm_graph()
+    eg, src, _root, (x, y, z) = _comm_graph()
     dst = Op.make("add", Op.make("add", z, y), x)
 
     result = eg.coherent_paths(src, dst)
@@ -249,7 +250,7 @@ def test_coherent_paths_finds_alternate_derivations():
 
 def test_all_proofs_distinct_signatures():
     """Derivations are deduplicated by (rule, path) signature."""
-    eg, src, root, (x, y, z) = _comm_graph()
+    eg, src, _root, (x, y, z) = _comm_graph()
     dst = Op.make("add", Op.make("add", z, y), x)
     paths = eg.all_proofs(src, dst, max_paths=16)
     sigs = [tuple((s.rule, s.path) for s in p) for p in paths]
@@ -259,7 +260,7 @@ def test_all_proofs_distinct_signatures():
 
 def test_all_proofs_bounded_enumeration():
     """max_paths caps the result; fuel bounds the search."""
-    eg, src, root, (x, y, z) = _comm_graph()
+    eg, src, _root, (x, y, z) = _comm_graph()
     dst = Op.make("add", Op.make("add", z, y), x)
     capped = eg.coherent_paths(src, dst, max_paths=1)
     assert capped["n_paths"] == 1
@@ -272,7 +273,7 @@ def test_all_proofs_bounded_enumeration():
 def test_all_proofs_identity_and_level2():
     """src == dst is the trivial (empty) coherence; the API also works
     at level 2 since the same witness data backs it."""
-    eg, src, root, _ = _comm_graph(level=2)
+    eg, src, _root, _ = _comm_graph(level=2)
     assert eg.all_proofs(src, src) == [[]]
     x, y = Var("x", _t()), Var("y", _t())
     s2 = Op.make("add", x, y)

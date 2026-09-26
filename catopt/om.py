@@ -72,7 +72,7 @@ def _shape_of(t: Any):
     Metavariable bindings resolve through ``EGraph``'s representative
     member (``_min_term``/``any_term``), which may be a CARRIER member:
     ``applyd``/``apply``/the om family report a *convention* shape
-    under ``catopt.cost._shape_of`` (the state slot, the map's linear
+    under ``catopt.typing._shape_of`` (the state slot, the map's linear
     part — ``()`` when the slot resolves to a scalar member), not the
     tensor value the e-class denotes.  Judging side conditions on
     convention shapes vetoed legal rewrites — observed: ``om_lift``
@@ -100,7 +100,7 @@ def _dim_eq(a: Any, b: Any) -> bool:
 
 
 def _broadcast_ok(a, b) -> bool:
-    from catopt.cost import _INVALID, _broadcast
+    from catopt.typing import _INVALID, _broadcast
 
     return _broadcast(a, b) is not _INVALID
 
@@ -669,7 +669,7 @@ def _check_cat_pair(bound: dict) -> int | None:
         return None
     if not all(_dim_eq(b1[i], b2[i]) for i in range(rb) if i != db):
         return None
-    from catopt.cost import _INVALID, _broadcast
+    from catopt.typing import _INVALID, _broadcast
 
     ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
     if ba is _INVALID or bb is _INVALID:
@@ -1117,7 +1117,7 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
     k1, k2 = k1s[-2], k2s[-2]
     if not (isinstance(k1, int) and isinstance(k2, int)):
         return False  # can't derive split sizes
-    from catopt.cost import _INVALID, _broadcast
+    from catopt.typing import _INVALID, _broadcast
 
     bb = _broadcast(qs[:-2], k1s[:-2])
     if bb is _INVALID:

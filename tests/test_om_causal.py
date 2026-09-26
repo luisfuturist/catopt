@@ -169,9 +169,13 @@ def _causal_chunked_ok(
     """Saturate an sdpa-over-concats term, force-extract the chunked
     carrier, verify fp64 vs F.scaled_dot_product_attention."""
     torch.manual_seed(seed)
-    qshape = (batch + (T, d)) if batch else (T, d)
-    kshape = lambda k: (batch + (k, d)) if batch else (k, d)
-    vshape = lambda k: (batch + (k, dv)) if batch else (k, dv)
+    qshape = (*batch, T, d) if batch else (T, d)
+
+    def kshape(k):
+        return (*batch, k, d) if batch else (k, d)
+
+    def vshape(k):
+        return (*batch, k, dv) if batch else (k, dv)
     q = Var("q", TensorType(qshape))
     ks = [
         Var(f"k{i}", TensorType(kshape(k)))
@@ -202,7 +206,7 @@ def _causal_chunked_ok(
     term = _extract_chunked(eg, root)
     assert term is not None and "om_compose" in op_repr(term)
 
-    inputs = [q] + ks + vs
+    inputs = [q, *ks, *vs]
     ir = IR(
         root=term,
         inputs=inputs,
@@ -254,7 +258,7 @@ def test_causal_law_fires_kwarg_spelling():
         Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
     ]
     term = _sdpa_cat_term(q, ks, vs, spelling="kwarg")
-    eg, root, _ = _run_om(term)
+    eg, _root, _ = _run_om(term)
     assert any(k.startswith("sdpa_cat_causal_") for k in eg.rule_fires)
 
 
@@ -268,7 +272,7 @@ def test_causal_law_fires_arg1_concat_spelling():
         Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
     ]
     term = _sdpa_cat_term(q, ks, vs, attr_key="arg1", spelling="export")
-    eg, root, _ = _run_om(term)
+    eg, _root, _ = _run_om(term)
     assert any(
         k.startswith("sdpa_cat_causal_") and k.endswith("arg1")
         for k in eg.rule_fires
@@ -282,7 +286,7 @@ def test_causal_law_fires_arg1_concat_spelling():
 
 def test_causal_chunked_attention_fp64():
     """THE law: sdpa(q, cat k, cat v, is_causal) ≡ om tree, fp64."""
-    eg, term, out, ref, _ = _causal_chunked_ok([3, 6])
+    eg, term, _out, _ref, _ = _causal_chunked_ok([3, 6])
     assert eg.rule_fires.get("masked_fill_cat_slice_dim", 0) > 0
     assert eg.rule_fires.get("om_split", 0) > 0
     r = op_repr(term)
@@ -310,7 +314,7 @@ def test_causal_decode_single_query_row():
     """T_q=1: torch's is_causal is lower-LEFT triangular, so the decode
     row sees only key 0 — the chunked carrier must reproduce exactly
     that (including the footgun), i.e. out == v[...,0,:]."""
-    eg, term, out, ref, tvs = _causal_chunked_ok([3, 4], T=1)
+    _eg, _term, out, ref, tvs = _causal_chunked_ok([3, 4], T=1)
     # row 0 attends key 0 with weight 1 in BOTH forms (ref is (1, dv)).
     assert torch.equal(ref, tvs[0][:1])
     _assert_close_or_nan(out, ref)
@@ -343,7 +347,7 @@ def test_causal_tq_gt_first_block():
 def test_unmasked_sdpa_cat_fp64():
     """sdpa(q, cat k, cat v) — no mask at all — chunks to the plain om
     homomorphism over scaled scores."""
-    eg, term, out, ref, _ = _causal_chunked_ok([3, 6], causal=False)
+    eg, term, _out, _ref, _ = _causal_chunked_ok([3, 6], causal=False)
     assert any(
         k.startswith("sdpa_cat_")
         and not k.startswith("sdpa_cat_causal_")
@@ -368,7 +372,7 @@ def test_fully_masked_row_nan_parity():
     parity check is isnan-equality: no NaN positions on either side —
     while uneven blocks exercise the isfinite guard internally for
     rows t < o_i (fully masked within late blocks)."""
-    eg, term, out, ref, _ = _causal_chunked_ok([5, 2], T=3)
+    _eg, _term, out, ref, _ = _causal_chunked_ok([5, 2], T=3)
     # every row's late-block slice is fully masked for t < 5
     assert not torch.isnan(out).any() and not torch.isnan(ref).any()
     _assert_close_or_nan(out, ref)
@@ -378,7 +382,7 @@ def test_fully_masked_row_nan_parity_decode():
     """T_q=1, block 0 size 1: the second block is fully masked for the
     only row — its NaN carrier must drop out (isfinite guard), leaving
     out == v0 exactly, matching sdpa."""
-    _, _, out, ref, tvs = _causal_chunked_ok([1, 6], T=1)
+    _, _, out, ref, _tvs = _causal_chunked_ok([1, 6], T=1)
     assert not torch.isnan(out).any()
     _assert_close_or_nan(out, ref)
 

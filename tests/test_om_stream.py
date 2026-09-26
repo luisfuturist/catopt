@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Streaming (bounded-working-set) lowering for the om monoid.
 
 :class:`catopt.om_lower.StreamingOMModule` evaluates the same
@@ -84,9 +85,11 @@ def _qk_vars(B, H, T, d, dv, ksizes):
 
 
 def _om_ir(q, ks, vs, tree=_compose_tree):
-    leaves = [_qk_leaf(q, k, v) for k, v in zip(ks, vs)]
+    leaves = [
+        _qk_leaf(q, k, v) for k, v in zip(ks, vs, strict=True)
+    ]
     root = Op.make("om_apply", tree(leaves))
-    inputs = [q] + list(ks) + list(vs)
+    inputs = [q, *ks, *vs]
     return IR(
         root=root,
         inputs=inputs,
@@ -245,8 +248,8 @@ def test_streaming_score_vars_and_om_leaf():
     e3 = torch.exp(s3 - mm)
     tm, tl = mm, e3.sum(-1, keepdim=True)
     ta = e3 @ v3
-    ref = torch.softmax(torch.cat(tss + [s3], -1), -1) @ torch.cat(
-        tvs + [v3], -2
+    ref = torch.softmax(torch.cat([*tss, s3], -1), -1) @ torch.cat(
+        [*tvs, v3], -2
     )
     with torch.no_grad():
         out = mod(*tss, *tvs, tm, tl, ta)
@@ -293,7 +296,10 @@ def test_streaming_masked_nan_matches_dense():
         root=Op.make(
             "om_apply",
             _compose_tree(
-                [Op.make("om_elem", s, v) for s, v in zip(ss, vs)]
+                [
+                    Op.make("om_elem", s, v)
+                    for s, v in zip(ss, vs, strict=True)
+                ]
             ),
         ),
         inputs=ss + vs,
@@ -382,7 +388,7 @@ def test_streaming_peak_memory_flat_in_Tkv():
         with torch.no_grad():
             sp = _peak_bytes(lambda: smod(q, K, V))
             bp = _peak_bytes(lambda: bmod(q, K, V))
-        del q, K, V, smod, bmod
+        q = K = V = smod = bmod = None
         gc.collect()
         if DEV == "cuda":
             torch.cuda.empty_cache()
@@ -454,7 +460,7 @@ def test_incremental_step_equals_recompute():
                 tV[:, :, i : i + C],
             )
 
-    for a, b in zip(st, full):
+    for a, b in zip(st, full, strict=True):
         assert (a - b).abs().max().item() < 1e-12
     assert (
         om_apply_state(st2) - om_apply_state(full)
@@ -510,7 +516,7 @@ def test_empty_state_is_identity():
     st_empty = om_step_qk(
         om_empty_state((B, H, Tq), dv, dtype=torch.float64), q, k, v
     )
-    for a, b in zip(st_none, st_empty):
+    for a, b in zip(st_none, st_empty, strict=True):
         assert torch.equal(a, b)
     # composing the empty state on the RIGHT is also the identity
     from catopt.torch_bridge import _om_compose
@@ -518,14 +524,14 @@ def test_empty_state_is_identity():
     st2 = _om_compose(
         st_none, om_empty_state((B, H, Tq), dv, dtype=torch.float64)
     )
-    for a, b in zip(st_none, st2):
+    for a, b in zip(st_none, st2, strict=True):
         assert torch.equal(a, b)
 
 
 def test_incremental_through_module_statics():
     """The decode API is reachable on the module class itself."""
     torch.manual_seed(0)
-    B, H, Tq, d, dv = 1, 2, 4, 16, 8
+    B, H, Tq, _d, dv = 1, 2, 4, 16, 8
     s = Var("s", TensorType((B, H, Tq, 32)))
     v = Var("v", TensorType((B, H, 32, dv)))
     ir = IR(

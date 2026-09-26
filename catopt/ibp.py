@@ -50,9 +50,9 @@ from typing import Any, NamedTuple
 
 import torch
 
-from catopt.cost import _shape_of
 from catopt.eps import _find_subterms, _path_sensitivity, model_bound
 from catopt.ir import IR, Const, Op, Param, Var
+from catopt.typing import _shape_of
 
 __all__ = ["Box", "ibp_bound", "tight_model_bound"]
 

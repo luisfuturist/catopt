@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Seed-witness synthesis — guarded compositions that need real witnesses.
 
 ``synthesize_rules`` validates every candidate by instantiating its LHS.

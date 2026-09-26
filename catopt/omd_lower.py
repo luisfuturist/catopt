@@ -55,9 +55,9 @@ from typing import Any
 import torch
 
 import catopt.xcarrier  # noqa: F401 — registers the omd_* / affd_*
-from catopt.cost import _shape_of
 from catopt.ir import IR, Op
 from catopt.torch_bridge import _IR_TO_TORCH, IRModule
+from catopt.typing import _shape_of
 
 # torch bindings into _IR_TO_TORCH.
 

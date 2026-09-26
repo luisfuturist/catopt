@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """SCAN_LAWS on a *selective* SSM — input-dependent per-step dynamics.
 
 ``LinearRecurrence`` (test_torch_integration.py) lifts a fixed-A LTI
@@ -102,7 +103,7 @@ def test_selective_ssm_affine_lift_reaches_log_depth():
     m = SelectiveSSM(D, D, T).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
 
-    ir, st, best, stats = _scan(m, x)
+    ir, st, best, _stats = _scan(m, x)
     d_orig, d_best = _opdepth(ir.root, {}), _opdepth(best, {})
 
     # The affine monoid was reached: apply/aff_compose appear, and the
@@ -177,7 +178,7 @@ def test_diagonal_elementwise_ssm_does_not_lift():
     T, D = 16, 16
     m = DiagonalSSM(D, D, T).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
-    ir, st, best, _ = _scan(m, x)
+    ir, _st, best, _ = _scan(m, x)
     # Sanity: the step really is add(mul(a_t, h), mul(b_t, x_t)).
     assert ir.root.op == "add"
     assert ir.root.args[0].op == "mul"

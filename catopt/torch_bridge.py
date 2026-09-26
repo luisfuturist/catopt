@@ -31,6 +31,7 @@ _ATEN_TO_IR: dict[str, str] = {
     "reshape": "reshape",
     "view": "reshape",
     "amax": "max",
+    "amin": "min",
     "matmul.default": "matmul",
     "contiguous": "contiguous",
     "clone": "contiguous",
@@ -66,6 +67,7 @@ _IR_TO_TORCH_EXTRA: dict[str, str] = {
     "view.default": "reshape",
     "clone.default": "contiguous",
     "amax.default": "max",
+    "amin.default": "min",
     "scaled_dot_product_attention.default": "sdpa",
     "conv2d.default": "conv2d",
 }
@@ -94,6 +96,7 @@ _ATTR_RENAMES: dict[str, dict[str, str]] = {
     "concat": {"arg1": "dim"},
     "chunk": {"arg1": "chunks", "arg2": "dim"},
     "split": {"arg2": "dim"},
+    "rms_norm": {"arg3": "eps"},
 }
 
 
@@ -422,6 +425,8 @@ _IR_TO_TORCH: dict[str, Any] = {
     "rsqrt": torch.rsqrt,
     "sum": lambda x, *a, **kw: x.sum(*_dim_args(a, kw)),
     "mean": lambda x, *a, **kw: x.mean(*_dim_args(a, kw)),
+    "max": lambda x, *a, **kw: x.amax(*_dim_args(a, kw)),
+    "min": lambda x, *a, **kw: x.amin(*_dim_args(a, kw)),
     "transpose": lambda x, *a, **kw: (
         x.t()
         if x.dim() == 2 and "arg1" not in kw

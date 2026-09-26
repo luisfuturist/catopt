@@ -137,12 +137,12 @@ def test_witnessed_split_offer_also_replays():
     eg = EGraph()
     root = eg.add_term(term)
     lifts = lift_scan_to_trace(eg, root_eid=root, witness=True)
-    assert {l.split for l in lifts} == {None, (4, 4)}
-    for l in lifts:
-        cert = eg.certificate(term, l.term, root_eid=root)
+    assert {lft.split for lft in lifts} == {None, (4, 4)}
+    for lft in lifts:
+        cert = eg.certificate(term, lft.term, root_eid=root)
         assert cert.n_egraph_dependent == 0
         out = verify_certificate(term, cert, strict=True)
-        assert op_repr(out) == op_repr(l.term)
+        assert op_repr(out) == op_repr(lft.term)
 
 
 def test_witness_step_at_subterm_position():

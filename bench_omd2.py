@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# ruff: noqa: E402, RUF002
 """bench_omd2 — the omd executor on a *realistic* attention stack.
 
 Follow-up to /tmp/bench_omd.py (toy _ScanAttn).  The question: does the
@@ -847,7 +848,7 @@ def print_tables(sizes, devices, all_rows, meta):
             "warmup 5, ~30 reps)\n"
         )
         forms = []
-        for (T, d), rows in all_rows.items():
+        for (_T, d), rows in all_rows.items():
             if d == dev:
                 for k in rows:
                     if k not in forms:
@@ -864,7 +865,7 @@ def print_tables(sizes, devices, all_rows, meta):
             for k in forms:
                 if k not in rows:
                     continue
-                tms, err, n, ops = rows[k]
+                tms, err, _n, ops = rows[k]
                 if tms is None:
                     print(f"| {T} | {k} | FAIL | — | — | — | — |")
                     continue

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Hybrid SSM+attention blocks — TWO monoid carriers in one e-graph.
 
 ``catopt.models.hybrid.HybridBlock`` stacks a diagonal-affine scan
@@ -102,9 +103,12 @@ def _normalize_attrs(term, memo=None):
             attrs["chunks"] = attrs.pop("arg1")
         if "dim" not in attrs and "arg2" in attrs:
             attrs["dim"] = attrs.pop("arg2")
-    elif term.op == "split":
-        if "dim" not in attrs and "arg2" in attrs:
-            attrs["dim"] = attrs.pop("arg2")
+    elif (
+        term.op == "split"
+        and "dim" not in attrs
+        and "arg2" in attrs
+    ):
+        attrs["dim"] = attrs.pop("arg2")
     out = Op.make(term.op, *args, **attrs)
     memo[k] = out
     return out
@@ -253,7 +257,7 @@ def test_both_carriers_coexist_in_one_egraph():
     T, D = 16, 16
     m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
-    ir, st, eg, out = _run_hybrid(m, x)
+    _ir, _st, eg, out = _run_hybrid(m, x)
 
     stats = out["stats"]
     census = _op_census(eg)
@@ -304,7 +308,7 @@ def test_om_elems_consume_scan_outputs():
     T, D = 16, 16
     m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
-    ir, st, eg, out = _run_hybrid(m, x)
+    _ir, _st, eg, _out = _run_hybrid(m, x)
 
     elems = [n for n in eg._node_to_class if n.op == "om_elem"]
     assert elems
@@ -342,7 +346,7 @@ def test_raw_export_fires_om_split():
     T, D = 16, 16
     m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
-    ir, st, eg, out = _run_hybrid(m, x, normalize=False)
+    _ir, _st, eg, _out = _run_hybrid(m, x, normalize=False)
 
     census = _op_census(eg)
     # Scan carrier still lifts fine (spelling-independent).
@@ -467,7 +471,7 @@ def test_scale_commutes_into_q_proj_weight():
     T, D = 16, 16
     m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
-    ir, st, eg, out = _run_hybrid(m, x)
+    _ir, _st, eg, _out = _run_hybrid(m, x)
 
     assert eg.rule_fires.get("linear_row_scale_rev", 0) >= 1
     assert eg.rule_fires.get("linear_channel_scale", 0) >= 1

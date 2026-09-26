@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Interval bound propagation — per-op rules, end-to-end tightness,
 and honest reporting.
 
@@ -252,7 +253,7 @@ def _quant_setup(seed=0):
 def test_tight_bound_beats_spectral_and_stays_sound():
     """The headline result: IBP's bound is (a) ≥ the measured error —
     still a certificate — and (b) strictly below the spectral product."""
-    m, x, ir, src, term, cert, offers = _quant_setup()
+    _m, x, _ir, src, term, cert, offers = _quant_setup()
     assert len(offers) == 2
     res = tight_model_bound(term, cert, src, x)
     spec = res["spectral_bound"]
@@ -280,7 +281,7 @@ def test_tight_bound_uses_real_activation_norms():
     """The weight-side edge is billed the measured activation norm, not
     input_norm × a sensitivity product — check the site contributions
     individually undercut their spectral counterparts."""
-    m, x, ir, src, term, cert, offers = _quant_setup()
+    _m, x, _ir, src, term, cert, _offers = _quant_setup()
     res = tight_model_bound(term, cert, src, x)
     mb = model_bound(
         term, cert, src, torch.linalg.norm(x, dim=-1).max().item()
@@ -337,7 +338,7 @@ def test_dead_relu_zeroes_site_contribution():
 def test_ibp_never_worse_than_spectral():
     """Sites with no local-rule path contribute exactly their spectral
     share — the total is a per-site min, never worse than model_bound."""
-    m, x, ir, src, term, cert, offers = _quant_setup()
+    _m, x, _ir, src, term, cert, _offers = _quant_setup()
     res = tight_model_bound(term, cert, src, x)
     assert res["bound"] <= res["spectral_bound"] + 1e-12
     for c in res["site_contributions"]:
@@ -374,7 +375,7 @@ def test_honest_report_when_no_gain():
 def test_artifact_bound_uses_realized_delta():
     """The realized ΔW (lhs−rhs of the cert step) is a tighter, still
     true radius than the cert's worst-case Frobenius envelope."""
-    m, x, ir, src, term, cert, offers = _quant_setup()
+    _m, x, _ir, src, term, cert, _offers = _quant_setup()
     res = tight_model_bound(term, cert, src, x)
     assert res["artifact_bound"] <= res["bound"] + 1e-12
     # and it should be *noticeably* tighter than the cert-radius bound

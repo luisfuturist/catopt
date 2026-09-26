@@ -198,7 +198,7 @@ def test_rmsnorm_export_captures_reduction_attrs():
     torch.manual_seed(0)
     model = RMSNorm(16)
     x = torch.randn(2, 3, 16)
-    ir, source = export_to_ir(model, x)
+    ir, _source = export_to_ir(model, x)
     s = op_repr(ir.root)
     assert "mean" in s
     assert "rsqrt" in s
@@ -720,7 +720,7 @@ def test_attr_metavariable_binds_shape():
     torch.manual_seed(0)
     m = AttentionBlock(32, n_heads=2).eval()
     x = torch.randn(2, 4, 32)
-    ir, source = export_to_ir(m, x)
+    ir, _source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
     eg.run([QKV_FUSE], eid, max_iterations=5, max_nodes=5000)
@@ -986,7 +986,7 @@ def test_pairing_no_shared_input_no_fusion():
         "mul", Op.make("linear", x, wa), Op.make("linear", y, wb)
     )
     eg = EGraph()
-    eid = eg.add_term(t)
+    _eid = eg.add_term(t)
     groups = pair_shared_input_linears(eg)
     assert not any(len(g) >= 2 for g in groups)
     assert not any(n.op == "split" for n in eg._node_to_class)
@@ -1028,7 +1028,7 @@ def test_multi_input_module():
     m = TwoInput().eval()
     x = torch.randn(4, 16)
     s = torch.randn(4, 16)
-    opt, stats = optimize_model(m, (x, s), verbose=False)
+    opt, _stats = optimize_model(m, (x, s), verbose=False)
     with torch.no_grad():
         diff = (m(x, s) - opt(x, s)).abs().max().item()
     assert diff < 1e-4
@@ -1086,7 +1086,7 @@ def test_rope_style_ops_roundtrip():
     x = torch.randn(2, 8, 4, 16)
     fc = torch.randn(8, 8)
     fs = torch.randn(8, 8)
-    opt, stats = optimize_model(m, (x, fc, fs), verbose=False)
+    opt, _stats = optimize_model(m, (x, fc, fs), verbose=False)
     with torch.no_grad():
         diff = (m(x, fc, fs) - opt(x, fc, fs)).abs().max().item()
     assert diff < 1e-4
@@ -1108,7 +1108,7 @@ def test_dag_sharing_scales():
     x = Var("x", TensorType((4, 32)))
     shared = x
     t = shared
-    for i in range(14):  # tree-expansion would be ~16k nodes; DAG is 14
+    for _ in range(14):  # tree-expansion would be ~16k nodes; DAG is 14
         t = Op.make("add", t, Op.make("mul", t, shared))
     eg = EGraph()
     t0 = time.time()
@@ -1276,7 +1276,7 @@ def test_sdpa_fold_additive_mask():
     torch.manual_seed(0)
     m = AdditiveMaskAttention(dim=128, n_heads=4, block_size=64).eval()
     x = torch.randn(1, 32, 128)
-    opt, info = optimize_model(
+    opt, _info = optimize_model(
         m, x, ruleset="categorical", max_iterations=4, verbose=False
     )
     with torch.no_grad():

@@ -241,7 +241,7 @@ def test_slice_dedup_requires_storage_cost_axis():
     low, _ = optimize_model(m, x, cost_fn=flops_cost, verbose=False)
     with torch.no_grad():
         assert (low(x) - m(x)).abs().max() < 1e-9  # still exact
-    r = param_report(m, low)
+    _r = param_report(m, low)
     # flop-axis extraction keeps the dense leaves: no storage win.
     assert not any("__heads" in n for n in low.state_dict())
 

@@ -195,7 +195,7 @@ def test_plan_levels_are_independent():
     plan = build_scan_plan(scan_ir.root)
     assert plan is not None
     assert len(plan["leaves"]) == steps
-    assert all(l.op == "aff" for l in plan["leaves"])
+    assert all(lf.op == "aff" for lf in plan["leaves"])
     # balanced tree over 8 leaves: 4 + 2 + 1 composes on 3 levels
     assert [len(lv) for lv in plan["levels"]] == [4, 2, 1]
 

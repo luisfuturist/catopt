@@ -1021,7 +1021,7 @@ def kron_linear_params(
 
 
 def _shape_of(t: Any):
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     return _so(t)
 

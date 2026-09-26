@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Mask-distribution laws — masked_fill/add/where over concat.
 
 The online-softmax homomorphism (OM_SPLIT) needs the score operand to
@@ -509,7 +510,7 @@ def _masked_chunked_ok(
     term = _extract_chunked(eg, root)
     assert term is not None and "om_compose" in op_repr(term)
 
-    inputs = [q] + ks + vs + [m]
+    inputs = [q, *ks, *vs, m]
     ir = IR(
         root=term,
         inputs=inputs,
@@ -603,7 +604,7 @@ def test_masked_chunked_batched_heads():
     term = _extract_chunked(eg, root)
     assert term is not None
 
-    inputs = [q] + ks + vs + [m]
+    inputs = [q, *ks, *vs, m]
     ir = IR(
         root=term,
         inputs=inputs,
@@ -654,7 +655,7 @@ def test_fully_masked_row_nan_positions_match():
     term = _extract_chunked(eg, root)
     assert term is not None
 
-    inputs = [q] + ks + vs + [m]
+    inputs = [q, *ks, *vs, m]
     ir = IR(
         root=term,
         inputs=inputs,
@@ -699,7 +700,7 @@ def test_fully_masked_block_contributes_zero():
     term = _extract_chunked(eg, root)
     assert term is not None
 
-    inputs = [q] + ks + vs + [m]
+    inputs = [q, *ks, *vs, m]
     ir = IR(
         root=term,
         inputs=inputs,
@@ -737,7 +738,7 @@ def test_causal_mask_row_zero_is_fine():
     term = _extract_chunked(eg, root)
     assert term is not None
 
-    inputs = [q] + ks + vs + [m]
+    inputs = [q, *ks, *vs, m]
     ir = IR(
         root=term,
         inputs=inputs,

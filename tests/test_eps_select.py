@@ -83,7 +83,7 @@ def _has_chained_linear(term):
 def test_param_bytes_selects_factorised_member():
     """The killer result: pricing parameter storage makes extraction
     pick the certified low-rank chain that flops-based models pass over."""
-    ir, src, eg, root, offers = _saturated()
+    _ir, src, eg, root, offers = _saturated()
     assert offers, "expected a low-rank offer"
     o = offers[0]
 
@@ -106,7 +106,7 @@ def test_param_bytes_selects_factorised_member():
 
 def test_param_bytes_counts_eps_factors_normally():
     """eps_* derived params are billed like any other Param leaf."""
-    ir, src, eg, root, offers = _saturated()
+    _ir, src, eg, root, offers = _saturated()
     o = offers[0]
     cost = param_bytes_cost_for(src)
     best = eg.extract_best(root, cost)
@@ -145,7 +145,7 @@ def test_bounded_generous_budget_keeps_factorised():
 def test_bounded_zero_budget_is_exact_only():
     """max_error=0 reproduces exact-only extraction: the dense member
     returns, identical to an e-graph that never saw the eps offer."""
-    ir, src, eg, root, offers = _saturated()
+    ir, src, eg, root, _offers = _saturated()
     cost = param_bytes_cost_for(src)
     lo = eg.extract_best_bounded(
         root, cost, max_error=0.0, src_term=ir.root
@@ -208,7 +208,7 @@ def test_bounded_exact_graph_unaffected():
 
 
 def test_bounded_none_budget_is_plain_extraction():
-    ir, src, eg, root, _ = _saturated()
+    _ir, src, eg, root, _ = _saturated()
     cost = param_bytes_cost_for(src)
     assert op_repr(eg.extract_best_bounded(root, cost)) == op_repr(
         eg.extract_best(root, cost)

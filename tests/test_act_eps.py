@@ -1,3 +1,4 @@
+# ruff: noqa: RUF003
 """Activation-space ε: certified bounded-error rewrites on ACTIVATIONS.
 
 Where :mod:`catopt.eps` certifies *weight* substitutions (compile-time
@@ -91,7 +92,7 @@ def test_act_quant_offers_at_activation_edges():
     quantize/dequantize member; Var inputs and Param leaves get none."""
     m = _two_layer()
     x = torch.randn(4, 32, dtype=torch.float64)
-    ir, src, eg, root = _build(m, x)
+    ir, src, eg, _root = _build(m, x)
     calib = calibrate(ir, x, src)
     offers = act_quant(eg, src, bits=8, calib=calib)
     # two activation edges: relu's input (l1 out), l2's input (relu out)
@@ -218,7 +219,7 @@ def test_act_quant_shared_activation_wraps_every_read():
 
     m = M().eval().double()
     x = torch.randn(4, 32, dtype=torch.float64)
-    ir, src, eg, root = _build(m, x)
+    ir, src, eg, _root = _build(m, x)
     offers = act_quant(eg, src, bits=8, calib=calibrate(ir, x, src))
     by_site = {}
     for o in offers:

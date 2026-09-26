@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Tests for catopt.trace — JSV traced-monoidal axioms as e-graph rules.
 
 Each axiom is checked two ways:
@@ -353,7 +354,7 @@ def test_slide_pulls_matrix_out_of_recurrence():
     on the loop's output instead — the eqsat can pick whichever side
     is cheaper (e.g. h fused into the surrounding affine map)."""
     du, dx, dy = 3, 2, 2
-    lhs, rhs, env = _slide_terms(du, dx, dy, 70)
+    lhs, _rhs, _env = _slide_terms(du, dx, dy, 70)
     eg = EGraph()
     eid = eg.add_term(lhs)
     eg.run([TR_SLIDE], eid)

@@ -58,9 +58,11 @@ def _compose_tree(leaves):
 
 def _om_ir(q, ks, vs, leaf_fn=_qk_leaf):
     """om_apply(balanced compose tree over per-block om_elem leaves)."""
-    leaves = [leaf_fn(q, k, v) for k, v in zip(ks, vs)]
+    leaves = [
+        leaf_fn(q, k, v) for k, v in zip(ks, vs, strict=True)
+    ]
     root = Op.make("om_apply", _compose_tree(leaves))
-    inputs = [q] + list(ks) + list(vs)
+    inputs = [q, *ks, *vs]
     return IR(
         root=root,
         inputs=inputs,
@@ -235,7 +237,9 @@ def test_score_vars_directly():
         Var(f"v{i}", TensorType((B, H, k, dv)))
         for i, k in enumerate(ksizes)
     ]
-    leaves = [Op.make("om_elem", s, v) for s, v in zip(ss, vs)]
+    leaves = [
+        Op.make("om_elem", s, v) for s, v in zip(ss, vs, strict=True)
+    ]
     root = Op.make("om_apply", _compose_tree(leaves))
     inputs = ss + vs
     ir = IR(
@@ -384,8 +388,8 @@ def test_om_packaging_leaf():
     e3 = torch.exp(s3 - mm)
     tm, tl = mm, e3.sum(-1, keepdim=True)
     ta = e3 @ v3
-    ref = torch.softmax(torch.cat(tss + [s3], -1), -1) @ torch.cat(
-        tvs + [v3], -2
+    ref = torch.softmax(torch.cat([*tss, s3], -1), -1) @ torch.cat(
+        [*tvs, v3], -2
     )
     with torch.no_grad():
         out = mod(*tss, *tvs, tm, tl, ta)
@@ -407,7 +411,10 @@ def test_fully_masked_row_nan_matches_dense():
     root = Op.make(
         "om_apply",
         _compose_tree(
-            [Op.make("om_elem", s, v) for s, v in zip(ss, vs)]
+            [
+                Op.make("om_elem", s, v)
+                for s, v in zip(ss, vs, strict=True)
+            ]
         ),
     )
     inputs = ss + vs
@@ -462,7 +469,7 @@ def test_detects_extracted_om_term():
     assert is_om_apply_term(chunked), op_repr(chunked)
     assert "om_compose" in op_repr(chunked)
 
-    inputs = [q] + ks + vs
+    inputs = [q, *ks, *vs]
     ir = IR(
         root=chunked,
         inputs=inputs,
@@ -499,7 +506,7 @@ def test_plan_levels_are_independent():
     plan = build_om_plan(ir.root)
     assert plan is not None
     assert len(plan["leaves"]) == 8
-    assert all(l.op == "om_elem" for l in plan["leaves"])
+    assert all(lf.op == "om_elem" for lf in plan["leaves"])
     # balanced tree over 8 leaves: 4 + 2 + 1 composes on 3 levels
     assert [len(lv) for lv in plan["levels"]] == [4, 2, 1]
     assert len(plan["leaf_groups"]) == 1  # one uniform shape group
@@ -622,7 +629,7 @@ def test_fallback_on_om_ops_outside_apply():
         out = mod(ts1, ts2, tv1, tv2)
     assert isinstance(out, tuple) and len(out) == 3
     s = torch.cat([ts1, ts2], -1)
-    e = torch.exp(s - s.amax(-1, keepdim=True))
+    _e = torch.exp(s - s.amax(-1, keepdim=True))
     assert torch.allclose(
         out[2] / out[1],
         torch.softmax(s, -1) @ torch.cat([tv1, tv2], -2),

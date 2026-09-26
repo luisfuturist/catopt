@@ -113,7 +113,7 @@ def test_reshape_apply_dense_headsplit():
         i,
     )
     # reverse refolds
-    back = _law(XC.XC_RESHAPE_APPLY_REV, out, env)
+    _back = _law(XC.XC_RESHAPE_APPLY_REV, out, env)
 
 
 def test_reshape_apply_dense_merge():
@@ -213,7 +213,7 @@ def test_transpose_apply_dense():
     )
     _law(XC.XC_TRANSPOSE_APPLY, t0, env)
     # reverse: the pushed-through member re-fuses.
-    back = _law(XC.XC_TRANSPOSE_APPLY_REV, out, env)
+    _back = _law(XC.XC_TRANSPOSE_APPLY_REV, out, env)
 
 
 def test_transpose_apply_rev_veto_input_axis():
@@ -359,7 +359,8 @@ def test_om_elem_aff_batched_heads():
     a = meta._eval_term(t0, env)
     bb = meta._eval_term(applied, env)
     assert all(
-        meta._eval_allclose(x, y, tol=1e-12) for x, y in zip(a, bb)
+        meta._eval_allclose(x, y, tol=1e-12)
+        for x, y in zip(a, bb, strict=True)
     )
     # unfold direction too
     _law(XC.XC_OM_ELEM_AFF_REV, Op.make("om_elem_aff", s, A, b, h), env)
@@ -517,7 +518,7 @@ def _find_path(t, pred, path=()):
         if pred(t):
             return path
         for i, a in enumerate(t.args):
-            r = _find_path(a, pred, path + (i,))
+            r = _find_path(a, pred, (*path, i))
             if r is not None:
                 return r
     return None
@@ -650,7 +651,7 @@ def test_mha_omd_value_member_is_viewed_apply():
     T, D, nh, hd = 8, 16, 2, 8
     m = _ScanAttnMH(T, D, nh, hd).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
-    ir, src = export_to_ir(m, x)
+    ir, _src = export_to_ir(m, x)
 
     eg = EGraph()
     root = eg.add_term(ir.root)
@@ -673,10 +674,10 @@ def test_mha_omd_value_member_is_viewed_apply():
             continue
         for n in ec.nodes:
             if n.op == "om_elem" and len(n.children) == 2:
-                for h_eid, opts in _elem_affine_options(
+                for _h_eid, opts in _elem_affine_options(
                     eg, n.children[1]
                 ).items():
-                    for kind, a_eid, b_eid in opts:
+                    for kind, a_eid, _b_eid in opts:
                         if kind != "dense":
                             continue
                         at = eg.any_term(a_eid)

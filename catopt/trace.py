@@ -175,7 +175,7 @@ op_def(
 
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     return _so(t)
 

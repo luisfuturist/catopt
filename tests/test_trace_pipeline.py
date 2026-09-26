@@ -155,7 +155,7 @@ class TestExportBoundary:
         m = DiagonalSSM(D, D, T).eval().double()
         x = torch.randn(T, D)
         # the ACTUAL regime pipeline entry point (CARRIER_LAWS + lifts)
-        eg, root, ir, src, stats = build_egraph(m, x)
+        eg, _root, _ir, _src, stats = build_egraph(m, x)
         assert stats.get("nonlocal_lifts", 0) > 0
         assert _tr_fires(eg), "trace laws should fire post-lift"
         census = _op_census(eg)
@@ -168,7 +168,7 @@ class TestExportBoundary:
         T, D = 16, 16
         m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
         x = torch.randn(T, D)
-        ir, st = export_to_ir(m, x)
+        ir, _st = export_to_ir(m, x)
         eg = EGraph()
         # the stratified union harness (more contentful laws than
         # CARRIER_LAWS — stronger negative evidence)
@@ -179,7 +179,7 @@ class TestExportBoundary:
             + R.CATEGORICAL_RULES
             + TRACE_LAWS
         )
-        out = meta.stratified_run(
+        _out = meta.stratified_run(
             eg,
             laws,
             ir.root,
@@ -213,7 +213,7 @@ class TestExportBoundary:
         c0 = _op_census(eg0)
         assert c0["trace"] == 0 and c0["inv"] == 0 and c0["eye"] == 0
         # the full pipeline lifts recurrences into trace form
-        eg, root, ir, src, stats = build_egraph(m, x)
+        eg, _root, ir, _src, stats = build_egraph(m, x)
         assert stats.get("nonlocal_lifts", 0) > 0
         assert _op_census(eg)["trace"] > 0
 
@@ -250,7 +250,7 @@ class TestExportBoundary:
         T, D = 16, 16
         m = DiagonalSSM(D, D, T).eval().double()
         x = torch.randn(T, D)
-        eg, root, ir, src, stats = build_egraph(m, x)
+        eg, root, ir, src, _stats = build_egraph(m, x)
         frontier = regime_frontier(
             eg,
             root,
@@ -308,7 +308,7 @@ class TestSeededTracePipeline:
         """The payoff rule: ONE saturation under CARRIER_LAWS splits
         the joint loop into bdiag of independent channel traces —
         reachable the moment any trace exists in the graph."""
-        ir, term, x, env = _seeded_joint_loop()
+        _ir, term, _x, _env = _seeded_joint_loop()
         eg = EGraph()
         root = eg.add_term(term)
         eg.run(CARRIER_LAWS, root, max_iterations=10)

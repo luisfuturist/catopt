@@ -290,7 +290,7 @@ def test_share_duplicate_param_slices_guards():
 
     eg = EGraph()
     eg.add_term(Param("bias", TensorType((8,))))
-    w_eid = eg.add_term(Param("W", TensorType((6, 4))))
+    _w_eid = eg.add_term(Param("W", TensorType((6, 4))))
     offers = share_duplicate_param_slices(eg, source)
 
     # Only W qualifies: h=2 splits it into two equal (3,4) halves ->

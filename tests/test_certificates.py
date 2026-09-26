@@ -121,7 +121,7 @@ def test_certificate_scan_laws_t4():
     src = _recurrence(4)
     eg = EGraph()
     root = eg.add_term(src)
-    stats = eg.run(
+    _stats = eg.run(
         R.SCAN_LAWS, root, max_iterations=14, max_nodes=300_000
     )
     best = eg.extract_min_depth(root)
@@ -227,21 +227,21 @@ def test_tampered_rhs_fails(comm_cert):
 
 
 def test_tampered_rule_name_fails(comm_cert):
-    src, cert, x, y = comm_cert
+    src, cert, _x, _y = comm_cert
     cert.steps[0].rule = "nonexistent_rule"
     with pytest.raises(CertificateVerificationError):
         verify_certificate(src, cert)
 
 
 def test_tampered_path_fails(comm_cert):
-    src, cert, x, y = comm_cert
+    src, cert, _x, _y = comm_cert
     cert.steps[0].path = (0,)  # point at a subterm, not the root
     with pytest.raises(CertificateVerificationError):
         verify_certificate(src, cert)
 
 
 def test_wrong_source_fails(comm_cert):
-    src, cert, x, y = comm_cert
+    _src, cert, x, y = comm_cert
     with pytest.raises(CertificateVerificationError):
         verify_certificate(Op.make("mul", x, y), cert)
 
@@ -311,7 +311,7 @@ def test_proof_tracking_overhead_small():
         return eg, stats, time.perf_counter() - t0
 
     eg_on, stats_on, t_on = saturate(True)
-    eg_off, stats_off, t_off = saturate(False)
+    _eg_off, stats_off, t_off = saturate(False)
 
     # identical search behaviour — proofs observe, they don't steer
     assert stats_on["iterations"] == stats_off["iterations"]

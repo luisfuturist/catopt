@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Regression pins on the falsified corners — the negatives that must
 never silently regress into claimed wins.
 
@@ -94,7 +95,7 @@ class _AdapterUnmerged(nn.Module):
     "saving").  Mirrors ``tests/test_exact_corner.py``; kept small.
     """
 
-    I, O, R = 64, 64, 8
+    I, O, R = 64, 64, 8  # noqa: E741
 
     def __init__(self, seed=0):
         super().__init__()
@@ -120,7 +121,7 @@ def test_unmerged_adapter_no_phantom_savings():
     torch.manual_seed(0)
     model = _AdapterUnmerged().eval().double()
     x = torch.randn(4, _AdapterUnmerged.I, dtype=torch.float64)
-    low, stats = optimize_model(
+    low, _stats = optimize_model(
         model, x, cost_fn=param_bytes_cost_for(), verbose=False
     )
     with torch.no_grad():

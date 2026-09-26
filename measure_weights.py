@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Phase 0 — falsification harness for weight-space structure.
 
 Loads a llama2.c-format .bin checkpoint and measures, per 2D weight
@@ -48,7 +49,7 @@ def load_llama2c(path: str) -> dict[str, np.ndarray]:
 
     take("token_embedding", (vocab, dim))
     take("rms_att", (L, dim))
-    for i, nm in enumerate(("wq", "wk", "wv", "wo")):
+    for _i, nm in enumerate(("wq", "wk", "wv", "wo")):
         take(nm, (L, dim, dim))
     take("rms_ffn", (L, dim))
     take("w1", (L, dim, hidden))
@@ -77,7 +78,7 @@ def analyze(W: np.ndarray) -> dict:
         for t in (1e-1, 1e-2, 1e-3, 1e-4)
     }
     # displacement rank (Toeplitz generator check)
-    Z = np.zeros_like(W)
+    _Z = np.zeros_like(W)
     D = W.copy()
     D[1:, :] -= W[:-1, :]  # row-shift displacement
     dsv = np.linalg.svd(D, compute_uv=False)
@@ -432,7 +433,7 @@ def main() -> None:
         if W.shape[0] != W.shape[1] or W.shape[0] % 32:
             continue  # monarch needs square, multiple-of-32
         s95 = _svd_storage(W, 0.95)
-        k95, kf = _kron_storage(W, 0.95)
+        k95, _kf = _kron_storage(W, 0.95)
         sp95 = _sparse_storage(W, 0.95)
         s99 = _svd_storage(W, 0.99)
         k99, _ = _kron_storage(W, 0.99)
@@ -485,13 +486,13 @@ def _cross_layer_dups(w: dict) -> dict:
         if fam not in w:
             continue
         A = w[fam]  # (L, out, in)
-        L, O, I = A.shape
+        L, _O, _I = A.shape
         # rows (out-features), cols (in-features), head-blocks (48-row)
         rows = {i: {} for i in range(L)}
         cols = {i: {} for i in range(L)}
-        for l in range(L):
-            rows[l] = _row_hashes(A[l])
-            cols[l] = _row_hashes(A[l].T)
+        for lyr in range(L):
+            rows[lyr] = _row_hashes(A[lyr])
+            cols[lyr] = _row_hashes(A[lyr].T)
         for i in range(L):
             for j in range(i + 1, L):
                 shared_r = set(rows[i]) & set(rows[j])
@@ -527,7 +528,7 @@ def _shared_subspace(w: dict) -> dict:
         L = A.shape[0]
         stacked = A.reshape(L * A.shape[1], -1)
         r_stack = _exact_rank(stacked)
-        r_sum = sum(_exact_rank(A[l]) for l in range(L))
+        r_sum = sum(_exact_rank(A[lyr]) for lyr in range(L))
         # The gate is rank(stack) < min(#rows, #cols) — a stacked
         # matrix that is FULL column rank shares no subspace; the
         # Σ-layer comparison alone is degenerate (ambient dim caps
@@ -642,7 +643,7 @@ def _shared_dictionary(w: dict, k: int = 64) -> dict:
         A = w[fam]
         L = A.shape[0]
         st = A.reshape(L * A.shape[1], -1).astype(np.float64)
-        U, S, Vt = np.linalg.svd(st, full_matrices=False)
+        _U, _S, Vt = np.linalg.svd(st, full_matrices=False)
         D = Vt[:k]  # dictionary (k,in)
         # codes: st ≈ C @ D — least squares per row
         C = st @ D.T  # (rows, k)

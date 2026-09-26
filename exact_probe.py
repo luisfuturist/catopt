@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF001
 """exact_probe.py — measure the exact-structure corner across model archetypes.
 
 The corner's legitimate scope is EXACT structure only:

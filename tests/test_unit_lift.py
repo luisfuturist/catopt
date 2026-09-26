@@ -162,7 +162,7 @@ def test_unit_lift_fires_on_cumsum_spine():
     torch.manual_seed(0)
     T, d = 8, 4
     term, inputs = _cumsum_term(T, d)
-    x = inputs[0]
+    _x = inputs[0]
     ir = IR(root=term, inputs=inputs)
 
     eg = EGraph()
@@ -279,9 +279,9 @@ def test_trace_lift_accepts_unit_carrier():
     assert len(lifts) >= 1
     with torch.no_grad():
         ref = m(x)
-        for l in lifts:
+        for lft in lifts:
             mod = ir_to_torch_module(
-                IR(root=l.term, inputs=ir.inputs), param_values=st
+                IR(root=lft.term, inputs=ir.inputs), param_values=st
             )
             assert (mod(x) - ref).abs().max().item() < 1e-10
 

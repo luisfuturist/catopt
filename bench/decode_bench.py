@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Launch-bound regime benchmark: does catopt+Inductor beat Inductor?
 
 Hypothesis under test: catopt's pairing pass (shared-input linears →
@@ -42,6 +43,7 @@ B=1 output is verified bitwise against the stock model at load time.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import sys
 import time
@@ -352,11 +354,11 @@ def main():
             # -- kernel-count evidence, once, on the smallest cell -----
             if gemm_evidence is None and args.device == "cuda":
 
-                def _eager_fwd():
+                def _eager_fwd(idx=idx):
                     with torch.no_grad():
                         model(idx)
 
-                def _opt_fwd():
+                def _opt_fwd(opt=opt, idx=idx):
                     with torch.no_grad():
                         opt(idx)
 
@@ -379,12 +381,10 @@ def main():
             )
             # Free per-cell artifacts — deepcopied + compiled modules
             # pile up fast on a 4 GB card and distort later cells.
-            del opt
+            opt = None
             gc.collect()
-            try:
+            with contextlib.suppress(Exception):
                 torch._dynamo.reset()
-            except Exception:
-                pass
             if args.device == "cuda":
                 torch.cuda.empty_cache()
 
@@ -406,7 +406,7 @@ def main():
             print(f"{tag:<11} {note}")
             continue
 
-        def fmt(tag_):
+        def fmt(tag_, res=res):
             e = res.get(tag_)
             if not e:
                 return f"{'—':>16}"

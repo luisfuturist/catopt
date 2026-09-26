@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """The ε axis — certified bounded-error rewrites.
 
 ``low_rank_params`` offers truncated-SVD factorisations of ``linear``

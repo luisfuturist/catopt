@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Regression tests pinning the exact-structure corner's measured claim:
 
     "~0% on dense LLMs, real on structured ones."
@@ -159,7 +160,7 @@ class _GQAProj(nn.Module):
 
 
 class _AdapterMerged(nn.Module):
-    I, O, R = 128, 128, 8
+    I, O, R = 128, 128, 8  # noqa: E741
 
     def __init__(self, seed=0):
         super().__init__()
@@ -174,7 +175,7 @@ class _AdapterMerged(nn.Module):
 
 
 class _AdapterUnmerged(nn.Module):
-    I, O, R = 128, 128, 8
+    I, O, R = 128, 128, 8  # noqa: E741
 
     def __init__(self, seed=0):
         super().__init__()
@@ -298,7 +299,7 @@ def test_dense_transformer_saves_nearly_zero():
     embedding) saves ~0%: the only win is the norm-affine gain folded
     into the head weight — measured 512 B of 656,384 B (0.08%)."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(
+    low, _stats, r, rel = _opt(
         _DenseLM(n_layers=2),
         torch.randint(0, 128, (2, 8)),
         max_iterations=12,
@@ -358,7 +359,7 @@ def test_gqa_materialised_repeat_kv_37pct():
     saves exactly 2*(8-2)*8*64*8 = 49,152 B = 37.5%, fp64-exact."""
     torch.manual_seed(0)
     m = _GQAProj(kv_map=[0, 0, 0, 0, 1, 1, 1, 1])
-    low, stats, r, rel = _opt(m, torch.randn(4, 3 * _GQAProj.DIM))
+    low, _stats, r, rel = _opt(m, torch.randn(4, 3 * _GQAProj.DIM))
     assert rel < 1e-12
     expect = (
         2
@@ -385,7 +386,7 @@ def test_tied_embedding_classifier_stored_twice_50pct():
     """share_duplicate_params discovers the tie bitwise — one of the two
     512×64 tables drops out of the file: exactly 50%, zero output diff."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(_TiedTwice(), torch.randint(0, 512, (8,)))
+    _low, _stats, r, rel = _opt(_TiedTwice(), torch.randint(0, 512, (8,)))
     assert rel == 0.0
     assert r["optimized_bytes"] == r["original_bytes"] // 2
     assert len(r["eliminated"]) == 1
@@ -396,7 +397,7 @@ def test_adapter_merged_fold_11pct():
     the W + B@A param-only subtree folds to one stored tensor — A and B
     eliminated: r*(i+o)*8 = 16,384 B = 11.03%, bitwise-exact output."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(_AdapterMerged(), torch.randn(4, 128))
+    low, _stats, r, rel = _opt(_AdapterMerged(), torch.randn(4, 128))
     assert rel == 0.0
     expect = (
         _AdapterMerged.R * (_AdapterMerged.I + _AdapterMerged.O) * BYTES
@@ -417,7 +418,7 @@ def test_adapter_unmerged_does_not_regress():
     −82.8% when leaf-name dedup made the materialised copies look
     free).  fp64-exact output."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(_AdapterUnmerged(), torch.randn(4, 128))
+    low, _stats, r, rel = _opt(_AdapterUnmerged(), torch.randn(4, 128))
     assert rel < 1e-12
     assert r["bytes_saved"] == 0
     assert r["eliminated"] == []
@@ -429,7 +430,7 @@ def test_moe_tied_routed_experts_75pct():
     inputs: share_duplicate_params merges all copies — 3 of 4 expert
     weight sets drop out: exactly 75%, zero output diff."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(_MoERouted(n=4), torch.randn(4, 4, 64))
+    _low, _stats, r, rel = _opt(_MoERouted(n=4), torch.randn(4, 4, 64))
     assert rel == 0.0
     assert (
         r["bytes_saved"] == (4 - 1) * 2 * 64 * 64 * BYTES
@@ -449,7 +450,7 @@ def test_moe_tied_shared_input_75pct():
     drop out, 3·2·64·64·8 = 196,608 B (the (4,) gate param explains the
     32 B over an exact quarter), fp64-exact."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(_MoEShared(n=4), torch.randn(4, 64))
+    low, _stats, r, rel = _opt(_MoEShared(n=4), torch.randn(4, 64))
     assert rel == 0.0
     assert (
         r["bytes_saved"] == (4 - 1) * 2 * 64 * 64 * BYTES
@@ -469,7 +470,7 @@ def test_composed_linears_fold_saves_half():
     halves — 131,072 B saved, both original weights eliminated.
     fp64-exact output (reassociation noise only)."""
     torch.manual_seed(0)
-    low, stats, r, rel = _opt(
+    low, _stats, r, rel = _opt(
         _ComposedChain(d=128), torch.randn(4, 128)
     )
     assert rel < 1e-12
@@ -483,7 +484,7 @@ def test_dead_param_dropped():
     of the optimized state_dict — the trivially-exact corner case."""
     torch.manual_seed(0)
     m = _DeadParam(d=64, unused=4096)
-    low, stats, r, rel = _opt(m, torch.randn(4, 64))
+    low, _stats, r, rel = _opt(m, torch.randn(4, 64))
     assert rel == 0.0
     assert "p_unused" in r["eliminated"]
     assert r["bytes_saved"] == 4096 * 64 * BYTES  # 2,097,152 B

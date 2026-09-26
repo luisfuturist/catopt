@@ -78,7 +78,7 @@ def _nested_cat(ts, dim):
 def _chunked_attention(n_blocks=4, B=2, H=2, T=16, d=8, dv=8, seed=0):
     """Dense chunked attention term → (ir, inputs, eg, root)."""
     torch.manual_seed(seed)
-    K = T // n_blocks
+    _K = T // n_blocks
     q = Var("q", TensorType((B, H, T, d)))
     Kv = Var("K", TensorType((B, H, T, d)))
     Vv = Var("V", TensorType((B, H, T, dv)))
@@ -197,7 +197,7 @@ class TestFrontierSSM:
 
 class TestDispatchSSM:
     def test_end_to_end_and_outputs(self):
-        model, x, ir, source, eg, root, _st = _ssm_fixture()
+        model, x, _ir, _source, _eg, _root, _st = _ssm_fixture()
         disp = regime_dispatch(
             model,
             x,
@@ -281,7 +281,7 @@ class TestDispatchSSM:
             ],
         )
         entries = disp.entries
-        term, mod = entries["a"]
+        term, _mod = entries["a"]
         assert op_repr(term) == op_repr(disp.frontier["a"].term)
 
 
@@ -292,7 +292,7 @@ class TestDispatchSSM:
 
 class TestFrontierAttention:
     def test_dense_vs_om(self):
-        ir, inputs, eg, root = _chunked_attention()
+        ir, _inputs, eg, root = _chunked_attention()
         frontier = regime_frontier(
             eg,
             root,
@@ -337,7 +337,7 @@ class TestFrontierAttention:
         assert disp.frontier["stream"].engaged
 
     def test_roofline_picks_lifted(self):
-        ir, inputs, eg, root = _chunked_attention()
+        ir, _inputs, eg, root = _chunked_attention()
         frontier = regime_frontier(
             eg, root, {"prefill": (roofline_cost, "om_batched")}, ir=ir
         )
@@ -395,7 +395,7 @@ class TestDegradation:
         assert op_repr(ch.term) == op_repr(ch.cost_term)
 
     def test_collapse_reported(self):
-        ir, inputs, eg, root = _chunked_attention()
+        ir, _inputs, eg, root = _chunked_attention()
         frontier = regime_frontier(
             eg,
             root,
@@ -566,7 +566,7 @@ class TestProfiles:
             ir=ir,
             profiles={"edge": EDGE_SRAM, "gpu": EDGE_SRAM},
         )
-        edge, gpu = frontier["edge"], frontier["gpu"]
+        edge, _gpu = frontier["edge"], frontier["gpu"]
         assert edge.term.op == "matmul"  # EDGE_SRAM attached
         reg_by_name = {r.name: r for r in frontier.regimes}
         assert reg_by_name["edge"].profile == EDGE_SRAM
@@ -574,7 +574,7 @@ class TestProfiles:
 
     def test_regime_dispatch_calibrate_profile(self):
         """calibrate=<profile> fills profile-less regimes, no measuring."""
-        model, x, ir, _src, _eg, _root, _st = _ssm_fixture()
+        model, x, _ir, _src, _eg, _root, _st = _ssm_fixture()
         disp = regime_dispatch(
             model,
             x,
@@ -604,7 +604,7 @@ class TestProfiles:
 
 class TestMisc:
     def test_footprint_cost(self):
-        _m, _x, ir, _src, eg, root, _st = _ssm_fixture()
+        _m, _x, _ir, _src, eg, root, _st = _ssm_fixture()
         dense = eg.extract_best(root, flops_cost)
         v = footprint_cost(dense)
         assert isinstance(v, float) and v > 0
@@ -618,7 +618,7 @@ class TestMisc:
             assert r.cost_fn is not None or r.extract_fn is not None
 
     def test_signature_labels(self, ssm):
-        _m, _x, ir, _src, eg, root, _st = ssm
+        _m, _x, _ir, _src, eg, root, _st = ssm
         dense = eg.extract_best(root, flops_cost)
         scan = eg.extract_min_depth(root)
         assert architecture_signature(dense)[0] == "tensor"

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """trace_lift — the trm↔apply bridge: lifting unrolled recurrences into
 the traced-monoidal representation of catopt/trace.py.
 
@@ -157,8 +158,8 @@ class TestInsertion:
         lifts = TL.lift_scan_to_trace(eg)
         # joint trace + the auto 2-way channel split
         assert len(lifts) == 2
-        joint = [l for l in lifts if l.split is None][0]
-        split = [l for l in lifts if l.split is not None][0]
+        joint = next(lft for lft in lifts if lft.split is None)
+        split = next(lft for lft in lifts if lft.split is not None)
         assert joint.T == T and joint.d == d and joint.kind == "diag"
         assert split.split == (2, 2)
         assert eg.n_enodes > n0
@@ -194,7 +195,7 @@ class TestInsertion:
     def test_idempotent(self):
         term, _, _ = _diag_term(4, 4)
         eg = EGraph()
-        root = eg.add_term(term)
+        _root = eg.add_term(term)
         TL.lift_scan_to_trace(eg)
         n1 = eg.n_enodes
         lifts2 = TL.lift_scan_to_trace(eg)
@@ -223,12 +224,12 @@ class TestNumerics:
         term, inputs, _ = _diag_term(T, d)
         env, x = _env(T, d, seed=1)
         eg = EGraph()
-        root = eg.add_term(term)
+        _root = eg.add_term(term)
         lifts = TL.lift_scan_to_trace(eg)
-        assert {l.split for l in lifts} == {None, (3, 3)}
+        assert {lft.split for lft in lifts} == {None, (3, 3)}
         want = _eval(term, inputs, env, x)
-        for l in lifts:
-            got = _eval(l.term, inputs, env, x)
+        for lft in lifts:
+            got = _eval(lft.term, inputs, env, x)
             err = (got - want).abs().max().item()
             assert err < 1e-11
 
@@ -237,7 +238,7 @@ class TestNumerics:
         term, inputs, _ = _dense_term(T, d)
         env, x = _env(T, d, seed=2, dense=True)
         eg = EGraph()
-        root = eg.add_term(term)
+        _root = eg.add_term(term)
         lifts = TL.lift_scan_to_trace(eg)
         # dense transitions couple channels — no split offered
         assert len(lifts) == 1 and lifts[0].kind == "dense"
@@ -251,12 +252,12 @@ class TestNumerics:
         term, inputs, _ = _applyd_term(T, d)
         env, x = _env(T, d, seed=3)
         eg = EGraph()
-        root = eg.add_term(term)
+        _root = eg.add_term(term)
         lifts = TL.lift_scan_to_trace(eg)
         assert len(lifts) == 2
         want = _eval(term, inputs, env, x)
-        for l in lifts:
-            got = _eval(l.term, inputs, env, x)
+        for lft in lifts:
+            got = _eval(lft.term, inputs, env, x)
             assert (got - want).abs().max().item() < 1e-11
 
     def test_carrier_lift_after_scan_saturation(self):
@@ -272,8 +273,8 @@ class TestNumerics:
         lifts = TL.lift_scan_to_trace(eg, root_eid=root)
         assert lifts
         want = _eval(term, inputs, env, x)
-        for l in lifts:
-            got = _eval(l.term, inputs, env, x)
+        for lft in lifts:
+            got = _eval(lft.term, inputs, env, x)
             assert (got - want).abs().max().item() < 1e-11
 
     def test_exported_diagonal_ssm_fp64(self):
@@ -288,9 +289,9 @@ class TestNumerics:
         lifts = TL.lift_scan_to_trace(eg, root_eid=root)
         assert lifts, "exported mul-spine not recognised"
         want = m(x)
-        for l in lifts:
+        for lft in lifts:
             got = ir_to_torch_module(
-                IR(root=l.term, inputs=ir.inputs),
+                IR(root=lft.term, inputs=ir.inputs),
                 param_values=src_tensors,
             )(x)
             assert (got - want).abs().max().item() < 1e-9
@@ -304,11 +305,11 @@ class TestNumerics:
         eg = EGraph()
         root = eg.add_term(ir.root)
         lifts = TL.lift_scan_to_trace(eg, root_eid=root)
-        assert lifts and all(l.kind == "dense" for l in lifts)
+        assert lifts and all(lft.kind == "dense" for lft in lifts)
         want = m(x)
-        for l in lifts:
+        for lft in lifts:
             got = ir_to_torch_module(
-                IR(root=l.term, inputs=ir.inputs),
+                IR(root=lft.term, inputs=ir.inputs),
                 param_values=src_tensors,
             )(x)
             assert (got - want).abs().max().item() < 1e-9
@@ -329,7 +330,7 @@ class TestPostLiftSaturation:
         eg = EGraph()
         root = eg.add_term(term)
         lifts = TL.lift_scan_to_trace(eg)
-        split = [l for l in lifts if l.split == (4, 4)]
+        split = [lft for lft in lifts if lft.split == (4, 4)]
         assert split, "channel-split parl member not offered"
         eg.run(TRACE_LAWS, root, max_iterations=8)
         assert eg.rule_fires.get("tr_superpose", 0) >= 1
@@ -396,11 +397,11 @@ class TestPostLiftSaturation:
         """The tuple-usize joint trace splits into nested traces which
         each expand — the vanishing/closed-form chain is reachable."""
         T, d = 3, 4
-        term, inputs, _ = _diag_term(T, d)
-        env, x = _env(T, d, seed=7)
+        term, _inputs, _ = _diag_term(T, d)
+        _envv, _x = _env(T, d, seed=7)
         eg = EGraph()
         root = eg.add_term(term)
-        lifts = TL.lift_scan_to_trace(eg)  # split member has
+        _lifts = TL.lift_scan_to_trace(eg)  # split member has
         eg.run(
             TRACE_LAWS,
             root,  # usize=(Td1, Td2)
@@ -416,11 +417,11 @@ class TestPostLiftSaturation:
         T, d = 6, 8
         term, _, _ = _diag_term(T, d)
         eg = EGraph()
-        root = eg.add_term(term)
+        _root = eg.add_term(term)
         lifts = TL.lift_scan_to_trace(eg)
-        for l in lifts:
+        for lft in lifts:
             for cost in (flops_cost, depth_cost, roofline_cost):
-                c = dag_cost(l.term, cost)
+                c = dag_cost(lft.term, cost)
                 assert 0 < c < _INVALID_COST
 
 
@@ -450,7 +451,7 @@ class TestStorageBound:
         lifts = TL.lift_scan_to_trace(eg)
         # one joint F + one channel-split F — not ~2T prefix copies
         assert 1 <= len(lifts) <= 2
-        assert max(l.T for l in lifts) == T
+        assert max(lft.T for lft in lifts) == T
         minted = eg.n_enodes - n0
         # the two offered members are O(T) structure each — far below
         # the ~2T Fs a per-prefix mint produced (~4·T² enodes).
@@ -481,8 +482,8 @@ class TestStorageBound:
         eg.add_term(term)
         lifts = TL.lift_scan_to_trace(eg)
         orig = param_bytes_cost(term)
-        for l in lifts:
-            got = param_bytes_cost(l.term)
+        for lft in lifts:
+            got = param_bytes_cost(lft.term)
             assert got <= 2 * orig  # ~parity, never ~2T×
             assert got == orig  # same named leaves, in fact
 
@@ -501,7 +502,7 @@ class TestNoOp:
             "tanh", Op.make("add", Op.make("matmul", w, x), v)
         )
         eg = EGraph()
-        root = eg.add_term(term)
+        _root = eg.add_term(term)
         n0 = eg.n_enodes
         lifts = TL.lift_scan_to_trace(eg)
         assert lifts == []

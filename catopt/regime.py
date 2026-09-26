@@ -70,11 +70,8 @@ import torch.nn as nn
 
 from catopt.calibrate import TargetProfile, load_profile
 from catopt.cost import (
-    _INVALID,
     _INVALID_COST,
     _VIEW_OPS,
-    _numel,
-    _shape_of,
     dag_cost,
     flops_cost,
     launch_aware_cost,
@@ -98,6 +95,7 @@ from catopt.scan_lower import (
 )
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.trace import TRACE_LAWS
+from catopt.typing import _INVALID, _numel, _shape_of
 from catopt.xcarrier import XC_LAWS
 
 __all__ = [

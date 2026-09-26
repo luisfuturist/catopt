@@ -150,20 +150,20 @@ __all__ = [
 
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
-    from catopt.cost import _shape_of as _so
+    from catopt.typing import _shape_of as _so
 
     return _so(t)
 
 
 def _broadcast_ok(a, b) -> bool:
-    from catopt.cost import _INVALID, _broadcast
+    from catopt.typing import _INVALID, _broadcast
 
     return _broadcast(a, b) is not _INVALID
 
 
 def _bc(a, b):
     """Broadcast result, or None when incompatible/unknown."""
-    from catopt.cost import _INVALID, _broadcast
+    from catopt.typing import _INVALID, _broadcast
 
     r = _broadcast(a, b)
     return None if r is _INVALID else r
@@ -185,7 +185,7 @@ def _vec(t) -> bool:
 def _xshape(t: Any, _memo: dict | None = None):
     """The TRUE value shape of a bound term — for the XC guards.
 
-    ``catopt.cost._shape_of`` prices the carriers by convention:
+    ``catopt.typing._shape_of`` prices the carriers by convention:
     ``apply``/``applyd`` report h's (state) shape, ``aff``/``aff_diag``
     report the map's linear part.  That convention is exact on the
     recurrence spine, where state and value shapes coincide — but it
@@ -1251,7 +1251,7 @@ def _numel_of(s) -> int:
 
 def _resolve_view_shape(S, numel_in: int):
     """Concrete resolution of a reshape ``shape`` attr against the
-    input's numel — the same convention ``cost._shape_of`` uses (one
+    input's numel — the same convention ``typing._shape_of`` uses (one
     literal -1 may appear in exported graphs and is inferred).
     Returns the resolved tuple, or None when the shape is ill-formed
     or numel-inconsistent (then the view — and the law — is not

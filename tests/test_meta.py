@@ -272,7 +272,7 @@ def test_synthesize_emits_valid_derived_rules():
         # random tensors.
         mvars = sorted(meta.pattern_metavars(d.lhs))
         leaves = [Var(f"_t{i}", _T()) for i in range(len(mvars))]
-        subst = dict(zip(mvars, leaves))
+        subst = dict(zip(mvars, leaves, strict=True))
         t0 = meta.instantiate_pattern(d.lhs, subst)
         env = {
             v: torch.randn(4, 4, dtype=torch.float64) for v in leaves
@@ -344,7 +344,7 @@ def test_synthesis_with_lift_step_emits_composed_form():
 
 def test_derived_rules_fire_in_egraph():
     """A synthesized rule plugs back into the e-graph and rewrites."""
-    seed, A1, A2, h0, u, x = _recurrence_seed()
+    seed, _A1, _A2, _h0, _u, _x = _recurrence_seed()
     rules = [r for r in R.SCAN_LAWS if r.name != "aff_lift_step"]
     derived = meta.synthesize_rules(rules, [seed], fuel=2000)
     assert derived

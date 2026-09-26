@@ -134,7 +134,7 @@ def test_extract_best():
     """Extract the minimum-cost term from an e-class."""
     x = Var("x", TensorType((1, 4)))
     zero = Const(0)
-    y = Var("y", TensorType((1, 4)))
+    _y = Var("y", TensorType((1, 4)))
 
     term = Op.make("add", x, zero)  # add(x, 0)
     eg = EGraph()
@@ -209,7 +209,7 @@ def test_naturality_rewriting():
 
     from catopt.cost import count_cost
 
-    best = eg.extract_best(eid, count_cost)
+    _best = eg.extract_best(eid, count_cost)
 
     root_class = eg.get_class(eid)
     # Should contain both forms
@@ -218,7 +218,7 @@ def test_naturality_rewriting():
 
     from catopt.cost import count_cost, flops_cost
 
-    best = eg.extract_best(eid, flops_cost)
+    _best = eg.extract_best(eid, flops_cost)
 
     # The naturality rule should have produced: mul(matmul(x, W), c)
     # Both forms should be equivalent
@@ -270,7 +270,7 @@ def test_incremental_frontier_refires_at_dirtied_classes():
     from catopt.rules import ASSOC_ADD, COMM_ADD
 
     stats = eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=20)
-    root = eg.get_class(eid)
+    _root = eg.get_class(eid)
     # Saturation reached every bracketing of the 3-summand chain:
     # (x+y)+z, x+(y+z), and the commuted orders.
     assert stats["iterations"] < 20
@@ -390,7 +390,7 @@ def test_min_term_returns_smallest_member():
     from catopt.rules import ID_ADD
 
     eg.run([ID_ADD], eid, max_iterations=5)
-    t, s = eg._min_term(eid, {})
+    _t, s = eg._min_term(eid, {})
     assert s == 1  # the bare Var beats add(x, 0)
 
 
