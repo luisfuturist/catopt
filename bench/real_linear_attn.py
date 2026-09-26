@@ -51,17 +51,19 @@ The transform, verified to *fire*:
    recorded from the production pipeline at ``--optimize-max-t`` and
    below (whole-graph e-graphs don't scale to the top of the T sweep).
 
-Honest expectations (measured on this CPU):
+Honest expectations (measured on this CPU, fp32):
 
-* ``retnet`` — the batched scan beats eager ~3× (``leaf_a_shared`` +
-  ``leaf_b_gather`` engage; ~log T launches vs ~5·T eager dispatches).
+* ``retnet`` — the batched scan beats eager ~2.6–4.8× at T ≤ 512
+  (``leaf_a_shared`` + ``leaf_b_gather`` engage; ~log T launches vs
+  ~5·T eager dispatches), growing with T.
 * ``gla``/``delta`` — honest CPU negatives: the per-leaf evaluator
-  cost of data-dependent leaf terms dominates the batched schedule.
+  cost of data-dependent leaf terms dominates the batched schedule
+  (~0.5–0.9× vs eager).
 * Inductor fuses the *pointwise* diagonal chain into ~one kernel and
-  is a strong CPU baseline — its compile time grows linearly with the
-  unrolled horizon T (a cost catopt's linear IR build does not pay).
-  On launch-bound devices the schedules invert: O(T) serial launches
-  vs O(log T) batched ones.
+  beats every variant on this device — its compile time grows
+  linearly with the unrolled horizon T (a cost catopt's linear IR
+  build does not pay).  On launch-bound devices the schedules
+  invert: O(T) serial launches vs O(log T) batched ones.
 
 Baselines / variants per cell (benchkit ``Runner``, fp32 timing):
 ``eager`` · ``inductor`` (SIGALRM-guarded ``torch.compile``) ·
@@ -114,6 +116,14 @@ from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt_core.egraph.types import _LeafRegistry
 
 _APPLY_OPS = ("apply", "applyd")
+
+# run_all.py picks these up for its --quick lane.
+QUICK = {
+    "sizes": "128,512",
+    "families": "retnet,gla",
+    "depths": "4",
+    "compile_timeout": 60.0,
+}
 
 
 # ---------------------------------------------------------------------------
