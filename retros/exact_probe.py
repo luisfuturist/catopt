@@ -2,6 +2,10 @@
 # ruff: noqa: RUF001
 """exact_probe.py — measure the exact-structure corner across model archetypes.
 
+ARCHIVED — weight-space probe, falsified axis (see ../REPORT.md).
+Lives under retros/ as evidence for the report's exact-corner pins;
+the llama2c loader it imports is bench/llama2c.py on main.
+
 The corner's legitimate scope is EXACT structure only:
   * share_duplicate_params        — whole-tensor tying (bitwise-equal params)
   * share_duplicate_param_slices  — intra-tensor head-block dedup (GQA/MoE
@@ -367,7 +371,7 @@ def probe_stories15m():
         share_duplicate_param_slices,
         share_duplicate_params,
     )
-    from measure_weights import load_llama2c
+    from retros.measure_weights import load_llama2c
 
     w = load_llama2c(CKPT)
     src = {}

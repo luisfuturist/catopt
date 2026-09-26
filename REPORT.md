@@ -36,7 +36,7 @@ references never reaches the state dict. Composition, tying,
 slice-sharing, and bounded factorization are the same event at
 different certificate bound values.
 
-## 2. Phase 0 — Linear falsification (`measure_weights.py`)
+## 2. Phase 0 — Linear falsification (`retros/measure_weights.py`)
 
 Measured real trained weights (llama2.c `stories15M`, 15M params):
 
@@ -201,7 +201,7 @@ This is the honest negative the kill-gates were for.
 ### 10.1 Relational probe — the last untested class
 
 Exact **cross-layer** structure on stories15M **and** stories110M
-(`measure_weights.py relational`):
+(`retros/measure_weights.py relational`):
 
 | probe | stories15M | stories110M |
 |---|---|---|
@@ -224,7 +224,7 @@ at the bit level; the only lossless wins are the architectural ones
 cross-layer structure.
 
 ### 10.1b Symmetry probes — equivariance, polynomial, learned
-displacement (`measure_weights.py symmetries`, stories15M)
+displacement (`retros/measure_weights.py symmetries`, stories15M)
 
 | probe | hypothesis | result |
 |---|---|---|
