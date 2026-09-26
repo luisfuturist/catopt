@@ -212,7 +212,6 @@ backend implements `Sink`; `catopt-core` never imports it.
 
 ```bash
 uv sync                       # installs all workspace members editable
-python main.py                # demo: all transform families
 python bench/fetch.py         # checkpoints → ~/.cache/catopt
 python bench/stories15m_bench.py --device cuda
 python bench/decode_bench.py --device cuda --quick   # launch-bound sweep
