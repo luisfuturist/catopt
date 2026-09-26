@@ -3,18 +3,23 @@
 **A verified search engine over faster, provably equivalent versions of
 your model.**
 
-catopt takes a PyTorch model, searches the space of semantics-preserving
-graph transformations, and returns a faster module with a replayable
-equivalence certificate — then hands it to `torch.compile` so Inductor
-does the codegen either way.
+catopt searches the space of semantics-preserving graph transformations
+of a model and returns a faster program with a replayable equivalence
+certificate. The semantic engine (`catopt-core`) is **backend-agnostic**
+— IR, e-graph, laws, and cost algebra run with zero dependencies.
+PyTorch is the *shipped* integration: models enter and leave through
+`Source`/`Sink` ports, and `torch.compile`/Inductor is used only as the
+benchmark baseline and the torch sink's codegen. Nothing in the engine
+names CUDA, Triton, or torch — target pricing is a pluggable cost model
+(`calibrate()` + `roofline_cost_for`).
 
 ```text
-PyTorch model
-  → torch.export              (the graph, typed)
+model (any Source)
+  → typed IR                  (frontend port: TorchSource shipped)
   → e-graph saturation        (equivalent programs, enumerated)
-  → cost-based extraction     (the cheapest one, for your hardware)
-  → verified module           (certificate replayed, fp64-checked)
-  → torch.compile / Inductor  (same backend, fair fight)
+  → cost-based extraction     (the cheapest one, for your backend)
+  → verified program          (certificate replayed, fp64-checked)
+  → backend lowering          (Sink port: TorchSink → torch.compile)
 ```
 
 ```python
@@ -160,6 +165,12 @@ target — the same equivalence space, selected per backend.
 
 ## Limitations
 
+- **Compute, not weights** — weights are compile-time constants folded
+  into the graph (weight folding is constant folding, not
+  reparameterization). The weight-space axis (INR/Kronecker/monarch
+  weight programs) was falsified and archived in `project/retros/`.
+  `catopt-eps` (opt-in) is certified *activation* approximation — the
+  only ε>0 axis.
 - **Nothing discovered is novel to practitioners** — fused QKV, flash
   attention, the linear-attention identity are all known. The
   contribution is automatic discovery + verification + per-shape choice,
