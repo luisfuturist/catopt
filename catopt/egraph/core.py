@@ -122,10 +122,6 @@ class EGraph(_ExtractMixin, _ProofMixin):
     def n_enodes(self) -> int:
         return len(self._node_to_class)
 
-    @property
-    def n_nodes(self) -> int:
-        return sum(len(c.nodes) for c in self._classes.values())
-
     def find(self, eid: int) -> int:
         return self._uf.find(eid)
 

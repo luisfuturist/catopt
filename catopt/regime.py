@@ -203,7 +203,6 @@ class ExecutorSpec:
     accepts: Callable[[Any], bool]
     engaged: Callable[[nn.Module], bool]
     carrier: tuple[frozenset, frozenset, frozenset] | None = None
-    blurb: str = ""
 
 
 EXECUTORS: dict[str, ExecutorSpec] = {
@@ -213,7 +212,6 @@ EXECUTORS: dict[str, ExecutorSpec] = {
         _always_true,
         _always_true,
         None,
-        "plain serial evaluation of the term (IRModule)",
     ),
     "scan": ExecutorSpec(
         "scan",
@@ -225,7 +223,6 @@ EXECUTORS: dict[str, ExecutorSpec] = {
             frozenset({"aff_compose", "affd_compose"}),
             frozenset({"aff", "aff_diag"}),
         ),
-        "level-batched aff-tree scan (BatchedScanModule)",
     ),
     "om_batched": ExecutorSpec(
         "om_batched",
@@ -237,7 +234,6 @@ EXECUTORS: dict[str, ExecutorSpec] = {
             frozenset({"om_compose"}),
             frozenset({"om", "om_elem"}),
         ),
-        "level-batched online-softmax tree (BatchedOMModule)",
     ),
     "om_streaming": ExecutorSpec(
         "om_streaming",
@@ -249,7 +245,6 @@ EXECUTORS: dict[str, ExecutorSpec] = {
             frozenset({"om_compose"}),
             frozenset({"om", "om_elem"}),
         ),
-        "bounded-working-set left fold (StreamingOMModule)",
     ),
     "trace": ExecutorSpec(
         "trace",
@@ -261,8 +256,6 @@ EXECUTORS: dict[str, ExecutorSpec] = {
             frozenset({"parl", "bdiag"}),
             frozenset({"eye", "cswap"}),
         ),
-        "traced-monoidal fixpoint — the JSV carrier; evaluated by "
-        "IRModule through the trace/bdiag/parl/inv torch bindings",
     ),
 }
 
@@ -1011,7 +1004,6 @@ class RegimeDispatch(nn.Module):
         if self._regime not in self._meta:
             raise KeyError(f"unknown default regime {default!r}")
         self.verification: dict[str, dict] | None = None
-        self.saturation_stats: dict | None = None
 
     # -- one set of weights ------------------------------------------
     @staticmethod
@@ -1162,13 +1154,11 @@ class RegimeDispatch(nn.Module):
 #: XC_LAWS crosses the carrier seam: linear readouts exit the scan
 #: carriers, the om numerator is such a readout, and the deferred omd
 #: carrier keeps chunked attention affine in the scan's initial state.
+#: ``build_egraph`` keeps the cross-carrier seam laws (XC_LAWS) in a
+#: bounded second tier (see its ``xc`` flag): the set is mostly
+#: bidirectional pairs minting fresh enodes, so it gets its own
+#: iteration budget after the carriers are established.
 CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS
-#: Core carriers + the cross-carrier seam laws interleaved — for
-#: callers that want one saturating ruleset.  ``build_egraph`` keeps
-#: XC in a bounded second tier instead (see its ``xc`` flag): the set
-#: is mostly bidirectional pairs minting fresh enodes, so it gets its
-#: own iteration budget after the carriers are established.
-CARRIER_X_LAWS = CARRIER_LAWS + XC_LAWS
 
 
 def default_rules() -> list:
@@ -1293,7 +1283,7 @@ def regime_dispatch(
         if isinstance(example_input, tuple)
         else (example_input,)
     )
-    eg, root, ir, source, stats = build_egraph(
+    eg, root, ir, source, _stats = build_egraph(
         model,
         example_input,
         rules=rules,
@@ -1320,7 +1310,6 @@ def regime_dispatch(
         eg, root, regime_list, ir=ir, src_term=ir.root
     )
     disp = frontier.build(param_values=source, default=default)
-    disp.saturation_stats = stats
     if verify:
         was_training = model.training
         try:

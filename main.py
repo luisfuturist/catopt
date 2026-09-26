@@ -366,7 +366,6 @@ def demo_swiglu_rmsnorm(
 
     xg = torch.randn(batch, seqlen, dim)
     sg, rn = SwiGLU(dim), RMSNorm(dim)
-    results = []
     for name, model, x in (("SwiGLU", sg, xg), ("RMSNorm", rn, xg)):
         ir, source_tensors = export_to_ir(model, x)
         eg = EGraph()
@@ -404,8 +403,6 @@ def demo_swiglu_rmsnorm(
             diff = (out_o - out_n).abs().max().item()
             ok = "✓" if diff < 1e-4 else "✗"
             print(f"  {ok} {name}: max abs diff {diff:.3e}")
-            results.append((name, diff))
-    return None
 
 
 def main() -> None:

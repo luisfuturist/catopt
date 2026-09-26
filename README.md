@@ -171,7 +171,8 @@ catopt/          the engine: ir, egraph, rules, cost, optimize
   xcarrier       cross-carrier laws + deferred omd carrier
   meta           coherence stratification + rule synthesis
   calibrate      per-device cost constants
-bench/           real-checkpoint benchmarks (stories15M/110M, decode sweep)
+bench/           real-checkpoint benchmarks: stories15M/110M, decode sweep,
+                 e2e smoke, omd attention stack
 tests/           578 tests
 REPORT.md        full measurements + the falsified directions
 project/         orphan branch: ADRs and retrospectives (worktree)
@@ -179,9 +180,9 @@ project/         orphan branch: ADRs and retrospectives (worktree)
 
 ```bash
 python main.py                # demo: all transform families
-python bench_gpu.py           # GPU table (needs CUDA)
 python bench/fetch.py         # checkpoints → ~/.cache/catopt
 python bench/stories15m_bench.py --device cuda
+python bench/decode_bench.py --device cuda --quick   # launch-bound sweep
 python -m pytest tests/ -q
 ```
 

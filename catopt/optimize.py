@@ -34,7 +34,6 @@ from catopt.report import (
     BlockReport,
     CompositionalReport,
     OptReport,
-    rel_diff,
     verify_module,
 )
 from catopt.rules import (
@@ -818,12 +817,6 @@ def _capture_block_inputs(
         for h in handles:
             h.remove()
     return captured
-
-
-def _rel_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Back-compat alias for :func:`catopt.report.rel_diff` — the
-    diff+tolerance computation now lives in the uniform verify gate."""
-    return rel_diff(a, b)
 
 
 def _replace_submodule(

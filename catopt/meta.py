@@ -152,13 +152,6 @@ def classify_rules(
     return coherent, contentful
 
 
-#: Coherent / contentful partition of every rule defined in catopt.rules.
-_ALL_MODULE_RULES = _iter_module_rules(R)
-COHERENT: list[Rewrite]
-CONTENTFUL: list[Rewrite]
-COHERENT, CONTENTFUL = classify_rules(_ALL_MODULE_RULES)
-
-
 # ---------------------------------------------------------------------------
 #  Part A.2 — canonicalize: eager coherence normalization
 # ---------------------------------------------------------------------------
@@ -272,18 +265,6 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
 # ---------------------------------------------------------------------------
 #  Part A.3 — stratified_run
 # ---------------------------------------------------------------------------
-
-
-def canonical_cost(cost_fn):
-    """Wrap *cost_fn* so extraction prices the canonical form of each
-    candidate — coherent-equivalent bracketings are scored by their
-    normal form, so e.g. a right-leaning ``aff_compose`` chain is
-    charged its balanced (log-depth) cost."""
-
-    def wrapped(t: Any, **kw) -> float:
-        return cost_fn(canonicalize(t), **kw)
-
-    return wrapped
 
 
 def stratified_run(

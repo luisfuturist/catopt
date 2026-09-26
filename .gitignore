@@ -45,3 +45,11 @@ Thumbs.db
 .~lock.*#
 project/
 .venv/
+
+# Coverage / profiling artifacts
+.coverage
+.coverage.*
+htmlcov/
+cov_ann/
+.pytest_cache/
+*.prof

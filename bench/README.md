@@ -57,3 +57,28 @@ parity, > 1.03 → REGRESSION.
 Launch-bound cells (B=1, T≤64) lose 4–15% — split-view copies after
 the fused GEMM cost more than the saved launches. Large cells
 (B≥8, T≥128, and stories110M) land at parity within ~1%.
+
+## bench_e2e.py — quick whole-model smoke
+
+```bash
+python bench/bench_e2e.py     # CUDA if available, else CPU
+```
+
+One-cell sanity run: a MiniGPT of stacked `ParallelBlock`s, optimize
+once, report eager / Inductor / catopt / catopt+Inductor lower-quartile
+ms. Naive single-config timing — for the rigorous sweep use
+`decode_bench.py`.
+
+## bench_omd2.py — omd executor on a realistic attention stack
+
+```bash
+python bench/bench_omd2.py --sizes 64,128 --skip-gap
+```
+
+Research bench: does the cross-carrier omd lift survive a
+transformer-shaped attention (real q/k/v projections, multi-head,
+causal mask), and is `BatchedOmdModule` still fast when it does?
+Variants `mqa` (the firing case), `mha`, `mha-chunk`, `sdpa`; times
+torch-eager / IR / best / omd / omd-batched / CUDA-graph / Inductor /
+omd-direct where applicable. Bounded saturation (300k-node cap) —
+exploratory, not a certified path.

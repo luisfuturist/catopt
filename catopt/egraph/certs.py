@@ -4,8 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from catopt.ir import op_repr
-
 # ---------------------------------------------------------------------------
 #  Proof-carrying merges — 2-morphisms as first-class data
 # ---------------------------------------------------------------------------
@@ -140,21 +138,5 @@ class Certificate:
         an exact equivalence, not a certified approximation."""
         return self.error_bound == 0.0
 
-    def render(self) -> str:
-        lines = [
-            f"certificate: {op_repr(self.src)}",
-            f"        ==> {op_repr(self.dst)}",
-        ]
-        for i, s in enumerate(self.steps):
-            tag = "  [e-graph-dependent]" if s.egraph_dependent else ""
-            r = self.rules.get(s.rule)
-            if r is not None and r.error_bound:
-                tag += f"  [ε≤{r.error_bound:.3e} {r.bound_norm}]"
-            lines.append(
-                f"  {i:>3}. {s.rule} @{list(s.path)}: "
-                f"{op_repr(s.lhs)} -> {op_repr(s.rhs)}{tag}"
-            )
-        if not self.exact:
-            lines.append(f"  total ε bound: {self.error_bound:.3e}")
-        return "\n".join(lines)
+
 

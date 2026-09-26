@@ -67,8 +67,9 @@ import argparse
 import signal
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, "/home/luis/Desktop/catopt")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.setrecursionlimit(400_000)
 
 import torch

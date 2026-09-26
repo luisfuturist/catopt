@@ -180,11 +180,6 @@ def _concrete(s) -> bool:
     )
 
 
-def _vec(t) -> bool:
-    s = _shape_of(t)
-    return _concrete(s) and len(s) == 1
-
-
 def _xshape(t: Any, _memo: dict | None = None):
     """The TRUE value shape of a bound term — for the XC guards.
 

@@ -519,8 +519,6 @@ class TraceLift:
     root_eid: int
     out_eid: int
     trace_eid: int
-    f_eid: int
-    vec_eid: int
     term: Any
     kind: str
     T: int
@@ -587,7 +585,7 @@ def _offer(
     h0 = em.ref(plan.h0)
     if not em.broken:
         F = _channel_F(em, plan.kind, maps, d)
-        tr, vec, out = _emit_head(em, F, ins, h0, d, T * d)
+        tr, _vec, out = _emit_head(em, F, ins, h0, d, T * d)
         eg.union(
             cid,
             out[0],
@@ -606,8 +604,6 @@ def _offer(
                 root_eid=cid,
                 out_eid=out[0],
                 trace_eid=tr[0],
-                f_eid=F[0],
-                vec_eid=vec[0],
                 term=out[1],
                 kind=plan.kind,
                 T=T,
@@ -653,8 +649,6 @@ def _offer(
                 root_eid=cid,
                 out_eid=outp[0],
                 trace_eid=trp[0],
-                f_eid=Fp[0],
-                vec_eid=vecp[0],
                 term=outp[1],
                 kind=plan.kind,
                 T=T,
