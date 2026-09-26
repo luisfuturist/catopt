@@ -41,6 +41,8 @@ RTX 2050, synced timing.
 | **Projection pairing** (QKV, gate·up, parallel branches → 1 GEMM) | PaLM-style block, 5 projections fused | **1.24× vs Inductor** end-to-end |
 | **FLOP reduction** (reassociation, weight merging, factorization) | DeepParallel b=4096 | **2.51×** GPU / **3.02×** CPU |
 | **Asymptotic reassociation** | LinearAttention `(QKᵀ)V → Q(KᵀV)`: O(T²d)→O(Td²) | **8.0×** at T=2048 |
+| **Weights-first fold** (k-deep chain → 1 GEMM; Inductor's post-grad graph keeps all k left-assoc `mm`s — captured live) | `x @ W₁@…@W₁₆` | **15.9× vs Inductor** GPU at k=16 — a transform it structurally cannot reach |
+| **Scan lift on real blocks** | RetNet/GLA/delta-rule blocks (parallel-scan carrier, fp64-exact) | **2.1–21.7× vs eager** GPU at T≤2048 |
 | **Attention fold** | `softmax(masked_fill(qkᵀ·s)) @ v` → `sdpa(is_causal)` | **4.6×** vs eager, **2.5×** under Inductor (nanoGPT, T=2048) |
 | **Parallel-scan discovery** | LTI recurrence → balanced Blelloch tree | **6.3×** CUDA-graph, T=64 |
 | **Diagonal-affine scan** | Mamba-faithful `a⊙h + b⊙x` | **4.4×** CUDA-graph, T=64 |
@@ -120,6 +122,8 @@ The honest regime map, all measured:
 | Conv pairing | **Wins** — Inductor never fuses cuDNN calls |
 | GEMM pairing on transformer blocks | **Parity** — ~40 non-GEMM kernels/layer dilute it |
 | Real trained checkpoints (stories15M/110M) | **Parity** — all blocks transform and verify, no win at these sizes |
+| Scan lift on real linear-attention blocks (GPU) | **Wins 2.1–21.7× vs eager**; **loses** to a *compiled* Inductor |
+| Inductor compile wall on unrolled recurrences | **Win by reachability** — Inductor's compile grows superlinearly in T (54–85s at T=2048, >60s timeout on GLA); CatOpt ships a certified O(log T) schedule in seconds |
 | Launch-bound decode cells (B=1, T≤64) | **Loses 4–15%** — split-view copies cost more than saved launches |
 | Large cells (B≥8, T≥128, stories110M) | **Parity** — GEMM-shape efficiency washes out at ~1% |
 
@@ -130,6 +134,19 @@ QKV + gate·up fuse, outputs verify to ~2e-5 — at parity with Inductor
 profiler-verified); at these dimensions it just doesn't pay. The
 launch-bound hypothesis was falsified — on blocks, on whole models,
 and on the large-cell crossover sweep (`bench/decode_bench.py`).
+
+Real linear-attention blocks (`bench/real_linear_attn.py`, RetNet /
+GLA / delta-rule shapes, GPU): the scan-carrier lift produces a
+certified O(log T) schedule — fp64-exact through a saturated e-graph —
+beating eager 9.4–21.7× at T≤2048. The honest split: a *successfully
+compiled* Inductor is still faster (it fuses the unrolled pointwise
+chain into ~one kernel, 0.06–0.15ms), **but Inductor's compile time
+explodes with the unrolled horizon** — 54s at T=512, 85s at T=2048 on
+RetNet, and GLA T=2048 doesn't compile within the 60s timeout at all.
+At that horizon CatOpt's seconds-linear pipeline is the only path that
+produces an optimized schedule. Kernel-side, per-leaf eval cost is the
+gap to close — the schedule exists, the executor isn't yet as lean as
+Inductor's fused pointwise.
 
 **Controlled negative**: NormLinear loses slightly (0.98×) — Inductor
 already fuses `x·rms·wn` into the GEMM's input read, so restructuring
@@ -189,8 +206,10 @@ catopt/                     façade — public API + compat aliases;
                             to its new home via sys.modules
 bench/                      real-checkpoint benchmarks: stories15M/110M,
                             decode sweep, e2e smoke, omd attention stack
-                            + reassoc_scale (the head-to-head) and
-                            search_efficiency (exploration cost vs space)
+                            + reassoc_scale (the head-to-head),
+                            search_efficiency (exploration cost vs
+                            space), real_linear_attn (scan lift on
+                            RetNet/GLA/delta blocks, CPU+CUDA)
 tests/                      1609 tests
 project/                    orphan branch: plans, ADRs, retrospectives
 ```
