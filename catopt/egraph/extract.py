@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from catopt.cost import _memo_dispatch
 from catopt.egraph.types import (
     ENode,
     _LeafRegistry,
@@ -192,10 +193,6 @@ class _ExtractMixin:
         # per-candidate cost_fn calls O(1) amortised over the DAG.
         # Terms are content-hashed and interned — memos key on the term
         # object directly and hold it alive; no keepalive needed.
-        import inspect
-
-        cost_memo: dict = {}
-        takes_memo = "memo" in inspect.signature(cost_fn).parameters
         # Storage-style cost models (param_bytes_cost) bill Param leaves
         # — folding does not shrink the weights file — so the param-only
         # discount does not apply.  getattr(..., "func", ...) unwraps
@@ -205,11 +202,7 @@ class _ExtractMixin:
             "charges_param_only",
             False,
         )
-
-        def cfn(t: Any) -> float:
-            return (
-                cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
-            )
+        cfn = _memo_dispatch(cost_fn)
 
         def best(
             eclass_id: int,
@@ -481,15 +474,7 @@ class _ExtractMixin:
         # score steering candidates: picking member_reaching[0] can grab
         # an arbitrarily expensive alternative (e.g. a distributed form)
         # and inflate the forced term's true DAG cost.
-        import inspect
-
-        cost_memo: dict = {}
-        takes_memo = "memo" in inspect.signature(cost_fn).parameters
-
-        def cfn(t: Any) -> float:
-            return (
-                cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
-            )
+        cfn = _memo_dispatch(cost_fn)
 
         pass1_cache: dict = {}
         self.extract_best(

@@ -782,27 +782,21 @@ class IRModule(torch.nn.Module):
         # Phase 3b: materialize weight-only subtrees (e.g. W1 @ (W2 @ W3))
         # at construction time, so runtime is a single matmul per fused chain.
         self._fold_memo: dict[int, Any] = {}
-        self._uses_memo: dict[int, bool] = {}
+        self._uses_memo: dict = {}
         self._root = self._fold_weight_chains(ir.root)
         self._build_params()
 
     def _uses_input(self, term: Any) -> bool:
         """True if the term mentions any data-dependent leaf (Var input).
 
-        Memoised by id(): extracted terms are shared-subterm DAGs, and
-        an unmemoised walk is exponential in DAG depth.
+        Delegates to :func:`catopt.typing.has_var_leaf` with the
+        instance's content-keyed memo: extracted terms are
+        shared-subterm DAGs, and an unmemoised walk is exponential in
+        DAG depth.
         """
-        key = term
-        if key in self._uses_memo:
-            return self._uses_memo[key]
-        if isinstance(term, Var):
-            res = True
-        elif isinstance(term, Op):
-            res = any(self._uses_input(a) for a in term.args)
-        else:
-            res = False
-        self._uses_memo[key] = res
-        return res
+        from catopt.typing import has_var_leaf
+
+        return has_var_leaf(term, self._uses_memo)
 
     def _fold_weight_chains(self, term: Any) -> Any:
         """Bottom-up: replace weight-only subtrees with a single fused Param.

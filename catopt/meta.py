@@ -89,6 +89,13 @@ from typing import Any
 
 import catopt.rules as R
 from catopt.egraph import EGraph, Rewrite
+from catopt.egraph.terms import (
+    _replace_subterm,
+    _term_paths,
+)
+from catopt.egraph.terms import (
+    _subterm as _term_subterm,
+)
 from catopt.ir import Const, Op, Param, Var, op_repr
 
 # ---------------------------------------------------------------------------
@@ -376,6 +383,13 @@ def match_pattern(
     String attr values are attribute metavariables bound under
     ``"$attr:<name>"`` — mirroring :meth:`EGraph._match`.  Returns the
     substitution dict or ``None``.
+
+    Near-clone of :func:`catopt.egraph.terms._term_match`, kept
+    separate because the leaf compare genuinely differs: this uses
+    ``==`` (numeric equality — ``Const(0)`` matches ``Const(0.0)``,
+    which the identity rules rely on), while ``_term_match`` compares
+    ``repr`` — the e-graph's leaf-key convention, where ``"0" !=
+    "0.0"`` and two same-named Vars are one leaf regardless of type.
     """
     if subst is None:
         subst = {}
@@ -414,7 +428,16 @@ def match_pattern(
 
 def instantiate_pattern(pat: Any, subst: dict) -> Any:
     """Instantiate a pattern term: str leaves and str attr values are
-    looked up in *subst*; everything else is rebuilt as-is."""
+    looked up in *subst*; everything else is rebuilt as-is.
+
+    Near-clone of :func:`catopt.egraph.terms._term_instantiate`, kept
+    separate because the missing-binding contract differs: an unbound
+    ``$attr:`` metavar raises ``KeyError`` here (callers like
+    ``apply_rewrite_at``/``_fire_guarded`` treat it as a veto), while
+    ``_term_instantiate`` falls back to the literal metavar string —
+    which would mint a bogus ``attr="<name>"`` term instead of
+    vetoing.
+    """
     if isinstance(pat, str):
         return subst[pat]
     if isinstance(pat, Op):
@@ -441,28 +464,30 @@ def pattern_metavars(pat: Any) -> set[str]:
 
 
 def _positions(
-    term: Any, path: tuple = ()
+    term: Any,
 ) -> Iterable[tuple[tuple, Any]]:
-    """Yield ``(path, subterm)`` for every position, DFS pre-order."""
-    yield path, term
-    if isinstance(term, Op):
-        for i, a in enumerate(term.args):
-            yield from _positions(a, (*path, i))
+    """Yield ``(path, subterm)`` for every position, DFS pre-order —
+    ``catopt.egraph.terms._term_paths`` zipped with ``_subterm``."""
+    for p in _term_paths(term):
+        yield p, _term_subterm(term, p)
 
 
 def _subterm(term: Any, path: tuple) -> Any:
-    for i in path:
-        term = term.args[i]
-    return term
+    """The subterm at *path* — delegates to
+    :func:`catopt.egraph.terms._subterm`, whose bad-path contract is
+    ``None`` rather than this module's old ``IndexError``.  Every
+    caller passes paths produced by ``_positions``/user-supplied
+    rewrite paths; a bad path now yields a clean no-match."""
+    return _term_subterm(term, path)
 
 
 def _replace(term: Any, path: tuple, new: Any) -> Any:
-    if not path:
-        return new
-    i, rest = path[0], path[1:]
-    args = list(term.args)
-    args[i] = _replace(args[i], rest, new)
-    return Op.make(term.op, *args, **dict(term.attrs))
+    """*term* with the subterm at *path* replaced — delegates to
+    :func:`catopt.egraph.terms._replace_subterm`.  Bad paths raise
+    ``CertificateVerificationError`` there rather than the old
+    ``IndexError``; callers only ever pass valid ``_positions``
+    paths."""
+    return _replace_subterm(term, path, new)
 
 
 def _common_prefix(p: tuple, q: tuple) -> tuple:

@@ -506,6 +506,61 @@ def _numel(shape) -> int:
 
 
 # ---------------------------------------------------------------------------
+#  Term predicates shared across cost / lowering / laws
+# ---------------------------------------------------------------------------
+
+
+def has_var_leaf(term: Any, memo: dict | None = None) -> bool:
+    """True iff the subtree mentions a :class:`Var` leaf (runtime data).
+
+    Param-only subtrees fold at compile time — this predicate is the
+    activation/weight distinction used by the cost model's DAG
+    accounting and parameter-fold pricing (``cost.dag_cost`` /
+    ``cost._folds_to_param``), the torch bridge's weight-chain
+    folding, the pairing pass, and activation-eps site
+    classification.
+
+    ``memo`` is a content-keyed dict threaded across a traversal so
+    shared-subterm DAGs stay a linear walk (terms are interned
+    content objects — safe dict keys, no ``id()``/GC hazards).  Keys
+    are ``("hv", term)``-prefixed so the memo may be SHARED with other
+    content-keyed helpers (``_shape_of`` keys on bare ``term``) — as
+    ``param_bytes_cost`` does — without value collisions; a private
+    per-call dict works identically.
+    """
+    memo = {} if memo is None else memo
+    k = ("hv", term)
+    hit = memo.get(k)
+    if hit is not None:
+        return hit
+    if isinstance(term, Var):
+        out = True
+    elif isinstance(term, Op):
+        out = any(has_var_leaf(a, memo) for a in term.args)
+    else:
+        out = False
+    memo[k] = out
+    return out
+
+
+def _concrete(shape: Any) -> bool:
+    """True iff *shape* is a non-empty tuple of concrete int dims."""
+    return (
+        isinstance(shape, tuple)
+        and len(shape) > 0
+        and all(isinstance(d, int) for d in shape)
+    )
+
+
+def _stack_dim(attrs: dict) -> int:
+    """The concatenation/stack axis from an op's attrs — the canonical
+    ``dim`` spelling or positional ``arg1``, defaulting to 0 on a
+    non-int value."""
+    d = attr_of(attrs, "dim", "arg1", default=0)
+    return d if isinstance(d, int) else 0
+
+
+# ---------------------------------------------------------------------------
 # Per-op shape rules — the carrier ops' extensible dispatch
 # ---------------------------------------------------------------------------
 #

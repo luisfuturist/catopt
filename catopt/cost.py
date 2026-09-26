@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from catopt.ir import Const, Op, Param, Var
+from catopt.ir import Const, Op, Param
 
 # compat: moved to catopt.typing — the shape/type-inference layer owns
 # itself now; re-exported here so existing `from catopt.cost import
@@ -31,6 +31,7 @@ from catopt.typing import (  # noqa: F401
     _infer_op_shape,
     _numel,
     _shape_of,
+    has_var_leaf,
 )
 
 # ---------------------------------------------------------------------------
@@ -276,6 +277,28 @@ def flops_cost(term: Any, memo: dict | None = None) -> float:
     return 0.0
 
 
+def _memo_dispatch(cost_fn, memo: dict | None = None):
+    """Bind *cost_fn* to a shared content-keyed memo, uniformly.
+
+    Returns a one-argument ``term -> float`` callable conforming to the
+    extraction CostFn convention: cost models that accept a ``memo``
+    kwarg (the built-in models do) get the dict threaded in — a shared
+    memo turns repeated evaluations over a shared-subterm DAG into a
+    linear walk; models without one are called bare.  ``memo=None``
+    creates a fresh dict kept inside the closure.
+
+    This is the single place the ``inspect.signature`` probe lives —
+    ``extract_best``, ``extract_paired`` and :func:`dag_cost` all wrap
+    through here.
+    """
+    import inspect
+
+    m = {} if memo is None else memo
+    if "memo" in inspect.signature(cost_fn).parameters:
+        return lambda t: cost_fn(t, memo=m)
+    return lambda t: cost_fn(t)
+
+
 def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     """True DAG cost of an extracted term: shared subtrees charged once.
 
@@ -298,17 +321,11 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     function's value on the root IS the DAG cost, so the subtractive
     per-node decomposition below is skipped — it would mis-bill them.
     """
-    import inspect
-
-    memo = {} if memo is None else memo
-    takes_memo = "memo" in inspect.signature(cost_fn).parameters
     # getattr(..., "func", ...) unwraps functools.partial bindings.
     bill_params = getattr(
         getattr(cost_fn, "func", cost_fn), "charges_param_only", False
     )
-
-    def c(t: Any) -> float:
-        return cost_fn(t, memo=memo) if takes_memo else cost_fn(t)
+    c = _memo_dispatch(cost_fn, memo)
 
     # Cost models that already index the whole term DAG — by leaf name
     # and by materialised-subtree identity (``param_bytes_cost``) —
@@ -323,7 +340,7 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     seen: set[int] = set()
     total = 0.0
 
-    var_memo: dict[int, bool] = {}
+    var_memo: dict = {}
 
     def has_var(t: Any) -> bool:
         """True if the subtree reads a data input (Var leaf).
@@ -331,18 +348,10 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
         Subtrees over only Param/Const leaves are compile-time work —
         lowering folds them into a materialised parameter — so they are
         charged 0, matching extract_best's param-only discount.
+        Delegates to :func:`catopt.typing.has_var_leaf` (the shared
+        implementation) with this DAG walk's private memo.
         """
-        k = t  # content-keyed
-        if k in var_memo:
-            return var_memo[k]
-        if isinstance(t, Var):
-            out = True
-        elif isinstance(t, Op):
-            out = any(has_var(a) for a in t.args)
-        else:
-            out = False
-        var_memo[k] = out
-        return out
+        return has_var_leaf(t, var_memo)
 
     def rec(t: Any) -> None:
         nonlocal total
@@ -573,21 +582,13 @@ _FOLDABLE_ELEMWISE = frozenset(
 def _has_var_leaf(term: Any, memo: dict) -> bool:
     """True iff the subtree reads a data input (Var leaf).
 
-    Mirrors ``IRModule._uses_input``; content-keyed so the shared-subterm
-    DAG stays a linear walk.
+    Private alias kept for this module's fold walkers; delegates to
+    :func:`catopt.typing.has_var_leaf` — the single implementation —
+    which uses the same ``("hv", term)`` key convention, so the memo
+    this shares with ``_shape_of``/``_folds_to_param`` keeps its exact
+    key/value contents.
     """
-    k = ("hv", term)
-    hit = memo.get(k)
-    if hit is not None:
-        return hit
-    if isinstance(term, Var):
-        out = True
-    elif isinstance(term, Op):
-        out = any(_has_var_leaf(a, memo) for a in term.args)
-    else:
-        out = False
-    memo[k] = out
-    return out
+    return has_var_leaf(term, memo)
 
 
 def _param_resolves(p: Param, source_tensors: dict | None) -> bool:

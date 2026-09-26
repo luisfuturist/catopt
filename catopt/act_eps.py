@@ -149,22 +149,15 @@ _register_extensions()
 def _has_var(t, _memo: dict | None = None) -> bool:
     """True when the term mentions a Var leaf (data-dependent subtree —
     the activation/weight distinction: param-only subtrees fold at
-    compile time and belong to ``eps.quant_params``, not here)."""
-    if _memo is None:
-        _memo = {}
-    # Terms are hash-consed content objects — key the memo on the term
-    # itself (no id()/GC hazards).
-    key = t
-    if key in _memo:
-        return _memo[key]
-    if isinstance(t, Var):
-        out = True
-    elif isinstance(t, Op):
-        out = any(_has_var(a, _memo) for a in t.args)
-    else:
-        out = False
-    _memo[key] = out
-    return out
+    compile time and belong to ``eps.quant_params``, not here).
+
+    Delegates to :func:`catopt.typing.has_var_leaf`, the single
+    implementation; ``_memo`` stays a caller-supplied content-keyed
+    dict (terms are interned content objects — safe keys, no
+    ``id()``/GC hazards)."""
+    from catopt.typing import has_var_leaf
+
+    return has_var_leaf(t, _memo)
 
 
 def _site_absmax(calib, key: str):

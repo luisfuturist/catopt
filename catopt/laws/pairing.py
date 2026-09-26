@@ -42,13 +42,14 @@ from catopt.ir import Op
 
 
 def _term_has_var(t: Any) -> bool:
-    from catopt.ir import Var
+    """True iff the term mentions a ``Var`` leaf (runtime data).
 
-    if isinstance(t, Var):
-        return True
-    if isinstance(t, Op):
-        return any(_term_has_var(a) for a in t.args)
-    return False
+    Kept for the ``catopt.rules`` compat re-export; delegates to the
+    single implementation, :func:`catopt.typing.has_var_leaf`.
+    """
+    from catopt.typing import has_var_leaf
+
+    return has_var_leaf(t)
 
 
 def _pair_shared_input(

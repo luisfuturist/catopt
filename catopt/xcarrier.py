@@ -173,11 +173,11 @@ def _bc(a, b):
 
 
 def _concrete(s) -> bool:
-    return (
-        isinstance(s, tuple)
-        and len(s) > 0
-        and all(isinstance(d, int) for d in s)
-    )
+    """tuple-of-int shape predicate — single source is
+    :func:`catopt.typing._concrete` (shared with the lowerers)."""
+    from catopt.typing import _concrete as _tc
+
+    return _tc(s)
 
 
 def _xshape(t: Any, _memo: dict | None = None):
@@ -1935,8 +1935,11 @@ XC_LAWS: list[Rewrite] = [
 
 
 def _stack_dim(attrs: dict) -> int:
-    d = attrs.get("dim", attrs.get("arg1", 0))
-    return d if isinstance(d, int) else 0
+    """The stack/concat axis from an op's attrs — single source is
+    :func:`catopt.typing._stack_dim` (shared with the lowerers)."""
+    from catopt.typing import _stack_dim as _tsd
+
+    return _tsd(attrs)
 
 
 def _offer_witness(

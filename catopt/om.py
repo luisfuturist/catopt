@@ -66,7 +66,7 @@ from catopt.ir import Const, Op, op_def
 from catopt.rules import R
 
 
-def _shape_of(t: Any):
+def _vshape(t: Any):
     """The *value* shape of a bound term — carrier-aware.
 
     Metavariable bindings resolve through ``EGraph``'s representative
@@ -116,7 +116,7 @@ def _check_om_lift(bound: dict) -> bool:
     other axis is well-typed but a *different* program — the check is
     load-bearing."""
     sd = bound.get("$attr:SD", -1)
-    ss, vs = _shape_of(bound.get("s")), _shape_of(bound.get("v"))
+    ss, vs = _vshape(bound.get("s")), _vshape(bound.get("v"))
     if not (
         isinstance(ss, tuple)
         and isinstance(vs, tuple)
@@ -190,8 +190,8 @@ def _check_om_concat_dims(bound: dict) -> bool:
     and values concat on dim -2 (the same key axis, pre-contraction).
     A cat along any other axis is well-typed but WRONG."""
     sd, vd = bound.get("$attr:SD"), bound.get("$attr:VD")
-    s1, s2 = _shape_of(bound.get("s1")), _shape_of(bound.get("s2"))
-    v1, v2 = _shape_of(bound.get("v1")), _shape_of(bound.get("v2"))
+    s1, s2 = _vshape(bound.get("s1")), _vshape(bound.get("s2"))
+    v1, v2 = _vshape(bound.get("v1")), _vshape(bound.get("v2"))
     if not all(isinstance(x, tuple) for x in (s1, s2, v1, v2)):
         return False
     if not (isinstance(sd, int) and isinstance(vd, int)):
@@ -231,8 +231,8 @@ def _derive_om_concat_dims(bound: dict) -> dict | None:
     """Concat dims for the merged element, computed from bound shapes:
     scores join on their last dim, values on dim -2.  Vetoes (returns
     None) when the two chunks cannot form a well-typed cat."""
-    s1, s2 = _shape_of(bound.get("s1")), _shape_of(bound.get("s2"))
-    v1, v2 = _shape_of(bound.get("v1")), _shape_of(bound.get("v2"))
+    s1, s2 = _vshape(bound.get("s1")), _vshape(bound.get("s2"))
+    v1, v2 = _vshape(bound.get("v1")), _vshape(bound.get("v2"))
     if not all(isinstance(x, tuple) for x in (s1, s2, v1, v2)):
         return None
     if not _chunks_compatible(s1, s2, v1, v2):
@@ -321,8 +321,8 @@ def _check_matmul_t_concat(bound: dict) -> bool:
         bound.get("$attr:T1"),
         bound.get("$attr:T2"),
     )
-    k1, k2 = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
-    q = _shape_of(bound.get("q"))
+    k1, k2 = _vshape(bound.get("k1")), _vshape(bound.get("k2"))
+    q = _vshape(bound.get("q"))
     if not all(isinstance(x, int) for x in (kd, t1, t2)):
         return False
     if not all(isinstance(s, tuple) for s in (k1, k2, q)):
@@ -346,7 +346,7 @@ def _derive_score_concat_dim(bound: dict) -> dict | None:
     """The concat dim through the transpose: after .T the key axis is
     last in k.T and lands on the scores' last dim, at index
     rank(out)-1 = max(rank q, rank k) - 1."""
-    q, k1 = _shape_of(bound.get("q")), _shape_of(bound.get("k1"))
+    q, k1 = _vshape(bound.get("q")), _vshape(bound.get("k1"))
     if not (isinstance(q, tuple) and isinstance(k1, tuple)):
         return None
     return {"$attr:SD": max(len(q), len(k1)) - 1}
@@ -453,7 +453,7 @@ def _cat_axis_plan(
     broadcast result (output rank = max operand rank — a bigger-rank
     mask broadcasts the output up).
     """
-    s1, s2 = _shape_of(bound.get("s1")), _shape_of(bound.get("s2"))
+    s1, s2 = _vshape(bound.get("s1")), _vshape(bound.get("s2"))
     D = bound.get("$attr:D")
     if not (
         isinstance(s1, tuple)
@@ -474,7 +474,7 @@ def _cat_axis_plan(
     shapes: dict[str, tuple] = {}
     out_rank = r
     for key in (sliced_key, *fixed_keys):
-        sh = _shape_of(bound.get(key))
+        sh = _vshape(bound.get(key))
         if not isinstance(sh, tuple):
             return None  # unknown shape: can't prove
         shapes[key] = sh
@@ -650,8 +650,8 @@ def _check_cat_pair(bound: dict) -> int | None:
     pair must be cat-compatible on its own axis, and the per-block
     broadcast results must be cat-compatible on the shared axis.
     Returns the result cat dim, or None to veto."""
-    a1, a2 = _shape_of(bound.get("a1")), _shape_of(bound.get("a2"))
-    b1, b2 = _shape_of(bound.get("b1")), _shape_of(bound.get("b2"))
+    a1, a2 = _vshape(bound.get("a1")), _vshape(bound.get("a2"))
+    b1, b2 = _vshape(bound.get("b1")), _vshape(bound.get("b2"))
     DA, DB = bound.get("$attr:DA"), bound.get("$attr:DB")
     if not all(isinstance(s, tuple) and s for s in (a1, a2, b1, b2)):
         return None
@@ -822,7 +822,7 @@ OM_MASK_LAWS: list[Rewrite] = [
 #      The causal bad-mask of an x-shaped score matrix: on x's last two
 #      dims, out[...,t,j] = (j + off > t) — strict upper triangle
 #      shifted ``off`` keys right, broadcast back to x's full shape.
-#      Rank-preserving so ``_shape_of`` reads it through the default
+#      Rank-preserving so ``typing._shape_of`` reads it through the default
 #      case — which is what lets masked_fill_cat_slice derive split
 #      sizes for n-ary concats.  Semantics follow torch's is_causal:
 #      lower-LEFT triangular, i.e. j ≤ t, so a T_q=1 decode row sees
@@ -959,9 +959,9 @@ def _check_sdpa_cat(bound: dict) -> bool:
     blocks are cat-compatible, q's head dim contracts k's, each key
     block pairs with its value block, batch dims broadcast per block,
     and the sdpa flags are benign (dropout_p == 0, numeric scale)."""
-    qs = _shape_of(bound.get("q"))
-    k1s, k2s = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
-    v1s, v2s = _shape_of(bound.get("v1")), _shape_of(bound.get("v2"))
+    qs = _vshape(bound.get("q"))
+    k1s, k2s = _vshape(bound.get("k1")), _vshape(bound.get("k2"))
+    v1s, v2s = _vshape(bound.get("v1")), _vshape(bound.get("v2"))
     if not all(isinstance(s, tuple) for s in (qs, k1s, k2s, v1s, v2s)):
         return False
     if (
@@ -1020,7 +1020,7 @@ def _derive_sdpa_cat(bound: dict) -> dict | None:
     operand."""
     sc = bound.get("$attr:SC")
     if sc is None:
-        e = _shape_of(bound.get("q"))
+        e = _vshape(bound.get("q"))
         if not (isinstance(e, tuple) and e and isinstance(e[-1], int)):
             return None
         sc = float(e[-1]) ** -0.5
@@ -1114,9 +1114,9 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
     vetoes the rewrite — the split sizes could not be derived."""
     if not _check_sdpa_cat(bound):
         return False
-    ms = _shape_of(bound.get("m"))
-    qs = _shape_of(bound.get("q"))
-    k1s, k2s = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
+    ms = _vshape(bound.get("m"))
+    qs = _vshape(bound.get("q"))
+    k1s, k2s = _vshape(bound.get("k1")), _vshape(bound.get("k2"))
     if not isinstance(ms, tuple):
         return False
     k1, k2 = k1s[-2], k2s[-2]

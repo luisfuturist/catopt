@@ -11,7 +11,7 @@ scaled-softmax attention, output projection):
   when the state resolves to a scalar member), and the value e-class
   holds an ``apply`` reporting the state shape ``(D,)``.  Judging the
   lift on those convention shapes fails ``len(shape) >= 2`` and vetoes
-  a legal rewrite.  ``catopt.om._shape_of`` now resolves the *value*
+  a legal rewrite.  ``catopt.om._vshape`` now resolves the *value*
   shape via ``xcarrier._xshape``, so the check sees the true
   ``(nh,T,K)`` / ``(nh,T,d)`` regardless of which class member is
   picked.
