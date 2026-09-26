@@ -22,6 +22,7 @@ from importlib import import_module as _imp
 
 _ALIAS = {
     "catopt.act_eps": "catopt_eps.act_eps",
+    "catopt.adapters": "catopt_torch.adapters",
     "catopt.attrs": "catopt_core.attrs",
     "catopt.calibrate": "catopt_optimize.calibrate",
     "catopt.cost": "catopt_core.cost",
@@ -92,6 +93,7 @@ del _name
 # dependency of every install.
 from catopt_core.cost import (
     CostModel,
+    backend_cost,
     count_cost,
     flops_cost,
 )
@@ -104,6 +106,7 @@ from catopt_core.ir import (
     TensorType,
     Var,
 )
+from catopt_core.ports import Binding, Sink, Source
 from catopt_core.rules import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
@@ -123,6 +126,8 @@ with _suppress(ModuleNotFoundError):  # partial install only
 with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_optimize.optimize import optimize_model
 with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_torch.adapters import TorchSink, TorchSource
+with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_torch.torch_bridge import (
         IRModule,
         export_to_ir,
@@ -138,6 +143,7 @@ __all__ = [
     "IR",
     "SIMPLIFICATION_RULES",
     "BatchedOmdModule",
+    "Binding",
     "Const",
     "CostModel",
     "EGraph",
@@ -146,9 +152,14 @@ __all__ = [
     "Op",
     "Param",
     "Rewrite",
+    "Sink",
+    "Source",
     "TensorType",
+    "TorchSink",
+    "TorchSource",
     "Var",
     "all_rules",
+    "backend_cost",
     "build_omd_plan",
     "count_cost",
     "export_to_ir",

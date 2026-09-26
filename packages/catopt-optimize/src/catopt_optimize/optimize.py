@@ -27,6 +27,7 @@ from catopt_carriers.xcarrier import (
     omd_tree_lift,
 )
 from catopt_core.cost import (
+    backend_cost,
     dag_cost,
     flops_cost,
     launch_aware_cost,
@@ -34,7 +35,7 @@ from catopt_core.cost import (
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Op, op_repr
 from catopt_core.ops import OpTable
-from catopt_core.ports import CostFn
+from catopt_core.ports import CostFn, OpRegistry, Sink, Source
 from catopt_core.rules import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
@@ -44,13 +45,13 @@ from catopt_core.rules import (
     share_duplicate_param_slices,
     share_duplicate_params,
 )
+from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.report import (
     BlockReport,
     CompositionalReport,
     OptReport,
     verify_module,
 )
-from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 #: Rules whose saturation closure is combinatorially explosive on
 #: stacked blocks: the pure-symmetry monoid laws enumerate every
@@ -211,7 +212,7 @@ def _check_resources(eg, max_enodes, max_memory_mb) -> None:
 
 
 def _eval_const(
-    term: Any, params: dict, ops: OpTable | None = None
+    term: Any, params: dict, ops: OpRegistry | None = None
 ) -> torch.Tensor | None:
     """Evaluate a parameter-only subtree to a concrete tensor.
 
@@ -264,7 +265,7 @@ def _specialize_causal(
     term: Any,
     params: dict,
     memo: dict | None = None,
-    ops: OpTable | None = None,
+    ops: OpRegistry | None = None,
 ) -> Any:
     """sdpa(q,k,v, mask) where mask is parameter-only and evaluates to
     a causal keep-mask → sdpa(q,k,v, is_causal=True).  Dropping the
@@ -301,6 +302,8 @@ def discover_alternatives(
     max_iterations: int = 6,
     cost_fn: CostFn | None = None,
     top_k: int = 8,
+    source: Source | None = None,
+    sink: Sink | None = None,
 ) -> dict:
     """Enumerate the cheapest distinct members of the semantic
     equivalence class [G] — the discovery-engine view.
@@ -311,10 +314,21 @@ def discover_alternatives(
     rule-fire provenance (which generic laws actually fired).  Human
     inspection of this frontier is how level-3 candidates — emergent
     compositions of known laws — are found.
+
+    ``source`` / ``sink`` select the graph source and the (backend-
+    relative) sink, defaulting to :class:`TorchSource` /
+    :class:`TorchSink`; alternatives are priced against
+    ``sink.supported_ops`` so the frontier only ever lists forms the
+    sink can lower.
     """
+    if source is None:
+        source = TorchSource()
+    if sink is None:
+        sink = TorchSink()
     if cost_fn is None:
         cost_fn = launch_aware_cost
-    ir, source_tensors = export_to_ir(model, example_input)
+    cost_fn = backend_cost(cost_fn, sink.supported_ops)
+    ir, source_tensors = source.to_ir(model, example_input)
     eg = EGraph()
     root_eid = eg.add_term(ir.root)
     rules = {
@@ -393,6 +407,8 @@ def optimize_model(
     eps_rtol: float | None = None,
     symmetry_budget: int | None = 2048,
     ops: OpTable | None = None,
+    source: Source | None = None,
+    sink: Sink | None = None,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -449,9 +465,22 @@ def optimize_model(
         construction, bounded by ``rtol`` per offer).
     ops : OpTable, optional
         The op table the optimized term is lowered through (plan 0001
-        phase 2c) — passed to ``ir_to_torch_module`` and used for the
-        causal-mask constant evaluation.  ``None`` (default) resolves
-        to ``OpTable.full()`` — the ambient ``_IR_TO_TORCH`` table.
+        phase 2c) — used to build the default :class:`TorchSink` and
+        for the causal-mask constant evaluation.  ``None`` (default)
+        resolves to ``OpTable.full()`` — the ambient ``_IR_TO_TORCH``
+        table.  Ignored when ``sink`` is given.
+    source : Source, optional
+        The graph-source port (``model -> (IR, leaves)``), defaulting
+        to :class:`TorchSource` (``torch.export``).  Pass a different
+        source to optimize a non-torch frontend — the core search never
+        imports torch itself.
+    sink : Sink, optional
+        The graph-sink port (``IR -> runnable``, plus its op set and
+        equivalence gate), defaulting to ``TorchSink(ops=ops)``.
+        Extraction is priced against ``sink.supported_ops``
+        (:func:`catopt_core.cost.backend_cost`), so the optimizer only
+        commits to forms the sink can lower.  Takes precedence over
+        ``ops``.
     verbose : bool
         Print progress.
 
@@ -471,8 +500,15 @@ def optimize_model(
         per-block fallback (status ``"failed"``,
         ``reason == "resource_limit"``).
     """
+    if source is None:
+        source = TorchSource()
+    if sink is None:
+        sink = TorchSink(ops=ops)
     if cost_fn is None:
         cost_fn = launch_aware_cost
+    # Backend-relative pricing: members using an op the sink cannot
+    # lower price at +inf, so extraction never commits to one.
+    cost_fn = backend_cost(cost_fn, sink.supported_ops)
 
     # Recursive walks (extraction, member resolution) descend the
     # e-class DAG, whose depth grows with the saturation closure —
@@ -485,7 +521,7 @@ def optimize_model(
         print(
             f"[Phase 1] Exporting {model.__class__.__name__} to IR..."
         )
-    ir, source_tensors = export_to_ir(model, example_input)
+    ir, source_tensors = source.to_ir(model, example_input)
     if verbose:
         print(f"  IR root: {op_repr(ir.root)}")
         print(f"  Inputs:  {[str(v) for v in ir.inputs]}")
@@ -630,7 +666,7 @@ def optimize_model(
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
     _cm: dict = {}
     best_term = _specialize_causal(
-        best_term, source_tensors, _cm, ops=ops
+        best_term, source_tensors, _cm, ops=sink.ops
     )
     if _cm.get("_hit"):
         stats["causal_specialized"] = True
@@ -651,14 +687,12 @@ def optimize_model(
         input_names=ir.input_names,
         params=ir.params,
     )
-    optimized_module = ir_to_torch_module(
-        optimized_ir, param_values=source_tensors, ops=ops
-    )
+    optimized_module = sink.lower(optimized_ir, source_tensors)
 
     # Verify semantic equivalence
     if verbose:
         print("[Verify] Checking output equivalence...")
-        vr = verify_module(
+        vr = sink.verify(
             model, optimized_module, example_input, rtol=1e-4
         )
         print(f"  Max abs diff:  {vr.max_abs:.6e}")

@@ -29,6 +29,30 @@ Deep stacks use `optimize_compositional`, which optimizes each block
 against its captured real input and recomposes with per-block
 verification and automatic fallback.
 
+## Pluggable source and sink
+
+The pipeline's two ends are named ports, not hard-wired torch calls.
+A **`Source`** lifts a backend-native model to IR
+(`model → (IR, leaf values)`); a **`Sink`** lowers IR back to a
+runnable and owns the backend's op set and its equivalence gate.
+`optimize_model` and `discover_alternatives` take `source=` / `sink=`,
+defaulting to `TorchSource` / `TorchSink`.
+
+The sink's `supported_ops` bounds the search: extraction prices any
+member that uses an op the backend can't lower at `+inf`
+(`backend_cost`), so the optimizer only commits to forms the sink can
+execute — the backend counterpart of the semantic-language bound
+below. A non-torch backend is a `Sink` implementation and nothing in
+`catopt-core` changes; the torch-free core never imports it.
+
+```python
+from catopt import optimize_model, TorchSource
+
+# my_sink implements catopt.Sink (supported_ops / ops / lower / verify)
+opt, report = optimize_model(model, x, source=TorchSource(),
+                             sink=my_sink)
+```
+
 ## What it finds
 
 The transforms are not handwritten recipes — they fall out of the
@@ -171,8 +195,9 @@ packages/catopt-core/       the torch-free semantic engine (zero deps)
   egraph/                   union-find, matching, saturation, proof
   laws/                     equational laws + non-local pairing passes
   cost, meta, rulecache     cost algebra, rule synthesis, law cache
-  ports, ops                protocol boundaries + OpTable registry
+  ports, ops                Source/Sink + protocol boundaries, OpTable
 packages/catopt-torch/      the PyTorch adapters (deps: core + torch)
+  adapters                  TorchSource / TorchSink (the ports)
   torch_bridge              torch.export → IR → executable module
   executors/                BatchedExecutorBase + level_schedule
   models/, report           small model zoo; OptReport + verify gate
@@ -188,7 +213,7 @@ catopt/                     façade — public API + compat aliases;
                             to its new home via sys.modules
 bench/                      real-checkpoint benchmarks: stories15M/110M,
                             decode sweep, e2e smoke, omd attention stack
-tests/                      1579 tests
+tests/                      1609 tests
 project/                    orphan branch: plans, ADRs, retrospectives
 ```
 

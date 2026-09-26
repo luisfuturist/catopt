@@ -8,7 +8,6 @@ a ``CostFn``.
 """
 
 import torch
-
 from catopt.cost import (
     CostModel,
     count_cost,
@@ -28,6 +27,7 @@ from catopt.omd_lower import to_batched_omd_module
 from catopt.ops import OpTable
 from catopt.ports import (
     BatchedExecutor,
+    Binding,
     CostFn,
     Executor,
     LawSet,
@@ -36,6 +36,8 @@ from catopt.ports import (
     RuleLike,
     RuleProvider,
     ShapeRule,
+    Sink,
+    Source,
     TorchBinding,
     Verifier,
     signature_conforms,
@@ -196,6 +198,34 @@ def test_verifier_wrong_signature_rejected():
     # Call sites always pass rtol/atol by name — strict probe.
     assert not signature_conforms(lambda a, b: None, Verifier, strict=True)
     assert not signature_conforms(object(), Verifier)
+
+
+# ---------------------------------------------------------------------------
+#  Source / Sink — the whole-graph source/sink boundary
+# ---------------------------------------------------------------------------
+
+
+def test_torch_source_is_source():
+    from catopt.adapters import TorchSource
+
+    assert isinstance(TorchSource(), Source)
+    assert not isinstance(object(), Source)
+
+
+def test_torch_sink_is_sink():
+    from catopt.adapters import TorchSink
+
+    sink = TorchSink()
+    assert isinstance(sink, Sink)
+    assert isinstance(sink.supported_ops, frozenset)
+    assert "matmul" in sink.supported_ops
+    assert isinstance(sink.ops, OpRegistry)
+    assert not isinstance(object(), Sink)
+
+
+def test_binding_alias_is_the_same_protocol():
+    assert Binding is TorchBinding
+    assert isinstance(_IR_TO_TORCH["matmul"], Binding)
 
 
 # ---------------------------------------------------------------------------

@@ -31,17 +31,24 @@ The ports (this file)
   :class:`BatchedExecutor` — the lowered-module contract.
 * :class:`Verifier` — the semantic-equivalence gate,
   ``(ref_out, out, rtol, atol) -> VerifyReport``.
-* :class:`TorchBinding` — one op's lowering, ``(*args, **attrs)``.
+* :class:`Source` — the whole-graph source port,
+  ``model -> (IR, leaves)``.
+* :class:`Sink` — the whole-graph sink port, ``IR -> runnable``, plus
+  the backend's supported-op set and module-level equivalence gate.
+* :class:`Binding` — one op's lowering, ``(*args, **attrs)``
+  (``TorchBinding`` is the historical alias of the same protocol).
 * :class:`OpRegistry` — the adapter-registry port.
 
 Outside the hexagon (the adapters)
 ----------------------------------
 The torch-facing implementations: ``torch_bridge._CORE_TORCH_BINDINGS``
 and each carrier module's ``TORCH_BINDINGS`` entries are
-``TorchBinding``s; ``IRModule`` / ``BatchedScanModule`` /
+``Binding``s; ``IRModule`` / ``BatchedScanModule`` /
 ``BatchedOMModule`` / ``StreamingOMModule`` / ``BatchedOmdModule`` are
 ``Executor``s; ``report.verify_equiv`` is the canonical ``Verifier``;
-each ``_SHAPE_RULES`` entry is a ``ShapeRule``.  ``ops.OpTable`` is the
+``catopt_torch.adapters.TorchSource`` / ``TorchSink`` are the canonical
+``Source`` / ``Sink`` pair; each ``_SHAPE_RULES`` entry is a
+``ShapeRule``.  ``ops.OpTable`` is the
 adapter *registry* — it composes the adapters and is already the right
 shape, so ``OpRegistry`` describes its surface rather than re-wrapping
 it.  The ambient ``torch_bridge._IR_TO_TORCH`` dict remains the live
@@ -99,10 +106,11 @@ if TYPE_CHECKING:
     import torch
     from catopt_torch.report import VerifyReport
 
-    from catopt_core.ir import Op
+    from catopt_core.ir import IR, Op
 
 __all__ = [
     "BatchedExecutor",
+    "Binding",
     "CostFn",
     "Executor",
     "LawSet",
@@ -111,6 +119,8 @@ __all__ = [
     "RuleLike",
     "RuleProvider",
     "ShapeRule",
+    "Sink",
+    "Source",
     "TorchBinding",
     "Verifier",
     "signature_conforms",
@@ -123,7 +133,7 @@ __all__ = [
 
 
 @runtime_checkable
-class TorchBinding(Protocol):
+class Binding(Protocol):
     """One op's lowering: ``fn(*operand_values, **attrs) -> Any``.
 
     Adapter port.  Entries of ``torch_bridge._CORE_TORCH_BINDINGS``,
@@ -134,9 +144,19 @@ class TorchBinding(Protocol):
     swallowing lambdas in the core table both satisfy it.  Results may
     be tensors *or* carrier values (``(A, b)`` pairs, ``(m, l, a)``
     triples): the carrier packaging ops return tuples by design.
+
+    The port is backend-neutral — a numpy/JAX lowering table's entries
+    conform too; the name is historical.  ``TorchBinding`` remains as
+    an alias of the same protocol.
     """
 
     def __call__(self, *args: Any, **attrs: Any) -> Any: ...
+
+
+#: Historical alias of :class:`Binding` — the lowering port predates the
+#: backend-neutral spelling.  The same object, kept so ``isinstance``
+#: checks and annotations written against ``TorchBinding`` keep working.
+TorchBinding = Binding
 
 
 @runtime_checkable
@@ -209,7 +229,7 @@ class OpRegistry(Protocol):
     :meth:`register` is the composition surface.
     """
 
-    torch_bindings: dict[str, TorchBinding]
+    torch_bindings: dict[str, Binding]
     shape_rules: dict[str, ShapeRule]
     attr_schemas: dict[str, dict[int, str]]
 
@@ -284,6 +304,78 @@ class Verifier(Protocol):
         self,
         ref_out: torch.Tensor,
         out: torch.Tensor,
+        rtol: float = 1e-4,
+        atol: float | None = None,
+    ) -> VerifyReport: ...
+
+
+# ---------------------------------------------------------------------------
+#  Graph ports — the whole-graph source / sink boundary
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class Source(Protocol):
+    """The graph-source port: a backend-native model -> catopt IR.
+
+    Adapter port.  ``catopt_torch.adapters.TorchSource`` is the canonical
+    implementation (``torch.export`` → ATen → IR).  The return is the
+    IR plus the concrete leaf values (parameters and buffers) keyed by
+    IR param name — the paired :class:`Sink` materialises the lowered
+    module from them, and the non-local passes read them for exact
+    weight identity.  ``model`` / ``example_inputs`` are ``Any``
+    because only the adapter knows the frontend's types.
+    """
+
+    def to_ir(
+        self, model: Any, example_inputs: Any
+    ) -> tuple[IR, dict[str, Any]]: ...
+
+
+@runtime_checkable
+class Sink(Protocol):
+    """The graph-sink port: IR -> runnable, backend-relative.
+
+    Adapter port.  ``catopt_torch.adapters.TorchSink`` is the canonical
+    implementation.  Three responsibilities, all backend-owned:
+
+    * ``supported_ops`` bounds the reachable equivalence class.  It is
+      the set of op names this backend can lower; extraction prices any
+      member that uses an op outside it at ``+inf`` (see
+      :func:`catopt_core.cost.backend_cost`), so the search never
+      commits to a form the sink cannot execute — the backend
+      counterpart of the semantic-language bound.  A sink without
+      ``sdpa`` simply never selects the attention fold.
+    * ``ops`` is the lowering registry (an :class:`OpRegistry`) the
+      compile-time const folds and causal specialization dispatch
+      through.
+    * ``lower`` materialises a runnable :class:`Executor` from an IR and
+      its leaf values; ``verify`` runs a reference and an optimized
+      executable on the same inputs and returns the equivalence report
+      in the backend's own runtime.
+
+    ``verify`` is module-level — ``ref`` / ``opt`` are runnables in the
+    sink's runtime, not tensors; the torch implementation delegates to
+    ``report.verify_module``.  Call sites pass ``rtol`` / ``atol`` by
+    name, matching :class:`Verifier`.
+    """
+
+    @property
+    def supported_ops(self) -> frozenset[str]: ...
+
+    @property
+    def ops(self) -> OpRegistry: ...
+
+    def lower(
+        self, ir: IR, params: dict[str, Any] | None = None
+    ) -> Executor: ...
+
+    def verify(
+        self,
+        ref: Any,
+        opt: Any,
+        inputs: Any,
+        *,
         rtol: float = 1e-4,
         atol: float | None = None,
     ) -> VerifyReport: ...
@@ -427,7 +519,7 @@ def signature_conforms(
 
     Uninspectable callables (C-level functions without signatures)
     pass — presence-level conformance is all that can be proven.  A
-    port whose ``__call__`` is variadic-only (:class:`TorchBinding`)
+    port whose ``__call__`` is variadic-only (:class:`Binding`)
     probes empty: arity is per-op there, so any callable conforms.
     """
     if not callable(fn):

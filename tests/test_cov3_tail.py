@@ -7,7 +7,6 @@ rulecache env, ports signature internals, compositional e2e arms."""
 import pytest
 import torch
 import torch.nn as nn
-
 from catopt.attrs import is_positional_attr
 from catopt.ir import Const, Op, Param, TensorType, Var
 from catopt.optimize import (
@@ -270,13 +269,17 @@ def test_discover_alternatives_fires_pairing_and_lifts():
 
 def test_verbose_verify_warning_arm(monkeypatch):
     """verify reports failure → the ✗ warning arm prints and optimize
-    still returns a module (verify failure is non-fatal)."""
+    still returns a module (verify failure is non-fatal).
+
+    ``optimize_model`` now verifies through the sink, so the torch
+    sink's ``verify_module`` is the patched seam (plan 0004).
+    """
     from catopt.report import VerifyReport
 
     def fake_verify(*a, **kw):
         return VerifyReport(max_abs=0.5, max_rel=0.5, passed=False)
 
-    monkeypatch.setattr("catopt.optimize.verify_module", fake_verify)
+    monkeypatch.setattr("catopt.adapters.verify_module", fake_verify)
     torch.manual_seed(0)
     x = torch.randn(2, 8)
     opt, _s = optimize_model(_MLP(), x, verbose=True, max_iterations=1)

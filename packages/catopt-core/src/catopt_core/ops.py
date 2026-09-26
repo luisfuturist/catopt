@@ -53,7 +53,7 @@ Ports layer
 :class:`catopt_core.ports.OpRegistry` (``torch_bindings`` /
 ``shape_rules`` / ``attr_schemas`` / ``register``); the protocol names
 the surface, nothing is re-wrapped.  Its dicts hold
-:class:`~catopt_core.ports.TorchBinding` and
+:class:`~catopt_core.ports.Binding` and
 :class:`~catopt_core.ports.ShapeRule` values.
 """
 
@@ -63,7 +63,7 @@ import importlib
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
-from catopt_core.ports import ShapeRule, TorchBinding
+from catopt_core.ports import Binding, ShapeRule
 
 __all__ = ["OpTable", "carrier_torch_bindings"]
 
@@ -101,7 +101,7 @@ def _carrier_module_objects() -> list[ModuleType]:
     return mods
 
 
-def carrier_torch_bindings() -> dict[str, TorchBinding]:
+def carrier_torch_bindings() -> dict[str, Binding]:
     """Every carrier module's ``TORCH_BINDINGS`` merged into one dict.
 
     Rebuilt per call — later carriers win on a name collision and a
@@ -109,7 +109,7 @@ def carrier_torch_bindings() -> dict[str, TorchBinding]:
     Importing the carriers here is safe: they export dicts now and
     mutate no shared registry.
     """
-    out: dict[str, TorchBinding] = {}
+    out: dict[str, Binding] = {}
     for mod in _carrier_module_objects():
         out.update(getattr(mod, "TORCH_BINDINGS", None) or {})
     return out
@@ -123,7 +123,7 @@ class OpTable:
 
     Attributes
     ----------
-    torch_bindings : dict[str, TorchBinding]
+    torch_bindings : dict[str, Binding]
         ``op_name -> lowering fn`` — the table ``IRModule._eval``
         dispatches through.  For :meth:`full` this IS the ambient
         ``torch_bridge._IR_TO_TORCH`` dict (shared, live); for
@@ -141,7 +141,7 @@ class OpTable:
     """
 
     def __init__(self) -> None:
-        self.torch_bindings: dict[str, TorchBinding] = {}
+        self.torch_bindings: dict[str, Binding] = {}
         self.shape_rules: dict[str, ShapeRule] = {}
         self.attr_schemas: dict[str, dict[int, str]] = {}
 

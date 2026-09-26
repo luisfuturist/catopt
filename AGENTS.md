@@ -26,6 +26,12 @@ coverage report -m                                              # coverage (fail
 Pre-commit (`pre-commit install`) runs ruff check/format and pyright on
 `packages/**/*.py` + `catopt/`.
 
+Known drift: the installed ruff (0.16.9) flags pre-existing isort /
+format differences across `tests/` and `bench/` that predate any
+current change. `ruff check packages catopt` is the meaningful gate
+(0 errors); repo-wide `ruff check` and `ruff format --check` are not
+clean at `HEAD` under 0.16.9.
+
 ## Typecheck ratchet
 
 - Checker: **pyright** (`[tool.pyright]` in `pyproject.toml`,
@@ -40,6 +46,20 @@ Pre-commit (`pre-commit install`) runs ruff check/format and pyright on
   clean at `standard` strictness.
 - Baseline was green at 0 errors / 2 warnings (`calibrate.py`
   `reportUnusedExpression`); warnings must not regress to errors.
+
+## Ports (hexagonal boundary)
+
+`catopt_core.ports` names every adapter contract as a
+`@runtime_checkable` Protocol.  The whole-graph ends are `Source`
+(`model -> (IR, leaves)`) and `Sink` (`IR -> runnable`, plus its
+`supported_ops` set and the module-level equivalence gate); the per-op
+port is `Binding` (`TorchBinding` is an alias of the same object).
+`optimize_model` / `discover_alternatives` take `source=` / `sink=`
+(defaults: `catopt_torch.adapters.TorchSource` / `TorchSink`).
+Extraction is priced through
+`catopt_core.cost.backend_cost(cost_fn, sink.supported_ops)`, so the
+search only selects forms the backend can lower.  A new backend
+implements `Sink`; nothing in `catopt-core` changes.
 
 ## Conventions
 

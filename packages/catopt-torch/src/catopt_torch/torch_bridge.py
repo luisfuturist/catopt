@@ -169,11 +169,16 @@ def _infer_shape(node_or_value: Any) -> tuple:
 def export_to_ir(
     model: torch.nn.Module,
     example_input: torch.Tensor | tuple,
-) -> IR:
+) -> tuple[IR, dict[str, torch.Tensor]]:
     """Export a PyTorch model to a catopt IR via torch.export.
 
     ``example_input`` may be a single tensor or a tuple of positional
     args for multi-input modules.
+
+    Returns ``(ir, source_tensors)`` — the IR plus the concrete
+    parameter/buffer values keyed by IR param name (e.g. ``p_w1``),
+    used to materialise the lowered module and to compare exact
+    weights in the non-local passes.
 
     Uses exported._graph_signature.inputs_to_parameters to map graph
     placeholder node targets (e.g. 'p_w1') to actual model attribute

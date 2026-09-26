@@ -17,9 +17,13 @@ fewer total floating-point operations.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Collection
+from typing import TYPE_CHECKING, Any
 
 from catopt_core.ir import Const, Op, Param
+
+if TYPE_CHECKING:
+    from catopt_core.ports import CostFn
 
 # compat: moved to catopt_core.typing — the shape/type-inference layer owns
 # itself now; re-exported here so existing `from catopt_core.cost import
@@ -989,3 +993,69 @@ class CostModel:
                 base += self(arg)
             return float(base)
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+#  Backend-relative pricing — the sink's supported-op bound
+# ---------------------------------------------------------------------------
+
+
+def _ops_supported(
+    term: Any, allowed: frozenset[str], cache: dict[Any, bool]
+) -> bool:
+    """True iff every :class:`Op` in ``term``'s DAG names an op in
+    ``allowed``; leaves (``Param`` / ``Const`` / ``Var``) are always
+    supported.  ``cache`` memoizes the content-keyed verdict, so a
+    shared-subterm DAG costs one linear walk across every extraction
+    probe rather than one walk per probe."""
+    hit = cache.get(term)
+    if hit is not None:
+        return hit
+    ok = not isinstance(term, Op) or (
+        term.op in allowed
+        and all(_ops_supported(a, allowed, cache) for a in term.args)
+    )
+    cache[term] = ok
+    return ok
+
+
+def backend_cost(
+    cost_fn: CostFn, supported_ops: Collection[str]
+) -> CostFn:
+    """Wrap ``cost_fn`` so members outside a backend's op set price at
+    ``+inf`` — extraction is *backend-relative*.
+
+    ``supported_ops`` is the op-name set a
+    :class:`~catopt_core.ports.Sink` can lower (its ``supported_ops``).
+    Any term using an op outside the set can never win extraction, so
+    the optimizer commits only to forms the sink can execute: the
+    reachable equivalence class is bounded by the backend's semantic
+    language rather than discovered and then rejected at lowering.
+    Leaves are always supported.
+
+    The wrapper preserves the wrapped model's ``charges_param_only`` /
+    ``dag_exact`` / ``profile`` markers, so :func:`dag_cost` and
+    extraction bill a ``param_bytes_cost``-based model exactly as
+    before.  It always declares ``memo`` (so the extraction memo is
+    threaded in) but forwards it only to a ``cost_fn`` that accepts it,
+    matching :func:`_memo_dispatch`'s adaptive call.
+    """
+    import inspect
+
+    allowed = frozenset(supported_ops)
+    cache: dict[Any, bool] = {}
+    try:
+        accepts_memo = "memo" in inspect.signature(cost_fn).parameters
+    except (TypeError, ValueError):  # uninspectable callable
+        accepts_memo = False
+
+    def priced(term: Any, memo: dict | None = None) -> float:
+        if not _ops_supported(term, allowed, cache):
+            return float("inf")
+        return cost_fn(term, memo) if accepts_memo else cost_fn(term)
+
+    priced.__name__ = getattr(cost_fn, "__name__", "backend_cost")
+    for marker in ("charges_param_only", "dag_exact", "profile"):
+        if hasattr(cost_fn, marker):
+            setattr(priced, marker, getattr(cost_fn, marker))
+    return priced
