@@ -1,8 +1,8 @@
 """Memo-safety regression tests for the hash-consing cleanup.
 
 Since phase 2a terms are interned, hashable content objects: the memo
-tables that used to key on ``id(t)`` (act_eps's ``_has_var`` /
-calibrate-eval, meta's ``canonicalize``, the om/omd shape checks and
+tables that used to key on ``id(t)`` (``has_var_leaf``, meta's
+``canonicalize``, the om/omd shape checks and
 plan builders) now key on the term itself.  These tests mint pairs of
 structurally identical but OBJECT-distinct terms — direct
 ``Op(...)``/``Var(...)`` construction bypasses ``Op.make``'s intern
@@ -15,11 +15,11 @@ results either way.
 
 import torch
 
-from catopt.act_eps import _has_var, calibrate
-from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
+from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt.meta import canonicalize, match_pattern
 from catopt.om_lower import _is_om_tree, build_om_plan
 from catopt.omd_lower import _is_omd_tree, build_omd_plan
+from catopt.typing import has_var_leaf
 
 
 def _T(*shape):
@@ -67,11 +67,11 @@ def test_has_var_shared_memo_content_keyed():
     t1 = Op("add", (_mm(), Const(0.0)), {})
     t2 = _fresh(t1)
     memo: dict = {}
-    assert _has_var(t1, memo) is True
+    assert has_var_leaf(t1, memo) is True
     n = len(memo)
     # Second call over the twin: content-keyed hits, id-keyed would
     # append a whole second set of entries for the twin objects.
-    assert _has_var(t2, memo) is True
+    assert has_var_leaf(t2, memo) is True
     assert len(memo) == n
 
 
@@ -152,10 +152,11 @@ def test_build_omd_plan_dedups_equal_distinct_leaves():
     assert plan["omd_root"] == 1  # slot 0 = leaf, slot 1 = compose
 
 
-def test_calibrate_ir_eval_consistent_across_mints():
-    # The calibrate eval memo is shared with the term-DAG walk: twin
-    # subtrees must produce the same site table as a truly shared
-    # (interned) subtree.
+def test_eval_term_memo_dedups_twin_subtrees():
+    # ``eval_term``'s memo is content-keyed: a twin subtree evaluates
+    # through the same memo entry as a truly shared (interned) subtree.
+    from catopt.torch_bridge import eval_term
+
     x = Var("x", _T(2, 3))
     w = Param("w", _T(3, 4))
     mm = Op.make("matmul", x, w)
@@ -164,11 +165,27 @@ def test_calibrate_ir_eval_consistent_across_mints():
 
     xv = torch.randn(2, 3)
     wv = torch.randn(3, 4)
-    r_twins = calibrate(
-        IR(root=root_twins, inputs=[x]), (xv,), {"w": wv}
+    env = {"x": xv}
+    penv = {"w": wv}
+    bindings = {"matmul": torch.matmul, "add": torch.add}
+    memo: dict = {}
+    r_twins = eval_term(
+        root_twins,
+        var_env=env,
+        param_env=penv,
+        bindings=bindings,
+        memo=memo,
+        strict=True,
     )
-    r_shared = calibrate(
-        IR(root=root_shared, inputs=[x]), (xv,), {"w": wv}
+    memo_shared: dict = {}
+    r_shared = eval_term(
+        root_shared,
+        var_env=env,
+        param_env=penv,
+        bindings=bindings,
+        memo=memo_shared,
+        strict=True,
     )
-    assert r_twins["per_site"] == r_shared["per_site"]
-    assert r_twins["global"] == r_shared["global"]
+    assert torch.equal(r_twins, r_shared)
+    # the twin tree populates no more entries than the shared one
+    assert len(memo) == len(memo_shared)

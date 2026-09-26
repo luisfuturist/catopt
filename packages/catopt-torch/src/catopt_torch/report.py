@@ -147,8 +147,8 @@ class OptReport:
     Field names equal the dict keys.  Saturation keys are always
     populated on a real stats dict; the path-dependent extras
     (``pairing_groups`` only when the pairing pass found groups,
-    ``nonlocal_lifts`` only when a lift fired, ``eps_offers`` only with
-    ``eps_rtol``, ``paired_extract``/``causal_specialized`` only when
+    ``nonlocal_lifts`` only when a lift fired,
+    ``paired_extract``/``causal_specialized`` only when
     the corresponding specialization won) stay ``None`` when absent —
     and ``to_dict`` omits them, so
     ``OptReport.from_stats(stats).to_dict() == stats`` exactly.
@@ -168,7 +168,6 @@ class OptReport:
     rule_fires: dict[str, int] | None = None
     pairing_groups: int | None = None
     nonlocal_lifts: int | None = None
-    eps_offers: list | None = None
     paired_extract: bool | None = None
     causal_specialized: bool | None = None
     # -- unmodelled keys, re-emitted verbatim -------------------------

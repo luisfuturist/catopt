@@ -12,7 +12,6 @@ dependencies = [
     "catopt-core",
     "catopt-torch",
     "catopt-carriers",
-    "catopt-eps",
     "catopt-optimize",
     "torch>=2.0",
     "numpy>=1.24",
@@ -74,7 +73,6 @@ members = ["packages/*"]
 catopt-core = { workspace = true }
 catopt-torch = { workspace = true }
 catopt-carriers = { workspace = true }
-catopt-eps = { workspace = true }
 catopt-optimize = { workspace = true }
 
 [tool.pytest.ini_options]
@@ -104,7 +102,6 @@ root_packages = [
     "catopt_core",
     "catopt_torch",
     "catopt_carriers",
-    "catopt_eps",
     "catopt_optimize",
     "catopt",
 ]
@@ -119,7 +116,6 @@ source_modules = ["catopt_core"]
 forbidden_modules = [
     "catopt_torch",
     "catopt_carriers",
-    "catopt_eps",
     "catopt_optimize",
 ]
 
@@ -154,7 +150,6 @@ extraPaths = [
     "packages/catopt-core/src",
     "packages/catopt-torch/src",
     "packages/catopt-carriers/src",
-    "packages/catopt-eps/src",
     "packages/catopt-optimize/src",
 ]
 exclude = [
@@ -167,8 +162,6 @@ exclude = [
     "packages/catopt-carriers/src/catopt_carriers/scan_lower.py",      #  11 — Optional subscripts; None in Tensor dicts
     "packages/catopt-core/src/catopt_core/cost.py",            #  10 — FunctionType attr assignment; object→float
     "packages/catopt-carriers/src/catopt_carriers/omd_lower.py",       #   9 — Optional subscripts; None in Tensor dicts
-    "packages/catopt-eps/src/catopt_eps/eps.py",             #   8 — possibly-unbound vars; Optional args
-    "packages/catopt-eps/src/catopt_eps/ibp.py",             #   7 — Optional member access on Box intervals
     "packages/catopt-core/src/catopt_core/laws/tensor.py",     #   7 — Op passed where str expected
     "packages/catopt-torch/src/catopt_torch/torch_bridge.py",    #   7 — Optional attrs; torch Module return types
     "packages/catopt-optimize/src/catopt_optimize/optimize.py",        #   6 — "IR not iterable"; arg-type mismatches
@@ -187,7 +180,7 @@ pythonVersion = "3.13"
 reportMissingImports = "error"
 
 [tool.coverage.run]
-source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_eps", "catopt_optimize", "catopt"]
+source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_optimize", "catopt"]
 branch = true
 omit = ["*/tests/*"]
 

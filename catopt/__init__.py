@@ -6,8 +6,8 @@ The engine is split across distributions — ``catopt-core`` (the
 torch-free semantic engine: IR, attrs, typing, egraph, laws, cost,
 meta, rulecache, ports, ops), ``catopt-torch`` (the PyTorch adapter:
 bridge, executors, models, reports), ``catopt-carriers`` (om/xcarrier/
-trace lifts + lowerers), ``catopt-eps`` (the opt-in approximation
-toolkit), ``catopt-optimize`` (the pipeline orchestrators).
+trace lifts + lowerers), ``catopt-optimize`` (the pipeline
+orchestrators).
 
 ``sys.modules`` aliases below keep every still-used historical
 ``catopt.X`` path resolving to its new home — ``from catopt.cost import
@@ -21,16 +21,13 @@ from contextlib import suppress as _suppress
 from importlib import import_module as _imp
 
 _ALIAS = {
-    "catopt.act_eps": "catopt_eps.act_eps",
     "catopt.adapters": "catopt_torch.adapters",
     "catopt.attrs": "catopt_core.attrs",
     "catopt.calibrate": "catopt_optimize.calibrate",
     "catopt.cost": "catopt_core.cost",
     "catopt.egraph": "catopt_core.egraph",
     "catopt.egraph.terms": "catopt_core.egraph.terms",
-    "catopt.eps": "catopt_eps.eps",
     "catopt.executors": "catopt_torch.executors",
-    "catopt.ibp": "catopt_eps.ibp",
     "catopt.ir": "catopt_core.ir",
     "catopt.laws": "catopt_core.laws",
     "catopt.laws.base": "catopt_core.laws.base",

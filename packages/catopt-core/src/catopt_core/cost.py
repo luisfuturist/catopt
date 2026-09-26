@@ -7,7 +7,7 @@ Models provided include:
 * count_cost - counts the number of operations (simplest).
 * flops_cost - estimates FLOPs using shape information.
 * param_bytes_cost - counts stored parameter values (the storage
-  axis; what lets extraction prefer certified compressed members).
+  axis; what lets extraction prefer weight-sharing members).
 
 For the "killer experiment", the FLOPs-based model matters: it rewards
 the associativity / distributivity / naturality rewrites that produce
@@ -444,7 +444,7 @@ def count_cost(term: Any, memo: dict | None = None) -> float:
 
 
 # ---------------------------------------------------------------------------
-#  Parameter-storage cost model — the ε axis's pricing side
+#  Parameter-storage cost model — the memory axis's pricing side
 # ---------------------------------------------------------------------------
 
 
@@ -456,13 +456,12 @@ def param_bytes_cost(
 ) -> float:
     """Cost = stored parameter values — what the LOWERED module keeps.
 
-    The storage axis the flop-based models cannot see: a low-rank
-    factorisation or a shared (tied) weight computes the same function
-    from fewer stored scalars.  The unit is *values* (bytes at unit
-    width — multiply by dtype size for true bytes); ``eps_*`` factor
-    params introduced by :func:`catopt_eps.eps.low_rank_params` count
-    normally, which is what lets extraction prefer the certified
-    compressed member.
+    The storage axis the flop-based models cannot see: a shared
+    (tied) weight or a deduplicated head-stack computes the same
+    function from fewer stored scalars.  The unit is *values* (bytes
+    at unit width — multiply by dtype size for true bytes); derived
+    params registered by the sharing passes count normally, which is
+    what lets extraction prefer the storage-cheaper member.
 
     Pricing mirrors ``IRModule._fold_weight_chains`` /
     ``_build_params`` (catopt_torch.torch_bridge), not the term's leaf list:
@@ -482,7 +481,7 @@ def param_bytes_cost(
 
     A Param's numel comes from ``source_tensors[name]`` when the name
     resolves there — the actual tensor, authoritative for derived
-    ``eps_*`` params — else from its ``TensorType`` (unknown dims
+    params — else from its ``TensorType`` (unknown dims
     count 1, matching ``_numel``'s best-effort convention).
 
     Follows the standard ``(term, memo=None)`` cost-fn convention;
@@ -536,7 +535,7 @@ def _param_numel(
     """Stored scalar count for one Param leaf.
 
     ``source_tensors`` (name -> tensor, e.g. from ``export_to_ir`` plus
-    any ``eps_*`` factors a pass injected) is authoritative when the
+    any derived params a pass injected) is authoritative when the
     name resolves there; else the declared ``TensorType``.  With
     ``by_bytes`` the count is weighted by the stored dtype's width
     (``numel * element_size``) — the axis under which int8 quantization
@@ -599,7 +598,7 @@ def _param_resolves(p: Param, source_tensors: dict | None) -> bool:
     """Would ``p.name`` land in ``_param_values`` at lowering?
 
     ``optimize_model`` hands the whole ``source_tensors`` dict to the
-    lowerer as ``param_values`` (sharing/eps passes register their
+    lowerer as ``param_values`` (the sharing passes register their
     derived names into it), so an unbound ``source_tensors`` —
     ``param_bytes_cost_for()`` — assumes every leaf resolves.  With a
     bound dict the check is exact: a leaf absent from it cannot fold

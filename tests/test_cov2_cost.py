@@ -1,7 +1,7 @@
 """Coverage-gap tests for catopt.cost.
 
 ``tests/test_cost.py`` covers the flagship semantics — broadcasting,
-weight dedup, the eps storage axis, the e-graph end-to-end.  This file
+weight dedup, the storage cost axis, the e-graph end-to-end.  This file
 drives the per-op ``_flops_of`` arms and the structural edges those
 never reach:
 

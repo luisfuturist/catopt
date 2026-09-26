@@ -23,6 +23,8 @@ branches in the split modules:
   enumeration caps, ``rebuild`` provenance of untracked nodes,
   ``_any_term_cached`` RecursionError fallback, ``apply_rule``
   bound-None/derive-veto skips, ``_candidate_classes`` leaf LHS,
+  ``_offer_witness``/``_pointwise_witness`` rhs fallbacks (term-only
+  offer interns the term; eid-only offer resolves it via ``any_term``),
   ``run`` bounded-saturation bookkeeping.
 
 Cyclic e-classes are built by unioning a class into its own child's
@@ -1697,3 +1699,46 @@ def test_verify_cert_final_dst_mismatch():
     )
     with pytest.raises(CertificateVerificationError, match="claims"):
         verify_certificate(x, cert)
+
+
+# ---------------------------------------------------------------------------
+#  _offer_witness rhs fallbacks — non-local passes may hand over only the
+#  term (intern it) or only the eid (resolve its term via any_term)
+# ---------------------------------------------------------------------------
+
+
+def test_offer_witness_term_only_interns_rhs():
+    """``_offer_witness(cid, rhs_term=...)`` with no ``rhs_eid`` interns
+    the offered term itself — the fallback for a pass whose member is
+    not in the graph yet."""
+    eg = EGraph()
+    x = eg.add_term(_v("x"))
+    offered = Op.make("f", _v("x"))
+    merged = eg._offer_witness(
+        x,
+        rhs_term=offered,
+        provenance="test_pass",
+        law="test law",
+        note="term-only offer",
+    )
+    assert merged
+    # the offered member was interned and merged into x's class
+    assert eg.find(eg.add_term(offered)) == eg.find(x)
+
+
+def test_offer_witness_eid_only_resolves_rhs_term():
+    """``_offer_witness(cid, rhs_eid=...)`` with no ``rhs_term`` resolves
+    the witness RHS through ``any_term`` — the fallback for passes that
+    offer an already-interned class member."""
+    eg = EGraph()
+    x = eg.add_term(_v("x"))
+    fx = eg.add_term(Op.make("f", _v("x")))
+    merged = eg._offer_witness(
+        x,
+        fx,
+        provenance="test_pass",
+        law="test law",
+        note="eid-only offer",
+    )
+    assert merged
+    assert eg.find(fx) == eg.find(x)

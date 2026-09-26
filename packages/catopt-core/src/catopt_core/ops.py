@@ -3,7 +3,7 @@
 Before this phase the torch-lowering table lived as module-global
 mutable state: ``catopt_torch.torch_bridge._IR_TO_TORCH`` was seeded with the
 core bindings and every carrier module (``catopt_carriers.trace``,
-``catopt_carriers.xcarrier``, ``catopt_carriers.om``, ``catopt_eps.act_eps``) mutated it at
+``catopt_carriers.xcarrier``, ``catopt_carriers.om``) mutated it at
 import time.  Whether a term could be lowered therefore depended on
 WHICH modules had happened to be imported — an invisible dependency.
 
@@ -51,7 +51,6 @@ Carrier modules that opt in (and the ops they contribute):
   ``om_elem_affd`` ``om_elem_aff`` ``omd`` ``omd_elem`` ``omd_compose``
   ``omd_apply`` ``omd_applym``
 * :mod:`catopt_carriers.om` — ``cmask`` ``fill`` ``attnbias``
-* :mod:`catopt_eps.act_eps` — ``aquant`` ``adequant``
 
 That set is the built-in ``_CARRIER_MODULES`` tuple, in registration
 order.  A NEW carrier package does not edit core: it calls
@@ -155,7 +154,6 @@ _CARRIER_MODULES: tuple[str, ...] = (
     "catopt_carriers.trace",
     "catopt_carriers.xcarrier",
     "catopt_carriers.om",
-    "catopt_eps.act_eps",
 )
 
 #: Carrier modules registered at runtime via :func:`register_carrier`,
@@ -187,8 +185,8 @@ def _carrier_module_objects() -> list[ModuleType]:
 
     A carrier's terms cannot exist without its package, so a missing
     carrier module (partial install — e.g. catopt-core + catopt-torch
-    alone, no ``catopt-carriers``/``catopt-eps``) contributes nothing
-    and is skipped silently.  The ``ModuleNotFoundError`` is narrowed
+    alone, no ``catopt-carriers``) contributes nothing and is skipped
+    silently.  The ``ModuleNotFoundError`` is narrowed
     to the carrier module itself or one of its parent packages: an
     import error raised INSIDE an installed carrier (a missing
     dependency, ``e.name`` differing) still propagates.
@@ -254,7 +252,7 @@ class OpTable:
     def core(cls) -> OpTable:
         """The base table: every registered core binding table + shape
         rules + attr schema.  No carrier ops — ``trace``/``omd_*``/
-        ``cmask``/``aquant`` are absent until a carrier module is
+        ``cmask`` are absent until a carrier module is
         :meth:`register`\\ ed.
 
         With a backend adapter imported (``catopt_torch.torch_bridge``

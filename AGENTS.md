@@ -4,8 +4,8 @@ Categorical optimization of neural-network computation graphs
 (Python 3.13, torch + numpy). Monorepo layout: the domain packages
 live under `packages/` (`catopt-core` — the torch-free engine;
 `catopt-torch` — PyTorch adapters; `catopt-carriers` — carrier
-laws/executors; `catopt-eps` — opt-in approximation toolkit;
-`catopt-optimize` — pipeline orchestrators); `catopt/` is the façade
+laws/executors; `catopt-optimize` — pipeline orchestrators);
+`catopt/` is the façade
 + compat aliases (every historical `catopt.X` import path resolves to
 its new home via `sys.modules` aliases). Tests in
 `tests/`. The dev virtualenv is `.venv/` (uv-managed).
@@ -21,7 +21,7 @@ uv run pytest                 # full test suite (pytest-xdist enabled)
 .venv/bin/ruff format --check # formatting
 .venv/bin/vulture             # dead code (uses [tool.vulture] paths)
 .venv/bin/lint-imports        # hexagonal boundary contracts
-coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_eps,catopt_optimize,catopt -m pytest tests/ -q
+coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_optimize,catopt -m pytest tests/ -q
 coverage report -m                                              # coverage (fail_under=100)
 ```
 
@@ -61,7 +61,7 @@ configured in `pyproject.toml`):
   configured `paths`); a non-zero exit (3) means dead code.
 - **import-linter** (`[tool.importlinter]`) pins the hexagonal boundary:
   a `forbidden` contract makes `catopt_core` importing `catopt_torch` /
-  `catopt_carriers` / `catopt_eps` / `catopt_optimize` — or the `torch`
+  `catopt_carriers` / `catopt_optimize` — or the `torch`
   / `numpy` external packages — a hard error.  Run
   `.venv/bin/lint-imports`.  Core is a *sink* for adapter-pushed state
   (see `catopt_core.ops` *Backend wiring*), never a puller: the adapter

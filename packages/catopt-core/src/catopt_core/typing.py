@@ -516,8 +516,7 @@ def has_var_leaf(term: Any, memo: dict | None = None) -> bool:
     activation/weight distinction used by the cost model's DAG
     accounting and parameter-fold pricing (``cost.dag_cost`` /
     ``cost._folds_to_param``), the torch bridge's weight-chain
-    folding, the pairing pass, and activation-eps site
-    classification.
+    folding, and the pairing pass.
 
     ``memo`` is a content-keyed dict threaded across a traversal so
     shared-subterm DAGs stay a linear walk (terms are interned

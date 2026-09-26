@@ -64,7 +64,7 @@ def test_full_skips_uninstalled_carrier(monkeypatch):
         monkeypatch.delitem(_IR_TO_TORCH, op, raising=False)
         assert op not in t.torch_bindings
     # every installed carrier still registers
-    for op in ("trace", "omd_apply", "aquant"):
+    for op in ("trace", "omd_apply", "affd_a"):
         assert op in t.torch_bindings, op
 
 

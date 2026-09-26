@@ -70,19 +70,9 @@ def test_optreport_path_dependent_keys():
     m = _small_mlp()
     _opt, stats = optimize_model(m, x, verbose=False, max_iterations=3)
     rep = OptReport.from_stats(stats)
-    assert rep.eps_offers is None
     assert rep.paired_extract is None
     assert rep.causal_specialized is None
-    assert "eps_offers" not in rep.to_dict()
     assert "paired_extract" not in rep.to_dict()
-
-    # eps_rtol opt-in records eps_offers; round-trip still exact
-    _opt, stats = optimize_model(
-        m, x, eps_rtol=0.9, verbose=False, max_iterations=3
-    )
-    rep = OptReport.from_stats(stats)
-    assert rep.eps_offers == stats["eps_offers"]
-    assert rep.to_dict() == stats
 
     # the pairing pass sets pairing_groups / paired_extract
     pm = ParallelLinear(16, n_experts=2).eval().double()

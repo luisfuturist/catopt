@@ -418,8 +418,8 @@ def _expand_torch(t: Any, *a: Any, **kw: Any) -> Any:
 
 
 #: Core torch lowering bindings — the base ``OpTable``'s table (plan
-#: 0001 phase 2c).  Carrier ops (``trace``/``omd_*``/``cmask``/
-#: ``aquant``...) are deliberately ABSENT: they live in each carrier
+#: 0001 phase 2c).  Carrier ops (``trace``/``omd_*``/``cmask``...)
+#: are deliberately ABSENT: they live in each carrier
 #: module's ``TORCH_BINDINGS`` export and compose via
 #: :class:`catopt_core.ops.OpTable`, not by mutating this dict at import.
 #: ``_IR_TO_TORCH`` below is the ambient view over this table.
@@ -543,8 +543,7 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         int(attr_of(kw, "dim", default=0)),
         int(attr_of(kw, "index", default=0)),
     ),
-    # embedding(W, idx) — row gather; factorised form gathers the small
-    # factor then projects (eps.low_rank_gather).
+    # embedding(W, idx) — row gather.
     "embedding": lambda w, idx, *a, **kw: torch.nn.functional.embedding(
         idx, w
     ),
@@ -794,8 +793,8 @@ def eval_term(
 
     Single source for the eval-term family (plan 0002 phase D) —
     :meth:`IRModule._eval` (strict runtime eval), the permissive
-    compile-time folds ``optimize._eval_const`` /
-    ``ibp._eval_concrete``, and ``_fold_weight_chains``' shallow fold
+    compile-time fold ``optimize._eval_const``, and
+    ``_fold_weight_chains``' shallow fold
     all delegate here.  Leaf semantics:
 
     * ``Var``   → ``var_env[name]``; on a miss, ``var_default`` when
@@ -1081,8 +1080,8 @@ class IRModule(torch.nn.Module):
         for name, shape in param_shapes.items():
             if name in self._param_values:
                 # Use the original model's parameter value.  Integer
-                # tensors (quantized params offered by eps passes) are
-                # registered without grad — Parameters require float.
+                # tensors are registered without grad — Parameters
+                # require a floating/complex dtype.
                 v = self._param_values[name].clone()
                 p = torch.nn.Parameter(
                     v,

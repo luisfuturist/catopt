@@ -1,4 +1,3 @@
-# ruff: noqa: RUF002
 """Top-level optimization pipeline.
 
 This module implements the four-phase killer experiment:
@@ -404,7 +403,6 @@ def optimize_model(
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
     cost_fn: CostFn | None = None,
-    eps_rtol: float | None = None,
     symmetry_budget: int | None = 2048,
     ops: OpTable | None = None,
     source: Source | None = None,
@@ -450,19 +448,6 @@ def optimize_model(
         saturation.  The bound can only *miss* optimizations, never
         introduce wrong ones — every recorded merge is still a real
         equality.
-    eps_rtol : float, optional
-        Optional certified-approximation toolkit — off by default and
-        not part of the core optimizer.  When set, also run the
-        certified-approximation passes
-        (``eps.low_rank_params`` + ``eps.kron_linear_params``): each
-        offer carries an exact Eckart–Young / Frobenius bound and is
-        recorded in ``stats["eps_offers"]``.  Setting ``eps_rtol`` is
-        the opt-in: approximate members then compete in extraction
-        like any other — they win wherever the chosen cost model
-        prefers them (most often under ``param_bytes_cost``, but a
-        cheaper approximate member can win under the default
-        launch-aware cost too — the result is approximate by
-        construction, bounded by ``rtol`` per offer).
     ops : OpTable, optional
         The op table the optimized term is lowered through (plan 0001
         phase 2c) — used to build the default :class:`TorchSink` and
@@ -611,27 +596,6 @@ def optimize_model(
         + share_duplicate_params(eg, source_tensors)
         + share_duplicate_param_slices(eg, source_tensors)
     )
-    if eps_rtol is not None:
-        try:
-            from catopt_eps.eps import (
-                kron_linear_params,
-                low_rank_gather,
-                low_rank_params,
-            )
-        except ModuleNotFoundError as e:  # pragma: no cover — fires
-            # only when catopt-eps isn't installed (partial install).
-            raise ModuleNotFoundError(
-                "eps_rtol requires the catopt-eps package "
-                "(pip install catopt-eps, or catopt-optimize[eps])"
-            ) from e
-
-        eps_offers = (
-            low_rank_params(eg, source_tensors, rtol=eps_rtol)
-            + low_rank_gather(eg, source_tensors, rtol=eps_rtol)
-            + kron_linear_params(eg, source_tensors, rtol=eps_rtol)
-        )
-        lifts += eps_offers
-        stats["eps_offers"] = eps_offers
     if lifts:
         eg.rebuild()
         _check_resources(eg, max_enodes, max_memory_mb)

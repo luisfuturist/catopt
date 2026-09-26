@@ -50,9 +50,6 @@ CARRIER_OPS = (
     "cmask",
     "fill",
     "attnbias",
-    # catopt.act_eps
-    "aquant",
-    "adequant",
 )
 
 #: Base ops — the ``_CORE_TORCH_BINDINGS`` literal, including the

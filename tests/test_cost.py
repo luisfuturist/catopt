@@ -160,11 +160,11 @@ def test_param_bytes_source_tensors():
 
 
 def test_param_bytes_factorised_cheaper():
-    """The eps axis: chained low-rank factors beat the dense weight."""
+    """Chained narrow factors store fewer values than the dense weight."""
     x = Var("x", TensorType((4, 64)))
     W = Param("W", TensorType((64, 64)))
-    V = Param("eps_v_W_0", TensorType((8, 64)))
-    U = Param("eps_u_W_0", TensorType((64, 8)))
+    V = Param("V", TensorType((8, 64)))
+    U = Param("U", TensorType((64, 8)))
     dense = Op.make("linear", x, W)
     chained = Op.make("linear", Op.make("linear", x, V), U)
     assert param_bytes_cost(chained) == 8 * 64 + 64 * 8

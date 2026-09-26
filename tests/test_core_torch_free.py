@@ -2,7 +2,7 @@
 
 ``catopt-core`` is the declared zero-dependency engine: it must import
 neither ``torch``/``numpy`` nor any sibling domain package
-(``catopt_torch``/``catopt_carriers``/``catopt_eps``/``catopt_optimize``)
+(``catopt_torch``/``catopt_carriers``/``catopt_optimize``)
 on ANY code path.  Two complementary proofs:
 
 * **static** — an AST walk over every ``.py`` under
@@ -46,7 +46,6 @@ _FORBIDDEN = frozenset(
         "numpy",
         "catopt_torch",
         "catopt_carriers",
-        "catopt_eps",
         "catopt_optimize",
     }
 )

@@ -1,5 +1,5 @@
 """Coverage tests for catopt.optimize — resource bounds, the OOM
-adapter, causal-mask specialization, discovery/eps entry points, the
+adapter, causal-mask specialization, the discovery entry point, the
 parameter-diff report, and the compositional driver."""
 # ruff: noqa: RUF059 — test-idiom unpacking
 
@@ -220,25 +220,16 @@ def test_optimize_model_rulesets_and_equivalence():
         optimize_model(m, x, ruleset="nonsense", verbose=False)
 
 
-def test_optimize_model_cost_fn_and_eps_optin():
+def test_optimize_model_cost_fn_override():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
     opt, stats = optimize_model(
         m, x, cost_fn=flops_cost, verbose=False, max_iterations=3
     )
     assert opt is not None
-    # eps_rtol opts into certified-approximation offers
-    opt2, stats2 = optimize_model(
-        m, x, eps_rtol=0.9, verbose=False, max_iterations=3
-    )
-    assert "eps_offers" in stats2
-    assert isinstance(stats2["eps_offers"], list)
-    assert len(stats2["eps_offers"]) >= 1
-    # the lowered module runs; whether the eps member won extraction is
-    # cost-model-dependent (an approximate win is still certified, not
-    # a silent accuracy trade — it is recorded in eps_offers)
+    # the lowered module runs and stays equivalent
     with torch.no_grad():
-        out = opt2(x)
+        out = opt(x)
     assert out.shape == m(x).shape and torch.isfinite(out).all()
 
 

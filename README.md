@@ -168,9 +168,9 @@ target — the same equivalence space, selected per backend.
 - **Compute, not weights** — weights are compile-time constants folded
   into the graph (weight folding is constant folding, not
   reparameterization). The weight-space axis (INR/Kronecker/monarch
-  weight programs) was falsified and archived in `project/retros/`.
-  `catopt-eps` (opt-in) is certified *activation* approximation — the
-  only ε>0 axis.
+  weight programs) was falsified and archived in `project/retros/`;
+  the ε approximation toolkit (`catopt-eps`) moved off main to the
+  `weight-eps` branch.
 - **Nothing discovered is novel to practitioners** — fused QKV, flash
   attention, the linear-attention identity are all known. The
   contribution is automatic discovery + verification + per-shape choice,
@@ -208,8 +208,6 @@ packages/catopt-torch/      the PyTorch adapters (deps: core + torch)
 packages/catopt-carriers/   semantic carriers (deps: core + torch)
   om, xcarrier, trace       online-softmax / deferred / traced monoids
   *_lower, trace_lift       lowerers + the non-local lift passes
-packages/catopt-eps/        opt-in certified-approximation toolkit
-  eps, act_eps, ibp         weight offers, site wraps, interval bounds
 packages/catopt-optimize/   pipeline orchestrators (deps: all above)
   optimize, regime, calibrate
 catopt/                     façade — public API + compat aliases;

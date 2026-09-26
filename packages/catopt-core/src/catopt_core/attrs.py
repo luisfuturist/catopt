@@ -80,7 +80,7 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     "getitem": {1: "index"},
     # --- axis ops -----------------------------------------------------------
     # transpose(x, dim0, dim1) — the axes the rule patterns mint and
-    # every reader (typing, ibp, the torch binding) reads.
+    # every reader (typing, the torch binding) reads.
     "transpose": {1: "dim0", 2: "dim1"},
     "unsqueeze": {1: "dim"},
     "squeeze": {1: "dim"},
@@ -91,7 +91,7 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     "gather": {1: "dim"},
     "narrow": {1: "dim", 2: "start", 3: "length"},
     # aten.slice(t, dim, start, end, step) — the trailing three are
-    # the slice bounds/stride, read by typing/ibp/the binding.
+    # the slice bounds/stride, read by typing/the binding.
     "slice": {1: "dim", 2: "start", 3: "end", 4: "step"},
     # --- attention / normalisation -----------------------------------------
     # sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa);
