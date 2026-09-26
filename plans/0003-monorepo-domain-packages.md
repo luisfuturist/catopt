@@ -1,6 +1,6 @@
 # Plan 0003 — Monorepo: domain packages with isolated dependencies
 
-Status: proposed
+Status: complete (4755e2f)
 Date: 2026-09-26
 Branch: `project` (orphan — plans live here, not on main)
 Follows: `0002-genericity-and-shared-machinery.md` (phases A–D complete)
@@ -153,3 +153,25 @@ entangled), 3–5 verify.
   before the public re-exports.
 - **Setuptools packaging per subpackage** — each pyproject needs
   `package-dir` + `packages.find` scoped to `src`.
+
+
+## Progress log
+
+Complete — `4755e2f`. All five distributions scaffolded and live:
+
+- `catopt-core` — **verified zero-dep**: torch-free venv runs
+  `EGraph` + 50 rules + `extract_best` + hash-consing.
+- `catopt-torch`, `catopt-carriers`, `catopt-eps`, `catopt-optimize`
+  — deps declared per the DAG in §design.
+- `catopt/` façade: `sys.modules` aliases + top-level `setattr` for
+  every historical path — 1,579 tests passed unchanged (zero test
+  edits needed for import paths).
+- Migration surfaced one real latent defect: `act_eps`'s extension
+  registration imported the façade path from inside a domain
+  package and silently no-oped on `except Exception` — aquant/
+  adequant never entered `eps._LIP_FREE`, `model_bound` returned inf.
+  Now an intra-package import.
+- Logger namespaces follow the new module names (`catopt_core.*`);
+  `optimize.py` verbose prints stay allowed (documented stdout-compat).
+- Gates: 1,579 tests / coverage 100% / ruff 0 / pyright 0.
+- README layout rewritten for the workspace; AGENTS.md commands updated.
