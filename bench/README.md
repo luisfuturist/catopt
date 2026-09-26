@@ -118,3 +118,20 @@ over fragmented classes past k≈11 (k=11 ≈ 17s); production uses
 `rule_budgets`/`meta.canonicalize`, which is precisely why the
 codebase ships them — the bench says so rather than claiming exact
 eqsat scales.
+
+## benchkit.py — the shared harness + reports
+
+```bash
+python bench/run_all.py --device cpu --quick          # all harnessed suites
+python bench/run_all.py --suites reassoc_scale --quick
+python bench/reassoc_scale.py --out bench/results    # single suite + artifacts
+```
+
+`benchkit` is the shared machinery: `Case`/`Variant`/`Runner`
+(torch.utils.benchmark medians + IQR, CUDA-synced) → `Report` (env
+provenance: torch/python/git/device/timestamp) → JSON + Markdown +
+matplotlib PNGs under `bench/results/` (gitignored — regenerate any
+run). Harnessed suites expose `run_bench(args) -> Report`;
+`run_all.py` drives them and writes the run-level `REPORT_<ts>.md`
+index. matplotlib/pandas live in the `bench` dependency group —
+`uv sync --group bench`.

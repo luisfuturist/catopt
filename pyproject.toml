@@ -30,6 +30,10 @@ dev = [
 ]
 
 [dependency-groups]
+bench = [
+    "matplotlib>=3.8",
+    "pandas>=2.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=5.0",

@@ -27,11 +27,20 @@ Per cell (k, d, R):
   timed with ``torch.utils.benchmark`` (median via blocked_autorange).
 * correctness gate: ``torch.allclose`` fp32 vs the original eager
   output for every variant; a failed gate marks the cell FAIL.
+* harness: each cell is wrapped as a ``benchkit.Case`` (five variants
+  carrying the FLOP model; proof/verify notes in ``aux``), timed by
+  ``benchkit.Runner`` — same warmup + ``blocked_autorange``
+  ``min_run_time`` contract — and collected into a
+  ``benchkit.Report`` → timestamped JSON + Markdown + plots under
+  ``--out`` (default ``bench/results``).  ``--no-artifacts`` skips
+  emission for quick runs.  The console table is unchanged — the
+  harness augments, it does not replace.
 
 Usage:
     python bench/reassoc_scale.py --device cpu
     python bench/reassoc_scale.py --device cuda --dims 256,512,1024
     python bench/reassoc_scale.py --device cpu --depths 4,8 --rows 16384
+    python bench/reassoc_scale.py --device cpu --no-artifacts
 """
 # ruff: noqa: RUF001 RUF002 RUF003 -- ×, ·, −, ² in strings/docstrings
 # are deliberate math notation; same convention as catopt_core.laws.
@@ -43,14 +52,17 @@ import io
 import json
 import logging
 import re
+import statistics
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 import torch.nn as nn
+from benchkit import Case, Report, Runner, Variant, collect_env
 from catopt.cost import launch_aware_cost
 from catopt.egraph import EGraph
 from catopt.ir import Op, Param, Var, op_repr
@@ -70,7 +82,6 @@ from catopt_carriers.xcarrier import (
     gather_applyd_stack,
     omd_tree_lift,
 )
-from torch.utils.benchmark import Timer
 
 #: Rules subsumed inside ``optimize_model`` by the non-local pairing
 #: pass — mirrored so the inspection e-graph below is the same search
@@ -427,29 +438,116 @@ def analyze_postgrad(text: str, k: int, rows: int, d: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  Timing
+#  Timing (via benchkit.Runner)
 # ---------------------------------------------------------------------------
 
 
-def time_ms(
-    fn,
-    x: torch.Tensor,
-    dev: torch.device,
-    warmup: int,
-    min_run_time: float,
-) -> float:
-    """Median ms/call via ``torch.utils.benchmark.Timer`` —
-    explicit warmup (≥3) then blocked_autorange medians."""
-    sync = dev.type == "cuda"
-    stmt = "fn(x); torch.cuda.synchronize()" if sync else "fn(x)"
-    timer = Timer(stmt=stmt, globals={"fn": fn, "x": x, "torch": torch})
-    with torch.no_grad():
-        for _ in range(max(warmup, 3)):
+def _timed_stmt(fn, x: torch.Tensor):
+    """Zero-arg variant callable: one inference under ``no_grad`` —
+    the same contract the old ``time_ms`` enforced inside its Timer
+    loop (``Runner`` adds warmup, ``blocked_autorange`` and the CUDA
+    sync around it)."""
+
+    def stmt() -> None:
+        with torch.no_grad():
             fn(x)
-        if sync:
-            torch.cuda.synchronize()
-        meas = timer.blocked_autorange(min_run_time=min_run_time)
-    return meas.median * 1e3
+
+    return stmt
+
+
+def _ms_value(v) -> float | None:
+    """Coerce one benchkit measurement record to median ms."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if (
+        isinstance(v, (list, tuple))
+        and v
+        and all(isinstance(t, (int, float)) for t in v)
+    ):
+        return float(statistics.median(v))
+    for key in (
+        "median_ms",
+        "ms",
+        "median",
+        "mean_ms",
+        "mean",
+        "median_s",
+        "mean_s",
+    ):
+        val = (
+            v.get(key) if isinstance(v, dict) else getattr(v, key, None)
+        )
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            out = float(val)
+            return out * 1e3 if key.endswith("_s") else out
+    return None
+
+
+def _variant_ms(cell) -> dict[str, float]:
+    """Variant name → median ms, resolved from a ``Runner`` Cell.
+
+    ``benchkit.Cell.medians`` is ``name → median seconds`` — that's
+    the canonical path.  The fallback walk below tolerates other
+    container shapes (dict ``name → measurement`` or list of named
+    records) so the console table prints exactly the numbers
+    ``run_case`` measured, whatever the Cell internals settle to.
+    """
+    med = getattr(cell, "medians", None)
+    if med is None and isinstance(cell, dict):
+        med = cell.get("medians")
+    if isinstance(med, dict) and med:
+        return {str(n): float(s) * 1e3 for n, s in med.items()}
+    sources: list = []
+    for obj in (cell, getattr(cell, "case", None)):
+        if obj is None:
+            continue
+        for key in (
+            "measurements",
+            "results",
+            "ms",
+            "times",
+            "timings",
+            "variants",
+        ):
+            cont = (
+                obj.get(key)
+                if isinstance(obj, dict)
+                else getattr(obj, key, None)
+            )
+            if cont:
+                sources.append(cont)
+        if isinstance(obj, dict):
+            sources.append(obj)
+    for cont in sources:
+        pairs: list[tuple[str | None, object]] = []
+        if isinstance(cont, dict):
+            pairs = [(str(nm), v) for nm, v in cont.items()]
+        else:
+            for rec in cont:
+                nm = (
+                    rec.get("name")
+                    if isinstance(rec, dict)
+                    else getattr(rec, "name", None)
+                )
+                if nm is None:
+                    nm = getattr(
+                        getattr(rec, "variant", None), "name", None
+                    )
+                pairs.append((None if nm is None else str(nm), rec))
+        out = {
+            nm: ms
+            for nm, v in pairs
+            if nm is not None and (ms := _ms_value(v)) is not None
+        }
+        if out:
+            return out
+    raise RuntimeError(
+        f"could not resolve per-variant medians from Cell "
+        f"{type(cell).__name__} "
+        f"(attrs: {[a for a in dir(cell) if not a.startswith('_')]})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -463,10 +561,15 @@ def run_cell(
     rows: int,
     dev: torch.device,
     *,
-    warmup: int,
-    min_run_time: float,
+    runner: Runner,
     verbose: bool,
-) -> dict:
+) -> tuple[dict, object | None]:
+    """One (k, d, R) cell → ``(record, benchkit.Cell | None)``.
+
+    The record dict feeds the console table; the benchkit Cell (None
+    when the verify gate fails or the pipeline errors — those cells
+    are never timed, as before) feeds the ``Report``.
+    """
     torch.manual_seed(0)
     m = LinearAttnChain(d, k).to(dev).eval()
     x = torch.randn(rows, d, device=dev)
@@ -506,7 +609,7 @@ def run_cell(
     except Exception as e:  # honest failure path — do not fake the win
         print(f"  catopt FAILED: {type(e).__name__}: {e}")
         cell["error"] = f"{type(e).__name__}: {e}"
-        return cell
+        return cell, None
     opt = opt.to(dev).eval()
     cell["pipeline_s"] = time.time() - t0
     fires = {
@@ -522,6 +625,8 @@ def run_cell(
     term, _estats = saturate_and_extract(m, x)
     ok_term, term_msg = check_weights_first(term, k)
     cell["term_weights_first"] = ok_term
+    cell["term_msg"] = term_msg
+    cell["extracted_root"] = op_repr(opt._root)[:400]
     if verbose or not ok_term:
         print(f"  extracted term: {op_repr(term)[:400]}")
     print(
@@ -535,6 +640,7 @@ def run_cell(
     cm, pg = compile_with_postgrad(m, x)
     pa = analyze_postgrad(pg, k, rows, d)
     cell["inductor_mm"] = pa["n_mm"]
+    cell["inductor_wx_w"] = pa["n_weight_only_mm"]
     cell["inductor_left_assoc"] = pa["left_assoc"]
     if pa["graph_found"]:
         print(
@@ -578,70 +684,270 @@ def run_cell(
         f"{'✓' if ok else '✗ FAIL'}"
     )
     if not ok:
-        return cell
+        return cell, None
 
     # -- timing ---------------------------------------------------------
-    cell["eager_ms"] = time_ms(m, x, dev, warmup, min_run_time)
-    cell["inductor_ms"] = time_ms(cm, x, dev, warmup, min_run_time)
-    cell["ref_ms"] = time_ms(ref, x, dev, warmup, min_run_time)
-    cell["catopt_ms"] = time_ms(opt, x, dev, warmup, min_run_time)
-    cell["catopt_inductor_ms"] = time_ms(
-        copt, x, dev, warmup, min_run_time
+    # Same five variants as always, now expressed as a benchkit Case:
+    # the Runner applies the same warmup + blocked_autorange
+    # min_run_time contract time_ms used to enforce inline.
+    case = Case(
+        name=f"k{k}_d{d}_R{rows}",
+        params={"k": k, "d": d, "R": rows},
+        variants=[
+            Variant(
+                name="eager",
+                stmt=_timed_stmt(m, x),
+                flops=float(cell["flops_left"]),
+                note="left-assoc chain: k sequential (R,d)@(d,d) GEMMs",
+            ),
+            Variant(
+                name="inductor",
+                stmt=_timed_stmt(cm, x),
+                flops=float(cell["flops_left"]),
+                note=(
+                    f"torch.compile original — post-grad graph still "
+                    f"{pa['n_mm']} left-assoc mms"
+                ),
+            ),
+            Variant(
+                name="manual_ref",
+                stmt=_timed_stmt(ref, x),
+                flops=float(cell["flops_right_runtime"]),
+                note=(
+                    f"hand-folded W_eff — the reachable optimum "
+                    f"(+{cell['flops_right_fold'] / 1e9:.2f} GF fold "
+                    f"paid once at construction)"
+                ),
+            ),
+            Variant(
+                name="catopt",
+                stmt=_timed_stmt(opt, x),
+                flops=float(cell["flops_right_runtime"]),
+                note=(
+                    f"e-graph extraction {term_msg} — weight product "
+                    f"folds to a fused param at lowering"
+                ),
+            ),
+            Variant(
+                name="catopt_inductor",
+                stmt=_timed_stmt(copt, x),
+                flops=float(cell["flops_right_runtime"]),
+                note="catopt module under the same Inductor backend",
+            ),
+        ],
+        aux={
+            "verify": {
+                "max_abs": cell["max_abs"],
+                "max_rel": cell["max_rel"],
+                "allclose_fp32": cell["verified"],
+                "rtol": 1e-4,
+                "atol": 1e-5,
+            },
+            "inductor_proof": {
+                "post_grad_mm": pa["n_mm"],
+                "weight_only_mm": pa["n_weight_only_mm"],
+                "left_assoc": pa["left_assoc"],
+                "graph_found": pa["graph_found"],
+                "note": (
+                    f"{pa['n_mm']} left-assoc mms on the data spine — "
+                    f"weights-first unreachable"
+                    if pa["left_assoc"]
+                    else "post-grad graph is NOT the pure left chain"
+                ),
+                "mm_lines": [ln[:110] for ln in pa["mm_lines"][:k]],
+            },
+            "catopt_extraction": {
+                "weights_first": ok_term,
+                "note": term_msg,
+                "assoc_rule_fires": fires,
+                "inductor_backend_mm": pa2["n_mm"],
+                "pipeline_s": cell["pipeline_s"],
+            },
+            "extracted_root": cell["extracted_root"],
+            "flops_model": {
+                "left_assoc_runtime": cell["flops_left"],
+                "weights_first_runtime": cell["flops_right_runtime"],
+                "weights_first_fold_once": cell["flops_right_fold"],
+            },
+        },
     )
+    ran = runner.run_case(case)
+    ms = _variant_ms(ran)
+    cell["eager_ms"] = ms["eager"]
+    cell["inductor_ms"] = ms["inductor"]
+    cell["ref_ms"] = ms["manual_ref"]
+    cell["catopt_ms"] = ms["catopt"]
+    cell["catopt_inductor_ms"] = ms["catopt_inductor"]
+    iqr = getattr(ran, "iqr", None) or {}
+    cell["iqr_ms"] = {str(n): float(s) * 1e3 for n, s in iqr.items()}
     cell["x_vs_eager"] = cell["eager_ms"] / cell["catopt_ms"]
     cell["x_vs_inductor"] = (
         cell["inductor_ms"] / cell["catopt_inductor_ms"]
     )
-    return cell
+    return cell, ran
 
 
 def _parse_ints(s: str) -> list[int]:
     return [int(v) for v in s.split(",") if v.strip()]
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="matmul-chain reassociation: catopt vs Inductor"
-    )
-    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    ap.add_argument(
-        "--depths",
-        type=str,
-        default=None,
-        help="comma-separated chain depths k (default 2,4,8,16)",
-    )
-    ap.add_argument(
-        "--dims",
-        type=str,
-        default=None,
-        help="comma-separated dims d (default 512 on cpu, "
-        "256,512,1024 on cuda)",
-    )
-    ap.add_argument(
-        "--rows",
-        type=str,
-        default=None,
-        help="comma-separated B·T row counts (default "
-        "4096,16384,65536)",
-    )
-    ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument(
-        "--min-run-time",
-        type=float,
-        default=0.4,
-        help="blocked_autorange window per variant, seconds",
-    )
-    ap.add_argument(
-        "--verbose", action="store_true", help="print extracted terms"
-    )
-    ap.add_argument(
-        "--json", type=str, default=None, help="write results to PATH"
-    )
-    args = ap.parse_args()
+# ---------------------------------------------------------------------------
+#  Artifacts (benchkit.Report + suite-specific plots)
+# ---------------------------------------------------------------------------
 
-    dev = torch.device(args.device)
+#: Variant name → record-dict ms key (kept aligned with the five
+#: ``Variant(name=…)`` built in ``run_cell``).
+_MS_KEY = {
+    "eager": "eager_ms",
+    "inductor": "inductor_ms",
+    "manual_ref": "ref_ms",
+    "catopt": "catopt_ms",
+    "catopt_inductor": "catopt_inductor_ms",
+}
+_VARIANT_LABELS = {
+    "eager": "eager",
+    "inductor": "inductor",
+    "manual_ref": "manual ref",
+    "catopt": "catopt",
+    "catopt_inductor": "catopt+inductor",
+}
+
+
+def _emit_plots(
+    results: list[dict], plots_dir: Path, ts: str
+) -> list[Path]:
+    """The two suite plots, one figure per fixed d:
+
+    * ``reassoc_scale_<ts>_ms_d<d>.png`` — ms-per-variant grouped bars
+      for each (k, R) cell;
+    * ``reassoc_scale_<ts>_speedup_vs_inductor_d<d>.png`` —
+      speedup_vs_inductor vs k, one curve per R.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ok = [c for c in results if c.get("verified")]
+    written: list[Path] = []
+    for d in sorted({c["d"] for c in ok}):
+        cells = sorted(
+            (c for c in ok if c["d"] == d),
+            key=lambda c: (c["k"], c["rows"]),
+        )
+        if not cells:
+            continue
+
+        fig, ax = plt.subplots(
+            figsize=(max(7.0, 1.1 * len(cells)), 4.5)
+        )
+        names = list(_MS_KEY)
+        width = 0.8 / len(names)
+        xs = list(range(len(cells)))
+        for i, v in enumerate(names):
+            ax.bar(
+                [x + (i - (len(names) - 1) / 2) * width for x in xs],
+                [c[_MS_KEY[v]] for c in cells],
+                width,
+                label=_VARIANT_LABELS[v],
+            )
+        ax.set_yscale("log")
+        ax.set_xticks(xs)
+        ax.set_xticklabels(
+            [f"k{c['k']}\nR{c['rows']}" for c in cells], fontsize=8
+        )
+        ax.set_ylabel("ms / call (median, log scale)")
+        ax.set_title(f"reassoc_scale — ms per variant, d={d}")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        p = plots_dir / f"reassoc_scale_{ts}_ms_d{d}.png"
+        fig.savefig(p, dpi=150)
+        plt.close(fig)
+        written.append(p)
+
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for r in sorted({c["rows"] for c in cells}):
+            pts = sorted(
+                (c for c in cells if c["rows"] == r),
+                key=lambda c: c["k"],
+            )
+            ax.plot(
+                [c["k"] for c in pts],
+                [c["x_vs_inductor"] for c in pts],
+                marker="o",
+                label=f"B·T={r}",
+            )
+        ax.axhline(1.0, color="grey", lw=0.8, ls="--")
+        ax.set_xlabel("chain depth k")
+        ax.set_ylabel("speedup vs Inductor (×)")
+        ax.set_title(
+            f"reassoc_scale — catopt+inductor speedup_vs_inductor, d={d}"
+        )
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        p = (
+            plots_dir
+            / f"reassoc_scale_{ts}_speedup_vs_inductor_d{d}.png"
+        )
+        fig.savefig(p, dpi=150)
+        plt.close(fig)
+        written.append(p)
+    return written
+
+
+def _md_supplement(results: list[dict], best: dict | None) -> str:
+    """Markdown appended after ``Report.to_markdown``: the per-cell
+    proof excerpt and the suite summary line — the parts of the
+    console output a generic report can't reconstruct."""
+    lines = ["", "## Per-cell proof excerpt", ""]
+    for c in results:
+        tag = f"k={c['k']} d={c['d']} B·T={c['rows']}"
+        if "error" in c:
+            lines.append(f"- {tag}: **ERROR** `{c['error']}`")
+        elif not c.get("verified"):
+            lines.append(f"- {tag}: **FAIL** — fp32 allclose gate")
+        else:
+            lines.append(
+                f"- {tag}: inductor post-grad = {c['inductor_mm']} "
+                f"left-assoc mms ({c['inductor_wx_w']} weight×weight) "
+                f"— transform unreached; catopt extracted "
+                f"`{c['term_msg']}`; verify max_abs="
+                f"{c['max_abs']:.2e} rel_to_max={c['max_rel']:.2e}"
+            )
+    lines += ["", "## Summary", ""]
+    if best is not None:
+        lines.append(
+            f"catopt finds a transform Inductor cannot express: "
+            f"**{best['x_vs_inductor']:.2f}× vs Inductor** on "
+            f"(k,d,B·T)=({best['k']},{best['d']},{best['rows']}) "
+            f"({best['x_vs_eager']:.2f}× vs eager; Inductor emitted "
+            f"{best['inductor_mm']} left-assoc mms, catopt runs "
+            f"{best['catopt_inductor_mm']})."
+        )
+    else:
+        lines.append(
+            "no verified cell where the proof held — honest "
+            "negative result."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_bench(args: argparse.Namespace) -> Report:
+    """The full sweep → ``benchkit.Report`` (the run_all.py convention).
+
+    ``args`` is the namespace ``main()`` parses; when driven by
+    ``run_all.py`` only ``device``/``warmup``/``min_run_time``/``out``
+    (and maybe ``quick``) are set, so every suite-specific attr falls
+    back to the CLI default via ``getattr``.
+    """
+    dev = torch.device(getattr(args, "device", "cpu"))
     if dev.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but CUDA unavailable")
+
+    warmup = getattr(args, "warmup", 5)
+    min_run_time = getattr(args, "min_run_time", 0.4)
+    verbose = getattr(args, "verbose", False)
+    quick = getattr(args, "quick", False)
 
     # Post-grad capture needs a fresh compile each cell — a served FX
     # cache hit skips the pass pipeline and emits no graph.
@@ -652,14 +958,27 @@ def main() -> None:
     except Exception:
         pass
 
-    depths = _parse_ints(args.depths) if args.depths else [2, 4, 8, 16]
-    if args.dims:
-        dims = _parse_ints(args.dims)
+    arg_depths = getattr(args, "depths", None)
+    arg_dims = getattr(args, "dims", None)
+    arg_rows = getattr(args, "rows", None)
+    # ``quick`` (run_all) shrinks the sweep without overriding an
+    # explicitly-passed axis.
+    depths = (
+        _parse_ints(arg_depths)
+        if arg_depths
+        else ([2, 4] if quick else [2, 4, 8, 16])
+    )
+    if arg_dims:
+        dims = _parse_ints(arg_dims)
     else:
         # CPU-safe default: one dim keeps the sweep quick; Inductor
         # compile time dominates, not the matmuls themselves.
         dims = [256, 512, 1024] if dev.type == "cuda" else [512]
-    rows = _parse_ints(args.rows) if args.rows else [4096, 16384, 65536]
+    rows = (
+        _parse_ints(arg_rows)
+        if arg_rows
+        else ([4096] if quick else [4096, 16384, 65536])
+    )
     cells = [(k, d, r) for d in dims for k in depths for r in rows]
     for _k, _d, _r in cells:
         if _r <= _d:
@@ -685,19 +1004,16 @@ def main() -> None:
     )
     print("=" * 78)
 
+    runner = Runner(
+        device=dev, warmup=warmup, min_run_time=min_run_time
+    )
     results = []
+    report_cells = []
     for k, d, r in cells:
-        results.append(
-            run_cell(
-                k,
-                d,
-                r,
-                dev,
-                warmup=args.warmup,
-                min_run_time=args.min_run_time,
-                verbose=args.verbose,
-            )
-        )
+        c, ran = run_cell(k, d, r, dev, runner=runner, verbose=verbose)
+        results.append(c)
+        if ran is not None:
+            report_cells.append(ran)
 
     # -- clean table ----------------------------------------------------
     hdr = (
@@ -775,7 +1091,11 @@ def main() -> None:
         "fold (not in the timed loop)."
     )
 
-    if args.json:
+    report = Report(
+        suite="reassoc_scale", cells=report_cells, env=collect_env(dev)
+    )
+
+    if getattr(args, "json", None):
         payload = {
             "device": str(dev),
             "depths": depths,
@@ -795,6 +1115,90 @@ def main() -> None:
         }
         Path(args.json).write_text(json.dumps(payload, indent=2))
         print(f"  results → {args.json}")
+
+    if not getattr(args, "no_artifacts", False):
+        out_dir = Path(getattr(args, "out", "bench/results"))
+        plots_dir = out_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        json_path = out_dir / f"reassoc_scale_{ts}.json"
+        md_path = out_dir / f"reassoc_scale_{ts}.md"
+        report.to_json(json_path)
+        report.to_markdown(md_path, speedup_vs="inductor")
+        with md_path.open("a") as fh:
+            fh.write(_md_supplement(results, best))
+        written = _emit_plots(results, plots_dir, ts)
+        try:
+            written += [
+                Path(p)
+                for p in report.to_plots(
+                    plots_dir, x_param="k", speedup_vs="inductor"
+                )
+            ]
+        except Exception as e:
+            print(
+                f"  note: Report.to_plots skipped "
+                f"({type(e).__name__}: {e})"
+            )
+        print(f"  artifacts → {json_path}")
+        print(f"            → {md_path}")
+        for p in written:
+            print(f"            → {p}")
+
+    return report
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="matmul-chain reassociation: catopt vs Inductor"
+    )
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument(
+        "--depths",
+        type=str,
+        default=None,
+        help="comma-separated chain depths k (default 2,4,8,16)",
+    )
+    ap.add_argument(
+        "--dims",
+        type=str,
+        default=None,
+        help="comma-separated dims d (default 512 on cpu, "
+        "256,512,1024 on cuda)",
+    )
+    ap.add_argument(
+        "--rows",
+        type=str,
+        default=None,
+        help="comma-separated B·T row counts (default "
+        "4096,16384,65536)",
+    )
+    ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument(
+        "--min-run-time",
+        type=float,
+        default=0.4,
+        help="blocked_autorange window per variant, seconds",
+    )
+    ap.add_argument(
+        "--verbose", action="store_true", help="print extracted terms"
+    )
+    ap.add_argument(
+        "--json", type=str, default=None, help="write results to PATH"
+    )
+    ap.add_argument(
+        "--out",
+        type=str,
+        default="bench/results",
+        help="artifact dir for benchkit JSON/Markdown/plots "
+        "(default bench/results)",
+    )
+    ap.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="skip JSON/Markdown/plot emission for quick runs",
+    )
+    run_bench(ap.parse_args())
 
 
 if __name__ == "__main__":

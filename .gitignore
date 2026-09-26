@@ -53,3 +53,6 @@ htmlcov/
 cov_ann/
 .pytest_cache/
 *.prof
+
+# Bench outputs
+bench/results/

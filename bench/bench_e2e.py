@@ -12,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 import torch.nn as nn
-
 from catopt.models import ParallelBlock
 from catopt.optimize import optimize_model
 
@@ -64,7 +63,6 @@ def main():
         )
     )
     torch.manual_seed(0)
-
 
     for n_layers, T, B in [(2, 128, 8)]:
         m = MiniGPT(256, 8, n_layers).to(dev).eval().float()

@@ -37,10 +37,23 @@ Also measured per depth:
   ``assoc_linear`` on the real export path (typing, attrs validation,
   pairing passes, extraction, lowering, verification).
 
+Reporting goes through ``benchkit``: each (policy, k) cell is a
+``Case`` carrying the sweep coordinates in ``params`` and every
+measured quantity — space_log10, enodes, live e-nodes, e-classes,
+iterations, rule fires, encode-DP count, wall/extract ms — in ``aux``
+(the data channel; saturation is a one-shot stateful wall-clock run,
+not a repeatable per-call kernel, so ``Timer`` autorange does not
+apply).  Cells are collected into ``Report(suite="search_efficiency")``
+which emits JSON + Markdown + grouped-bar PNGs under ``--out``
+(default ``bench/results/``); on top of the generic artifacts the
+script writes the two suite-specific plots: the money plot
+(program-space size vs live e-nodes vs k, log-y) and wall_ms vs k.
+
 Usage:
 
     .venv/bin/python bench/search_efficiency.py --device cpu
-    .venv/bin/python bench/search_efficiency.py --depths 4,8,16 --json out.json
+    .venv/bin/python bench/search_efficiency.py --depths 4,8,16 --out /tmp/se
+    .venv/bin/python bench/search_efficiency.py --no-artifacts   # console only
 """
 
 from __future__ import annotations
@@ -48,15 +61,16 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
-import json
 import math
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from benchkit import Case, Cell, Report, Runner, Variant, collect_env
 from catopt_core.cost import flops_cost
 from catopt_core.egraph import EGraph
 from catopt_core.ir import Op, Param, TensorType
@@ -75,6 +89,27 @@ _DIMS = (8, 512, 32, 256)
 #: Rules classified as pure symmetry — the expansive closure generators
 #: that ``optimize_model`` puts under an enode budget.
 _ASSOC_RULES = (ASSOC_MATMUL, ASSOC_MATMUL_REV)
+
+#: Runner settings for the marker variants.  The measured quantity of
+#: every case here is a one-shot, stateful wall-clock run (build the
+#: e-graph, saturate, count) — not a repeatable per-call kernel — so
+#: ``blocked_autorange`` repetition does not apply.  ``Variant.stmt``
+#: is therefore an instant marker; the variant's ``medians`` entry is
+#: backfilled with the single measured wall time (N=1 → IQR 0) and the
+#: full statistics live in ``Case.aux``.  warmup=0 + a tiny
+#: min_run_time keep the marker timing itself negligible.
+_RUNNER_WARMUP = 0
+_RUNNER_MIN_RUN_TIME = 0.001
+
+_ONESHOT_NOTE = (
+    "one-shot wall-clock measurement; median backfilled from aux "
+    "(wall_ms etc.), stats in aux"
+)
+
+
+def _marker() -> None:
+    """Instant stand-in for a one-shot measurement (see module docstring)."""
+    return None
 
 
 def catalan(n: int) -> int:
@@ -334,6 +369,263 @@ def measure_e2e(k: int, device: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+#  benchkit adapters — Case construction, one-shot timing, plots
+# ---------------------------------------------------------------------------
+
+
+def _sat_aux(row: dict[str, Any], policy: str) -> dict[str, Any]:
+    """Flatten a :func:`measure_run` row into the Case ``aux`` channel."""
+    k = row["k"]
+    cat = catalan(k - 1)
+    return {
+        "policy": policy,
+        "space": cat,
+        "space_terms": f"Catalan({k - 1})",
+        "space_log10": log10n(cat),
+        "live_theory": (k**3 - k) // 6 + k,
+        "eclasses_theory": k * (k + 1) // 2,
+        "enodes": row["enodes"],
+        "live": row["live_enodes"],
+        "eclasses": row["eclasses"],
+        "iters": row["sat_iters"],
+        "fires": row["total_fires"],
+        "rule_fires": row["rule_fires"],
+        "wall_ms": round(row["wall_ms"], 3),
+        "extract_ms": round(row["extract_ms"], 3),
+        "count_ms": round(row["count_ms"], 3),
+        "encode_dp_count": row["terms_at_root"],
+        "terms_capped": row["terms_capped"],
+        "derivations": row["derivations_at_root"],
+        "best_cost": row["best_cost"],
+        "budget_spent": row["budget_spent"],
+        "budget_suspended": row["budget_suspended"],
+    }
+
+
+def _strat_aux(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "canon_ms": round(row["canon_ms"], 3),
+        "stratified_ms": round(row["stratified_ms"], 3),
+        "enodes": row["enodes"],
+        "coherent_dropped": row["coherent_dropped"],
+        "balanced_cost": row["balanced_cost"],
+    }
+
+
+def _e2e_aux(row: dict[str, Any]) -> dict[str, Any]:
+    if "error" in row:
+        return {"error": row["error"]}
+    return {
+        "e2e_ms": round(row["e2e_ms"], 3),
+        "enodes": row["enodes"],
+        "iters": row["sat_iters"],
+        "fires": row["total_fires"],
+        "verified_rel_diff": row["verified_rel_diff"],
+    }
+
+
+def _oneshot_cell(
+    runner: Runner,
+    name: str,
+    params: dict[str, Any],
+    aux: dict[str, Any],
+    wall_ms: dict[str, float],
+) -> Cell:
+    """Package an already-taken one-shot measurement as a ``Cell``.
+
+    Saturation/export are single stateful wall-clock runs, so the
+    variants carry marker statements (``_marker``) just to keep the
+    case structurally uniform; ``run_case`` times them in ~µs and each
+    real measured wall time is then written into ``medians`` — a
+    one-shot measurement IS its own median, with IQR 0.  Variants with
+    no measurement (e.g. a failed e2e) are dropped so reports render
+    them as missing rather than as a spurious ~0 ms.
+    """
+    variants = [
+        Variant(v, stmt=_marker, note=_ONESHOT_NOTE) for v in wall_ms
+    ]
+    case = Case(
+        name=name, params=dict(params), variants=variants, aux=aux
+    )
+    cell = runner.run_case(case)
+    for v, ms in wall_ms.items():
+        if ms is None:
+            cell.medians.pop(v, None)
+            cell.iqr.pop(v, None)
+        else:
+            cell.medians[v] = ms / 1e3
+            cell.iqr[v] = 0.0
+    cell.aux.update(aux)
+    return cell
+
+
+def _plt():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _cells_named(report: Report, prefix: str) -> list[Cell]:
+    out = [
+        c
+        for c in report.cells
+        if c.case.name.startswith(prefix) and "k" in c.case.params
+    ]
+    out.sort(key=lambda c: c.case.params["k"])
+    return out
+
+
+def plot_space_vs_enodes(report: Report, outdir: Path) -> Path | None:
+    """The money plot: exponential program space vs polynomial e-graph.
+
+    log-y curve of Catalan(k-1) — the size of the equivalent-program
+    space the e-graph explores — against the live e-node count the
+    saturated (exact, then bounded-fragment) graph actually stores,
+    plus the (k^3-k)/6+k / k(k+1)/2 closed forms it provably attains.
+    """
+    exact = _cells_named(report, "exact_k")
+    bounded = _cells_named(report, "bounded_k")
+    if not exact and not bounded:
+        return None
+    ks = sorted(
+        {
+            c.case.params["k"]
+            for c in exact + bounded
+            if c.aux.get("space")
+        }
+    )
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.semilogy(
+        ks,
+        [catalan(k - 1) for k in ks],
+        "k-",
+        lw=1.6,
+        label="program space  Catalan(k-1)",
+    )
+    ax.semilogy(
+        ks,
+        [(k**3 - k) // 6 + k for k in ks],
+        ":",
+        color="grey",
+        label="live e-nodes theory  (k^3-k)/6+k",
+    )
+    ax.semilogy(
+        ks,
+        [k * (k + 1) // 2 for k in ks],
+        "-.",
+        color="grey",
+        label="e-classes theory  k(k+1)/2",
+    )
+    if exact:
+        ax.semilogy(
+            [c.case.params["k"] for c in exact],
+            [c.aux["live"] for c in exact],
+            "o",
+            color="tab:blue",
+            label="exact saturation: live e-nodes",
+        )
+    if bounded:
+        ax.semilogy(
+            [c.case.params["k"] for c in bounded],
+            [max(c.aux.get("live") or 1, 1) for c in bounded],
+            "s",
+            color="tab:orange",
+            ms=4,
+            label="bounded saturation: live e-nodes",
+        )
+    ax.set_xlabel("chain depth k (matmuls)")
+    ax.set_ylabel("count (log)")
+    ax.set_title(
+        "search_efficiency: equivalent-program space vs e-graph size"
+    )
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    p = outdir / "search_efficiency_space_vs_enodes.png"
+    fig.savefig(p, dpi=140)
+    plt.close(fig)
+    return p
+
+
+def plot_wall_ms(report: Report, outdir: Path) -> Path | None:
+    """Saturation/pipeline wall time vs k (log-y; spans ms → seconds)."""
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    drew = False
+    for prefix, key, marker, label in (
+        ("exact_k", "wall_ms", "o", "exact saturation"),
+        ("bounded_k", "wall_ms", "s", "bounded saturation"),
+        ("strat_k", "stratified_ms", "^", "canonicalize+stratified"),
+        ("e2e_k", "e2e_ms", "v", "optimize_model e2e"),
+    ):
+        cells = [
+            c
+            for c in _cells_named(report, prefix)
+            if c.aux.get(key) is not None
+        ]
+        if not cells:
+            continue
+        drew = True
+        ax.semilogy(
+            [c.case.params["k"] for c in cells],
+            [c.aux[key] for c in cells],
+            marker,
+            label=label,
+            ms=4,
+        )
+    if not drew:
+        plt.close(fig)
+        return None
+    ax.set_xlabel("chain depth k (matmuls)")
+    ax.set_ylabel("wall time, ms (log)")
+    ax.set_title("search_efficiency: saturation wall time vs k")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    p = outdir / "search_efficiency_wall_ms.png"
+    fig.savefig(p, dpi=140)
+    plt.close(fig)
+    return p
+
+
+def write_artifacts(report: Report, out: str | Path) -> list[Path]:
+    """Emit the benchkit report (JSON + MD + bar plots) plus the two
+    suite-specific PNGs under ``out``."""
+    out = Path(out)
+    plots_dir = out / "plots"
+    paths: list[Path] = []
+
+    j = out / "search_efficiency.json"
+    report.to_json(j)
+    paths.append(j)
+    m = out / "search_efficiency.md"
+    report.to_markdown(m)
+    paths.append(m)
+
+    try:
+        paths += [Path(p) for p in report.to_plots(plots_dir)]
+    except Exception as e:  # matplotlib optional — never sink the JSON
+        print(f"[warn] benchkit plots skipped: {e}")
+    try:
+        for p in (
+            plot_space_vs_enodes(report, plots_dir),
+            plot_wall_ms(report, plots_dir),
+        ):
+            if p is not None:
+                paths.append(p)
+    except Exception as e:
+        print(f"[warn] suite plots skipped: {e}")
+    return paths
+
+
+# ---------------------------------------------------------------------------
+#  Console reporting (unchanged semantics)
+# ---------------------------------------------------------------------------
+
+
 def fmt_ms(ms: float) -> str:
     return f"{ms:10.1f}"
 
@@ -370,7 +662,7 @@ def print_table(title: str, rows: list[dict[str, Any]]) -> None:
     print()
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
             "Search-efficiency benchmark: equivalent-program space "
@@ -387,12 +679,16 @@ def main() -> None:
         "--device", default="cpu", help="torch device for the e2e path"
     )
     ap.add_argument(
-        "--json",
-        nargs="?",
-        const="-",
-        default=None,
-        metavar="PATH",
-        help="emit results as JSON (to PATH, or stdout if no PATH)",
+        "--out",
+        default=str(Path(__file__).resolve().parent / "results"),
+        metavar="DIR",
+        help="artifact directory for the benchkit report "
+        "(search_efficiency.json/.md + plots/; default bench/results)",
+    )
+    ap.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="console output only — write no JSON/Markdown/PNG artifacts",
     )
     ap.add_argument(
         "--exact-max",
@@ -416,46 +712,85 @@ def main() -> None:
         "matches a pure matmul chain — but the first whole-graph "
         "scan of the other ~50 rules is skipped)",
     )
-    args = ap.parse_args()
+    return ap.parse_args(argv)
 
+
+def run_bench(args: argparse.Namespace) -> Report:
+    """Run the sweep and return the populated benchkit ``Report``.
+
+    Every measured cell becomes a ``Case`` — sweep coords in
+    ``params``, all statistics in ``aux`` — run through ``Runner`` so
+    the report's cells carry real one-shot wall medians (see
+    :func:`_oneshot_cell`).
+    """
     depths = sorted(
-        {int(d) for d in args.depths.split(",") if d.strip()}
+        {
+            int(d)
+            for d in (
+                getattr(args, "depths", None) or "4,8,12,16,20,24"
+            ).split(",")
+            if d.strip()
+        }
     )
     if not depths:
-        ap.error("--depths must contain at least one integer")
-    rules = list(_ASSOC_RULES) if args.assoc_only else all_rules()
-    budgets = {r.name: args.budget for r in _ASSOC_RULES}
+        raise SystemExit("--depths must contain at least one integer")
+    rules = (
+        list(_ASSOC_RULES)
+        if getattr(args, "assoc_only", False)
+        else all_rules()
+    )
+    budgets = {
+        r.name: (getattr(args, "budget", None) or 2048)
+        for r in _ASSOC_RULES
+    }
 
     # Warm torch.export/dynamo caches once so the first e2e row isn't
     # dominated by one-time compile bookkeeping; also probes whether the
     # requested device exists.
-    if args.device != "cpu":
+    device = getattr(args, "device", None) or "cpu"
+    if device != "cpu":
         try:
             import torch
 
             if (
-                args.device.startswith("cuda")
+                device.startswith("cuda")
                 and not torch.cuda.is_available()
             ):
-                print(
-                    f"[warn] {args.device} unavailable; e2e runs on cpu"
-                )
-                args.device = "cpu"
+                print(f"[warn] {device} unavailable; e2e runs on cpu")
+                device = "cpu"
         except ImportError:
             pass
     with contextlib.suppress(Exception):
-        measure_e2e(2, args.device)
+        measure_e2e(2, device)
 
+    runner = Runner(
+        device=(getattr(args, "device", None) or "cpu"),
+        warmup=_RUNNER_WARMUP,
+        min_run_time=_RUNNER_MIN_RUN_TIME,
+    )
+    cells: list[Cell] = []
     exact_rows, bounded_rows, strat_rows, e2e_rows = [], [], [], []
 
     # -- exact saturation sweep: every k in [4, exact_max] -------------
     # The dense sweep matters here: it exposes the polynomial O(k^3)
     # e-node growth against the exponential Catalan(k-1) space at the
     # exact fixed point, verified by the term-count DP.
-    exact_depths = [d for d in range(4, args.exact_max + 1)]
+    exact_depths = [
+        d
+        for d in range(4, (getattr(args, "exact_max", None) or 11) + 1)
+    ]
     for k in exact_depths:
         er = measure_run(k, rules, None)
         exact_rows.append(er)
+        cells.append(
+            _oneshot_cell(
+                runner,
+                name=f"exact_k{k}",
+                params={"k": k},
+                aux=_sat_aux(er, "exact"),
+                wall_ms={"sat": er["wall_ms"]},
+            )
+        )
         live_theory = (k**3 - k) // 6 + k
         cls_theory = k * (k + 1) // 2
         cat = catalan(k - 1)
@@ -486,11 +821,15 @@ def main() -> None:
             f"{cat:.3e} bracketings",
             flush=True,
         )
-    skipped_exact = [d for d in depths if d > args.exact_max]
+    skipped_exact = [
+        d
+        for d in depths
+        if d > (getattr(args, "exact_max", None) or 11)
+    ]
     if skipped_exact:
         print(
             f"exact saturation skipped at k={skipped_exact} "
-            f"(--exact-max {args.exact_max}; k=12 already needs the "
+            f"(--exact-max {(getattr(args, 'exact_max', None) or 11)}; k=12 already needs the "
             "generic matcher to enumerate ~4^12 substitutions, ~3 min)"
         )
     print()
@@ -499,7 +838,22 @@ def main() -> None:
         # -- bounded saturation: the production policy, at every k ------
         br = measure_run(k, rules, budgets)
         bounded_rows.append(br)
-        assert br["enodes"] <= k**5 + 4 * args.budget + 512, (
+        cells.append(
+            _oneshot_cell(
+                runner,
+                name=f"bounded_k{k}",
+                params={
+                    "k": k,
+                    "budget": (getattr(args, "budget", None) or 2048),
+                },
+                aux=_sat_aux(br, "bounded"),
+                wall_ms={"sat": br["wall_ms"]},
+            )
+        )
+        assert (
+            br["enodes"]
+            <= k**5 + 4 * (getattr(args, "budget", None) or 2048) + 512
+        ), (
             f"k={k}: bounded e-graph grew past its polynomial cap: "
             f"{br['enodes']}"
         )
@@ -516,16 +870,40 @@ def main() -> None:
         # -- engineered fast path --------------------------------------
         sr = measure_stratified(k, rules)
         strat_rows.append(sr)
+        cells.append(
+            _oneshot_cell(
+                runner,
+                name=f"strat_k{k}",
+                params={"k": k},
+                aux=_strat_aux(sr),
+                wall_ms={
+                    "canon": sr["canon_ms"],
+                    "strat": sr["stratified_ms"],
+                },
+            )
+        )
 
         # -- end-to-end pipeline ---------------------------------------
         try:
-            e2e_rows.append(measure_e2e(k, args.device))
+            e2e_rows.append(
+                measure_e2e(k, (getattr(args, "device", None) or "cpu"))
+            )
         except Exception as e:  # torch/export issues must not hide the
             # core measurement — report and continue.
             e2e_rows.append(
                 {"k": k, "error": f"{type(e).__name__}: {e}"}
             )
             print(f"k={k:>3} e2e:     FAILED ({e})", flush=True)
+        er2 = e2e_rows[-1]
+        cells.append(
+            _oneshot_cell(
+                runner,
+                name=f"e2e_k{k}",
+                params={"k": k},
+                aux=_e2e_aux(er2),
+                wall_ms={"e2e": er2.get("e2e_ms")},
+            )
+        )
 
     print()
     print_table(
@@ -534,7 +912,7 @@ def main() -> None:
         exact_rows,
     )
     print_table(
-        f"BOUNDED saturation (rule_budgets={args.budget} per symmetry "
+        f"BOUNDED saturation (rule_budgets={(getattr(args, 'budget', None) or 2048)} per symmetry "
         "rule — the production policy):",
         bounded_rows,
     )
@@ -616,22 +994,25 @@ def main() -> None:
         "program space)."
     )
 
-    if args.json is not None:
-        payload = {
-            "depths": depths,
-            "budget": args.budget,
-            "rules": [r.name for r in rules],
-            "exact": exact_rows,
-            "bounded": bounded_rows,
-            "stratified": strat_rows,
-            "e2e": e2e_rows,
-        }
-        text = json.dumps(payload, indent=2, default=str)
-        if args.json == "-":
-            print(text)
-        else:
-            Path(args.json).write_text(text)
-            print(f"\nJSON written to {args.json}")
+    return Report(
+        suite="search_efficiency",
+        cells=cells,
+        env=collect_env(getattr(args, "device", None) or "cpu"),
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    report = run_bench(args)
+    if not getattr(args, "no_artifacts", False):
+        paths = write_artifacts(
+            report, (getattr(args, "out", None) or "bench/results")
+        )
+        print(
+            f"\nartifacts written to {(getattr(args, 'out', None) or 'bench/results')}:"
+        )
+        for p in paths:
+            print(f"  {p}")
 
 
 if __name__ == "__main__":
