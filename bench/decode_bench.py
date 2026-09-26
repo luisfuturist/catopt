@@ -56,6 +56,7 @@ from torch.utils.benchmark import Timer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from llama2c import load_llama2c
 from stories15m_bench import (
     Block,
     Stories15M,
@@ -63,7 +64,6 @@ from stories15m_bench import (
 )
 
 from catopt.report import CompositionalReport, verify_equiv
-from measure_weights import load_llama2c
 
 
 # ---------------------------------------------------------------------------

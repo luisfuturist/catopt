@@ -23,7 +23,8 @@ import torch.nn.functional as F
 from torch.utils.benchmark import Timer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from measure_weights import load_llama2c
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from llama2c import load_llama2c
 
 
 def cache_dir() -> Path:
