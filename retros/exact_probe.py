@@ -371,7 +371,7 @@ def probe_stories15m():
         share_duplicate_param_slices,
         share_duplicate_params,
     )
-    from retros.measure_weights import load_llama2c
+    from measure_weights import load_llama2c  # same dir
 
     w = load_llama2c(CKPT)
     src = {}
