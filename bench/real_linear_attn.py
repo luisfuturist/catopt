@@ -103,8 +103,8 @@ import torch.nn as nn
 from benchkit import Case, Report, Runner, Variant, collect_env
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, op_repr
+from catopt.laws import SCAN_DIAG_LAWS, SCAN_LAWS
 from catopt.optimize import OptimizationResourceError, optimize_model
-from catopt.rules import SCAN_DIAG_LAWS, SCAN_LAWS
 from catopt.scan_lower import (
     build_scan_plan,
     is_scan_apply_term,
@@ -396,7 +396,11 @@ def _canonical_scan_term(
     leaves = []
     for i, (a, b) in enumerate(steps):
         if u_base is not None:
-            b = Op.make("select", u_base, arg1=dim, arg2=i)
+            # Exported selects spell attrs dim=/index= — the torch
+            # eval binding reads *only* those names (arg1/arg2 are
+            # recognised by the plan's _select_index but silently
+            # index 0 in generic eval).
+            b = Op.make("select", u_base, dim=dim, index=i)
         leaves.append(Op.make(leaf_op, a, b))
 
     def tree(lo: int, hi: int) -> Op:
@@ -851,7 +855,15 @@ def run_cell(
     # -- optimize_model (the production pipeline, bounded sizes) -----
     opt64 = None
     opt_ir = None
-    if opt_max_t >= T:
+    if n_blocks > 1:
+        # The emitted-seq graph turns whole-graph saturation into an
+        # ~8-minute build at T=128 already — not a bench-timeable
+        # variant.  The scan/chain evidence stands on certify +
+        # canonical paths.
+        cell["opt_error"] = (
+            f"skipped (L={n_blocks}: whole-graph e-graph cost)"
+        )
+    elif opt_max_t >= T:
         t0 = time.time()
         try:
             opt64, ostats = optimize_model(
