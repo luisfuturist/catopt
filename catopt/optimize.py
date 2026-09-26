@@ -27,7 +27,7 @@ from catopt.cost import (
     launch_aware_cost,
 )
 from catopt.egraph import EGraph
-from catopt.ir import IR, Const, Op, Param, Var, op_repr
+from catopt.ir import IR, Op, op_repr
 from catopt.ops import OpTable
 from catopt.ports import CostFn
 from catopt.report import (
@@ -214,30 +214,23 @@ def _check_resources(eg, max_enodes, max_memory_mb) -> None:
 def _eval_const(
     term: Any, params: dict, ops: OpTable | None = None
 ) -> torch.Tensor | None:
-    """Evaluate a parameter-only subtree to a concrete tensor."""
-    from catopt.torch_bridge import _IR_TO_TORCH
+    """Evaluate a parameter-only subtree to a concrete tensor.
+
+    Permissive compile-time fold — any un-evaluatable piece (Var,
+    missing Param, missing binding, raising binding, non-tensor
+    result) yields ``None``.  Delegates to
+    :func:`catopt.torch_bridge.eval_term` (plan 0002 phase D);
+    ``tensor_only`` reproduces the per-level isinstance check.
+    """
+    from catopt.torch_bridge import _IR_TO_TORCH, eval_term
 
     bindings = _IR_TO_TORCH if ops is None else ops.torch_bindings
-    if isinstance(term, Param):
-        return params.get(term.name)
-    if isinstance(term, Const):
-        return torch.tensor(term.value)
-    if isinstance(term, Var):
-        return None
-    if isinstance(term, Op):
-        vals = [_eval_const(a, params, ops) for a in term.args]
-        if any(v is None for v in vals):
-            return None
-        fn = bindings.get(term.op)
-        if fn is None:
-            return None
-        try:
-            with torch.no_grad():
-                out = fn(*vals, **dict(term.attrs))
-            return out if isinstance(out, torch.Tensor) else None
-        except Exception:
-            return None
-    return None
+    return eval_term(
+        term,
+        param_env=params,
+        bindings=bindings,
+        tensor_only=True,
+    )
 
 
 def _is_causal_keep_mask(mask_val: torch.Tensor, q_shape) -> bool:

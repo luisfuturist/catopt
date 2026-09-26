@@ -54,7 +54,7 @@ from typing import Any
 
 import torch
 
-from catopt.egraph import EGraph, Rewrite
+from catopt.egraph import EGraph
 from catopt.ir import Const, Op, Param, TensorType
 
 __all__ = [
@@ -129,20 +129,16 @@ def optimize_weight(
                         Param(un, TensorType((o, r))),
                         Param(vn, TensorType((r, i))),
                     )
-                    meid = eg.add_term(member)
-                    wit = (
-                        Rewrite(
-                            name=f"wlr#{meid}",
-                            lhs=leaf,
-                            rhs=member,
-                            law=f"W ≈ U_rΣVᵀ, ‖ΔW‖₂ = σ_{r + 1}",
-                            error_bound=bound,
-                            bound_norm="spectral",
-                        )
-                        if witness
-                        else None
+                    eg._offer_witness(
+                        root,
+                        rhs_term=member,
+                        lhs_term=leaf,
+                        provenance="wlr",
+                        law=f"W ≈ U_rΣVᵀ, ‖ΔW‖₂ = σ_{r + 1}",
+                        witness=witness,
+                        error_bound=bound,
+                        bound_norm="spectral",
                     )
-                    eg.union(root, meid, witness=wit)
                     offers.append(("lowrank", r, bound))
         # ---- Kronecker-sum offer (executable form) -------------------
         # A⊗B = reshape(transpose(reshape(Avec@Bvecᵀ,(m1,n1,m2,n2)),
@@ -213,20 +209,16 @@ def optimize_weight(
                         shape=(o, i),
                     )
                     acc = kt if acc is None else Op.make("add", acc, kt)
-                meid = eg.add_term(acc)
-                wit = (
-                    Rewrite(
-                        name=f"wkron#{meid}",
-                        lhs=leaf,
-                        rhs=acc,
-                        law=f"W ≈ Σ_{K} Aᵢ⊗Bᵢ, ‖ΔW‖_F = {resid:.3e}",
-                        error_bound=resid,
-                        bound_norm="frobenius",
-                    )
-                    if witness
-                    else None
+                eg._offer_witness(
+                    root,
+                    rhs_term=acc,
+                    lhs_term=leaf,
+                    provenance="wkron",
+                    law=f"W ≈ Σ_{K} Aᵢ⊗Bᵢ, ‖ΔW‖_F = {resid:.3e}",
+                    witness=witness,
+                    error_bound=resid,
+                    bound_norm="frobenius",
                 )
-                eg.union(root, meid, witness=wit)
                 offers.append(("kron", K, resid))
                 break
             else:
@@ -250,20 +242,16 @@ def optimize_weight(
                 ),
                 Const(float(s)),
             )
-            meid = eg.add_term(member)
-            wit = (
-                Rewrite(
-                    name=f"wquant#{meid}",
-                    lhs=leaf,
-                    rhs=member,
-                    law=f"W ≈ int{bits}·s, ‖ΔW‖_F ≤ (s/2)·√n",
-                    error_bound=bound,
-                    bound_norm="frobenius",
-                )
-                if witness
-                else None
+            eg._offer_witness(
+                root,
+                rhs_term=member,
+                lhs_term=leaf,
+                provenance="wquant",
+                law=f"W ≈ int{bits}·s, ‖ΔW‖_F ≤ (s/2)·√n",
+                witness=witness,
+                error_bound=bound,
+                bound_norm="frobenius",
             )
-            eg.union(root, meid, witness=wit)
             offers.append(("quant", bits, bound))
 
     # saturate the generator programs themselves with the ordinary
@@ -674,24 +662,20 @@ def quant_params(
                     f"{wt.name}: ‖W−Ŵ‖_F ≤ (s/2)·√n = "
                     f"{bound:.3e} (s={s:.3e})"
                 )
-            wit = None
-            if witness:
-                wit = Rewrite(
-                    name=f"eps_q{bits}#{member_eid}",
-                    lhs=wt,
-                    rhs=member,
-                    law=law,
-                    error_bound=bound,
-                    bound_norm="frobenius",
-                )
-            eg.union(
+            eg._offer_witness(
                 c,
                 member_eid,
-                witness=wit,
+                rhs_term=member,
+                lhs_term=wt,
+                provenance=f"eps_q{bits}",
+                law=law,
+                witness=witness,
                 note=(
                     f"eps_quant: {wt.name} -> int{bits}"
                     f"{'/chan' if flat is not None else ''}"
                 ),
+                error_bound=bound,
+                bound_norm="frobenius",
             )
             offers.append(
                 {
@@ -777,35 +761,23 @@ def low_rank_gather(
                 "matmul",
                 (g, eg.add_term(Param(vname, TensorType((r, d))))),
             )
-            offer_term = eg.any_term(outer)
-            src_term = eg._oldest_term(c) or eg.any_term(c)
-            wit = None
-            if (
-                witness
-                and offer_term is not None
-                and src_term is not None
-            ):
-                wit = Rewrite(
-                    name=f"eps_emb#{outer}",
-                    lhs=src_term,
-                    rhs=offer_term,
-                    law=(
-                        f"low-rank embedding of {wt.name}: "
-                        f"W ≈ U_rΣ_rV_rᵀ, ‖W−Ŵ‖₂ = σ_{r + 1} = "
-                        f"{bound:.3e} (Eckart–Young; per-row error "
-                        "≤ bound)"
-                    ),
-                    error_bound=bound,
-                    bound_norm="spectral",
-                )
-            eg.union(
+            eg._offer_witness(
                 c,
                 outer,
-                witness=wit,
+                provenance="eps_emb",
+                law=(
+                    f"low-rank embedding of {wt.name}: "
+                    f"W ≈ U_rΣ_rV_rᵀ, ‖W−Ŵ‖₂ = σ_{r + 1} = "
+                    f"{bound:.3e} (Eckart–Young; per-row error "
+                    "≤ bound)"
+                ),
+                witness=witness,
                 note=(
                     f"eps_low_rank_gather: {wt.name} "
                     f"({v}x{d}) -> rank {r}, ε={bound:.3e}"
                 ),
+                error_bound=bound,
+                bound_norm="spectral",
             )
             offers.append(
                 {
@@ -976,35 +948,23 @@ def kron_linear_params(
             )
             if len(node.children) == 3:
                 outer = eg.add_enode("add", (outer, node.children[2]))
-            offer_term = eg.any_term(outer)
-            src_term = eg._oldest_term(c) or eg.any_term(c)
-            wit = None
-            if (
-                witness
-                and offer_term is not None
-                and src_term is not None
-            ):
-                wit = Rewrite(
-                    name=f"eps_kron#{outer}",
-                    lhs=src_term,
-                    rhs=offer_term,
-                    law=(
-                        f"Kronecker-sum factorisation of {wt.name}: "
-                        f"W ≈ Σ_{K} Aᵢ⊗Bᵢ, rearranged SVD residual "
-                        f"‖W−Ŵ‖_F = {resid:.3e} (exact)"
-                    ),
-                    error_bound=resid,
-                    bound_norm="frobenius",
-                )
-            eg.union(
+            eg._offer_witness(
                 c,
                 outer,
-                witness=wit,
+                provenance="eps_kron",
+                law=(
+                    f"Kronecker-sum factorisation of {wt.name}: "
+                    f"W ≈ Σ_{K} Aᵢ⊗Bᵢ, rearranged SVD residual "
+                    f"‖W−Ŵ‖_F = {resid:.3e} (exact)"
+                ),
+                witness=witness,
                 note=(
                     f"eps_kron: {wt.name} ({o}x{i}) -> "
                     f"{K} terms ({m1}x{n1})x({m2}x{n2}), "
                     f"ε_F={resid:.3e}"
                 ),
+                error_bound=resid,
+                bound_norm="frobenius",
             )
             offers.append(
                 {
@@ -1099,35 +1059,23 @@ def low_rank_params(
             outer = eg.add_enode(
                 "linear", tuple(outer_children), dict(node.attrs)
             )
-            offer_term = eg.any_term(outer)
-            src_term = eg._oldest_term(c) or eg.any_term(c)
-            wit = None
-            if (
-                witness
-                and offer_term is not None
-                and src_term is not None
-            ):
-                wit = Rewrite(
-                    name=f"eps_lr#{outer}",
-                    lhs=src_term,
-                    rhs=offer_term,
-                    law=(
-                        f"truncated-SVD factorisation of {wt.name}: "
-                        f"‖W − UΣVᵀ‖₂ = σ_{r + 1} = {bound:.3e} "
-                        "(exact Eckart–Young bound; output error at "
-                        "this site ≤ bound·‖x‖₂)"
-                    ),
-                    error_bound=bound,
-                    bound_norm="spectral",
-                )
-            eg.union(
+            eg._offer_witness(
                 c,
                 outer,
-                witness=wit,
+                provenance="eps_lr",
+                law=(
+                    f"truncated-SVD factorisation of {wt.name}: "
+                    f"‖W − UΣVᵀ‖₂ = σ_{r + 1} = {bound:.3e} "
+                    "(exact Eckart–Young bound; output error at "
+                    "this site ≤ bound·‖x‖₂)"
+                ),
+                witness=witness,
                 note=(
                     f"eps_low_rank: {wt.name} ({o}x{i}) "
                     f"-> rank {r}, ε={bound:.3e}"
                 ),
+                error_bound=bound,
+                bound_norm="spectral",
             )
             offers.append(
                 {

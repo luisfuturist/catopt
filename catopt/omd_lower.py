@@ -56,7 +56,11 @@ from typing import Any
 import torch
 
 import catopt.xcarrier  # noqa: F401 — registers the omd_* / affd_*
-from catopt.executors import BatchedExecutorBase
+from catopt.executors import (
+    BatchedExecutorBase,
+    level_schedule,
+    slot_gathers,
+)
 from catopt.ir import IR, Op
 from catopt.torch_bridge import _IR_TO_TORCH, IRModule
 from catopt.typing import _shape_of
@@ -273,39 +277,15 @@ def build_omd_plan(root: Any) -> dict | None:
     f_term, h_term = root.args
 
     # ---- om side: leaves + compose levels ----------------------------
-    omd_leaves: list[Op] = []
-    omd_levels: list[list[Op]] = []
-    level_of: dict[Any, int] = {}
-
-    def visit(t: Op) -> int:
-        tid = t
-        if tid in level_of:
-            return level_of[tid]
-        if t.op == "omd_compose":
-            lv = max(visit(t.args[0]), visit(t.args[1])) + 1
-            level_of[tid] = lv
-            while len(omd_levels) < lv:
-                omd_levels.append([])
-            omd_levels[lv - 1].append(t)
-            return lv
-        level_of[tid] = 0
-        omd_leaves.append(t)
-        return 0
-
-    visit(f_term)
+    # Level schedule — term-keyed; omd_compose is the internal binary
+    # node, everything else is a level-0 carrier leaf.
+    omd_leaves, omd_levels = level_schedule(
+        f_term, lambda t: t.args, lambda t: t.op != "omd_compose"
+    )
     slot = {lf: i for i, lf in enumerate(omd_leaves)}
-    nxt = len(omd_leaves)
-    omd_gather = []
-    for nodes in omd_levels:
-        omd_gather.append(
-            (
-                [slot[t.args[0]] for t in nodes],
-                [slot[t.args[1]] for t in nodes],
-            )
-        )
-        for t in nodes:
-            slot[t] = nxt
-            nxt += 1
+    omd_gather = slot_gathers(
+        omd_levels, lambda t: t.args, slot, len(omd_leaves)
+    )
 
     # ---- scan leaf tensor args (and h) for map projections -----------
     targets: dict[Any, tuple[Any, str]] = {}  # map term -> (term, domain)
@@ -527,24 +507,21 @@ def build_omd_plan(root: Any) -> dict | None:
         return plan
 
     # ---- forest mode: per-domain level-batched compose ---------------
+    # The leaf/level tables were built by walk_map (the iterative
+    # cousin of level_schedule — kept bespoke: prefix chains nest O(T)
+    # deep, and the walk interleaves per-domain validation with the
+    # leaf-arg scan); the slot/gather tail IS the shared skeleton.
     for dom, d in domains.items():
         if not _sig_uniform(d["leaves"], dom):
             return None
         slot_d = {lf: i for i, lf in enumerate(d["leaves"])}
-        nxt_d = len(d["leaves"])
-        gather = []
-        for nodes in d["levels"]:
-            gather.append(
-                (
-                    [slot_d[t.args[0]] for t in nodes],
-                    [slot_d[t.args[1]] for t in nodes],
-                )
-            )
-            for t in nodes:
-                slot_d[t] = nxt_d
-                nxt_d += 1
         d["slot"] = slot_d
-        d["gather"] = gather
+        d["gather"] = slot_gathers(
+            d["levels"],
+            lambda t: t.args,
+            slot_d,
+            len(d["leaves"]),
+        )
         d["a_gather"] = _part_gather(d["leaves"], 0)
         d["b_gather"] = _part_gather(d["leaves"], 1)
     plan["map_mode"] = "forest"

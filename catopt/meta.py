@@ -1246,6 +1246,10 @@ def synthesize_rules(
         # covers vetoing; extra derives would be dead weight).
         placeholders = _rhs_derive_placeholders(rhs)
         drv = derive if (derive is not None and placeholders) else None
+        # Not the pointwise-offer ritual (``EGraph._offer_witness``):
+        # this mints a *candidate rule* for the synthesiser —
+        # validated, subsumption-checked, collected — with no e-class
+        # union involved.
         cand = Rewrite(
             name=f"syn_{r1.name}__{r2.name}_{counter[0]}",
             lhs=lhs,

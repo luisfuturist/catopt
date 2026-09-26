@@ -344,6 +344,125 @@ class EGraph(_ExtractMixin, _ProofMixin):
         """Every rule application recorded during saturation."""
         return list(self._applications)
 
+    # -- non-local offers: the pointwise-witness ritual --------------------
+
+    def _pointwise_witness(
+        self,
+        cid: int,
+        rhs_eid: int,
+        *,
+        rhs_term: Any = None,
+        lhs_term: Any = None,
+        provenance: str,
+        law: str,
+        name_eid: int | None = None,
+        error_bound: float | None = None,
+        bound_norm: str = "spectral",
+    ) -> Rewrite | None:
+        """Synthesise the pointwise :class:`Rewrite` certifying one
+        non-locally offered member — see :meth:`_offer_witness`.
+
+        ``lhs`` defaults to the *oldest* member of ``cid``'s class —
+        the term the e-graph saw first — chosen so the certificate's
+        ``src`` side usually *is* the witness LHS and the bridging
+        connect is trivial.  Passes asserting a specific member (a
+        Param leaf they just interned, say) pass ``lhs_term``
+        explicitly.  ``rhs`` is the offered member itself, resolved
+        through :meth:`any_term` when ``rhs_term`` is not given;
+        passes needing a *deterministic* representative
+        (``_any_term_cached``, ``_oldest_term``) resolve it themselves
+        and pass the term in.
+
+        The name is ``f"{provenance}#{rhs_eid}"`` — unique per offered
+        enode, so several offers in one graph never collide in
+        ``_rule_objs`` (``name_eid`` overrides the anchor for a pass
+        that names the merge after the other side).
+
+        Returns ``None`` when either side is unresolvable — a
+        degenerate fully-cyclic class — so the caller's merge may
+        proceed witness-free and stay ``egraph_dependent`` rather than
+        carrying a fabricated certificate.  (The older
+        ``or any_term`` fallback some sites used can never fire: both
+        resolvers return ``None`` exactly when the class has no
+        acyclic member.)
+        """
+        if rhs_term is None:
+            rhs_term = self.any_term(rhs_eid)
+        src = (
+            lhs_term
+            if lhs_term is not None
+            else self._oldest_term(self.find(cid))
+        )
+        if src is None or rhs_term is None:
+            return None
+        return Rewrite(
+            name=(
+                f"{provenance}#"
+                f"{name_eid if name_eid is not None else rhs_eid}"
+            ),
+            lhs=src,
+            rhs=rhs_term,
+            law=law,
+            error_bound=error_bound,
+            bound_norm=bound_norm,
+        )
+
+    def _offer_witness(
+        self,
+        cid: int,
+        rhs_eid: int | None = None,
+        *,
+        rhs_term: Any = None,
+        lhs_term: Any = None,
+        provenance: str,
+        law: str,
+        witness: bool = True,
+        note: str = "",
+        name_eid: int | None = None,
+        error_bound: float | None = None,
+        bound_norm: str = "spectral",
+        term_provenance: str = "input",
+    ) -> bool:
+        """Offer a non-locally-computed member under a pointwise
+        witness — the canonical ritual behind every non-local pass.
+
+        A non-local pass offers a member no LHS pattern could produce
+        (it is computed from the whole e-graph, not from a matched
+        subterm).  Recording the merge under a synthesised
+        :class:`Rewrite` — ``class_member -> offered_term`` — makes
+        the asserted equality replayable: :meth:`certificate` emits it
+        as a named step and ``verify_certificate`` re-matches and
+        re-instantiates it standalone instead of emitting an
+        ``egraph_dependent`` stub.
+
+        Steps: intern ``rhs_term`` via :meth:`add_term` when
+        ``rhs_eid`` is not given (``term_provenance`` tags the new
+        enodes), mint the witness through :meth:`_pointwise_witness`,
+        then :meth:`union` the two classes under it.  ``witness``
+        toggles the witness only — the merge happens either way, so a
+        pass declining certificates stays honestly witness-free.
+        ``note`` rides on the :class:`ProofEdge` like every other
+        union.  Returns :meth:`union`'s result.
+        """
+        if rhs_eid is None:
+            rhs_eid = self.add_term(rhs_term, provenance=term_provenance)
+        wit = (
+            self._pointwise_witness(
+                cid,
+                rhs_eid,
+                rhs_term=rhs_term,
+                lhs_term=lhs_term,
+                provenance=provenance,
+                law=law,
+                name_eid=name_eid,
+                error_bound=error_bound,
+                bound_norm=bound_norm,
+            )
+            if witness
+            else None
+        )
+        return self.union(cid, rhs_eid, witness=wit, note=note)
+
     # -- pattern matching --
 
     def matches(

@@ -11,6 +11,15 @@ mixin (extracted in plan 0002 phase A) single-sources that shared
 machinery; each concrete class keeps its own ``__init__`` and its own
 ``_forward_impl`` plan section, which genuinely differ per carrier.
 
+The module also hosts the plan-time **level-schedule skeleton**
+(extracted in plan 0002 phase D) — :func:`level_schedule` (post-order
+``visit()`` assigning tree levels) and :func:`slot_gathers`
+(leaf-first slot numbering + per-level operand gathers) — shared by
+``build_scan_plan``/``build_om_plan``/``build_omd_plan``.  The
+per-domain seeding stays at the sites: om weights leaf slots by DAG
+multiplicity and omd's map forest walks iteratively per domain, so
+the helpers expose the invariant, not a policy.
+
 Ports layer: the concrete classes conform to
 :class:`catopt.ports.BatchedExecutor` (``forward`` + ``_plan`` +
 ``is_batched``); the members here stay class-level API, not port
@@ -24,7 +33,87 @@ from typing import Any, Self
 
 import torch
 
-__all__ = ["BatchedExecutorBase"]
+__all__ = ["BatchedExecutorBase", "level_schedule", "slot_gathers"]
+
+
+def level_schedule(
+    root: Any,
+    children_of: Callable[[Any], Any],
+    is_leaf: Callable[[Any], bool],
+    *,
+    key: Callable[[Any], Any] = lambda t: t,
+) -> tuple[list, list[list]]:
+    """Post-order level assignment over a compose tree (or DAG).
+
+    ``visit(t)`` returns ``t``'s level — 0 when ``is_leaf(t)``, else
+    ``max(children's levels) + 1`` — appending leaves to ``leaves``
+    in first-encounter order and internal nodes to ``levels[lv-1]``,
+    so every node's operands sit at strictly earlier levels.  Shared
+    subtrees are visited once via the ``key``-projected memo: the
+    default is the term itself (post-hash-consing terms are interned
+    — content keys); ``id`` keeps strict per-object identity.
+
+    Returns ``(leaves, levels)``; pair with :func:`slot_gathers` for
+    the leaf-first slot numbering + per-level operand gathers.
+    ``children_of``/``is_leaf`` carry the per-domain vocabulary
+    (``aff_compose`` / ``om_compose`` / ``omd_compose``).
+    """
+    leaves: list = []
+    levels: list[list] = []
+    level_of: dict[Any, int] = {}
+
+    def visit(t: Any) -> int:
+        k = key(t)
+        lv = level_of.get(k)
+        if lv is not None:
+            return lv
+        if is_leaf(t):
+            level_of[k] = 0
+            leaves.append(t)
+            return 0
+        lv = max(visit(a) for a in children_of(t)) + 1
+        level_of[k] = lv
+        while len(levels) < lv:
+            levels.append([])
+        levels[lv - 1].append(t)
+        return lv
+
+    visit(root)
+    return leaves, levels
+
+
+def slot_gathers(
+    levels: list[list],
+    children_of: Callable[[Any], Any],
+    slot: dict,
+    next_slot: int,
+    *,
+    key: Callable[[Any], Any] = lambda t: t,
+) -> list[tuple[list[int], list[int]]]:
+    """Leaf-first slot numbering + per-level operand gathers.
+
+    ``slot`` arrives seeded with the leaf slots — contiguous
+    ``0..n-1`` at most sites, or om_lower's multiplicity-weighted
+    layout (DAG-shared leaves occupy one slot per occurrence — pass
+    the real ``next_slot``).  Each level's outputs then take
+    consecutive slots in order, so every operand slot is < its own
+    level's outputs.  Returns ``gathers[k] == (f_slots, g_slots)``,
+    the index_select lists each level consumes.  ``slot`` is mutated
+    (internal nodes added) so the caller reads the root's slot
+    afterwards.
+    """
+    gathers: list[tuple[list[int], list[int]]] = []
+    for nodes in levels:
+        gathers.append(
+            (
+                [slot[key(children_of(t)[0])] for t in nodes],
+                [slot[key(children_of(t)[1])] for t in nodes],
+            )
+        )
+        for t in nodes:
+            slot[key(t)] = next_slot
+            next_slot += 1
+    return gathers
 
 
 class BatchedExecutorBase:

@@ -18,7 +18,6 @@ properties — just evaluated over the diagram rather than a term.
 
 from typing import Any
 
-from catopt.egraph import Rewrite
 from catopt.ir import Op
 
 # ---------------------------------------------------------------------------
@@ -179,22 +178,19 @@ def _pair_shared_input(
                 # Replayable witness: the member's own class term ->
                 # its section of the fused GEMM.  Pointwise honesty —
                 # asserts this instance, exactly what the pass proved.
-                src = getattr(eg, "_oldest_term", eg.any_term)(cid)
                 split_term = eg._any_term_cached(split_eid)
-                wit = None
-                if src is not None and split_term is not None:
-                    wit = Rewrite(
-                        name=f"pair#{split_eid}",
-                        lhs=src,
-                        rhs=split_term,
-                        law=(
-                            "pointwise witness for a non-local offer: "
-                            "this member equals its split section of "
-                            "the shared fused weight (equality "
-                            "established by the pairing pass)"
-                        ),
-                    )
-                eg.union(cid, split_eid, witness=wit)
+                eg._offer_witness(
+                    cid,
+                    split_eid,
+                    rhs_term=split_term,
+                    provenance="pair",
+                    law=(
+                        "pointwise witness for a non-local offer: "
+                        "this member equals its split section of "
+                        "the shared fused weight (equality "
+                        "established by the pairing pass)"
+                    ),
+                )
                 group.setdefault(cid, enode)
             groups.append(group)
     return groups
@@ -327,23 +323,20 @@ def share_duplicate_params(
             t = source_tensors[name]
             p = Param(name, TensorType(tuple(int(d) for d in t.shape)))
             eid = eg.add_term(p)
-            wit = None
-            if witness:
-                wit = Rewrite(
-                    name=f"share#{eid}",
-                    lhs=p,
-                    rhs=canon_term,
-                    law=(
-                        "pointwise witness for exact weight tying: "
-                        "the two parameter leaves hold bitwise-equal "
-                        "tensors (equality established by the sharing "
-                        "pass over source tensors)"
-                    ),
-                )
-            eg.union(
+            eg._offer_witness(
                 eid,
                 canon_eid,
-                witness=wit,
+                rhs_term=canon_term,
+                lhs_term=p,
+                provenance="share",
+                name_eid=eid,
+                law=(
+                    "pointwise witness for exact weight tying: "
+                    "the two parameter leaves hold bitwise-equal "
+                    "tensors (equality established by the sharing "
+                    "pass over source tensors)"
+                ),
+                witness=witness,
                 note=f"share_duplicate_params: {name} == {canon}",
             )
     return groups
@@ -486,25 +479,20 @@ def share_duplicate_param_slices(
             member, provenance="share_duplicate_param_slices"
         )
         w_term = Param(name, TensorType((o, i)))
-        wit = None
-        if witness:
-            wit = Rewrite(
-                name=f"share_slices#{member_eid}",
-                lhs=w_term,
-                rhs=member,
-                law=(
-                    "pointwise witness for slice-level weight sharing: "
-                    "the parameter's head row-blocks are bitwise-equal "
-                    "to blocks of the deduplicated stack under "
-                    "index_map (equality established by the sharing "
-                    "pass over source tensors)"
-                ),
-                error_bound=None,
-            )
-        eg.union(
+        eg._offer_witness(
             w_eid,
             member_eid,
-            witness=wit,
+            rhs_term=member,
+            lhs_term=w_term,
+            provenance="share_slices",
+            law=(
+                "pointwise witness for slice-level weight sharing: "
+                "the parameter's head row-blocks are bitwise-equal "
+                "to blocks of the deduplicated stack under "
+                "index_map (equality established by the sharing "
+                "pass over source tensors)"
+            ),
+            witness=witness,
             note=(
                 f"share_duplicate_param_slices: {name} (o={o}) "
                 f"= {h} heads x {d} rows -> {k} unique"

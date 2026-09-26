@@ -1942,30 +1942,15 @@ def _stack_dim(attrs: dict) -> int:
     return _tsd(attrs)
 
 
-def _offer_witness(
-    eg: EGraph,
-    cid: int,
-    offered: Any,
-    offered_eid: int,
-    provenance: str,
-):
-    """Pointwise Rewrite certifying a non-local offer — the same
-    convention as ``trace_lift._lift_witness``: lhs is the oldest
-    member of the class, rhs the offered term; the merge replays as a
-    named rule step in certificates."""
-    src = eg._oldest_term(eg.find(cid))
-    if src is None:  # pragma: no cover — every e-class is born with an acyclic enode
-        return None
-    return Rewrite(
-        name=f"{provenance}#{offered_eid}",
-        lhs=src,
-        rhs=offered,
-        law=(
-            "pointwise witness for a non-local offer: stack of "
-            "same-state carrier applications is one application of "
-            "the stacked map"
-        ),
-    )
+#: Pointwise-witness law text for the non-local carrier offers — the
+#: merges mint through :meth:`EGraph._offer_witness` (lhs is the
+#: oldest member of the class, rhs the offered term) so they replay
+#: as named rule steps in certificates.
+_XC_OFFER_LAW = (
+    "pointwise witness for a non-local offer: stack of "
+    "same-state carrier applications is one application of "
+    "the stacked map"
+)
 
 
 def _map_out_shape(f_shape, h_shape, kind: str):
@@ -2083,17 +2068,13 @@ def _gather_stack(
                     fmap = eg.add_enode(pack_op, (sa, sb))
                     out = eg.add_enode(apply_op, (fmap, h_eid))
                     offered_term = eg.any_term(out)
-                    w = (
-                        _offer_witness(
-                            eg, c, offered_term, out, provenance
-                        )
-                        if witness and offered_term is not None
-                        else None
-                    )
-                    eg.union(
+                    eg._offer_witness(
                         c,
                         out,
-                        witness=w,
+                        rhs_term=offered_term,
+                        provenance=provenance,
+                        law=_XC_OFFER_LAW,
+                        witness=witness,
                         note=(
                             f"{provenance}: stack of "
                             f"{len(kids)} {apply_op} members "
@@ -2294,15 +2275,13 @@ def omd_tree_lift(
                         continue
                     out = eg.add_enode(apply_op, (root, h_eid))
                     offered = eg.any_term(out)
-                    w = (
-                        _offer_witness(eg, c, offered, out, provenance)
-                        if witness and offered is not None
-                        else None
-                    )
-                    eg.union(
+                    eg._offer_witness(
                         c,
                         out,
-                        witness=w,
+                        rhs_term=offered,
+                        provenance=provenance,
+                        law=_XC_OFFER_LAW,
+                        witness=witness,
                         note=(
                             f"{provenance}: om tree over "
                             f"{kind}-affine values, shared h"

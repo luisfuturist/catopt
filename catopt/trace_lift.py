@@ -526,6 +526,21 @@ class TraceLift:
     split: tuple | None = None
 
 
+#: Pointwise-witness law text for every trace offer.  The pass
+#: asserts this equality by construction — it builds F so that
+#: ``matmul(trace(F), v)`` is the fixpoint of THIS unrolled
+#: recurrence — and recording the union under the synthesised rule
+#: makes that assertion replayable: ``certificate`` emits it as a
+#: named step and ``verify_certificate`` re-matches/re-instantiates
+#: it on real terms.
+_LIFT_LAW = (
+    "pointwise witness for a non-local offer: this unrolled "
+    "recurrence equals its nilpotent block-shift trace "
+    "fixpoint (equality established by construction in "
+    "lift_scan_to_trace)"
+)
+
+
 def _lift_witness(
     eg: EGraph,
     cid: int,
@@ -535,35 +550,18 @@ def _lift_witness(
 ) -> Rewrite | None:
     """Synthesise the pointwise :class:`Rewrite` certifying one offer.
 
-    ``lhs`` is the *oldest* member of the recurrence class — the term
-    the e-graph saw first (the input spine or carrier the pass
-    recognised), chosen so the certificate's ``src`` side usually *is*
-    the witness LHS and the bridging connect is trivial.  ``rhs`` is
-    the offered trace member itself.  The pass asserts this equality by
-    construction — it built F so that ``matmul(trace(F), v)`` is the
-    fixpoint of THIS unrolled recurrence — and recording the union
-    under the synthesised rule makes that assertion replayable:
-    ``certificate`` emits it as a named step and
-    ``verify_certificate`` re-matches/re-instantiates it on real terms.
-
-    The name is unique per offered enode so several offers in one graph
-    never collide in ``_rule_objs``.  Returns ``None`` when the class
-    has no resolvable member (degenerate cyclic graph) — the union then
+    Thin trace-law wrapper over :meth:`EGraph._pointwise_witness`
+    (``lhs`` is the oldest member of the recurrence class, ``rhs`` the
+    offered trace member).  Returns ``None`` when the class has no
+    resolvable member (degenerate cyclic graph) — the union then
     proceeds witness-free and stays ``egraph_dependent``.
     """
-    src = eg._oldest_term(eg.find(cid))
-    if src is None:
-        return None
-    return Rewrite(
-        name=f"{provenance}#{offered_eid}",
-        lhs=src,
-        rhs=offered,
-        law=(
-            "pointwise witness for a non-local offer: this unrolled "
-            "recurrence equals its nilpotent block-shift trace "
-            "fixpoint (equality established by construction in "
-            "lift_scan_to_trace)"
-        ),
+    return eg._pointwise_witness(
+        cid,
+        offered_eid,
+        rhs_term=offered,
+        provenance=provenance,
+        law=_LIFT_LAW,
     )
 
 
@@ -586,14 +584,13 @@ def _offer(
     if not em.broken:
         F = _channel_F(em, plan.kind, maps, d)
         tr, _vec, out = _emit_head(em, F, ins, h0, d, T * d)
-        eg.union(
+        eg._offer_witness(
             cid,
             out[0],
-            witness=(
-                _lift_witness(eg, cid, out[1], out[0], provenance)
-                if witness
-                else None
-            ),
+            rhs_term=out[1],
+            provenance=provenance,
+            law=_LIFT_LAW,
+            witness=witness,
             note=(
                 f"trace_lift: unrolled {plan.kind} recurrence "
                 f"(T={T}, d={d}) → nilpotent block-shift fixpoint"
@@ -631,14 +628,13 @@ def _offer(
         trp = em.op("trace", (Fp,), {"usize": (u1, u2)})
         mvp = em.op("matmul", (trp, vec2))
         outp = em.op("reshape", (mvp,), {"shape": (d,)})
-        eg.union(
+        eg._offer_witness(
             cid,
             outp[0],
-            witness=(
-                _lift_witness(eg, cid, outp[1], outp[0], provenance)
-                if witness
-                else None
-            ),
+            rhs_term=outp[1],
+            provenance=provenance,
+            law=_LIFT_LAW,
+            witness=witness,
             note=(
                 f"trace_lift: channel-split {part} of a T={T} "
                 f"diagonal recurrence → joint trace over parl"
@@ -687,7 +683,7 @@ def lift_scan_to_trace(
     strict prefixes of a longer recognised chain.
 
     ``witness`` attaches a replayable certificate witness to every
-    offered union (see :func:`_lift_witness` and
+    offered union (see :meth:`EGraph._offer_witness` and
     ``EGraph.union(..., witness=...)``): each offer's merge then shows
     up in :meth:`EGraph.certificate` as a named, standalone-replayable
     rule step instead of an ``egraph_dependent`` stub, so

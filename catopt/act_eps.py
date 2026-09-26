@@ -55,7 +55,7 @@ from typing import Any
 
 import torch
 
-from catopt.egraph import EGraph, ENode, Rewrite
+from catopt.egraph import EGraph, ENode
 from catopt.ir import Const, Op, Param, TensorType, Var, op_def, op_repr
 
 __all__ = [
@@ -253,34 +253,24 @@ def _wrap_sites(
                     continue
                 seen.add(key)
                 bound, norm = bound_of(ch_c)
-                src_term = eg._oldest_term(cc) or eg.any_term(cc)
                 # Deterministic RHS: the member with each child resolved
                 # to its class's OLDEST term — the derivation then
                 # bridges original members, not arbitrary (possibly
                 # bound-carrying) ones, keeping certificates tight.
                 offer_term = eg._oldest_term(meid) or eg.any_term(meid)
-                wit = None
-                if (
-                    witness
-                    and src_term is not None
-                    and offer_term is not None
-                ):
-                    wit = Rewrite(
-                        name=f"{tag}#{meid}",
-                        lhs=src_term,
-                        rhs=offer_term,
-                        law=law_of(ch_c, i, node, bound),
-                        error_bound=bound,
-                        bound_norm=norm,
-                    )
-                merged = eg.union(
+                merged = eg._offer_witness(
                     cc,
                     meid,
-                    witness=wit,
+                    rhs_term=offer_term,
+                    provenance=tag,
+                    law=law_of(ch_c, i, node, bound),
+                    witness=witness,
                     note=(
                         f"{tag}: wrap input {i} of {node.op} "
                         f"(activation class {ch_c}), ε={bound:.3e}"
                     ),
+                    error_bound=bound,
+                    bound_norm=norm,
                 )
                 offers.append(
                     {

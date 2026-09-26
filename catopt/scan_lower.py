@@ -36,7 +36,11 @@ from typing import Any
 
 import torch
 
-from catopt.executors import BatchedExecutorBase
+from catopt.executors import (
+    BatchedExecutorBase,
+    level_schedule,
+    slot_gathers,
+)
 from catopt.ir import IR, Op, Param
 from catopt.torch_bridge import IRModule
 from catopt.typing import _shape_of
@@ -243,27 +247,16 @@ def build_scan_plan(root: Any) -> dict | None:
     f_term, h_term = root.args
     diag = root.op == "applyd"
 
-    leaves: list[Op] = []
-    levels: list[list[Op]] = []
-    level_of: dict[int, int] = {}
     leaf_op = "aff_diag" if root.op == "applyd" else "aff"
-
-    def visit(t: Op) -> int:
-        tid = id(t)
-        if tid in level_of:
-            return level_of[tid]
-        if t.op == leaf_op:
-            level_of[tid] = 0
-            leaves.append(t)
-            return 0
-        lv = max(visit(t.args[0]), visit(t.args[1])) + 1
-        level_of[tid] = lv
-        while len(levels) < lv:
-            levels.append([])
-        levels[lv - 1].append(t)
-        return lv
-
-    visit(f_term)
+    # Level schedule, id()-keyed like the historical visit: post-fold
+    # the tree is Op.make-interned, so term keys would be equivalent —
+    # id() simply makes the per-object dedup explicit.
+    leaves, levels = level_schedule(
+        f_term,
+        lambda t: t.args,
+        lambda t: t.op == leaf_op,
+        key=id,
+    )
     if not _leaf_shapes_consistent(leaves):
         return None
 
@@ -272,15 +265,9 @@ def build_scan_plan(root: Any) -> dict | None:
     slot: dict[int, int] = {
         id(lf): i for i, lf in enumerate(leaves)
     }
-    next_slot = len(leaves)
-    level_gather: list[tuple[list[int], list[int]]] = []
-    for nodes in levels:
-        f_idx = [slot[id(t.args[0])] for t in nodes]
-        g_idx = [slot[id(t.args[1])] for t in nodes]
-        level_gather.append((f_idx, g_idx))
-        for t in nodes:
-            slot[id(t)] = next_slot
-            next_slot += 1
+    level_gather = slot_gathers(
+        levels, lambda t: t.args, slot, len(leaves), key=id
+    )
 
     a0 = leaves[0].args[0]
     leaf_a_shared = all(

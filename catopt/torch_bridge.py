@@ -7,6 +7,7 @@ model parameter names (W1, W2, ...) and retrieve their shapes.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -740,6 +741,121 @@ def _dim_args(args: tuple, kwargs: dict) -> tuple:
     return (dim, bool(keep))
 
 
+#: Sentinel for "no default supplied" — distinct from ``None`` so a
+#: legitimate ``None`` default (e.g. a zero-arg forward's ``x``) still
+#: resolves instead of reading as failure.
+_MISS: Any = object()
+
+
+def _randn_param(term: Param) -> torch.Tensor:
+    """``IRModule._eval``'s unregistered-Param fallback: a fresh randn
+    of the declared shape (``None`` dims materialise as extent 1)."""
+    shape = tuple(d if d is not None else 1 for d in term.typ.shape)
+    return torch.randn(*shape)
+
+
+def eval_term(
+    term: Any,
+    *,
+    var_env: dict | None = None,
+    param_env: dict | None = None,
+    bindings: Any = None,
+    memo: dict | None = None,
+    strict: bool = False,
+    var_default: Any = _MISS,
+    param_default: Callable[[Param], Any] | None = None,
+    tensor_only: bool = False,
+) -> Any:
+    """Evaluate an IR term against concrete environments.
+
+    Single source for the eval-term family (plan 0002 phase D) —
+    :meth:`IRModule._eval` (strict runtime eval), the permissive
+    compile-time folds ``optimize._eval_const`` /
+    ``ibp._eval_concrete``, and ``_fold_weight_chains``' shallow fold
+    all delegate here.  Leaf semantics:
+
+    * ``Var``   → ``var_env[name]``; on a miss, ``var_default`` when
+      the caller supplied one (``IRModule`` passes the forward's first
+      input — the single-input "self" fallback), else failure.
+    * ``Param`` → ``param_env[name]``; on a miss,
+      ``param_default(term)`` when given (``IRModule`` passes
+      :func:`_randn_param` — the unshaped-Param fallback), else
+      failure.
+    * ``Const`` → ``torch.tensor(value)``.
+    * ``Op``    → ``bindings[op](*args, **attrs)``; ``memo`` (when
+      given) dedups DAG-shared subtrees — interned terms are content
+      keys.
+
+    ``strict=True`` is the runtime contract: a missing binding raises
+    ``ValueError``, binding errors propagate with grad enabled, and an
+    unknown term type raises ``TypeError``.  ``strict=False`` is the
+    fold contract: any un-evaluatable piece — missing leaf, missing
+    binding, raising binding — yields ``None`` instead, and op calls
+    run under ``torch.no_grad()``.  ``tensor_only`` (compile-time
+    folds) additionally treats a non-Tensor op result (e.g. an ``aff``
+    pair) as failure AT EVERY level — mirroring the recursive
+    isinstance check of the fold sites it replaced, not a top-level
+    filter.  The two env-miss raises under ``strict`` are nominal —
+    every strict caller passes both defaults.
+    """
+
+    def go(t: Any) -> Any:
+        if isinstance(t, Var):
+            v = (var_env or {}).get(t.name, var_default)
+            if v is _MISS:
+                if strict:  # pragma: no cover — strict callers pass var_default
+                    raise KeyError(t.name)
+                return None
+            return v
+        if isinstance(t, Const):
+            return torch.tensor(t.value)
+        if isinstance(t, Param):
+            v = (param_env or {}).get(t.name)
+            if v is None:
+                if param_default is not None:
+                    return param_default(t)
+                if strict:  # pragma: no cover — strict callers pass param_default
+                    raise KeyError(t.name)
+                return None
+            return v
+        if isinstance(t, Op):
+            if memo is not None:
+                hit = memo.get(t)
+                if hit is not None:
+                    return hit
+            fn = (bindings or {}).get(t.op)
+            if fn is None:
+                if strict:
+                    raise ValueError(f"No torch binding for op '{t.op}'")
+                return None
+            args = [go(a) for a in t.args]
+            if not strict and any(a is None for a in args):
+                return None
+            if strict:
+                out = fn(*args, **dict(t.attrs))
+            else:
+                try:
+                    with torch.no_grad():
+                        out = fn(*args, **dict(t.attrs))
+                except Exception:
+                    return None
+            if tensor_only and not isinstance(out, torch.Tensor):
+                if strict:  # pragma: no cover — no strict caller sets tensor_only
+                    raise TypeError(
+                        f"eval_term: op '{t.op}' returned "
+                        f"{type(out).__name__}, not a tensor"
+                    )
+                return None
+            if memo is not None:
+                memo[t] = out
+            return out
+        if strict:
+            raise TypeError(f"Cannot evaluate term: {t}")
+        return None
+
+    return go(term)
+
+
 class IRModule(torch.nn.Module):
     """A torch module reconstructed from a catopt IR term.
 
@@ -872,43 +988,35 @@ class IRModule(torch.nn.Module):
                     # Try eager compile-time fold via the op table's
                     # torch bindings (ambient _IR_TO_TORCH for the
                     # default full table; the custom table's own dict
-                    # for an explicit ``ops``).
-                    vals: list[torch.Tensor] = []
-                    ok = True
-                    for a in term.args:
-                        if (
-                            isinstance(a, _Param)
-                            and a.name in self._param_values
-                        ):
-                            vals.append(self._param_values[a.name])
-                        elif isinstance(a, Const):
-                            vals.append(torch.tensor(a.value))
-                        else:
-                            ok = False
-                            break
-                    if ok:
-                        try:
-                            fn = self._torch_bindings[term.op]
-                            with torch.no_grad():
-                                fused = fn(*vals, **dict(term.attrs))
-                            if isinstance(fused, torch.Tensor):
-                                fused_name = f"fused_{len(self._param_map) + len(self._param_values)}"
-                                self._param_values[fused_name] = (
-                                    fused.detach().clone()
-                                )
-                                shape = tuple(
-                                    int(d) for d in fused.shape
-                                )
-                                from catopt.ir import TensorType
+                    # for an explicit ``ops``).  SHALLOW by design:
+                    # eval_term only fires when every arg already
+                    # resolved to a leaf — a surviving Op arg means the
+                    # fold list declined it below, and descending now
+                    # would fold ops outside that list.
+                    fused = None
+                    if all(
+                        isinstance(a, (_Param, Const)) for a in term.args
+                    ):
+                        fused = eval_term(
+                            term,
+                            param_env=self._param_values,
+                            bindings=self._torch_bindings,
+                            tensor_only=True,
+                        )
+                    if fused is not None:
+                        fused_name = f"fused_{len(self._param_map) + len(self._param_values)}"
+                        self._param_values[fused_name] = (
+                            fused.detach().clone()
+                        )
+                        shape = tuple(int(d) for d in fused.shape)
+                        from catopt.ir import TensorType
 
-                                result = _Param(
-                                    name=fused_name,
-                                    typ=TensorType(shape),
-                                )
-                                self._fold_memo[orig_key] = result
-                                return result
-                        except Exception:
-                            pass
+                        result = _Param(
+                            name=fused_name,
+                            typ=TensorType(shape),
+                        )
+                        self._fold_memo[orig_key] = result
+                        return result
         self._fold_memo[orig_key] = term
         return term
 
@@ -969,33 +1077,24 @@ class IRModule(torch.nn.Module):
         x: torch.Tensor,
         memo: dict[int, torch.Tensor],
     ) -> torch.Tensor:
-        if isinstance(term, Var):
-            return env.get(term.name, env.get("self", x))
-        if isinstance(term, Const):
-            return torch.tensor(term.value)
-        if isinstance(term, Param):
-            pid = self._param_map.get(term.name)
-            if pid is not None:
-                return pid
-            shape = tuple(
-                d if d is not None else 1 for d in term.typ.shape
-            )
-            return torch.randn(*shape)
-        if isinstance(term, Op):
-            # Shared subtrees (e.g. one fused GEMM read by two chunk
-            # projections) are the SAME object — compute once.
-            hit = memo.get(term)
-            if hit is not None:
-                return hit
-            fn = self._torch_bindings.get(term.op)
-            if fn is None:
-                raise ValueError(f"No torch binding for op '{term.op}'")
-            args = [self._eval(a, env, x, memo) for a in term.args]
-            kwargs = dict(term.attrs) if term.attrs else {}
-            result = fn(*args, **kwargs)
-            memo[term] = result
-            return result
-        raise TypeError(f"Cannot evaluate term: {term}")
+        """Strict runtime evaluation — delegates to :func:`eval_term`.
+
+        ``var_default=x`` is the single-input "self" fallback (``env``
+        always carries ``"self"`` → ``x``, so a Var missing from ``env``
+        resolves to the first input); ``param_default=_randn_param``
+        materialises Params that never registered (unshaped
+        ``typ.size is None``); shared subtrees dedup through ``memo``.
+        """
+        return eval_term(
+            term,
+            var_env=env,
+            var_default=x,
+            param_env=self._param_map,
+            param_default=_randn_param,
+            bindings=self._torch_bindings,
+            memo=memo,
+            strict=True,
+        )
 
 
 def ir_to_torch_module(

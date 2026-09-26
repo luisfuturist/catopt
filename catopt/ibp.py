@@ -262,29 +262,18 @@ _STRUCTURAL = {
 def _eval_concrete(t: Any, env: dict, values: dict):
     """Evaluate a term to a tensor: Params from ``env``, Vars from
     ``values`` (concrete inputs), Consts by value, ops via the torch
-    bindings.  ``None`` when anything is not concretely evaluatable."""
-    from catopt.torch_bridge import _IR_TO_TORCH
+    bindings.  ``None`` when anything is not concretely evaluatable.
 
-    if isinstance(t, Var):
-        return values.get(t.name)
-    if isinstance(t, Param):
-        return env.get(t.name)
-    if isinstance(t, Const):
-        return torch.tensor(t.value)
-    if isinstance(t, Op):
-        fn = _IR_TO_TORCH.get(t.op)
-        if fn is None:
-            return None
-        args = [_eval_concrete(a, env, values) for a in t.args]
-        if any(a is None for a in args):
-            return None
-        try:
-            with torch.no_grad():
-                out = fn(*args, **dict(t.attrs))
-            return out
-        except Exception:
-            return None
-    return None
+    Delegates to :func:`catopt.torch_bridge.eval_term` (plan 0002
+    phase D) — permissive mode, and unlike ``optimize._eval_const``
+    deliberately NOT ``tensor_only``: carrier bindings (``aff``,
+    ``om``, ...) return tuples that are legitimate concrete values.
+    """
+    from catopt.torch_bridge import _IR_TO_TORCH, eval_term
+
+    return eval_term(
+        t, var_env=values, param_env=env, bindings=_IR_TO_TORCH
+    )
 
 
 def _inf_box(t: Any) -> Box:
