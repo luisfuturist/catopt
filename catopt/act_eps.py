@@ -38,12 +38,14 @@ the member acyclic and models the real deployment — each consumer reads
 a quantized copy of the activation, which is exactly what an int8 KV
 cache or activation buffer does.
 
-Both ops are registered through the existing extension points —
-``ir.op_def`` for the generator and ``torch_bridge._IR_TO_TORCH`` for
-the lowering — so this module is self-contained: no edits to ir.py,
-torch_bridge.py, or eps.py.  (``eps._LIP_FREE`` additionally gains the
-two op names so ``model_bound``'s Lipschitz walk treats the ≈identity
-decode correctly.)
+Both ops are declared through the extension points — ``ir.op_def`` for
+the generator and a ``TORCH_BINDINGS`` export for the lowering
+(``catopt.ops.OpTable`` folds it in; no import-time mutation of
+``torch_bridge._IR_TO_TORCH``, plan 0001 phase 2c) — so this module is
+self-contained: no edits to ir.py, torch_bridge.py, or eps.py.
+(``eps._LIP_FREE`` additionally gains the two op names so
+``model_bound``'s Lipschitz walk treats the ≈identity decode
+correctly.)
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from catopt.ir import Const, Op, Param, TensorType, Var, op_def, op_repr
 
 __all__ = [
     "ACT_EPS_OPS",
+    "TORCH_BINDINGS",
     "act_low_rank",
     "act_quant",
     "calibrate",
@@ -66,9 +69,10 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-#  IR ops + torch bindings — registered via the existing extension points
-#  (``op_def`` writes the generator registry; ``_IR_TO_TORCH`` is the lowering
-#  table ``IRModule._eval`` dispatches through).  No ir.py/torch_bridge.py
+#  IR ops + torch bindings — declared via the extension points
+#  (``op_def`` writes the generator registry; ``TORCH_BINDINGS`` is the
+#  lowering fragment ``catopt.ops.OpTable`` folds into the table
+#  ``IRModule._eval`` dispatches through).  No ir.py/torch_bridge.py
 #  edits are needed.
 # ---------------------------------------------------------------------------
 
@@ -112,11 +116,17 @@ def _adequant_torch(pair, *a, **kw):
     return q.to(s.dtype) * s
 
 
-def _register_extensions() -> None:
-    from catopt.torch_bridge import _IR_TO_TORCH
+#: Torch lowering bindings — an EXPORT, not an import-time mutation
+#: (plan 0001 phase 2c): :class:`catopt.ops.OpTable` folds this dict in
+#: via ``register``/``full()``; importing this module registers nothing
+#: into ``torch_bridge._IR_TO_TORCH``.
+TORCH_BINDINGS: dict[str, Any] = {
+    "aquant": _aquant_torch,
+    "adequant": _adequant_torch,
+}
 
-    _IR_TO_TORCH.setdefault("aquant", _aquant_torch)
-    _IR_TO_TORCH.setdefault("adequant", _adequant_torch)
+
+def _register_extensions() -> None:
     # The decode is ≈identity: let eps.model_bound's Lipschitz walk pass
     # through the pair (the substitution error is already carried by the
     # rewrite's error_bound).  Registry extension, not an eps.py edit.

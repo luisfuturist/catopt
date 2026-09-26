@@ -104,9 +104,9 @@ import torch
 from catopt.egraph import Rewrite
 from catopt.ir import Op, op_def
 from catopt.rules import R
-from catopt.torch_bridge import _IR_TO_TORCH
 
 __all__ = [
+    "TORCH_BINDINGS",
     "TRACE_LAWS",
     "TR_COLLAPSE",
     "TR_EXPAND",
@@ -745,9 +745,15 @@ def _eye_torch(*a, **kw) -> torch.Tensor:
     return torch.eye(d, dtype=torch.get_default_dtype())
 
 
-_IR_TO_TORCH["trace"] = _trace_torch
-_IR_TO_TORCH["bdiag"] = lambda *ts, **kw: torch.block_diag(*ts)
-_IR_TO_TORCH["parl"] = _parl_torch
-_IR_TO_TORCH["eye"] = _eye_torch
-_IR_TO_TORCH["cswap"] = _cswap_torch
-_IR_TO_TORCH["inv"] = lambda t, *a, **kw: torch.linalg.inv(t)
+#: Torch lowering bindings — an EXPORT, not an import-time mutation
+#: (plan 0001 phase 2c): :class:`catopt.ops.OpTable` folds this dict in
+#: via ``register``/``full()``; importing this module registers nothing
+#: into ``torch_bridge._IR_TO_TORCH``.
+TORCH_BINDINGS: dict[str, Any] = {
+    "trace": _trace_torch,
+    "bdiag": lambda *ts, **kw: torch.block_diag(*ts),
+    "parl": _parl_torch,
+    "eye": _eye_torch,
+    "cswap": _cswap_torch,
+    "inv": lambda t, *a, **kw: torch.linalg.inv(t),
+}

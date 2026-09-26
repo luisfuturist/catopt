@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002, RUF003
 """Fixed torch_bridge.py — uses exported._graph_signature.inputs_to_parameters
 to correctly map graph placeholder targets (p_w1, p_w2, ...) to actual
 model parameter names (W1, W2, ...) and retrieve their shapes.
@@ -5,12 +6,14 @@ model parameter names (W1, W2, ...) and retrieve their shapes.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import torch
 
 from catopt.attrs import ATTR_SCHEMA
 from catopt.ir import IR, Const, Op, Param, TensorType, Var
+from catopt.ops import OpTable
 
 _ATEN_TO_IR: dict[str, str] = {
     "add": "add",
@@ -199,20 +202,16 @@ def export_to_ir(
     # Map from graph placeholder target -> model attribute name
     # e.g. {'p_w1': 'W1', 'p_w2': 'W2', 'p_w3': 'W3'}
     inputs_to_params: dict[str, str] = {}
-    try:
+    with contextlib.suppress(Exception):
         inputs_to_params = dict(
             exported._graph_signature.inputs_to_parameters
         )
-    except Exception:
-        pass
     # Buffers (e.g. nanoGPT's causal-mask `bias`) are placeholders too —
     # they are constants, not user inputs: lift them like parameters.
-    try:
+    with contextlib.suppress(Exception):
         inputs_to_params.update(
             exported._graph_signature.inputs_to_buffers
         )
-    except Exception:
-        pass
 
     env: dict[str, Any] = {}
     inputs: list[Var] = []
@@ -398,7 +397,13 @@ def _resolve_attr(module: torch.nn.Module, target: str) -> torch.Tensor:
     return obj
 
 
-_IR_TO_TORCH: dict[str, Any] = {
+#: Core torch lowering bindings — the base ``OpTable``'s table (plan
+#: 0001 phase 2c).  Carrier ops (``trace``/``omd_*``/``cmask``/
+#: ``aquant``...) are deliberately ABSENT: they live in each carrier
+#: module's ``TORCH_BINDINGS`` export and compose via
+#: :class:`catopt.ops.OpTable`, not by mutating this dict at import.
+#: ``_IR_TO_TORCH`` below is the ambient view over this table.
+_CORE_TORCH_BINDINGS: dict[str, Any] = {
     "matmul": torch.matmul,
     "add": torch.add,
     "mul": torch.mul,
@@ -604,7 +609,7 @@ _IR_TO_TORCH: dict[str, Any] = {
     # running row-max, running exp-sum denominator, running weighted
     # numerator.  Only ``om_apply`` returns a tensor — a / l, UNCLAMPED,
     # so a fully-masked row yields NaN exactly like dense softmax.
-    "om": lambda m, l, a, *x, **kw: (m, l, a),
+    "om": lambda m, lv, a, *x, **kw: (m, lv, a),
     "om_elem": lambda s, v, *a, **kw: _om_elem(s, v),
     "om_compose": lambda f, g, *a, **kw: _om_compose(f, g),
     "om_apply": lambda f, *a, **kw: f[2] / f[1],
@@ -619,6 +624,64 @@ _IR_TO_TORCH: dict[str, Any] = {
     ),
     "applyd": lambda f, h, *a, **kw: f[0] * h + f[1],
 }
+
+
+class _AmbientTorchBindings(dict):
+    """The ambient lowering table — legacy ``_IR_TO_TORCH`` semantics.
+
+    Seeded eagerly with ``_CORE_TORCH_BINDINGS``; carrier bindings
+    (each module's ``TORCH_BINDINGS`` export) resolve ON DEMAND through
+    :func:`catopt.ops.carrier_torch_bindings` and are cached back into
+    the dict, so ``_IR_TO_TORCH["omd_elem"]`` works whether or not a
+    carrier module was imported — and imports register nothing.
+
+    Still deliberately mutable: ``_IR_TO_TORCH[op] = fn`` overrides the
+    binding for every consumer reading the ambient table (including
+    ``IRModule`` instances built earlier — the pre-2c dispatch
+    semantics).  An explicit :class:`catopt.ops.OpTable` owns a private
+    dict and is NOT routed through here.
+    """
+
+    def _resolve(self, key: str) -> Any:
+        """Pull ``key``'s binding from the carrier modules' exports,
+        caching the hit back into the dict.  ``None`` when unknown."""
+        from catopt.ops import carrier_torch_bindings
+
+        fn = carrier_torch_bindings().get(key)
+        if fn is not None:
+            dict.__setitem__(self, key, fn)
+        return fn
+
+    def __missing__(self, key: str) -> Any:
+        fn = self._resolve(key)
+        if fn is None:
+            raise KeyError(key)
+        return fn
+
+    def get(self, key: str, default: Any = None) -> Any:
+        # ``dict.get`` never consults ``__missing__`` — route misses
+        # through the carrier resolver so ``_IR_TO_TORCH.get`` sees the
+        # same table ``[]`` does.
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
+
+#: Ambient lowering table — see :class:`_AmbientTorchBindings`.  New
+#: code should take an explicit :class:`catopt.ops.OpTable` (the
+#: ``ops`` parameter on ``IRModule`` / ``optimize_model``); this dict
+#: remains for back-compat readers and post-hoc binding overrides.
+_IR_TO_TORCH: _AmbientTorchBindings = _AmbientTorchBindings(
+    _CORE_TORCH_BINDINGS
+)
 
 
 def _om_elem(s: torch.Tensor, v: torch.Tensor):
@@ -645,13 +708,13 @@ def _om_compose(f, g):
     fin1, fin2 = torch.isfinite(m1), torch.isfinite(m2)
     e1 = torch.where(fin1, torch.exp(m1 - mx), torch.zeros_like(mx))
     e2 = torch.where(fin2, torch.exp(m2 - mx), torch.zeros_like(mx))
-    l = torch.where(fin1, l1 * e1, torch.zeros_like(l1)) + torch.where(
-        fin2, l2 * e2, torch.zeros_like(l2)
-    )
+    lv = torch.where(
+        fin1, l1 * e1, torch.zeros_like(l1)
+    ) + torch.where(fin2, l2 * e2, torch.zeros_like(l2))
     a = torch.where(fin1, a1 * e1, torch.zeros_like(a1)) + torch.where(
         fin2, a2 * e2, torch.zeros_like(a2)
     )
-    return (mx, l, a)
+    return (mx, lv, a)
 
 
 def _split_sizes(sizes: Any, kw: dict):
@@ -690,14 +753,23 @@ class IRModule(torch.nn.Module):
         Optional mapping from IR param names (e.g. 'p_w1') to actual
         tensor values (e.g. a clone of the original model's W1).
         If not provided, random parameters are generated.
+    ops : OpTable | None
+        The op table to lower through (plan 0001 phase 2c).  ``None``
+        (default) resolves to ``OpTable.full()`` — the ambient table
+        sharing ``_IR_TO_TORCH``, so post-construction binding
+        overrides keep reaching ``_eval``.  An explicit table owns its
+        own dict: an op absent from it fails loudly at eval.
     """
 
     def __init__(
         self,
         ir: IR,
         param_values: dict[str, torch.Tensor] | None = None,
+        ops: OpTable | None = None,
     ) -> None:
         super().__init__()
+        self._ops = ops if ops is not None else OpTable.full()
+        self._torch_bindings = self._ops.torch_bindings
         self._inputs = ir.inputs
         self._param_map: dict[str, torch.nn.Parameter] = {}
         self._param_values = param_values or {}
@@ -797,7 +869,10 @@ class IRModule(torch.nn.Module):
                     "pow",
                     "concat",
                 ):
-                    # Try eager compile-time fold via _IR_TO_TORCH bindings
+                    # Try eager compile-time fold via the op table's
+                    # torch bindings (ambient _IR_TO_TORCH for the
+                    # default full table; the custom table's own dict
+                    # for an explicit ``ops``).
                     vals: list[torch.Tensor] = []
                     ok = True
                     for a in term.args:
@@ -813,7 +888,7 @@ class IRModule(torch.nn.Module):
                             break
                     if ok:
                         try:
-                            fn = _IR_TO_TORCH[term.op]
+                            fn = self._torch_bindings[term.op]
                             with torch.no_grad():
                                 fused = fn(*vals, **dict(term.attrs))
                             if isinstance(fused, torch.Tensor):
@@ -912,7 +987,7 @@ class IRModule(torch.nn.Module):
             hit = memo.get(term)
             if hit is not None:
                 return hit
-            fn = _IR_TO_TORCH.get(term.op)
+            fn = self._torch_bindings.get(term.op)
             if fn is None:
                 raise ValueError(f"No torch binding for op '{term.op}'")
             args = [self._eval(a, env, x, memo) for a in term.args]
@@ -924,7 +999,13 @@ class IRModule(torch.nn.Module):
 
 
 def ir_to_torch_module(
-    ir: IR, param_values: dict[str, torch.Tensor] | None = None
+    ir: IR,
+    param_values: dict[str, torch.Tensor] | None = None,
+    ops: OpTable | None = None,
 ) -> IRModule:
-    """Convert a catopt IR into a torch.nn.Module."""
-    return IRModule(ir, param_values=param_values)
+    """Convert a catopt IR into a torch.nn.Module.
+
+    ``ops`` selects the lowering table; ``None`` (default) uses
+    ``OpTable.full()`` — the ambient ``_IR_TO_TORCH`` table.
+    """
+    return IRModule(ir, param_values=param_values, ops=ops)

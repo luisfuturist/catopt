@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 """Top-level optimization pipeline.
 
 This module implements the four-phase killer experiment:
@@ -28,6 +29,7 @@ from catopt.cost import (
 )
 from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, Var, op_repr
+from catopt.ops import OpTable
 from catopt.rules import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
@@ -203,10 +205,13 @@ def _check_resources(eg, max_enodes, max_memory_mb) -> None:
             )
 
 
-def _eval_const(term: Any, params: dict) -> torch.Tensor | None:
+def _eval_const(
+    term: Any, params: dict, ops: OpTable | None = None
+) -> torch.Tensor | None:
     """Evaluate a parameter-only subtree to a concrete tensor."""
     from catopt.torch_bridge import _IR_TO_TORCH
 
+    bindings = _IR_TO_TORCH if ops is None else ops.torch_bindings
     if isinstance(term, Param):
         return params.get(term.name)
     if isinstance(term, Const):
@@ -214,10 +219,10 @@ def _eval_const(term: Any, params: dict) -> torch.Tensor | None:
     if isinstance(term, Var):
         return None
     if isinstance(term, Op):
-        vals = [_eval_const(a, params) for a in term.args]
+        vals = [_eval_const(a, params, ops) for a in term.args]
         if any(v is None for v in vals):
             return None
-        fn = _IR_TO_TORCH.get(term.op)
+        fn = bindings.get(term.op)
         if fn is None:
             return None
         try:
@@ -258,7 +263,10 @@ def _is_causal_keep_mask(mask_val: torch.Tensor, q_shape) -> bool:
 
 
 def _specialize_causal(
-    term: Any, params: dict, memo: dict | None = None
+    term: Any,
+    params: dict,
+    memo: dict | None = None,
+    ops: OpTable | None = None,
 ) -> Any:
     """sdpa(q,k,v, mask) where mask is parameter-only and evaluates to
     a causal keep-mask → sdpa(q,k,v, is_causal=True).  Dropping the
@@ -272,10 +280,12 @@ def _specialize_causal(
     key = term  # content-keyed: interned terms hash by structure
     if key in memo:
         return memo[key]
-    args = tuple(_specialize_causal(a, params, memo) for a in term.args)
+    args = tuple(
+        _specialize_causal(a, params, memo, ops) for a in term.args
+    )
     attrs = dict(term.attrs)
     if term.op == "sdpa" and len(args) >= 4 and not attrs.get("arg5"):
-        mv = _eval_const(args[3], params)
+        mv = _eval_const(args[3], params, ops)
         if mv is not None and _is_causal_keep_mask(mv, _so(args[0])):
             args = args[:3]
             attrs["arg5"] = True
@@ -384,6 +394,7 @@ def optimize_model(
     cost_fn=None,
     eps_rtol: float | None = None,
     symmetry_budget: int | None = 2048,
+    ops: OpTable | None = None,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -434,6 +445,11 @@ def optimize_model(
         under a storage-aware cost model (``param_bytes_cost``) or
         explicit selection — the default launch-aware cost keeps the
         exact member, so this never silently trades accuracy.
+    ops : OpTable, optional
+        The op table the optimized term is lowered through (plan 0001
+        phase 2c) — passed to ``ir_to_torch_module`` and used for the
+        causal-mask constant evaluation.  ``None`` (default) resolves
+        to ``OpTable.full()`` — the ambient ``_IR_TO_TORCH`` table.
     verbose : bool
         Print progress.
 
@@ -604,7 +620,9 @@ def optimize_model(
     # Causal specialization: a param-only attn_mask that evaluates to a
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
     _cm: dict = {}
-    best_term = _specialize_causal(best_term, source_tensors, _cm)
+    best_term = _specialize_causal(
+        best_term, source_tensors, _cm, ops=ops
+    )
     if _cm.get("_hit"):
         stats["causal_specialized"] = True
 
@@ -625,7 +643,7 @@ def optimize_model(
         params=ir.params,
     )
     optimized_module = ir_to_torch_module(
-        optimized_ir, param_values=source_tensors
+        optimized_ir, param_values=source_tensors, ops=ops
     )
 
     # Verify semantic equivalence
@@ -837,6 +855,7 @@ def optimize_compositional(
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
     verify_tol: float = 1e-4,
+    ops: OpTable | None = None,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Optimize a stacked/multi-block model one block at a time.
@@ -913,6 +932,7 @@ def optimize_compositional(
                 max_enodes=max_enodes,
                 max_memory_mb=max_memory_mb,
                 cost_fn=cost_fn,
+                ops=ops,
                 verbose=verbose,
             )
             # Per-block verification on the captured input — soundness

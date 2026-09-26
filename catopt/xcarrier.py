@@ -125,9 +125,11 @@ VERIFICATION
     tests/test_xcarrier.py; the passes assert equality by construction
     and (optionally) attach pointwise witnesses like ``trace_lift``.
 
-Torch bindings for the new ops are registered into
-:data:`catopt.torch_bridge._IR_TO_TORCH` at import time — additive,
-the same mechanism :mod:`catopt.trace` uses.
+Torch bindings for the new ops are declared in ``TORCH_BINDINGS`` at
+module level — an export :class:`catopt.ops.OpTable` folds in via
+``register``/``full()`` (plan 0001 phase 2c).  Importing this module
+mutates nothing: :data:`catopt.torch_bridge._IR_TO_TORCH` resolves the
+bindings lazily when a consumer actually reads them.
 """
 
 from __future__ import annotations
@@ -139,9 +141,9 @@ import torch
 from catopt.egraph import EGraph, Rewrite
 from catopt.ir import Op, TensorType, Var
 from catopt.rules import R
-from catopt.torch_bridge import _IR_TO_TORCH
 
 __all__ = [
+    "TORCH_BINDINGS",
     "XC_LAWS",
     "gather_apply_stack",
     "gather_applyd_stack",
@@ -307,7 +309,8 @@ def _shape(t):
 
 
 # ---------------------------------------------------------------------------
-#  Torch bindings — registered into the bridge's op table (additive).
+#  Torch bindings — declared in TORCH_BINDINGS below (phase 2c:
+#  exports composed by catopt.ops.OpTable, no import-time mutation).
 # ---------------------------------------------------------------------------
 
 
@@ -416,17 +419,22 @@ def _omd_applym(f, h, *a, **kw):
     return (f[2] @ h + f[3]) / f[1]
 
 
-_IR_TO_TORCH["affd_a"] = _affd_a
-_IR_TO_TORCH["affd_b"] = _affd_b
-_IR_TO_TORCH["aff_A"] = _affd_a
-_IR_TO_TORCH["aff_b"] = _affd_b
-_IR_TO_TORCH["om_elem_affd"] = _om_elem_affd
-_IR_TO_TORCH["om_elem_aff"] = _om_elem_aff
-_IR_TO_TORCH["omd"] = _omd
-_IR_TO_TORCH["omd_elem"] = _omd_elem
-_IR_TO_TORCH["omd_compose"] = _omd_compose
-_IR_TO_TORCH["omd_apply"] = _omd_apply
-_IR_TO_TORCH["omd_applym"] = _omd_applym
+#: Torch lowering bindings — an EXPORT, not an import-time mutation
+#: (plan 0001 phase 2c).  ``aff_A``/``aff_b`` are the dense-fiber
+#: spellings of the affd projections.
+TORCH_BINDINGS: dict[str, Any] = {
+    "affd_a": _affd_a,
+    "affd_b": _affd_b,
+    "aff_A": _affd_a,
+    "aff_b": _affd_b,
+    "om_elem_affd": _om_elem_affd,
+    "om_elem_aff": _om_elem_aff,
+    "omd": _omd,
+    "omd_elem": _omd_elem,
+    "omd_compose": _omd_compose,
+    "omd_apply": _omd_apply,
+    "omd_applym": _omd_applym,
+}
 
 
 # ---------------------------------------------------------------------------

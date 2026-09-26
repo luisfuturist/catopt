@@ -64,7 +64,6 @@ import torch
 from catopt.egraph import Rewrite, _LeafRegistry
 from catopt.ir import Const, Op, op_def
 from catopt.rules import R
-from catopt.torch_bridge import _IR_TO_TORCH
 
 
 def _shape_of(t: Any):
@@ -816,8 +815,8 @@ OM_MASK_LAWS: list[Rewrite] = [
 #  of late blocks (t < o_i, fully masked within that block) exercise
 #  om_compose's isfinite guard exactly as in the materialised case.
 #
-#  The unfold needs two small generator ops, registered here via the
-#  trace.py mechanism (op_def + _IR_TO_TORCH):
+#  The unfold needs two small generator ops, declared here via the
+#  trace.py mechanism (op_def + a TORCH_BINDINGS export — phase 2c):
 #
 #  ``cmask(x, off=0)``
 #      The causal bad-mask of an x-shaped score matrix: on x's last two
@@ -936,9 +935,15 @@ def _attnbias_torch(m: torch.Tensor, *a, **kw) -> torch.Tensor:
     return m
 
 
-_IR_TO_TORCH["cmask"] = _cmask_torch
-_IR_TO_TORCH["fill"] = _fill_torch
-_IR_TO_TORCH["attnbias"] = _attnbias_torch
+#: Torch lowering bindings — an EXPORT, not an import-time mutation
+#: (plan 0001 phase 2c): :class:`catopt.ops.OpTable` folds this dict in
+#: via ``register``/``full()``; importing this module registers nothing
+#: into ``torch_bridge._IR_TO_TORCH``.
+TORCH_BINDINGS: dict[str, Any] = {
+    "cmask": _cmask_torch,
+    "fill": _fill_torch,
+    "attnbias": _attnbias_torch,
+}
 
 #: The masked_fill fill-value in rule RHSs.  _instantiate turns a
 #: non-Op RHS leaf into a repr-keyed leaf enode; registering the Const

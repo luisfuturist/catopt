@@ -92,9 +92,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import catopt.trace as _cat_trace  # noqa: F401  (torch bindings for
-
-# trace/bdiag/parl/eye/cswap/inv)
 from catopt.egraph import EGraph, Rewrite, _LeafRegistry
 from catopt.ir import Const, Op
 from catopt.scan_lower import build_scan_plan
