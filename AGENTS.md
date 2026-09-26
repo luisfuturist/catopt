@@ -19,6 +19,8 @@ uv run pytest                 # full test suite (pytest-xdist enabled)
 .venv/bin/pyright             # typecheck — 0 errors required (warnings OK)
 .venv/bin/ruff check          # lint
 .venv/bin/ruff format --check # formatting
+.venv/bin/vulture             # dead code (uses [tool.vulture] paths)
+.venv/bin/lint-imports        # hexagonal boundary contracts
 coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_eps,catopt_optimize,catopt -m pytest tests/ -q
 coverage report -m                                              # coverage (fail_under=100)
 ```
@@ -46,6 +48,24 @@ clean at `HEAD` under 0.16.9.
   clean at `standard` strictness.
 - Baseline was green at 0 errors / 2 warnings (`calibrate.py`
   `reportUnusedExpression`); warnings must not regress to errors.
+
+## Dead-code + architecture linting
+
+Two dev-only ratchets (both in the `dev` dependency group, both
+configured in `pyproject.toml`):
+
+- **vulture** (`[tool.vulture]`, `min_confidence = 80`) flags
+  unreachable / unused code across `packages` / `catopt` / `tests`.
+  The suite is pinned at 100% coverage, so a genuine dead branch is a
+  real finding, not noise.  Run `.venv/bin/vulture` (uses the
+  configured `paths`); a non-zero exit (3) means dead code.
+- **import-linter** (`[tool.importlinter]`) pins the hexagonal boundary:
+  a `forbidden` contract makes `catopt_core` importing `catopt_torch` /
+  `catopt_carriers` / `catopt_eps` / `catopt_optimize` — or the `torch`
+  / `numpy` external packages — a hard error.  Run
+  `.venv/bin/lint-imports`.  Core is a *sink* for adapter-pushed state
+  (see `catopt_core.ops` *Backend wiring*), never a puller: the adapter
+  registers its tables into core, core never imports the adapter.
 
 ## Ports (hexagonal boundary)
 
