@@ -519,7 +519,16 @@ class Report:
             plt.close(fig)
             paths.append(str(p))
 
-        if x_param and speedup_vs:
+        if (
+            x_param
+            and speedup_vs
+            and any(
+                x_param in c.case.params
+                and speedup_vs in c.medians
+                and len(c.medians) > 1
+                for c in self.cells
+            )
+        ):
             paths.append(
                 self.plot_cells(
                     x_param,

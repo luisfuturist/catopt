@@ -3,7 +3,7 @@
 
     "~0% on dense LLMs, real on structured ones."
 
-Measured by /tmp/exact_probe.py across model archetypes under the storage
+Measured by `project/retros/exact_probe.py` (project branch) across model archetypes under the storage
 cost axis (``param_bytes_cost_for``), fp64 outputs checked every run:
 
   * dense (real stories15M + synthetic 2-layer MHA/FFN transformer)
@@ -73,7 +73,7 @@ def _opt(model, example, **kw):
 
 
 # ---------------------------------------------------------------------------
-#  Archetype builders (kept in lock-step with /tmp/exact_probe.py)
+#  Archetype builders (kept in lock-step with project/retros/exact_probe.py)
 # ---------------------------------------------------------------------------
 
 

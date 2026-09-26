@@ -1,7 +1,7 @@
 """llama2.c v2-style checkpoint parser — the ONLY thing the benches
-need out of the old root `measure_weights.py` (the rest of that file
-was the weight-space probe axis; it lives on the `project` branch
-with REPORT.md now)."""
+need out of the old root `measure_weights.py` — the rest was the
+weight-space probe axis, archived at `project/retros/` on the
+project branch next to REPORT.md)."""
 
 from __future__ import annotations
 
