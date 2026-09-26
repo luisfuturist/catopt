@@ -53,6 +53,7 @@ DEFAULT_SUITES = [
     "reassoc_scale",
     "search_efficiency",
     "real_linear_attn",
+    "cost_fidelity",
     "bench_e2e",
 ]
 

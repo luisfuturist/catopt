@@ -153,6 +153,19 @@ produces an optimized schedule. Kernel-side, per-leaf eval cost is the
 gap to close — the schedule exists, the executor isn't yet as lean as
 Inductor's fused pointwise.
 
+**Cost-model fidelity** (`bench/cost_fidelity.py`, GPU): the parity
+map above is a *pricing* story more than a search story. Priced-vs-
+measured rank correlation: **ρ ≈ 0.95** in the win regime (k-chain —
+the model orders the frontier correctly and picks the winner), but
+**ρ ≈ −0.3** on scan blocks — *inverted*. The decomposition: same
+term, same predicted cost, 6–30× latency spread across lowerings —
+Inductor's fused kernel is rank-1 measured but priced like the
+generic per-leaf evaluator that runs 30× slower. The frontier
+contains the right programs; term-level cost can't see executor
+cost. (Also caught: trace-carrier members hiding a 14.5s
+`linalg.solve` under a normally-priced term.) Pricing the
+*lowering*, not just the term, is the named next step.
+
 **Controlled negative**: NormLinear loses slightly (0.98×) — Inductor
 already fuses `x·rms·wn` into the GEMM's input read, so restructuring
 can't promise a bandwidth win intra-kernel fusion already delivers.
@@ -218,7 +231,9 @@ bench/                      real-checkpoint benchmarks: stories15M/110M,
                             + reassoc_scale (the head-to-head),
                             search_efficiency (exploration cost vs
                             space), real_linear_attn (scan lift on
-                            RetNet/GLA/delta blocks, CPU+CUDA)
+                            RetNet/GLA/delta blocks, CPU+CUDA),
+                            cost_fidelity (predicted cost vs measured
+                            latency — rho/tau per cost fn)
 tests/                      1609 tests
 project/                    orphan branch: plans, ADRs, retrospectives
 ```
