@@ -285,3 +285,16 @@ No step changes public API without a deprecation shim.
 Real bugs the refactor surfaced (beyond the two it was designed around): `max` op unbound, rms_norm eps positional, layer_norm eps misread, ibp `_inf_box` sentinel crash, `xs[0]` IndexError on param-only plans ×3 modules, `_matmul` dtype promotion, `_select_index` getitem spelling, unbind default dim, omd batched-seed memo silently dead (id-keyed vs content-keyed), `eps_rtol` docstring overclaim.
 
 Current state (bc1ea0e): **1009 tests**, ruff 0 findings, coverage 87.77% (fail_under ratchet 87 → 100 target open).
+
+## Progress log — post-refactor hardening (through 18ed505)
+
+| Item | Commit | Result |
+|---|---|---|
+| Dead code + hygiene | `ded412e` | ~15 dead items removed; bench files consolidated in bench/; artifacts ignored; import graph verified DAG (1 deliberate lazy cycle) |
+| Ports & adapters | `d6e05cd` | `catopt/ports.py` — Protocol boundary layer (CostFn/ShapeRule/LawSet/TorchBinding/Executor/Verifier/OpRegistry); zero deps, structural conformance |
+| Typechecker | `d6e05cd` | pyright standard-mode green baseline; 22 Any-heavy files excluded w/ documented counts; pre-commit hook; AGENTS.md |
+| Coverage → 100% | `a0a4a11` + `18ed505` | wave1 87.8→94, waves 2+3 → **100% line + branch** (9,527 stmts / 4,008 branches); fail_under=100; ~480 new tests; e2e/integration suite added (torch.compile parity, cert round-trip, OpTable composition, fallbacks) |
+
+Pragmas: ~30 defensive-unreachable sites excluded with inline proof comments; 3 CUDA-only method bodies; torch-2.14 export invariants. All honest — each carries why it can't execute.
+
+Final state (18ed505): **1,564 tests**, ruff 0, pyright 0, coverage 100% enforced.
