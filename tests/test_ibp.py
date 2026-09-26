@@ -30,7 +30,7 @@ from catopt.ibp import (
     tight_model_bound,
 )
 from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.rules import all_rules
+from catopt_core.laws import all_rules
 from catopt.torch_bridge import export_to_ir
 
 

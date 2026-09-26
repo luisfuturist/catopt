@@ -36,7 +36,7 @@ import torch
 
 import catopt.trace as cat_trace  # noqa: F401  (registers torch bindings)
 from catopt import meta
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Param, TensorType, Var, op_repr

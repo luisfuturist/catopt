@@ -210,7 +210,7 @@ def test_batched_rope_egraph_reshapes_welltyped():
     appear ill-typed."""
     torch.manual_seed(0)
     from catopt.optimize import _EXPANSIVE_RULES
-    from catopt.rules import all_rules
+    from catopt_core.laws import all_rules
     from catopt.torch_bridge import export_to_ir
 
     blk = RopeBlock().eval()

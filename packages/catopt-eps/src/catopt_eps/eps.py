@@ -95,7 +95,7 @@ def optimize_weight(
     deployment, exact structural sharing).
     """
     from catopt_core.cost import param_bytes_cost_for
-    from catopt_core.rules import all_rules
+    from catopt_core.laws import all_rules
 
     src: dict = {name: W}
     eg = EGraph()

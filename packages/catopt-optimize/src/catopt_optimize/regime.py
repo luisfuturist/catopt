@@ -93,7 +93,7 @@ from catopt_core.cost import (
 )
 from catopt_core.egraph import EGraph, ENode
 from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
-from catopt_core.rules import SCAN_DIAG_LAWS, SCAN_LAWS
+from catopt_core.laws import SCAN_DIAG_LAWS, SCAN_LAWS
 from catopt_core.typing import _INVALID, _numel, _shape_of
 from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 

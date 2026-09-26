@@ -194,7 +194,7 @@ def test_rule_decode_guarded_missing_parent_is_miss(tmp_path):
 
 
 def _om_rules():
-    from catopt.rules import all_rules
+    from catopt_core.laws import all_rules
 
     return all_rules()
 

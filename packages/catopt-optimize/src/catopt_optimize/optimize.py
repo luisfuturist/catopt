@@ -34,9 +34,7 @@ from catopt_core.cost import (
 )
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Op, op_repr
-from catopt_core.ops import OpTable
-from catopt_core.ports import CostFn, OpRegistry, Sink, Source
-from catopt_core.rules import (
+from catopt_core.laws import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
     all_rules,
@@ -45,6 +43,8 @@ from catopt_core.rules import (
     share_duplicate_param_slices,
     share_duplicate_params,
 )
+from catopt_core.ops import OpTable
+from catopt_core.ports import CostFn, OpRegistry, Sink, Source
 from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.report import (
     BlockReport,

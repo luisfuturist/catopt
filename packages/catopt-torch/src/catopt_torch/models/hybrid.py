@@ -5,7 +5,7 @@ one module, so the e-graph sees BOTH monoid carriers simultaneously.
 Two carriers live side by side here:
 
 * the *diagonal-affine* monoid (``aff_diag`` / ``affd_compose`` /
-  ``applyd`` — see ``SCAN_DIAG_LAWS`` in :mod:`catopt_core.rules`) over the
+  ``applyd`` — see ``SCAN_DIAG_LAWS`` in :mod:`catopt_core.laws`) over the
   Mamba-faithful recurrence ``h_t = a_t ⊙ h_{t-1} + b_t ⊙ x_t``;
 * the *online-softmax* monoid (``om_elem`` / ``om_compose`` /
   ``om_apply`` — see ``OM_LAWS`` in :mod:`catopt_carriers.om`) over the chunked

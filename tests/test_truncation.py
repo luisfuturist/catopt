@@ -14,7 +14,7 @@ import tracemalloc
 
 import pytest
 
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import count_cost
 from catopt.egraph import (
     Certificate,

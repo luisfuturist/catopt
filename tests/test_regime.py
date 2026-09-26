@@ -14,7 +14,7 @@ Covers:
 import pytest
 import torch
 
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.calibrate import (
     PROFILE_DIR_ENV,
     TargetProfile,

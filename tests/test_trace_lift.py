@@ -34,7 +34,7 @@ import torch
 
 import catopt.trace as cat_trace  # registers torch bindings
 import catopt.trace_lift as TL
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import (
     _INVALID_COST,
     dag_cost,

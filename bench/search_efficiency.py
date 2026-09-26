@@ -75,7 +75,7 @@ from catopt_core.cost import flops_cost
 from catopt_core.egraph import EGraph
 from catopt_core.ir import Op, Param, TensorType
 from catopt_core.meta import canonicalize, stratified_run
-from catopt_core.rules import (
+from catopt_core.laws import (
     ASSOC_MATMUL,
     ASSOC_MATMUL_REV,
     all_rules,

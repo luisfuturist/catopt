@@ -15,7 +15,7 @@ from catopt.cost import dag_cost, param_bytes_cost, param_bytes_cost_for
 from catopt.egraph import EGraph
 from catopt.eps import low_rank_params
 from catopt.ir import Op, Param, TensorType, Var, op_repr
-from catopt.rules import all_rules
+from catopt_core.laws import all_rules
 from catopt.torch_bridge import export_to_ir
 
 

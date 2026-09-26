@@ -18,7 +18,7 @@ unrolled-recurrence seed, it re-derives the unfolded equivalent of
 import torch
 
 from catopt import meta
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
 from catopt.models import LinearRecurrence, SwiGLU

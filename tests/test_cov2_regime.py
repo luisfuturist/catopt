@@ -78,7 +78,7 @@ def _ssm_fixture(T=8, D=8, seed=0):
     ir, source = export_to_ir(model, x)
     eg = EGraph()
     root = eg.add_term(ir.root)
-    from catopt import rules as R
+    from catopt_core import laws as R
 
     stats = eg.run(
         R.SCAN_DIAG_LAWS, root, max_iterations=14, max_nodes=400_000

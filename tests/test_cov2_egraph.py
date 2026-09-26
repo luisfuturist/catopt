@@ -50,7 +50,7 @@ Everything is deterministic (small graphs, no RNG).
 
 import pytest
 
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import count_cost, dag_cost
 from catopt.egraph import (
     Certificate,
@@ -72,7 +72,7 @@ from catopt.egraph.terms import (
     _term_paths,
 )
 from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
-from catopt.rules import pair_shared_input_linears
+from catopt_core.laws import pair_shared_input_linears
 
 
 def _t(d=4):

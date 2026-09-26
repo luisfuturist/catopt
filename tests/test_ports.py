@@ -43,7 +43,7 @@ from catopt.ports import (
     signature_conforms,
 )
 from catopt.report import VerifyReport, verify_equiv
-from catopt.rules import CATEGORICAL_RULES, all_rules
+from catopt_core.laws import CATEGORICAL_RULES, all_rules
 from catopt.scan_lower import to_batched_scan_module
 from catopt.torch_bridge import _IR_TO_TORCH, IRModule
 from catopt.typing import _SHAPE_RULES

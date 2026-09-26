@@ -324,7 +324,7 @@ def test_real_stories15m_checkpoint_offers_zero():
     sys.path.insert(0, REPO)
     from catopt.egraph import EGraph
     from catopt.ir import Param, TensorType
-    from catopt.rules import (
+    from catopt_core.laws import (
         share_duplicate_param_slices,
         share_duplicate_params,
     )

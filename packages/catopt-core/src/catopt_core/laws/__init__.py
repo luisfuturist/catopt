@@ -12,18 +12,35 @@
   e-graph (pairing, weight sharing).  These are diagram-level passes,
   not equational laws.
 
-``catopt_core.rules`` remains as a thin compatibility shim re-exporting
-this surface; new code should import from ``catopt_core.laws``.
+This package is the canonical rewrite surface — the historical
+``catopt_core.rules`` module (and its ``catopt.rules`` alias) is gone.
 """
 
-from catopt_core.laws.base import R
-from catopt_core.laws.pairing import (
+# Public surface (in ``__all__``) plus the private side-condition /
+# memo helpers historically reachable through the removed
+# ``catopt_core.rules`` shim (and its ``catopt.rules`` alias).  The
+# private names are re-exported (hence ``noqa: F401``) so
+# ``catopt_core.laws._x`` keeps resolving, but stay out of ``__all__``.
+from catopt_core.laws.base import (  # noqa: F401
+    _SHAPE_MEMO,
+    R,
+    _is_channel_scale,
+    _is_row_scale,
+    _is_scalar,
+    _shape_of,
+)
+from catopt_core.laws.pairing import (  # noqa: F401
+    _CONV_ATTR_KEYS,
+    _pair_shared_input,
+    _term_has_var,
+    _wshape,
     pair_shared_input_convs,
     pair_shared_input_linears,
     share_duplicate_param_slices,
     share_duplicate_params,
 )
-from catopt_core.laws.scan import (
+from catopt_core.laws.scan import (  # noqa: F401
+    _AFFD_UNIT,
     AFF_ASSOC,
     AFF_ASSOC_REV,
     AFF_COMPOSE_UNFOLD,
@@ -48,8 +65,15 @@ from catopt_core.laws.scan import (
     AFFD_UNLIFT,
     SCAN_DIAG_LAWS,
     SCAN_LAWS,
+    _affd_state_like,
+    _affd_unit_state_like,
+    _derive_affd_unit,
 )
-from catopt_core.laws.tensor import (
+from catopt_core.laws.tensor import (  # noqa: F401
+    _QK_SCORES,
+    _QKV_CAT,
+    _REPEAT_KV,
+    _REPEAT_V,
     ALL_RULES,
     ASSOC_ADD,
     ASSOC_LINEAR,
@@ -92,6 +116,24 @@ from catopt_core.laws.tensor import (
     WEIGHT_DISTRIBUTE_LINEAR,
     WEIGHT_FACTOR,
     WEIGHT_FACTOR_LINEAR,
+    _check_gqa_absorb,
+    _check_linear_bias_compose,
+    _check_repeat_chain,
+    _check_score_transpose,
+    _check_sdpa_base,
+    _check_sdpa_mf,
+    _check_sdpa_mf_scaled,
+    _check_sdpa_scaled,
+    _check_softmax_dim,
+    _const_val,
+    _derive_scale_div,
+    _derive_scale_mul,
+    _derive_scale_one,
+    _derive_split_sizes,
+    _head,
+    _head_v,
+    _make_sdpa_fold_rules,
+    _scale_of,
     all_rules,
 )
 

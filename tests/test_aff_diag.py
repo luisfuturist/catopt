@@ -53,7 +53,7 @@ import math
 import torch
 
 from catopt import meta
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import dag_cost, flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, op_repr

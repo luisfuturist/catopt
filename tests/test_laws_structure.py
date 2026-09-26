@@ -1,35 +1,36 @@
-"""Structure tests for the Phase-2d split of ``catopt.rules``.
+"""Structure tests for the ``catopt_core.laws`` rewrite surface.
 
-``catopt/rules.py`` was split into the ``catopt.laws`` package by
-domain; ``catopt.rules`` is now a pure compatibility shim.  These tests
-pin the contract:
+``catopt_core.rules`` — and its ``catopt.rules`` alias — used to be a
+pure compatibility shim over the ``catopt_core.laws`` package.  That
+shim is gone; ``catopt_core.laws`` is now the canonical rewrite
+surface.  These tests pin the contract:
 
-* every name that was previously importable from ``catopt.rules``
-  still resolves through the shim (public rules, collections, pass
-  functions, and the private check/memo helpers);
+* every name that was previously importable from the shim — public
+  rules, collections, pass functions, and the private check/memo
+  helpers — still resolves from ``catopt_core.laws``;
 * ``all_rules()`` returns the same rule set as before;
-* the non-local pairing passes resolve identically from both the
-  legacy path and ``catopt.laws.pairing``;
-* each ``catopt.laws`` submodule is self-contained — it never imports
-  the compat shim.
+* the non-local pairing passes resolve identically from the package
+  and from ``catopt_core.laws.pairing``;
+* each ``catopt_core.laws`` submodule is self-contained — it never
+  imports the removed shim.
 """
 
 import importlib
 import re
 import sys
 
-import catopt.laws.pairing
-import catopt.laws.scan
-import catopt.laws.tensor
-import catopt.rules as rules
-from catopt.egraph import Rewrite
+import catopt_core.laws as laws
+import catopt_core.laws.pairing
+import catopt_core.laws.scan
+import catopt_core.laws.tensor
+from catopt_core.egraph import Rewrite
 
-#: Every public name importable from the old ``catopt.rules`` — the
-#: union of all ``from catopt.rules import ...`` sites across catopt/,
-#: tests/, and bench/, plus the rule objects accessed as module
-#: attributes (``from catopt import rules as R; R.X``).
+#: Every public name the old ``catopt_core.rules`` shim exposed — the
+#: union of all ``from catopt_core.rules import ...`` sites across
+#: packages/, catopt/, tests/, and bench/, plus the rule objects
+#: accessed as module attributes.
 PUBLIC_NAMES = [
-    # rewrite-constructor shorthand (catopt.om/trace/xcarrier use it)
+    # rewrite-constructor shorthand (om/trace/xcarrier use it)
     "R",
     # monoid / group / decomposition laws
     "COMM_ADD",
@@ -112,9 +113,9 @@ PUBLIC_NAMES = [
     "share_duplicate_param_slices",
 ]
 
-#: Private helpers the old module exposed — tests import
+#: Private helpers the old shim re-exported — tests import
 #: ``_check_gqa_absorb``/``_check_softmax_dim`` directly, and
-#: ``_SHAPE_MEMO``/``_shape_of`` may be reached as ``rules._x``.
+#: ``_SHAPE_MEMO``/``_shape_of`` may be reached as ``laws._x``.
 PRIVATE_NAMES = [
     "_SHAPE_MEMO",
     "_shape_of",
@@ -161,61 +162,62 @@ PAIRING_PASSES = [
 ]
 
 
-def test_public_names_resolve_via_shim():
-    missing = [n for n in PUBLIC_NAMES if not hasattr(rules, n)]
+def test_public_names_resolve():
+    missing = [n for n in PUBLIC_NAMES if not hasattr(laws, n)]
     assert not missing, f"names no longer importable: {missing}"
 
 
-def test_private_names_resolve_via_shim():
-    missing = [n for n in PRIVATE_NAMES if not hasattr(rules, n)]
+def test_private_names_resolve():
+    missing = [n for n in PRIVATE_NAMES if not hasattr(laws, n)]
     assert not missing, f"helpers no longer importable: {missing}"
 
 
-def test_shim_exports_every_rewrite():
-    """meta._iter_module_rules over the shim must see the full set."""
-    from catopt.meta import _iter_module_rules
+def test_laws_exports_every_rewrite():
+    """meta._iter_module_rules over the package must see the full set."""
+    from catopt_core.meta import _iter_module_rules
 
-    found = _iter_module_rules(rules)
+    found = _iter_module_rules(laws)
     assert all(isinstance(r, Rewrite) for r in found)
     # 50 tensor + 6 dense-scan + 16 diagonal-scan rewrites.
     assert len(found) == 72
 
 
 def test_all_rules_count_unchanged():
-    assert len(rules.all_rules()) == 50
-    assert rules.all_rules() == rules.ALL_RULES
-    assert len(rules.ALL_RULES) == (
-        len(rules.SIMPLIFICATION_RULES) + len(rules.CATEGORICAL_RULES)
+    assert len(laws.all_rules()) == 50
+    assert laws.all_rules() == laws.ALL_RULES
+    assert len(laws.ALL_RULES) == (
+        len(laws.SIMPLIFICATION_RULES) + len(laws.CATEGORICAL_RULES)
     )
     # each call returns a fresh list, not the shared ALL_RULES object
-    assert rules.all_rules() is not rules.ALL_RULES
+    assert laws.all_rules() is not laws.ALL_RULES
 
 
 def test_collections_split_by_domain():
-    assert len(rules.SIMPLIFICATION_RULES) == 13
-    assert len(rules.CATEGORICAL_RULES) == 37
-    assert len(rules.SCAN_LAWS) == 6
-    assert len(rules.SCAN_DIAG_LAWS) == 16
+    assert len(laws.SIMPLIFICATION_RULES) == 13
+    assert len(laws.CATEGORICAL_RULES) == 37
+    assert len(laws.SCAN_LAWS) == 6
+    assert len(laws.SCAN_DIAG_LAWS) == 16
 
 
 def test_pairing_passes_resolve_from_both_paths():
     for name in PAIRING_PASSES:
-        legacy = getattr(rules, name)
-        direct = getattr(catopt.laws.pairing, name)
-        assert callable(legacy) and callable(direct)
-        assert legacy is direct
+        package = getattr(laws, name)
+        direct = getattr(catopt_core.laws.pairing, name)
+        assert callable(package) and callable(direct)
+        assert package is direct
 
 
 def test_laws_modules_are_self_contained():
-    """No laws submodule may depend on the catopt.rules compat shim."""
+    """No laws submodule may depend on the removed ``*.rules`` shim."""
     shim_import = re.compile(
-        r"(?:from|import)\s+catopt\.rules\b|catopt\.rules\."
+        r"(?:from|import)\s+catopt(?:_core)?\.rules\b"
+        r"|catopt(?:_core)?\.rules\."
     )
     for mod in (
-        catopt.laws.base,
-        catopt.laws.tensor,
-        catopt.laws.scan,
-        catopt.laws.pairing,
+        catopt_core.laws.base,
+        catopt_core.laws.tensor,
+        catopt_core.laws.scan,
+        catopt_core.laws.pairing,
     ):
         with open(mod.__file__) as f:
             src = f.read()
@@ -224,31 +226,28 @@ def test_laws_modules_are_self_contained():
 
 def test_laws_modules_import_cleanly():
     """Each laws module resolves its own surface standalone."""
-    import catopt.laws as laws
-
     expected = {
-        "catopt.laws.base": ["R", "_SHAPE_MEMO", "_shape_of"],
-        "catopt.laws.tensor": [
+        "catopt_core.laws.base": ["R", "_SHAPE_MEMO", "_shape_of"],
+        "catopt_core.laws.tensor": [
             "SIMPLIFICATION_RULES",
             "CATEGORICAL_RULES",
             "ALL_RULES",
             "all_rules",
         ],
-        "catopt.laws.scan": ["SCAN_LAWS", "SCAN_DIAG_LAWS"],
-        "catopt.laws.pairing": PAIRING_PASSES,
+        "catopt_core.laws.scan": ["SCAN_LAWS", "SCAN_DIAG_LAWS"],
+        "catopt_core.laws.pairing": PAIRING_PASSES,
     }
     for modname, names in expected.items():
         mod = sys.modules.get(modname) or importlib.import_module(modname)
         for n in names:
             assert hasattr(mod, n), f"{modname}.{n}"
-    # package-level re-export matches the shim's surface
-    assert laws.all_rules() == rules.all_rules()
-    assert laws.SCAN_LAWS is rules.SCAN_LAWS
-    assert laws.SCAN_DIAG_LAWS is rules.SCAN_DIAG_LAWS
+    # package-level re-export matches the submodules' surface
+    assert laws.all_rules() == catopt_core.laws.tensor.all_rules()
+    assert laws.SCAN_LAWS is catopt_core.laws.scan.SCAN_LAWS
+    assert laws.SCAN_DIAG_LAWS is catopt_core.laws.scan.SCAN_DIAG_LAWS
 
 
-def test_shim_preserves_module_level_objects():
-    """Name bindings the old module carried (imports) still resolve."""
-    assert rules.Rewrite is Rewrite
-    assert isinstance(rules._SHAPE_MEMO, dict)
-    assert callable(rules._shape_of)
+def test_laws_preserves_module_level_objects():
+    """Private helpers the old shim carried still resolve from the package."""
+    assert isinstance(laws._SHAPE_MEMO, dict)
+    assert callable(laws._shape_of)

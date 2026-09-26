@@ -48,7 +48,7 @@ import torch.nn as nn
 
 import catopt.trace  # noqa: F401 — registers trace/eye/parl bindings
 from catopt import meta
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt import trace_lift as TL
 from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr

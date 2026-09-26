@@ -62,7 +62,7 @@ Findings encoded as tests (T=16, d=16 unless noted):
 import torch
 
 from catopt import meta
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import dag_cost, flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Var, op_repr
@@ -498,7 +498,7 @@ def test_pairing_pass_spans_the_boundary():
     carrier seam: {decay_proj, B_proj} share x; {q,k,v(,W_q·c)} share
     the scan stack y.  The product law doesn't care which monoid reads
     the output."""
-    from catopt.rules import pair_shared_input_linears
+    from catopt_core.laws import pair_shared_input_linears
 
     torch.manual_seed(0)
     T, D = 16, 16

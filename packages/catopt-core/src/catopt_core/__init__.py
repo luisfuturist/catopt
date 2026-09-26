@@ -14,7 +14,7 @@ The categorical optimizer's abstract core: typed term IR
 
 from catopt_core.egraph import EGraph, ENode, Rewrite
 from catopt_core.ir import IR, Const, Op, Param, TensorType, Var
-from catopt_core.rules import CATEGORICAL_RULES
+from catopt_core.laws import CATEGORICAL_RULES
 
 __all__ = [
     "CATEGORICAL_RULES",

@@ -28,7 +28,7 @@ from catopt.cost import count_cost
 from catopt.egraph import EGraph, verify_certificate
 from catopt.eps import model_bound
 from catopt.ir import IR, Op, op_repr
-from catopt.rules import all_rules
+from catopt_core.laws import all_rules
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 

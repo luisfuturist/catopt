@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, op_repr
 from catopt.models import LinearRecurrence, SwiGLU

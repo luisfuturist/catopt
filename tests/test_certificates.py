@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.cost import count_cost
 from catopt.egraph import (
     CertificateVerificationError,
@@ -21,7 +21,7 @@ from catopt.egraph import (
     verify_certificate,
 )
 from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
-from catopt.rules import pair_shared_input_linears
+from catopt_core.laws import pair_shared_input_linears
 
 
 def _t(d=4):

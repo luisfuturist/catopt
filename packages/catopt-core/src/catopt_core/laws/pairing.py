@@ -72,8 +72,9 @@ def _exact_equal(a: Any, b: Any) -> bool:
 def _term_has_var(t: Any) -> bool:
     """True iff the term mentions a ``Var`` leaf (runtime data).
 
-    Kept for the ``catopt_core.rules`` compat re-export; delegates to the
-    single implementation, :func:`catopt_core.typing.has_var_leaf`.
+    Re-exported from :mod:`catopt_core.laws` for backward compatibility;
+    delegates to the single implementation,
+    :func:`catopt_core.typing.has_var_leaf`.
     """
     from catopt_core.typing import has_var_leaf
 

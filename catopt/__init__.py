@@ -11,7 +11,7 @@ toolkit), ``catopt-optimize`` (the pipeline orchestrators).
 
 ``sys.modules`` aliases below keep every historical ``catopt.X`` path
 resolving to its new home — ``from catopt.cost import flops_cost``,
-``import catopt.egraph.core``, ``from catopt.rules import all_rules``
+``import catopt.egraph.core``, ``from catopt.laws import all_rules``
 etc. all keep working unchanged.
 """
 
@@ -56,7 +56,6 @@ _ALIAS = {
     "catopt.regime": "catopt_optimize.regime",
     "catopt.report": "catopt_torch.report",
     "catopt.rulecache": "catopt_core.rulecache",
-    "catopt.rules": "catopt_core.rules",
     "catopt.scan_lower": "catopt_carriers.scan_lower",
     "catopt.torch_bridge": "catopt_torch.torch_bridge",
     "catopt.trace": "catopt_carriers.trace",
@@ -106,12 +105,12 @@ from catopt_core.ir import (
     TensorType,
     Var,
 )
-from catopt_core.ports import Binding, Sink, Source
-from catopt_core.rules import (
+from catopt_core.laws import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
     all_rules,
 )
+from catopt_core.ports import Binding, Sink, Source
 
 # Torch-domain re-exports stay fault-tolerant like the alias loop:
 # on a partial install ``import catopt`` still succeeds — the absent

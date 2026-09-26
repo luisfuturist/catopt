@@ -16,7 +16,7 @@ from pathlib import Path
 from catopt.calibrate import calibrate
 from catopt.egraph import EGraph
 from catopt.ir import Op, Param, TensorType, Var
-from catopt.rules import ASSOC_LINEAR_BIAS
+from catopt_core.laws import ASSOC_LINEAR_BIAS
 
 _REPO = Path(__file__).resolve().parents[1]
 

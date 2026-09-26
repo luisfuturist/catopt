@@ -27,7 +27,7 @@ import torch
 
 from catopt import meta
 from catopt import om as OM
-from catopt import rules as R
+from catopt_core import laws as R
 from catopt.egraph import EGraph, Rewrite
 from catopt.ir import Const, Op, TensorType, Var, op_repr
 from catopt.rulecache import (

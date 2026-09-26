@@ -23,7 +23,7 @@ from catopt.ops import OpTable
 from catopt.optimize import discover_alternatives, optimize_model
 from catopt.ports import Sink
 from catopt.report import VerifyReport
-from catopt.rules import all_rules
+from catopt_core.laws import all_rules
 
 
 def _to_np(v):

@@ -2,7 +2,7 @@
 
 from catopt.egraph import EGraph, ENode, UnionFind
 from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
-from catopt.rules import (
+from catopt_core.laws import (
     CATEGORICAL_RULES,
 )
 
@@ -267,7 +267,7 @@ def test_incremental_frontier_refires_at_dirtied_classes():
     term = Op.make("add", Op.make("add", x, y), z)
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import ASSOC_ADD, COMM_ADD
+    from catopt_core.laws import ASSOC_ADD, COMM_ADD
 
     stats = eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=20)
     _root = eg.get_class(eid)
@@ -301,7 +301,7 @@ def test_rule_budgets_bound_expansion():
         term = Op.make("add", term, y)
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import ASSOC_ADD, COMM_ADD
+    from catopt_core.laws import ASSOC_ADD, COMM_ADD
 
     eg_full = EGraph()
     eid_full = eg_full.add_term(term)
@@ -335,7 +335,7 @@ def test_rule_budget_persists_across_run_calls():
         term = Op.make("add", term, v)
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import ASSOC_ADD, COMM_ADD
+    from catopt_core.laws import ASSOC_ADD, COMM_ADD
 
     eg.run(
         [ASSOC_ADD, COMM_ADD],
@@ -365,7 +365,7 @@ def test_matches_max_results_cap():
     )
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import ASSOC_ADD, COMM_ADD
+    from catopt_core.laws import ASSOC_ADD, COMM_ADD
 
     eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=10)
     root = eg.find(eid)
@@ -387,7 +387,7 @@ def test_min_term_returns_smallest_member():
     zero = Const(0)
     eg = EGraph()
     eid = eg.add_term(Op.make("add", x, zero))
-    from catopt.rules import ID_ADD
+    from catopt_core.laws import ID_ADD
 
     eg.run([ID_ADD], eid, max_iterations=5)
     _t, s = eg._min_term(eid, {})
@@ -409,7 +409,7 @@ def test_fresh_rule_full_scan_after_saturation():
     term = Op.make("add", x, Op.make("add", y, zero))
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import COMM_ADD, ID_ADD
+    from catopt_core.laws import COMM_ADD, ID_ADD
 
     eg.run([ID_ADD], eid, max_iterations=5)
     assert not eg._dirty  # saturated: frontier is empty
@@ -434,7 +434,7 @@ def test_incremental_saturation_same_fixed_point():
     )
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import CATEGORICAL_RULES
+    from catopt_core.laws import CATEGORICAL_RULES
 
     eg.run(CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=10000)
     n1 = eg.n_enodes

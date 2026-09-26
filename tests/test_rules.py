@@ -2,7 +2,7 @@
 
 from catopt.egraph import EGraph
 from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.rules import (
+from catopt_core.laws import (
     ASSOC_MATMUL,
     ASSOC_MATMUL_REV,
     CATEGORICAL_RULES,
@@ -178,7 +178,7 @@ def test_share_duplicate_param_slices_offers_dedup_member():
 
     from catopt.egraph import EGraph
     from catopt.ir import IR
-    from catopt.rules import share_duplicate_param_slices
+    from catopt_core.laws import share_duplicate_param_slices
     from catopt.torch_bridge import ir_to_torch_module
 
     torch.manual_seed(0)
@@ -249,7 +249,7 @@ def test_share_duplicate_param_slices_no_offer_when_all_distinct():
     import torch
 
     from catopt.egraph import EGraph
-    from catopt.rules import share_duplicate_param_slices
+    from catopt_core.laws import share_duplicate_param_slices
 
     torch.manual_seed(1)
     W = torch.randn(
@@ -272,7 +272,7 @@ def test_share_duplicate_param_slices_guards():
     import torch
 
     from catopt.egraph import EGraph
-    from catopt.rules import share_duplicate_param_slices
+    from catopt_core.laws import share_duplicate_param_slices
 
     torch.manual_seed(2)
     # A 1-D "weight" (bias-like) with a duplicated half — not 2-D, skip.

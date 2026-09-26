@@ -1,7 +1,7 @@
 # ruff: noqa: RUF002, RUF003
 """Online-softmax monoid — the nonlinear analogue of the scan carrier.
 
-The affine-map monoid (``SCAN_LAWS`` in :mod:`catopt_core.rules`) showed that
+The affine-map monoid (``SCAN_LAWS`` in :mod:`catopt_core.laws`) showed that
 lifting a recurrence into a monoid carrier lets plain associativity
 discover parallel bracketings.  The same trick works for the softmax
 recurrence — FlashAttention's running (max, sum, numerator) triple.
@@ -62,7 +62,7 @@ from typing import Any
 import torch
 from catopt_core.egraph import Rewrite, _LeafRegistry
 from catopt_core.ir import Const, Op, op_def
-from catopt_core.rules import R
+from catopt_core.laws import R
 
 
 def _vshape(t: Any):

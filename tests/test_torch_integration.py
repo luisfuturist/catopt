@@ -10,7 +10,7 @@ from catopt.cost import flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
 from catopt.models import MatrixChain, RMSNorm, SwiGLU
-from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
+from catopt_core.laws import CATEGORICAL_RULES, SIMPLIFICATION_RULES
 from catopt.torch_bridge import (
     _SCALAR_OPERAND_OPS,
     _canon_aten_name,
@@ -238,7 +238,7 @@ def test_rmsnorm_roundtrip_and_optimize():
 def test_pow_to_square_bridge():
     """pow(x, 2) and square(x) land in the same e-class."""
     from catopt.ir import TensorType, Var
-    from catopt.rules import POW_TO_SQUARE, SQUARE_TO_POW
+    from catopt_core.laws import POW_TO_SQUARE, SQUARE_TO_POW
 
     x = Var("x", TensorType((4, 4)))
     term = Op.make("pow", x, Const(2))
@@ -258,7 +258,7 @@ def test_pow_to_square_bridge():
 def test_silu_mul_form_rule():
     """silu(g)*u expands to (g*sigmoid(g))*u in the e-graph."""
     from catopt.ir import TensorType, Var
-    from catopt.rules import SILU_MUL_FORM
+    from catopt_core.laws import SILU_MUL_FORM
 
     g = Var("g", TensorType((4, 4)))
     u = Var("u", TensorType((4, 4)))
@@ -395,7 +395,7 @@ def test_assoc_linear_bias_composes():
     affine-map composition including biases.  Fires on the 3-ary
     linear torch.export emits for bias=True, where assoc_linear
     cannot reach."""
-    from catopt.rules import ASSOC_LINEAR_BIAS
+    from catopt_core.laws import ASSOC_LINEAR_BIAS
 
     torch.manual_seed(0)
     i, h, o = 32, 128, 32
@@ -503,7 +503,7 @@ def test_weight_merge_does_not_fire_on_distinct_inputs():
     y = Var("y", TensorType((4, 4)))
     w1 = Param("W1", TensorType((4, 4)))
     w2 = Param("W2", TensorType((4, 4)))
-    from catopt.rules import WEIGHT_FACTOR
+    from catopt_core.laws import WEIGHT_FACTOR
 
     different = Op.make(
         "add", Op.make("matmul", x, w1), Op.make("matmul", y, w2)
@@ -629,7 +629,7 @@ def test_swiglu_fuse_evals_fused_gemm_once():
 
 def test_swiglu_fuse_requires_shared_input():
     """The pairing rule must not fire when gate/up read DIFFERENT inputs."""
-    from catopt.rules import SWIGLU_FUSE
+    from catopt_core.laws import SWIGLU_FUSE
 
     x = Var("x", TensorType((4, 4)))
     y = Var("y", TensorType((4, 4)))
@@ -714,7 +714,7 @@ def test_qkv_fuse_produces_single_gemm():
 def test_attr_metavariable_binds_shape():
     """Pattern attr value-as-string binds the node's concrete attr."""
     from catopt.models import AttentionBlock
-    from catopt.rules import QKV_FUSE
+    from catopt_core.laws import QKV_FUSE
 
     torch.manual_seed(0)
     m = AttentionBlock(32, n_heads=2).eval()
@@ -779,7 +779,7 @@ def test_row_scale_rejects_data_scale():
     wrong — the check predicate must reject it (regression for the
     diff=9.83 unsoundness caught by the verifier).
     """
-    from catopt.rules import LINEAR_ROW_SCALE
+    from catopt_core.laws import LINEAR_ROW_SCALE
 
     x = Var("x", TensorType((4, 4)))
     r = Var("r", TensorType((4, 4)))  # data-shaped, NOT per-row
@@ -840,7 +840,7 @@ def test_gqa_asym_fuse():
 def test_derive_hook_computes_sizes():
     """Rewrite.derive injects computed attrs into the instantiation."""
     from catopt.models import GQAAttention
-    from catopt.rules import QKV_FUSE_ASYM
+    from catopt_core.laws import QKV_FUSE_ASYM
 
     torch.manual_seed(0)
     m = GQAAttention(64, n_heads=2, n_kv_heads=1).eval()
@@ -924,7 +924,7 @@ def test_pairing_subsumes_swiglu_rule():
     """The pairing pass alone fuses gate/up — no consumer pattern needed."""
     from catopt.cost import dag_cost, launch_aware_cost
     from catopt.models import SwiGLU
-    from catopt.rules import (
+    from catopt_core.laws import (
         CATEGORICAL_RULES,
         PARALLEL_MUL_FUSE,
         QKV_FUSE,
@@ -975,7 +975,7 @@ def test_pairing_subsumes_swiglu_rule():
 
 def test_pairing_no_shared_input_no_fusion():
     """Linears with different inputs must NOT be paired."""
-    from catopt.rules import pair_shared_input_linears
+    from catopt_core.laws import pair_shared_input_linears
 
     x = Var("x", TensorType((4, 4)))
     y = Var("y", TensorType((4, 4)))
@@ -993,7 +993,7 @@ def test_pairing_no_shared_input_no_fusion():
 
 def test_channel_scale_rejects_row_scale():
     """linear(x*r, W) with r per-row must not fold r into W."""
-    from catopt.rules import LINEAR_CHANNEL_SCALE
+    from catopt_core.laws import LINEAR_CHANNEL_SCALE
 
     x = Var("x", TensorType((4, 8, 4)))
     r = Var("r", TensorType((4, 8, 1)))  # per-row
@@ -1167,7 +1167,7 @@ def test_conv2d_pairing_not_offered_for_grouped():
     grouped convolutions incorrectly."""
     import torch.nn as nn
     from catopt.egraph import EGraph
-    from catopt.rules import pair_shared_input_convs
+    from catopt_core.laws import pair_shared_input_convs
     from catopt.torch_bridge import export_to_ir
 
     class Grouped(nn.Module):
@@ -1220,7 +1220,7 @@ def test_gqa_absorb_repeat_kv():
 def test_gqa_absorb_rejects_bad_repeat():
     """The check must veto chains that are NOT repeat_interleave —
     e.g. expand growing a non-inserted dim."""
-    from catopt.rules import _check_gqa_absorb
+    from catopt_core.laws import _check_gqa_absorb
 
     # Forge a bad binding: expand grows dim 2 (a real dim), not the
     # unsqueezed dim 3.
@@ -1286,7 +1286,7 @@ def test_sdpa_fold_additive_mask():
 def test_sdpa_fold_rejects_wrong_dim():
     """softmax over a non-key dim is NOT attention — must not fold."""
     from catopt.ir import TensorType, Var
-    from catopt.rules import _check_softmax_dim
+    from catopt_core.laws import _check_softmax_dim
 
     q = Var("q", TensorType((1, 4, 32, 16)))
     bound = {"Q": q, "$attr:SD": 1}
@@ -1303,7 +1303,7 @@ def test_linear_recurrence_scan_structure():
     from catopt.models import LinearRecurrence
     from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
-    from catopt import rules as R
+    from catopt_core import laws as R
 
     def opdepth(t, memo):
         if not isinstance(t, Op):
@@ -1359,7 +1359,7 @@ def test_affine_monoid_parallel_scan():
     from catopt.models import LinearRecurrence
     from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
-    from catopt import rules as R
+    from catopt_core import laws as R
 
     def opdepth(t, memo):
         if not isinstance(t, Op):

@@ -264,7 +264,7 @@ def test_assoc_linear_bias_rule_member_extracts_finite():
     extraction must never see _INVALID_COST on the real shape."""
     from catopt.cost import _INVALID_COST, _shape_of
     from catopt.egraph import EGraph
-    from catopt.rules import ASSOC_LINEAR_BIAS
+    from catopt_core.laws import ASSOC_LINEAR_BIAS
 
     i, h, o = 8, 16, 8
     x = Var("x", TensorType((4, i)))

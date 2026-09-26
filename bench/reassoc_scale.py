@@ -68,7 +68,7 @@ from catopt.cost import launch_aware_cost
 from catopt.egraph import EGraph
 from catopt.ir import Op, Param, Var, op_repr
 from catopt.optimize import _EXPANSIVE_RULES, optimize_model
-from catopt.rules import (
+from catopt_core.laws import (
     all_rules,
     pair_shared_input_convs,
     pair_shared_input_linears,

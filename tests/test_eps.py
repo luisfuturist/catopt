@@ -20,7 +20,7 @@ from catopt.eps import (
     quant_params,
 )
 from catopt.ir import IR, Op, TensorType, Var
-from catopt.rules import all_rules
+from catopt_core.laws import all_rules
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 

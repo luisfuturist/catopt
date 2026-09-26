@@ -87,7 +87,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Protocol
 
-import catopt_core.rules as R
+import catopt_core.laws as R
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.egraph.terms import (
     _replace_subterm,

@@ -102,7 +102,7 @@ from typing import Any
 import torch
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Op, op_def
-from catopt_core.rules import R
+from catopt_core.laws import R
 
 __all__ = [
     "TORCH_BINDINGS",

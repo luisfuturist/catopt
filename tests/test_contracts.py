@@ -46,7 +46,7 @@ import torch.nn.functional as F
 from catopt.cost import _INVALID, _shape_of
 from catopt.egraph import _term_instantiate
 from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
+from catopt_core.laws import CATEGORICAL_RULES, SIMPLIFICATION_RULES
 from catopt.torch_bridge import (
     _ATEN_TO_IR,
     _IR_TO_TORCH,
