@@ -759,6 +759,12 @@ class IRModule(torch.nn.Module):
         sharing ``_IR_TO_TORCH``, so post-construction binding
         overrides keep reaching ``_eval``.  An explicit table owns its
         own dict: an op absent from it fails loudly at eval.
+
+    Ports layer: an ``IRModule`` is a minimal
+    :class:`catopt.ports.Executor` — ``forward(*xs) -> Tensor`` — and
+    is itself the ``eval_mod`` the planned wrappers embed (see
+    :class:`catopt.ports.PlannedExecutor`); ``ops`` conforms to
+    :class:`catopt.ports.OpRegistry`.
     """
 
     def __init__(
@@ -1006,6 +1012,9 @@ def ir_to_torch_module(
     """Convert a catopt IR into a torch.nn.Module.
 
     ``ops`` selects the lowering table; ``None`` (default) uses
-    ``OpTable.full()`` — the ambient ``_IR_TO_TORCH`` table.
+    ``OpTable.full()`` — the ambient ``_IR_TO_TORCH`` table.  The
+    return type stays the concrete :class:`IRModule` rather than the
+    :class:`catopt.ports.Executor` port — callers use module attrs the
+    port doesn't name (``state_dict``/``parameters``/``_eval``).
     """
     return IRModule(ir, param_values=param_values, ops=ops)

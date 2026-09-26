@@ -580,6 +580,12 @@ class BatchedOmdModule(torch.nn.Module):
     root is not an omd application — a drop-in replacement for
     ``ir_to_torch_module`` on ANY IR.  Any inconsistency the batched
     path hits at runtime likewise falls back to serial evaluation.
+
+    Ports layer: conforms to :class:`catopt.ports.BatchedExecutor`
+    (``forward`` + ``_plan`` + ``is_batched``; ``eval_mod`` is the
+    semantic member — see :class:`catopt.ports.PlannedExecutor` for why
+    it is not the runtime-checked one).  ``map_mode`` / ``fallbacks`` /
+    ``is_graph_captured`` stay class-level API, not port members.
     """
 
     def __init__(

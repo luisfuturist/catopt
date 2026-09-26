@@ -45,6 +45,16 @@ its ``torch_bindings`` on that same dict, so a post-construction
 A custom ``OpTable`` owns a private plain dict: deleting a binding
 there makes the missing op fail loudly at eval ("No torch binding"),
 it can never silently re-resolve through the ambient table.
+
+Ports layer
+-----------
+:class:`OpTable` IS the adapter-registry of the hexagonal boundary in
+:mod:`catopt.ports` — it structurally conforms to
+:class:`catopt.ports.OpRegistry` (``torch_bindings`` /
+``shape_rules`` / ``attr_schemas`` / ``register``); the protocol names
+the surface, nothing is re-wrapped.  Its dicts hold
+:class:`~catopt.ports.TorchBinding` and
+:class:`~catopt.ports.ShapeRule` values.
 """
 
 from __future__ import annotations
@@ -52,6 +62,8 @@ from __future__ import annotations
 import importlib
 from types import ModuleType, SimpleNamespace
 from typing import Any
+
+from catopt.ports import ShapeRule, TorchBinding
 
 __all__ = ["OpTable", "carrier_torch_bindings"]
 
@@ -71,7 +83,7 @@ def _carrier_module_objects() -> list[ModuleType]:
     return [importlib.import_module(name) for name in _CARRIER_MODULES]
 
 
-def carrier_torch_bindings() -> dict[str, Any]:
+def carrier_torch_bindings() -> dict[str, TorchBinding]:
     """Every carrier module's ``TORCH_BINDINGS`` merged into one dict.
 
     Rebuilt per call — later carriers win on a name collision and a
@@ -79,7 +91,7 @@ def carrier_torch_bindings() -> dict[str, Any]:
     Importing the carriers here is safe: they export dicts now and
     mutate no shared registry.
     """
-    out: dict[str, Any] = {}
+    out: dict[str, TorchBinding] = {}
     for mod in _carrier_module_objects():
         out.update(getattr(mod, "TORCH_BINDINGS", None) or {})
     return out
@@ -88,14 +100,17 @@ def carrier_torch_bindings() -> dict[str, Any]:
 class OpTable:
     """An explicit registry of op semantics.
 
+    The adapter registry of the ports layer — conforms to
+    :class:`catopt.ports.OpRegistry`.
+
     Attributes
     ----------
-    torch_bindings : dict[str, Callable]
+    torch_bindings : dict[str, TorchBinding]
         ``op_name -> lowering fn`` — the table ``IRModule._eval``
         dispatches through.  For :meth:`full` this IS the ambient
         ``torch_bridge._IR_TO_TORCH`` dict (shared, live); for
         ``core()``/custom tables it is a private plain dict.
-    shape_rules : dict[str, Callable]
+    shape_rules : dict[str, ShapeRule]
         ``op_name -> fn(op, shapes) -> shape`` — mirrors
         ``catopt.typing._SHAPE_RULES``.  Shape inference still
         dispatches through the ambient registry today (threading a
@@ -108,8 +123,8 @@ class OpTable:
     """
 
     def __init__(self) -> None:
-        self.torch_bindings: dict[str, Any] = {}
-        self.shape_rules: dict[str, Any] = {}
+        self.torch_bindings: dict[str, TorchBinding] = {}
+        self.shape_rules: dict[str, ShapeRule] = {}
         self.attr_schemas: dict[str, dict[int, str]] = {}
 
     # -- constructors -------------------------------------------------

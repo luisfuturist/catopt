@@ -163,7 +163,14 @@ target — the same equivalence space, selected per backend.
 ## Layout
 
 ```
-catopt/          the engine: ir, egraph, rules, cost, optimize
+catopt/          the engine: ir, egraph, laws, cost, ops, optimize
+  ports          protocol boundaries (CostFn, Executor, OpRegistry, ...)
+  egraph/        union-find, matching, saturation, extraction, proof
+  laws/          equational laws (tensor/scan) + non-local passes
+  typing         shape inference (register_shape_rule protocol)
+  attrs          per-op attribute schemas (mint-time validation)
+  ops            OpTable — explicit adapter registry (bindings/shapes/attrs)
+  report         typed OptReport/BlockReport + verify_equiv gate
   torch_bridge   torch.export → IR → executable module (+weight folding)
   om/om_lower    online-softmax monoid + chunked/streaming executors
   scan_lower     level-batched parallel-scan executor

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "catopt"
@@ -21,6 +21,7 @@ dev = [
     "ruff>=0.6",
     "coverage>=7.0",
     "pre-commit>=3.0",
+    "pyright>=1.1.380",
 ]
 
 [dependency-groups]
@@ -31,6 +32,7 @@ dev = [
     "ruff>=0.6",
     "coverage>=7.0",
     "pre-commit>=3.0",
+    "pyright>=1.1.380",
 ]
 
 [tool.setuptools.packages.find]
@@ -54,6 +56,44 @@ ignore = [
     "B008",     # function-call in default arg — used for cost-fn defaults
     "SIM108",   # ternary suggestion — if/else often clearer here
 ]
+
+[tool.pyright]
+# Ratchet: `include` is the whole package so new modules are checked
+# automatically; `exclude` is the temporary opt-out list — remove entries
+# as files get annotated. Baseline (pyright 1.1.414, standard mode):
+# 442 errors / 22 files. Excluded-file diagnostics are not reported, but
+# excluded files are still analyzed when imported by checked files.
+# Each entry: error count at baseline + dominant issue. Sorted by count.
+typeCheckingMode = "standard"
+include = ["catopt"]
+exclude = [
+    "catopt/xcarrier.py",        # 164 — Optional-subscript/operand on un-narrowed dict lookups
+    "catopt/om.py",              #  87 — same Optional-heavy rewriting internals
+    "catopt/egraph/proof.py",    #  36 — attribute access on untyped proof objects
+    "catopt/egraph/extract.py",  #  32 — attribute access on untyped extraction state
+    "catopt/om_lower.py",        #  22 — Optional subscripts + incompatible override
+    "catopt/typing.py",          #  18 — generic helpers; arg-type mismatches
+    "catopt/scan_lower.py",      #  11 — Optional subscripts; None in Tensor dicts
+    "catopt/cost.py",            #  10 — FunctionType attr assignment; object→float
+    "catopt/omd_lower.py",       #   9 — Optional subscripts; None in Tensor dicts
+    "catopt/eps.py",             #   8 — possibly-unbound vars; Optional args
+    "catopt/ibp.py",             #   7 — Optional member access on Box intervals
+    "catopt/laws/tensor.py",     #   7 — Op passed where str expected
+    "catopt/torch_bridge.py",    #   7 — Optional attrs; torch Module return types
+    "catopt/optimize.py",        #   6 — "IR not iterable"; arg-type mismatches
+    "catopt/report.py",          #   5 — Optional member access; None args
+    "catopt/meta.py",            #   3 — list↔dict assignment mismatches
+    "catopt/models/__init__.py", #   3 — nn.Module __getitem__; int→Tensor return
+    "catopt/models/ssm.py",      #   2 — Tensor|Module arithmetic operators
+    "catopt/regime.py",          #   2 — Tensor−object op; IR not iterable
+    "catopt/egraph/core.py",     #   1 — dict return-type mismatch
+    "catopt/ir.py",              #   1 — int * Optional[int]
+    "catopt/laws/pairing.py",    #   1 — tuple assigned to list[int]
+]
+pythonVersion = "3.13"
+# torch and numpy ship usable stubs; keep missing imports an error so a
+# broken environment fails loudly instead of silently degrading to Any.
+reportMissingImports = "error"
 
 [tool.coverage.run]
 source = ["catopt"]

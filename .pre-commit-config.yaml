@@ -11,3 +11,12 @@ repos:
         entry: .venv/bin/ruff format
         language: system
         types: [python]
+      - id: pyright
+        name: pyright
+        # Per-file invocation: files passed explicitly still honor the
+        # `exclude` list in pyproject.toml, so excluded modules stay green
+        # while every checked module is verified. Config: [tool.pyright].
+        entry: .venv/bin/pyright
+        language: system
+        types: [python]
+        files: ^catopt/.*\.py$

@@ -324,6 +324,12 @@ class BatchedScanModule(torch.nn.Module):
     still CPU-dispatch limited; :meth:`capture_cuda_graph` records the
     whole batched forward into a CUDA graph so one ``graph.replay()``
     replaces all per-level launches.
+
+    Ports layer: conforms to :class:`catopt.ports.BatchedExecutor`
+    (``forward`` + ``_plan`` + ``is_batched``; ``eval_mod`` is the
+    semantic member — see :class:`catopt.ports.PlannedExecutor` for why
+    it is not the runtime-checked one).  ``n_levels`` /
+    ``is_graph_captured`` stay class-level API, not port members.
     """
 
     def __init__(

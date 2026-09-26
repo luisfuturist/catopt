@@ -521,6 +521,12 @@ class BatchedOMModule(torch.nn.Module):
     still CPU-dispatch limited; :meth:`capture_cuda_graph` records the
     whole batched forward so one ``graph.replay()`` replaces every
     launch.
+
+    Ports layer: conforms to :class:`catopt.ports.BatchedExecutor`
+    (``forward`` + ``_plan`` + ``is_batched``; ``eval_mod`` is the
+    semantic member — see :class:`catopt.ports.PlannedExecutor` for why
+    it is not the runtime-checked one).  ``n_levels`` / ``n_blocks`` /
+    ``is_graph_captured`` stay class-level API, not port members.
     """
 
     def __init__(
@@ -953,6 +959,11 @@ class StreamingOMModule(torch.nn.Module):
     :func:`om_empty_state`, :func:`om_apply_state` — pure tensor ops,
     CUDA-graph capturable) and as the staticmethods ``step`` /
     ``step_qk`` / ``apply`` here.
+
+    Ports layer: a :class:`catopt.ports.PlannedExecutor` (``forward`` +
+    ``_plan``, with ``eval_mod`` as the serial fallback) but
+    deliberately not a :class:`~catopt.ports.BatchedExecutor` — its
+    discriminator is ``is_streaming``, not ``is_batched``.
     """
 
     def __init__(

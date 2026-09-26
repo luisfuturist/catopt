@@ -22,7 +22,6 @@ from typing import Any
 import torch
 
 from catopt.cost import (
-    CostModel,
     dag_cost,
     flops_cost,
     launch_aware_cost,
@@ -30,6 +29,7 @@ from catopt.cost import (
 from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, Var, op_repr
 from catopt.ops import OpTable
+from catopt.ports import CostFn
 from catopt.report import (
     BlockReport,
     CompositionalReport,
@@ -307,7 +307,7 @@ def discover_alternatives(
     *,
     ruleset: str = "categorical",
     max_iterations: int = 6,
-    cost_fn: CostModel = None,
+    cost_fn: CostFn | None = None,
     top_k: int = 8,
 ) -> dict:
     """Enumerate the cheapest distinct members of the semantic
@@ -397,7 +397,7 @@ def optimize_model(
     max_iterations: int = 100,
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
-    cost_fn=None,
+    cost_fn: CostFn | None = None,
     eps_rtol: float | None = None,
     symmetry_budget: int | None = 2048,
     ops: OpTable | None = None,
@@ -427,8 +427,9 @@ def optimize_model(
         bytes — checked at phase boundaries; crossing it raises
         :class:`OptimizationResourceError`.  ``None`` (default)
         disables the check.
-    cost_fn : callable
-        Cost function for term extraction.  Defaults to
+    cost_fn : CostFn | None
+        Cost function for term extraction — the
+        :class:`catopt.ports.CostFn` port.  Defaults to
         :func:`launch_aware_cost` (FLOPs + a small per-kernel penalty so
         that forms with identical FLOPs but fewer launches win).
     symmetry_budget : int, optional
@@ -719,7 +720,7 @@ def ir_to_string(term: Any) -> str:
     return op_repr(term)
 
 
-def term_cost(term: Any, cost_fn=None) -> float:
+def term_cost(term: Any, cost_fn: CostFn | None = None) -> float:
     """Compute the cost of a term using the given cost function."""
     if cost_fn is None:
         cost_fn = flops_cost
@@ -840,7 +841,7 @@ def optimize_compositional(
     *,
     block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool]
     | None = None,
-    cost_fn=None,
+    cost_fn: CostFn | None = None,
     ruleset: str = "all",
     max_iterations: int = 100,
     max_enodes: int | None = 100_000,
