@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from catopt.attrs import validate_attrs
+
 __all__ = [
     "IR",
     "Const",
@@ -101,8 +103,21 @@ class Op:
     attrs: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
-    def make(op: str, *args, **attrs) -> Op:
-        return Op(op, args, attrs)
+    def make(op: str, *args, validate: bool = True, **attrs) -> Op:
+        """Mint an op term under the ``catopt.attrs`` contract.
+
+        Ops declared in ``ATTR_SCHEMA`` are validated at mint: a
+        positional ``argN`` at an undeclared position, or a required
+        attr missing from a fully-attributed term, dies here with a
+        ``ValueError`` — not silently at eval.  ``argN`` at declared
+        positions stays legal (dual-spelling rule variants and
+        hand-minted terms consume it); the positional spelling only
+        merges — winning — when the canonical name is also supplied.
+        ``validate=False`` escapes for deliberate non-canonical mints.
+        """
+        return Op(
+            op, args, validate_attrs(op, attrs, validate=validate)
+        )
 
     def __repr__(self) -> str:
         parts = [op_repr(a) for a in self.args]

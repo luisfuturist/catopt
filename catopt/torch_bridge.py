@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from catopt.attrs import ATTR_SCHEMA
 from catopt.ir import IR, Const, Op, Param, TensorType, Var
 
 _ATEN_TO_IR: dict[str, str] = {
@@ -72,32 +73,16 @@ _IR_TO_TORCH_EXTRA: dict[str, str] = {
     "conv2d.default": "conv2d",
 }
 
-#: Positional-argument → named-attribute maps for ops whose trailing
-#: args are not generic dims (aten.conv2d takes stride/padding/dilation/
-#: groups positionally).
-_POSITIONAL_ATTRS: dict[str, dict[int, str]] = {
-    "conv2d": {3: "stride", 4: "padding", 5: "dilation", 6: "groups"},
-}
-
-#: Canonical attribute names the rule side (rules.py, om.py) and the
-#: cost model's ``_shape_of`` pattern-match.  torch.export emits
-#: trailing positional args as ``arg{i}`` attributes — ``cat(ts, -2)``
-#: arrives as ``concat(arg1=-2)`` and ``t.chunk(n, -2)`` as
-#: ``chunk(arg1=n, arg2=-2)`` — while every rule-produced term spells
-#: these ``dim=``/``chunks=``.  Renaming at the bridge boundary lands
-#: exports in the canonical spelling so rewrite LHSs (OM_SPLIT,
-#: MATMUL_T_CONCAT, ...) match raw exported graphs and ``_shape_of``
-#: reads chunk dims correctly.  Semantically a no-op: the
-#: ``_IR_TO_TORCH`` lowerings accept both spellings.  Deliberately
-#: narrow — ops whose positional spellings ARE the canonical rule-side
-#: ones (transpose/unsqueeze/softmax arg1/arg2, split's arg1 size) are
-#: left untouched.
-_ATTR_RENAMES: dict[str, dict[str, str]] = {
-    "concat": {"arg1": "dim"},
-    "chunk": {"arg1": "chunks", "arg2": "dim"},
-    "split": {"arg2": "dim"},
-    "rms_norm": {"arg3": "eps"},
-}
+#: Positional-argument → named-attribute mapping lives in
+#: ``catopt.attrs.ATTR_SCHEMA`` (plan 0001 phase 1b): for every
+#: schema'd op, non-node args at declared positions land under the
+#: canonical attr name directly — ``cat(ts, -2)`` becomes
+#: ``concat(dim=-2)``, ``F.sdpa(..., is_causal=True)`` becomes
+#: ``is_causal=True``, never ``argN``.  Ops *not* in the schema keep
+#: the legacy ``arg{i}`` spelling so undeclared positionals fail
+#: loudly at ``Op.make`` validation instead of being silently
+#: accepted under a guessed name.  (What used to be ``_ATTR_RENAMES``
+#: for concat/chunk/split/rms_norm is fully covered by the schema.)
 
 
 #: Ops where a numeric argument is a scalar OPERAND (not an attribute).
@@ -281,13 +266,19 @@ def export_to_ir(
             ir_op = _ATEN_TO_IR.get(op_name, op_name)
             args = []
             attrs = {}
-            positional_attrs = _POSITIONAL_ATTRS.get(ir_op, {})
+            positional_attrs = ATTR_SCHEMA.get(ir_op, {})
             for i, arg_node in enumerate(node.args):
-                if i in positional_attrs and not hasattr(
-                    arg_node, "name"
+                if (
+                    i in positional_attrs
+                    and arg_node is not None
+                    and not hasattr(arg_node, "name")
                 ):
                     # e.g. conv2d(x, w, b, [s,s], [p,p], [d,d], g) —
-                    # non-node positionals are named op attributes.
+                    # non-node positionals at schema-declared positions
+                    # are named op attributes.  ``None`` positionals
+                    # (an absent sdpa attn_mask) are skipped — a
+                    # present-but-None attr would poison e-matching's
+                    # exact attr-set comparison.
                     v = arg_node
                     attrs[positional_attrs[i]] = (
                         tuple(v) if isinstance(v, (list, tuple)) else v
@@ -317,7 +308,10 @@ def export_to_ir(
                                 args.append(env[key])
                     # e.g. dim=[-1] lists for reductions; for view/reshape
                     # the list is the target SHAPE, not a dim.
-                    elif ir_op == "reshape" or ir_op in ("expand", "repeat"):
+                    elif ir_op == "reshape" or ir_op in (
+                        "expand",
+                        "repeat",
+                    ):
                         attrs["shape"] = tuple(arg_node)
                     elif ir_op in ("split", "chunk"):
                         attrs["sizes"] = tuple(arg_node)
@@ -353,12 +347,10 @@ def export_to_ir(
                     attrs[k] = v
                 elif isinstance(v, list):
                     attrs[k] = tuple(v)
-            # Land exported positional spellings in the canonical
-            # rule-side form (concat arg1→dim, chunk arg1→chunks /
-            # arg2→dim, split arg2→dim).  Existing named attrs win.
-            for old, new in _ATTR_RENAMES.get(ir_op, {}).items():
-                if old in attrs and new not in attrs:
-                    attrs[new] = attrs.pop(old)
+            # Canonical attr spellings are guaranteed below by
+            # ``Op.make`` (ATTR_SCHEMA): positional attrs were named at
+            # emission above; any ``argN`` still present for a schema'd
+            # op fails loudly at mint.
             if (
                 ir_op == "getitem"
                 and args
@@ -427,10 +419,17 @@ _IR_TO_TORCH: dict[str, Any] = {
     "mean": lambda x, *a, **kw: x.mean(*_dim_args(a, kw)),
     "max": lambda x, *a, **kw: x.amax(*_dim_args(a, kw)),
     "min": lambda x, *a, **kw: x.amin(*_dim_args(a, kw)),
+    # Canonical names per ATTR_SCHEMA are listed first in each get;
+    # the argN spellings remain live fallbacks — rule variants and
+    # hand-minted terms legitimately carry them (Op.make preserves
+    # declared-position argN; only the export boundary is canonical).
     "transpose": lambda x, *a, **kw: (
         x.t()
-        if x.dim() == 2 and "arg1" not in kw
-        else x.transpose(kw.get("arg1", -2), kw.get("arg2", -1))
+        if x.dim() == 2 and "arg1" not in kw and "dim0" not in kw
+        else x.transpose(
+            kw.get("dim0", kw.get("arg1", -2)),
+            kw.get("dim1", kw.get("arg2", -1)),
+        )
     ),
     "reshape": lambda x, *a, **kw: x.reshape(
         tuple(kw["shape"]) if "shape" in kw else (-1,)
@@ -478,10 +477,14 @@ _IR_TO_TORCH: dict[str, Any] = {
         list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))
     ),
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
-        t, int(kw.get("arg1", chunks)), dim=int(kw.get("arg2", dim))
+        t,
+        int(kw.get("chunks", kw.get("arg1", chunks))),
+        dim=int(kw.get("dim", kw.get("arg2", dim))),
     )[index],
     "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
-        t, _split_sizes(sizes, kw), dim=int(kw.get("arg2", dim))
+        t,
+        _split_sizes(sizes, kw),
+        dim=int(kw.get("dim", kw.get("arg2", dim))),
     )[index],
     # torch.export emits aten.dropout with train=False in eval mode —
     # the op is a semantic identity there.  This binding is only valid
@@ -490,7 +493,7 @@ _IR_TO_TORCH: dict[str, Any] = {
     # dtype casts are identity at the precision we verify (float32)
     "to": lambda x, *a, **kw: x,
     "clone": lambda x, *a, **kw: x.clone(),
-    "getitem": lambda t, **kw: t[kw.get("arg1", kw.get("index", 0))],
+    "getitem": lambda t, **kw: t[kw.get("index", kw.get("arg1", 0))],
     "unbind": lambda t, *a, **kw: torch.unbind(
         t, dim=int(kw.get("dim", kw.get("arg1", -1)))
     )[int(kw.get("index", 0))],
@@ -501,11 +504,11 @@ _IR_TO_TORCH: dict[str, Any] = {
         *tuple(kw.get("shape") or kw.get("dim") or a)
     ),
     "flatten": lambda x, *a, **kw: x.flatten(
-        int(kw.get("arg1", kw.get("start_dim", 0))),
-        int(kw.get("arg2", kw.get("end_dim", -1))),
+        int(kw.get("start_dim", kw.get("arg1", 0))),
+        int(kw.get("end_dim", kw.get("arg2", -1))),
     ),
     "slice": lambda t, *a, **kw: t[
-        (slice(None),) * int(kw.get("arg1", kw.get("dim", 0)))
+        (slice(None),) * int(kw.get("dim", kw.get("arg1", 0)))
         + (slice(kw.get("arg2"), kw.get("arg3"), kw.get("arg4")),)
     ],
     "unsqueeze": lambda t, *a, **kw: t.unsqueeze(
@@ -515,8 +518,8 @@ _IR_TO_TORCH: dict[str, Any] = {
         int(kw.get("dim", kw.get("arg1", -1)))
     ),
     "select": lambda t, *a, **kw: t.select(
-        int(kw.get("arg1", kw.get("dim", 0))),
-        int(kw.get("arg2", kw.get("index", 0))),
+        int(kw.get("dim", kw.get("arg1", 0))),
+        int(kw.get("index", kw.get("arg2", 0))),
     ),
     # embedding(W, idx) — row gather; factorised form gathers the small
     # factor then projects (eps.low_rank_gather).
@@ -554,16 +557,17 @@ _IR_TO_TORCH: dict[str, Any] = {
     ),
     "alias": lambda x, *a, **kw: x,
     "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
-        x, dim=int(kw.get("arg1", kw.get("dim", -1)))
+        x, dim=int(kw.get("dim", kw.get("arg1", -1)))
     ),
-    # aten.rms_norm(x, weight) with attrs dim=normalized_shape,
-    # arg3=eps — the normalization Llama-family blocks are built on.
+    # aten.rms_norm(x, normalized_shape, weight, eps) — canonical
+    # attrs dim=normalized_shape, eps=eps (Llama-family normalization);
+    # normalized_shape/arg3 are the legacy minted spellings.
     "rms_norm": lambda x, w=None, *a, **kw: (
         torch.nn.functional.rms_norm(
             x,
             tuple(kw.get("dim", kw.get("normalized_shape"))),
             weight=w,
-            eps=float(kw.get("arg3", kw.get("eps", 1e-6))),
+            eps=float(kw.get("eps", kw.get("arg3", 1e-6))),
         )
     ),
     "layer_norm": lambda x, w=None, b=None, *a, **kw: (
@@ -572,7 +576,9 @@ _IR_TO_TORCH: dict[str, Any] = {
             tuple(kw.get("dim", kw.get("normalized_shape"))),
             weight=w,
             bias=b,
-            eps=float(kw.get("arg5", kw.get("eps", 1e-5))),
+            # eps is arg4 canonically — NOT arg5 (the cudnn flag):
+            # reading arg5 silently produced eps=0.0 before.
+            eps=float(kw.get("eps", kw.get("arg4", 1e-5))),
         )
     ),
     "masked_fill": lambda x, m, v, *a, **kw: x.masked_fill(m, v),
@@ -649,8 +655,9 @@ def _om_compose(f, g):
 
 
 def _split_sizes(sizes: Any, kw: dict):
-    """split(x, sizes_list) and split(x, int) both export as 'split':
-    a sizes tuple lands in 'sizes', an int chunk size in 'arg1'."""
+    """split(x, sizes_list) and split(x, int) both land under the
+    canonical ``sizes`` attr at the boundary; minted terms may still
+    carry the positional ``arg1`` spelling."""
     sz = kw.get("sizes", sizes)
     if isinstance(sz, (list, tuple)) and sz:
         return list(sz)
