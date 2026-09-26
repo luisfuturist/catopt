@@ -1,6 +1,6 @@
 # Plan 0002 — Genericity: shared machinery, plug points, deduplication
 
-Status: proposed
+Status: phases A–D complete (3cf741f)
 Date: 2026-09-26
 Branch: `project` (orphan — plans live here, not on main)
 Follows: `0001-refactor-and-quality.md` (phases 0–3 + hardening complete)
@@ -150,3 +150,23 @@ the audit map.
   before touching plan types.
 - **Executor subclassing vs mixin** — mixin only; the classes keep
   their names/bases.
+
+
+---
+
+## Progress log
+
+| Phase | Commit | Result |
+|---|---|---|
+| A executor base | `d322e98` | `catopt/executors/base.py` — BatchedExecutorBase mixin (~150 lines deduped: capture/drop/is_graph_captured/_cached/_input_env/ev) |
+| B attr_of | `d322e98` | `attrs.attr_of` — 47 dual-spelling reads converted (bridge 24, typing 16, ibp 7); precedence + defaults preserved exactly |
+| C predicates + terms | `2f8789e` | `typing.has_var_leaf` (5 clones→1); meta path-fns delegate to egraph/terms (match/instantiate kept — verified semantics differ); `cost._memo_dispatch` ×3 sites; `om._shape_of`→`_vshape` rename; `_concrete`/`_stack_dim` single-sourced |
+| D witness/eval/schedule | `3cf741f` | `EGraph._pointwise_witness`+`_offer_witness` — 15 sites converted; `torch_bridge.eval_term` — 4/4 evaluators unified; `level_schedule`+`slot_gathers` executor helpers |
+
+Bug fixes along the way: `IRModule.forward` unguarded `xs[0]`, `omd_lower._select_index` getitem-arg1 divergence, env-dependent CUDA test made deterministic.
+
+Honest keep-separates (audit-verified, documented): `meta.match_pattern`/`instantiate_pattern` (Const eq vs repr compare; `$attr` KeyError veto), `_eval_const` permissive-vs-strict, `om`/`omd` batched-compose copies, omd forest `walk_map`, om multiplicity seeding, `eps`/`act_eps` `ev` variants, `meta` witness site (false positive — mints rules not unions).
+
+Remaining open item: Phase E recognizer consolidation (law-side vs lowerer-side gather/index recognizers) — deferred; substrates genuinely differ (e-class bindings vs extracted terms). Phase D plan-typing deferred as documented.
+
+State (3cf741f): **1,579 tests**, coverage 100%, ruff 0, pyright 0.
