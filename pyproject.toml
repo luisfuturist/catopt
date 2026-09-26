@@ -34,6 +34,21 @@ bench = [
     "matplotlib>=3.8",
     "pandas>=2.0",
 ]
+# OPT-IN, TEST-ONLY differential oracle (Phase 4).  `egglog` drives a
+# second equality-saturation engine used *only* by
+# tests/test_egglog_oracle.py to cross-check catopt's search on a small
+# op/law subset.  It is deliberately NOT in `dev`: the repo stays light
+# (egglog is a compiled Rust extension), the oracle test self-skips via
+# `pytest.importorskip("egglog")` when the group is absent, and nothing
+# under packages/ or catopt/ imports it.  Run with:
+#   uv sync --group oracle && .venv/bin/python -m pytest tests/test_egglog_oracle.py
+# egglog ships wheels for CPython >= 3.12 only, so the entry carries a
+# `python_version` marker: the workspace still declares `>=3.11`, but
+# the oracle group only resolves on the 3.12+ interpreters that can run
+# it (the dev venv is 3.13).
+oracle = [
+    "egglog>=14.0; python_version >= '3.12'",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=5.0",
