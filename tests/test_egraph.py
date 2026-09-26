@@ -447,3 +447,17 @@ def test_incremental_saturation_same_fixed_point():
 
     best = eg.extract_best(eid, flops_cost)
     assert best is not None
+
+
+def test_add_term_list_valued_attrs():
+    """Hand-minted list attrs don't crash ``add_term`` — enode attr
+    packing normalises list→tuple (the same canonicalisation the
+    export boundary does), so ``sizes=[2,2]`` and ``sizes=(2,2)``
+    mint to the same e-class."""
+    x = Var("x", TensorType((8,)))
+    t_list = Op.make("split", x, sizes=[2, 2], dim=0, index=0)
+    t_tuple = Op.make("split", x, sizes=(2, 2), dim=0, index=0)
+    eg = EGraph()
+    a = eg.add_term(t_list)
+    b = eg.add_term(t_tuple)
+    assert eg.find(a) == eg.find(b)

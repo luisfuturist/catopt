@@ -576,11 +576,18 @@ def optimize_model(
         + share_duplicate_param_slices(eg, source_tensors)
     )
     if eps_rtol is not None:
-        from catopt_eps.eps import (
-            kron_linear_params,
-            low_rank_gather,
-            low_rank_params,
-        )
+        try:
+            from catopt_eps.eps import (
+                kron_linear_params,
+                low_rank_gather,
+                low_rank_params,
+            )
+        except ModuleNotFoundError as e:  # pragma: no cover — fires
+            # only when catopt-eps isn't installed (partial install).
+            raise ModuleNotFoundError(
+                "eps_rtol requires the catopt-eps package "
+                "(pip install catopt-eps, or catopt-optimize[eps])"
+            ) from e
 
         eps_offers = (
             low_rank_params(eg, source_tensors, rtol=eps_rtol)

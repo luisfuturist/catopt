@@ -16,7 +16,6 @@ fp64-equivalent to both the eager model and the serial lowering.
 
 import pytest
 import torch
-
 from catopt.cost import flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Param, TensorType, Var
@@ -594,3 +593,65 @@ def test_omd_apply_term_accepting_bare_term():
     x = _rand((1,), 104)
     with torch.no_grad():
         assert (gen(x) - bat(x)).abs().max().item() < 1e-12
+
+
+def test_batched_dense_compose_levels_no_fallback():
+    """Dense-fiber ``omd_compose`` levels: fa carries (…,Tq,o,i) while
+    the row weight is (…,Tq,1) — the batched rescale needs the
+    trailing-1 broadcast the serial _omd_compose does, or every
+    forward falls back silently (audit finding R3)."""
+    T, Tq, d = 4, 3, 5
+    p_A, p_h, p_s1, p_s2 = [
+        _P(n, s)
+        for n, s in (
+            ("p_A", (T, d, d)),
+            ("p_h", (d,)),
+            ("p_s1", (Tq, T)),
+            ("p_s2", (Tq, T)),
+        )
+    ]
+    x_v = Var("x", TensorType((T, d)))
+
+    def dense_map():
+        leaves = [
+            Op.make(
+                "aff",
+                Op.make("select", p_A, arg1=0, arg2=t),
+                Op.make("select", x_v, arg1=0, arg2=t),
+            )
+            for t in range(T)
+        ]
+        fs = [leaves[0]]
+        for t in range(1, T):
+            fs.append(Op.make("aff_compose", leaves[t], fs[-1]))
+        return (
+            Op.make("stack", *(Op.make("aff_A", f) for f in fs), dim=0),
+            Op.make("stack", *(Op.make("aff_b", f) for f in fs), dim=0),
+        )
+
+    a1, b1 = dense_map()
+    a2, b2 = dense_map()
+    term = Op.make(
+        "omd_applym",
+        Op.make(
+            "omd_compose",
+            Op.make("omd_elem", p_s1, a1, b1),
+            Op.make("omd_elem", p_s2, a2, b2),
+        ),
+        p_h,
+    )
+    ir = IR(root=term, inputs=[x_v], params={})
+    pv = {
+        "p_A": _rand((T, d, d), 30) * 0.2,
+        "p_h": _rand((d,), 31),
+        "p_s1": _rand((Tq, T), 32),
+        "p_s2": _rand((Tq, T), 33),
+    }
+    x = _rand((T, d), 34)
+    gen = ir_to_torch_module(ir, pv).eval()
+    bat = to_batched_omd_module(ir, pv).eval()
+    assert bat.is_batched
+    with torch.no_grad():
+        diff = (gen(x) - bat(x)).abs().max().item()
+    assert bat.fallbacks == 0  # the batched dense compose must fire
+    assert diff < 1e-6

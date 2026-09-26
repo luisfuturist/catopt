@@ -103,8 +103,21 @@ class Rewrite:
         )
 
 
+def _norm_attr_value(v: Any) -> Any:
+    """List-valued attrs are unhashable — enode attr keys carry
+    tuples instead (the export boundary already canonicalises
+    list→tuple; hand-minted terms get the same normalisation here)."""
+    return tuple(v) if isinstance(v, list) else v
+
+
 def _pattern_attrs(op: Op) -> tuple[tuple[str, Any], ...]:
-    return tuple(sorted(op.attrs.items())) if op.attrs else ()
+    return (
+        tuple(
+            sorted((k, _norm_attr_value(v)) for k, v in op.attrs.items())
+        )
+        if op.attrs
+        else ()
+    )
 
 
 class _LeafRegistry:

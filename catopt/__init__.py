@@ -17,6 +17,7 @@ etc. all keep working unchanged.
 
 # -- compat: alias every historical module path BEFORE anything else --
 import sys as _sys
+from contextlib import suppress as _suppress
 from importlib import import_module as _imp
 
 _ALIAS = {
@@ -79,14 +80,16 @@ for _old, _new in _ALIAS.items():
         pass  # domain package isn't installed (partial install)
 
 del _sys, _imp
+# Strip the remaining compat scaffolding — no private names survive as
+# stray module attributes (pop tolerates names the loop never bound on
+# a bare install).
+for _name in ("_ALIAS", "_old", "_new", "_mod"):
+    globals().pop(_name, None)
+del _name
 
 # -- public API ---------------------------------------------------------
-from catopt_carriers.omd_lower import (
-    BatchedOmdModule,
-    build_omd_plan,
-    is_omd_apply_term,
-    to_batched_omd_module,
-)
+# Core re-exports are unconditional — catopt-core is a hard
+# dependency of every install.
 from catopt_core.cost import (
     CostModel,
     count_cost,
@@ -106,12 +109,27 @@ from catopt_core.rules import (
     SIMPLIFICATION_RULES,
     all_rules,
 )
-from catopt_optimize.optimize import optimize_model
-from catopt_torch.torch_bridge import (
-    IRModule,
-    export_to_ir,
-    ir_to_torch_module,
-)
+
+# Torch-domain re-exports stay fault-tolerant like the alias loop:
+# on a partial install ``import catopt`` still succeeds — the absent
+# package's names simply are not bound.
+with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_carriers.omd_lower import (
+        BatchedOmdModule,
+        build_omd_plan,
+        is_omd_apply_term,
+        to_batched_omd_module,
+    )
+with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_optimize.optimize import optimize_model
+with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_torch.torch_bridge import (
+        IRModule,
+        export_to_ir,
+        ir_to_torch_module,
+    )
+
+del _suppress
 
 __version__ = "0.1.0dev"
 

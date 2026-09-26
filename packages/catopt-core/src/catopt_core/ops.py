@@ -16,9 +16,9 @@ WHICH modules had happened to be imported — an invisible dependency.
   exports in: ``TORCH_BINDINGS`` / ``SHAPE_RULES`` / ``ATTR_SCHEMA``
   dicts the module publishes at top level (importing the module no
   longer mutates anything).
-* :meth:`OpTable.full` — ``core()`` plus every carrier module —
-  preserves today's ambient behavior and is the default
-  ``IRModule``/``optimize_model`` dispatches through.
+* :meth:`OpTable.full` — ``core()`` plus every carrier module that
+  is installed — preserves today's ambient behavior and is the
+  default ``IRModule``/``optimize_model`` dispatches through.
 
 Carrier modules that opt in (and the ops they contribute):
 
@@ -80,7 +80,25 @@ _CARRIER_MODULES: tuple[str, ...] = (
 
 
 def _carrier_module_objects() -> list[ModuleType]:
-    return [importlib.import_module(name) for name in _CARRIER_MODULES]
+    """Import the carrier modules that are installed.
+
+    A carrier's terms cannot exist without its package, so a missing
+    carrier module (partial install — e.g. catopt-core + catopt-torch
+    alone, no ``catopt-carriers``/``catopt-eps``) contributes nothing
+    and is skipped silently.  The ``ModuleNotFoundError`` is narrowed
+    to the carrier module itself or one of its parent packages: an
+    import error raised INSIDE an installed carrier (a missing
+    dependency, ``e.name`` differing) still propagates.
+    """
+    mods: list[ModuleType] = []
+    for name in _CARRIER_MODULES:
+        try:
+            mods.append(importlib.import_module(name))
+        except ModuleNotFoundError as e:
+            missing = e.name or ""
+            if name != missing and not name.startswith(missing + "."):
+                raise
+    return mods
 
 
 def carrier_torch_bindings() -> dict[str, TorchBinding]:
@@ -148,8 +166,13 @@ class OpTable:
 
     @classmethod
     def full(cls) -> OpTable:
-        """``core()`` plus every carrier module — today's ambient
-        behavior, as an explicit object.
+        """``core()`` plus every carrier module that is installed —
+        today's ambient behavior, as an explicit object.
+
+        Carrier packages absent from the environment are skipped:
+        their terms cannot exist without the package anyway, so a
+        partial install (e.g. catopt-core + catopt-torch only) still
+        yields a working table.
 
         The returned table's ``torch_bindings`` is the ambient
         ``catopt_torch.torch_bridge._IR_TO_TORCH`` dict itself: post-hoc

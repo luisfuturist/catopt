@@ -9,5 +9,8 @@ description = "Optimizer orchestrators for catopt: pipelines, regime dispatch, c
 requires-python = ">=3.11"
 dependencies = ["catopt-core", "catopt-torch", "catopt-carriers", "torch>=2.0"]
 
+[project.optional-dependencies]
+eps = ["catopt-eps"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

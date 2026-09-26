@@ -397,6 +397,17 @@ def _resolve_attr(module: torch.nn.Module, target: str) -> torch.Tensor:
     return obj
 
 
+def _expand_torch(t: Any, *a: Any, **kw: Any) -> Any:
+    """``t.expand`` binding: the target shape arrives as ``shape`` /
+    ``dim`` attrs or positional args — a size sequence OR a bare int.
+    Splat sequences; pass a scalar through (``t.expand(*4)`` would be a
+    ``TypeError``, ``t.expand(4)``/``t.expand(-1)`` is legal)."""
+    dim_v = kw.get("shape") or kw.get("dim") or a
+    if isinstance(dim_v, (tuple, list)):
+        return t.expand(*dim_v)
+    return t.expand(dim_v)
+
+
 #: Core torch lowering bindings — the base ``OpTable``'s table (plan
 #: 0001 phase 2c).  Carrier ops (``trace``/``omd_*``/``cmask``/
 #: ``aquant``...) are deliberately ABSENT: they live in each carrier
@@ -485,12 +496,12 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         t,
         int(attr_of(kw, "chunks", "arg1", default=chunks)),
         dim=int(attr_of(kw, "dim", "arg2", default=dim)),
-    )[index],
+    )[int(attr_of(kw, "index", "arg3", default=index))],
     "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
         t,
         _split_sizes(sizes, kw),
         dim=int(attr_of(kw, "dim", "arg2", default=dim)),
-    )[index],
+    )[int(attr_of(kw, "index", "arg3", default=index))],
     # torch.export emits aten.dropout with train=False in eval mode —
     # the op is a semantic identity there.  This binding is only valid
     # because export_to_ir always exports eval()-mode graphs.
@@ -501,13 +512,11 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     "getitem": lambda t, **kw: t[attr_of(kw, "index", "arg1", default=0)],
     "unbind": lambda t, *a, **kw: torch.unbind(
         t, dim=int(attr_of(kw, "dim", "arg1", default=0))
-    )[int(kw.get("index", 0))],
+    )[int(attr_of(kw, "index", "arg2", "arg3", default=0))],
     "stack": lambda *ts, **kw: torch.stack(
         list(ts), dim=int(attr_of(kw, "dim", "arg1", default=0))
     ),
-    "expand": lambda t, *a, **kw: t.expand(
-        *tuple(kw.get("shape") or kw.get("dim") or a)
-    ),
+    "expand": _expand_torch,
     "flatten": lambda x, *a, **kw: x.flatten(
         int(attr_of(kw, "start_dim", "arg1", default=0)),
         int(attr_of(kw, "end_dim", "arg2", default=-1)),
@@ -896,7 +905,8 @@ class IRModule(torch.nn.Module):
         self._param_values = param_values or {}
         # Phase 3b: materialize weight-only subtrees (e.g. W1 @ (W2 @ W3))
         # at construction time, so runtime is a single matmul per fused chain.
-        self._fold_memo: dict[int, Any] = {}
+        # Keyed by interned term OBJECTS (content-hashed), not ints.
+        self._fold_memo: dict[Any, Any] = {}
         self._uses_memo: dict = {}
         self._root = self._fold_weight_chains(ir.root)
         self._build_params()
@@ -1025,7 +1035,9 @@ class IRModule(torch.nn.Module):
 
         param_shapes: dict[str, tuple] = {}
 
-        seen: set[int] = set()
+        # Interned term objects are content-hashed — safe set members
+        # (no id()/GC hazards).
+        seen: set[Any] = set()
 
         def collect(t: Any) -> None:
             if t in seen:
@@ -1074,7 +1086,7 @@ class IRModule(torch.nn.Module):
         term: Any,
         env: dict[str, torch.Tensor],
         x: torch.Tensor,
-        memo: dict[int, torch.Tensor],
+        memo: dict[Any, torch.Tensor],
     ) -> torch.Tensor:
         """Strict runtime evaluation — delegates to :func:`eval_term`.
 

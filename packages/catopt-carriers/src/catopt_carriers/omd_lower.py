@@ -63,9 +63,11 @@ from catopt_torch.executors import (
 )
 from catopt_torch.torch_bridge import _IR_TO_TORCH, IRModule
 
-import catopt_carriers.xcarrier  # noqa: F401 — registers the omd_* / affd_*
-
-# torch bindings into _IR_TO_TORCH.
+# Still required for its op_def / _LeafRegistry registrations — the
+# omd_* / affd_* torch bindings are NOT seeded here anymore: they
+# resolve lazily through carrier_torch_bindings() (each module's
+# TORCH_BINDINGS export).
+import catopt_carriers.xcarrier  # noqa: F401
 
 __all__ = [
     "BatchedOmdModule",
@@ -867,10 +869,27 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
                     l_n = torch.where(
                         fin1, l1 * e1, torch.zeros_like(l1)
                     ) + torch.where(fin2, l2 * e2, torch.zeros_like(l2))
+                    # fa may carry extra trailing axes past e's
+                    # (…,Tq,1) — the dense fiber's coefficient is
+                    # (…,Tq,o,i) — so the row weight needs trailing
+                    # 1-dims to broadcast (same as
+                    # xcarrier._omd_compose; a no-op on diag fibers).
+                    e1f = e1.reshape(
+                        *e1.shape, *([1] * (fa1.dim() - e1.dim()))
+                    )
+                    e2f = e2.reshape(
+                        *e2.shape, *([1] * (fa2.dim() - e2.dim()))
+                    )
+                    fin1f = fin1.reshape(
+                        *fin1.shape, *([1] * (fa1.dim() - fin1.dim()))
+                    )
+                    fin2f = fin2.reshape(
+                        *fin2.shape, *([1] * (fa2.dim() - fin2.dim()))
+                    )
                     fa_n = torch.where(
-                        fin1, fa1 * e1, torch.zeros_like(fa1)
+                        fin1f, fa1 * e1f, torch.zeros_like(fa1)
                     ) + torch.where(
-                        fin2, fa2 * e2, torch.zeros_like(fa2)
+                        fin2f, fa2 * e2f, torch.zeros_like(fa2)
                     )
                     fb_n = torch.where(
                         fin1, fb1 * e1, torch.zeros_like(fb1)

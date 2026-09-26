@@ -108,7 +108,10 @@ def test_verbose_true_yields_debug(caplog):
 
 
 def test_verbose_restores_logger_level(caplog):
-    log = logging.getLogger("catopt.calibrate")
+    # The real logger lives under the domain package's name —
+    # `catopt.calibrate` is only a sys.modules alias and would name a
+    # DIFFERENT logger object (making the restore check vacuous).
+    log = logging.getLogger("catopt_optimize.calibrate")
     prev = log.level
     with caplog.at_level(logging.DEBUG):
         calibrate(device="cpu", quick=True, verbose=True)

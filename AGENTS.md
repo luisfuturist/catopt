@@ -45,7 +45,8 @@ Pre-commit (`pre-commit install`) runs ruff check/format and pyright on
 
 - Line length 72 (ruff). E501/B008/SIM108 intentionally ignored — see
   `[tool.ruff.lint]` for rationale.
-- Coverage ratchet: `fail_under = 87` in `[tool.coverage.report]`,
-  raised per refactor phase toward 100.
+- Coverage floor: `fail_under = 100` in `[tool.coverage.report]` —
+  the suite is pinned at 100%; new branches need tests (or a
+  justified `pragma: no cover`).
 - Tests allocating CUDA tensors use the `requires_cuda` marker
   (auto-skipped when CUDA is absent).

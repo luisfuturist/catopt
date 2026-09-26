@@ -139,10 +139,16 @@ def _register_extensions() -> None:
     # rewrite's error_bound).  Registry extension, not an eps.py edit.
     try:
         from catopt_eps import eps as _eps
-
-        _eps._LIP_FREE.update(("aquant", "adequant"))
-    except Exception:
-        pass
+    except ModuleNotFoundError:  # pragma: no cover — eps.py ships
+        # beside act_eps; only a partial/broken install hits this.
+        # A broken-but-present eps module still propagates its error.
+        return
+    lip_free = getattr(_eps, "_LIP_FREE", None)
+    if lip_free is not None:
+        # A missing extension point (older/partial eps.py) skips the
+        # registration quietly — but anything raised INSIDE the import
+        # or the update itself propagates.
+        lip_free.update(("aquant", "adequant"))
 
 
 _register_extensions()

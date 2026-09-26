@@ -133,13 +133,20 @@ dependencies = [
     { name = "torch" },
 ]
 
+[package.optional-dependencies]
+eps = [
+    { name = "catopt-eps" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "catopt-carriers", editable = "packages/catopt-carriers" },
     { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-eps", marker = "extra == 'eps'", editable = "packages/catopt-eps" },
     { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "torch", specifier = ">=2.0" },
 ]
+provides-extras = ["eps"]
 
 [[package]]
 name = "catopt-torch"

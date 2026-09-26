@@ -15,6 +15,7 @@ from catopt_core.egraph.types import (
     Rewrite,
     UnionFind,
     _LeafRegistry,
+    _norm_attr_value,
     _pattern_attrs,
 )
 from catopt_core.ir import Op
@@ -148,7 +149,11 @@ class EGraph(_ExtractMixin, _ProofMixin):
         (e.g. a non-local pass); enodes born inside a rule application
         are tagged with the firing rule regardless.
         """
-        attr_t = tuple(sorted((attrs or {}).items()))
+        attr_t = tuple(
+            sorted(
+                (k, _norm_attr_value(v)) for k, v in (attrs or {}).items()
+            )
+        )
         enode = ENode(op, tuple(self.find(c) for c in children), attr_t)
         if enode in self._node_to_class:
             return self.find(self._node_to_class[enode])
@@ -703,7 +708,11 @@ class EGraph(_ExtractMixin, _ProofMixin):
             enode = ENode(
                 pattern.op,
                 tuple(self.find(c) for c in child_eids),
-                tuple(sorted(attrs.items())),
+                tuple(
+                    sorted(
+                        (k, _norm_attr_value(v)) for k, v in attrs.items()
+                    )
+                ),
             )
             if enode in self._node_to_class:
                 eid = self.find(self._node_to_class[enode])
