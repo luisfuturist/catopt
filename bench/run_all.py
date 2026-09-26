@@ -49,7 +49,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import benchkit
 
 #: Default suite order — harnessed modules first.
-DEFAULT_SUITES = ["reassoc_scale", "search_efficiency", "bench_e2e"]
+DEFAULT_SUITES = [
+    "reassoc_scale",
+    "search_efficiency",
+    "real_linear_attn",
+    "bench_e2e",
+]
 
 
 class _LaxNamespace(argparse.Namespace):

@@ -119,6 +119,29 @@ over fragmented classes past k≈11 (k=11 ≈ 17s); production uses
 codebase ships them — the bench says so rather than claiming exact
 eqsat scales.
 
+## real_linear_attn.py — the real-model case
+
+```bash
+python bench/real_linear_attn.py --device cpu
+python bench/real_linear_attn.py --device cuda --families retnet,gla,delta
+```
+
+Gated linear-attention blocks in the RetNet / GLA / delta-rule
+family (Sun et al. 2023 shape): ``h_t = γ ⊙ h_{t−1} + u_t`` (retnet,
+fixed decay), data-dependent decay (gla), or
+``A_t = I − β k_t k_t^T`` (delta-rule), each with a k-deep value
+chain — a real architecture where TWO transforms fire: the
+affine-monoid scan lift (``applyd``/``affd`` carriers → O(log T)
+level-batched schedule, certified fp64-exact via a saturated e-graph)
+and the weights-first fold of the value chain.
+
+**Measured (CPU):** retnet T=128 ``catopt_scan`` ≈ 2.9× vs eager, at
+the closed-form geometric-series floor; honest negatives —
+Inductor's fused pointwise kernel wins vs-eager on CPU (the launch
+count inversion matters on launch-bound devices), and data-dependent
+leaves (gla/delta) don't amortise per-leaf eval on CPU. The fp32
+gate attributes which variant fails (`gate_checks` in aux).
+
 ## benchkit.py — the shared harness + reports
 
 ```bash
