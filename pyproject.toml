@@ -42,6 +42,8 @@ dev = [
     "coverage>=7.0",
     "pre-commit>=3.0",
     "pyright>=1.1.380",
+    "vulture>=2.16",
+    "import-linter>=2.15",
 ]
 
 [tool.setuptools.packages.find]
@@ -64,6 +66,43 @@ catopt-optimize = { workspace = true }
 testpaths = ["tests"]
 markers = [
     "requires_cuda: test allocates CUDA tensors; skipped at setup when CUDA is absent or OOMs on a probe allocation",
+]
+
+# --- dead-code + architecture linting (dev tooling) ----------------
+# vulture: flag unreachable/unused code at high confidence.  The suite
+# is pinned at 100% coverage, so a genuine dead branch is a real
+# finding, not noise.  Run `.venv/bin/vulture` (uses these paths) or
+# `.venv/bin/vulture packages catopt tests --min-confidence 80`; a
+# non-zero exit (3) means dead code.  If a public member is kept only
+# for the compatibility aliases, add its name to `ignore_names` here
+# rather than leaving a false positive.
+[tool.vulture]
+min_confidence = 80
+paths = ["packages", "catopt", "tests"]
+
+# import-linter: the hexagonal-boundary ratchet.  The key contract is
+# "core is torch-free" — catopt-core (the zero-dependency engine) must
+# never import the PyTorch adapter or any sibling domain package.  It
+# FAILS on the pre-decoupling tree and is the gate Phase 1 makes green.
+[tool.importlinter]
+root_packages = [
+    "catopt_core",
+    "catopt_torch",
+    "catopt_carriers",
+    "catopt_eps",
+    "catopt_optimize",
+    "catopt",
+]
+
+[[tool.importlinter.contracts]]
+name = "core is torch-free (and carrier-free)"
+type = "forbidden"
+source_modules = ["catopt_core"]
+forbidden_modules = [
+    "catopt_torch",
+    "catopt_carriers",
+    "catopt_eps",
+    "catopt_optimize",
 ]
 
 [tool.ruff]

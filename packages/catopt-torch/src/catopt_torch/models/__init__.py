@@ -57,9 +57,7 @@ class AttentionBlock(nn.Module):
     projections and the attention scaling.
     """
 
-    def __init__(
-        self, dim: int, n_heads: int = 8, dropout: float = 0.0
-    ) -> None:
+    def __init__(self, dim: int, n_heads: int = 8) -> None:
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
