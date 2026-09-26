@@ -43,12 +43,13 @@ import hashlib
 import inspect
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-from catopt.egraph import Rewrite
-from catopt.ir import Op, Var, Const, Param, TensorType
 import catopt.meta as M
+from catopt.egraph import Rewrite
+from catopt.ir import Const, Op, Param, TensorType, Var
 
 __all__ = [
     "RuleCache",
@@ -65,6 +66,7 @@ CACHE_VERSION = 1
 # ---------------------------------------------------------------------------
 #  Term / attribute serialization  (Op trees, metvars, placeholders — pure data)
 # ---------------------------------------------------------------------------
+
 
 def _enc_attr(v: Any) -> Any:
     """JSON-safe encoding of an attribute value (or a ``$attr:`` binding
@@ -122,7 +124,8 @@ def _dec_term(d: Any) -> Any:
         return Op.make(
             d["op"],
             *[_dec_term(a) for a in d["args"]],
-            **{k: _dec_attr(v) for k, v in d["attrs"].items()})
+            **{k: _dec_attr(v) for k, v in d["attrs"].items()},
+        )
     raise ValueError(f"bad term encoding: {d!r}")
 
 
@@ -153,6 +156,7 @@ def _dec_binding(pairs: list) -> dict:
 #  Rule records
 # ---------------------------------------------------------------------------
 
+
 def _enc_rule(rule: Rewrite) -> dict:
     """Serialize a synthesized rule: name, law, provenance, patterns,
     and — when guarded — the (pat1, pat2) re-expression spec recorded on
@@ -163,21 +167,30 @@ def _enc_rule(rule: Rewrite) -> dict:
         raise TypeError(
             f"rule {rule.name!r} has check/derive hooks but no "
             "guard_pats re-expression spec — only rules emitted by "
-            "meta.synthesize_rules are cacheable")
+            "meta.synthesize_rules are cacheable"
+        )
     return {
         "name": rule.name,
         "law": rule.law,
-        "parents": list(getattr(rule, "parents",
-                                M.SYNTH_PARENTS.get(rule.name, ()))),
+        "parents": list(
+            getattr(rule, "parents", M.SYNTH_PARENTS.get(rule.name, ()))
+        ),
         "lhs": _enc_term(rule.lhs),
         "rhs": _enc_term(rule.rhs),
         "guard": (
-            {"pat1": _enc_binding(spec[0]), "pat2": _enc_binding(spec[1])}
-            if (guarded and spec is not None) else None),
+            {
+                "pat1": _enc_binding(spec[0]),
+                "pat2": _enc_binding(spec[1]),
+            }
+            if (guarded and spec is not None)
+            else None
+        ),
     }
 
 
-def _dec_rule(rec: dict, parents_by_name: dict[str, Rewrite]) -> Rewrite:
+def _dec_rule(
+    rec: dict, parents_by_name: dict[str, Rewrite]
+) -> Rewrite:
     """Rebuild a rule.  Guarded rules re-run ``_compose_guards`` on the
     stored re-expression maps — the parents must be present (by name)
     in *parents_by_name*, or a ``KeyError`` propagates and the whole
@@ -191,15 +204,24 @@ def _dec_rule(rec: dict, parents_by_name: dict[str, Rewrite]) -> Rewrite:
         p1, p2 = rec["parents"]
         r1 = parents_by_name[p1]
         r2 = parents_by_name[p2]
-        pats = (_dec_binding(guard["pat1"]), _dec_binding(guard["pat2"]))
+        pats = (
+            _dec_binding(guard["pat1"]),
+            _dec_binding(guard["pat2"]),
+        )
         check, drv = M._compose_guards(r1, r2, pats[0], pats[1])
         # Same policy as synthesize_rules.offer: the composite derive is
         # only attached when the RHS actually carries "@i:" placeholders.
         if not (drv is not None and M._rhs_derive_placeholders(rhs)):
             drv = None
         derive = drv
-    rule = Rewrite(name=rec["name"], lhs=lhs, rhs=rhs,
-                   law=rec["law"], check=check, derive=derive)
+    rule = Rewrite(
+        name=rec["name"],
+        lhs=lhs,
+        rhs=rhs,
+        law=rec["law"],
+        check=check,
+        derive=derive,
+    )
     parents = tuple(rec.get("parents") or ())
     object.__setattr__(rule, "parents", parents)
     if parents:
@@ -212,6 +234,7 @@ def _dec_rule(rec: dict, parents_by_name: dict[str, Rewrite]) -> Rewrite:
 # ---------------------------------------------------------------------------
 #  Fingerprints / cache key
 # ---------------------------------------------------------------------------
+
 
 def _sha(parts: Iterable[str]) -> str:
     h = hashlib.sha256()
@@ -228,8 +251,9 @@ def _hook_sig(fn) -> str:
     if fn is None:
         return ""
     if isinstance(fn, functools.partial):
-        return (f"partial({_hook_sig(fn.func)};{fn.args!r};"
-                f"{fn.keywords!r})")
+        return (
+            f"partial({_hook_sig(fn.func)};{fn.args!r};{fn.keywords!r})"
+        )
     ident = f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', '')}"
     try:
         src = inspect.getsource(fn)
@@ -242,28 +266,38 @@ def ruleset_fingerprint(rules: Iterable[Rewrite]) -> str:
     """Hash of the parent ruleset: every rule's name, serialized lhs/rhs
     patterns, and hook signatures — sorted so rule order doesn't matter."""
     entries = sorted(
-        json.dumps({
-            "name": r.name,
-            "lhs": _enc_term(r.lhs),
-            "rhs": _enc_term(r.rhs),
-            "check": _hook_sig(r.check),
-            "derive": _hook_sig(r.derive),
-        }, sort_keys=True)
-        for r in rules)
+        json.dumps(
+            {
+                "name": r.name,
+                "lhs": _enc_term(r.lhs),
+                "rhs": _enc_term(r.rhs),
+                "check": _hook_sig(r.check),
+                "derive": _hook_sig(r.derive),
+            },
+            sort_keys=True,
+        )
+        for r in rules
+    )
     return _sha(entries)
 
 
 def seed_fingerprint(seed_terms: Iterable[Any]) -> str:
     """Hash of the serialized seed terms, in order (seed order affects
     which derivations are explored and rule naming)."""
-    return _sha(json.dumps(_enc_term(s), sort_keys=True)
-                for s in seed_terms)
+    return _sha(
+        json.dumps(_enc_term(s), sort_keys=True) for s in seed_terms
+    )
 
 
-def cache_key(rules: Iterable[Rewrite], seed_terms: Iterable[Any] = (),
-              *, fuel: int = 512, numeric_check: bool = True,
-              require_overlap: bool = True,
-              emit_subsumed: bool = False) -> str:
+def cache_key(
+    rules: Iterable[Rewrite],
+    seed_terms: Iterable[Any] = (),
+    *,
+    fuel: int = 512,
+    numeric_check: bool = True,
+    require_overlap: bool = True,
+    emit_subsumed: bool = False,
+) -> str:
     """The cache key for one synthesis problem instance: ruleset
     fingerprint + seed fingerprint + synthesis params + format version."""
     rules = list(rules)
@@ -284,6 +318,7 @@ def cache_key(rules: Iterable[Rewrite], seed_terms: Iterable[Any] = (),
 # ---------------------------------------------------------------------------
 #  RuleCache + convenience wrapper
 # ---------------------------------------------------------------------------
+
 
 def _default_cache_dir() -> Path:
     env = os.environ.get("CATOPT_RULECACHE_DIR")
@@ -316,8 +351,9 @@ class RuleCache:
         tmp.replace(self.path(key))
         return self.path(key)
 
-    def load(self, key: str, rules: Iterable[Rewrite] = ()
-             ) -> list[Rewrite] | None:
+    def load(
+        self, key: str, rules: Iterable[Rewrite] = ()
+    ) -> list[Rewrite] | None:
         """Load the rule set stored under *key*, or ``None`` on a miss.
 
         *rules* is the parent ruleset: guarded rules rebuild their
@@ -329,8 +365,10 @@ class RuleCache:
             return None
         try:
             payload = json.loads(p.read_text())
-            if (payload.get("version") != CACHE_VERSION
-                    or payload.get("key") != key):
+            if (
+                payload.get("version") != CACHE_VERSION
+                or payload.get("key") != key
+            ):
                 return None
             by_name = {r.name: r for r in rules}
             return [_dec_rule(rec, by_name) for rec in payload["rules"]]
@@ -338,12 +376,16 @@ class RuleCache:
             return None
 
 
-def synthesize_rules_cached(rules: list[Rewrite],
-                            seed_terms: Iterable[Any] = (),
-                            *, fuel: int = 512, numeric_check: bool = True,
-                            require_overlap: bool = True,
-                            emit_subsumed: bool = False,
-                            cache_dir: Any = None) -> list[Rewrite]:
+def synthesize_rules_cached(
+    rules: list[Rewrite],
+    seed_terms: Iterable[Any] = (),
+    *,
+    fuel: int = 512,
+    numeric_check: bool = True,
+    require_overlap: bool = True,
+    emit_subsumed: bool = False,
+    cache_dir: Any = None,
+) -> list[Rewrite]:
     """``meta.synthesize_rules`` with persistence: on a repeat call with
     the same ruleset, seeds, and parameters the derived rules are loaded
     from *cache_dir* (composite guards rebuilt from the parent hooks)
@@ -355,15 +397,24 @@ def synthesize_rules_cached(rules: list[Rewrite],
     ``$CATOPT_RULECACHE_DIR`` or ``~/.cache/catopt/rulecache``."""
     rules = list(rules)
     cache = RuleCache(cache_dir or _default_cache_dir())
-    key = cache_key(rules, seed_terms, fuel=fuel,
-                    numeric_check=numeric_check,
-                    require_overlap=require_overlap,
-                    emit_subsumed=emit_subsumed)
+    key = cache_key(
+        rules,
+        seed_terms,
+        fuel=fuel,
+        numeric_check=numeric_check,
+        require_overlap=require_overlap,
+        emit_subsumed=emit_subsumed,
+    )
     hit = cache.load(key, rules)
     if hit is not None:
         return hit
     derived = M.synthesize_rules(
-        rules, seed_terms, fuel=fuel, numeric_check=numeric_check,
-        require_overlap=require_overlap, emit_subsumed=emit_subsumed)
+        rules,
+        seed_terms,
+        fuel=fuel,
+        numeric_check=numeric_check,
+        require_overlap=require_overlap,
+        emit_subsumed=emit_subsumed,
+    )
     cache.store(key, derived)
     return derived

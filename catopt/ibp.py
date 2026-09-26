@@ -42,6 +42,7 @@ radii (an iterate-until-stable loop, ``max_iter`` rounds).  If the
 iterate does not converge the reported bound is the last — largest —
 iterate and ``converged`` is ``False`` in the result dict.
 """
+
 from __future__ import annotations
 
 import math
@@ -49,15 +50,16 @@ from typing import Any, NamedTuple
 
 import torch
 
-from catopt.ir import Op, Var, Const, Param, IR
 from catopt.cost import _shape_of
 from catopt.eps import _find_subterms, _path_sensitivity, model_bound
+from catopt.ir import IR, Const, Op, Param, Var
 
 __all__ = ["Box", "ibp_bound", "tight_model_bound"]
 
 
 class Box(NamedTuple):
     """An elementwise interval ``lo ≤ x ≤ hi``."""
+
     lo: torch.Tensor
     hi: torch.Tensor
 
@@ -73,6 +75,7 @@ class Box(NamedTuple):
 # ---------------------------------------------------------------------------
 #  Scalar bounds derived from a box
 # ---------------------------------------------------------------------------
+
 
 def _fro_bound(b: Box) -> float:
     """Upper bound on ‖x‖_F over the box."""
@@ -117,6 +120,7 @@ def _minabs(b: Box) -> float:
 #  Interval arithmetic primitives
 # ---------------------------------------------------------------------------
 
+
 def _pt(t: torch.Tensor) -> Box:
     return Box(t, t)
 
@@ -134,8 +138,9 @@ def _neg(a: Box) -> Box:
 
 
 def _mul(a: Box, b: Box) -> Box:
-    ps = torch.stack([a.lo * b.lo, a.lo * b.hi,
-                      a.hi * b.lo, a.hi * b.hi])
+    ps = torch.stack(
+        [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi]
+    )
     return Box(ps.amin(0), ps.amax(0))
 
 
@@ -158,9 +163,11 @@ def _matmul(a: Box, b: Box) -> Box:
     bc = (b.lo + b.hi) / 2
     br = (b.hi - b.lo) / 2
     c = torch.matmul(ac, bc)
-    r = (torch.matmul(ar, bc.abs())
-         + torch.matmul(ac.abs(), br)
-         + torch.matmul(ar, br))
+    r = (
+        torch.matmul(ar, bc.abs())
+        + torch.matmul(ac.abs(), br)
+        + torch.matmul(ar, br)
+    )
     return Box(c - r, c + r)
 
 
@@ -178,8 +185,10 @@ def _softmax(a: Box, dim: int) -> Box:
 #: Unary ops that are monotonically increasing everywhere.
 _MONO_INC = {"relu", "sigmoid", "tanh", "exp"}
 #: Unary ops with a single interior minimum at a known point.
-_INTERIOR_MIN = {"silu": -1.2784645427610738,
-                 "gelu": -0.7517907364130968}
+_INTERIOR_MIN = {
+    "silu": -1.2784645427610738,
+    "gelu": -0.7517907364130968,
+}
 
 
 def _unary(b: Box, op: str, fn) -> Box | None:
@@ -191,12 +200,12 @@ def _unary(b: Box, op: str, fn) -> Box | None:
         return _neg(b)
     if op == "sqrt":
         if float(b.lo.min()) < 0:
-            return None                     # NaN domain — unsupported
+            return None  # NaN domain — unsupported
         return Box(fn(b.lo), fn(b.hi))
     if op == "rsqrt":
         if float(b.lo.min()) <= 0:
             return None
-        return Box(fn(b.hi), fn(b.lo))      # decreasing
+        return Box(fn(b.hi), fn(b.lo))  # decreasing
     if op in _INTERIOR_MIN:
         lo, hi = fn(b.lo), fn(b.hi)
         xs = _INTERIOR_MIN[op]
@@ -207,10 +216,12 @@ def _unary(b: Box, op: str, fn) -> Box | None:
         return Box(torch.minimum(lo, hi), torch.maximum(lo, hi))
     if op == "square":
         m = b.maxabs
-        lo = torch.where((b.lo <= 0) & (b.hi >= 0),
-                         torch.zeros_like(m),
-                         torch.minimum(b.lo.abs(), b.hi.abs()) ** 2)
-        return Box(lo, m ** 2)
+        lo = torch.where(
+            (b.lo <= 0) & (b.hi >= 0),
+            torch.zeros_like(m),
+            torch.minimum(b.lo.abs(), b.hi.abs()) ** 2,
+        )
+        return Box(lo, m**2)
     return None
 
 
@@ -218,10 +229,28 @@ def _unary(b: Box, op: str, fn) -> Box | None:
 #: multi-operand ops the *non-first* operands are taken from ``.lo``
 #: (they are indices/params — required to be point boxes by the caller).
 _STRUCTURAL = {
-    "reshape", "view", "transpose", "contiguous", "float", "to", "alias",
-    "type_as", "clone", "dropout", "select", "slice", "unsqueeze",
-    "squeeze", "flatten", "getitem", "chunk", "split", "unbind",
-    "expand", "broadcast", "index_select",
+    "reshape",
+    "view",
+    "transpose",
+    "contiguous",
+    "float",
+    "to",
+    "alias",
+    "type_as",
+    "clone",
+    "dropout",
+    "select",
+    "slice",
+    "unsqueeze",
+    "squeeze",
+    "flatten",
+    "getitem",
+    "chunk",
+    "split",
+    "unbind",
+    "expand",
+    "broadcast",
+    "index_select",
 }
 
 
@@ -230,6 +259,7 @@ def _eval_concrete(t: Any, env: dict, values: dict):
     ``values`` (concrete inputs), Consts by value, ops via the torch
     bindings.  ``None`` when anything is not concretely evaluatable."""
     from catopt.torch_bridge import _IR_TO_TORCH
+
     if isinstance(t, Var):
         return values.get(t.name)
     if isinstance(t, Param):
@@ -263,12 +293,21 @@ def _inf_box(t: Any) -> Box:
 
 
 def _as_float(t: torch.Tensor) -> torch.Tensor:
-    return t if t.is_floating_point() else t.to(torch.get_default_dtype())
+    return (
+        t if t.is_floating_point() else t.to(torch.get_default_dtype())
+    )
 
 
-def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
-              boxes: dict, path: tuple, unsupported: list,
-              site_boxes: dict | None) -> Box:
+def _ibp_eval(
+    t: Any,
+    env: dict,
+    input_box: dict,
+    values: dict,
+    boxes: dict,
+    path: tuple,
+    unsupported: list,
+    site_boxes: dict | None,
+) -> Box:
     """Recursive interval evaluator; records every node's box in
     ``boxes`` (keyed by path) and flags rule-less ops in ``unsupported``."""
     from catopt.torch_bridge import _IR_TO_TORCH
@@ -295,9 +334,19 @@ def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
     elif isinstance(t, Const):
         box = _pt(torch.tensor(float(t.value)))
     elif isinstance(t, Op):
-        argboxes = [_ibp_eval(a, env, input_box, values, boxes,
-                              path + (i,), unsupported, site_boxes)
-                    for i, a in enumerate(t.args)]
+        argboxes = [
+            _ibp_eval(
+                a,
+                env,
+                input_box,
+                values,
+                boxes,
+                path + (i,),
+                unsupported,
+                site_boxes,
+            )
+            for i, a in enumerate(t.args)
+        ]
         op = t.op
         attrs = dict(t.attrs)
         fn = _IR_TO_TORCH.get(op)
@@ -330,7 +379,9 @@ def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
             box = _softmax(argboxes[0], dim)
         elif op in ("sum", "mean") and fn is not None:
             # reductions are monotone in every input
-            box = Box(fn(argboxes[0].lo, **attrs), fn(argboxes[0].hi, **attrs))
+            box = Box(
+                fn(argboxes[0].lo, **attrs), fn(argboxes[0].hi, **attrs)
+            )
         elif op in ("max", "min"):
             # no torch binding for these names — apply amax/amin on the
             # declared dim (whole tensor when absent); monotone in input
@@ -341,10 +392,15 @@ def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
             if dim is None:
                 box = Box(f(a.lo), f(a.hi))
             else:
-                d = tuple(dim) if isinstance(dim, (list, tuple)) \
+                d = (
+                    tuple(dim)
+                    if isinstance(dim, (list, tuple))
                     else (int(dim),)
-                box = Box(f(a.lo, dim=d, keepdim=keep),
-                          f(a.hi, dim=d, keepdim=keep))
+                )
+                box = Box(
+                    f(a.lo, dim=d, keepdim=keep),
+                    f(a.hi, dim=d, keepdim=keep),
+                )
         elif op == "pow":
             e = argboxes[1] if len(argboxes) > 1 else None
             if e is not None and torch.equal(e.lo, e.hi):
@@ -353,17 +409,23 @@ def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
                 if ev == 2:
                     box = _unary(a, "square", torch.square)
                 elif ev >= 1 and float(a.lo.min()) >= 0:
-                    box = Box(a.lo ** ev, a.hi ** ev)
+                    box = Box(a.lo**ev, a.hi**ev)
                 elif ev == 0:
                     box = _pt(torch.ones_like(a.lo))
                 elif float(a.lo.min()) > 0:
-                    box = (Box(a.hi ** ev, a.lo ** ev) if ev < 0
-                           else Box(a.lo ** ev, a.hi ** ev))
+                    box = (
+                        Box(a.hi**ev, a.lo**ev)
+                        if ev < 0
+                        else Box(a.lo**ev, a.hi**ev)
+                    )
             if box is None:
                 unsupported.append("pow")
                 box = _inf_box(t)
-        elif op in _MONO_INC or op in _INTERIOR_MIN or op in (
-                "neg", "sqrt", "rsqrt", "square"):
+        elif (
+            op in _MONO_INC
+            or op in _INTERIOR_MIN
+            or op in ("neg", "sqrt", "rsqrt", "square")
+        ):
             if fn is not None:
                 box = _unary(argboxes[0], op, fn)
             if box is None:
@@ -376,47 +438,69 @@ def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
                 box = _inf_box(t)
             else:
                 w = argboxes[0]
-                box = Box(torch.nn.functional.embedding(idx.long(), w.lo),
-                          torch.nn.functional.embedding(idx.long(), w.hi))
+                box = Box(
+                    torch.nn.functional.embedding(idx.long(), w.lo),
+                    torch.nn.functional.embedding(idx.long(), w.hi),
+                )
         elif op in ("concat", "stack", "cat"):
             if fn is not None:
-                box = Box(fn(*[b.lo for b in argboxes], **attrs),
-                          fn(*[b.hi for b in argboxes], **attrs))
+                box = Box(
+                    fn(*[b.lo for b in argboxes], **attrs),
+                    fn(*[b.hi for b in argboxes], **attrs),
+                )
         elif op in _STRUCTURAL and fn is not None:
             # exact map — apply to both endpoints; non-first operands
             # (indices, dims) are taken at their concrete value
             rest = [b.lo for b in argboxes[1:]]
             try:
-                box = Box(fn(argboxes[0].lo, *rest, **attrs),
-                          fn(argboxes[0].hi, *rest, **attrs))
+                box = Box(
+                    fn(argboxes[0].lo, *rest, **attrs),
+                    fn(argboxes[0].hi, *rest, **attrs),
+                )
             except Exception:
                 box = None
         elif op == "where" and len(argboxes) == 3:
             c = _eval_concrete(t.args[0], env, values)
             if c is not None:
-                box = Box(torch.where(c.bool(), argboxes[1].lo, argboxes[2].lo),
-                          torch.where(c.bool(), argboxes[1].hi, argboxes[2].hi))
+                box = Box(
+                    torch.where(
+                        c.bool(), argboxes[1].lo, argboxes[2].lo
+                    ),
+                    torch.where(
+                        c.bool(), argboxes[1].hi, argboxes[2].hi
+                    ),
+                )
             else:
                 # conservative hull of both branches
-                box = Box(torch.minimum(argboxes[1].lo, argboxes[2].lo),
-                          torch.maximum(argboxes[1].hi, argboxes[2].hi))
+                box = Box(
+                    torch.minimum(argboxes[1].lo, argboxes[2].lo),
+                    torch.maximum(argboxes[1].hi, argboxes[2].hi),
+                )
         elif op == "masked_fill" and len(argboxes) >= 2:
             m = _eval_concrete(t.args[1], env, values)
-            v = _eval_concrete(t.args[2], env, values) \
-                if len(t.args) > 2 else None
+            v = (
+                _eval_concrete(t.args[2], env, values)
+                if len(t.args) > 2
+                else None
+            )
             try:
                 vv = float(v) if v is not None else None
             except Exception:
                 vv = None
             if m is not None and vv is not None:
-                box = Box(argboxes[0].lo.masked_fill(m.bool(), vv),
-                          argboxes[0].hi.masked_fill(m.bool(), vv))
+                box = Box(
+                    argboxes[0].lo.masked_fill(m.bool(), vv),
+                    argboxes[0].hi.masked_fill(m.bool(), vv),
+                )
         if box is None:
             # last resort: if every operand is a point box the op can be
             # evaluated exactly through its torch binding — this keeps
             # comparisons / exotic ops usable on point input boxes.
-            if (fn is not None and argboxes and
-                    all(torch.equal(b.lo, b.hi) for b in argboxes)):
+            if (
+                fn is not None
+                and argboxes
+                and all(torch.equal(b.lo, b.hi) for b in argboxes)
+            ):
                 try:
                     out = fn(*[b.lo for b in argboxes], **attrs)
                     if isinstance(out, torch.Tensor):
@@ -442,8 +526,10 @@ def _ibp_eval(t: Any, env: dict, input_box: dict, values: dict,
 #  Public: ibp_bound
 # ---------------------------------------------------------------------------
 
-def _collect_vars(t: Any, acc: list | None = None,
-                  seen: set | None = None) -> list:
+
+def _collect_vars(
+    t: Any, acc: list | None = None, seen: set | None = None
+) -> list:
     if acc is None:
         acc, seen = [], set()
     if isinstance(t, Var):
@@ -456,8 +542,9 @@ def _collect_vars(t: Any, acc: list | None = None,
     return acc
 
 
-def _norm_input_box(input_box: Any, term: Any,
-                    input_radius: float = 0.0) -> dict:
+def _norm_input_box(
+    input_box: Any, term: Any, input_radius: float = 0.0
+) -> dict:
     """Normalise the input box specification to ``{var_name: Box}``.
 
     Accepts: a dict ``{name: (lo,hi) | tensor}``, a single tensor
@@ -469,20 +556,25 @@ def _norm_input_box(input_box: Any, term: Any,
         if isinstance(v, Box):
             return v
         if isinstance(v, (tuple, list)) and len(v) == 2:
-            lo, hi = (_as_float(torch.as_tensor(v[0])),
-                      _as_float(torch.as_tensor(v[1])))
+            lo, hi = (
+                _as_float(torch.as_tensor(v[0])),
+                _as_float(torch.as_tensor(v[1])),
+            )
             return Box(lo, hi)
         t = _as_float(torch.as_tensor(v))
         return Box(t - input_radius, t + input_radius)
 
     if isinstance(input_box, dict):
         return {k: mk(v) for k, v in input_box.items()}
-    if (isinstance(input_box, (tuple, list)) and len(input_box) == 2
-            and all(torch.is_tensor(v) for v in input_box)
-            and vars_ and
-            torch.as_tensor(input_box[0]).shape ==
-            torch.as_tensor(input_box[1]).shape ==
-            vars_[0].typ.shape):
+    if (
+        isinstance(input_box, (tuple, list))
+        and len(input_box) == 2
+        and all(torch.is_tensor(v) for v in input_box)
+        and vars_
+        and torch.as_tensor(input_box[0]).shape
+        == torch.as_tensor(input_box[1]).shape
+        == vars_[0].typ.shape
+    ):
         return {vars_[0].name: mk(input_box)}
     if isinstance(input_box, (tuple, list)):
         return {v.name: mk(t) for v, t in zip(vars_, input_box)}
@@ -490,10 +582,15 @@ def _norm_input_box(input_box: Any, term: Any,
     return {vars_[0].name: mk(input_box)} if vars_ else {}
 
 
-def ibp_bound(term: Any, env: dict, input_box: Any, *,
-              values: dict | None = None,
-              site_boxes: dict | None = None,
-              input_radius: float = 0.0) -> dict:
+def ibp_bound(
+    term: Any,
+    env: dict,
+    input_box: Any,
+    *,
+    values: dict | None = None,
+    site_boxes: dict | None = None,
+    input_radius: float = 0.0,
+) -> dict:
     """Propagate ``[lo, hi]`` boxes through ``term`` to the output.
 
     Parameters
@@ -522,13 +619,19 @@ def ibp_bound(term: Any, env: dict, input_box: Any, *,
     boxes: dict = {}
     unsupported: list = []
     ib = _norm_input_box(input_box, term, input_radius)
-    out = _ibp_eval(term, env, ib, values or {}, boxes, (),
-                    unsupported, site_boxes)
-    width = (out.hi - out.lo)
-    return {"lo": out.lo, "hi": out.hi,
-            "width": float(width.abs().max()) if width.numel()
-            else float(width.abs()),
-            "boxes": boxes, "unsupported": unsupported}
+    out = _ibp_eval(
+        term, env, ib, values or {}, boxes, (), unsupported, site_boxes
+    )
+    width = out.hi - out.lo
+    return {
+        "lo": out.lo,
+        "hi": out.hi,
+        "width": float(width.abs().max())
+        if width.numel()
+        else float(width.abs()),
+        "boxes": boxes,
+        "unsupported": unsupported,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -542,10 +645,26 @@ _SPEC_PRESERVING_ANY_ARG = {"add", "sub", "concat", "cat", "stack"}
 #: Ops preserving the bound only when the perturbation enters via
 #: operand 0 (the data operand — index/mask/fill operands would not be
 #: real-valued perturbations).
-_SPEC_PRESERVING_ARG0 = {"neg", "float", "to", "alias", "type_as",
-                        "clone", "dropout", "broadcast", "masked_fill",
-                        "select", "slice", "getitem", "chunk", "split",
-                        "unbind", "index_select", "squeeze", "unsqueeze"}
+_SPEC_PRESERVING_ARG0 = {
+    "neg",
+    "float",
+    "to",
+    "alias",
+    "type_as",
+    "clone",
+    "dropout",
+    "broadcast",
+    "masked_fill",
+    "select",
+    "slice",
+    "getitem",
+    "chunk",
+    "split",
+    "unbind",
+    "index_select",
+    "squeeze",
+    "unsqueeze",
+}
 
 
 def _closest_to_zero(b: Box) -> torch.Tensor:
@@ -605,7 +724,7 @@ def _unary_lip(op: str, b: Box, attrs: dict) -> float | None:
         return 1.0 / (2 * math.sqrt(lo)) if lo > 0 else None
     if op == "rsqrt":
         lo = float(b.lo.min())
-        return 0.5 * lo ** -1.5 if lo > 0 else None
+        return 0.5 * lo**-1.5 if lo > 0 else None
     if op == "square":
         return 2.0 * float(b.maxabs.max())
     if op == "pow":
@@ -643,8 +762,9 @@ def _rearrange_mult(in_box: Box, out_box: Box) -> float:
     return math.sqrt(in_box.lo.numel() / max(1, d_out))
 
 
-def _hop(node: Op, i: int, argb: list, out_box: Box,
-         kind: str) -> tuple[float | None, str]:
+def _hop(
+    node: Op, i: int, argb: list, out_box: Box, kind: str
+) -> tuple[float | None, str]:
     """Multiplier for a perturbation entering ``node`` via operand ``i``.
 
     ``kind`` is ``"row"`` (per-row L2 bound — the common currency) or
@@ -666,7 +786,7 @@ def _hop(node: Op, i: int, argb: list, out_box: Box,
                 rows = w.shape[0] if w.ndim >= 2 else w.numel()
                 m *= math.sqrt(rows)
             return m, "row"
-        if i == 2 and op == "linear":        # bias: vector row bound
+        if i == 2 and op == "linear":  # bias: vector row bound
             return 1.0, "row"
         return None, kind
 
@@ -741,8 +861,18 @@ def _hop(node: Op, i: int, argb: list, out_box: Box,
     if op == "where":
         return (1.0, "row") if i > 0 else (None, kind)
 
-    if op in ("relu", "sigmoid", "tanh", "silu", "gelu", "exp", "neg",
-              "sqrt", "rsqrt", "square"):
+    if op in (
+        "relu",
+        "sigmoid",
+        "tanh",
+        "silu",
+        "gelu",
+        "exp",
+        "neg",
+        "sqrt",
+        "rsqrt",
+        "square",
+    ):
         return _unary_lip(op, argb[0], node.attrs), "row"
 
     # comparisons, sdpa, om/aff/trace carriers, logicals, unknown ops
@@ -752,6 +882,7 @@ def _hop(node: Op, i: int, argb: list, out_box: Box,
 # ---------------------------------------------------------------------------
 #  Site bookkeeping
 # ---------------------------------------------------------------------------
+
 
 def _subterm(term: Any, path: tuple) -> Any:
     t = term
@@ -794,24 +925,33 @@ def _spectral_path_ok(site: dict, term: Any) -> bool:
     p = site["path"]
     if p:
         parent = _subterm(term, p[:-1])
-        if isinstance(parent, Op) and parent.op in ("linear", "matmul") \
-                and p[-1] == 1:
-            return True                # weight slot — sound
+        if (
+            isinstance(parent, Op)
+            and parent.op in ("linear", "matmul")
+            and p[-1] == 1
+        ):
+            return True  # weight slot — sound
     s = _subterm(term, p) if p else term
     if isinstance(s, Op) and s.op == "linear":
         return False
     if isinstance(s, Op) and s.op == "matmul" and s.args:
         a0 = s.args[0]
         if isinstance(a0, Op) and a0.op == "embedding":
-            return True                # per-row bound — sound
+            return True  # per-row bound — sound
         if isinstance(a0, Param):
-            return True                # bound on the member value
-        return False                   # activation matmul site
+            return True  # bound on the member value
+        return False  # activation matmul site
     return True
 
 
-def _site_scalar(site: dict, term: Any, boxes: dict, env: dict,
-                 values: dict, actual: bool) -> tuple[float, str] | None:
+def _site_scalar(
+    site: dict,
+    term: Any,
+    boxes: dict,
+    env: dict,
+    values: dict,
+    actual: bool,
+) -> tuple[float, str] | None:
     """The perturbation scalar injected at the site: (r0, kind).
 
     Weight-slot sites (site value feeds arg1 of linear/matmul) carry a
@@ -826,16 +966,25 @@ def _site_scalar(site: dict, term: Any, boxes: dict, env: dict,
     # ---- weight slot? --------------------------------------------------
     if p:
         parent = _subterm(term, p[:-1])
-        if isinstance(parent, Op) and parent.op in ("linear", "matmul") \
-                and p[-1] == 1:
+        if (
+            isinstance(parent, Op)
+            and parent.op in ("linear", "matmul")
+            and p[-1] == 1
+        ):
             if delta is not None and delta.ndim >= 2:
                 r = float(torch.linalg.matrix_norm(delta, 2).max())
-                return (min(r, b), "spec") if math.isfinite(r) \
+                return (
+                    (min(r, b), "spec")
+                    if math.isfinite(r)
                     else (b, "spec")
+                )
             if delta is not None and delta.ndim < 2:
                 r = float(delta.abs().max())
-                return (min(r, b), "spec") if math.isfinite(r) \
+                return (
+                    (min(r, b), "spec")
+                    if math.isfinite(r)
                     else (b, "spec")
+                )
             # cert-radius fallback: both declared norms bound σ_max
             return b, "spec"
 
@@ -848,7 +997,7 @@ def _site_scalar(site: dict, term: Any, boxes: dict, env: dict,
 
     s = _subterm(term, p)
     if norm == "frobenius":
-        return b, "row"          # worst case: one row holds it all
+        return b, "row"  # worst case: one row holds it all
     # spectral: bound on σ_max — every row ≤ b; the only looser case is
     # a site whose *value* is an activation produced by the approximated
     # matrix (eps_lr: err_row ≤ σ_{r+1}·‖x_row‖).
@@ -867,9 +1016,9 @@ def _site_scalar(site: dict, term: Any, boxes: dict, env: dict,
     if isinstance(s, Op) and s.op == "matmul" and s.args:
         a0 = s.args[0]
         if isinstance(a0, Op) and a0.op == "embedding":
-            return b, "row"        # eps_emb: per-row bound declared
+            return b, "row"  # eps_emb: per-row bound declared
         if isinstance(a0, Param):
-            return b, "row"        # weight-program site: bound on value
+            return b, "row"  # weight-program site: bound on value
         xb = boxes.get(p + (0,))
         if xb is not None:
             return b * _maxrow_bound(xb), "row"
@@ -877,8 +1026,9 @@ def _site_scalar(site: dict, term: Any, boxes: dict, env: dict,
     return b, "row"
 
 
-def _walk_site(term: Any, path: tuple, r0: float, kind0: str,
-               boxes: dict, R: dict) -> float | None:
+def _walk_site(
+    term: Any, path: tuple, r0: float, kind0: str, boxes: dict, R: dict
+) -> float | None:
     """Multiply ``r0`` up the path site→root through local hop
     multipliers; accumulate per-node radii into ``R`` for the box
     widening pass.  ``None`` = a hop has no local rule (→ spectral)."""
@@ -889,7 +1039,9 @@ def _walk_site(term: Any, path: tuple, r0: float, kind0: str,
         node = _subterm(term, path[:d])
         if not isinstance(node, Op):
             return None
-        argb = [boxes.get(path[:d] + (j,)) for j in range(len(node.args))]
+        argb = [
+            boxes.get(path[:d] + (j,)) for j in range(len(node.args))
+        ]
         outb = boxes.get(path[:d])
         if any(a is None for a in argb) or outb is None:
             return None
@@ -930,20 +1082,28 @@ def _elem_lip_map(op: str, b: Box) -> torch.Tensor | None:
         t = torch.tanh(a)
         return 1 - t * t
     if op == "silu":
-        pts = [b.lo, b.hi] + [torch.full_like(b.lo, c)
-                              for c in (-4.0, -2.0, 0.0, 2.0, 4.0, 8.0)]
+        pts = [b.lo, b.hi] + [
+            torch.full_like(b.lo, c)
+            for c in (-4.0, -2.0, 0.0, 2.0, 4.0, 8.0)
+        ]
         m = _silu_der(b.lo).abs() * 0
         for p in pts:
             inside = (p >= b.lo) & (p <= b.hi)
-            m = torch.where(inside, torch.maximum(m, _silu_der(p).abs()), m)
+            m = torch.where(
+                inside, torch.maximum(m, _silu_der(p).abs()), m
+            )
         return m
     if op == "gelu":
-        pts = [b.lo, b.hi] + [torch.full_like(b.lo, c)
-                              for c in (-3.0, -1.0, 0.0, 1.0, 3.0)]
+        pts = [b.lo, b.hi] + [
+            torch.full_like(b.lo, c)
+            for c in (-3.0, -1.0, 0.0, 1.0, 3.0)
+        ]
         m = torch.zeros_like(b.lo)
         for p in pts:
             inside = (p >= b.lo) & (p <= b.hi)
-            m = torch.where(inside, torch.maximum(m, _gelu_der(p).abs()), m)
+            m = torch.where(
+                inside, torch.maximum(m, _gelu_der(p).abs()), m
+            )
         return m
     if op == "exp":
         return b.hi.exp()
@@ -952,18 +1112,26 @@ def _elem_lip_map(op: str, b: Box) -> torch.Tensor | None:
     if op == "sqrt":
         if float(b.lo.min()) <= 0:
             return None
-        return 0.5 * b.lo ** -0.5
+        return 0.5 * b.lo**-0.5
     if op == "rsqrt":
         if float(b.lo.min()) <= 0:
             return None
-        return 0.5 * b.lo ** -1.5
+        return 0.5 * b.lo**-1.5
     if op == "neg":
         return torch.ones_like(b.lo)
     return None
 
 
-def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
-                argb: list, outb: Box, env: dict, values: dict):
+def _prop_delta(
+    node: Op,
+    i: int,
+    cur: torch.Tensor,
+    mag: bool,
+    argb: list,
+    outb: Box,
+    env: dict,
+    values: dict,
+):
     """Propagate a perturbation TENSOR through one hop.
 
     ``cur`` is either the signed realized delta (``mag=False``) or a
@@ -972,6 +1140,7 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
     |sibling|, never the signed value).  Returns ``(tensor, mag)`` or
     ``None`` = no tensor rule → caller degrades to the scalar walk."""
     from catopt.torch_bridge import _IR_TO_TORCH
+
     op = node.op
     cur = cur.double()
 
@@ -990,7 +1159,7 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
         if i == 1:
             a = sib(0)
             return None if a is None else (a @ cur.T, mag)
-        if i == 2:      # bias: broadcast the vector over every row
+        if i == 2:  # bias: broadcast the vector over every row
             shape = outb.lo.shape if outb is not None else cur.shape
             try:
                 return torch.broadcast_to(cur, shape), mag
@@ -1007,10 +1176,19 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
         return None
     if op in ("add", "sub"):
         if mag:
-            return cur, True            # magnitude bound passes both
+            return cur, True  # magnitude bound passes both
         return (cur, False) if op == "add" or i == 0 else (-cur, False)
-    if op in ("neg", "float", "to", "alias", "type_as", "clone",
-              "dropout", "contiguous", "broadcast"):
+    if op in (
+        "neg",
+        "float",
+        "to",
+        "alias",
+        "type_as",
+        "clone",
+        "dropout",
+        "contiguous",
+        "broadcast",
+    ):
         if mag:
             return cur, True
         fn = _IR_TO_TORCH.get(op)
@@ -1020,9 +1198,21 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
             return fn(cur, **dict(node.attrs)), False
         except Exception:
             return cur.double(), False
-    if op in ("reshape", "view", "transpose", "select", "slice",
-              "getitem", "chunk", "split", "unbind", "squeeze",
-              "unsqueeze", "flatten", "expand"):
+    if op in (
+        "reshape",
+        "view",
+        "transpose",
+        "select",
+        "slice",
+        "getitem",
+        "chunk",
+        "split",
+        "unbind",
+        "squeeze",
+        "unsqueeze",
+        "flatten",
+        "expand",
+    ):
         fn = _IR_TO_TORCH.get(op)
         if fn is None or i != 0:
             return None
@@ -1034,23 +1224,32 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
         dim = int(node.attrs.get("dim", node.attrs.get("arg1", 0)))
         parts = []
         for j, b in enumerate(argb):
-            parts.append(cur if j == i else torch.zeros_like(b.lo.double()))
+            parts.append(
+                cur if j == i else torch.zeros_like(b.lo.double())
+            )
         return torch.cat(parts, dim=dim), mag
     if op == "stack":
         dim = int(node.attrs.get("dim", node.attrs.get("arg1", 0)))
-        parts = [cur if j == i else torch.zeros_like(b.lo.double())
-                 for j, b in enumerate(argb)]
+        parts = [
+            cur if j == i else torch.zeros_like(b.lo.double())
+            for j, b in enumerate(argb)
+        ]
         return torch.stack(parts, dim=dim), mag
     if op == "index_select" and i == 0:
         fn = _IR_TO_TORCH.get("index_select")
         if fn is None:
             return None
         try:
-            idx = _eval_concrete(node.args[1], env, values) \
-                if len(node.args) > 1 else None
-            return ((fn(cur, idx, **dict(node.attrs)), mag)
-                    if idx is not None
-                    else (fn(cur, **dict(node.attrs)), mag))
+            idx = (
+                _eval_concrete(node.args[1], env, values)
+                if len(node.args) > 1
+                else None
+            )
+            return (
+                (fn(cur, idx, **dict(node.attrs)), mag)
+                if idx is not None
+                else (fn(cur, **dict(node.attrs)), mag)
+            )
         except Exception:
             return None
     if op == "embedding" and i == 0:
@@ -1078,8 +1277,17 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
             return fn(cur, **dict(node.attrs)), mag
         except Exception:
             return None
-    if op in ("relu", "sigmoid", "tanh", "silu", "gelu", "exp",
-              "square", "sqrt", "rsqrt"):
+    if op in (
+        "relu",
+        "sigmoid",
+        "tanh",
+        "silu",
+        "gelu",
+        "exp",
+        "square",
+        "sqrt",
+        "rsqrt",
+    ):
         lm = _elem_lip_map(op, argb[0])
         return None if lm is None else (cur.abs() * lm.double(), True)
     if op == "where" and i > 0:
@@ -1087,17 +1295,26 @@ def _prop_delta(node: Op, i: int, cur: torch.Tensor, mag: bool,
         if c is None:
             return None
         z = torch.zeros_like(cur)
-        return torch.where(c.bool(), cur if i == 1 else z,
-                           z if i == 1 else cur), mag
+        return torch.where(
+            c.bool(), cur if i == 1 else z, z if i == 1 else cur
+        ), mag
     if op == "masked_fill" and i == 0:
         m = _eval_concrete(node.args[1], env, values)
-        return (None if m is None
-                else (cur.masked_fill(m.bool(), 0.0), mag))
+        return (
+            None if m is None else (cur.masked_fill(m.bool(), 0.0), mag)
+        )
     return None
 
 
-def _walk_site_artifact(term: Any, path: tuple, delta, kind0: str,
-                        boxes: dict, env: dict, values: dict):
+def _walk_site_artifact(
+    term: Any,
+    path: tuple,
+    delta,
+    kind0: str,
+    boxes: dict,
+    env: dict,
+    values: dict,
+):
     """Artifact walk: propagate the realized delta tensor hop-by-hop;
     degrade to the scalar row-bound walk at the first op with no
     tensor rule.  Returns a max-abs bound at the root, or None."""
@@ -1112,10 +1329,13 @@ def _walk_site_artifact(term: Any, path: tuple, delta, kind0: str,
         node = _subterm(term, path[:d])
         if not isinstance(node, Op):
             return None
-        argb = [boxes.get(path[:d] + (j,)) for j in range(len(node.args))]
+        argb = [
+            boxes.get(path[:d] + (j,)) for j in range(len(node.args))
+        ]
         outb = boxes.get(path[:d])
-        res = _prop_delta(node, path[d], cur, mag, argb, outb,
-                          env, values)
+        res = _prop_delta(
+            node, path[d], cur, mag, argb, outb, env, values
+        )
         if res is None:
             # degrade: scalar row-bound walk on the remaining hops
             r = _maxrow_bound(Box(cur.abs(), cur.abs()))
@@ -1123,8 +1343,10 @@ def _walk_site_artifact(term: Any, path: tuple, delta, kind0: str,
             carried, kind = r, "row"
             for dd in range(d, -1, -1):
                 nd = _subterm(term, path[:dd])
-                ab = [boxes.get(path[:dd] + (j,))
-                      for j in range(len(nd.args))]
+                ab = [
+                    boxes.get(path[:dd] + (j,))
+                    for j in range(len(nd.args))
+                ]
                 ob = boxes.get(path[:dd])
                 mult, kind = _hop(nd, path[dd], ab, ob, kind)
                 if mult is None or not math.isfinite(mult):
@@ -1159,22 +1381,38 @@ def _collect_sites(term: Any, cert: Any) -> tuple[list, float]:
         paths = _find_subterms(term, step.rhs)
         if not paths:
             unlocated += rule.error_bound
-            sites.append({"rule": step.rule, "bound": rule.error_bound,
-                          "norm": getattr(rule, "bound_norm", None),
-                          "path": None, "lhs": step.lhs, "rhs": step.rhs})
+            sites.append(
+                {
+                    "rule": step.rule,
+                    "bound": rule.error_bound,
+                    "norm": getattr(rule, "bound_norm", None),
+                    "path": None,
+                    "lhs": step.lhs,
+                    "rhs": step.rhs,
+                }
+            )
             continue
         for p in paths:
-            sites.append({"rule": step.rule, "bound": rule.error_bound,
-                          "norm": getattr(rule, "bound_norm", None),
-                          "path": p, "lhs": step.lhs, "rhs": step.rhs})
+            sites.append(
+                {
+                    "rule": step.rule,
+                    "bound": rule.error_bound,
+                    "norm": getattr(rule, "bound_norm", None),
+                    "path": p,
+                    "lhs": step.lhs,
+                    "rhs": step.rhs,
+                }
+            )
     return sites, unlocated
 
 
 def _vars_and_inputs(term: Any, example_input: Any):
     vars_ = _collect_vars(term)
-    inputs = (list(example_input) if isinstance(example_input,
-                                                (tuple, list))
-              else [example_input])
+    inputs = (
+        list(example_input)
+        if isinstance(example_input, (tuple, list))
+        else [example_input]
+    )
     values = {v.name: t for v, t in zip(vars_, inputs)}
     return vars_, inputs, values
 
@@ -1184,25 +1422,32 @@ def _input_norm(inputs: list) -> float:
     for t in inputs:
         tt = torch.as_tensor(t)
         if tt.ndim >= 1 and tt.is_floating_point():
-            rows = torch.linalg.norm(tt.double().reshape(-1,
-                                     tt.shape[-1]), dim=-1)
+            rows = torch.linalg.norm(
+                tt.double().reshape(-1, tt.shape[-1]), dim=-1
+            )
             best = max(best, float(rows.max()))
         elif tt.ndim == 0:
             best = max(best, abs(float(tt)))
     return best or 1.0
 
 
-def _measured_error(term: Any, cert: Any, src: dict,
-                    inputs: list, vars_: list) -> float | None:
+def _measured_error(
+    term: Any, cert: Any, src: dict, inputs: list, vars_: list
+) -> float | None:
     """Run the extracted term and the certificate's source term through
     real torch modules and diff — the empirical error the bound covers."""
     try:
         from catopt.torch_bridge import ir_to_torch_module
+
         mods = []
         for root in (cert.src, term):
             src_vars = _collect_vars(root)
-            ir = IR(root=root, inputs=src_vars,
-                    input_names={v.name for v in src_vars}, params={})
+            ir = IR(
+                root=root,
+                inputs=src_vars,
+                input_names={v.name for v in src_vars},
+                params={},
+            )
             mods.append(ir_to_torch_module(ir, param_values=src))
         with torch.no_grad():
             o0 = mods[0](*[torch.as_tensor(t) for t in inputs])
@@ -1216,10 +1461,16 @@ def _measured_error(term: Any, cert: Any, src: dict,
 #  Public: tight_model_bound
 # ---------------------------------------------------------------------------
 
-def tight_model_bound(term: Any, cert: Any, src: dict,
-                      example_input: Any, *,
-                      input_radius: float = 0.0,
-                      max_iter: int = 4) -> dict:
+
+def tight_model_bound(
+    term: Any,
+    cert: Any,
+    src: dict,
+    example_input: Any,
+    *,
+    input_radius: float = 0.0,
+    max_iter: int = 4,
+) -> dict:
     """Whole-model error bound via interval propagation.
 
     For each bound-carrying certificate step the site's contribution is
@@ -1244,13 +1495,23 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
     module on ``example_input`` when both lower successfully.
     """
     vars_, inputs, values = _vars_and_inputs(term, example_input)
-    input_box = _norm_input_box(
-        {v.name: t for v, t in zip(vars_, inputs)} if vars_ else {},
-        term, input_radius) if vars_ else {}
+    input_box = (
+        _norm_input_box(
+            {v.name: t for v, t in zip(vars_, inputs)} if vars_ else {},
+            term,
+            input_radius,
+        )
+        if vars_
+        else {}
+    )
     for v, t in zip(vars_, inputs):
-        input_box.setdefault(v.name, Box(
-            _as_float(torch.as_tensor(t)) - input_radius,
-            _as_float(torch.as_tensor(t)) + input_radius))
+        input_box.setdefault(
+            v.name,
+            Box(
+                _as_float(torch.as_tensor(t)) - input_radius,
+                _as_float(torch.as_tensor(t)) + input_radius,
+            ),
+        )
 
     ib = ibp_bound(term, src, input_box, values=values)
     base_boxes = ib["boxes"]
@@ -1259,7 +1520,10 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
     spectral = model_bound(term, cert, src, input_norm)
     spec_contrib = {}
     for c in spectral["site_contributions"]:
-        key = (c.get("rule"), tuple(c["path"]) if c.get("path") else None)
+        key = (
+            c.get("rule"),
+            tuple(c["path"]) if c.get("path") else None,
+        )
         spec_contrib[key] = c.get("contribution")
 
     sites, unlocated = _collect_sites(term, cert)
@@ -1279,9 +1543,14 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
         n_fallback = 0
         for s in sites:
             if s["path"] is None:
-                contributions.append({"rule": s["rule"], "bound": s["bound"],
-                                      "unlocated": True,
-                                      "contribution": s["bound"]})
+                contributions.append(
+                    {
+                        "rule": s["rule"],
+                        "bound": s["bound"],
+                        "unlocated": True,
+                        "contribution": s["bound"],
+                    }
+                )
                 continue
             c0 = _site_scalar(s, term, boxes, src, values, actual=False)
             if c0 is None:
@@ -1291,17 +1560,30 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
             # tensor (exact through linear hops, elementwise-bounded at
             # nonlinearities); fall back to the scalar walk.
             delta = _site_delta(s, src, values)
-            ca = _walk_site_artifact(term, s["path"], delta, "row",
-                                     boxes, src, values) \
-                if delta is not None else None
+            ca = (
+                _walk_site_artifact(
+                    term, s["path"], delta, "row", boxes, src, values
+                )
+                if delta is not None
+                else None
+            )
             if ca is None:
-                a0 = _site_scalar(s, term, boxes, src, values,
-                                  actual=True) or c0
-                ca = _walk_site(term, s["path"], a0[0], a0[1], boxes, {})
+                a0 = (
+                    _site_scalar(
+                        s, term, boxes, src, values, actual=True
+                    )
+                    or c0
+                )
+                ca = _walk_site(
+                    term, s["path"], a0[0], a0[1], boxes, {}
+                )
             fb = False
             spec_ok = _spectral_path_ok(s, term)
-            sc = spec_contrib.get((s["rule"], s["path"])) \
-                if spec_ok else None
+            sc = (
+                spec_contrib.get((s["rule"], s["path"]))
+                if spec_ok
+                else None
+            )
             if cc is None:
                 fb = True
                 n_fallback += 1
@@ -1311,9 +1593,13 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
                     # recorded): the site's own scalar × the global
                     # Lipschitz product is still sound.
                     sens = _path_sensitivity(
-                        term, s["path"], src, input_norm)
-                    cc = (c0[0] * sens if sens is not None
-                          else float("inf"))
+                        term, s["path"], src, input_norm
+                    )
+                    cc = (
+                        c0[0] * sens
+                        if sens is not None
+                        else float("inf")
+                    )
                 ca = cc
             else:
                 # per-site min: widening margins can exceed spectral's
@@ -1326,12 +1612,20 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
                     ca = cc
             total += cc
             total_a += ca
-            contributions.append({
-                "rule": s["rule"], "bound": s["bound"], "path": s["path"],
-                "contribution": cc, "artifact_contribution": ca,
-                "fallback": fb, "spectral_unsafe": not spec_ok})
-        if all(new_R.get(k, 0.0) <= R.get(k, 0.0) + 1e-12
-               for k in new_R):
+            contributions.append(
+                {
+                    "rule": s["rule"],
+                    "bound": s["bound"],
+                    "path": s["path"],
+                    "contribution": cc,
+                    "artifact_contribution": ca,
+                    "fallback": fb,
+                    "spectral_unsafe": not spec_ok,
+                }
+            )
+        if all(
+            new_R.get(k, 0.0) <= R.get(k, 0.0) + 1e-12 for k in new_R
+        ):
             converged = True
             break
         for k, v in new_R.items():
@@ -1348,24 +1642,29 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
             f"{n_unsafe} spectral site(s) sit at activation positions "
             "where model_bound's downstream-only walk misses the "
             "input-norm factor — the spectral figure may UNDER-bound "
-            "there; IBP used the input-scaled local estimate instead")
+            "there; IBP used the input-scaled local estimate instead"
+        )
     if not tighter:
         notes.append(
             "IBP did not improve on the spectral path bound for this "
-            "term (local constants were not smaller than global ones)")
+            "term (local constants were not smaller than global ones)"
+        )
     if n_fallback:
         notes.append(
             f"{n_fallback} site(s) used the spectral path contribution "
             "(no interval rule on their path, or spectral was tighter "
-            "after widening margins)")
+            "after widening margins)"
+        )
     if not converged:
         notes.append(
             f"widening iterate did not fully converge in {max_iter} "
-            "rounds; reported bound is the last (largest) iterate")
+            "rounds; reported bound is the last (largest) iterate"
+        )
     if ib["unsupported"]:
         notes.append(
             "ops with no sound interval rule produced ±∞ boxes: "
-            + ", ".join(sorted(set(ib["unsupported"]))))
+            + ", ".join(sorted(set(ib["unsupported"])))
+        )
 
     return {
         "bound": total,
@@ -1373,12 +1672,15 @@ def tight_model_bound(term: Any, cert: Any, src: dict,
         "spectral_bound": spectral_bound,
         "measured_error": err,
         "tighter": tighter,
-        "improvement": (spectral_bound / total
-                        if total > 0 else float("inf")),
-        "cert_conservatism": (total / err
-                              if err and err > 0 else float("inf")),
-        "artifact_conservatism": (total_a / err
-                                  if err and err > 0 else float("inf")),
+        "improvement": (
+            spectral_bound / total if total > 0 else float("inf")
+        ),
+        "cert_conservatism": (
+            total / err if err and err > 0 else float("inf")
+        ),
+        "artifact_conservatism": (
+            total_a / err if err and err > 0 else float("inf")
+        ),
         "site_contributions": contributions,
         "n_bounded_steps": spectral["n_bounded_steps"],
         "n_fallback": n_fallback,

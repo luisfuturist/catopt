@@ -18,12 +18,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from catopt.ir import Op, Var, Const, Param
-
+from catopt.ir import Const, Op, Param, Var
 
 # ---------------------------------------------------------------------------
 # Shape inference (lightweight)
 # ---------------------------------------------------------------------------
+
 
 def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
     """Best-effort shape inference for a term.
@@ -105,15 +105,30 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "add" | "mul" | "sub" | "div":
             # Element-wise ops broadcast: result is the broadcast shape,
             # not simply the first operand's shape.
-            return _broadcast(shapes[0], shapes[1] if len(shapes) > 1 else None)
+            return _broadcast(
+                shapes[0], shapes[1] if len(shapes) > 1 else None
+            )
         case "eq" | "ne" | "lt" | "le" | "gt" | "ge":
-            return _broadcast(shapes[0], shapes[1] if len(shapes) > 1 else None)
+            return _broadcast(
+                shapes[0], shapes[1] if len(shapes) > 1 else None
+            )
         case "where":
-            out = _broadcast(shapes[1], shapes[2] if len(shapes) > 2 else None)
+            out = _broadcast(
+                shapes[1], shapes[2] if len(shapes) > 2 else None
+            )
             return _broadcast(out, shapes[0])
         case (
-            "square" | "sqrt" | "neg" | "sigmoid" | "silu" | "tanh"
-            | "gelu" | "rsqrt" | "exp" | "softmax" | "masked_fill"
+            "square"
+            | "sqrt"
+            | "neg"
+            | "sigmoid"
+            | "silu"
+            | "tanh"
+            | "gelu"
+            | "rsqrt"
+            | "exp"
+            | "softmax"
+            | "masked_fill"
             | "logical_not"
         ):
             return shapes[0]
@@ -123,8 +138,12 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # F.linear(x[..., in], W[out, in]) -> [..., out]
             # A scalar x () has no in-features axis — fall through to
             # the unknown result rather than fabricating (w[0],).
-            if (len(shapes) >= 2 and shapes[0] is not None
-                    and shapes[0] and shapes[1] is not None):
+            if (
+                len(shapes) >= 2
+                and shapes[0] is not None
+                and shapes[0]
+                and shapes[1] is not None
+            ):
                 w = shapes[1]
                 if len(w) >= 1:
                     out = tuple(shapes[0][:-1]) + (w[0],)
@@ -195,11 +214,15 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                     known = 1
                     for d in shape:
                         if d != -1:
-                            known *= (d if d is not None and d > 0 else 1)
-                    inferred = (base_n // known
-                                if known and base_n % known == 0 else None)
-                    shape = tuple(inferred if d == -1 else d
-                                  for d in shape)
+                            known *= d if d is not None and d > 0 else 1
+                    inferred = (
+                        base_n // known
+                        if known and base_n % known == 0
+                        else None
+                    )
+                    shape = tuple(
+                        inferred if d == -1 else d for d in shape
+                    )
                 # A reshape is a view: the declared shape MUST preserve
                 # the input numel.  Returning the attr verbatim lets an
                 # ill-typed member (e.g. one that halved the wrong axis)
@@ -208,12 +231,14 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 # can even prefer it.  Flag the mismatch instead so the
                 # member costs _INVALID_COST and can never be picked.
                 base = shapes[0]
-                if (isinstance(base, tuple)
-                        and all(isinstance(d, int) and d >= 0
-                                for d in shape)
-                        and all(isinstance(d, int) and d >= 0
-                                for d in base)
-                        and _numel(shape) != _numel(base)):
+                if (
+                    isinstance(base, tuple)
+                    and all(
+                        isinstance(d, int) and d >= 0 for d in shape
+                    )
+                    and all(isinstance(d, int) and d >= 0 for d in base)
+                    and _numel(shape) != _numel(base)
+                ):
                     return _INVALID
                 return shape
             return shapes[0]
@@ -228,7 +253,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if not base:
                 return None
-            d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(base)
+            d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(
+                base
+            )
             return tuple(x for i, x in enumerate(base) if i != d)
         case "expand":
             s = op.attrs.get("shape")
@@ -249,7 +276,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if not base:
                 # () has no dim to unbind — carrier-internal operand.
                 return None
-            d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(base)
+            d = op.attrs.get("arg1", op.attrs.get("dim", -1)) % len(
+                base
+            )
             return tuple(x for i, x in enumerate(base) if i != d)
         case "getitem":
             # After unbind the element shape is already the arg's shape.
@@ -274,7 +303,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             step = op.attrs.get("arg4", 1) or 1
             out = list(base)
             if isinstance(base[d], int):
-                n = (min(hi, base[d]) if isinstance(hi, int) else base[d]) - lo
+                n = (
+                    min(hi, base[d]) if isinstance(hi, int) else base[d]
+                ) - lo
                 out[d] = max(0, -(-n // step))
             return tuple(out)
         case "embedding":
@@ -291,7 +322,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             d = op.attrs.get("dim", op.attrs.get("arg1", 0)) % len(base)
             idx = op.attrs.get("index", op.attrs.get("arg2"))
             out = list(base)
-            out[d] = len(idx) if isinstance(idx, (tuple, list)) else None
+            out[d] = (
+                len(idx) if isinstance(idx, (tuple, list)) else None
+            )
             return tuple(out)
         case "flatten":
             base = shapes[0]
@@ -300,9 +333,16 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             d0 = op.attrs.get("arg1", op.attrs.get("start_dim", 0))
             d1 = op.attrs.get("arg2", op.attrs.get("end_dim", -1))
             d0, d1 = d0 % len(base), d1 % len(base)
-            merged = _numel(base[d0:d1 + 1])
-            return tuple(base[:d0]) + (merged,) + tuple(base[d1 + 1:])
-        case "contiguous" | "to" | "type_as" | "float" | "dropout" | "alias":
+            merged = _numel(base[d0 : d1 + 1])
+            return tuple(base[:d0]) + (merged,) + tuple(base[d1 + 1 :])
+        case (
+            "contiguous"
+            | "to"
+            | "type_as"
+            | "float"
+            | "dropout"
+            | "alias"
+        ):
             return shapes[0]
         case "sdpa":
             # out has q's shape (B, h, T, d)
@@ -310,11 +350,23 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "conv2d":
             # x (N,C,H,W) @ w (O,C,kh,kw) -> (N,O,H',W')
             x, w = shapes[0], shapes[1]
-            if (x is None or w is None or len(x) < 4 or len(w) < 4
-                    or isinstance(op.attrs.get("padding"), str)):
-                return (x[0], w[0], None, None) if (
-                    x is not None and w is not None
-                    and len(x) >= 1 and len(w) >= 1) else (x or None)
+            if (
+                x is None
+                or w is None
+                or len(x) < 4
+                or len(w) < 4
+                or isinstance(op.attrs.get("padding"), str)
+            ):
+                return (
+                    (x[0], w[0], None, None)
+                    if (
+                        x is not None
+                        and w is not None
+                        and len(x) >= 1
+                        and len(w) >= 1
+                    )
+                    else (x or None)
+                )
             st = op.attrs.get("stride", 1)
             pd = op.attrs.get("padding", 0)
             dl = op.attrs.get("dilation", 1)
@@ -323,9 +375,13 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             dl = dl if isinstance(dl, (tuple, list)) else (dl, dl)
             oh = ow = None
             if x[2] is not None and w[2] is not None:
-                oh = (x[2] + 2 * pd[0] - dl[0] * (w[2] - 1) - 1) // st[0] + 1
+                oh = (x[2] + 2 * pd[0] - dl[0] * (w[2] - 1) - 1) // st[
+                    0
+                ] + 1
             if x[3] is not None and w[3] is not None:
-                ow = (x[3] + 2 * pd[1] - dl[1] * (w[3] - 1) - 1) // st[1] + 1
+                ow = (x[3] + 2 * pd[1] - dl[1] * (w[3] - 1) - 1) // st[
+                    1
+                ] + 1
             return (x[0], w[0], oh, ow)
         case "aff":
             # The map h ↦ A·h + b is a pair value; its "shape" is the
@@ -359,8 +415,12 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # shape (...,T,d) — like `aff`, the carrier is priced as
             # the tensor it will become under om_apply.
             s, v = shapes[0], shapes[1]
-            if (isinstance(s, tuple) and isinstance(v, tuple)
-                    and len(s) >= 1 and len(v) >= 1):
+            if (
+                isinstance(s, tuple)
+                and isinstance(v, tuple)
+                and len(s) >= 1
+                and len(v) >= 1
+            ):
                 return tuple(s[:-1]) + (v[-1],)
             # A ()-shaped operand is a carrier member read as a
             # tensor — unknown, not scalar.
@@ -385,9 +445,13 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # bdiag is literal block-diagonal; parl re-lays the same
             # blocks keeping feedback wires first (see catopt.trace).
             a, b = shapes[0], shapes[1]
-            if (isinstance(a, tuple) and isinstance(b, tuple)
-                    and len(a) == 2 and len(b) == 2
-                    and all(isinstance(d, int) for d in (*a, *b))):
+            if (
+                isinstance(a, tuple)
+                and isinstance(b, tuple)
+                and len(a) == 2
+                and len(b) == 2
+                and all(isinstance(d, int) for d in (*a, *b))
+            ):
                 return (a[0] + b[0], a[1] + b[1])
             return a or None
         case "inv":
@@ -404,7 +468,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             for s in shapes:
                 if not isinstance(s, tuple) or len(s) != len(a):
                     return a
-                out[dim] += (s[dim] or 0)
+                out[dim] += s[dim] or 0
             return tuple(out)
         case "chunk":
             base = shapes[0]
@@ -428,10 +492,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             idx = op.attrs.get("index", op.attrs.get("arg3", 0)) or 0
             out = list(base)
             if isinstance(sizes, (tuple, list)):
-                out[dim] = (sizes[idx] if idx < len(sizes)
-                            else None)
+                out[dim] = sizes[idx] if idx < len(sizes) else None
             elif isinstance(sizes, int):
-                out[dim] = sizes          # equal-size sections
+                out[dim] = sizes  # equal-size sections
             else:
                 out[dim] = None
             return tuple(out)
@@ -473,9 +536,7 @@ def _broadcast(a, b):
             out.append(None)
         elif da == 1:
             out.append(db)
-        elif db == 1:
-            out.append(da)
-        elif da == db:
+        elif db == 1 or da == db:
             out.append(da)
         else:
             return _INVALID  # provably ill-typed
@@ -487,7 +548,7 @@ def _numel(shape) -> int:
         return 1
     result = 1
     for d in shape:
-        result *= (d if d is not None else 1)
+        result *= d if d is not None else 1
     return result
 
 
@@ -496,23 +557,46 @@ def _numel(shape) -> int:
 # ---------------------------------------------------------------------------
 
 _OP_FLOPS: dict[str, int] = {
-    "matmul": 2, "add": 1, "mul": 1, "sub": 1, "div": 4, "square": 1,
-    "sqrt": 2, "neg": 1, "pow": 2,
-    "sigmoid": 2, "silu": 3, "tanh": 2, "gelu": 3, "rsqrt": 2, "exp": 1,
-    "sum": 1, "mean": 2, "max": 1,
-    "transpose": 0, "reshape": 0, "broadcast": 0, "linear": 2,
+    "matmul": 2,
+    "add": 1,
+    "mul": 1,
+    "sub": 1,
+    "div": 4,
+    "square": 1,
+    "sqrt": 2,
+    "neg": 1,
+    "pow": 2,
+    "sigmoid": 2,
+    "silu": 3,
+    "tanh": 2,
+    "gelu": 3,
+    "rsqrt": 2,
+    "exp": 1,
+    "sum": 1,
+    "mean": 2,
+    "max": 1,
+    "transpose": 0,
+    "reshape": 0,
+    "broadcast": 0,
+    "linear": 2,
     # concat/chunk are wire juxtaposition / projection: pure data
     # movement, zero FLOPs.  On weights they are compile-time work.
-    "concat": 0, "chunk": 0, "split": 0,
+    "concat": 0,
+    "chunk": 0,
+    "split": 0,
     # index_select is a gather: memory traffic, no arithmetic.
     "index_select": 0,
     # contiguous copies memory (0 FLOPs but real bandwidth — the
     # roofline model prices it); sdpa ~2*T work per output element.
-    "contiguous": 0, "sdpa": 2,
+    "contiguous": 0,
+    "sdpa": 2,
     # Traced-monoidal ops (catopt.trace): wire juxtaposition and
     # constant morphisms carry no FLOPs; trace/inv are priced in
     # _flops_of directly (solve cost depends on usize).
-    "bdiag": 0, "parl": 0, "eye": 0, "cswap": 0,
+    "bdiag": 0,
+    "parl": 0,
+    "eye": 0,
+    "cswap": 0,
 }
 
 #: Ops that produce no kernel — true views or wire bookkeeping.
@@ -521,12 +605,22 @@ _OP_FLOPS: dict[str, int] = {
 #: for consumers (priced via _STRIDE_PENALTY).  concat is NOT here: a
 #: runtime cat() is a real copy kernel — it is only free when the whole
 #: subtree is param-only (compile-time fold, handled by extraction).
-_VIEW_OPS = {"transpose", "reshape", "broadcast", "chunk",
-             "split", "leaf", "aff", "om", "aff_diag",
-             # Constant morphisms (catopt.trace): zero-arg ops that
-             # materialise a fixed matrix — compile-time constants,
-             # like the carrier-packaging ops above.
-             "eye", "cswap"}
+_VIEW_OPS = {
+    "transpose",
+    "reshape",
+    "broadcast",
+    "chunk",
+    "split",
+    "leaf",
+    "aff",
+    "om",
+    "aff_diag",
+    # Constant morphisms (catopt.trace): zero-arg ops that
+    # materialise a fixed matrix — compile-time constants,
+    # like the carrier-packaging ops above.
+    "eye",
+    "cswap",
+}
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.
@@ -550,9 +644,16 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
     if term.op == "matmul":
         # Standard matmul: 2 * M * N * K
         shapes = [_shape_of(a, memo) for a in term.args]
-        if shapes and shapes[1] is not None and shapes[1] is not _INVALID:
-            k_dim = (shapes[1][-2] if len(shapes[1]) >= 2
-                     else (shapes[1][0] if len(shapes[1]) == 1 else 1))
+        if (
+            shapes
+            and shapes[1] is not None
+            and shapes[1] is not _INVALID
+        ):
+            k_dim = (
+                shapes[1][-2]
+                if len(shapes[1]) >= 2
+                else (shapes[1][0] if len(shapes[1]) == 1 else 1)
+            )
             return float(2 * n_out * k_dim)
         return float(2 * n_out)
     if term.op == "linear":
@@ -565,8 +666,12 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
         # 2 * N * O * H' * W' * (C*kh*kw / groups)
         shapes = [_shape_of(a, memo) for a in term.args]
         w = shapes[1] if len(shapes) > 1 else None
-        if (w is not None and w is not _INVALID and len(w) >= 4
-                and all(isinstance(d, int) for d in w[1:4])):
+        if (
+            w is not None
+            and w is not _INVALID
+            and len(w) >= 4
+            and all(isinstance(d, int) for d in w[1:4])
+        ):
             k = w[1] * w[2] * w[3]
             g = term.attrs.get("groups", 1)
             if isinstance(g, int) and g > 1:
@@ -581,16 +686,24 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
         # one matvec, one add ≈ 2·d³ + O(d²) flops.
         shapes = [_shape_of(a, memo) for a in term.args]
         f = shapes[0] if shapes else None
-        if (f is not None and f is not _INVALID and len(f) >= 2
-                and isinstance(f[-1], int)):
+        if (
+            f is not None
+            and f is not _INVALID
+            and len(f) >= 2
+            and isinstance(f[-1], int)
+        ):
             return float(2 * n_out * f[-1])
         return float(2 * n_out)
     if term.op == "apply":
         # f·h + b: matvec + add ≈ 2·d² flops on a d-vector out.
         shapes = [_shape_of(a, memo) for a in term.args]
         f = shapes[0] if shapes else None
-        if (f is not None and f is not _INVALID and len(f) >= 2
-                and isinstance(f[-1], int)):
+        if (
+            f is not None
+            and f is not _INVALID
+            and len(f) >= 2
+            and isinstance(f[-1], int)
+        ):
             return float(2 * n_out * f[-1])
         return float(2 * n_out)
     if term.op == "aff_diag":
@@ -611,8 +724,11 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
         # exp(s−m) @ v GEMM at 2·n_out·K (K = scores' last dim).
         shapes = [_shape_of(a, memo) for a in term.args]
         s = shapes[0] if shapes else None
-        k = (s[-1] if isinstance(s, tuple) and s
-             and isinstance(s[-1], int) else 1)
+        k = (
+            s[-1]
+            if isinstance(s, tuple) and s and isinstance(s[-1], int)
+            else 1
+        )
         return float(2 * n_out * k + 3 * _numel(s))
     if term.op == "om_compose":
         # max + 2 rescale exps + 2 mul-adds per accumulator element.
@@ -641,8 +757,9 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
     return float(_OP_FLOPS.get(term.op, 1) * n_out)
 
 
-def _local_cost(term: Op, launch_penalty: float = 0.0,
-                memo: dict | None = None) -> float:
+def _local_cost(
+    term: Op, launch_penalty: float = 0.0, memo: dict | None = None
+) -> float:
     """Cost contribution of a single op node (excludes children).
 
     = op FLOPs on the inferred output shape + launch penalty.
@@ -701,11 +818,13 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     per-node decomposition below is skipped — it would mis-bill them.
     """
     import inspect
+
     memo = {} if memo is None else memo
     takes_memo = "memo" in inspect.signature(cost_fn).parameters
     # getattr(..., "func", ...) unwraps functools.partial bindings.
-    bill_params = getattr(getattr(cost_fn, "func", cost_fn),
-                          "charges_param_only", False)
+    bill_params = getattr(
+        getattr(cost_fn, "func", cost_fn), "charges_param_only", False
+    )
 
     def c(t: Any) -> float:
         return cost_fn(t, memo=memo) if takes_memo else cost_fn(t)
@@ -804,7 +923,9 @@ def depth_cost(term: Any, memo: dict | None = None) -> float:
             # Unshapeable op: charge a launch, not a veto — depth is a
             # structural metric, not a soundness gate.
             local = _LAUNCH_S * 1e9
-        child = max((depth_cost(a, memo) for a in term.args), default=0.0)
+        child = max(
+            (depth_cost(a, memo) for a in term.args), default=0.0
+        )
         out = local + child
         memo[ck] = float(out)
         return out
@@ -832,9 +953,13 @@ def count_cost(term: Any, memo: dict | None = None) -> float:
 #  Parameter-storage cost model — the ε axis's pricing side
 # ---------------------------------------------------------------------------
 
-def param_bytes_cost(term: Any, source_tensors: dict | None = None,
-                     memo: dict | None = None,
-                     by_bytes: bool = False) -> float:
+
+def param_bytes_cost(
+    term: Any,
+    source_tensors: dict | None = None,
+    memo: dict | None = None,
+    by_bytes: bool = False,
+) -> float:
     """Cost = stored parameter values — what the LOWERED module keeps.
 
     The storage axis the flop-based models cannot see: a low-rank
@@ -876,8 +1001,9 @@ def param_bytes_cost(term: Any, source_tensors: dict | None = None,
     verbatim instead of re-deriving it per node.
     """
     memo = {} if memo is None else memo
-    return float(sum(_param_index(term, source_tensors, memo,
-                                  by_bytes).values()))
+    return float(
+        sum(_param_index(term, source_tensors, memo, by_bytes).values())
+    )
 
 
 # Markers read by EGraph.extract_best / dag_cost: storage pricing does
@@ -888,8 +1014,9 @@ param_bytes_cost.charges_param_only = True
 param_bytes_cost.dag_exact = True
 
 
-def param_bytes_cost_for(source_tensors: dict | None = None,
-                         by_bytes: bool = False):
+def param_bytes_cost_for(
+    source_tensors: dict | None = None, by_bytes: bool = False
+):
     """Bind ``source_tensors`` and return a standard cost fn.
 
     Same closure convention as :func:`roofline_cost_for`: the result
@@ -901,8 +1028,7 @@ def param_bytes_cost_for(source_tensors: dict | None = None,
     """
 
     def cost(term: Any, memo: dict | None = None) -> float:
-        return param_bytes_cost(term, source_tensors, memo,
-                                by_bytes)
+        return param_bytes_cost(term, source_tensors, memo, by_bytes)
 
     cost.__name__ = "param_bytes_cost_for"
     cost.charges_param_only = True
@@ -910,8 +1036,9 @@ def param_bytes_cost_for(source_tensors: dict | None = None,
     return cost
 
 
-def _param_numel(p: Param, source_tensors: dict | None,
-                 by_bytes: bool = False) -> float:
+def _param_numel(
+    p: Param, source_tensors: dict | None, by_bytes: bool = False
+) -> float:
     """Stored scalar count for one Param leaf.
 
     ``source_tensors`` (name -> tensor, e.g. from ``export_to_ir`` plus
@@ -930,10 +1057,10 @@ def _param_numel(p: Param, source_tensors: dict | None,
                 if by_bytes:
                     esz = getattr(t, "element_size", None)
                     return numel * (esz() if callable(esz) else 4)
-                return numel              # torch.Tensor / jax / etc.
+                return numel  # torch.Tensor / jax / etc.
             s = getattr(t, "size", None)
             if isinstance(s, (int, float)):
-                return float(s)            # numpy .size
+                return float(s)  # numpy .size
     shape = getattr(getattr(p, "typ", None), "shape", None)
     return float(_numel(shape))
 
@@ -943,10 +1070,23 @@ def _param_numel(p: Param, source_tensors: dict | None,
 #: subtree is param-only.  ``matmul`` and ``concat`` are spelled out
 #: separately in ``_folds_to_param`` because they fold under tighter arg
 #: rules (real tensor operands, not Consts).  Keep in lock-step.
-_FOLDABLE_ELEMWISE = frozenset({
-    "add", "mul", "sub", "div", "neg", "square", "sqrt",
-    "sigmoid", "silu", "tanh", "gelu", "exp", "pow",
-})
+_FOLDABLE_ELEMWISE = frozenset(
+    {
+        "add",
+        "mul",
+        "sub",
+        "div",
+        "neg",
+        "square",
+        "sqrt",
+        "sigmoid",
+        "silu",
+        "tanh",
+        "gelu",
+        "exp",
+        "pow",
+    }
+)
 
 
 def _has_var_leaf(term: Any, memo: dict) -> bool:
@@ -982,8 +1122,9 @@ def _param_resolves(p: Param, source_tensors: dict | None) -> bool:
     return source_tensors is None or p.name in source_tensors
 
 
-def _folds_to_param(term: Any, source_tensors: dict | None,
-                    memo: dict) -> bool:
+def _folds_to_param(
+    term: Any, source_tensors: dict | None, memo: dict
+) -> bool:
     """True iff ``_fold_weight_chains`` rewrites *term* to a fused Param.
 
     Mirrors the lowerer bottom-up: a param-only subtree folds when
@@ -1002,6 +1143,7 @@ def _folds_to_param(term: Any, source_tensors: dict | None,
         return hit
     res = False
     if not _has_var_leaf(term, memo):
+
         def to_param(a: Any, allow_const: bool) -> bool:
             if isinstance(a, Param):
                 return _param_resolves(a, source_tensors)
@@ -1017,7 +1159,9 @@ def _folds_to_param(term: Any, source_tensors: dict | None,
     return res
 
 
-def _fold_ewidth(term: Any, source_tensors: dict | None) -> float | None:
+def _fold_ewidth(
+    term: Any, source_tensors: dict | None
+) -> float | None:
     """Element width of a materialised fold — the widest resolvable
     leaf's dtype (the fused tensor inherits arg dtypes); ``None`` when
     no leaf carries one, letting the caller default to fp32."""
@@ -1029,14 +1173,18 @@ def _fold_ewidth(term: Any, source_tensors: dict | None) -> float | None:
                 return float(esz())
         return 4.0
     if isinstance(term, Op):
-        ws = [w for a in term.args
-              if (w := _fold_ewidth(a, source_tensors)) is not None]
+        ws = [
+            w
+            for a in term.args
+            if (w := _fold_ewidth(a, source_tensors)) is not None
+        ]
         return max(ws) if ws else None
     return None
 
 
-def _fold_numel(term: Op, source_tensors: dict | None, memo: dict,
-                by_bytes: bool) -> float:
+def _fold_numel(
+    term: Op, source_tensors: dict | None, memo: dict, by_bytes: bool
+) -> float:
     """Stored size of the tensor a folding subtree materialises to —
     the OUTPUT numel: ``concat`` re-stores every argument's rows, a
     weight ``matmul`` stores the dense product.
@@ -1047,8 +1195,12 @@ def _fold_numel(term: Op, source_tensors: dict | None, memo: dict,
     return n
 
 
-def _param_index(term: Any, source_tensors: dict | None,
-                 memo: dict, by_bytes: bool = False) -> dict[str, float]:
+def _param_index(
+    term: Any,
+    source_tensors: dict | None,
+    memo: dict,
+    by_bytes: bool = False,
+) -> dict[str, float]:
     """``{key: numel}`` for every *stored* parameter entry in a term DAG.
 
     Two kinds of entries, mirroring the lowered weights file:
@@ -1068,17 +1220,20 @@ def _param_index(term: Any, source_tensors: dict | None,
     if hit is not None:
         return hit
     if isinstance(term, Param):
-        out = {term.name: _param_numel(term, source_tensors,
-                                       by_bytes)}
+        out = {term.name: _param_numel(term, source_tensors, by_bytes)}
     elif isinstance(term, Op):
         if _folds_to_param(term, source_tensors, memo):
-            out = {f"\x00fold:{id(term)}": _fold_numel(
-                term, source_tensors, memo, by_bytes)}
+            out = {
+                f"\x00fold:{id(term)}": _fold_numel(
+                    term, source_tensors, memo, by_bytes
+                )
+            }
         else:
             out = {}
             for a in term.args:
-                for n, v in _param_index(a, source_tensors, memo,
-                                         by_bytes).items():
+                for n, v in _param_index(
+                    a, source_tensors, memo, by_bytes
+                ).items():
                     out.setdefault(n, v)
     else:
         out = {}
@@ -1109,10 +1264,10 @@ def _param_index(term: Any, source_tensors: dict | None,
 # strided view is not slower reads but forced materialisation when a
 # layout-strict consumer (e.g. SDPA) needs contiguous input, priced in
 # _local_roofline as an extra copy kernel.
-_PEAK_FLOPS = 2.5e12    # measured: ~2.5 TFLOPS fp32 GEMM (RTX 2050)
-_PEAK_BW = 8.9e10       # measured: ~89 GB/s copy bandwidth
-_LAUNCH_S = 8.7e-6      # measured: ~8.7 µs eager launch overhead
-_STRIDE_PENALTY = 1.0   # measured: strided copies ~1.0x on this GPU
+_PEAK_FLOPS = 2.5e12  # measured: ~2.5 TFLOPS fp32 GEMM (RTX 2050)
+_PEAK_BW = 8.9e10  # measured: ~89 GB/s copy bandwidth
+_LAUNCH_S = 8.7e-6  # measured: ~8.7 µs eager launch overhead
+_STRIDE_PENALTY = 1.0  # measured: strided copies ~1.0x on this GPU
 
 
 def _is_strided(term: Any, memo: dict | None = None) -> bool:
@@ -1139,15 +1294,22 @@ def _bytes_of(term: Op, memo: dict | None = None) -> float:
         w = _STRIDE_PENALTY if _is_strided(a, memo) else 1.0
         in_bytes += n * 4.0 * w
     # view ops share storage with their input — no output write
-    out_bytes = 0.0 if term.op in _VIEW_OPS else _numel(
-        _infer_op_shape(term, memo)) * 4.0
+    out_bytes = (
+        0.0
+        if term.op in _VIEW_OPS
+        else _numel(_infer_op_shape(term, memo)) * 4.0
+    )
     return in_bytes + out_bytes
 
 
-def _local_roofline(term: Op, memo: dict | None = None, *,
-                    peak_flops: float = _PEAK_FLOPS,
-                    peak_bw: float = _PEAK_BW,
-                    launch_s: float = _LAUNCH_S) -> float:
+def _local_roofline(
+    term: Op,
+    memo: dict | None = None,
+    *,
+    peak_flops: float = _PEAK_FLOPS,
+    peak_bw: float = _PEAK_BW,
+    launch_s: float = _LAUNCH_S,
+) -> float:
     """Estimated nanoseconds for one op: max(compute, memory) + launch."""
     shape = _infer_op_shape(term, memo)
     if shape is _INVALID:
@@ -1165,8 +1327,13 @@ def _local_roofline(term: Op, memo: dict | None = None, *,
     return (max(compute_s, memory_s) + launch) * 1e9
 
 
-def _roofline_cost(term: Any, memo: dict, peak_flops: float,
-                   peak_bw: float, launch_s: float) -> float:
+def _roofline_cost(
+    term: Any,
+    memo: dict,
+    peak_flops: float,
+    peak_bw: float,
+    launch_s: float,
+) -> float:
     """Shared traversal for roofline_cost and roofline_cost_for.
 
     The memo key carries the constants so two profiles can share a memo
@@ -1176,11 +1343,17 @@ def _roofline_cost(term: Any, memo: dict, peak_flops: float,
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
-        base = _local_roofline(term, memo, peak_flops=peak_flops,
-                               peak_bw=peak_bw, launch_s=launch_s)
+        base = _local_roofline(
+            term,
+            memo,
+            peak_flops=peak_flops,
+            peak_bw=peak_bw,
+            launch_s=launch_s,
+        )
         for arg in term.args:
-            base += _roofline_cost(arg, memo, peak_flops, peak_bw,
-                                   launch_s)
+            base += _roofline_cost(
+                arg, memo, peak_flops, peak_bw, launch_s
+            )
         memo[ck] = float(base)
         return memo[ck]
     memo[ck] = 0.0
@@ -1217,15 +1390,20 @@ def _profile_constants(profile: Any) -> tuple[float, float, float]:
         get = profile.__getitem__
     else:
         get = lambda k: getattr(profile, k)  # noqa: E731
-    return (float(get("tflops")) * 1e12,
-            float(get("gbps")) * 1e9,
-            float(get("launch_us")) * 1e-6)
+    return (
+        float(get("tflops")) * 1e12,
+        float(get("gbps")) * 1e9,
+        float(get("launch_us")) * 1e-6,
+    )
 
 
-def roofline_cost_for(profile: Any = None, *,
-                      peak_flops: float | None = None,
-                      peak_bw: float | None = None,
-                      launch_s: float | None = None):
+def roofline_cost_for(
+    profile: Any = None,
+    *,
+    peak_flops: float | None = None,
+    peak_bw: float | None = None,
+    launch_s: float | None = None,
+):
     """Return a roofline cost fn calibrated to a measured target profile.
 
     ``profile`` is a ``catopt.calibrate.TargetProfile`` (or any object
@@ -1270,8 +1448,9 @@ def depth_cost_for(profile: Any = None):
         if ck in memo:
             return memo[ck]
         if isinstance(term, Op):
-            local = _local_roofline(term, memo, peak_flops=pf,
-                                    peak_bw=bw, launch_s=ls)
+            local = _local_roofline(
+                term, memo, peak_flops=pf, peak_bw=bw, launch_s=ls
+            )
             if local >= _INVALID_COST:
                 local = ls * 1e9
             child = max((cost(a, memo) for a in term.args), default=0.0)
@@ -1314,7 +1493,11 @@ class CostModel:
             elif term.op == "linear":
                 # F.linear(x[.., in], W[out, in]) -> 2 * M * out * in
                 shapes = [_shape_of(a) for a in term.args]
-                if shapes and shapes[0] is not None and len(shapes[0]) >= 1:
+                if (
+                    shapes
+                    and shapes[0] is not None
+                    and len(shapes[0]) >= 1
+                ):
                     base = 2 * n * shapes[0][-1]
                 else:
                     base = 2 * n

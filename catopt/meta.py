@@ -83,12 +83,12 @@ representative of the same critical pair.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
-from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Op, Var, Const, Param, op_repr
 import catopt.rules as R
-
+from catopt.egraph import EGraph, Rewrite
+from catopt.ir import Const, Op, Param, Var, op_repr
 
 # ---------------------------------------------------------------------------
 #  Part A.1 — coherence classification
@@ -99,16 +99,25 @@ import catopt.rules as R
 #: computation — the search-space the e-graph should never store.
 #: ``om_assoc``/``om_assoc_rev`` live in catopt.om (same law family:
 #: associativity of a monoid's compose).
-COHERENT_RULE_NAMES: frozenset[str] = frozenset({
-    "comm_add", "comm_mul",          # SMC symmetry
-    "assoc_add", "assoc_mul",        # additive/multiplicative associativity
-    "id_add", "id_mul",              # monoid units
-    "double_neg",                    # involution
-    "assoc_matmul", "assoc_matmul_rev",   # associativity of composition
-    "aff_assoc", "aff_assoc_rev",         # affine-map monoid associativity
-    "affd_assoc", "affd_assoc_rev",       # diagonal-affine monoid assoc.
-    "om_assoc", "om_assoc_rev",           # online-softmax monoid assoc.
-})
+COHERENT_RULE_NAMES: frozenset[str] = frozenset(
+    {
+        "comm_add",
+        "comm_mul",  # SMC symmetry
+        "assoc_add",
+        "assoc_mul",  # additive/multiplicative associativity
+        "id_add",
+        "id_mul",  # monoid units
+        "double_neg",  # involution
+        "assoc_matmul",
+        "assoc_matmul_rev",  # associativity of composition
+        "aff_assoc",
+        "aff_assoc_rev",  # affine-map monoid associativity
+        "affd_assoc",
+        "affd_assoc_rev",  # diagonal-affine monoid assoc.
+        "om_assoc",
+        "om_assoc_rev",  # online-softmax monoid assoc.
+    }
+)
 
 
 def module_rules(mod=R) -> list[Rewrite]:
@@ -133,7 +142,9 @@ def _iter_module_rules(mod) -> list[Rewrite]:
     return uniq
 
 
-def classify_rules(rules: Iterable[Rewrite]) -> tuple[list[Rewrite], list[Rewrite]]:
+def classify_rules(
+    rules: Iterable[Rewrite],
+) -> tuple[list[Rewrite], list[Rewrite]]:
     """Split *rules* into ``(coherent, contentful)`` by name."""
     coherent = [r for r in rules if r.name in COHERENT_RULE_NAMES]
     contentful = [r for r in rules if r.name not in COHERENT_RULE_NAMES]
@@ -158,7 +169,8 @@ _AC_IDENTITY: dict[str, float] = {"add": 0.0, "mul": 1.0}
 #: rebuild balanced.  For ``aff_compose`` the balanced form is the
 #: parallel-scan (Blelloch) bracketing — computed here, not searched.
 _ASSOC_ONLY: frozenset[str] = frozenset(
-    {"matmul", "aff_compose", "affd_compose"})
+    {"matmul", "aff_compose", "affd_compose"}
+)
 
 
 def _sort_key(t: Any) -> str:
@@ -170,10 +182,12 @@ def _balanced(op: str, items: list[Any], attrs: dict) -> Any:
     if len(items) == 1:
         return items[0]
     mid = len(items) // 2
-    return Op.make(op,
-                   _balanced(op, items[:mid], attrs),
-                   _balanced(op, items[mid:], attrs),
-                   **attrs)
+    return Op.make(
+        op,
+        _balanced(op, items[:mid], attrs),
+        _balanced(op, items[mid:], attrs),
+        **attrs,
+    )
 
 
 def _flatten_chain(term: Op) -> list[Any]:
@@ -181,8 +195,11 @@ def _flatten_chain(term: Op) -> list[Any]:
     out: list[Any] = []
 
     def go(t: Any) -> None:
-        if (isinstance(t, Op) and t.op == term.op
-                and dict(t.attrs) == dict(term.attrs)):
+        if (
+            isinstance(t, Op)
+            and t.op == term.op
+            and dict(t.attrs) == dict(term.attrs)
+        ):
             for a in t.args:
                 go(a)
         else:
@@ -226,8 +243,11 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
     elif out.op in _AC_IDENTITY:
         flat = _flatten_chain(out)
         ident = _AC_IDENTITY[out.op]
-        flat = [t for t in flat
-                if not (isinstance(t, Const) and t.value == ident)]
+        flat = [
+            t
+            for t in flat
+            if not (isinstance(t, Const) and t.value == ident)
+        ]
         if not flat:
             out = Const(ident)
         elif len(flat) == 1:
@@ -251,21 +271,31 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
 #  Part A.3 — stratified_run
 # ---------------------------------------------------------------------------
 
+
 def canonical_cost(cost_fn):
     """Wrap *cost_fn* so extraction prices the canonical form of each
     candidate — coherent-equivalent bracketings are scored by their
     normal form, so e.g. a right-leaning ``aff_compose`` chain is
     charged its balanced (log-depth) cost."""
+
     def wrapped(t: Any, **kw) -> float:
         return cost_fn(canonicalize(t), **kw)
+
     return wrapped
 
 
-def stratified_run(eg: EGraph, rules: list[Rewrite], term: Any,
-                   *, max_iterations: int = 100, max_nodes: int = 100_000,
-                   cost_fn=None, extract: bool = True,
-                   canonicalize_output: bool = True,
-                   extract_fn=None) -> dict:
+def stratified_run(
+    eg: EGraph,
+    rules: list[Rewrite],
+    term: Any,
+    *,
+    max_iterations: int = 100,
+    max_nodes: int = 100_000,
+    cost_fn=None,
+    extract: bool = True,
+    canonicalize_output: bool = True,
+    extract_fn=None,
+) -> dict:
     """Canonicalize *term*, saturate with the CONTENTFUL rules only.
 
     The coherent laws are never run: equivalent bracketings/permutations
@@ -282,8 +312,12 @@ def stratified_run(eg: EGraph, rules: list[Rewrite], term: Any,
     canon = canonicalize(term)
     root = eg.add_term(canon)
     coherent, contentful = classify_rules(rules)
-    stats = eg.run(contentful, root, max_iterations=max_iterations,
-                   max_nodes=max_nodes)
+    stats = eg.run(
+        contentful,
+        root,
+        max_iterations=max_iterations,
+        max_nodes=max_nodes,
+    )
     out = {
         "root_eid": root,
         "stats": stats,
@@ -295,18 +329,24 @@ def stratified_run(eg: EGraph, rules: list[Rewrite], term: Any,
         # Depth (and other max-composed measures) are not additive, so
         # extract_best cannot rank them — pass extract_fn =
         # eg.extract_min_depth for those objectives.
-        best = (extract_fn(root) if extract_fn is not None
-                else eg.extract_best(root, cost_fn))
+        best = (
+            extract_fn(root)
+            if extract_fn is not None
+            else eg.extract_best(root, cost_fn)
+        )
         out["best"] = best
         out["canonical_best"] = (
-            canonicalize(best) if canonicalize_output and best is not None
-            else best)
+            canonicalize(best)
+            if canonicalize_output and best is not None
+            else best
+        )
     return out
 
 
 # ---------------------------------------------------------------------------
 #  Part B — rule synthesis via critical-pair completion
 # ---------------------------------------------------------------------------
+
 
 #: ops with at least one string attr value carry *attribute*
 #: metavariables (bound into the substitution under "$attr:<name>").
@@ -343,7 +383,9 @@ def _synthesizable(r: Rewrite) -> bool:
     return True
 
 
-def match_pattern(pat: Any, term: Any, subst: dict | None = None) -> dict | None:
+def match_pattern(
+    pat: Any, term: Any, subst: dict | None = None
+) -> dict | None:
     """One-sided match of pattern *pat* against a concrete *term*.
 
     ``str`` leaves in the pattern are metavariables binding any subterm;
@@ -360,8 +402,11 @@ def match_pattern(pat: Any, term: Any, subst: dict | None = None) -> dict | None
         subst[pat] = term
         return subst
     if isinstance(pat, Op):
-        if (not isinstance(term, Op) or term.op != pat.op
-                or len(term.args) != len(pat.args)):
+        if (
+            not isinstance(term, Op)
+            or term.op != pat.op
+            or len(term.args) != len(pat.args)
+        ):
             return None
         if set(term.attrs) != set(pat.attrs):
             return None
@@ -412,7 +457,9 @@ def pattern_metavars(pat: Any) -> set[str]:
     return out
 
 
-def _positions(term: Any, path: tuple = ()) -> Iterable[tuple[tuple, Any]]:
+def _positions(
+    term: Any, path: tuple = ()
+) -> Iterable[tuple[tuple, Any]]:
     """Yield ``(path, subterm)`` for every position, DFS pre-order."""
     yield path, term
     if isinstance(term, Op):
@@ -450,7 +497,9 @@ def _overlapping(p: tuple, q: tuple) -> bool:
     return lca == p or lca == q
 
 
-def apply_rewrite_at(rule: Rewrite, term: Any, path: tuple) -> Any | None:
+def apply_rewrite_at(
+    rule: Rewrite, term: Any, path: tuple
+) -> Any | None:
     """Apply *rule* to ``term`` at *path*; return the rewritten term or
     ``None`` if the LHS doesn't match or a guard vetoes the firing.
 
@@ -544,9 +593,9 @@ def _fire_guarded(rule: Rewrite, term: Any, path: tuple, ns: str):
             return None
         for k, v in extra.items():
             if k.startswith("$attr:"):
-                ph = ns + k[len("$attr:"):]
-                inst[k] = ph        # stays a metavar in the derived rule
-                conc[ph] = v        # but this instance's value is known
+                ph = ns + k[len("$attr:") :]
+                inst[k] = ph  # stays a metavar in the derived rule
+                conc[ph] = v  # but this instance's value is known
             else:
                 inst[k] = v
     try:
@@ -560,11 +609,13 @@ def _concretize_attrs(t: Any, conc: dict) -> Any:
     """Replace placeholder attr values inside a concrete term using the
     fired *conc* map (placeholder name -> derived value)."""
     if isinstance(t, Op):
-        attrs = {k: (conc.get(v, v) if isinstance(v, str) else v)
-                 for k, v in t.attrs.items()}
-        return Op.make(t.op,
-                       *(_concretize_attrs(a, conc) for a in t.args),
-                       **attrs)
+        attrs = {
+            k: (conc.get(v, v) if isinstance(v, str) else v)
+            for k, v in t.attrs.items()
+        }
+        return Op.make(
+            t.op, *(_concretize_attrs(a, conc) for a in t.args), **attrs
+        )
     return t
 
 
@@ -577,10 +628,11 @@ def _reexpress_term(t: Any, names: dict, keep: set) -> Any:
     concrete.  A metavar leaf (symbolic path) passes through.  Anything
     else — a leaf the derived rule does not bind — is un-reexpressible."""
     if isinstance(t, Op):
-        return Op.make(t.op,
-                       *(_reexpress_term(a, names, keep)
-                         for a in t.args),
-                       **dict(t.attrs))
+        return Op.make(
+            t.op,
+            *(_reexpress_term(a, names, keep) for a in t.args),
+            **dict(t.attrs),
+        )
     if isinstance(t, str):
         return t
     if t in keep:
@@ -630,8 +682,7 @@ def _reexpress_binding(pats: dict, subst: dict) -> dict | None:
     return out
 
 
-def _compose_guards(r1: Rewrite, r2: Rewrite,
-                    pat1: dict, pat2: dict):
+def _compose_guards(r1: Rewrite, r2: Rewrite, pat1: dict, pat2: dict):
     """Build the derived rule's ``(check, derive)`` from the parents'.
 
     ``pat1``/``pat2`` map each parent's metavariables to patterns over
@@ -649,8 +700,12 @@ def _compose_guards(r1: Rewrite, r2: Rewrite,
     hooks are also re-run (they can veto) and their outputs fill the
     ``"@i:"`` placeholders the derived RHS carries.  Returns
     ``(None, None)`` when neither parent is guarded."""
-    if (r1.check is None and r1.derive is None
-            and r2.check is None and r2.derive is None):
+    if (
+        r1.check is None
+        and r1.derive is None
+        and r2.check is None
+        and r2.derive is None
+    ):
         return None, None
     ns1, ns2 = _DRV_PREFIX
 
@@ -683,7 +738,7 @@ def _compose_guards(r1: Rewrite, r2: Rewrite,
                 return None
             for k, v in e1.items():
                 if k.startswith("$attr:"):
-                    eff1["$attr:" + ns1 + k[len("$attr:"):]] = v
+                    eff1["$attr:" + ns1 + k[len("$attr:") :]] = v
                 else:
                     eff1[k] = v
         b2 = _reexpress_binding(pat2, eff1)
@@ -718,7 +773,7 @@ def _compose_guards(r1: Rewrite, r2: Rewrite,
                 continue
             for k, v in e.items():
                 if k.startswith("$attr:"):
-                    out["$attr:" + ns + k[len("$attr:"):]] = v
+                    out["$attr:" + ns + k[len("$attr:") :]] = v
                 else:
                     out[k] = v
         return out
@@ -733,15 +788,18 @@ def _rhs_derive_placeholders(rhs: Any) -> set[str]:
     out: set[str] = set()
     if isinstance(rhs, Op):
         for v in rhs.attrs.values():
-            if (isinstance(v, str)
-                    and any(v.startswith(p) for p in _DRV_PREFIX)):
+            if isinstance(v, str) and any(
+                v.startswith(p) for p in _DRV_PREFIX
+            ):
                 out.add(v)
         for a in rhs.args:
             out |= _rhs_derive_placeholders(a)
     return out
 
 
-def _concrete_matched_leaves(pat: Any, term: Any, out: set | None = None) -> set:
+def _concrete_matched_leaves(
+    pat: Any, term: Any, out: set | None = None
+) -> set:
     """Leaf values that a pattern pinned down with *concrete* leaves.
 
     Those leaves may NOT be generalized to metavariables in a derived
@@ -760,19 +818,27 @@ def _concrete_matched_leaves(pat: Any, term: Any, out: set | None = None) -> set
     return out
 
 
-def _leaf_generalize(region: Any, names: dict, keep: set,
-                     counter: list[int], assign_fresh: bool) -> Any:
+def _leaf_generalize(
+    region: Any,
+    names: dict,
+    keep: set,
+    counter: list[int],
+    assign_fresh: bool,
+) -> Any:
     """Rename each leaf of *region* to a metavariable (shared ``names``
     map keeps lhs/rhs consistent), except leaves in *keep* which were
     concrete-matched and must stay literal.  With ``assign_fresh=False``
     (the RHS pass) an unseen leaf is a constant introduced by a rule
     pattern — it stays concrete."""
     if isinstance(region, Op):
-        return Op.make(region.op,
-                       *(_leaf_generalize(a, names, keep, counter,
-                                          assign_fresh)
-                         for a in region.args),
-                       **dict(region.attrs))
+        return Op.make(
+            region.op,
+            *(
+                _leaf_generalize(a, names, keep, counter, assign_fresh)
+                for a in region.args
+            ),
+            **dict(region.attrs),
+        )
     if region in keep:
         return region
     if region in names:
@@ -797,8 +863,9 @@ def _alpha_key(lhs: Any, rhs: Any) -> tuple[str, str]:
             table.append(t)
             return f"${len(table) - 1}"
         if isinstance(t, Op):
-            return Op.make(t.op, *(norm(a, table) for a in t.args),
-                           **dict(t.attrs))
+            return Op.make(
+                t.op, *(norm(a, table) for a in t.args), **dict(t.attrs)
+            )
         return t
 
     return op_repr(norm(lhs, names)), op_repr(norm(rhs, names))
@@ -809,8 +876,10 @@ def _eval_term(term: Any, env: dict) -> Any:
     tensor), using the torch_bridge op bindings.  Returns a tensor or a
     nested tuple (aff/om carriers)."""
     from catopt.torch_bridge import _IR_TO_TORCH
+
     if isinstance(term, Const):
         import torch
+
         return torch.tensor(term.value)
     if isinstance(term, (Var, Param)):
         return env[term]
@@ -825,9 +894,11 @@ def _eval_term(term: Any, env: dict) -> Any:
 
 def _eval_allclose(a: Any, b: Any, tol: float = 1e-6) -> bool:
     import torch
+
     if isinstance(a, tuple) and isinstance(b, tuple):
         return len(a) == len(b) and all(
-            _eval_allclose(x, y, tol) for x, y in zip(a, b))
+            _eval_allclose(x, y, tol) for x, y in zip(a, b)
+        )
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         return bool(torch.allclose(a, b, atol=tol, rtol=tol))
     return False
@@ -844,8 +915,14 @@ def _term_is_ground(t: Any) -> bool:
     return True
 
 
-def _replays(derived: Rewrite, r1: Rewrite, r2: Rewrite,
-             t0: Any, target: Any, fuel: int = 400) -> bool:
+def _replays(
+    derived: Rewrite,
+    r1: Rewrite,
+    r2: Rewrite,
+    t0: Any,
+    target: Any,
+    fuel: int = 400,
+) -> bool:
     """Check the derivation replays: some r1 application on *t0* followed
     by some r2 application reaches *target*."""
     spent = 0
@@ -865,6 +942,7 @@ def _replays(derived: Rewrite, r1: Rewrite, r2: Rewrite,
 
 def _fresh_leaves(n: int, shape: tuple = (4, 4)) -> list[Var]:
     from catopt.ir import TensorType
+
     return [Var(f"_synth_{i}", TensorType(shape)) for i in range(n)]
 
 
@@ -876,8 +954,20 @@ _LEAF_SHAPES: tuple = ((4, 4), ())
 
 #: Values enumerated for attribute metavariables in a candidate LHS
 #: (dims first — they dominate; a few shapes for view-style attrs).
-_ATTR_POOL: tuple = (-1, -2, 1, 2, 0, -3, 3, 4, -4,
-                     (4, 4), (4,), (2, 4, 4))
+_ATTR_POOL: tuple = (
+    -1,
+    -2,
+    1,
+    2,
+    0,
+    -3,
+    3,
+    4,
+    -4,
+    (4, 4),
+    (4,),
+    (2, 4, 4),
+)
 
 #: Cap on LHS instantiations tried per leaf-shape profile.
 _MAX_INSTANTIATIONS: int = 400
@@ -888,11 +978,14 @@ def _instantiation_stream(term_mvars: list[str], attr_mvars: list[str]):
     :data:`_LEAF_SHAPES` profile) times a bounded product of
     :data:`_ATTR_POOL` values for attribute metavariables."""
     import itertools
+
     for shape in _LEAF_SHAPES:
         leaves = _fresh_leaves(len(term_mvars), shape)
         base = dict(zip(term_mvars, leaves))
         count = 0
-        for combo in itertools.product(*([_ATTR_POOL] * len(attr_mvars))):
+        for combo in itertools.product(
+            *([_ATTR_POOL] * len(attr_mvars))
+        ):
             subst = dict(base)
             for a, v in zip(attr_mvars, combo):
                 subst["$attr:" + a] = v
@@ -921,12 +1014,14 @@ def _tensor_env(subst: dict) -> dict:
     seeds), so Var/Param leaves are collected recursively — a scalar or
     tensor needed only deep inside a bound mask still gets an entry."""
     import torch
+
     env = {}
     for v in subst.values():
         for leaf in _leaf_vars(v):
             shape = getattr(getattr(leaf, "typ", None), "shape", None)
-            if (shape is not None
-                    and all(isinstance(d, int) for d in shape)):
+            if shape is not None and all(
+                isinstance(d, int) for d in shape
+            ):
                 env[leaf] = torch.randn(*shape, dtype=torch.float64)
     return env
 
@@ -947,9 +1042,14 @@ def _seed_witnesses(lhs: Any, seeds: Iterable[Any]):
                 yield m
 
 
-def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
-                        numeric: bool, witness: dict | None = None,
-                        seeds: Iterable[Any] = ()) -> bool:
+def _validate_candidate(
+    cand: Rewrite,
+    r1: Rewrite,
+    r2: Rewrite,
+    numeric: bool,
+    witness: dict | None = None,
+    seeds: Iterable[Any] = (),
+) -> bool:
     """Well-formedness + derivation replay + (optional) numeric check.
 
     *witness* (seed path) is the concrete binding the derivation
@@ -972,8 +1072,9 @@ def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
         elif v not in lhs_terms:
             return False
     term_mvars = sorted(lhs_terms)
-    attr_mvars = sorted(v[len("$attr:"):]
-                        for v in lhs_mv if v.startswith("$attr:"))
+    attr_mvars = sorted(
+        v[len("$attr:") :] for v in lhs_mv if v.startswith("$attr:")
+    )
 
     def attempt(subst: dict, fatal_replay: bool):
         """None: instance vetoed/skipped; False: reject; True: emit."""
@@ -1002,7 +1103,9 @@ def _validate_candidate(cand: Rewrite, r1: Rewrite, r2: Rewrite,
                 a = _eval_term(t0, env)
                 b = _eval_term(tout, env)
             except Exception:
-                return True  # ops without torch bindings: structural only
+                return (
+                    True  # ops without torch bindings: structural only
+                )
             return _eval_allclose(a, b)
         return True
 
@@ -1045,16 +1148,23 @@ def _subsumed(cand: Rewrite, existing: list[Rewrite]) -> bool:
             inst = instantiate_pattern(e.rhs, subst)
         except KeyError:
             continue
-        if _alpha_key(inst, inst)[0] == _alpha_key(cand.rhs, cand.rhs)[0]:
+        if (
+            _alpha_key(inst, inst)[0]
+            == _alpha_key(cand.rhs, cand.rhs)[0]
+        ):
             return True
     return False
 
 
-def synthesize_rules(rules: list[Rewrite],
-                     seed_terms: Iterable[Any] = (),
-                     *, fuel: int = 512, numeric_check: bool = True,
-                     require_overlap: bool = True,
-                     emit_subsumed: bool = False) -> list[Rewrite]:
+def synthesize_rules(
+    rules: list[Rewrite],
+    seed_terms: Iterable[Any] = (),
+    *,
+    fuel: int = 512,
+    numeric_check: bool = True,
+    require_overlap: bool = True,
+    emit_subsumed: bool = False,
+) -> list[Rewrite]:
     """Compose ordered pairs of rules into derived rewrite rules.
 
     Two synthesis paths (seed-guided runs FIRST — it is the preferred
@@ -1108,10 +1218,17 @@ def synthesize_rules(rules: list[Rewrite],
     counter = [0]
     ns1, ns2 = _DRV_PREFIX
 
-    def offer(lhs: Any, rhs: Any, r1: Rewrite, r2: Rewrite,
-              via: str, check=None, derive=None,
-              witness: dict | None = None,
-              pats: tuple[dict, dict] | None = None) -> None:
+    def offer(
+        lhs: Any,
+        rhs: Any,
+        r1: Rewrite,
+        r2: Rewrite,
+        via: str,
+        check=None,
+        derive=None,
+        witness: dict | None = None,
+        pats: tuple[dict, dict] | None = None,
+    ) -> None:
         if _is_tautology(lhs, rhs):
             return
         key = _alpha_key(lhs, rhs)
@@ -1125,9 +1242,11 @@ def synthesize_rules(rules: list[Rewrite],
         drv = derive if (derive is not None and placeholders) else None
         cand = Rewrite(
             name=f"syn_{r1.name}__{r2.name}_{counter[0]}",
-            lhs=lhs, rhs=rhs,
+            lhs=lhs,
+            rhs=rhs,
             law=f"synthesized: {r1.name} then {r2.name} ({via})",
-            check=check, derive=drv,
+            check=check,
+            derive=drv,
         )
         counter[0] += 1
         # Frozen dataclass: provenance rides on the instance dict plus
@@ -1139,11 +1258,16 @@ def synthesize_rules(rules: list[Rewrite],
         # the composite check/derive at load time via _compose_guards.
         if pats is not None:
             object.__setattr__(cand, "guard_pats", pats)
-        if not emit_subsumed and _subsumed(
-                cand, usable + derived):
+        if not emit_subsumed and _subsumed(cand, usable + derived):
             return
-        if not _validate_candidate(cand, r1, r2, numeric_check,
-                                   witness=witness, seeds=seed_terms):
+        if not _validate_candidate(
+            cand,
+            r1,
+            r2,
+            numeric_check,
+            witness=witness,
+            seeds=seed_terms,
+        ):
             return
         derived.append(cand)
 
@@ -1195,8 +1319,9 @@ def synthesize_rules(rules: list[Rewrite],
                         if bad:
                             continue
                         try:
-                            if r2.check is not None \
-                                    and not r2.check(m2e):
+                            if r2.check is not None and not r2.check(
+                                m2e
+                            ):
                                 continue
                         except Exception:
                             continue
@@ -1210,7 +1335,7 @@ def synthesize_rules(rules: list[Rewrite],
                                 continue
                             for k, v in e2.items():
                                 if k.startswith("$attr:"):
-                                    inst2[k] = ns2 + k[len("$attr:"):]
+                                    inst2[k] = ns2 + k[len("$attr:") :]
                                 else:
                                     inst2[k] = v
                         try:
@@ -1223,26 +1348,44 @@ def synthesize_rules(rules: list[Rewrite],
                         names: dict = {}
                         cnt = [0]
                         lhs_pat = _leaf_generalize(
-                            _subterm(s, lca), names, keep | keep2, cnt,
-                            assign_fresh=True)
+                            _subterm(s, lca),
+                            names,
+                            keep | keep2,
+                            cnt,
+                            assign_fresh=True,
+                        )
                         rhs_pat = _leaf_generalize(
-                            _subterm(t2, lca), names, keep | keep2, cnt,
-                            assign_fresh=False)
+                            _subterm(t2, lca),
+                            names,
+                            keep | keep2,
+                            cnt,
+                            assign_fresh=False,
+                        )
                         # Re-express both fired bindings over the derived
                         # metavariables; an un-reexpressible binding
                         # rejects the pair outright.
                         try:
-                            pat1 = _reexpress_map(m1, names,
-                                                  keep | keep2)
-                            pat2 = _reexpress_map(m2, names,
-                                                  keep | keep2)
+                            pat1 = _reexpress_map(
+                                m1, names, keep | keep2
+                            )
+                            pat2 = _reexpress_map(
+                                m2, names, keep | keep2
+                            )
                         except _Unreexpressible:
                             continue
                         chk, drv = _compose_guards(r1, r2, pat1, pat2)
                         witness = {v: leaf for leaf, v in names.items()}
-                        offer(lhs_pat, rhs_pat, r1, r2, "seed",
-                              check=chk, derive=drv, witness=witness,
-                              pats=(pat1, pat2))
+                        offer(
+                            lhs_pat,
+                            rhs_pat,
+                            r1,
+                            r2,
+                            "seed",
+                            check=chk,
+                            derive=drv,
+                            witness=witness,
+                            pats=(pat1, pat2),
+                        )
 
     # -- symbolic path: r1 applied to its own lhs -------------------------
     for r1 in usable:
@@ -1253,17 +1396,21 @@ def synthesize_rules(rules: list[Rewrite],
         # only ``derive`` can produce become "@1:" placeholders.
         subst = {}
         for v in pattern_metavars(r1.lhs):
-            subst[v] = v[len("$attr:"):] if v.startswith("$attr:") else v
+            subst[v] = (
+                v[len("$attr:") :] if v.startswith("$attr:") else v
+            )
         for v in pattern_metavars(r1.rhs):
             if v.startswith("$attr:") and v not in subst:
-                subst[v] = ns1 + v[len("$attr:"):]
+                subst[v] = ns1 + v[len("$attr:") :]
         try:
             t1 = instantiate_pattern(r1.rhs, subst)
         except KeyError:
             continue
         # r1's binding on the derived rule's own subst is the identity.
-        pat1 = {v: (v[len("$attr:"):] if v.startswith("$attr:") else v)
-                for v in pattern_metavars(r1.lhs)}
+        pat1 = {
+            v: (v[len("$attr:") :] if v.startswith("$attr:") else v)
+            for v in pattern_metavars(r1.lhs)
+        }
         for q, sub in _positions(t1):
             for r2 in usable:
                 spent += 1
@@ -1277,11 +1424,11 @@ def synthesize_rules(rules: list[Rewrite],
                 inst2 = dict(m2)
                 ok = True
                 for v in pattern_metavars(r2.rhs):
-                    if (v.startswith("$attr:") and v not in inst2):
+                    if v.startswith("$attr:") and v not in inst2:
                         if r2.derive is None:
                             ok = False
                             break
-                        inst2[v] = ns2 + v[len("$attr:"):]
+                        inst2[v] = ns2 + v[len("$attr:") :]
                 if not ok:
                     continue
                 try:
@@ -1290,8 +1437,15 @@ def synthesize_rules(rules: list[Rewrite],
                     continue
                 t2 = _replace(t1, q, rhs2)
                 chk, drv = _compose_guards(r1, r2, pat1, m2)
-                offer(r1.lhs, t2, r1, r2, "symbolic",
-                      check=chk, derive=drv, pats=(pat1, m2))
-
+                offer(
+                    r1.lhs,
+                    t2,
+                    r1,
+                    r2,
+                    "symbolic",
+                    check=chk,
+                    derive=drv,
+                    pats=(pat1, m2),
+                )
 
     return derived

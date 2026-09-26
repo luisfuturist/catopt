@@ -57,24 +57,22 @@ Findings encoded as tests (T=16, d=16 unless noted):
   "masked_fill distributes over concat" law nobody wrote.
 """
 
-import math
 
-import pytest
 import torch
 
-from catopt.egraph import EGraph
-from catopt import rules as R
 from catopt import meta
+from catopt import rules as R
+from catopt.cost import dag_cost, flops_cost
+from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Var, op_repr
-from catopt.om import OM_LAWS
 from catopt.models.hybrid import HybridBlock, TwoLayerHybrid
+from catopt.om import OM_LAWS
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.cost import flops_cost, dag_cost
-
 
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
+
 
 def _normalize_attrs(term, memo=None):
     """Unify exported positional attr spellings with the rule-side ones.
@@ -118,7 +116,9 @@ def _opdepth(t, memo):
         return 0
     k = id(t)
     if k not in memo:
-        memo[k] = 1 + max((_opdepth(a, memo) for a in t.args), default=0)
+        memo[k] = 1 + max(
+            (_opdepth(a, memo) for a in t.args), default=0
+        )
     return memo[k]
 
 
@@ -139,11 +139,18 @@ def _class_has_op(eg, eid, opname, seen=None):
 
 def _op_census(eg):
     from collections import Counter
+
     return Counter(n.op for n in eg._node_to_class)
 
 
-def _run_hybrid(m, x, laws=None, normalize=True, max_iterations=14,
-                max_nodes=400_000):
+def _run_hybrid(
+    m,
+    x,
+    laws=None,
+    normalize=True,
+    max_iterations=14,
+    max_nodes=400_000,
+):
     """Export, (optionally) attr-normalise, stratified-saturate.
 
     Returns (ir, source_tensors, eg, stratified_run output).
@@ -153,15 +160,24 @@ def _run_hybrid(m, x, laws=None, normalize=True, max_iterations=14,
     root = _normalize_attrs(ir.root) if normalize else ir.root
     eg = EGraph()
     out = meta.stratified_run(
-        eg, laws, root, max_iterations=max_iterations,
-        max_nodes=max_nodes, extract_fn=eg.extract_min_depth)
+        eg,
+        laws,
+        root,
+        max_iterations=max_iterations,
+        max_nodes=max_nodes,
+        extract_fn=eg.extract_min_depth,
+    )
     return ir, st, eg, out
 
 
 def _verify(m, x, ir, st, term, tol=1e-10):
     """Lower *term* and check fp64-equivalence against the module."""
-    opt_ir = IR(root=term, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=term,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     mod.eval()
     with torch.no_grad():
@@ -172,13 +188,18 @@ def _verify(m, x, ir, st, term, tol=1e-10):
 #: core simplification/categorical rules.  ``stratified_run`` drops the
 #: coherent members (comm/assoc/id/involution, affd_assoc, om_assoc,
 #: assoc_matmul) and saturates with the contentful remainder.
-_LAWS = (R.SCAN_DIAG_LAWS + OM_LAWS
-         + R.SIMPLIFICATION_RULES + R.CATEGORICAL_RULES)
+_LAWS = (
+    R.SCAN_DIAG_LAWS
+    + OM_LAWS
+    + R.SIMPLIFICATION_RULES
+    + R.CATEGORICAL_RULES
+)
 
 
 # ---------------------------------------------------------------------------
 #  (a) export sanity — the shapes the lifts match must be present
 # ---------------------------------------------------------------------------
+
 
 def test_hybrid_export_shape():
     """The module exports as stack(add(mul,mul)… steps) feeding
@@ -192,18 +213,19 @@ def test_hybrid_export_shape():
     ops = _op_census_term(ir.root)
     # T recurrence steps, each add(mul(a_t, h), mul(b_t, x_t))
     assert ops["add"] == T and ops["mul"] >= 2 * T
-    assert ops["select"] == 3 * T           # a[t], b[t], x[t] per step
-    assert ops["stack"] == 1                # the SSM sequence output
+    assert ops["select"] == 3 * T  # a[t], b[t], x[t] per step
+    assert ops["stack"] == 1  # the SSM sequence output
     assert ops["softmax"] == 1 and ops["matmul"] == 2
     # chunked K/V: 2 cats over 2 getitem-folded chunk projections each
     assert ops["concat"] == 2 and ops["chunk"] == 4
-    assert ops["linear"] == 6               # decay,B + q,k,v + out
+    assert ops["linear"] == 6  # decay,B + q,k,v + out
     # root is the output projection over the attention matmul
     assert ir.root.op == "linear"
 
 
 def _op_census_term(root):
     from collections import Counter
+
     c = Counter()
     seen = set()
 
@@ -215,6 +237,7 @@ def _op_census_term(root):
             c[t.op] += 1
             for a in t.args:
                 go(a)
+
     go(root)
     return c
 
@@ -222,6 +245,7 @@ def _op_census_term(root):
 # ---------------------------------------------------------------------------
 #  (b) both carriers in one e-graph + which rules fired
 # ---------------------------------------------------------------------------
+
 
 def test_both_carriers_coexist_in_one_egraph():
     """One saturation holds aff_diag/applyd AND om_elem/om_apply."""
@@ -235,26 +259,39 @@ def test_both_carriers_coexist_in_one_egraph():
     census = _op_census(eg)
     print(f"\n[hybrid] stats={stats}")
     print(f"[hybrid] rule_fires={eg.rule_fires}")
-    print(f"[hybrid] carrier census="
-          f" aff_diag={census['aff_diag']} applyd={census['applyd']}"
-          f" affd_compose={census['affd_compose']}"
-          f" om_elem={census['om_elem']} om_apply={census['om_apply']}"
-          f" om_compose={census['om_compose']}")
+    print(
+        f"[hybrid] carrier census="
+        f" aff_diag={census['aff_diag']} applyd={census['applyd']}"
+        f" affd_compose={census['affd_compose']}"
+        f" om_elem={census['om_elem']} om_apply={census['om_apply']}"
+        f" om_compose={census['om_compose']}"
+    )
 
     # (a) both carrier domains materialised in the SAME e-graph
-    assert census["aff_diag"] == T        # one map leaf per step
+    assert census["aff_diag"] == T  # one map leaf per step
     assert census["applyd"] > 0 and census["affd_compose"] > 0
     assert census["om_elem"] >= 2 and census["om_apply"] >= 1
-    assert census["om_compose"] >= 1      # OM_SPLIT actually chunked
+    assert census["om_compose"] >= 1  # OM_SPLIT actually chunked
 
     # The whole om chain fired on a *real exported graph* (post
     # spelling-normalisation): lift → score-concat → split → merge.
-    for name in ("om_lift", "matmul_t_concat", "om_split",
-                 "om_merge", "om_unlift"):
+    for name in (
+        "om_lift",
+        "matmul_t_concat",
+        "om_split",
+        "om_merge",
+        "om_unlift",
+    ):
         assert eg.rule_fires.get(name, 0) >= 1, name
     # The scan side: step lifts + step composes fired per step.
-    assert sum(v for k, v in eg.rule_fires.items()
-               if k.startswith("affd_lift")) >= T
+    assert (
+        sum(
+            v
+            for k, v in eg.rule_fires.items()
+            if k.startswith("affd_lift")
+        )
+        >= T
+    )
     # Coherent laws were stratified away — computed, not stored.
     assert "affd_assoc" in out["coherent_dropped"]
     assert "om_assoc" in out["coherent_dropped"]
@@ -272,16 +309,18 @@ def test_om_elems_consume_scan_outputs():
     elems = [n for n in eg._node_to_class if n.op == "om_elem"]
     assert elems
     for n in elems:
-        s_cid = n.children[0]   # score block e-class
-        assert (_class_has_op(eg, s_cid, "applyd")
-                or _class_has_op(eg, s_cid, "aff_diag")), \
-            "om_elem score block does not reach the scan carrier"
+        s_cid = n.children[0]  # score block e-class
+        assert _class_has_op(eg, s_cid, "applyd") or _class_has_op(
+            eg, s_cid, "aff_diag"
+        ), "om_elem score block does not reach the scan carrier"
 
     # And the root e-class's attention member shows both program forms:
     # dense matmul(softmax) and lifted om_apply in ONE e-class.
-    attn_classes = [cid for cid in eg._classes
-                    if any(n.op == "om_apply"
-                           for n in eg._classes[cid].nodes)]
+    attn_classes = [
+        cid
+        for cid in eg._classes
+        if any(n.op == "om_apply" for n in eg._classes[cid].nodes)
+    ]
     assert attn_classes
     members = {n.op for n in eg._classes[attn_classes[0]].nodes}
     assert "matmul" in members and "om_apply" in members
@@ -290,6 +329,7 @@ def test_om_elems_consume_scan_outputs():
 # ---------------------------------------------------------------------------
 #  (c) the attr-spelling gap — honest negative on RAW export
 # ---------------------------------------------------------------------------
+
 
 def test_raw_export_fires_om_split():
     """The bridge now canonicalises exported positional spellings
@@ -310,15 +350,20 @@ def test_raw_export_fires_om_split():
     # The whole om chain fires on the raw export now.
     assert eg.rule_fires.get("om_lift", 0) >= 1
     assert census["om_compose"] > 0
-    assert (eg.rule_fires.get("om_split", 0)
-            + eg.rule_fires.get("om_split_arg1", 0)) > 0
-    assert (eg.rule_fires.get("matmul_t_concat", 0)
-            + eg.rule_fires.get("matmul_t_concat_arg1", 0)) > 0
+    assert (
+        eg.rule_fires.get("om_split", 0)
+        + eg.rule_fires.get("om_split_arg1", 0)
+    ) > 0
+    assert (
+        eg.rule_fires.get("matmul_t_concat", 0)
+        + eg.rule_fires.get("matmul_t_concat_arg1", 0)
+    ) > 0
 
 
 # ---------------------------------------------------------------------------
 #  (d) extraction — carriers coexist but greedy never mixes them
 # ---------------------------------------------------------------------------
+
 
 def test_extraction_carrier_report():
     """Greedy flops: raw adds + dense softmax.  Min-depth: applyd scan +
@@ -335,10 +380,14 @@ def test_extraction_carrier_report():
     rep_f = op_repr(best_f)
     best_d = out["canonical_best"]
     rep_d = op_repr(best_d)
-    print(f"\n[hybrid] flops-best: applyd={'applyd' in rep_f}"
-          f" om={'om_apply' in rep_f}  cost={dag_cost(best_f, flops_cost):.0f}")
-    print(f"[hybrid] depth-best: applyd={'applyd' in rep_d}"
-          f" om={'om_apply' in rep_d}")
+    print(
+        f"\n[hybrid] flops-best: applyd={'applyd' in rep_f}"
+        f" om={'om_apply' in rep_f}  cost={dag_cost(best_f, flops_cost):.0f}"
+    )
+    print(
+        f"[hybrid] depth-best: applyd={'applyd' in rep_d}"
+        f" om={'om_apply' in rep_d}"
+    )
 
     # flops extraction prefers the raw sequential spine (3d/step beats
     # 5d/step lifted) and dense softmax — honest negative for mixing.
@@ -367,7 +416,9 @@ def test_coordinated_extraction_has_both_carriers():
     # pin every om_compose-holding class to a compose member
     for cid in list(eg._classes):
         c = eg.find(cid)
-        comps = [n for n in eg._classes[c].nodes if n.op == "om_compose"]
+        comps = [
+            n for n in eg._classes[c].nodes if n.op == "om_compose"
+        ]
         if comps:
             ov.setdefault(c, comps[0])
     # pin the attention class to a composed om_apply member
@@ -375,8 +426,9 @@ def test_coordinated_extraction_has_both_carriers():
     for cid in list(eg._classes):
         c = eg.find(cid)
         for n in eg._classes[c].nodes:
-            if (n.op == "om_apply"
-                    and _class_has_op(eg, n.children[0], "om_compose")):
+            if n.op == "om_apply" and _class_has_op(
+                eg, n.children[0], "om_compose"
+            ):
                 ov[c] = n
                 pinned_om = True
     assert pinned_om, "no composed om_apply member materialised"
@@ -405,6 +457,7 @@ def test_coordinated_extraction_has_both_carriers():
 #  (e) cross-layer rewrites — what actually fired across the boundary
 # ---------------------------------------------------------------------------
 
+
 def test_scale_commutes_into_q_proj_weight():
     """The 1/√d attention scale slid through q_proj into a weight-only
     mul: linear_row_scale_rev then linear_channel_scale.  The folded
@@ -432,7 +485,8 @@ def test_scale_commutes_into_q_proj_weight():
 
 def _is_var_sub(t):
     return isinstance(t, Var) or (
-        isinstance(t, Op) and any(_is_var_sub(a) for a in t.args))
+        isinstance(t, Op) and any(_is_var_sub(a) for a in t.args)
+    )
 
 
 def test_pairing_pass_spans_the_boundary():
@@ -441,6 +495,7 @@ def test_pairing_pass_spans_the_boundary():
     the scan stack y.  The product law doesn't care which monoid reads
     the output."""
     from catopt.rules import pair_shared_input_linears
+
     torch.manual_seed(0)
     T, D = 16, 16
     m = HybridBlock(D, D, 16, T, n_chunks=2).eval().double()
@@ -465,6 +520,7 @@ def test_pairing_pass_spans_the_boundary():
 # ---------------------------------------------------------------------------
 #  (f) TwoLayerHybrid — SSM → attention → SSM
 # ---------------------------------------------------------------------------
+
 
 def test_two_layer_hybrid_composes_across_boundary():
     """The second recurrence's aff_diag leaves carry the attention
@@ -491,9 +547,12 @@ def test_two_layer_hybrid_composes_across_boundary():
 
     # every second-layer aff_diag translation reaches the om carrier
     hits = sum(
-        1 for n in eg._node_to_class
-        if n.op == "aff_diag" and len(n.children) == 2
-        and _class_has_op(eg, n.children[1], "om_apply"))
+        1
+        for n in eg._node_to_class
+        if n.op == "aff_diag"
+        and len(n.children) == 2
+        and _class_has_op(eg, n.children[1], "om_apply")
+    )
     print(f"[2layer] aff_diag leaves containing om_apply: {hits}")
     assert hits >= T
 

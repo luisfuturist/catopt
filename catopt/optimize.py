@@ -15,25 +15,35 @@ from __future__ import annotations
 import copy
 import sys
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
-from catopt.ir import IR, Op, Var, Const, Param
+from catopt.cost import (
+    CostModel,
+    dag_cost,
+    flops_cost,
+    launch_aware_cost,
+)
 from catopt.egraph import EGraph
-from catopt.rules import (all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
-                          pair_shared_input_linears,
-                          pair_shared_input_convs,
-                          share_duplicate_params,
-                          share_duplicate_param_slices)
-from catopt.trace_lift import lift_scan_to_trace
-from catopt.xcarrier import (gather_applyd_stack, gather_apply_stack,
-                             omd_tree_lift)
-from catopt.cost import (flops_cost, count_cost, launch_aware_cost,
-                         CostModel, dag_cost)
+from catopt.ir import IR, Const, Op, Param, Var, op_repr
+from catopt.rules import (
+    CATEGORICAL_RULES,
+    SIMPLIFICATION_RULES,
+    all_rules,
+    pair_shared_input_convs,
+    pair_shared_input_linears,
+    share_duplicate_param_slices,
+    share_duplicate_params,
+)
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.ir import op_repr
-
+from catopt.trace_lift import lift_scan_to_trace
+from catopt.xcarrier import (
+    gather_apply_stack,
+    gather_applyd_stack,
+    omd_tree_lift,
+)
 
 #: Rules whose saturation closure is combinatorially explosive on
 #: stacked blocks: the pure-symmetry monoid laws enumerate every
@@ -52,23 +62,38 @@ from catopt.ir import op_repr
 #: Measured on stacked ParallelBlocks (the model that motivated
 #: ``optimize_compositional``): identical extracted cost at every
 #: budget ≥ 512 while saturation drops from minutes to ~1s.
-_EXPANSIVE_RULES = frozenset({
-    # monoid symmetries
-    "comm_add", "comm_mul", "assoc_add", "assoc_mul",
-    # diagonal-scale naturality (norm folding)
-    "linear_row_scale", "linear_row_scale_rev",
-    "linear_channel_scale", "linear_channel_scale_rev",
-    # bilinearity: distribute / factor pairs (both directions)
-    "distribute_matmul_over_add", "factor_matmul",
-    "right_distribute_matmul", "right_factor_matmul",
-    "weight_factor_matmul", "weight_distribute_matmul",
-    "weight_factor_linear", "weight_distribute_linear",
-    "right_factor_linear",
-    # composition chains / scalar naturality
-    "assoc_linear", "assoc_linear_bias", "assoc_linear_bias_rev",
-    "naturality_scalar", "naturality_scalar_rev",
-    "assoc_matmul", "assoc_matmul_rev",
-})
+_EXPANSIVE_RULES = frozenset(
+    {
+        # monoid symmetries
+        "comm_add",
+        "comm_mul",
+        "assoc_add",
+        "assoc_mul",
+        # diagonal-scale naturality (norm folding)
+        "linear_row_scale",
+        "linear_row_scale_rev",
+        "linear_channel_scale",
+        "linear_channel_scale_rev",
+        # bilinearity: distribute / factor pairs (both directions)
+        "distribute_matmul_over_add",
+        "factor_matmul",
+        "right_distribute_matmul",
+        "right_factor_matmul",
+        "weight_factor_matmul",
+        "weight_distribute_matmul",
+        "weight_factor_linear",
+        "weight_distribute_linear",
+        "right_factor_linear",
+        # composition chains / scalar naturality
+        "assoc_linear",
+        "assoc_linear_bias",
+        "assoc_linear_bias_rev",
+        "naturality_scalar",
+        "naturality_scalar_rev",
+        "assoc_matmul",
+        "assoc_matmul_rev",
+    }
+)
 
 
 class OptimizationResourceError(RuntimeError):
@@ -96,9 +121,11 @@ def _looks_like_oom(exc: BaseException) -> bool:
         return True
     if isinstance(exc, RuntimeError):
         msg = str(exc).lower()
-        return ("out of memory" in msg
-                or "can't allocate memory" in msg
-                or "cannot allocate memory" in msg)
+        return (
+            "out of memory" in msg
+            or "can't allocate memory" in msg
+            or "cannot allocate memory" in msg
+        )
     return False
 
 
@@ -114,10 +141,11 @@ def _oom_to_resource_error(fn):
             return fn(*args, **kwargs)
         except OptimizationResourceError:
             raise
-        except Exception as e:  # noqa: BLE001 — re-raised unless OOM
+        except Exception as e:
             if _looks_like_oom(e):
                 raise OptimizationResourceError(
-                    f"{type(e).__name__}: {e}") from e
+                    f"{type(e).__name__}: {e}"
+                ) from e
             raise
 
     return wrapper
@@ -135,10 +163,15 @@ def _current_memory_mb() -> float:
                     break
     except OSError:  # non-Linux: peak RSS is the portable fallback
         import resource
-        rss = resource.getrusage(
-            resource.RUSAGE_SELF).ru_maxrss / 1024.0
-    dev = (torch.cuda.memory_allocated() / float(1 << 20)
-           if torch.cuda.is_available() else 0.0)
+
+        rss = (
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        )
+    dev = (
+        torch.cuda.memory_allocated() / float(1 << 20)
+        if torch.cuda.is_available()
+        else 0.0
+    )
     return rss + dev
 
 
@@ -152,22 +185,28 @@ def _check_resources(eg, max_enodes, max_memory_mb) -> None:
     extraction/lowering effort on an over-budget graph.  The memory
     check catches tensor pressure an e-node count cannot see
     (materialised weight folds, lowered parameters)."""
-    if max_enodes is not None and eg is not None \
-            and eg.n_enodes >= max_enodes:
+    if (
+        max_enodes is not None
+        and eg is not None
+        and eg.n_enodes >= max_enodes
+    ):
         raise OptimizationResourceError(
             f"e-graph reached {eg.n_enodes} e-nodes "
-            f"(max_enodes={max_enodes})")
+            f"(max_enodes={max_enodes})"
+        )
     if max_memory_mb is not None:
         used = _current_memory_mb()
         if used > max_memory_mb:
             raise OptimizationResourceError(
                 f"memory footprint {used:.0f} MiB exceeds "
-                f"max_memory_mb={max_memory_mb}")
+                f"max_memory_mb={max_memory_mb}"
+            )
 
 
 def _eval_const(term: Any, params: dict) -> torch.Tensor | None:
     """Evaluate a parameter-only subtree to a concrete tensor."""
     from catopt.torch_bridge import _IR_TO_TORCH
+
     if isinstance(term, Param):
         return params.get(term.name)
     if isinstance(term, Const):
@@ -193,26 +232,39 @@ def _eval_const(term: Any, params: dict) -> torch.Tensor | None:
 def _is_causal_keep_mask(mask_val: torch.Tensor, q_shape) -> bool:
     """mask (…, T, T) keeps exactly the lower triangle and T matches
     q's sequence dim — i.e. the mask IS is_causal."""
-    from catopt.cost import _shape_of as _so
+
     if not isinstance(q_shape, tuple) or len(q_shape) < 2:
         return False
-    if (mask_val.ndim < 2 or mask_val.shape[-1] != mask_val.shape[-2]
-            or mask_val.shape[-1] != q_shape[-2]):
+    if (
+        mask_val.ndim < 2
+        or mask_val.shape[-1] != mask_val.shape[-2]
+        or mask_val.shape[-1] != q_shape[-2]
+    ):
         return False
-    keep = (mask_val.bool() if mask_val.dtype == torch.bool
-            else mask_val > -1e30)
-    tril = torch.tril(torch.ones(mask_val.shape[-2], mask_val.shape[-1],
-                                 dtype=torch.bool,
-                                 device=mask_val.device))
+    keep = (
+        mask_val.bool()
+        if mask_val.dtype == torch.bool
+        else mask_val > -1e30
+    )
+    tril = torch.tril(
+        torch.ones(
+            mask_val.shape[-2],
+            mask_val.shape[-1],
+            dtype=torch.bool,
+            device=mask_val.device,
+        )
+    )
     return bool((keep == tril).all())
 
 
-def _specialize_causal(term: Any, params: dict,
-                       memo: dict | None = None) -> Any:
+def _specialize_causal(
+    term: Any, params: dict, memo: dict | None = None
+) -> Any:
     """sdpa(q,k,v, mask) where mask is parameter-only and evaluates to
     a causal keep-mask → sdpa(q,k,v, is_causal=True).  Dropping the
     materialised mask unlocks the fused flash/mem-efficient kernels."""
     from catopt.cost import _shape_of as _so
+
     if memo is None:
         memo = {}
     if not isinstance(term, Op):
@@ -222,8 +274,7 @@ def _specialize_causal(term: Any, params: dict,
         return memo[key]
     args = tuple(_specialize_causal(a, params, memo) for a in term.args)
     attrs = dict(term.attrs)
-    if (term.op == "sdpa" and len(args) >= 4
-            and not attrs.get("arg5")):
+    if term.op == "sdpa" and len(args) >= 4 and not attrs.get("arg5"):
         mv = _eval_const(args[3], params)
         if mv is not None and _is_causal_keep_mask(mv, _so(args[0])):
             args = args[:3]
@@ -258,47 +309,61 @@ def discover_alternatives(
     ir, source_tensors = export_to_ir(model, example_input)
     eg = EGraph()
     root_eid = eg.add_term(ir.root)
-    rules = {"all": all_rules(),
-             "simpl": SIMPLIFICATION_RULES,
-             "categorical": CATEGORICAL_RULES}[ruleset]
+    rules = {
+        "all": all_rules(),
+        "simpl": SIMPLIFICATION_RULES,
+        "categorical": CATEGORICAL_RULES,
+    }[ruleset]
     if ruleset == "categorical":
-        _SUBSUMED = {"swiglu_fuse", "qkv_fuse", "qkv_fuse_asym",
-                     "parallel_mul_fuse"}
+        _SUBSUMED = {
+            "swiglu_fuse",
+            "qkv_fuse",
+            "qkv_fuse_asym",
+            "parallel_mul_fuse",
+        }
         rules = [r for r in rules if r.name not in _SUBSUMED]
     # Same bounded-saturation policy as optimize_model — the frontier
     # stays representative but the call returns in bounded time.
     rule_budgets = {n: 2048 for n in _EXPANSIVE_RULES}
-    stats = eg.run(rules, root_eid, max_iterations=max_iterations,
-                   rule_budgets=rule_budgets)
-    groups = (pair_shared_input_linears(eg)
-              + pair_shared_input_convs(eg))
+    stats = eg.run(
+        rules,
+        root_eid,
+        max_iterations=max_iterations,
+        rule_budgets=rule_budgets,
+    )
+    groups = pair_shared_input_linears(eg) + pair_shared_input_convs(eg)
     if groups:
         eg.rebuild()
         stats["pairing_groups"] = len(groups)
-        eg.run(rules, root_eid, max_iterations=5,
-               rule_budgets=rule_budgets)
+        eg.run(
+            rules, root_eid, max_iterations=5, rule_budgets=rule_budgets
+        )
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
     # same-state carrier applications -> one application, whole om
     # trees over scanned values -> the deferred omd carrier, and exact
     # weight tying (duplicate Param leaves share one class).
     # All witnessed so certificates stay replayable.
-    lifts = (lift_scan_to_trace(eg)
-             + gather_applyd_stack(eg)
-             + gather_apply_stack(eg)
-             + omd_tree_lift(eg)
-             + share_duplicate_params(eg, source_tensors)
-             + share_duplicate_param_slices(eg, source_tensors))
+    lifts = (
+        lift_scan_to_trace(eg)
+        + gather_applyd_stack(eg)
+        + gather_apply_stack(eg)
+        + omd_tree_lift(eg)
+        + share_duplicate_params(eg, source_tensors)
+        + share_duplicate_param_slices(eg, source_tensors)
+    )
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
-        eg.run(rules, root_eid, max_iterations=5,
-               rule_budgets=rule_budgets)
+        eg.run(
+            rules, root_eid, max_iterations=5, rule_budgets=rule_budgets
+        )
     alts = eg.extract_alternatives(root_eid, cost_fn, top_k=top_k)
     return {
         "alternatives": alts,
         "diverse_classes": eg.diverse_classes(),
-        "rule_fires": dict(sorted(eg.rule_fires.items(),
-                                  key=lambda kv: -kv[1])),
+        "rule_fires": dict(
+            sorted(eg.rule_fires.items(), key=lambda kv: -kv[1])
+        ),
         "stats": stats,
         "ir": ir,
         "eg": eg,
@@ -399,7 +464,9 @@ def optimize_model(
 
     # -- Phase 1: Export to IR -------------------------------------------
     if verbose:
-        print(f"[Phase 1] Exporting {model.__class__.__name__} to IR...")
+        print(
+            f"[Phase 1] Exporting {model.__class__.__name__} to IR..."
+        )
     ir, source_tensors = export_to_ir(model, example_input)
     if verbose:
         print(f"  IR root: {op_repr(ir.root)}")
@@ -408,7 +475,9 @@ def optimize_model(
 
     # -- Phase 2: Build e-graph and saturate -----------------------------
     if verbose:
-        print("[Phase 2] Building e-graph and running equality saturation...")
+        print(
+            "[Phase 2] Building e-graph and running equality saturation..."
+        )
     eg = EGraph()
     root_eid = eg.add_term(ir.root)
 
@@ -418,14 +487,20 @@ def optimize_model(
     # pair_shared_input_linears pass, which needs no consumer pattern.
     # Keeping them would let extraction pick consumer-level chunk
     # alternatives that bypass the globally-coordinated split choice.
-    _SUBSUMED = {"swiglu_fuse", "parallel_mul_fuse",
-                 "qkv_fuse", "qkv_fuse_asym"}
+    _SUBSUMED = {
+        "swiglu_fuse",
+        "parallel_mul_fuse",
+        "qkv_fuse",
+        "qkv_fuse_asym",
+    }
     if ruleset == "all":
         rules = [r for r in all_rules() if r.name not in _SUBSUMED]
     elif ruleset == "simpl":
         rules = SIMPLIFICATION_RULES
     elif ruleset == "categorical":
-        rules = [r for r in CATEGORICAL_RULES if r.name not in _SUBSUMED]
+        rules = [
+            r for r in CATEGORICAL_RULES if r.name not in _SUBSUMED
+        ]
     else:
         raise ValueError(f"Unknown ruleset: {ruleset}")
 
@@ -435,27 +510,38 @@ def optimize_model(
     # Bounded-saturation budget for the expansive rules (see
     # ``_EXPANSIVE_RULES``); enforced inside the matcher so a giant
     # e-class cannot spend the whole budget in one enumeration.
-    rule_budgets = ({n: symmetry_budget for n in _EXPANSIVE_RULES}
-                    if symmetry_budget is not None else None)
+    rule_budgets = (
+        {n: symmetry_budget for n in _EXPANSIVE_RULES}
+        if symmetry_budget is not None
+        else None
+    )
     # ``None`` = unbounded: the run loop wants a concrete watermark.
     run_cap = max_enodes if max_enodes is not None else sys.maxsize
 
-    stats = eg.run(rules, root_eid,
-                   max_iterations=max_iterations, max_nodes=run_cap,
-                   rule_budgets=rule_budgets)
+    stats = eg.run(
+        rules,
+        root_eid,
+        max_iterations=max_iterations,
+        max_nodes=run_cap,
+        rule_budgets=rule_budgets,
+    )
     _check_resources(eg, max_enodes, max_memory_mb)
 
     # Diagram-level product law: pair every linear sharing an input into
     # one GEMM + split views.  Non-local — no consumer pattern needed.
-    groups = (pair_shared_input_linears(eg)
-              + pair_shared_input_convs(eg))
+    groups = pair_shared_input_linears(eg) + pair_shared_input_convs(eg)
     if groups:
         eg.rebuild()
         _check_resources(eg, max_enodes, max_memory_mb)
         stats["pairing_groups"] = len(groups)
         # brief second saturation so other rules see the new enodes
-        eg.run(rules, root_eid, max_iterations=5, max_nodes=run_cap,
-               rule_budgets=rule_budgets)
+        eg.run(
+            rules,
+            root_eid,
+            max_iterations=5,
+            max_nodes=run_cap,
+            rule_budgets=rule_budgets,
+        )
         _check_resources(eg, max_enodes, max_memory_mb)
 
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
@@ -463,28 +549,39 @@ def optimize_model(
     # trees over scanned values -> the deferred omd carrier, and exact
     # weight tying (duplicate Param leaves share one class).
     # All witnessed so certificates stay replayable.
-    lifts = (lift_scan_to_trace(eg)
-             + gather_applyd_stack(eg)
-             + gather_apply_stack(eg)
-             + omd_tree_lift(eg)
-             + share_duplicate_params(eg, source_tensors)
-             + share_duplicate_param_slices(eg, source_tensors))
+    lifts = (
+        lift_scan_to_trace(eg)
+        + gather_applyd_stack(eg)
+        + gather_apply_stack(eg)
+        + omd_tree_lift(eg)
+        + share_duplicate_params(eg, source_tensors)
+        + share_duplicate_param_slices(eg, source_tensors)
+    )
     if eps_rtol is not None:
-        from catopt.eps import (low_rank_params, kron_linear_params,
-                                low_rank_gather)
-        eps_offers = (low_rank_params(eg, source_tensors, rtol=eps_rtol)
-                      + low_rank_gather(eg, source_tensors,
-                                        rtol=eps_rtol)
-                      + kron_linear_params(eg, source_tensors,
-                                           rtol=eps_rtol))
+        from catopt.eps import (
+            kron_linear_params,
+            low_rank_gather,
+            low_rank_params,
+        )
+
+        eps_offers = (
+            low_rank_params(eg, source_tensors, rtol=eps_rtol)
+            + low_rank_gather(eg, source_tensors, rtol=eps_rtol)
+            + kron_linear_params(eg, source_tensors, rtol=eps_rtol)
+        )
         lifts += eps_offers
         stats["eps_offers"] = eps_offers
     if lifts:
         eg.rebuild()
         _check_resources(eg, max_enodes, max_memory_mb)
         stats["nonlocal_lifts"] = len(lifts)
-        eg.run(rules, root_eid, max_iterations=5, max_nodes=run_cap,
-               rule_budgets=rule_budgets)
+        eg.run(
+            rules,
+            root_eid,
+            max_iterations=5,
+            max_nodes=run_cap,
+            rule_budgets=rule_budgets,
+        )
         _check_resources(eg, max_enodes, max_memory_mb)
 
     stats["rule_fires"] = dict(eg.rule_fires)
@@ -499,9 +596,9 @@ def optimize_model(
         # true DAG costs — forcing loses if a group is only partially
         # reachable or a bypassing alternative was already cheaper.
         forced = eg.extract_paired(root_eid, cost_fn, groups)
-        if (forced is not None
-                and dag_cost(forced, cost_fn)
-                <= dag_cost(best_term, cost_fn)):
+        if forced is not None and dag_cost(forced, cost_fn) <= dag_cost(
+            best_term, cost_fn
+        ):
             best_term = forced
             stats["paired_extract"] = True
     # Causal specialization: a param-only attn_mask that evaluates to a
@@ -521,9 +618,15 @@ def optimize_model(
     _check_resources(eg, max_enodes, max_memory_mb)
     if verbose:
         print("[Phase 3] Lowering optimized IR to torch module...")
-    optimized_ir = IR(root=best_term, inputs=ir.inputs,
-                      input_names=ir.input_names, params=ir.params)
-    optimized_module = ir_to_torch_module(optimized_ir, param_values=source_tensors)
+    optimized_ir = IR(
+        root=best_term,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
+    optimized_module = ir_to_torch_module(
+        optimized_ir, param_values=source_tensors
+    )
 
     # Verify semantic equivalence
     if verbose:
@@ -532,13 +635,19 @@ def optimize_model(
         optimized_module.eval()
         with torch.no_grad():
             if isinstance(example_input, tuple):
-                original_out = model(*[a.clone() for a in example_input])
-                opt_out = optimized_module(*[a.clone() for a in example_input])
+                original_out = model(
+                    *[a.clone() for a in example_input]
+                )
+                opt_out = optimized_module(
+                    *[a.clone() for a in example_input]
+                )
             else:
                 original_out = model(example_input.clone())
                 opt_out = optimized_module(example_input.clone())
             max_diff = (original_out - opt_out).abs().max().item()
-            rel_diff = max_diff / (original_out.abs().max().item() + 1e-8)
+            rel_diff = max_diff / (
+                original_out.abs().max().item() + 1e-8
+            )
             print(f"  Max abs diff:  {max_diff:.6e}")
             print(f"  Max rel diff:  {rel_diff:.6e}")
             if rel_diff < 1e-4:
@@ -549,8 +658,9 @@ def optimize_model(
     return optimized_module, stats
 
 
-def param_report(model: torch.nn.Module,
-                 optimized_module: torch.nn.Module) -> dict:
+def param_report(
+    model: torch.nn.Module, optimized_module: torch.nn.Module
+) -> dict:
     """Joint graph+parameter view: which original parameters survive in
     the optimized realization, which were eliminated, and which were
     derived (folded) — the 'optimized weights file' diff.
@@ -567,7 +677,9 @@ def param_report(model: torch.nn.Module,
     opt_names = set(opt)
     eliminated = sorted(orig_names - opt_names)
     derived = sorted(n for n in opt_names if n not in orig_names)
-    orig_bytes = sum(p.numel() * p.element_size() for p in orig.values())
+    orig_bytes = sum(
+        p.numel() * p.element_size() for p in orig.values()
+    )
     opt_bytes = sum(p.numel() * p.element_size() for p in opt.values())
     return {
         "original_params": len(orig),
@@ -581,8 +693,9 @@ def param_report(model: torch.nn.Module,
     }
 
 
-def save_optimized_weights(optimized_module: torch.nn.Module,
-                           path: str) -> None:
+def save_optimized_weights(
+    optimized_module: torch.nn.Module, path: str
+) -> None:
     """Emit the optimized weights file — only the parameters the
     certified form actually needs (folded derived tensors included)."""
     torch.save(optimized_module.state_dict(), path)
@@ -604,15 +717,20 @@ def term_cost(term: Any, cost_fn=None) -> float:
 #  Compositional optimization — per-block eqsat, then recompose
 # ---------------------------------------------------------------------------
 
-def _default_block_pred(parent: torch.nn.Module, name: str,
-                        module: torch.nn.Module) -> bool:
+
+def _default_block_pred(
+    parent: torch.nn.Module, name: str, module: torch.nn.Module
+) -> bool:
     """Default block selector: direct children of ``nn.ModuleList`` /
     ``nn.Sequential`` — the standard 'stacked blocks' structure."""
-    return isinstance(parent, (torch.nn.ModuleList, torch.nn.Sequential))
+    return isinstance(
+        parent, (torch.nn.ModuleList, torch.nn.Sequential)
+    )
 
 
-def _select_blocks(model: torch.nn.Module,
-                   block_pred: Callable | None) -> list[tuple[str, torch.nn.Module]]:
+def _select_blocks(
+    model: torch.nn.Module, block_pred: Callable | None
+) -> list[tuple[str, torch.nn.Module]]:
     """Walk the module tree and pick the top-most submodules to optimize
     independently.
 
@@ -651,17 +769,33 @@ def _capture_block_inputs(
         def hook(mod, args, kwargs, out):
             if name not in captured:
                 captured[name] = (
-                    tuple(a.detach().clone() if isinstance(a, torch.Tensor)
-                          else a for a in args),
-                    {k: (v.detach().clone() if isinstance(v, torch.Tensor)
-                         else v) for k, v in kwargs.items()},
+                    tuple(
+                        a.detach().clone()
+                        if isinstance(a, torch.Tensor)
+                        else a
+                        for a in args
+                    ),
+                    {
+                        k: (
+                            v.detach().clone()
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
+                        for k, v in kwargs.items()
+                    },
                 )
+
         return hook
 
     for name, mod in blocks:
-        handles.append(mod.register_forward_hook(make_hook(name),
-                                                 with_kwargs=True))
-    args = example_input if isinstance(example_input, tuple) else (example_input,)
+        handles.append(
+            mod.register_forward_hook(make_hook(name), with_kwargs=True)
+        )
+    args = (
+        example_input
+        if isinstance(example_input, tuple)
+        else (example_input,)
+    )
     try:
         model.eval()
         with torch.no_grad():
@@ -673,18 +807,19 @@ def _capture_block_inputs(
 
 
 def _rel_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    return ((a - b).abs().max().item()
-            / (a.abs().max().item() + 1e-8))
+    return (a - b).abs().max().item() / (a.abs().max().item() + 1e-8)
 
 
-def _replace_submodule(model: torch.nn.Module, dotted: str,
-                       new_mod: torch.nn.Module) -> None:
+def _replace_submodule(
+    model: torch.nn.Module, dotted: str, new_mod: torch.nn.Module
+) -> None:
     """Set ``model.<dotted>`` to ``new_mod``, handling ModuleList /
     Sequential integer children."""
     parent_name, _, child_name = dotted.rpartition(".")
     parent = model.get_submodule(parent_name) if parent_name else model
     if child_name.isdigit() and isinstance(
-            parent, (torch.nn.ModuleList, torch.nn.Sequential)):
+        parent, (torch.nn.ModuleList, torch.nn.Sequential)
+    ):
         parent[int(child_name)] = new_mod
     else:
         setattr(parent, child_name, new_mod)
@@ -694,7 +829,8 @@ def optimize_compositional(
     model: torch.nn.Module,
     example_input: torch.Tensor | tuple,
     *,
-    block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool] | None = None,
+    block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool]
+    | None = None,
     cost_fn=None,
     ruleset: str = "all",
     max_iterations: int = 100,
@@ -736,16 +872,23 @@ def optimize_compositional(
 
     blocks = _select_blocks(model, block_pred)
     if verbose:
-        print(f"[Compositional] {len(blocks)} candidate blocks: "
-              f"{[n for n, _ in blocks]}")
+        print(
+            f"[Compositional] {len(blocks)} candidate blocks: "
+            f"{[n for n, _ in blocks]}"
+        )
 
     captured = _capture_block_inputs(model, blocks, example_input)
 
     replacements: dict[str, torch.nn.Module] = {}
     block_stats: dict[str, dict[str, Any]] = {}
-    agg = {"original_params": 0, "optimized_params": 0,
-           "original_bytes": 0, "optimized_bytes": 0,
-           "eliminated": [], "derived": []}
+    agg = {
+        "original_params": 0,
+        "optimized_params": 0,
+        "original_bytes": 0,
+        "optimized_bytes": 0,
+        "eliminated": [],
+        "derived": [],
+    }
 
     for name, block in blocks:
         entry: dict[str, Any] = {}
@@ -763,10 +906,15 @@ def optimize_compositional(
         t0 = time.time()
         try:
             opt_mod, st = optimize_model(
-                block, ex,
-                ruleset=ruleset, max_iterations=max_iterations,
-                max_enodes=max_enodes, max_memory_mb=max_memory_mb,
-                cost_fn=cost_fn, verbose=verbose)
+                block,
+                ex,
+                ruleset=ruleset,
+                max_iterations=max_iterations,
+                max_enodes=max_enodes,
+                max_memory_mb=max_memory_mb,
+                cost_fn=cost_fn,
+                verbose=verbose,
+            )
             # Per-block verification on the captured input — soundness
             # gate independent of optimize_model's own (verbose-gated)
             # check.  Any mismatch or eval failure falls back.
@@ -777,7 +925,8 @@ def optimize_compositional(
             entry["rel_diff"] = rd
             if not (rd < verify_tol):
                 raise RuntimeError(
-                    f"block verification failed: rel diff {rd:.3e}")
+                    f"block verification failed: rel diff {rd:.3e}"
+                )
             replacements[name] = opt_mod
             entry["status"] = "optimized"
             entry["stats"] = st
@@ -787,16 +936,21 @@ def optimize_compositional(
             agg["optimized_params"] += pr["optimized_params"]
             agg["original_bytes"] += pr["original_bytes"]
             agg["optimized_bytes"] += pr["optimized_bytes"]
-            agg["eliminated"] += [f"{name}:{n}" for n in pr["eliminated"]]
+            agg["eliminated"] += [
+                f"{name}:{n}" for n in pr["eliminated"]
+            ]
             agg["derived"] += [f"{name}:{n}" for n in pr["derived"]]
             if verbose:
-                print(f"[Compositional] {name}: optimized "
-                      f"({entry['rel_diff']:.2e})")
-        except Exception as e:  # noqa: BLE001 — fallback keeps original
+                print(
+                    f"[Compositional] {name}: optimized "
+                    f"({entry['rel_diff']:.2e})"
+                )
+        except Exception as e:
             entry["status"] = "failed"
             entry["error"] = f"{type(e).__name__}: {e}"
-            if (isinstance(e, OptimizationResourceError)
-                    or _looks_like_oom(e)):
+            if isinstance(
+                e, OptimizationResourceError
+            ) or _looks_like_oom(e):
                 entry["reason"] = "resource_limit"
             if verbose:
                 print(f"[Compositional] {name}: keeping original ({e})")
@@ -822,36 +976,58 @@ def optimize_compositional(
         "compositional": True,
         "n_blocks": len(blocks),
         "n_optimized": len(replacements),
-        "n_failed": sum(1 for e in block_stats.values()
-                        if e.get("status") == "failed"),
-        "n_skipped": sum(1 for e in block_stats.values()
-                         if e.get("status") in ("skipped", "not_executed")),
+        "n_failed": sum(
+            1
+            for e in block_stats.values()
+            if e.get("status") == "failed"
+        ),
+        "n_skipped": sum(
+            1
+            for e in block_stats.values()
+            if e.get("status") in ("skipped", "not_executed")
+        ),
         "blocks": block_stats,
         "in_place": in_place,
     }
     agg["bytes_saved"] = agg["original_bytes"] - agg["optimized_bytes"]
-    agg["ratio"] = (agg["optimized_bytes"] / agg["original_bytes"]
-                    if agg["original_bytes"] else 1.0)
+    agg["ratio"] = (
+        agg["optimized_bytes"] / agg["original_bytes"]
+        if agg["original_bytes"]
+        else 1.0
+    )
     stats["param_report"] = agg
 
-    args = (example_input if isinstance(example_input, tuple)
-            else (example_input,))
+    args = (
+        example_input
+        if isinstance(example_input, tuple)
+        else (example_input,)
+    )
     model.eval()
     new_model.eval()
     try:
         with torch.no_grad():
-            ref = model(*[a.clone() if isinstance(a, torch.Tensor) else a
-                          for a in args])
-            out = new_model(*[a.clone() if isinstance(a, torch.Tensor) else a
-                              for a in args])
+            ref = model(
+                *[
+                    a.clone() if isinstance(a, torch.Tensor) else a
+                    for a in args
+                ]
+            )
+            out = new_model(
+                *[
+                    a.clone() if isinstance(a, torch.Tensor) else a
+                    for a in args
+                ]
+            )
         stats["end_to_end"] = {
             "max_abs_diff": (ref - out).abs().max().item(),
             "max_rel_diff": _rel_diff(ref, out),
         }
         if verbose:
-            print(f"[Compositional] end-to-end rel diff: "
-                  f"{stats['end_to_end']['max_rel_diff']:.3e}")
-    except Exception as e:  # noqa: BLE001
+            print(
+                f"[Compositional] end-to-end rel diff: "
+                f"{stats['end_to_end']['max_rel_diff']:.3e}"
+            )
+    except Exception as e:
         stats["end_to_end"] = {"error": f"{type(e).__name__}: {e}"}
         if verbose:
             print(f"[Compositional] end-to-end check failed: {e}")

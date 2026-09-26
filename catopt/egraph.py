@@ -25,6 +25,7 @@ from catopt.ir import Op, op_repr
 @dataclass(frozen=True)
 class ENode:
     """A term node in the e-graph: an op name with e-class children."""
+
     op: str
     children: tuple[int, ...]
     attrs: tuple[tuple[str, Any], ...] = ()
@@ -33,6 +34,7 @@ class ENode:
 @dataclass
 class EClass:
     """An equivalence class of semantically-equivalent terms."""
+
     id: int
     nodes: set[ENode] = field(default_factory=set)
     cache: dict[str, Any] = field(default_factory=dict)
@@ -93,11 +95,12 @@ class Rewrite:
     derived from the bound weight shapes.  Returning ``None`` vetoes the
     rewrite.
     """
+
     name: str
     lhs: Any
     rhs: Any
     law: str = ""
-    check: Any = None   # Callable[[dict[str, Any]], bool] | None
+    check: Any = None  # Callable[[dict[str, Any]], bool] | None
     derive: Any = None  # Callable[[dict], dict | None] | None
     # Bounded-error axis (ε-laws): when set, this rewrite is a
     # *certified approximation* — ``‖lhs − rhs‖ ≤ error_bound`` in the
@@ -109,7 +112,9 @@ class Rewrite:
     bound_norm: str = "spectral"
 
     def __repr__(self) -> str:
-        return f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
+        return (
+            f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
+        )
 
 
 def _pattern_attrs(op: Op) -> tuple[tuple[str, Any], ...]:
@@ -168,6 +173,7 @@ class ProofEdge:
     binding as ``(key, value)`` pairs — metavariables map to e-class
     ids, ``"$attr:"`` keys carry concrete attribute values.
     """
+
     rule: str | None
     a: int
     b: int
@@ -191,6 +197,7 @@ class CertStep:
     ``Certificate.stats`` and rejected under ``strict=True``, never
     silently passed.
     """
+
     rule: str
     path: tuple
     lhs: Any = None
@@ -215,6 +222,7 @@ class Certificate:
     ``n_egraph_dependent`` counts steps the e-graph witnessed but that
     cannot replay standalone.
     """
+
     src: Any
     dst: Any
     root_eid: int | None
@@ -237,8 +245,9 @@ class Certificate:
 
     @property
     def rules_used(self) -> list[str]:
-        return sorted({s.rule for s in self.steps
-                       if not s.egraph_dependent})
+        return sorted(
+            {s.rule for s in self.steps if not s.egraph_dependent}
+        )
 
     @property
     def error_bound(self) -> float:
@@ -263,8 +272,10 @@ class Certificate:
         return self.error_bound == 0.0
 
     def render(self) -> str:
-        lines = [f"certificate: {op_repr(self.src)}",
-                 f"        ==> {op_repr(self.dst)}"]
+        lines = [
+            f"certificate: {op_repr(self.src)}",
+            f"        ==> {op_repr(self.dst)}",
+        ]
         for i, s in enumerate(self.steps):
             tag = "  [e-graph-dependent]" if s.egraph_dependent else ""
             r = self.rules.get(s.rule)
@@ -272,7 +283,8 @@ class Certificate:
                 tag += f"  [ε≤{r.error_bound:.3e} {r.bound_norm}]"
             lines.append(
                 f"  {i:>3}. {s.rule} @{list(s.path)}: "
-                f"{op_repr(s.lhs)} -> {op_repr(s.rhs)}{tag}")
+                f"{op_repr(s.lhs)} -> {op_repr(s.rhs)}{tag}"
+            )
         if not self.exact:
             lines.append(f"  total ε bound: {self.error_bound:.3e}")
         return "\n".join(lines)
@@ -304,12 +316,16 @@ class EGraph:
     the dial — ``True`` selects level 2, ``False`` selects level 1.
     """
 
-    def __init__(self, track_proofs: bool | None = None,
-                 truncation_level: int = 2) -> None:
+    def __init__(
+        self,
+        track_proofs: bool | None = None,
+        truncation_level: int = 2,
+    ) -> None:
         if truncation_level not in (1, 2, 3):
             raise ValueError(
                 f"truncation_level must be 1, 2, or 3, "
-                f"got {truncation_level!r}")
+                f"got {truncation_level!r}"
+            )
         if track_proofs is not None:
             # Backward-compat override: the old boolean flag maps onto
             # the dial — True -> level 2 (witnesses), False -> level 1
@@ -329,8 +345,10 @@ class EGraph:
         self._enode_birth: dict[ENode, int] = {}
         self._enode_app: dict[ENode, int] = {}
         self._rule_objs: dict[str, Rewrite] = {}
-        self._tag_rule: str | None = None      # rule context (RHS instantiate)
-        self._collect: list | None = None      # enodes born mid-instantiate
+        self._tag_rule: str | None = (
+            None  # rule context (RHS instantiate)
+        )
+        self._collect: list | None = None  # enodes born mid-instantiate
         self._inst_last_enode: ENode | None = None
         # -- incremental saturation state --------------------------------
         # The matcher only needs to re-search an e-class when the match
@@ -389,9 +407,13 @@ class EGraph:
             return self.find(self._node_to_class[enode])
         return self._add_enode(enode, provenance)
 
-    def add_enode(self, op: str, children: tuple[int, ...],
-                  attrs: dict[str, Any] | None = None,
-                  provenance: str | None = None) -> int:
+    def add_enode(
+        self,
+        op: str,
+        children: tuple[int, ...],
+        attrs: dict[str, Any] | None = None,
+        provenance: str | None = None,
+    ) -> int:
         """Add an ENode with already-resolved child e-class IDs.
 
         ``provenance`` optionally names what introduced the enode
@@ -404,8 +426,9 @@ class EGraph:
             return self.find(self._node_to_class[enode])
         return self._add_enode(enode, provenance)
 
-    def _add_enode(self, enode: ENode,
-                   provenance: str | None = None) -> int:
+    def _add_enode(
+        self, enode: ENode, provenance: str | None = None
+    ) -> int:
         eid = self._next_id
         self._next_id += 1
         self._uf.parent.append(eid)
@@ -424,13 +447,18 @@ class EGraph:
         if self._track:
             self._enode_birth[enode] = eid
             self._enode_origin[enode] = (
-                self._tag_rule or provenance or "external")
+                self._tag_rule or provenance or "external"
+            )
             if self._collect is not None:
                 self._collect.append(enode)
         return eid
 
-    def add_term(self, term: Any, _memo: dict | None = None,
-                 provenance: str = "input") -> int:
+    def add_term(
+        self,
+        term: Any,
+        _memo: dict | None = None,
+        provenance: str = "input",
+    ) -> int:
         """Add a term (Var/Const/Param/Op) to the e-graph.
 
         ``_memo`` is an ``id()``-keyed cache: exported IR terms are DAGs
@@ -448,7 +476,8 @@ class EGraph:
             return memo[key]
         if isinstance(term, Op):
             child_eids = tuple(
-                self.add_term(a, memo, provenance) for a in term.args)
+                self.add_term(a, memo, provenance) for a in term.args
+            )
             attr_t = _pattern_attrs(term)
             enode = ENode(term.op, child_eids, attr_t)
             if enode in self._node_to_class:
@@ -460,9 +489,15 @@ class EGraph:
         memo[key] = self.add_leaf(repr(term), provenance)
         return memo[key]
 
-    def union(self, a: int, b: int, rule: str | None = None,
-              subst: dict | None = None, note: str = "",
-              witness: Rewrite | None = None) -> bool:
+    def union(
+        self,
+        a: int,
+        b: int,
+        rule: str | None = None,
+        subst: dict | None = None,
+        note: str = "",
+        witness: Rewrite | None = None,
+    ) -> bool:
         """Merge the e-classes of ``a`` and ``b``.
 
         ``rule``/``subst`` optionally record the 2-morphism witnessing
@@ -544,17 +579,24 @@ class EGraph:
                     _weid, w_en = self._locate(witness.rhs)
                     if w_en is not None:
                         app_idx = len(self._applications)
-                        self._applications.append({
-                            "rule": witness.name,
-                            "matched_eid": self.find(ra),
-                            "rhs_eid": self.find(rb),
-                            "subst": dict(subst or {}),
-                            "rhs_root_enode": w_en,
-                        })
+                        self._applications.append(
+                            {
+                                "rule": witness.name,
+                                "matched_eid": self.find(ra),
+                                "rhs_eid": self.find(rb),
+                                "subst": dict(subst or {}),
+                                "rhs_root_enode": w_en,
+                            }
+                        )
                         self._enode_app.setdefault(w_en, app_idx)
-                fs = (tuple(sorted(subst.items(), key=lambda kv: kv[0]))
-                      if subst else ())
-                self._merge_log.append(ProofEdge(rule, ra, rb, fs, note))
+                fs = (
+                    tuple(sorted(subst.items(), key=lambda kv: kv[0]))
+                    if subst
+                    else ()
+                )
+                self._merge_log.append(
+                    ProofEdge(rule, ra, rb, fs, note)
+                )
             return True
         return False
 
@@ -576,8 +618,9 @@ class EGraph:
 
     # -- pattern matching --
 
-    def matches(self, pattern: Any, eid: int,
-                max_results: int | None = None) -> list[dict[str, int]]:
+    def matches(
+        self, pattern: Any, eid: int, max_results: int | None = None
+    ) -> list[dict[str, int]]:
         """Find all substitutions that match *pattern* at e-class *eid*.
 
         ``max_results`` bounds the enumeration: matching stops once
@@ -589,10 +632,14 @@ class EGraph:
         self._match(pattern, eid, {}, results, max_results)
         return results
 
-    def _match(self, pattern: Any, eid: int,
-               subst: dict[str, int],
-               results: list[dict[str, int]],
-               limit: int | None = None) -> None:
+    def _match(
+        self,
+        pattern: Any,
+        eid: int,
+        subst: dict[str, int],
+        results: list[dict[str, int]],
+        limit: int | None = None,
+    ) -> None:
         if limit is not None and len(results) >= limit:
             return
         eid = self.find(eid)
@@ -659,14 +706,20 @@ class EGraph:
                 for i, pat_arg in enumerate(pattern.args):
                     new_substs: list[dict[str, int]] = []
                     for cs in child_substs:
-                        if (limit is not None
-                                and len(results) + len(new_substs)
-                                >= limit):
+                        if (
+                            limit is not None
+                            and len(results) + len(new_substs) >= limit
+                        ):
                             ok = False
                             break
                         child_results: list[dict[str, int]] = []
-                        self._match(pat_arg, node.children[i],
-                                    dict(cs), child_results, limit)
+                        self._match(
+                            pat_arg,
+                            node.children[i],
+                            dict(cs),
+                            child_results,
+                            limit,
+                        )
                         new_substs.extend(child_results)
                     if not new_substs:
                         ok = False
@@ -744,7 +797,8 @@ class EGraph:
                         # merge that forced the canonicalisation.)
                         for c in canon:
                             self._parents.setdefault(
-                                self.find(c), set()).add(eid)
+                                self.find(c), set()
+                            ).add(eid)
                     nn = ENode(node.op, canon, node.attrs)
                     new_nodes.add(nn)
                     if self._track and nn != node:
@@ -752,13 +806,16 @@ class EGraph:
                         # provenance — same term, fresh child ids.
                         if node in self._enode_origin:
                             self._enode_origin.setdefault(
-                                nn, self._enode_origin[node])
+                                nn, self._enode_origin[node]
+                            )
                         if node in self._enode_birth:
                             self._enode_birth.setdefault(
-                                nn, self._enode_birth[node])
+                                nn, self._enode_birth[node]
+                            )
                         if node in self._enode_app:
                             self._enode_app.setdefault(
-                                nn, self._enode_app[node])
+                                nn, self._enode_app[node]
+                            )
                         self._node_to_class.setdefault(nn, eid)
                 else:
                     new_nodes.add(node)
@@ -782,7 +839,9 @@ class EGraph:
             self._inst_last_enode = None
             return subst[pattern]
         if isinstance(pattern, Op):
-            child_eids = tuple(self._instantiate(a, subst) for a in pattern.args)
+            child_eids = tuple(
+                self._instantiate(a, subst) for a in pattern.args
+            )
             attr_t = _pattern_attrs(pattern)
             # Attribute metavariables (string values) resolve through the
             # substitution's "$attr:" namespace.
@@ -792,9 +851,11 @@ class EGraph:
                     attrs[k] = subst.get("$attr:" + v, v)
                 else:
                     attrs[k] = v
-            enode = ENode(pattern.op,
-                          tuple(self.find(c) for c in child_eids),
-                          tuple(sorted(attrs.items())))
+            enode = ENode(
+                pattern.op,
+                tuple(self.find(c) for c in child_eids),
+                tuple(sorted(attrs.items())),
+            )
             if enode in self._node_to_class:
                 eid = self.find(self._node_to_class[enode])
             else:
@@ -809,12 +870,17 @@ class EGraph:
             # string, which poisons any extracted member it lands in.
             _LeafRegistry.register(pattern)
             eid = self.add_leaf(repr(pattern))
-            self._inst_last_enode = ENode("leaf", (),
-                                          (("key", repr(pattern)),))
+            self._inst_last_enode = ENode(
+                "leaf", (), (("key", repr(pattern)),)
+            )
             return eid
 
-    def any_term(self, eid: int, _seen: frozenset = frozenset(),
-                 _memo: dict | None = None) -> Any:
+    def any_term(
+        self,
+        eid: int,
+        _seen: frozenset = frozenset(),
+        _memo: dict | None = None,
+    ) -> Any:
         """Return any acyclic representative term of an e-class.
 
         Prefers leaf nodes; used to resolve metavariable bindings to
@@ -855,8 +921,9 @@ class EGraph:
                 return _memo[eid]
         return None
 
-    def _min_term(self, eid: int, memo: dict,
-                  _seen: frozenset = frozenset()) -> tuple[Any, float]:
+    def _min_term(
+        self, eid: int, memo: dict, _seen: frozenset = frozenset()
+    ) -> tuple[Any, float]:
         """Smallest (fewest ops) acyclic member of an e-class, as
         ``(term, size)``.
 
@@ -943,8 +1010,9 @@ class EGraph:
             eclass.cache["min_term"] = (t, s)
         return t
 
-    def _candidate_classes(self, lhs: Any,
-                           search: set | list | None) -> Any:
+    def _candidate_classes(
+        self, lhs: Any, search: set | list | None
+    ) -> Any:
         """E-classes a rule's LHS could possibly match at.
 
         ``search=None`` scans the whole graph (the pre-incremental
@@ -955,8 +1023,9 @@ class EGraph:
         pattern can only match at the leaf's own class.
         """
         if isinstance(lhs, Op):
-            eligible = {self.find(c)
-                        for c in self._op_classes.get(lhs.op, ())}
+            eligible = {
+                self.find(c) for c in self._op_classes.get(lhs.op, ())
+            }
         elif isinstance(lhs, str):
             eligible = None
         else:
@@ -971,9 +1040,13 @@ class EGraph:
                 continue
             yield eid
 
-    def apply_rule(self, rule: Rewrite, root_eid: int,
-                   search: set | list | None = None,
-                   enode_budget: int | None = None) -> bool:
+    def apply_rule(
+        self,
+        rule: Rewrite,
+        root_eid: int,
+        search: set | list | None = None,
+        enode_budget: int | None = None,
+    ) -> bool:
         """Apply a single rewrite rule across e-classes.
 
         ``search`` limits the scan to the given class ids (the dirty
@@ -1005,21 +1078,33 @@ class EGraph:
                     spent = self.n_enodes - n_start
                     if spent >= enode_budget:
                         break
-                    match_cap = min(enode_budget - spent,
-                                    self._MATCH_CAP)
-                for subst in self.matches(rule.lhs, eid,
-                                          max_results=match_cap):
-                    if rule.check is not None or rule.derive is not None:
+                    match_cap = min(
+                        enode_budget - spent, self._MATCH_CAP
+                    )
+                for subst in self.matches(
+                    rule.lhs, eid, max_results=match_cap
+                ):
+                    if (
+                        rule.check is not None
+                        or rule.derive is not None
+                    ):
                         bound = {
-                            k: (v if k.startswith("$attr:")
-                                else self._any_term_cached(v))
+                            k: (
+                                v
+                                if k.startswith("$attr:")
+                                else self._any_term_cached(v)
+                            )
                             for k, v in subst.items()
                         }
-                        if any(v is None for k, v in bound.items()
-                               if not k.startswith("$attr:")):
+                        if any(
+                            v is None
+                            for k, v in bound.items()
+                            if not k.startswith("$attr:")
+                        ):
                             continue
-                        if (rule.check is not None
-                                and not rule.check(bound)):
+                        if rule.check is not None and not rule.check(
+                            bound
+                        ):
                             continue
                         if rule.derive is not None:
                             extra = rule.derive(bound)
@@ -1040,8 +1125,9 @@ class EGraph:
                     else:
                         rhs_eid = self._instantiate(rule.rhs, subst)
                     self._rule_objs.setdefault(rule.name, rule)
-                    merged = self.union(eid, rhs_eid,
-                                        rule=rule.name, subst=subst)
+                    merged = self.union(
+                        eid, rhs_eid, rule=rule.name, subst=subst
+                    )
                     if self._track and (merged or created):
                         # A real merge or freshly-instantiated enodes —
                         # the application is a witness worth keeping.  A
@@ -1049,13 +1135,15 @@ class EGraph:
                         # nothing created) adds no 2-morphism, so it is
                         # not recorded.
                         app_idx = len(self._applications)
-                        self._applications.append({
-                            "rule": rule.name,
-                            "matched_eid": self.find(eid),
-                            "rhs_eid": self.find(rhs_eid),
-                            "subst": dict(subst),
-                            "rhs_root_enode": self._inst_last_enode,
-                        })
+                        self._applications.append(
+                            {
+                                "rule": rule.name,
+                                "matched_eid": self.find(eid),
+                                "rhs_eid": self.find(rhs_eid),
+                                "subst": dict(subst),
+                                "rhs_root_enode": self._inst_last_enode,
+                            }
+                        )
                         # First discovered witness wins — a hash-consed
                         # enode keeps the application that created it.
                         for en in created or ():
@@ -1063,17 +1151,22 @@ class EGraph:
                     if merged:
                         changed = True
                         self.rule_fires[rule.name] = (
-                            self.rule_fires.get(rule.name, 0) + 1)
+                            self.rule_fires.get(rule.name, 0) + 1
+                        )
         finally:
             self._anyterm_memo = None
         return changed
 
     # -- saturation --
 
-    def run(self, rules: list[Rewrite], root_eid: int,
-            max_iterations: int = 100,
-            max_nodes: int = 100_000,
-            rule_budgets: dict[str, int] | None = None) -> dict[str, int]:
+    def run(
+        self,
+        rules: list[Rewrite],
+        root_eid: int,
+        max_iterations: int = 100,
+        max_nodes: int = 100_000,
+        rule_budgets: dict[str, int] | None = None,
+    ) -> dict[str, int]:
         """Run equality saturation until a fixed point.
 
         Incremental: each iteration re-searches only the *dirty
@@ -1122,22 +1215,31 @@ class EGraph:
                     remaining = None
                 n0 = self.n_enodes
                 if rule.name in self._applied_rules:
-                    self.apply_rule(rule, root_eid, search=search,
-                                    enode_budget=remaining)
+                    self.apply_rule(
+                        rule,
+                        root_eid,
+                        search=search,
+                        enode_budget=remaining,
+                    )
                 else:
                     # Never scanned this graph: full scan once —
                     # afterwards the dirty frontier suffices.
-                    self.apply_rule(rule, root_eid,
-                                    enode_budget=remaining)
+                    self.apply_rule(
+                        rule, root_eid, enode_budget=remaining
+                    )
                 if budget is not None:
                     spent[rule.name] += self.n_enodes - n0
             self.rebuild(set(search) | self._dirty)
             n_after = self.n_enodes
             if n_after >= max_nodes:
-                print(f"  [egraph] stopping: max_nodes ({max_nodes}) reached")
+                print(
+                    f"  [egraph] stopping: max_nodes ({max_nodes}) reached"
+                )
                 break
             if n_after == n_before and not self._dirty:
-                print(f"  [egraph] saturation at iteration {iteration + 1}")
+                print(
+                    f"  [egraph] saturation at iteration {iteration + 1}"
+                )
                 break
         # Leave the graph in the same canonicalised postcondition the
         # unrestricted loop guaranteed (downstream passes and
@@ -1150,8 +1252,9 @@ class EGraph:
             "n_proof_edges": len(self._merge_log),
             "truncation_level": self.truncation_level,
             "rule_budgets": {n: spent[n] for n in budgets},
-            "budget_suspended": [n for n in budgets
-                                 if spent[n] >= budgets[n]],
+            "budget_suspended": [
+                n for n in budgets if spent[n] >= budgets[n]
+            ],
         }
 
     # -- extraction --
@@ -1166,7 +1269,7 @@ class EGraph:
         directly.  Deterministic: members are scanned in a canonical
         sorted order so ties resolve identically every run.
         """
-        from catopt.ir import op_repr
+
         cache: dict[int, tuple[float, Any]] = {}
         in_prog: set[int] = set()
 
@@ -1178,9 +1281,10 @@ class EGraph:
                 return (float("inf"), None)
             in_prog.add(cid)
             best = (float("inf"), None)
-            for node in sorted(self._classes[cid].nodes,
-                               key=lambda n: (n.op, n.children,
-                                              repr(n.attrs))):
+            for node in sorted(
+                self._classes[cid].nodes,
+                key=lambda n: (n.op, n.children, repr(n.attrs)),
+            ):
                 if node.op == "leaf":
                     key = node.attrs[0][1] if node.attrs else "??"
                     cand = (0, _LeafRegistry.decode(key))
@@ -1199,9 +1303,10 @@ class EGraph:
                         dmax = max(dmax, d)
                     if not ok:
                         continue
-                    cand = (1 + dmax,
-                            Op.make(node.op, *kids,
-                                    **dict(node.attrs)))
+                    cand = (
+                        1 + dmax,
+                        Op.make(node.op, *kids, **dict(node.attrs)),
+                    )
                 if cand[0] < best[0]:
                     best = cand
             in_prog.discard(cid)
@@ -1210,8 +1315,9 @@ class EGraph:
 
         return go(eid)[1]
 
-    def extract_alternatives(self, eid: int, cost_fn,
-                             top_k: int = 8) -> list[tuple[float, Any]]:
+    def extract_alternatives(
+        self, eid: int, cost_fn, top_k: int = 8
+    ) -> list[tuple[float, Any]]:
         """Enumerate the root e-class frontier: for each non-leaf enode,
         force extraction through it and record the resulting term's DAG
         cost.  Returns the top-k cheapest *distinct* alternatives —
@@ -1220,14 +1326,16 @@ class EGraph:
         candidates."""
         from catopt.cost import dag_cost
         from catopt.ir import op_repr
+
         eid = self.find(eid)
         eclass = self._classes[eid]
         seen: dict[str, tuple[float, Any]] = {}
         for node in eclass.nodes:
             if node.op == "leaf":
                 continue
-            term = self.extract_best(eid, cost_fn,
-                                     overrides={eid: node})
+            term = self.extract_best(
+                eid, cost_fn, overrides={eid: node}
+            )
             if term is None:
                 continue
             key = op_repr(term)
@@ -1245,7 +1353,7 @@ class EGraph:
         two very different programs compute the same thing.  Returns
         classes with >= 2 distinct member ops, each with a one-line
         sketch of every distinct member."""
-        from catopt.ir import op_repr
+
         out = []
         for eid, ec in self._classes.items():
             ops = {n.op for n in ec.nodes if n.op != "leaf"}
@@ -1261,7 +1369,9 @@ class EGraph:
                     child_ops = [
                         next(iter(self._classes[self.find(c)].nodes)).op
                         if self._classes[self.find(c)].nodes
-                        else "?" for c in n.children]
+                        else "?"
+                        for c in n.children
+                    ]
                     sk = f"{n.op}({','.join(child_ops)})"
                 if sk not in seen_sketch:
                     seen_sketch.add(sk)
@@ -1270,10 +1380,14 @@ class EGraph:
         out.sort(key=lambda d: -len(d["members"]))
         return out
 
-    def extract_best(self, eid: int, cost_fn,
-                     overrides: dict[int, Any] | None = None,
-                     bans: dict[int, set] | None = None,
-                     _cache_out: dict | None = None) -> Any:
+    def extract_best(
+        self,
+        eid: int,
+        cost_fn,
+        overrides: dict[int, Any] | None = None,
+        bans: dict[int, set] | None = None,
+        _cache_out: dict | None = None,
+    ) -> Any:
         """Extract the minimum-cost term from the e-class at *eid*.
 
         ``overrides`` maps canonical e-class ids to a specific ENode:
@@ -1321,6 +1435,7 @@ class EGraph:
         # keepalive retains every candidate term so id() keys in the
         # memo cannot be recycled by the GC mid-extraction.
         import inspect
+
         cost_memo: dict = {}
         keepalive: list = []
         takes_memo = "memo" in inspect.signature(cost_fn).parameters
@@ -1328,13 +1443,20 @@ class EGraph:
         # — folding does not shrink the weights file — so the param-only
         # discount does not apply.  getattr(..., "func", ...) unwraps
         # functools.partial bindings of the flagged function.
-        bill_params = getattr(getattr(cost_fn, "func", cost_fn),
-                              "charges_param_only", False)
+        bill_params = getattr(
+            getattr(cost_fn, "func", cost_fn),
+            "charges_param_only",
+            False,
+        )
 
         def cfn(t: Any) -> float:
-            return cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
+            return (
+                cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
+            )
 
-        def best(eclass_id: int) -> tuple[float, Any, frozenset, bool, int]:
+        def best(
+            eclass_id: int,
+        ) -> tuple[float, Any, frozenset, bool, int]:
             eclass_id = self.find(eclass_id)
             if eclass_id in cache:
                 return cache[eclass_id]
@@ -1348,9 +1470,14 @@ class EGraph:
             # equal-cost/equal-size ties otherwise resolve by hash
             # order — the extraction result (and any test asserting a
             # particular extracted shape) must not depend on it.
-            nodes = (override,) if override is not None else sorted(
-                eclass.nodes,
-                key=lambda n: (n.op, n.children, repr(n.attrs)))
+            nodes = (
+                (override,)
+                if override is not None
+                else sorted(
+                    eclass.nodes,
+                    key=lambda n: (n.op, n.children, repr(n.attrs)),
+                )
+            )
             banned = bans.get(eclass_id) if bans else None
             best_total: float | None = None
             best_term: Any = None
@@ -1367,6 +1494,7 @@ class EGraph:
                     total = cfn(term)
                     if best_total is None or total < best_total:
                         from catopt.ir import Var as _Var
+
                         best_total = total
                         best_term = term
                         best_used = frozenset({eclass_id})
@@ -1400,16 +1528,18 @@ class EGraph:
                     # unless the cost model prices storage, in which
                     # case every class's local is billed.
                     for u in cused - used:
-                        if bill_params or not param_only_of.get(u, False):
+                        if bill_params or not param_only_of.get(
+                            u, False
+                        ):
                             sub_cost += local_of.get(u, 0.0)
                     used |= cused
                 if not valid:
                     continue
-                term = Op.make(node.op, *child_terms, **dict(node.attrs))
-                keepalive.append(term)
-                local = cfn(term) - sum(
-                    cfn(c) for c in child_terms
+                term = Op.make(
+                    node.op, *child_terms, **dict(node.attrs)
                 )
+                keepalive.append(term)
+                local = cfn(term) - sum(cfn(c) for c in child_terms)
                 local = max(local, 0.0)
                 if param_only and not bill_params:
                     local = 0.0  # whole subtree folds at compile time
@@ -1419,9 +1549,11 @@ class EGraph:
                 # param-only class, for example).  Counted incrementally
                 # from child caches — no tree walk.
                 nops = child_nops + 1
-                if (best_total is None
-                        or total < best_total
-                        or (total == best_total and nops < best_nops)):
+                if (
+                    best_total is None
+                    or total < best_total
+                    or (total == best_total and nops < best_nops)
+                ):
                     best_total = total
                     best_term = term
                     best_used = frozenset(used)
@@ -1434,7 +1566,10 @@ class EGraph:
             local_of[eclass_id] = best_local
             param_only_of[eclass_id] = best_param_only
             cache[eclass_id] = (
-                best_total or 0.0, best_term, best_used, best_param_only,
+                best_total or 0.0,
+                best_term,
+                best_used,
+                best_param_only,
                 best_nops,
             )
             return cache[eclass_id]
@@ -1444,10 +1579,15 @@ class EGraph:
             _cache_out.update(cache)
         return term
 
-    def extract_best_bounded(self, eid: int, cost_fn,
-                             max_error: float | None = None, *,
-                             src_term: Any = None,
-                             _cache_out: dict | None = None) -> Any:
+    def extract_best_bounded(
+        self,
+        eid: int,
+        cost_fn,
+        max_error: float | None = None,
+        *,
+        src_term: Any = None,
+        _cache_out: dict | None = None,
+    ) -> Any:
         """Extract the minimum-cost member whose derivation certifies
         within ``max_error``.
 
@@ -1480,8 +1620,9 @@ class EGraph:
         matching ``Certificate.error_bound``.
         """
         if max_error is None:
-            return self.extract_best(eid, cost_fn,
-                                     _cache_out=_cache_out)
+            return self.extract_best(
+                eid, cost_fn, _cache_out=_cache_out
+            )
         root = self.find(eid)
         if src_term is None:
             src_term = self._oldest_term(root)
@@ -1489,8 +1630,9 @@ class EGraph:
                 src_term = self.any_term(root)
         bans: dict[int, set] = {}
         for _ in range(self.n_enodes + 1):
-            term = self.extract_best(root, cost_fn, bans=bans,
-                                     _cache_out=_cache_out)
+            term = self.extract_best(
+                root, cost_fn, bans=bans, _cache_out=_cache_out
+            )
             if term is None:
                 return None
             cert = self.certificate(src_term, term, root_eid=root)
@@ -1517,8 +1659,9 @@ class EGraph:
 
     # -- coordinated (group) extraction ----------------------------------
 
-    def extract_paired(self, root_eid: int, cost_fn,
-                       groups: list[dict[int, Any]]) -> Any:
+    def extract_paired(
+        self, root_eid: int, cost_fn, groups: list[dict[int, Any]]
+    ) -> Any:
         """Extract with pairing groups forced to share their fused GEMM.
 
         Per-class greedy extraction cannot express the product law's
@@ -1571,15 +1714,22 @@ class EGraph:
         # an arbitrarily expensive alternative (e.g. a distributed form)
         # and inflate the forced term's true DAG cost.
         import inspect
+
         cost_memo: dict = {}
         takes_memo = "memo" in inspect.signature(cost_fn).parameters
 
         def cfn(t: Any) -> float:
-            return cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
+            return (
+                cost_fn(t, memo=cost_memo) if takes_memo else cost_fn(t)
+            )
 
         pass1_cache: dict = {}
-        self.extract_best(root_eid, cost_fn, overrides=member_over,
-                          _cache_out=pass1_cache)
+        self.extract_best(
+            root_eid,
+            cost_fn,
+            overrides=member_over,
+            _cache_out=pass1_cache,
+        )
 
         keepalive: list = []
 
@@ -1603,8 +1753,9 @@ class EGraph:
             cid = self.find(cid)
             if cid in member_over or len(ec.nodes) < 2:
                 continue
-            member_reaching = [n for n in ec.nodes
-                               if enode_reaches_member(n)]
+            member_reaching = [
+                n for n in ec.nodes if enode_reaches_member(n)
+            ]
             if member_reaching and len(member_reaching) < len(ec.nodes):
                 # class has both member-reaching and bypassing enodes —
                 # force the cheapest member route so the shared GEMM
@@ -1620,7 +1771,9 @@ class EGraph:
     _CERT_MAX_DEPTH = 400
     _CERT_MAX_STEPS = 20_000
 
-    def _class_of_term(self, term: Any, _memo: dict | None = None) -> Any:
+    def _class_of_term(
+        self, term: Any, _memo: dict | None = None
+    ) -> Any:
         """Canonical e-class id realising *term*, without mutating the graph.
 
         ``_memo`` is ``id(term)``-keyed: ``any_term``/``_min_term``
@@ -1667,8 +1820,11 @@ class EGraph:
             return eid, None
         if not isinstance(term, Op):
             for n in ec.nodes:
-                if (n.op == "leaf" and n.attrs
-                        and n.attrs[0][1] == repr(term)):
+                if (
+                    n.op == "leaf"
+                    and n.attrs
+                    and n.attrs[0][1] == repr(term)
+                ):
                     return eid, n
             return eid, None
         child_cls = [self._class_of_term(a, memo) for a in term.args]
@@ -1677,8 +1833,10 @@ class EGraph:
                 continue
             if dict(n.attrs) != term.attrs:
                 continue
-            if all(cc is not None and self.find(c) == cc
-                   for c, cc in zip(n.children, child_cls)):
+            if all(
+                cc is not None and self.find(c) == cc
+                for c, cc in zip(n.children, child_cls)
+            ):
                 return eid, n
         return eid, None
 
@@ -1690,8 +1848,12 @@ class EGraph:
         eid = self._node_to_class.get(enode)
         return eid if eid is not None else 1 << 60
 
-    def _oldest_term(self, eid: int, _stack: frozenset = frozenset(),
-                     _memo: dict | None = None):
+    def _oldest_term(
+        self,
+        eid: int,
+        _stack: frozenset = frozenset(),
+        _memo: dict | None = None,
+    ):
         """The earliest-created representative term of an e-class.
 
         Proof-time analogue of :meth:`any_term`: picking the minimum-
@@ -1754,11 +1916,16 @@ class EGraph:
             return None, en
         # ``en`` must be the application's RHS root — children compare
         # modulo canonicalisation (rebuild may have rewritten ids).
-        if (root_en.op != en.op or root_en.attrs != en.attrs
-                or len(root_en.children) != len(en.children)):
+        if (
+            root_en.op != en.op
+            or root_en.attrs != en.attrs
+            or len(root_en.children) != len(en.children)
+        ):
             return None, en
-        if not all(self.find(a) == self.find(b)
-                   for a, b in zip(root_en.children, en.children)):
+        if not all(
+            self.find(a) == self.find(b)
+            for a, b in zip(root_en.children, en.children)
+        ):
             return None, en
         return app, en
 
@@ -1780,8 +1947,9 @@ class EGraph:
                 out[k] = t
         return out
 
-    def _connect(self, s: Any, t: Any, pos: tuple,
-                 steps: list, depth: int) -> bool:
+    def _connect(
+        self, s: Any, t: Any, pos: tuple, steps: list, depth: int
+    ) -> bool:
         """Emit steps rewriting the subterm at ``pos`` from ``s`` to ``t``.
 
         Both terms are members of one e-class.  Returns True when every
@@ -1803,17 +1971,31 @@ class EGraph:
         """
         if op_repr(s) == op_repr(t):
             return True
-        if depth > self._CERT_MAX_DEPTH or len(steps) > self._CERT_MAX_STEPS:
-            steps.append(CertStep("<budget>", pos, s, t, {},
-                                  egraph_dependent=True,
-                                  note="derivation budget exceeded"))
+        if (
+            depth > self._CERT_MAX_DEPTH
+            or len(steps) > self._CERT_MAX_STEPS
+        ):
+            steps.append(
+                CertStep(
+                    "<budget>",
+                    pos,
+                    s,
+                    t,
+                    {},
+                    egraph_dependent=True,
+                    note="derivation budget exceeded",
+                )
+            )
             return False
 
         app, _en = self._app_for_member(t)
         if app is not None:
             rule = self._rule_objs.get(app["rule"])
-            bound = (self._resolve_subst(app["subst"])
-                     if rule is not None else None)
+            bound = (
+                self._resolve_subst(app["subst"])
+                if rule is not None
+                else None
+            )
             if bound is not None:
                 L = _term_instantiate(rule.lhs, bound)
                 R = _term_instantiate(rule.rhs, bound)
@@ -1821,21 +2003,35 @@ class EGraph:
                 steps.append(CertStep(rule.name, pos, L, R, bound))
                 if isinstance(R, Op) and isinstance(t, Op):
                     for i in range(len(t.args)):
-                        if not self._connect(R.args[i], t.args[i],
-                                             pos + (i,), steps, depth + 1):
+                        if not self._connect(
+                            R.args[i],
+                            t.args[i],
+                            pos + (i,),
+                            steps,
+                            depth + 1,
+                        ):
                             ok = False
                 return ok
 
-        if (isinstance(s, Op) and isinstance(t, Op)
-                and s.op == t.op and s.attrs == t.attrs
-                and len(s.args) == len(t.args)):
+        if (
+            isinstance(s, Op)
+            and isinstance(t, Op)
+            and s.op == t.op
+            and s.attrs == t.attrs
+            and len(s.args) == len(t.args)
+        ):
             cs = [self._class_of_term(a) for a in s.args]
             ct = [self._class_of_term(a) for a in t.args]
             if all(a is not None and a == b for a, b in zip(cs, ct)):
                 ok = True
                 for i in range(len(s.args)):
-                    if not self._connect(s.args[i], t.args[i],
-                                         pos + (i,), steps, depth + 1):
+                    if not self._connect(
+                        s.args[i],
+                        t.args[i],
+                        pos + (i,),
+                        steps,
+                        depth + 1,
+                    ):
                         ok = False
                 return ok
 
@@ -1844,14 +2040,28 @@ class EGraph:
             steps.extend(path)
             return True
 
-        steps.append(CertStep("<egraph>", pos, s, t, {},
-                              egraph_dependent=True,
-                              note=self._explain_gap(s, t)))
+        steps.append(
+            CertStep(
+                "<egraph>",
+                pos,
+                s,
+                t,
+                {},
+                egraph_dependent=True,
+                note=self._explain_gap(s, t),
+            )
+        )
         return False
 
-    def _edge_path(self, s: Any, t: Any, pos: tuple, depth: int = 0,
-                   _seen: set | None = None,
-                   _budget: list | None = None) -> list | None:
+    def _edge_path(
+        self,
+        s: Any,
+        t: Any,
+        pos: tuple,
+        depth: int = 0,
+        _seen: set | None = None,
+        _budget: list | None = None,
+    ) -> list | None:
         """Bounded search for a replayable step sequence ``s -> t``.
 
         Transitions are the rules that actually fired during this run,
@@ -1894,16 +2104,25 @@ class EGraph:
         if en_t is not None:
             org = self._enode_origin.get(en_t)
             if org == "external":
-                return ("target enode introduced outside rule "
-                        "application (non-local pass such as "
-                        "pair_shared_input_*, or a manual union)")
+                return (
+                    "target enode introduced outside rule "
+                    "application (non-local pass such as "
+                    "pair_shared_input_*, or a manual union)"
+                )
             if org == "input":
-                return ("both members predate saturation but no fired "
-                        "rule links them at this position")
+                return (
+                    "both members predate saturation but no fired "
+                    "rule links them at this position"
+                )
         return "no replayable derivation found"
 
-    def _resolve_dst(self, src_term: Any, dst_term: Any,
-                     root_eid: int | None, cost_fn) -> tuple[int | None, Any]:
+    def _resolve_dst(
+        self,
+        src_term: Any,
+        dst_term: Any,
+        root_eid: int | None,
+        cost_fn,
+    ) -> tuple[int | None, Any]:
         """Shared endpoint resolution for certificates and coherence."""
         if root_eid is None:
             root_eid = self._class_of_term(src_term)
@@ -1912,13 +2131,19 @@ class EGraph:
                 raise ValueError("src_term is not in this e-graph")
             if cost_fn is None:
                 from catopt.cost import count_cost
+
                 cost_fn = count_cost
             dst_term = self.extract_best(root_eid, cost_fn)
         return root_eid, dst_term
 
-    def certificate(self, src_term: Any, dst_term: Any = None, *,
-                    root_eid: int | None = None,
-                    cost_fn=None) -> Certificate:
+    def certificate(
+        self,
+        src_term: Any,
+        dst_term: Any = None,
+        *,
+        root_eid: int | None = None,
+        cost_fn=None,
+    ) -> Certificate:
         """Build a proof-carrying derivation ``src_term`` -> ``dst_term``.
 
         ``src_term`` is the term originally added to the e-graph (the
@@ -1937,19 +2162,30 @@ class EGraph:
         rejected under ``strict=True``.
         """
         root_eid, dst_term = self._resolve_dst(
-            src_term, dst_term, root_eid, cost_fn)
+            src_term, dst_term, root_eid, cost_fn
+        )
         if not self._track:
             if op_repr(src_term) == op_repr(dst_term):
                 steps0: list = []
             else:
-                steps0 = [CertStep(
-                    "<truncated>", (), src_term, dst_term, {},
-                    egraph_dependent=True,
-                    note="truncation level 1: proof witnesses "
-                         "were not recorded")]
+                steps0 = [
+                    CertStep(
+                        "<truncated>",
+                        (),
+                        src_term,
+                        dst_term,
+                        {},
+                        egraph_dependent=True,
+                        note="truncation level 1: proof witnesses "
+                        "were not recorded",
+                    )
+                ]
             return Certificate(
-                src=src_term, dst=dst_term, root_eid=root_eid,
-                steps=steps0, rules={},
+                src=src_term,
+                dst=dst_term,
+                root_eid=root_eid,
+                steps=steps0,
+                rules={},
                 stats={
                     "proof_free": True,
                     "truncation_level": self.truncation_level,
@@ -1958,22 +2194,31 @@ class EGraph:
                     "rules_used": [],
                     "n_proof_edges": 0,
                     "n_rule_applications": 0,
-                })
+                },
+            )
         steps: list = []
         self._connect(src_term, dst_term, (), steps, 0)
         used = sorted({s.rule for s in steps if not s.egraph_dependent})
         cert = Certificate(
-            src=src_term, dst=dst_term, root_eid=root_eid, steps=steps,
-            rules={n: self._rule_objs[n] for n in used
-                   if n in self._rule_objs},
+            src=src_term,
+            dst=dst_term,
+            root_eid=root_eid,
+            steps=steps,
+            rules={
+                n: self._rule_objs[n]
+                for n in used
+                if n in self._rule_objs
+            },
             stats={
                 "n_steps": len(steps),
                 "n_egraph_dependent": sum(
-                    1 for s in steps if s.egraph_dependent),
+                    1 for s in steps if s.egraph_dependent
+                ),
                 "rules_used": used,
                 "n_proof_edges": len(self._merge_log),
                 "n_rule_applications": len(self._applications),
-            })
+            },
+        )
         return cert
 
     # -- level 3: lazily-materialised coherences --------------------------
@@ -1989,10 +2234,17 @@ class EGraph:
     #  cap and a per-path loop check.  Nothing is stored: coherence is
     #  computed when asked, then thrown away.
 
-    def all_proofs(self, src_term: Any, dst_term: Any = None, *,
-                   root_eid: int | None = None, cost_fn=None,
-                   max_paths: int = 32, max_steps: int = 8,
-                   fuel: int = 8192) -> list:
+    def all_proofs(
+        self,
+        src_term: Any,
+        dst_term: Any = None,
+        *,
+        root_eid: int | None = None,
+        cost_fn=None,
+        max_paths: int = 32,
+        max_steps: int = 8,
+        fuel: int = 8192,
+    ) -> list:
         """Enumerate distinct derivations ``src_term`` -> ``dst_term``.
 
         Bounded BFS over the term-rewriting space generated by the rules
@@ -2016,9 +2268,11 @@ class EGraph:
         if not self._track:
             raise RuntimeError(
                 "all_proofs requires truncation_level >= 2: level 1 "
-                "records no proof witnesses to enumerate over")
+                "records no proof witnesses to enumerate over"
+            )
         root_eid, dst_term = self._resolve_dst(
-            src_term, dst_term, root_eid, cost_fn)
+            src_term, dst_term, root_eid, cost_fn
+        )
         dst_repr = op_repr(dst_term)
         if op_repr(src_term) == dst_repr:
             return [[]]
@@ -2026,7 +2280,8 @@ class EGraph:
         rules = list(self._rule_objs.values())
         # frontier entries: (term, steps_so_far, seen_term_reprs)
         frontier: list[tuple[Any, list, frozenset]] = [
-            (src_term, [], frozenset({op_repr(src_term)}))]
+            (src_term, [], frozenset({op_repr(src_term)}))
+        ]
         paths: list[list] = []
         sigs: set = set()
         while frontier and fuel > 0 and len(paths) < max_paths:
@@ -2047,8 +2302,7 @@ class EGraph:
                         m = _term_match(rule.lhs, sub)
                         if m is None:
                             continue
-                        if (rule.check is not None
-                                and not rule.check(m)):
+                        if rule.check is not None and not rule.check(m):
                             continue
                         inst = dict(m)
                         if rule.derive is not None:
@@ -2059,24 +2313,34 @@ class EGraph:
                         r = _term_instantiate(rule.rhs, inst)
                         new_term = _replace_subterm(term, path, r)
                         new_repr = op_repr(new_term)
-                        nsteps = steps + [CertStep(
-                            rule.name, path, sub, r, inst)]
+                        nsteps = steps + [
+                            CertStep(rule.name, path, sub, r, inst)
+                        ]
                         if new_repr == dst_repr:
                             sig = tuple(
-                                (s.rule, s.path) for s in nsteps)
+                                (s.rule, s.path) for s in nsteps
+                            )
                             if sig not in sigs:
                                 sigs.add(sig)
                                 paths.append(nsteps)
                         elif new_repr not in seen:
-                            nxt.append((new_term, nsteps,
-                                        seen | {new_repr}))
+                            nxt.append(
+                                (new_term, nsteps, seen | {new_repr})
+                            )
             frontier = nxt
         return paths
 
-    def coherent_paths(self, src_term: Any, dst_term: Any = None, *,
-                       root_eid: int | None = None, cost_fn=None,
-                       max_paths: int = 32, max_steps: int = 8,
-                       fuel: int = 8192) -> dict:
+    def coherent_paths(
+        self,
+        src_term: Any,
+        dst_term: Any = None,
+        *,
+        root_eid: int | None = None,
+        cost_fn=None,
+        max_paths: int = 32,
+        max_steps: int = 8,
+        fuel: int = 8192,
+    ) -> dict:
         """Coherence summary between two terms: how many distinct ways
         does the rewrite space prove them equal?
 
@@ -2089,14 +2353,23 @@ class EGraph:
         may exist than reported.
         """
         root_eid, dst_term = self._resolve_dst(
-            src_term, dst_term, root_eid, cost_fn)
+            src_term, dst_term, root_eid, cost_fn
+        )
         paths = self.all_proofs(
-            src_term, dst_term, root_eid=root_eid,
-            max_paths=max_paths, max_steps=max_steps, fuel=fuel)
+            src_term,
+            dst_term,
+            root_eid=root_eid,
+            max_paths=max_paths,
+            max_steps=max_steps,
+            fuel=fuel,
+        )
         cs = self._class_of_term(src_term)
         cd = self._class_of_term(dst_term)
-        same = (cs is not None and cd is not None
-                and self.find(cs) == self.find(cd))
+        same = (
+            cs is not None
+            and cd is not None
+            and self.find(cs) == self.find(cd)
+        )
         return {
             "src": src_term,
             "dst": dst_term,
@@ -2129,8 +2402,9 @@ def _iter_ops(term: Any):
 # ---------------------------------------------------------------------------
 
 
-def _term_match(pattern: Any, term: Any,
-                _subst: dict | None = None) -> dict | None:
+def _term_match(
+    pattern: Any, term: Any, _subst: dict | None = None
+) -> dict | None:
     """Structural match of a pattern against a plain *term* (no e-graph).
 
     Mirrors :meth:`EGraph._match` semantics at term granularity: string
@@ -2209,15 +2483,17 @@ def _replace_subterm(term: Any, path: tuple, new: Any) -> Any:
         return new
     if not isinstance(term, Op) or path[0] >= len(term.args):
         raise CertificateVerificationError(
-            f"cannot descend path {list(path)} in {op_repr(term)}")
+            f"cannot descend path {list(path)} in {op_repr(term)}"
+        )
     i = path[0]
     args = list(term.args)
     args[i] = _replace_subterm(args[i], path[1:], new)
     return Op.make(term.op, *args, **dict(term.attrs))
 
 
-def verify_certificate(src_term: Any, cert: Certificate, *,
-                       strict: bool = False) -> Any:
+def verify_certificate(
+    src_term: Any, cert: Certificate, *, strict: bool = False
+) -> Any:
     """Replay a certificate's rule applications on real terms.
 
     For each step: descend to ``path`` in the evolving term, re-match
@@ -2235,67 +2511,82 @@ def verify_certificate(src_term: Any, cert: Certificate, *,
     if strict and cert.n_egraph_dependent:
         raise CertificateVerificationError(
             f"{cert.n_egraph_dependent} e-graph-dependent step(s) "
-            "cannot be replayed standalone")
+            "cannot be replayed standalone"
+        )
     if cert.src is not None and op_repr(src_term) != op_repr(cert.src):
         raise CertificateVerificationError(
             f"source mismatch: certificate proves {op_repr(cert.src)}, "
-            f"got {op_repr(src_term)}")
+            f"got {op_repr(src_term)}"
+        )
     current = src_term
     for i, step in enumerate(cert.steps):
         sub = _subterm(current, step.path)
         if sub is None:
             raise CertificateVerificationError(
                 f"step {i} ({step.rule}): path {list(step.path)} "
-                f"absent in {op_repr(current)}")
+                f"absent in {op_repr(current)}"
+            )
         if step.egraph_dependent:
             if op_repr(sub) != op_repr(step.lhs):
                 raise CertificateVerificationError(
                     f"step {i} (e-graph-dependent): expected "
                     f"{op_repr(step.lhs)} at {list(step.path)}, "
-                    f"found {op_repr(sub)}")
+                    f"found {op_repr(sub)}"
+                )
             current = _replace_subterm(current, step.path, step.rhs)
             continue
         rule = cert.rules.get(step.rule)
         if rule is None:
             raise CertificateVerificationError(
-                f"step {i}: unknown rule {step.rule!r}")
+                f"step {i}: unknown rule {step.rule!r}"
+            )
         if op_repr(step.lhs) != op_repr(sub):
             raise CertificateVerificationError(
                 f"step {i} ({step.rule}): recorded LHS instance "
-                f"{op_repr(step.lhs)} != subterm {op_repr(sub)}")
+                f"{op_repr(step.lhs)} != subterm {op_repr(sub)}"
+            )
         m = _term_match(rule.lhs, sub)
         if m is None:
             raise CertificateVerificationError(
                 f"step {i} ({step.rule}): LHS does not match "
-                f"{op_repr(sub)}")
+                f"{op_repr(sub)}"
+            )
         for k, v in step.bindings.items():
             if k not in m:
                 continue  # derived binding — checked via derive/rhs below
-            same = (m[k] == v if k.startswith("$attr:")
-                    else op_repr(m[k]) == op_repr(v))
+            same = (
+                m[k] == v
+                if k.startswith("$attr:")
+                else op_repr(m[k]) == op_repr(v)
+            )
             if not same:
                 raise CertificateVerificationError(
-                    f"step {i} ({step.rule}): binding {k} tampered")
+                    f"step {i} ({step.rule}): binding {k} tampered"
+                )
         if rule.check is not None and not rule.check(m):
             raise CertificateVerificationError(
-                f"step {i} ({step.rule}): side condition fails on replay")
+                f"step {i} ({step.rule}): side condition fails on replay"
+            )
         inst = dict(m)
         for k, v in step.bindings.items():
-            inst.setdefault(k, v)      # derived $attr bindings
+            inst.setdefault(k, v)  # derived $attr bindings
         if rule.derive is not None:
             extra = rule.derive(m)
             if extra is None:
                 raise CertificateVerificationError(
-                    f"step {i} ({step.rule}): derive vetoed on replay")
+                    f"step {i} ({step.rule}): derive vetoed on replay"
+                )
             inst.update(extra)
         rhs = _term_instantiate(rule.rhs, inst)
         if op_repr(rhs) != op_repr(step.rhs):
             raise CertificateVerificationError(
                 f"step {i} ({step.rule}): recorded RHS "
-                f"{op_repr(step.rhs)} != instantiated {op_repr(rhs)}")
+                f"{op_repr(step.rhs)} != instantiated {op_repr(rhs)}"
+            )
         current = _replace_subterm(current, step.path, rhs)
     if op_repr(current) != op_repr(cert.dst):
         raise CertificateVerificationError(
             f"replay produced {op_repr(current)}, "
-            f"certificate claims {op_repr(cert.dst)}")
+            f"certificate claims {op_repr(cert.dst)}"
+        )
     return current

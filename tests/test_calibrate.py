@@ -6,28 +6,32 @@ import json
 import pytest
 
 from catopt.calibrate import (
+    PROFILE_DIR_ENV,
     TargetProfile,
     calibrate,
     list_profiles,
     load_profile,
     profiles_dir,
     save_profile,
-    PROFILE_DIR_ENV,
 )
 from catopt.cost import (
     dag_cost,
+    depth_cost_for,
     roofline_cost,
     roofline_cost_for,
-    depth_cost_for,
 )
 from catopt.ir import Op, Param, TensorType, Var
 
-
 # The constants hardcoded in catopt.cost — the dev RTX 2050 profile.
 RTX2050 = TargetProfile(
-    name="RTX 2050", tflops=2.5, gbps=89.0, launch_us=8.7,
-    device="cuda:0", measured_at="2025-01-01T00:00:00+00:00",
-    meta={"dtype": "float32"})
+    name="RTX 2050",
+    tflops=2.5,
+    gbps=89.0,
+    launch_us=8.7,
+    device="cuda:0",
+    measured_at="2025-01-01T00:00:00+00:00",
+    meta={"dtype": "float32"},
+)
 
 
 def _mm_term():
@@ -47,6 +51,7 @@ def _ew_term():
 # ---------------------------------------------------------------------------
 # Serialisation / persistence
 # ---------------------------------------------------------------------------
+
 
 def test_profile_json_roundtrip():
     s = RTX2050.to_json()
@@ -69,8 +74,8 @@ def test_profile_save_load(tmp_path, monkeypatch):
     path = save_profile(RTX2050)
     assert path.parent == tmp_path and path.exists()
 
-    assert load_profile(RTX2050.name) == RTX2050        # by name
-    assert load_profile(path) == RTX2050                # by path
+    assert load_profile(RTX2050.name) == RTX2050  # by name
+    assert load_profile(path) == RTX2050  # by path
     assert RTX2050.name in list_profiles()
 
     # dir= parameter bypasses the env default
@@ -86,11 +91,15 @@ def test_profile_save_load(tmp_path, monkeypatch):
 # roofline_cost_for
 # ---------------------------------------------------------------------------
 
+
 def test_roofline_cost_for_matches_default():
     """The RTX 2050 profile must reproduce roofline_cost exactly."""
     fn = roofline_cost_for(RTX2050)
-    for term in (_mm_term(), _ew_term(),
-                 Op.make("add", _mm_term(), Var("y", TensorType((256, 256))))):
+    for term in (
+        _mm_term(),
+        _ew_term(),
+        Op.make("add", _mm_term(), Var("y", TensorType((256, 256)))),
+    ):
         assert fn(term) == pytest.approx(roofline_cost(term))
 
 
@@ -102,15 +111,15 @@ def test_roofline_cost_for_no_profile_is_default():
 def test_roofline_cost_for_is_a_cost_fn():
     """Standard cost-fn signature: fn(term, memo=None); works in dag_cost."""
     fn = roofline_cost_for(RTX2050)
-    term = Op.make("add", _mm_term(),
-                   Var("y", TensorType((256, 256))))
+    term = Op.make("add", _mm_term(), Var("y", TensorType((256, 256))))
     assert fn(term) > 0.0
     assert fn(term, memo={}) == pytest.approx(fn(term))
     # tree (no shared subtrees): dag_cost == additive cost
     assert dag_cost(term, fn) == pytest.approx(fn(term))
     # dict-shaped profiles plug in too
     fn_dict = roofline_cost_for(
-        {"tflops": 2.5, "gbps": 89.0, "launch_us": 8.7})
+        {"tflops": 2.5, "gbps": 89.0, "launch_us": 8.7}
+    )
     assert fn_dict(term) == pytest.approx(fn(term))
 
 
@@ -129,19 +138,35 @@ def test_profile_flips_ordering():
     compute-bound matmul and a memory-bound elementwise op."""
     mm, ew = _mm_term(), _ew_term()
     weak_compute = TargetProfile(
-        "weak-compute", tflops=0.01, gbps=1000.0, launch_us=1.0,
-        device="cpu", measured_at="t")
+        "weak-compute",
+        tflops=0.01,
+        gbps=1000.0,
+        launch_us=1.0,
+        device="cpu",
+        measured_at="t",
+    )
     weak_memory = TargetProfile(
-        "weak-memory", tflops=1000.0, gbps=0.01, launch_us=1.0,
-        device="cpu", measured_at="t")
-    f_wc, f_wm = roofline_cost_for(weak_compute), roofline_cost_for(weak_memory)
-    assert f_wc(mm) > f_wc(ew)   # compute-poor target: matmul loses
-    assert f_wm(mm) < f_wm(ew)   # bandwidth-poor target: elementwise loses
+        "weak-memory",
+        tflops=1000.0,
+        gbps=0.01,
+        launch_us=1.0,
+        device="cpu",
+        measured_at="t",
+    )
+    f_wc, f_wm = (
+        roofline_cost_for(weak_compute),
+        roofline_cost_for(weak_memory),
+    )
+    assert f_wc(mm) > f_wc(ew)  # compute-poor target: matmul loses
+    assert f_wm(mm) < f_wm(
+        ew
+    )  # bandwidth-poor target: elementwise loses
 
 
 # ---------------------------------------------------------------------------
 # calibrate()
 # ---------------------------------------------------------------------------
+
 
 def test_calibrate_cpu_sane():
     """Loose, CI-friendly bounds — any real CPU lands inside these."""

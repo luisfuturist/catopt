@@ -1,16 +1,21 @@
 """Tests for rewrite rules."""
 
-import pytest
-from catopt.ir import Op, Var, Const, Param, TensorType, op_repr
-from catopt.egraph import EGraph, Rewrite
+from catopt.egraph import EGraph
+from catopt.ir import Const, Op, Param, TensorType, Var
 from catopt.rules import (
-    all_rules, SIMPLIFICATION_RULES, CATEGORICAL_RULES,
-    COMM_ADD, COMM_MUL, ASSOC_ADD, ASSOC_MUL,
-    ID_ADD, ID_MUL, DOUBLE_NEG, SUB_TO_ADD,
-    SILU_EXPAND, SQUARE_EXPAND,
-    DISTRIBUTE_MUL, FACTOR_MUL,
-    NATURALITY_SCALAR, NATURALITY_SCALAR_REV,
-    ASSOC_MATMUL, ASSOC_MATMUL_REV,
+    ASSOC_MATMUL,
+    ASSOC_MATMUL_REV,
+    CATEGORICAL_RULES,
+    COMM_ADD,
+    ID_ADD,
+    ID_MUL,
+    NATURALITY_SCALAR,
+    NATURALITY_SCALAR_REV,
+    SILU_EXPAND,
+    SIMPLIFICATION_RULES,
+    SQUARE_EXPAND,
+    SUB_TO_ADD,
+    all_rules,
 )
 
 
@@ -35,6 +40,7 @@ def test_id_add_simplifies():
     eg.run([ID_ADD], eid, max_iterations=5, max_nodes=100)
 
     from catopt.cost import count_cost
+
     best = eg.extract_best(eid, count_cost)
     # The best should be just "x" (leaf, 0 cost)
     # Note: after simplification, the e-class should contain both add(x,0) and x.
@@ -51,6 +57,7 @@ def test_id_mul_simplifies():
     eg.run([ID_MUL], eid, max_iterations=5, max_nodes=100)
 
     from catopt.cost import count_cost
+
     best = eg.extract_best(eid, count_cost)
     assert isinstance(best, Var) and best.name == "x"
 
@@ -67,7 +74,7 @@ def test_silu_expands():
     root_class = eg.get_class(eid)
     op_names = {n.op for n in root_class.nodes}
     assert "silu" in op_names  # original
-    assert "mul" in op_names   # expanded
+    assert "mul" in op_names  # expanded
 
 
 def test_sub_converts_to_add():
@@ -82,7 +89,7 @@ def test_sub_converts_to_add():
     root_class = eg.get_class(eid)
     op_names = {n.op for n in root_class.nodes}
     assert "sub" in op_names  # original
-    assert "add" in op_names   # converted
+    assert "add" in op_names  # converted
 
 
 def test_square_expands():
@@ -109,8 +116,12 @@ def test_naturality_round_trip():
     term = Op.make("matmul", W, Op.make("mul", x, c))
     eg = EGraph()
     eid = eg.add_term(term)
-    eg.run([NATURALITY_SCALAR, NATURALITY_SCALAR_REV], eid,
-           max_iterations=5, max_nodes=100)
+    eg.run(
+        [NATURALITY_SCALAR, NATURALITY_SCALAR_REV],
+        eid,
+        max_iterations=5,
+        max_nodes=100,
+    )
 
     root_class = eg.get_class(eid)
     # Should contain both forms
@@ -124,11 +135,17 @@ def test_matmul_associativity():
     B = Param("B", TensorType((4, 4)))
     C = Param("C", TensorType((4, 4)))
 
-    left = Op.make("matmul", Op.make("matmul", Op.make("matmul", x, A), B), C)
+    left = Op.make(
+        "matmul", Op.make("matmul", Op.make("matmul", x, A), B), C
+    )
     eg = EGraph()
     eid = eg.add_term(left)
-    eg.run([ASSOC_MATMUL, ASSOC_MATMUL_REV], eid,
-           max_iterations=10, max_nodes=10000)
+    eg.run(
+        [ASSOC_MATMUL, ASSOC_MATMUL_REV],
+        eid,
+        max_iterations=10,
+        max_nodes=10000,
+    )
 
     root_class = eg.get_class(eid)
     # Both association orders should be present
@@ -145,10 +162,12 @@ def _forced_member_term(eg, eid, op_name):
     override to the enode with the given op — the same coordinated-
     extraction mechanism the pipeline uses for pairing offers."""
     from catopt.cost import count_cost
+
     cls = eg.get_class(eid)
     node = next(n for n in cls.nodes if n.op == op_name)
-    return eg.extract_best(eid, count_cost,
-                           overrides={eg.find(eid): node})
+    return eg.extract_best(
+        eid, count_cost, overrides={eg.find(eid): node}
+    )
 
 
 def test_share_duplicate_param_slices_offers_dedup_member():
@@ -156,10 +175,11 @@ def test_share_duplicate_param_slices_offers_dedup_member():
     member that stores only the unique head-blocks and evaluates
     fp64-exact through ir_to_torch_module."""
     import torch
+
     from catopt.egraph import EGraph
+    from catopt.ir import IR
     from catopt.rules import share_duplicate_param_slices
     from catopt.torch_bridge import ir_to_torch_module
-    from catopt.ir import IR
 
     torch.manual_seed(0)
     h, d, i = 4, 3, 5
@@ -167,7 +187,7 @@ def test_share_duplicate_param_slices_offers_dedup_member():
     a = torch.randn(d, i, dtype=torch.float64)
     b = torch.randn(d, i, dtype=torch.float64)
     c = torch.randn(d, i, dtype=torch.float64)
-    W = torch.cat([a, b, a, c], dim=0)          # heads 0 and 2 tied
+    W = torch.cat([a, b, a, c], dim=0)  # heads 0 and 2 tied
     source = {"W": W}
 
     eg = EGraph()
@@ -179,7 +199,7 @@ def test_share_duplicate_param_slices_offers_dedup_member():
     assert off["param"] == "W"
     assert off["heads"] == h
     assert off["head_dim"] == d
-    assert off["unique"] == 3                    # {a, b, c}
+    assert off["unique"] == 3  # {a, b, c}
     assert off["index_map"] == (0, 1, 0, 2)
     assert off["stored_after"] == 3 * d * i
     assert off["stored_after"] < off["stored_before"] == o * i
@@ -203,7 +223,7 @@ def test_share_duplicate_param_slices_offers_dedup_member():
     assert stored == 3 * d * i < o * i
 
     # ... and evaluates bitwise-equal to W (float64, exact gather).
-    out = mod(torch.zeros(1))                    # no Var leaves: arg unused
+    out = mod(torch.zeros(1))  # no Var leaves: arg unused
     assert out.dtype == torch.float64
     assert torch.equal(out, W)
 
@@ -218,6 +238,7 @@ def test_share_duplicate_param_slices_offers_dedup_member():
     # Under the storage cost model the member wins extraction on its
     # own — 45 stored values < 60 — no coordinated override needed.
     from catopt.cost import param_bytes_cost_for
+
     best = eg.extract_best(w_eid, param_bytes_cost_for(source))
     assert best == member
 
@@ -226,11 +247,14 @@ def test_share_duplicate_param_slices_no_offer_when_all_distinct():
     """All-distinct head slices -> no member offered, no dedup tensor
     registered, the class keeps only its leaf."""
     import torch
+
     from catopt.egraph import EGraph
     from catopt.rules import share_duplicate_param_slices
 
     torch.manual_seed(1)
-    W = torch.randn(12, 5, dtype=torch.float64)  # 4 heads x 3 rows, all distinct
+    W = torch.randn(
+        12, 5, dtype=torch.float64
+    )  # 4 heads x 3 rows, all distinct
     source = {"W": W}
 
     eg = EGraph()
@@ -239,13 +263,14 @@ def test_share_duplicate_param_slices_no_offer_when_all_distinct():
 
     assert offers == []
     assert {n.op for n in eg.get_class(w_eid).nodes} == {"leaf"}
-    assert list(source) == ["W"]                 # nothing registered
+    assert list(source) == ["W"]  # nothing registered
 
 
 def test_share_duplicate_param_slices_guards():
     """Only 2-D params that actually appear in the e-graph are
     considered; a dedup form must strictly shrink storage."""
     import torch
+
     from catopt.egraph import EGraph
     from catopt.rules import share_duplicate_param_slices
 
@@ -258,7 +283,7 @@ def test_share_duplicate_param_slices_guards():
     # qualify, so use o=1*2... simplest non-shrinking case: W whose
     # only equal-block factorisation is h=o (all rows unique under it).
     W2 = torch.randn(6, 4, dtype=torch.float64)
-    W2[3:] = W2[:3]                              # halves equal: h=2 works
+    W2[3:] = W2[:3]  # halves equal: h=2 works
     # W3 is 2-D with duplicated rows but never appears in the e-graph.
     W3 = torch.cat([v.reshape(2, 2), v.reshape(2, 2)], dim=0)
     source = {"bias": v1, "W": W2, "absent": W3}
@@ -276,6 +301,9 @@ def test_share_duplicate_param_slices_guards():
     assert off["unique"] == 1 and off["index_map"] == (0, 0)
     assert off["stored_after"] == 3 * 4 < 6 * 4
     # 'bias' (1-D) and 'absent' (not in graph) produced no dedup params.
-    assert [n for n in source if n != "W" and n != off["dedup_param"]
-            and n != "bias"] == ["absent"]
+    assert [
+        n
+        for n in source
+        if n != "W" and n != off["dedup_param"] and n != "bias"
+    ] == ["absent"]
     assert off["dedup_param"] in source

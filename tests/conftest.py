@@ -27,12 +27,14 @@ def _cuda_skip_reason() -> str | None:
         return "requires_cuda: no CUDA device"
     try:
         x = torch.zeros(_PROBE_NUMEL, device="cuda")
-        float(x.sum())          # launch a kernel, not just an alloc
+        float(x.sum())  # launch a kernel, not just an alloc
         torch.cuda.synchronize()
         del x
-    except Exception as e:      # noqa: BLE001 — any probe failure → skip
-        return (f"requires_cuda: CUDA present but unusable "
-                f"({type(e).__name__}: {e})")
+    except Exception as e:
+        return (
+            f"requires_cuda: CUDA present but unusable "
+            f"({type(e).__name__}: {e})"
+        )
     return None
 
 

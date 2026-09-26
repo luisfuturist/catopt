@@ -39,10 +39,14 @@ def _first_tensor(x: Any) -> torch.Tensor:
     return x
 
 
-def _bench_once(model: torch.nn.Module, x: torch.Tensor,
-                warmup: int = 5, repeats: int = 20) -> BenchResult:
+def _bench_once(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    warmup: int = 5,
+    repeats: int = 20,
+) -> BenchResult:
     """Run a model *repeats* times and return timing statistics."""
-        # Warmup
+    # Warmup
     for _ in range(warmup):
         with torch.no_grad():
             _ = _call_model(model, x)
@@ -74,7 +78,7 @@ def _bench_once(model: torch.nn.Module, x: torch.Tensor,
     return BenchResult(
         name="",
         mean_ms=mean,
-        std_ms=var ** 0.5,
+        std_ms=var**0.5,
         n_runs=n,
     )
 
@@ -115,7 +119,11 @@ def benchmark_comparison(
     """
     # Verify semantic equivalence
     with torch.no_grad():
-        xc = tuple(t.clone() for t in x) if isinstance(x, tuple) else x.clone()
+        xc = (
+            tuple(t.clone() for t in x)
+            if isinstance(x, tuple)
+            else x.clone()
+        )
         orig_out = _call_model(original_model, xc)
         opt_out = _call_model(optimized_model, xc)
         max_diff = (orig_out - opt_out).abs().max().item()
@@ -123,18 +131,32 @@ def benchmark_comparison(
         print(f"  [verify] max_rel_diff = {rel_diff:.2e}")
 
     # Warm up compile cache
-    print(f"  [compile] warming up original model with torch.compile...")
-    orig_result = benchmark_model(original_model, x, f"{name} / TorchInductor",
-                                  use_compile=True)
-    print(f"  [compile] warming up optimized model with torch.compile...")
-    opt_result = benchmark_model(optimized_model, x, f"{name} / Categorical+Inductor",
-                                 use_compile=True)
+    print(
+        "  [compile] warming up original model with torch.compile..."
+    )
+    orig_result = benchmark_model(
+        original_model, x, f"{name} / TorchInductor", use_compile=True
+    )
+    print(
+        "  [compile] warming up optimized model with torch.compile..."
+    )
+    opt_result = benchmark_model(
+        optimized_model,
+        x,
+        f"{name} / Categorical+Inductor",
+        use_compile=True,
+    )
 
     # Also benchmark eager (no compile) for reference
-    orig_eager = benchmark_model(original_model, x, f"{name} / TorchInductor",
-                                 use_compile=False)
-    opt_eager = benchmark_model(optimized_model, x, f"{name} / Categorical+Inductor",
-                                use_compile=False)
+    orig_eager = benchmark_model(
+        original_model, x, f"{name} / TorchInductor", use_compile=False
+    )
+    opt_eager = benchmark_model(
+        optimized_model,
+        x,
+        f"{name} / Categorical+Inductor",
+        use_compile=False,
+    )
 
     return orig_result, opt_result
 
@@ -148,17 +170,23 @@ def print_comparison_table(
     Each entry in *cases* is:
     (program_name, semantically_equivalent, inductor_result, catopt_result)
     """
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  {title}")
-    print(f"{'='*80}")
-    print(f"{'Program':<20} {'Equiv?':<10} {'Inductor (ms)':>16} {'CatOpt (ms)':>16} {'Speedup':>10}")
-    print(f"{'-'*20} {'-'*10} {'-'*16} {'-'*16} {'-'*10}")
+    print(f"{'=' * 80}")
+    print(
+        f"{'Program':<20} {'Equiv?':<10} {'Inductor (ms)':>16} {'CatOpt (ms)':>16} {'Speedup':>10}"
+    )
+    print(f"{'-' * 20} {'-' * 10} {'-' * 16} {'-' * 16} {'-' * 10}")
 
     for prog_name, equiv, ind, cat in cases:
         speedup = ind.mean_ms / (cat.mean_ms + 1e-9)
-        speedup_str = f"{speedup:.2f}x" if speedup > 1.0 else f"{speedup:.2f}x"
+        speedup_str = (
+            f"{speedup:.2f}x" if speedup > 1.0 else f"{speedup:.2f}x"
+        )
         flag = "  ↑" if speedup > 1.001 else "  —"
-        print(f"{prog_name:<20} {equiv:<10} {ind.mean_ms:>10.3f}±{ind.std_ms:<4.2f}  "
-              f"{cat.mean_ms:>10.3f}±{cat.std_ms:<4.2f} {speedup_str:>8} {flag}")
+        print(
+            f"{prog_name:<20} {equiv:<10} {ind.mean_ms:>10.3f}±{ind.std_ms:<4.2f}  "
+            f"{cat.mean_ms:>10.3f}±{cat.std_ms:<4.2f} {speedup_str:>8} {flag}"
+        )
 
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")

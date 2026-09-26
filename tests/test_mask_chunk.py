@@ -38,16 +38,16 @@ Covered here:
 import torch
 import torch.nn.functional as F
 
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, TensorType, op_repr
-from catopt.om import OM_LAWS
 from catopt.cost import flops_cost
+from catopt.egraph import EGraph
+from catopt.ir import IR, Op, TensorType, Var, op_repr
+from catopt.om import OM_LAWS
 from catopt.torch_bridge import ir_to_torch_module
-
 
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
+
 
 def _nested_cat(ts, dim, attr_key="dim"):
     out = ts[0]
@@ -56,8 +56,9 @@ def _nested_cat(ts, dim, attr_key="dim"):
     return out
 
 
-def _sdpa_mask_term(q, ks, vs, m, attr_key="dim", spelling="export",
-                    scale=None):
+def _sdpa_mask_term(
+    q, ks, vs, m, attr_key="dim", spelling="export", scale=None
+):
     """sdpa(q, cat(k_i), cat(v_i), m) as an IR term.
 
     ``spelling`` selects the flag encoding:
@@ -90,15 +91,23 @@ def _sdpa_ref(q, ks, vs, m, scale=None):
     if scale is not None:
         kw["scale"] = scale
     return F.scaled_dot_product_attention(
-        q, torch.cat(list(ks), dim=-2), torch.cat(list(vs), dim=-2),
-        attn_mask=m, **kw)
+        q,
+        torch.cat(list(ks), dim=-2),
+        torch.cat(list(vs), dim=-2),
+        attn_mask=m,
+        **kw,
+    )
 
 
 def _run_om(term, max_iterations=20, max_nodes=200_000):
     eg = EGraph()
     root = eg.add_term(term)
-    stats = eg.run(OM_LAWS, root, max_iterations=max_iterations,
-                   max_nodes=max_nodes)
+    stats = eg.run(
+        OM_LAWS,
+        root,
+        max_iterations=max_iterations,
+        max_nodes=max_nodes,
+    )
     return eg, root, stats
 
 
@@ -124,12 +133,15 @@ def _extract_chunked(eg, root):
     ov = {}
     for cid in list(eg._classes):
         c = eg.find(cid)
-        comps = [n for n in eg._classes[c].nodes if n.op == "om_compose"]
+        comps = [
+            n for n in eg._classes[c].nodes if n.op == "om_compose"
+        ]
         if comps:
             ov.setdefault(c, comps[0])
     for n in eg.get_class(canon).nodes:
-        if (n.op == "om_apply"
-                and _class_has_op(eg, n.children[0], "om_compose")):
+        if n.op == "om_apply" and _class_has_op(
+            eg, n.children[0], "om_compose"
+        ):
             o = dict(ov)
             o[canon] = n
             t = eg.extract_best(canon, flops_cost, overrides=o)
@@ -146,15 +158,25 @@ def _assert_close_or_nan(out, ref, tol=1e-12):
     must be exactly the positions where ``ref`` is 0, and everywhere
     ``out`` is finite it must match ``ref`` to tol."""
     nan = torch.isnan(out)
-    assert not torch.isnan(ref).any()      # sdpa never NaNs
+    assert not torch.isnan(ref).any()  # sdpa never NaNs
     assert torch.equal(ref[nan], torch.zeros_like(ref[nan]))
     fin = ~nan
     assert (out[fin] - ref[fin]).abs().max().item() < tol
 
 
-def _mask_chunked_ok(ksizes, mask_fn, T=5, d=4, dv=7, seed=0,
-                     attr_key="dim", spelling="export", scale=None,
-                     batch=None, mask_term=None):
+def _mask_chunked_ok(
+    ksizes,
+    mask_fn,
+    T=5,
+    d=4,
+    dv=7,
+    seed=0,
+    attr_key="dim",
+    spelling="export",
+    scale=None,
+    batch=None,
+    mask_term=None,
+):
     """Saturate an sdpa-over-concats term carrying an explicit
     attn_mask, force-extract the chunked carrier, verify fp64 vs
     F.scaled_dot_product_attention.
@@ -170,35 +192,53 @@ def _mask_chunked_ok(ksizes, mask_fn, T=5, d=4, dv=7, seed=0,
     vshape = lambda k: (batch + (k, dv)) if batch else (k, dv)
     tm_probe = mask_fn(T, sum(ksizes))
     q = Var("q", TensorType(qshape))
-    ks = [Var(f"k{i}", TensorType(kshape(k)))
-          for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType(vshape(k)))
-          for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType(kshape(k)))
+        for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType(vshape(k)))
+        for i, k in enumerate(ksizes)
+    ]
     m = Var("m", TensorType(tuple(tm_probe.shape)))
     mterm = mask_term(m) if mask_term is not None else m
-    term = _sdpa_mask_term(q, ks, vs, mterm, attr_key=attr_key,
-                           spelling=spelling, scale=scale)
+    term = _sdpa_mask_term(
+        q,
+        ks,
+        vs,
+        mterm,
+        attr_key=attr_key,
+        spelling=spelling,
+        scale=scale,
+    )
 
     eg, root, _ = _run_om(term)
-    chunked = [n for n in eg.get_class(root).nodes
-               if n.op == "om_apply"
-               and _class_has_op(eg, n.children[0], "om_compose")]
-    assert chunked, "masked sdpa never decomposed into a chunked carrier"
+    chunked = [
+        n
+        for n in eg.get_class(root).nodes
+        if n.op == "om_apply"
+        and _class_has_op(eg, n.children[0], "om_compose")
+    ]
+    assert chunked, (
+        "masked sdpa never decomposed into a chunked carrier"
+    )
     term = _extract_chunked(eg, root)
     assert term is not None and "om_compose" in op_repr(term)
 
     inputs = [q] + ks + vs + [m]
-    ir = IR(root=term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
 
     tq = torch.randn(*qshape, dtype=torch.float64)
-    tks = [torch.randn(*kshape(k), dtype=torch.float64)
-           for k in ksizes]
-    tvs = [torch.randn(*vshape(k), dtype=torch.float64)
-           for k in ksizes]
+    tks = [torch.randn(*kshape(k), dtype=torch.float64) for k in ksizes]
+    tvs = [torch.randn(*vshape(k), dtype=torch.float64) for k in ksizes]
     tm = tm_probe
-    ref_mask = (torch.logical_not(tm) if mask_term is not None else tm)
+    ref_mask = torch.logical_not(tm) if mask_term is not None else tm
     ref = _sdpa_ref(tq, tks, tvs, ref_mask, scale=scale)
     with torch.no_grad():
         out = mod(tq, *tks, *tvs, tm)
@@ -210,13 +250,19 @@ def _mask_chunked_ok(ksizes, mask_fn, T=5, d=4, dv=7, seed=0,
 #  (a) the law fires — every spelling export/hand-built terms produce
 # ---------------------------------------------------------------------------
 
+
 def _fires_mask_law(spelling="export", attr_key="dim", scale=None):
     q = Var("q", TensorType((5, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))]
-    vs = [Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
+    ]
     m = Var("m", TensorType((5, 9)))
-    term = _sdpa_mask_term(q, ks, vs, m, attr_key=attr_key,
-                           spelling=spelling, scale=scale)
+    term = _sdpa_mask_term(
+        q, ks, vs, m, attr_key=attr_key, spelling=spelling, scale=scale
+    )
     eg, root, _ = _run_om(term)
     return eg
 
@@ -225,52 +271,55 @@ def test_mask_law_fires_export_spelling():
     """sdpa(q, cat k, cat v, m) — the bare 4-operand form torch.export
     emits — gains the om_apply member."""
     eg = _fires_mask_law()
-    assert any(k.startswith("sdpa_cat_mask_")
-               for k in eg.rule_fires), dict(eg.rule_fires)
+    assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires), (
+        dict(eg.rule_fires)
+    )
 
 
 def test_mask_law_fires_positional_attrs():
     """arg4=dropout_p, arg5=is_causal=False — the positional flag form."""
     eg = _fires_mask_law(spelling="pos")
-    assert any(k.startswith("sdpa_cat_mask_")
-               for k in eg.rule_fires)
+    assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
 
 
 def test_mask_law_fires_kwarg_spelling():
     """The hand-built is_causal=False kwarg form fires too."""
     eg = _fires_mask_law(spelling="kwarg")
-    assert any(k.startswith("sdpa_cat_mask_")
-               for k in eg.rule_fires)
+    assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
 
 
 def test_mask_law_fires_arg1_concat_spelling():
     """Concat dims spelled arg1= (raw positional) also match."""
     eg = _fires_mask_law(attr_key="arg1")
-    assert any(k.startswith("sdpa_cat_mask_") and k.endswith("arg1")
-               for k in eg.rule_fires)
+    assert any(
+        k.startswith("sdpa_cat_mask_") and k.endswith("arg1")
+        for k in eg.rule_fires
+    )
 
 
 def test_mask_law_fires_with_scale():
     """A non-default scale lands as scale= / arg6= and still fires."""
     eg = _fires_mask_law(scale=0.5)
-    assert any(k.startswith("sdpa_cat_mask_")
-               for k in eg.rule_fires)
+    assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
     eg = _fires_mask_law(spelling="pos", scale=0.5)
-    assert any(k.startswith("sdpa_cat_mask_")
-               for k in eg.rule_fires)
+    assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
 
 
 # ---------------------------------------------------------------------------
 #  (b) fp64 equivalence — additive (float) masks
 # ---------------------------------------------------------------------------
 
+
 def _addmask_fn(p=0.35):
     """Additive 0/−inf bias mask — the HF attn_bias idiom."""
+
     def fn(T, K):
         return torch.where(
             torch.rand(T, K) < p,
             torch.tensor(float("-inf"), dtype=torch.float64),
-            torch.zeros(T, K, dtype=torch.float64))
+            torch.zeros(T, K, dtype=torch.float64),
+        )
+
     return fn
 
 
@@ -331,7 +380,8 @@ def test_additive_mask_batched_heads():
         return torch.where(
             torch.rand(B, 1, T, K) < 0.35,
             torch.tensor(float("-inf"), dtype=torch.float64),
-            torch.zeros(B, 1, T, K, dtype=torch.float64))
+            torch.zeros(B, 1, T, K, dtype=torch.float64),
+        )
 
     _mask_chunked_ok([2, 5], mask_fn, batch=(B, H))
 
@@ -340,10 +390,11 @@ def test_additive_mask_batched_heads():
 #  (c) fp64 equivalence — bool keep-masks
 # ---------------------------------------------------------------------------
 
+
 def _boolmask_fn(T, K):
     """Bool keep-mask: True = attend (torch's attn_mask convention)."""
     m = torch.rand(T, K) < 0.6
-    m[:, 0] = True                     # keep row 0-key so rows stay live
+    m[:, 0] = True  # keep row 0-key so rows stay live
     return m
 
 
@@ -374,35 +425,42 @@ def test_logical_not_mask_operand_fp64():
     """The mask shape sdpa_fold produces: attn_mask = logical_not(mk)
     with mk the bad-mask.  attnbias coerces the bool operand exactly —
     keep where mk is False."""
+
     def badmask(T, K):
         m = torch.rand(T, K) < 0.4
-        m[:, 0] = False                # key 0 always allowed
+        m[:, 0] = False  # key 0 always allowed
         return m
 
     _mask_chunked_ok(
-        [3, 6], badmask,
-        mask_term=lambda mv: Op.make("logical_not", mv))
+        [3, 6], badmask, mask_term=lambda mv: Op.make("logical_not", mv)
+    )
 
 
 # ---------------------------------------------------------------------------
 #  (d) broadcast masks — lower rank, extent-1 key axis
 # ---------------------------------------------------------------------------
 
+
 def test_key_only_mask_fp64():
     """Mask (K,) — broadcast over rows, sliced on its own last dim."""
+
     def mask_fn(T, K):
         return torch.where(
             torch.rand(K) < 0.4,
             torch.tensor(float("-inf"), dtype=torch.float64),
-            torch.zeros(K, dtype=torch.float64))
+            torch.zeros(K, dtype=torch.float64),
+        )
+
     _mask_chunked_ok([3, 6], mask_fn)
 
 
 def test_rowwise_bias_mask_fp64():
     """Mask (T,1) — extent 1 on the key axis broadcasts; ADD_MASK_CAT's
     reuse mode shares the operand across blocks, no split needed."""
+
     def mask_fn(T, K):
         return torch.randn(T, 1, dtype=torch.float64)
+
     eg, term, out, ref, _ = _mask_chunked_ok([3, 6], mask_fn)
     _assert_close_or_nan(out, ref)
 
@@ -410,10 +468,12 @@ def test_rowwise_bias_mask_fp64():
 def test_head_broadcast_bool_mask_fp64():
     """Mask (1,1,T,K) under rank-4 scores — leading broadcast dims are
     fine; the key axis is still the last."""
+
     def mask_fn(T, K):
         m = torch.rand(1, 1, T, K) < 0.6
         m[..., 0] = True
         return m
+
     _mask_chunked_ok([2, 5], mask_fn, batch=(2, 3))
 
 
@@ -421,18 +481,21 @@ def test_head_broadcast_bool_mask_fp64():
 #  (e) −inf / NaN edge semantics — must match sdpa exactly
 # ---------------------------------------------------------------------------
 
+
 def test_fully_masked_row_nan_parity():
     """A row masked across ALL blocks: the carrier reproduces dense
     softmax (a/l = 0/0 = NaN) while torch's sdpa kernel emits 0 — the
     one documented divergence, inherited from om_apply's deliberately
     unclamped semantics.  Asserted precisely: NaN rows in out, zeros in
     ref, identical elsewhere."""
+
     def mask_fn(T, K):
         m = torch.zeros(T, K, dtype=torch.float64)
         m[torch.rand(T, K) < 0.3] = float("-inf")
-        m[1] = float("-inf")           # fully-masked row
+        m[1] = float("-inf")  # fully-masked row
         m[3] = float("-inf")
         return m
+
     eg, term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
     assert torch.isnan(out[1]).all() and torch.isnan(out[3]).all()
     assert torch.equal(ref[1], torch.zeros_like(ref[1]))
@@ -443,10 +506,12 @@ def test_fully_masked_row_nan_parity():
 def test_fully_masked_block_contributes_zero():
     """One whole block masked — its mask slice is all −inf, the carrier
     is dropped by om_compose's isfinite guard, matching sdpa."""
+
     def mask_fn(T, K):
         m = torch.zeros(T, K, dtype=torch.float64)
-        m[:, 3:] = float("-inf")       # block 1 entirely masked
+        m[:, 3:] = float("-inf")  # block 1 entirely masked
         return m
+
     eg, term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
     assert torch.isfinite(ref).all()
     _assert_close_or_nan(out, ref)
@@ -455,10 +520,12 @@ def test_fully_masked_block_contributes_zero():
 def test_bool_fully_masked_row_nan_parity():
     """Bool variant: an all-False row is fully masked → NaN carrier,
     zeros in sdpa — same documented divergence as the additive case."""
+
     def mask_fn(T, K):
         m = torch.rand(T, K) < 0.6
-        m[2] = False                   # fully-masked row
+        m[2] = False  # fully-masked row
         return m
+
     eg, term, out, ref, _ = _mask_chunked_ok([3, 4], mask_fn, T=4)
     assert torch.isnan(out[2]).all()
     assert torch.equal(ref[2], torch.zeros_like(ref[2]))
@@ -468,6 +535,7 @@ def test_bool_fully_masked_row_nan_parity():
 # ---------------------------------------------------------------------------
 #  (f) negative checks — ill-typed masks must NOT chunk
 # ---------------------------------------------------------------------------
+
 
 def _no_fire(term):
     eg = EGraph()
@@ -479,49 +547,72 @@ def _no_fire(term):
 def test_mask_wrong_extent_does_not_fire():
     """Mask last dim 6 while Tk = 3+6 = 9 — unsplittable → veto."""
     q = Var("q", TensorType((5, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))]
-    vs = [Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
+    ]
     m = Var("m", TensorType((5, 6)))
     eg = _no_fire(_sdpa_mask_term(q, ks, vs, m))
-    assert not any(k.startswith("sdpa_cat_mask_")
-                   for k in eg.rule_fires)
+    assert not any(
+        k.startswith("sdpa_cat_mask_") for k in eg.rule_fires
+    )
 
 
 def test_mask_extent_on_wrong_axis_does_not_fire():
     """Mask (Tk, Tq) — the key extent sits on the row axis → veto."""
     q = Var("q", TensorType((5, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))]
-    vs = [Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
+    ]
     m = Var("m", TensorType((9, 5)))
     eg = _no_fire(_sdpa_mask_term(q, ks, vs, m))
-    assert not any(k.startswith("sdpa_cat_mask_")
-                   for k in eg.rule_fires)
+    assert not any(
+        k.startswith("sdpa_cat_mask_") for k in eg.rule_fires
+    )
 
 
 def test_mask_unknown_key_extent_does_not_fire():
     """Unknown (None) block extents → can't derive split sizes → veto."""
     q = Var("q", TensorType((5, 4)))
-    ks = [Var("k0", TensorType((None, 4))),
-          Var("k1", TensorType((6, 4)))]
-    vs = [Var("v0", TensorType((None, 7))),
-          Var("v1", TensorType((6, 7)))]
+    ks = [
+        Var("k0", TensorType((None, 4))),
+        Var("k1", TensorType((6, 4))),
+    ]
+    vs = [
+        Var("v0", TensorType((None, 7))),
+        Var("v1", TensorType((6, 7))),
+    ]
     m = Var("m", TensorType((5, 9)))
     eg = _no_fire(_sdpa_mask_term(q, ks, vs, m))
-    assert not any(k.startswith("sdpa_cat_mask_")
-                   for k in eg.rule_fires)
+    assert not any(
+        k.startswith("sdpa_cat_mask_") for k in eg.rule_fires
+    )
 
 
 def test_mask_with_dropout_does_not_fire():
     """dropout_p != 0 alongside a mask is not pure math — veto."""
     q = Var("q", TensorType((5, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))]
-    vs = [Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
+    ]
     m = Var("m", TensorType((5, 9)))
     term = Op.make(
-        "sdpa", q,
+        "sdpa",
+        q,
         Op.make("concat", ks[0], ks[1], dim=-2),
         Op.make("concat", vs[0], vs[1], dim=-2),
-        m, arg4=0.5, arg5=False)
+        m,
+        arg4=0.5,
+        arg5=False,
+    )
     eg = _no_fire(term)
     assert not any(k.startswith("sdpa_cat_") for k in eg.rule_fires)
 
@@ -530,14 +621,22 @@ def test_mask_with_is_causal_true_does_not_fire():
     """mask + is_causal=True — torch forbids the combo; no pattern
     matches it (the mask laws only spell is_causal=False)."""
     q = Var("q", TensorType((5, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))]
-    vs = [Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
+    ]
     m = Var("m", TensorType((5, 9)))
     term = Op.make(
-        "sdpa", q,
+        "sdpa",
+        q,
         Op.make("concat", ks[0], ks[1], dim=-2),
         Op.make("concat", vs[0], vs[1], dim=-2),
-        m, arg4=0.0, arg5=True)
+        m,
+        arg4=0.0,
+        arg5=True,
+    )
     eg = _no_fire(term)
     assert not any(k.startswith("sdpa_cat_") for k in eg.rule_fires)
 
@@ -550,9 +649,11 @@ def test_mask_non_sequence_concat_does_not_fire():
     vs = [Var(f"v{i}", TensorType((3, 7))) for i in range(2)]
     m = Var("m", TensorType((5, 3)))
     term = Op.make(
-        "sdpa", q,
+        "sdpa",
+        q,
         Op.make("concat", ks[0], ks[1], dim=-1),
         Op.make("concat", vs[0], vs[1], dim=-1),
-        m)
+        m,
+    )
     eg = _no_fire(term)
     assert not any(k.startswith("sdpa_cat_") for k in eg.rule_fires)

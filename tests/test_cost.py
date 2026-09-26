@@ -1,9 +1,15 @@
 """Tests for cost models."""
 
 import pytest
-from catopt.ir import Op, Var, Const, Param, TensorType
-from catopt.cost import (count_cost, flops_cost, CostModel,
-                         param_bytes_cost, param_bytes_cost_for)
+
+from catopt.cost import (
+    CostModel,
+    count_cost,
+    flops_cost,
+    param_bytes_cost,
+    param_bytes_cost_for,
+)
+from catopt.ir import Const, Op, Param, TensorType, Var
 
 
 def test_count_cost_leaves():
@@ -126,21 +132,28 @@ def test_param_bytes_dedups_shared_names():
     assert param_bytes_cost(t) == 64 * 64
     # Two distinct Param objects spelled the same are still one weight.
     W2 = Param("W", TensorType((64, 64)))
-    t2 = Op.make("add", Op.make("linear", x, W), Op.make("linear", y, W2))
+    t2 = Op.make(
+        "add", Op.make("linear", x, W), Op.make("linear", y, W2)
+    )
     assert param_bytes_cost(t2) == 64 * 64
 
 
 def test_param_bytes_source_tensors():
     """source_tensors is authoritative for numel; TensorType is fallback."""
     import torch
+
     x = Var("x", TensorType((4, 8)))
-    W = Param("W", TensorType((None, None)))   # shape unknown at type level
+    W = Param(
+        "W", TensorType((None, None))
+    )  # shape unknown at type level
     t = Op.make("linear", x, W)
     src = {"W": torch.zeros(8, 16)}
     assert param_bytes_cost(t, src) == 8 * 16
     # names absent from source_tensors fall back to the TensorType
     U = Param("U", TensorType((3, 5)))
-    t2 = Op.make("add", Op.make("linear", x, W), Op.make("linear", x, U))
+    t2 = Op.make(
+        "add", Op.make("linear", x, W), Op.make("linear", x, U)
+    )
     assert param_bytes_cost(t2, src) == 8 * 16 + 3 * 5
     # the bound-closure form prices identically
     assert param_bytes_cost_for(src)(t2) == 8 * 16 + 3 * 5
@@ -172,9 +185,9 @@ def test_rank1_matmul_shapes():
     M = Param("M", TensorType((4, 8)))
     v = Param("v", TensorType((4,)))
     w = Param("w", TensorType((8,)))
-    assert _infer_op_shape(Op.make("matmul", A, v)) == (8,)   # matvec
-    assert _infer_op_shape(Op.make("matmul", v, M)) == (8,)   # vec-mat
-    assert _infer_op_shape(Op.make("matmul", v, v)) == ()     # dot
+    assert _infer_op_shape(Op.make("matmul", A, v)) == (8,)  # matvec
+    assert _infer_op_shape(Op.make("matmul", v, M)) == (8,)  # vec-mat
+    assert _infer_op_shape(Op.make("matmul", v, v)) == ()  # dot
     # batched matrix-vector keeps the batch dims
     B = Param("B", TensorType((2, 8, 4)))
     assert _infer_op_shape(Op.make("matmul", B, v)) == (2, 8)
@@ -184,7 +197,7 @@ def test_linear_bias_broadcast_shapes():
     """linear(x, W, b) broadcasts the bias slot: (o,) and the
     column-vector disguise (o,1) are rank-1 biases; a provably
     wrong bias is ill-typed (_INVALID), not silently ignored."""
-    from catopt.cost import _infer_op_shape, _INVALID
+    from catopt.cost import _INVALID, _infer_op_shape
 
     x = Var("x", TensorType((4, 16)))
     W = Param("W", TensorType((8, 16)))
@@ -206,8 +219,13 @@ def test_assoc_linear_bias_rhs_finite_cost():
     could never win extraction on cost — the rule existed but its
     product was unselectable except via the bias-slot dodge.
     """
-    from catopt.cost import (_infer_op_shape, _INVALID_COST,
-                             depth_cost, roofline_cost, dag_cost)
+    from catopt.cost import (
+        _INVALID_COST,
+        _infer_op_shape,
+        dag_cost,
+        depth_cost,
+        roofline_cost,
+    )
 
     i, h, o = 32, 128, 32
     x = Var("x", TensorType((4, i)))
@@ -217,10 +235,14 @@ def test_assoc_linear_bias_rhs_finite_cost():
     b2 = Param("b2", TensorType((o,)))
     rhs = Op.make(
         "add",
-        Op.make("linear", x,
-                Op.make("matmul", B, A),
-                Op.make("matmul", B, b1)),
-        b2)
+        Op.make(
+            "linear",
+            x,
+            Op.make("matmul", B, A),
+            Op.make("matmul", B, b1),
+        ),
+        b2,
+    )
     assert _infer_op_shape(rhs) == (4, o)
     for cost in (flops_cost, depth_cost, roofline_cost):
         assert 0 < dag_cost(rhs, cost) < _INVALID_COST
@@ -230,7 +252,8 @@ def test_assoc_linear_bias_rhs_finite_cost():
     alt = Op.make(
         "add",
         Op.make("linear", x, Op.make("matmul", B, A)),
-        Op.make("matmul", B, b1))
+        Op.make("matmul", B, b1),
+    )
     assert _infer_op_shape(alt) == (4, o)
     assert 0 < flops_cost(alt) < _INVALID_COST
 
@@ -239,9 +262,9 @@ def test_assoc_linear_bias_rule_member_extracts_finite():
     """End-to-end through the e-graph: the assoc_linear_bias rewrite
     fires and its RHS member sits in the class with a finite cost —
     extraction must never see _INVALID_COST on the real shape."""
+    from catopt.cost import _INVALID_COST, _shape_of
     from catopt.egraph import EGraph
     from catopt.rules import ASSOC_LINEAR_BIAS
-    from catopt.cost import _INVALID_COST, _shape_of
 
     i, h, o = 8, 16, 8
     x = Var("x", TensorType((4, i)))
@@ -272,10 +295,13 @@ def test_cost_preference_for_fewer_ops():
     C = Param("C", TensorType((32, 8)))
 
     # Left-assoc: ((x @ A) @ B) @ C  — many intermediate matmuls
-    left_assoc = Op.make("matmul", Op.make("matmul",
-                                  Op.make("matmul", x, A), B), C)
+    left_assoc = Op.make(
+        "matmul", Op.make("matmul", Op.make("matmul", x, A), B), C
+    )
     # Right-assoc: x @ (A @ (B @ C))  — fused weight
-    right_assoc = Op.make("matmul", x, Op.make("matmul", A, Op.make("matmul", B, C)))
+    right_assoc = Op.make(
+        "matmul", x, Op.make("matmul", A, Op.make("matmul", B, C))
+    )
 
     cost_left = flops_cost(left_assoc)
     cost_right = flops_cost(right_assoc)
@@ -283,4 +309,4 @@ def test_cost_preference_for_fewer_ops():
     assert cost_right < cost_left
     print(f"Left FLOPs:  {cost_left:.0f}")
     print(f"Right FLOPs: {cost_right:.0f}")
-    print(f"Speedup: {cost_left/cost_right:.1f}x")
+    print(f"Speedup: {cost_left / cost_right:.1f}x")

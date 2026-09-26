@@ -7,23 +7,22 @@ These cover the real-model path added for the polyhedral-RFC targets
 import pytest
 import torch
 
+from catopt.cost import flops_cost
+from catopt.egraph import EGraph
+from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
 from catopt.models import MatrixChain, RMSNorm, SwiGLU
+from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
 from catopt.torch_bridge import (
+    _SCALAR_OPERAND_OPS,
+    _canon_aten_name,
     export_to_ir,
     ir_to_torch_module,
-    IRModule,
-    _canon_aten_name,
-    _SCALAR_OPERAND_OPS,
 )
-from catopt.ir import IR, Op, Const, Var, Param, TensorType, op_repr
-from catopt.egraph import EGraph
-from catopt.rules import CATEGORICAL_RULES, SIMPLIFICATION_RULES
-from catopt.cost import flops_cost
-
 
 # ---------------------------------------------------------------------------
 #  ATen name canonicalization
 # ---------------------------------------------------------------------------
+
 
 def test_canon_overload_names():
     """Overload-qualified ATen names map to catopt generators."""
@@ -51,6 +50,7 @@ def test_scalar_operand_ops_contains_pow():
 # ---------------------------------------------------------------------------
 #  MatrixChain: associativity + compile-time weight fusion
 # ---------------------------------------------------------------------------
+
 
 def test_matrix_chain_export_and_lower_roundtrip():
     """Exported MatrixChain lowers back with bit-exact equivalence."""
@@ -98,8 +98,12 @@ def test_ir_module_fuses_weight_chain():
     eg.run(CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=5000)
     best = eg.extract_best(eid, flops_cost)
     lowered = ir_to_torch_module(
-        IR(root=best, inputs=ir.inputs,
-           input_names=ir.input_names, params=ir.params),
+        IR(
+            root=best,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
         param_values=source,
     )
     names = [n for n, _ in lowered.named_parameters()]
@@ -122,11 +126,17 @@ def test_ir_module_fused_params_match_original():
     x = torch.randn(2, 8)
     ir, source = export_to_ir(model, x)
     fused_term = Op.make(
-        "matmul", ir.params["p_w1"],
-        Op.make("matmul", ir.params["p_w2"], ir.params["p_w3"]))
+        "matmul",
+        ir.params["p_w1"],
+        Op.make("matmul", ir.params["p_w2"], ir.params["p_w3"]),
+    )
     lowered = ir_to_torch_module(
-        IR(root=fused_term, inputs=ir.inputs,
-           input_names=ir.input_names, params=ir.params),
+        IR(
+            root=fused_term,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
         param_values=source,
     )
     expected = torch.matmul(model.W1, torch.matmul(model.W2, model.W3))
@@ -137,6 +147,7 @@ def test_ir_module_fused_params_match_original():
 # ---------------------------------------------------------------------------
 #  SwiGLU / RMSNorm: the polyhedral-RFC targets
 # ---------------------------------------------------------------------------
+
 
 def test_swiglu_export_shape():
     """SwiGLU exports to the expected linear/mul/silu/linear structure."""
@@ -159,12 +170,20 @@ def test_swiglu_roundtrip_and_optimize():
     ir, source = export_to_ir(model, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=20, max_nodes=20000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=20,
+        max_nodes=20000,
+    )
     best = eg.extract_best(eid, flops_cost)
     lowered = ir_to_torch_module(
-        IR(root=best, inputs=ir.inputs,
-           input_names=ir.input_names, params=ir.params),
+        IR(
+            root=best,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
         param_values=source,
     )
     model.eval()
@@ -194,12 +213,20 @@ def test_rmsnorm_roundtrip_and_optimize():
     ir, source = export_to_ir(model, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=20, max_nodes=20000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=20,
+        max_nodes=20000,
+    )
     best = eg.extract_best(eid, flops_cost)
     lowered = ir_to_torch_module(
-        IR(root=best, inputs=ir.inputs,
-           input_names=ir.input_names, params=ir.params),
+        IR(
+            root=best,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
         param_values=source,
     )
     model.eval()
@@ -211,14 +238,19 @@ def test_rmsnorm_roundtrip_and_optimize():
 
 def test_pow_to_square_bridge():
     """pow(x, 2) and square(x) land in the same e-class."""
+    from catopt.ir import TensorType, Var
     from catopt.rules import POW_TO_SQUARE, SQUARE_TO_POW
-    from catopt.ir import Var, TensorType
+
     x = Var("x", TensorType((4, 4)))
     term = Op.make("pow", x, Const(2))
     eg = EGraph()
     eid = eg.add_term(term)
-    eg.run([POW_TO_SQUARE, SQUARE_TO_POW], eid,
-           max_iterations=5, max_nodes=1000)
+    eg.run(
+        [POW_TO_SQUARE, SQUARE_TO_POW],
+        eid,
+        max_iterations=5,
+        max_nodes=1000,
+    )
     ops = {n.op for n in eg.get_class(eid).nodes}
     assert "pow" in ops
     assert "square" in ops
@@ -226,17 +258,21 @@ def test_pow_to_square_bridge():
 
 def test_silu_mul_form_rule():
     """silu(g)*u expands to (g*sigmoid(g))*u in the e-graph."""
+    from catopt.ir import TensorType, Var
     from catopt.rules import SILU_MUL_FORM
-    from catopt.ir import Var, TensorType
+
     g = Var("g", TensorType((4, 4)))
     u = Var("u", TensorType((4, 4)))
     term = Op.make("mul", Op.make("silu", g), u)
     eg = EGraph()
     eid = eg.add_term(term)
     eg.run([SILU_MUL_FORM], eid, max_iterations=5, max_nodes=1000)
+
     # The rewritten form lives in the same e-class; silu's inner sigmoid
     # is nested one level down, so check the whole reachable term set.
-    def ops_in(eclass_id: int, seen: set[int] | None = None) -> set[str]:
+    def ops_in(
+        eclass_id: int, seen: set[int] | None = None
+    ) -> set[str]:
         seen = seen or set()
         eid = eg.find(eclass_id)
         if eid in seen:
@@ -258,7 +294,7 @@ def test_silu_mul_form_rule():
 #  Parallel projections: weight merging (bilinearity) — the composed win
 # ---------------------------------------------------------------------------
 
-from catopt.models import ParallelLinear, DeepParallel  # noqa: E402
+from catopt.models import DeepParallel, ParallelLinear  # noqa: E402
 
 
 def _eqsat_best(model, x):
@@ -266,16 +302,24 @@ def _eqsat_best(model, x):
     ir, source = export_to_ir(model, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=30, max_nodes=50000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=30,
+        max_nodes=50000,
+    )
     best = eg.extract_best(eid, flops_cost)
     return ir, best, source
 
 
 def _lower(ir, best, source):
     return ir_to_torch_module(
-        IR(root=best, inputs=ir.inputs,
-           input_names=ir.input_names, params=ir.params),
+        IR(
+            root=best,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
         param_values=source,
     )
 
@@ -288,11 +332,14 @@ def test_weight_factor_linear_halves_flops():
     # counting the (one-time) weight-add in the cost model.
     x = torch.randn(4096, 64)
     ir, best, source = _eqsat_best(m, x)
-    assert flops_cost(best) == pytest.approx(flops_cost(ir.root) / 2, rel=0.01)
+    assert flops_cost(best) == pytest.approx(
+        flops_cost(ir.root) / 2, rel=0.01
+    )
     low = _lower(ir, best, source)
     # merged to a single runtime parameter
     assert len(list(low.named_parameters())) == 1
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         assert (m(x.clone()) - low(x.clone())).abs().max() < 1e-4
 
@@ -309,7 +356,8 @@ def test_deepparallel_composed_win():
     assert flops_cost(best) < flops_cost(ir.root) / 2
     low = _lower(ir, best, source)
     assert len(list(low.named_parameters())) == 1
-    d.eval(); low.eval()
+    d.eval()
+    low.eval()
     with torch.no_grad():
         assert (d(x.clone()) - low(x.clone())).abs().max() < 1e-4
 
@@ -337,7 +385,7 @@ def test_assoc_linear_transpose_order():
     # with distinct dims it is not even shape-valid (12x8 @ 16x12), so a
     # hand-written merge that gets the order wrong fails loudly or silently
     # broadcasts.  catopt's assoc_linear rule (fused = B @ A) got it right.
-    naive_shape_possible = (d.W1.weight.shape[1] == d.W3.weight.shape[0])
+    naive_shape_possible = d.W1.weight.shape[1] == d.W3.weight.shape[0]
     if not naive_shape_possible:
         with pytest.raises(RuntimeError):
             _ = (d.W1.weight + d.W2.weight) @ d.W3.weight
@@ -349,6 +397,7 @@ def test_assoc_linear_bias_composes():
     linear torch.export emits for bias=True, where assoc_linear
     cannot reach."""
     from catopt.rules import ASSOC_LINEAR_BIAS
+
     torch.manual_seed(0)
     i, h, o = 32, 128, 32
     x = Var("x", TensorType((4, i)))
@@ -371,7 +420,8 @@ def test_assoc_linear_bias_composes():
     b1v = torch.randn(h, dtype=torch.float64)
     b2v = torch.randn(o, dtype=torch.float64)
     lhs = torch.nn.functional.linear(
-        torch.nn.functional.linear(xv, Av, b1v), Bv, b2v)
+        torch.nn.functional.linear(xv, Av, b1v), Bv, b2v
+    )
     rhs = torch.nn.functional.linear(xv, Bv @ Av, Bv @ b1v) + b2v
     assert (lhs - rhs).abs().max() < 1e-12
 
@@ -381,6 +431,7 @@ def test_assoc_linear_bias_end_to_end_param_drop():
     bias when the hidden dim sits above the break-even — real
     parameter storage reduction, not just a rewrite."""
     from catopt.optimize import optimize_model
+
     torch.manual_seed(0)
 
     class BiasedMLP(torch.nn.Module):
@@ -404,10 +455,11 @@ def test_assoc_linear_bias_end_to_end_param_drop():
 
     # the optimized weights file: eliminated originals + derived folds
     from catopt.optimize import param_report
+
     r = param_report(m, low)
     assert r["optimized_bytes"] < r["original_bytes"]
     assert r["eliminated"]  # fc1/fc2 weights folded away
-    assert r["derived"]     # fused_ materialized params
+    assert r["derived"]  # fused_ materialized params
     assert (y - ref).abs().max() < 1e-9
 
 
@@ -417,6 +469,7 @@ def test_share_duplicate_params_drops_tied_weight():
     the optimized state dict stores one copy.  Exact weight tying,
     discovered rather than declared."""
     from catopt.optimize import optimize_model, param_report
+
     torch.manual_seed(0)
 
     class SharedUse(torch.nn.Module):
@@ -453,8 +506,9 @@ def test_weight_merge_does_not_fire_on_distinct_inputs():
     w2 = Param("W2", TensorType((4, 4)))
     from catopt.rules import WEIGHT_FACTOR
 
-    different = Op.make("add", Op.make("matmul", x, w1),
-                        Op.make("matmul", y, w2))
+    different = Op.make(
+        "add", Op.make("matmul", x, w1), Op.make("matmul", y, w2)
+    )
     eg = EGraph()
     eid = eg.add_term(different)
     eg.run([WEIGHT_FACTOR], eid, max_iterations=5, max_nodes=500)
@@ -474,6 +528,7 @@ def test_weight_merge_does_not_fire_on_distinct_inputs():
 # ---------------------------------------------------------------------------
 #  Product structure: fused projections (SwiGLU gate/up)
 # ---------------------------------------------------------------------------
+
 
 def _find_ops(term, name, out=None):
     if out is None:
@@ -495,14 +550,19 @@ def test_swiglu_fuse_produces_shared_gemm():
     e-graph stores the fused projection once and lowering runs one GEMM.
     """
     from catopt.cost import launch_aware_cost
+
     torch.manual_seed(0)
     m = SwiGLU(32, hidden_mult=2)
     x = torch.randn(128, 32)
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=30, max_nodes=50000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=30,
+        max_nodes=50000,
+    )
     best = eg.extract_best(eid, launch_aware_cost)
 
     chunks = _find_ops(best, "chunk")
@@ -521,7 +581,8 @@ def test_swiglu_fuse_produces_shared_gemm():
     assert any(n.startswith("fused_") for n in names)
     assert "p_gate_weight" not in names
     assert "p_up_weight" not in names
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-5
@@ -530,23 +591,31 @@ def test_swiglu_fuse_produces_shared_gemm():
 def test_swiglu_fuse_evals_fused_gemm_once():
     """_eval memoization: the shared fused linear runs exactly once."""
     from catopt.cost import launch_aware_cost
+
     torch.manual_seed(0)
     m = SwiGLU(32, hidden_mult=2)
     x = torch.randn(64, 32)
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=30, max_nodes=50000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=30,
+        max_nodes=50000,
+    )
     best = eg.extract_best(eid, launch_aware_cost)
     low = _lower(ir, best, source)
 
     calls = []
     orig_linear = torch.nn.functional.linear
+
     def counting(*a, **kw):
         calls.append(1)
         return orig_linear(*a, **kw)
+
     import catopt.torch_bridge as tb
+
     saved = tb._IR_TO_TORCH["linear"]
     tb._IR_TO_TORCH["linear"] = counting
     try:
@@ -562,13 +631,16 @@ def test_swiglu_fuse_evals_fused_gemm_once():
 def test_swiglu_fuse_requires_shared_input():
     """The pairing rule must not fire when gate/up read DIFFERENT inputs."""
     from catopt.rules import SWIGLU_FUSE
+
     x = Var("x", TensorType((4, 4)))
     y = Var("y", TensorType((4, 4)))
     wa = Param("Wa", TensorType((4, 4)))
     wb = Param("Wb", TensorType((4, 4)))
-    t = Op.make("mul",
-                Op.make("silu", Op.make("linear", x, wa)),
-                Op.make("linear", y, wb))
+    t = Op.make(
+        "mul",
+        Op.make("silu", Op.make("linear", x, wa)),
+        Op.make("linear", y, wb),
+    )
     eg = EGraph()
     eid = eg.add_term(t)
     eg.run([SWIGLU_FUSE], eid, max_iterations=5, max_nodes=500)
@@ -582,15 +654,18 @@ def test_swiglu_fuse_requires_shared_input():
 #  Fused QKV (attribute metavariables + triple pairing)
 # ---------------------------------------------------------------------------
 
+
 def test_attention_roundtrip():
     """AttentionBlock exports and lowers bit-exactly."""
     from catopt.models import AttentionBlock
+
     torch.manual_seed(0)
     m = AttentionBlock(64, n_heads=4).eval()
     x = torch.randn(2, 8, 64)
     ir, source = export_to_ir(m, x)
     low = _lower(ir, ir.root, source)
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-5
@@ -598,16 +673,21 @@ def test_attention_roundtrip():
 
 def test_qkv_fuse_produces_single_gemm():
     """qkv_fuse merges q/k/v into one GEMM + three chunk projections."""
-    from catopt.models import AttentionBlock
     from catopt.cost import launch_aware_cost
+    from catopt.models import AttentionBlock
+
     torch.manual_seed(0)
     m = AttentionBlock(64, n_heads=4).eval()
     x = torch.randn(2, 8, 64)
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=30, max_nodes=50000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=30,
+        max_nodes=50000,
+    )
     best = eg.extract_best(eid, launch_aware_cost)
 
     chunks = _find_ops(best, "chunk")
@@ -625,7 +705,8 @@ def test_qkv_fuse_produces_single_gemm():
     assert "p_q_proj_weight" not in names
     assert "p_k_proj_weight" not in names
     assert "p_v_proj_weight" not in names
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-5
@@ -633,8 +714,9 @@ def test_qkv_fuse_produces_single_gemm():
 
 def test_attr_metavariable_binds_shape():
     """Pattern attr value-as-string binds the node's concrete attr."""
-    from catopt.rules import QKV_FUSE
     from catopt.models import AttentionBlock
+    from catopt.rules import QKV_FUSE
+
     torch.manual_seed(0)
     m = AttentionBlock(32, n_heads=2).eval()
     x = torch.randn(2, 4, 32)
@@ -643,11 +725,10 @@ def test_attr_metavariable_binds_shape():
     eid = eg.add_term(ir.root)
     eg.run([QKV_FUSE], eid, max_iterations=5, max_nodes=5000)
     # the fused enode must carry the ORIGINAL view shape, rebound via $attr:S
-    reshape_nodes = [
-        n for n in eg._node_to_class if n.op == "reshape"
-    ]
+    reshape_nodes = [n for n in eg._node_to_class if n.op == "reshape"]
     fused_reshapes = [
-        n for n in reshape_nodes
+        n
+        for n in reshape_nodes
         if any(dict(n.attrs).get("shape") == (2, 4, 2, 16) for _ in [0])
     ]
     # at least the three original reshapes exist; fused form adds 3 more
@@ -659,21 +740,28 @@ def test_attr_metavariable_binds_shape():
 #  Norm folding (channel-scale into weight, row-scale hoists out)
 # ---------------------------------------------------------------------------
 
+
 def test_normlinear_folds_channel_scale():
     """linear(x*rms*wn, W) -> rms * linear(x, W*wn): gain folds at compile time."""
-    from catopt.models import NormLinear
     from catopt.cost import launch_aware_cost
+    from catopt.models import NormLinear
+
     torch.manual_seed(0)
     m = NormLinear(64, 64).eval()
     x = torch.randn(128, 8, 64)
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=30, max_nodes=50000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=30,
+        max_nodes=50000,
+    )
     best = eg.extract_best(eid, launch_aware_cost)
     low = _lower(ir, best, source)
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-4
@@ -681,7 +769,8 @@ def test_normlinear_folds_channel_scale():
     names = [n for n, _ in low.named_parameters()]
     assert names == ["fused_2"] or (
         len([n for n in names if n.startswith("fused_")]) == 1
-        and "p_norm_weight" not in names)
+        and "p_norm_weight" not in names
+    )
 
 
 def test_row_scale_rejects_data_scale():
@@ -692,6 +781,7 @@ def test_row_scale_rejects_data_scale():
     diff=9.83 unsoundness caught by the verifier).
     """
     from catopt.rules import LINEAR_ROW_SCALE
+
     x = Var("x", TensorType((4, 4)))
     r = Var("r", TensorType((4, 4)))  # data-shaped, NOT per-row
     w = Param("W", TensorType((4, 4)))
@@ -709,18 +799,24 @@ def test_row_scale_rejects_data_scale():
 #  Asymmetric product pairing (GQA) + stacked TransformerBlock
 # ---------------------------------------------------------------------------
 
+
 def test_gqa_asym_fuse():
     """qkv_fuse_asym: uneven head counts -> split with derived sizes."""
-    from catopt.models import GQAAttention
     from catopt.cost import launch_aware_cost
+    from catopt.models import GQAAttention
+
     torch.manual_seed(0)
     m = GQAAttention(128, n_heads=4, n_kv_heads=2).eval()
     x = torch.randn(2, 8, 128)
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=20, max_nodes=50000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=20,
+        max_nodes=50000,
+    )
     best = eg.extract_best(eid, launch_aware_cost)
 
     splits = _find_ops(best, "split")
@@ -735,7 +831,8 @@ def test_gqa_asym_fuse():
     names = [n for n, _ in low.named_parameters()]
     assert any(n.startswith("fused_") for n in names)
     assert "p_q_proj_weight" not in names
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-5
@@ -743,8 +840,9 @@ def test_gqa_asym_fuse():
 
 def test_derive_hook_computes_sizes():
     """Rewrite.derive injects computed attrs into the instantiation."""
-    from catopt.rules import QKV_FUSE_ASYM
     from catopt.models import GQAAttention
+    from catopt.rules import QKV_FUSE_ASYM
+
     torch.manual_seed(0)
     m = GQAAttention(64, n_heads=2, n_kv_heads=1).eval()
     x = torch.randn(2, 4, 64)
@@ -757,32 +855,40 @@ def test_derive_hook_computes_sizes():
     # a split enode must exist carrying the derived sizes (64, 32, 32)
     sizes = {
         dict(n.attrs).get("sizes")
-        for n in eg._node_to_class if n.op == "split"
+        for n in eg._node_to_class
+        if n.op == "split"
     }
     assert (64, 32, 32) in sizes
 
 
 def test_transformer_block_stacks_fusions():
     """One saturation pass finds BOTH fusions in a full block."""
-    from catopt.models import TransformerBlock
     from catopt.cost import launch_aware_cost
+    from catopt.models import TransformerBlock
+
     torch.manual_seed(0)
     m = TransformerBlock(128, n_heads=4, hidden_mult=2).eval()
     x = torch.randn(4, 16, 128)
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(CATEGORICAL_RULES + SIMPLIFICATION_RULES, eid,
-           max_iterations=30, max_nodes=200000)
+    eg.run(
+        CATEGORICAL_RULES + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=30,
+        max_nodes=200000,
+    )
     best = eg.extract_best(eid, launch_aware_cost)
     r = op_repr(best)
     # fused QKV (3 chunks on one GEMM) AND fused gate/up (2 chunks)
     assert r.count("(chunk") >= 5
     low = _lower(ir, best, source)
-    n_fused = len([n for n, _ in low.named_parameters()
-                   if n.startswith("fused_")])
+    n_fused = len(
+        [n for n, _ in low.named_parameters() if n.startswith("fused_")]
+    )
     assert n_fused >= 2  # qkv concat + gate/up concat
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-4
@@ -792,11 +898,13 @@ def test_transformer_block_stacks_fusions():
 #  Diagram-level pairing pass (general product law)
 # ---------------------------------------------------------------------------
 
+
 def test_pairing_pass_five_way_parallel_block():
     """ParallelBlock: all 5 same-source projections fuse into ONE GEMM."""
+    from catopt.ir import op_repr
     from catopt.models import ParallelBlock
     from catopt.optimize import optimize_model
-    from catopt.ir import op_repr
+
     torch.manual_seed(0)
     m = ParallelBlock(128, n_heads=4, hidden_mult=2).eval()
     x = torch.randn(4, 16, 128)
@@ -806,7 +914,8 @@ def test_pairing_pass_five_way_parallel_block():
     assert r.count("(split") >= 5
     # uneven sizes: q,k,v are dim; gate,up are 2*dim
     assert "(128, 128, 128, 256, 256)" in r
-    m.eval(); opt.eval()
+    m.eval()
+    opt.eval()
     with torch.no_grad():
         d = (m(x.clone()) - opt(x.clone())).abs().max().item()
     assert d < 1e-4
@@ -814,14 +923,24 @@ def test_pairing_pass_five_way_parallel_block():
 
 def test_pairing_subsumes_swiglu_rule():
     """The pairing pass alone fuses gate/up — no consumer pattern needed."""
+    from catopt.cost import dag_cost, launch_aware_cost
     from catopt.models import SwiGLU
-    from catopt.rules import (pair_shared_input_linears,
-                              CATEGORICAL_RULES, SIMPLIFICATION_RULES,
-                              SWIGLU_FUSE, PARALLEL_MUL_FUSE,
-                              QKV_FUSE, QKV_FUSE_ASYM)
-    from catopt.cost import launch_aware_cost, dag_cost
-    subsumed = {SWIGLU_FUSE.name, PARALLEL_MUL_FUSE.name,
-                QKV_FUSE.name, QKV_FUSE_ASYM.name}
+    from catopt.rules import (
+        CATEGORICAL_RULES,
+        PARALLEL_MUL_FUSE,
+        QKV_FUSE,
+        QKV_FUSE_ASYM,
+        SIMPLIFICATION_RULES,
+        SWIGLU_FUSE,
+        pair_shared_input_linears,
+    )
+
+    subsumed = {
+        SWIGLU_FUSE.name,
+        PARALLEL_MUL_FUSE.name,
+        QKV_FUSE.name,
+        QKV_FUSE_ASYM.name,
+    }
     rules = [r for r in CATEGORICAL_RULES if r.name not in subsumed]
     torch.manual_seed(0)
     m = SwiGLU(64, 2).eval()
@@ -829,20 +948,27 @@ def test_pairing_subsumes_swiglu_rule():
     ir, source = export_to_ir(m, x)
     eg = EGraph()
     eid = eg.add_term(ir.root)
-    eg.run(rules + SIMPLIFICATION_RULES, eid, max_iterations=10,
-           max_nodes=50000)
+    eg.run(
+        rules + SIMPLIFICATION_RULES,
+        eid,
+        max_iterations=10,
+        max_nodes=50000,
+    )
     groups = pair_shared_input_linears(eg)
     eg.rebuild()
     assert groups and any(len(g) >= 2 for g in groups)
     greedy = eg.extract_best(eid, launch_aware_cost)
     forced = eg.extract_paired(eid, launch_aware_cost, groups)
     assert forced is not None
-    assert dag_cost(forced, launch_aware_cost) <= dag_cost(greedy, launch_aware_cost)
+    assert dag_cost(forced, launch_aware_cost) <= dag_cost(
+        greedy, launch_aware_cost
+    )
     splits = _find_ops(forced, "split")
     assert len(splits) == 2
     assert splits[0].args[0] is splits[1].args[0]
     low = _lower(ir, forced, source)
-    m.eval(); low.eval()
+    m.eval()
+    low.eval()
     with torch.no_grad():
         d = (m(x.clone()) - low(x.clone())).abs().max().item()
     assert d < 1e-5
@@ -851,13 +977,14 @@ def test_pairing_subsumes_swiglu_rule():
 def test_pairing_no_shared_input_no_fusion():
     """Linears with different inputs must NOT be paired."""
     from catopt.rules import pair_shared_input_linears
+
     x = Var("x", TensorType((4, 4)))
     y = Var("y", TensorType((4, 4)))
     wa = Param("A", TensorType((4, 4)))
     wb = Param("B", TensorType((4, 4)))
-    t = Op.make("mul",
-                Op.make("linear", x, wa),
-                Op.make("linear", y, wb))
+    t = Op.make(
+        "mul", Op.make("linear", x, wa), Op.make("linear", y, wb)
+    )
     eg = EGraph()
     eid = eg.add_term(t)
     groups = pair_shared_input_linears(eg)
@@ -868,6 +995,7 @@ def test_pairing_no_shared_input_no_fusion():
 def test_channel_scale_rejects_row_scale():
     """linear(x*r, W) with r per-row must not fold r into W."""
     from catopt.rules import LINEAR_CHANNEL_SCALE
+
     x = Var("x", TensorType((4, 8, 4)))
     r = Var("r", TensorType((4, 8, 1)))  # per-row
     w = Param("W", TensorType((4, 4)))
@@ -884,14 +1012,15 @@ def test_channel_scale_rejects_row_scale():
 
 def test_multi_input_module():
     from catopt.optimize import optimize_model
+
     """Modules with several tensor inputs export, optimize, and verify."""
     import torch.nn as nn
-    import torch.nn.functional as F
 
     class TwoInput(nn.Module):
         def __init__(self):
             super().__init__()
             self.w = nn.Linear(16, 16, bias=False)
+
         def forward(self, x, scale):
             return self.w(x * scale)
 
@@ -907,6 +1036,7 @@ def test_multi_input_module():
 
 def test_dropout_eval_is_identity():
     from catopt.optimize import optimize_model
+
     """Dropout exported in eval mode is a semantic identity and must lower."""
     import torch.nn as nn
     import torch.nn.functional as F
@@ -917,7 +1047,10 @@ def test_dropout_eval_is_identity():
             self.w1 = nn.Linear(16, 32, bias=False)
             self.w3 = nn.Linear(16, 32, bias=False)
             self.w2 = nn.Linear(32, 16, bias=False)
-            self.drop = nn.Dropout(0.5)  # p>0 but eval() makes it identity
+            self.drop = nn.Dropout(
+                0.5
+            )  # p>0 but eval() makes it identity
+
         def forward(self, x):
             return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
@@ -934,6 +1067,7 @@ def test_dropout_eval_is_identity():
 
 def test_rope_style_ops_roundtrip():
     from catopt.optimize import optimize_model
+
     """RoPE-shaped graphs (unbind/stack/expand/flatten/slice) lower and run."""
     import torch.nn as nn
 
@@ -967,6 +1101,7 @@ def test_dag_sharing_scales():
     must finish in seconds.
     """
     import time
+
     # Build a maximally-shared term DAG directly: x feeds every stage,
     # each stage's output feeds all later stages (depth d → 2^d tree if
     # expanded; the DAG object shares subtrees by identity).
@@ -979,12 +1114,15 @@ def test_dag_sharing_scales():
     t0 = time.time()
     root = eg.add_term(t)
     from catopt.cost import launch_aware_cost
+
     best = eg.extract_best(root, launch_aware_cost)
     mod = ir_to_torch_module(
-        IR(root=best, inputs=[x], input_names={"x"}, params={}))
+        IR(root=best, inputs=[x], input_names={"x"}, params={})
+    )
     dt = time.time() - t0
     assert dt < 30  # exponential blowup made this minutes
     import torch as _t
+
     xv = _t.randn(4, 32)
     with _t.no_grad():
         out = mod(xv)
@@ -1012,10 +1150,12 @@ def test_conv2d_pairing_asymmetric_and_incompatible():
             return torch.cat([self.c1(x), self.c2(x)], 1) + self.c3(x)
 
     from catopt.optimize import optimize_model
+
     m = MixedConv().eval()
     x = torch.randn(2, 16, 8, 8)
-    opt, info = optimize_model(m, x, ruleset="simpl", max_iterations=2,
-                               verbose=False)
+    opt, info = optimize_model(
+        m, x, ruleset="simpl", max_iterations=2, verbose=False
+    )
     # exactly one pairing group: c1/c2 fuse (96-ch conv + 32/64 split),
     # c3 (3x3 kernel) is excluded by the compat cluster key
     assert info.get("pairing_groups") == 1
@@ -1027,9 +1167,10 @@ def test_conv2d_pairing_not_offered_for_grouped():
     """groups>1 convs must not pair — cat on out-channels would mix
     grouped convolutions incorrectly."""
     import torch.nn as nn
-    from catopt.torch_bridge import export_to_ir
+
     from catopt.egraph import EGraph
     from catopt.rules import pair_shared_input_convs
+    from catopt.torch_bridge import export_to_ir
 
     class Grouped(nn.Module):
         def __init__(self):
@@ -1051,7 +1192,8 @@ def test_conv2d_pairing_not_offered_for_grouped():
 def test_reshape_negative_dim_shape_inference():
     """reshape attrs keep literal -1 dims; shape inference must resolve
     them from input numel rather than poisoning broadcast as _INVALID."""
-    from catopt.cost import _infer_op_shape, _INVALID, _broadcast
+    from catopt.cost import _broadcast, _infer_op_shape
+
     x = Var("x", TensorType((4, 8)))
     r = Op.make("reshape", x, shape=(-1, 2, 4))
     assert _infer_op_shape(r) == (4, 2, 4)  # numel 32 / (2*4) = 4
@@ -1069,8 +1211,9 @@ def test_gqa_absorb_repeat_kv():
     torch.manual_seed(0)
     m = RepeatKVAttention(dim=128, n_heads=8, n_kv_heads=2).eval()
     x = torch.randn(1, 16, 128)
-    opt, _ = optimize_model(m, x, ruleset="categorical",
-                            max_iterations=4, verbose=False)
+    opt, _ = optimize_model(
+        m, x, ruleset="categorical", max_iterations=4, verbose=False
+    )
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1079,7 +1222,8 @@ def test_gqa_absorb_repeat_kv():
 def test_gqa_absorb_rejects_bad_repeat():
     """The check must veto chains that are NOT repeat_interleave —
     e.g. expand growing a non-inserted dim."""
-    from catopt.rules import _check_gqa_absorb, _REPEAT_KV
+    from catopt.rules import _check_gqa_absorb
+
     # Forge a bad binding: expand grows dim 2 (a real dim), not the
     # unsqueezed dim 3.
     x = Var("k", TensorType((1, 8, 2, 32)))
@@ -1090,7 +1234,8 @@ def test_gqa_absorb_rejects_bad_repeat():
         "$attr:UDv": 3,
         "$attr:ESv": (1, 8, 2, 4, 32),
         "$attr:RSv": (1, 8, 8, 32),
-        "k": x, "v": Var("v", TensorType((1, 8, 2, 32))),
+        "k": x,
+        "v": Var("v", TensorType((1, 8, 2, 32))),
         "q": Var("q", TensorType((1, 8, 8, 32))),
     }
     assert _check_gqa_absorb(bad) is False
@@ -1104,15 +1249,16 @@ def test_sdpa_fold_masked_fill():
     """nanoGPT-style masked_fill causal attention must fold to
     sdpa(is_causal=True): the whole softmax-mask-attention chain
     collapses into one fused kernel call."""
+    from catopt.ir import op_repr
     from catopt.models import EagerAttention
     from catopt.optimize import optimize_model
-    from catopt.ir import op_repr
 
     torch.manual_seed(0)
     m = EagerAttention(dim=128, n_heads=4, block_size=64).eval()
     x = torch.randn(1, 32, 128)
-    opt, info = optimize_model(m, x, ruleset="categorical",
-                               max_iterations=4, verbose=False)
+    opt, info = optimize_model(
+        m, x, ruleset="categorical", max_iterations=4, verbose=False
+    )
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1123,15 +1269,16 @@ def test_sdpa_fold_masked_fill():
 
 def test_sdpa_fold_additive_mask():
     """HF-style additive causal mask must fold to sdpa(attn_mask=...)."""
+    from catopt.ir import op_repr
     from catopt.models import AdditiveMaskAttention
     from catopt.optimize import optimize_model
-    from catopt.ir import op_repr
 
     torch.manual_seed(0)
     m = AdditiveMaskAttention(dim=128, n_heads=4, block_size=64).eval()
     x = torch.randn(1, 32, 128)
-    opt, info = optimize_model(m, x, ruleset="categorical",
-                               max_iterations=4, verbose=False)
+    opt, info = optimize_model(
+        m, x, ruleset="categorical", max_iterations=4, verbose=False
+    )
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1140,8 +1287,8 @@ def test_sdpa_fold_additive_mask():
 
 def test_sdpa_fold_rejects_wrong_dim():
     """softmax over a non-key dim is NOT attention — must not fold."""
+    from catopt.ir import TensorType, Var
     from catopt.rules import _check_softmax_dim
-    from catopt.ir import Op, Var, TensorType
 
     q = Var("q", TensorType((1, 4, 32, 16)))
     bound = {"Q": q, "$attr:SD": 1}
@@ -1153,20 +1300,20 @@ def test_linear_recurrence_scan_structure():
     LTI recurrence h_t = A h_{t-1} + x_t reassociates so matrix powers
     A^k become shared subproducts and the critical path shortens.
     Verified exact in fp64."""
-    import torch.nn as nn
+    from catopt import rules as R
+    from catopt.egraph import EGraph
+    from catopt.ir import IR, Op
     from catopt.models import LinearRecurrence
     from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-    from catopt.egraph import EGraph
-    from catopt import rules as R
-    from catopt.ir import Op, IR
 
     def opdepth(t, memo):
         if not isinstance(t, Op):
             return 0
         k = id(t)
         if k not in memo:
-            memo[k] = 1 + max((opdepth(a, memo) for a in t.args),
-                              default=0)
+            memo[k] = 1 + max(
+                (opdepth(a, memo) for a in t.args), default=0
+            )
         return memo[k]
 
     torch.manual_seed(0)
@@ -1175,13 +1322,22 @@ def test_linear_recurrence_scan_structure():
     ir, st = export_to_ir(m, x)
     eg = EGraph()
     root = eg.add_term(ir.root)
-    laws = [R.DISTRIBUTE_MUL, R.ASSOC_MATMUL, R.ASSOC_MATMUL_REV,
-            R.ASSOC_ADD, R.COMM_ADD]
+    laws = [
+        R.DISTRIBUTE_MUL,
+        R.ASSOC_MATMUL,
+        R.ASSOC_MATMUL_REV,
+        R.ASSOC_ADD,
+        R.COMM_ADD,
+    ]
     eg.run(laws, root, max_iterations=4, max_nodes=80_000)
     best = eg.extract_min_depth(root)
     assert opdepth(best, {}) < opdepth(ir.root, {})
-    opt_ir = IR(root=best, inputs=ir.inputs, input_names=ir.input_names,
-                params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -1198,19 +1354,21 @@ def test_affine_monoid_parallel_scan():
     (partial-product, partial-sum) is a cross-class object term
     rewriting cannot synthesise."""
     import math
+
+    from catopt import rules as R
+    from catopt.egraph import EGraph
+    from catopt.ir import IR, Op
     from catopt.models import LinearRecurrence
     from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-    from catopt.egraph import EGraph
-    from catopt import rules as R
-    from catopt.ir import Op, IR
 
     def opdepth(t, memo):
         if not isinstance(t, Op):
             return 0
         k = id(t)
         if k not in memo:
-            memo[k] = 1 + max((opdepth(a, memo) for a in t.args),
-                              default=0)
+            memo[k] = 1 + max(
+                (opdepth(a, memo) for a in t.args), default=0
+            )
         return memo[k]
 
     torch.manual_seed(0)
@@ -1223,8 +1381,12 @@ def test_affine_monoid_parallel_scan():
     best = eg.extract_min_depth(root)
     # log-depth: ~2·log2(T) compose slots, far below the 2T spine.
     assert opdepth(best, {}) <= 4 * math.ceil(math.log2(16)) + 4
-    opt_ir = IR(root=best, inputs=ir.inputs, input_names=ir.input_names,
-                params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -1235,6 +1397,7 @@ def test_aff_monoid_ops_verify():
     """aff/aff_compose/apply lower to tuple-passing torch code and
     compute the affine composition correctly."""
     from catopt.torch_bridge import _IR_TO_TORCH
+
     torch.manual_seed(0)
     A, b = torch.randn(8, 8), torch.randn(8)
     C, d = torch.randn(8, 8), torch.randn(8)
@@ -1249,16 +1412,21 @@ def test_aff_monoid_ops_verify():
 def test_linear_attention_reassociation():
     """(Q K^T) V reassociates to Q (K^T V) — O(T^2 d) -> O(T d^2).
     Exact identity (verified in fp64); the cost model must pick it."""
+    from catopt.cost import roofline_cost
     from catopt.models import LinearAttention
     from catopt.optimize import optimize_model
-    from catopt.cost import roofline_cost
 
     m = LinearAttention().eval()
     t, d = 512, 64
     q = k = v = torch.randn(1, t, d, dtype=torch.float64)
-    opt, _ = optimize_model(m, (q, k, v), ruleset="categorical",
-                            max_iterations=4, cost_fn=roofline_cost,
-                            verbose=False)
+    opt, _ = optimize_model(
+        m,
+        (q, k, v),
+        ruleset="categorical",
+        max_iterations=4,
+        cost_fn=roofline_cost,
+        verbose=False,
+    )
     with torch.no_grad():
         diff = (m(q, k, v) - opt(q, k, v)).abs().max().item()
     assert diff < 1e-8  # fp64: reassociation is exact up to rounding

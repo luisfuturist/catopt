@@ -27,20 +27,19 @@ import os
 import platform
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional, Union
 
 import torch
 
 __all__ = [
+    "PROFILE_DIR_ENV",
     "TargetProfile",
     "calibrate",
+    "list_profiles",
+    "load_profile",
     "profiles_dir",
     "save_profile",
-    "load_profile",
-    "list_profiles",
-    "PROFILE_DIR_ENV",
 ]
 
 #: Environment variable overriding the profile-store directory.
@@ -50,6 +49,7 @@ PROFILE_DIR_ENV = "CATOPT_PROFILE_DIR"
 # ---------------------------------------------------------------------------
 # Profile object
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class TargetProfile:
@@ -82,29 +82,37 @@ class TargetProfile:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
 
     @classmethod
-    def from_json(cls, data: Union[str, bytes, dict]) -> "TargetProfile":
+    def from_json(
+        cls, data: str | bytes | dict
+    ) -> TargetProfile:
         """Rebuild from a JSON string/bytes or an already-parsed dict."""
         if isinstance(data, (str, bytes)):
             data = json.loads(data)
         if not isinstance(data, dict):
-            raise TypeError(f"cannot parse TargetProfile from {type(data)}")
+            raise TypeError(
+                f"cannot parse TargetProfile from {type(data)}"
+            )
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in data.items() if k in known})
 
     # -- persistence --------------------------------------------------
-    def save(self, dir: Optional[Union[str, Path]] = None) -> Path:
+    def save(self, dir: str | Path | None = None) -> Path:
         """Write this profile under the profiles dir; returns the path."""
         return save_profile(self, dir)
 
     @classmethod
-    def load(cls, name_or_path: Union[str, Path],
-             dir: Optional[Union[str, Path]] = None) -> "TargetProfile":
+    def load(
+        cls,
+        name_or_path: str | Path,
+        dir: str | Path | None = None,
+    ) -> TargetProfile:
         """Load by profile name or explicit file path."""
         return load_profile(name_or_path, dir)
 
     def cost_fn(self):
         """The additive roofline cost fn for this target."""
         from catopt.cost import roofline_cost_for
+
         return roofline_cost_for(self)
 
 
@@ -123,12 +131,17 @@ def profiles_dir() -> Path:
 
 
 def _safe_name(name: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "._-" else "_"
-                   for ch in name).strip("_") or "profile"
+    return (
+        "".join(
+            ch if ch.isalnum() or ch in "._-" else "_" for ch in name
+        ).strip("_")
+        or "profile"
+    )
 
 
-def save_profile(profile: TargetProfile,
-                 dir: Optional[Union[str, Path]] = None) -> Path:
+def save_profile(
+    profile: TargetProfile, dir: str | Path | None = None
+) -> Path:
     """Persist ``profile`` as ``<dir>/<safe-name>.json``; returns path."""
     d = Path(dir) if dir is not None else profiles_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -137,8 +150,10 @@ def save_profile(profile: TargetProfile,
     return path
 
 
-def load_profile(name_or_path: Union[str, Path],
-                 dir: Optional[Union[str, Path]] = None) -> TargetProfile:
+def load_profile(
+    name_or_path: str | Path,
+    dir: str | Path | None = None,
+) -> TargetProfile:
     """Load a profile by name (in the profiles dir) or by file path."""
     p = Path(name_or_path)
     if p.suffix == ".json" and p.exists():
@@ -157,17 +172,20 @@ def load_profile(name_or_path: Union[str, Path],
             if prof.name == name_or_path:
                 return prof
     raise FileNotFoundError(
-        f"no profile named {name_or_path!r} under {d}")
+        f"no profile named {name_or_path!r} under {d}"
+    )
 
 
-def list_profiles(dir: Optional[Union[str, Path]] = None) -> list[str]:
+def list_profiles(dir: str | Path | None = None) -> list[str]:
     """Names of all persisted profiles."""
     d = Path(dir) if dir is not None else profiles_dir()
     names = []
     if d.is_dir():
         for f in sorted(d.glob("*.json")):
             try:
-                names.append(TargetProfile.from_json(f.read_text()).name)
+                names.append(
+                    TargetProfile.from_json(f.read_text()).name
+                )
             except (ValueError, TypeError):
                 continue
     return names
@@ -177,13 +195,19 @@ def list_profiles(dir: Optional[Union[str, Path]] = None) -> list[str]:
 # Measurement
 # ---------------------------------------------------------------------------
 
+
 def _sync(dev: torch.device) -> None:
     if dev.type == "cuda":
         torch.cuda.synchronize(dev)
 
 
-def _measure_flops(dev: torch.device, dtype: torch.dtype,
-                   sizes: tuple, iters: int, warmup: int) -> float:
+def _measure_flops(
+    dev: torch.device,
+    dtype: torch.dtype,
+    sizes: tuple,
+    iters: int,
+    warmup: int,
+) -> float:
     """Best sustained matmul throughput over the size sweep, in FLOP/s."""
     best = 0.0
     for n in sizes:
@@ -205,8 +229,13 @@ def _measure_flops(dev: torch.device, dtype: torch.dtype,
     return best
 
 
-def _measure_bandwidth(dev: torch.device, dtype: torch.dtype,
-                       sizes_mb: tuple, iters: int, warmup: int) -> float:
+def _measure_bandwidth(
+    dev: torch.device,
+    dtype: torch.dtype,
+    sizes_mb: tuple,
+    iters: int,
+    warmup: int,
+) -> float:
     """Best copy/reduction bandwidth over the size sweep, in bytes/s."""
     esize = torch.empty(0, dtype=dtype).element_size()
     best = 0.0
@@ -242,8 +271,9 @@ def _measure_bandwidth(dev: torch.device, dtype: torch.dtype,
     return best
 
 
-def _measure_launch(dev: torch.device, dtype: torch.dtype,
-                    iters: int, warmup: int) -> float:
+def _measure_launch(
+    dev: torch.device, dtype: torch.dtype, iters: int, warmup: int
+) -> float:
     """Per-op wall time of a back-to-back tiny kernel loop, in seconds.
 
     A 1-element ``add_`` is launch-bound: the measured per-op time is
@@ -271,12 +301,15 @@ def _default_name(dev: torch.device) -> str:
     return f"{proc} (cpu, {torch.get_num_threads()}t)"
 
 
-def calibrate(device: Union[str, torch.device, None] = None, *,
-              name: Optional[str] = None,
-              dtype: torch.dtype = torch.float32,
-              quick: bool = False,
-              verbose: bool = False,
-              save: bool = False) -> TargetProfile:
+def calibrate(
+    device: str | torch.device | None = None,
+    *,
+    name: str | None = None,
+    dtype: torch.dtype = torch.float32,
+    quick: bool = False,
+    verbose: bool = False,
+    save: bool = False,
+) -> TargetProfile:
     """Measure the roofline constants of ``device`` (default: cuda if
     available, else cpu) and return a :class:`TargetProfile`.
 
@@ -290,9 +323,13 @@ def calibrate(device: Union[str, torch.device, None] = None, *,
     accuracy cost.  ``save=True`` additionally persists the profile under
     :func:`profiles_dir`.
     """
-    dev = (torch.device(device) if device is not None
-           else torch.device("cuda" if torch.cuda.is_available()
-                             else "cpu"))
+    dev = (
+        torch.device(device)
+        if device is not None
+        else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    )
     is_cuda = dev.type == "cuda"
 
     if is_cuda:
@@ -300,13 +337,17 @@ def calibrate(device: Union[str, torch.device, None] = None, *,
         flops_iters, flops_warmup = (10, 3) if quick else (20, 5)
         bw_mb = (64,) if quick else (64, 256)
         bw_iters, bw_warmup = (15, 3) if quick else (40, 5)
-        launch_iters, launch_warmup = (2000, 200) if quick else (5000, 500)
+        launch_iters, launch_warmup = (
+            (2000, 200) if quick else (5000, 500)
+        )
     else:
         flops_sizes = (256, 512) if quick else (512, 1024, 2048)
         flops_iters, flops_warmup = (3, 1) if quick else (5, 2)
         bw_mb = (32,) if quick else (64, 128)
         bw_iters, bw_warmup = (10, 3) if quick else (20, 5)
-        launch_iters, launch_warmup = (2000, 200) if quick else (5000, 500)
+        launch_iters, launch_warmup = (
+            (2000, 200) if quick else (5000, 500)
+        )
 
     # Measure honest fp32: TF32 tensor cores would inflate the matmul
     # number past what fp32 elementwise consumers actually get.
@@ -318,10 +359,13 @@ def calibrate(device: Union[str, torch.device, None] = None, *,
         except Exception:
             prev_tf32 = None
     try:
-        flops = _measure_flops(dev, dtype, flops_sizes,
-                               flops_iters, flops_warmup)
+        flops = _measure_flops(
+            dev, dtype, flops_sizes, flops_iters, flops_warmup
+        )
         bw = _measure_bandwidth(dev, dtype, bw_mb, bw_iters, bw_warmup)
-        launch = _measure_launch(dev, dtype, launch_iters, launch_warmup)
+        launch = _measure_launch(
+            dev, dtype, launch_iters, launch_warmup
+        )
     finally:
         if prev_tf32 is not None:
             try:
@@ -335,7 +379,9 @@ def calibrate(device: Union[str, torch.device, None] = None, *,
         gbps=bw / 1e9,
         launch_us=launch * 1e6,
         device=str(dev),
-        measured_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        measured_at=datetime.now(UTC).isoformat(
+            timespec="seconds"
+        ),
         meta={
             "dtype": str(dtype).replace("torch.", ""),
             "torch": torch.__version__,
@@ -343,9 +389,11 @@ def calibrate(device: Union[str, torch.device, None] = None, *,
         },
     )
     if verbose:
-        print(f"calibrated {profile.name} on {profile.device}: "
-              f"{profile.tflops:.3f} TFLOPS, {profile.gbps:.1f} GB/s, "
-              f"{profile.launch_us:.2f} µs launch")
+        print(
+            f"calibrated {profile.name} on {profile.device}: "
+            f"{profile.tflops:.3f} TFLOPS, {profile.gbps:.1f} GB/s, "
+            f"{profile.launch_us:.2f} µs launch"
+        )
     if save:
         save_profile(profile)
     return profile

@@ -11,18 +11,23 @@ These tests pin the mechanics on a 2-layer model: the dynamic
 the executed member honours its certified bound end-to-end, and the
 certificate is non-exact, replayable, and verifiable.
 """
+
 import math
 
 import torch
 import torch.nn as nn
 
-from catopt.egraph import EGraph, verify_certificate
-from catopt.ir import IR, Op, Var, TensorType, op_repr
-from catopt.rules import all_rules
+from catopt.act_eps import (
+    act_low_rank,
+    act_quant,
+    calibrate,
+    extract_with_offers,
+)
 from catopt.cost import count_cost
-from catopt.act_eps import (act_quant, act_low_rank, calibrate,
-                            extract_with_offers)
+from catopt.egraph import EGraph, verify_certificate
 from catopt.eps import model_bound
+from catopt.ir import IR, Op, op_repr
+from catopt.rules import all_rules
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 
@@ -53,7 +58,8 @@ def _build(m, x, iters=3):
 
 def _has_op(term, name):
     return isinstance(term, Op) and (
-        term.op == name or any(_has_op(a, name) for a in term.args))
+        term.op == name or any(_has_op(a, name) for a in term.args)
+    )
 
 
 def test_calibrate_collects_per_site_absmax():
@@ -63,13 +69,15 @@ def test_calibrate_collects_per_site_absmax():
     x = torch.randn(4, 32, dtype=torch.float64)
     ir, src = export_to_ir(m, x)
     calib = calibrate(ir, x, src)
-    assert calib["n_sites"] == 3          # linear1, relu, linear2 outputs
+    assert calib["n_sites"] == 3  # linear1, relu, linear2 outputs
     assert calib["global"] == max(calib["per_site"].values())
+
     # every op subterm of the root recorded
     def ops(t):
         if not isinstance(t, Op):
             return set()
         return {op_repr(t)} | set().union(*(ops(a) for a in t.args))
+
     assert ops(ir.root) <= set(calib["per_site"])
     # and the values are the true absmaxes
     with torch.no_grad():
@@ -115,10 +123,11 @@ def test_act_quant_executes_within_certified_bound():
     assert _has_op(term, "aquant") and _has_op(term, "adequant")
 
     mod = ir_to_torch_module(
-        IR(root=term, inputs=ir.inputs, params=ir.params), src)
+        IR(root=term, inputs=ir.inputs, params=ir.params), src
+    )
     with torch.no_grad():
         err = (mod(x) - m(x)).abs().max().item()
-    assert err > 0                      # a real, nonzero approximation
+    assert err > 0  # a real, nonzero approximation
     cert = eg.certificate(ir.root, term, root_eid=root)
     assert not cert.exact
     assert cert.error_bound > 0
@@ -126,13 +135,18 @@ def test_act_quant_executes_within_certified_bound():
     # both activation edges were quantized, both steps contribute
     site_bounds = sorted(o["bound"] for o in offers)
     step_bounds = sorted(
-        cert.rules[s.rule].error_bound for s in cert.steps
-        if cert.rules.get(s.rule) and cert.rules[s.rule].error_bound)
+        cert.rules[s.rule].error_bound
+        for s in cert.steps
+        if cert.rules.get(s.rule) and cert.rules[s.rule].error_bound
+    )
     assert step_bounds == site_bounds
     # whole-model bound: site bounds × Lipschitz path sensitivities
-    mb = model_bound(term, cert, src,
-                     input_norm=float(
-                         torch.linalg.norm(x, dim=-1).max()))
+    mb = model_bound(
+        term,
+        cert,
+        src,
+        input_norm=float(torch.linalg.norm(x, dim=-1).max()),
+    )
     assert mb["bound"] != float("inf")
     assert mb["bound"] >= err
 
@@ -161,7 +175,7 @@ def test_act_quant_uncalibrated_is_honestly_unbounded():
     m = _two_layer()
     x = torch.randn(4, 32, dtype=torch.float64)
     ir, src, eg, root = _build(m, x)
-    offers = act_quant(eg, src, bits=8)      # no calib
+    offers = act_quant(eg, src, bits=8)  # no calib
     assert offers
     assert all(o["bound"] == float("inf") for o in offers)
     term = extract_with_offers(eg, root, offers, cost_fn=count_cost)
@@ -177,8 +191,9 @@ def test_act_quant_bounded_extraction_prefers_exact():
     x = torch.randn(4, 32, dtype=torch.float64)
     ir, src, eg, root = _build(m, x)
     act_quant(eg, src, bits=8, calib=calibrate(ir, x, src))
-    term = eg.extract_best_bounded(root, count_cost, max_error=0.0,
-                                   src_term=ir.root)
+    term = eg.extract_best_bounded(
+        root, count_cost, max_error=0.0, src_term=ir.root
+    )
     assert term is not None
     assert not _has_op(term, "aquant")
     cert = eg.certificate(ir.root, term, root_eid=root)
@@ -235,7 +250,8 @@ def test_act_low_rank_offer_and_bound():
     term = extract_with_offers(eg, root, offers, cost_fn=count_cost)
     assert term is not None and _has_op(term, "matmul")
     mod = ir_to_torch_module(
-        IR(root=term, inputs=ir.inputs, params=ir.params), src)
+        IR(root=term, inputs=ir.inputs, params=ir.params), src
+    )
     with torch.no_grad():
         err = (mod(x) - m(x)).abs().max().item()
     cert = eg.certificate(ir.root, term, root_eid=root)
@@ -243,7 +259,10 @@ def test_act_low_rank_offer_and_bound():
     # measured residual recorded in the law text
     laws = " ".join(r.law for r in cert.rules.values() if r.error_bound)
     assert "measured residual" in laws
-    mb = model_bound(term, cert, src,
-                     input_norm=float(
-                         torch.linalg.norm(x, dim=-1).max()))
+    mb = model_bound(
+        term,
+        cert,
+        src,
+        input_norm=float(torch.linalg.norm(x, dim=-1).max()),
+    )
     assert mb["bound"] >= err or mb["bound"] == float("inf")

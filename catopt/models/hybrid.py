@@ -64,9 +64,14 @@ class HybridBlock(nn.Module):
         n_chunks: number of key/value blocks the concat is built from.
     """
 
-    def __init__(self, d_inner: int = 16, d_in: int = 16,
-                 d_attn: int = 16, steps: int = 16,
-                 n_chunks: int = 2) -> None:
+    def __init__(
+        self,
+        d_inner: int = 16,
+        d_in: int = 16,
+        d_attn: int = 16,
+        steps: int = 16,
+        n_chunks: int = 2,
+    ) -> None:
         super().__init__()
         self.decay_proj = nn.Linear(d_in, d_inner, bias=False)
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -77,20 +82,20 @@ class HybridBlock(nn.Module):
         self.out_proj = nn.Linear(d_attn, d_in, bias=False)
         self.steps = steps
         self.n_chunks = n_chunks
-        self.scale = d_attn ** -0.5
+        self.scale = d_attn**-0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (T, d_in)
-        a = torch.sigmoid(self.decay_proj(x))     # (T, d_inner) in (0,1)
-        b = self.B_proj(x)                        # (T, d_inner)
+        a = torch.sigmoid(self.decay_proj(x))  # (T, d_inner) in (0,1)
+        b = self.B_proj(x)  # (T, d_inner)
         h = self.h0
         ys = []
         for t in range(self.steps):
             h = a[t] * h + b[t] * x[t]
             ys.append(h)
-        y = torch.stack(ys, dim=0)                # (T, d_inner)
+        y = torch.stack(ys, dim=0)  # (T, d_inner)
 
-        q = self.q_proj(y) * self.scale           # scale on q, pre-matmul
+        q = self.q_proj(y) * self.scale  # scale on q, pre-matmul
         k = self.k_proj(y)
         v = self.v_proj(y)
         # Chunked K/V: cat of blocks so the om homomorphism can split.
@@ -110,9 +115,14 @@ class TwoLayerHybrid(nn.Module):
     Returns the second SSM's stacked state sequence, (T, d_inner).
     """
 
-    def __init__(self, d_inner: int = 16, d_in: int = 16,
-                 d_attn: int = 16, steps: int = 8,
-                 n_chunks: int = 2) -> None:
+    def __init__(
+        self,
+        d_inner: int = 16,
+        d_in: int = 16,
+        d_attn: int = 16,
+        steps: int = 8,
+        n_chunks: int = 2,
+    ) -> None:
         super().__init__()
         # Layer 1: diagonal SSM
         self.decay_proj1 = nn.Linear(d_in, d_inner, bias=False)
@@ -129,10 +139,15 @@ class TwoLayerHybrid(nn.Module):
         self.h0_2 = nn.Parameter(torch.zeros(d_inner))
         self.steps = steps
         self.n_chunks = n_chunks
-        self.scale = d_attn ** -0.5
+        self.scale = d_attn**-0.5
 
-    def _ssm(self, x: torch.Tensor, decay: nn.Linear,
-             B: nn.Linear, h0: torch.Tensor) -> torch.Tensor:
+    def _ssm(
+        self,
+        x: torch.Tensor,
+        decay: nn.Linear,
+        B: nn.Linear,
+        h0: torch.Tensor,
+    ) -> torch.Tensor:
         a = torch.sigmoid(decay(x))
         b = B(x)
         h = h0
@@ -152,6 +167,6 @@ class TwoLayerHybrid(nn.Module):
         K = torch.cat(list(k.chunk(self.n_chunks, dim=-2)), dim=-2)
         V = torch.cat(list(v.chunk(self.n_chunks, dim=-2)), dim=-2)
         att = torch.softmax(q @ K.transpose(-2, -1), dim=-1)
-        y2 = self.out_proj(att @ V)               # (T, d_in)
+        y2 = self.out_proj(att @ V)  # (T, d_in)
 
         return self._ssm(y2, self.decay_proj2, self.B_proj2, self.h0_2)

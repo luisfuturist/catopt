@@ -35,11 +35,11 @@ Covered here:
 
 import torch
 
-from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Op, Var, Const, TensorType, op_repr
 from catopt import meta
-from catopt import rules as R
 from catopt import om as OM
+from catopt import rules as R
+from catopt.egraph import EGraph, Rewrite
+from catopt.ir import Const, Op, TensorType, Var, op_repr
 
 
 def _T(*shape):
@@ -59,13 +59,17 @@ def _left_scaled_attention_seed():
     v = Var("v", _T(7, 6))
     m = Var("m", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1))
+        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+    )
     term = Op.make(
         "matmul",
-        Op.make("softmax",
-                Op.make("add", Op.make("mul", Const(0.5), scores), m),
-                arg1=-1),
-        v)
+        Op.make(
+            "softmax",
+            Op.make("add", Op.make("mul", Const(0.5), scores), m),
+            arg1=-1,
+        ),
+        v,
+    )
     return term, (q, k, v, m)
 
 
@@ -78,13 +82,17 @@ def _sub_mask_attention_seed():
     m1 = Var("m1", _T(5, 7))
     m2 = Var("m2", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1))
+        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+    )
     term = Op.make(
         "matmul",
-        Op.make("softmax",
-                Op.make("add", scores, Op.make("sub", m1, m2)),
-                arg1=-1),
-        v)
+        Op.make(
+            "softmax",
+            Op.make("add", scores, Op.make("sub", m1, m2)),
+            arg1=-1,
+        ),
+        v,
+    )
     return term, (q, k, v, m1, m2)
 
 
@@ -95,15 +103,22 @@ def _masked_fill_attention_seed():
     v = Var("v", _T(7, 6))
     mk = Var("mk", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1))
+        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+    )
     term = Op.make(
         "matmul",
-        Op.make("softmax",
-                Op.make("masked_fill",
-                        Op.make("mul", Const(0.5), scores),
-                        mk, Const(float("-inf"))),
-                arg1=-1),
-        v)
+        Op.make(
+            "softmax",
+            Op.make(
+                "masked_fill",
+                Op.make("mul", Const(0.5), scores),
+                mk,
+                Const(float("-inf")),
+            ),
+            arg1=-1,
+        ),
+        v,
+    )
     return term, (q, k, v, mk)
 
 
@@ -123,6 +138,7 @@ def _provenance_in(derived, parents):
 # ---------------------------------------------------------------------------
 #  (a) sdpa_fold-family compositions emit ONLY via a seed witness
 # ---------------------------------------------------------------------------
+
 
 def test_left_scaled_sdpa_fold_emits_only_with_seed():
     """comm_mul ∘ sdpa_fold_addmul: the fold's ``mul(scores, S)`` shape
@@ -156,16 +172,19 @@ def test_left_scaled_sdpa_fold_emits_only_with_seed():
     # fp64-verified on real tensors
     env = _env(leaves)
     assert meta._eval_allclose(
-        meta._eval_term(seed, env), meta._eval_term(applied, env),
-        tol=1e-10)
+        meta._eval_term(seed, env),
+        meta._eval_term(applied, env),
+        tol=1e-10,
+    )
 
     # and it plugs back into the e-graph: the root class gains an sdpa
     eg = EGraph()
     root = eg.add_term(seed)
     eg.run([d], root, max_iterations=3, max_nodes=5_000)
     assert eg.rule_fires.get(d.name, 0) > 0
-    assert any(n.op == "sdpa"
-               for n in eg.get_class(eg.find(root)).nodes)
+    assert any(
+        n.op == "sdpa" for n in eg.get_class(eg.find(root)).nodes
+    )
 
 
 def test_sdpa_fold_then_rewrite_emits_only_with_seed():
@@ -195,8 +214,10 @@ def test_sdpa_fold_then_rewrite_emits_only_with_seed():
 
     env = _env(leaves)
     assert meta._eval_allclose(
-        meta._eval_term(seed, env), meta._eval_term(applied, env),
-        tol=1e-10)
+        meta._eval_term(seed, env),
+        meta._eval_term(applied, env),
+        tol=1e-10,
+    )
 
 
 def test_masked_fill_sdpa_fold_emits_only_with_seed():
@@ -209,11 +230,13 @@ def test_masked_fill_sdpa_fold_emits_only_with_seed():
 
     bare = meta.synthesize_rules(rules, fuel=2000)
     assert not _provenance_in(
-        bare, ("comm_mul", "sdpa_fold_masked_fillmul"))
+        bare, ("comm_mul", "sdpa_fold_masked_fillmul")
+    )
 
     derived = meta.synthesize_rules(rules, [seed], fuel=2000)
     hits = _provenance_in(
-        derived, ("comm_mul", "sdpa_fold_masked_fillmul"))
+        derived, ("comm_mul", "sdpa_fold_masked_fillmul")
+    )
     assert hits, "masked_fill sdpa fold not synthesized"
     d = hits[0]
     assert d.check is not None and d.derive is not None
@@ -229,22 +252,35 @@ def test_masked_fill_sdpa_fold_emits_only_with_seed():
     env = _env((q, k, v), bools=())
     env[mk] = torch.rand(*mk.typ.shape) > 0.4
     assert meta._eval_allclose(
-        meta._eval_term(seed, env), meta._eval_term(applied, env),
-        tol=1e-10)
+        meta._eval_term(seed, env),
+        meta._eval_term(applied, env),
+        tol=1e-10,
+    )
 
     # vetoed instance: a non-Const fill fails the composite guard
     f_var = Var("f", _T())
     bad = Op.make(
         "matmul",
-        Op.make("softmax",
-                Op.make("masked_fill",
-                        Op.make("mul", Const(0.5),
-                                Op.make("matmul", q,
-                                        Op.make("transpose", k,
-                                                arg1=-2, arg2=-1))),
-                        mk, f_var),
-                arg1=-1),
-        v)
+        Op.make(
+            "softmax",
+            Op.make(
+                "masked_fill",
+                Op.make(
+                    "mul",
+                    Const(0.5),
+                    Op.make(
+                        "matmul",
+                        q,
+                        Op.make("transpose", k, arg1=-2, arg2=-1),
+                    ),
+                ),
+                mk,
+                f_var,
+            ),
+            arg1=-1,
+        ),
+        v,
+    )
     assert meta.apply_rewrite_at(d, bad, ()) is None
 
 
@@ -252,18 +288,21 @@ def test_masked_fill_sdpa_fold_emits_only_with_seed():
 #  (b) a guarded SYMBOLIC candidate is rescued by a seed-mined witness
 # ---------------------------------------------------------------------------
 
+
 def _symbolic_candidate(r1, r2):
     """Build the symbolic composition r1∘r2 exactly as the symbolic
     path does, returning the unvalidated candidate Rewrite."""
     subst = {}
     for v in meta.pattern_metavars(r1.lhs):
-        subst[v] = (v[len("$attr:"):] if v.startswith("$attr:") else v)
+        subst[v] = v[len("$attr:") :] if v.startswith("$attr:") else v
     for v in meta.pattern_metavars(r1.rhs):
         if v.startswith("$attr:") and v not in subst:
-            subst[v] = "@1:" + v[len("$attr:"):]
+            subst[v] = "@1:" + v[len("$attr:") :]
     t1 = meta.instantiate_pattern(r1.rhs, subst)
-    pat1 = {v: (v[len("$attr:"):] if v.startswith("$attr:") else v)
-            for v in meta.pattern_metavars(r1.lhs)}
+    pat1 = {
+        v: (v[len("$attr:") :] if v.startswith("$attr:") else v)
+        for v in meta.pattern_metavars(r1.lhs)
+    }
     for q, sub in meta._positions(t1):
         m2 = meta.match_pattern(r2.lhs, sub, {})
         if m2 is None:
@@ -275,13 +314,16 @@ def _symbolic_candidate(r1, r2):
                 if r2.derive is None:
                     ok = False
                     break
-                inst2[v] = "@2:" + v[len("$attr:"):]
+                inst2[v] = "@2:" + v[len("$attr:") :]
         if not ok:
             continue
-        t2 = meta._replace(t1, q, meta.instantiate_pattern(r2.rhs, inst2))
+        t2 = meta._replace(
+            t1, q, meta.instantiate_pattern(r2.rhs, inst2)
+        )
         chk, drv = meta._compose_guards(r1, r2, pat1, m2)
-        return Rewrite(name="cand", lhs=r1.lhs, rhs=t2,
-                       check=chk, derive=drv)
+        return Rewrite(
+            name="cand", lhs=r1.lhs, rhs=t2, check=chk, derive=drv
+        )
     raise AssertionError("no symbolic composition exists")
 
 
@@ -308,7 +350,8 @@ def test_seed_witness_rescues_symbolic_guarded_candidate():
     # end to end: same pair emits only when the seed is passed
     bare = meta.synthesize_rules([r1, r2], fuel=2000)
     assert not _provenance_in(
-        bare, ("linear_channel_scale", "comm_mul"))
+        bare, ("linear_channel_scale", "comm_mul")
+    )
     derived = meta.synthesize_rules([r1, r2], [seed], fuel=2000)
     hits = _provenance_in(derived, ("linear_channel_scale", "comm_mul"))
     assert hits
@@ -317,13 +360,16 @@ def test_seed_witness_rescues_symbolic_guarded_candidate():
     assert applied is not None
     env = _env((x, c, W))
     assert meta._eval_allclose(
-        meta._eval_term(seed, env), meta._eval_term(applied, env),
-        tol=1e-10)
+        meta._eval_term(seed, env),
+        meta._eval_term(applied, env),
+        tol=1e-10,
+    )
 
 
 # ---------------------------------------------------------------------------
 #  (c) the bounded pool remains the fallback for satisfiable guards
 # ---------------------------------------------------------------------------
+
 
 def test_bounded_instantiation_remains_fallback():
     """An unseeded guarded pair whose side conditions ARE reachable in
@@ -332,8 +378,9 @@ def test_bounded_instantiation_remains_fallback():
     rules = meta.module_rules(R) + meta.module_rules(OM)
     assert all(meta._synthesizable(r) for r in rules)
 
-    derived = meta.synthesize_rules([OM.OM_LIFT, OM.OM_UNLIFT],
-                                    fuel=1000)
+    derived = meta.synthesize_rules(
+        [OM.OM_LIFT, OM.OM_UNLIFT], fuel=1000
+    )
     hits = _provenance_in(derived, ("om_lift", "om_unlift"))
     assert hits, "unguarded-seed fallback regressed"
     lemma = hits[0]

@@ -33,21 +33,21 @@ evaluates fp64-identical to the source module.
 
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
+import catopt.om as OM  # registers cmask/fill/attnbias
+import catopt.xcarrier as XC  # registers omd/affd bindings
+from catopt.cost import _infer_op_shape, _shape_of, flops_cost
 from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, Const, Param, TensorType
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.cost import flops_cost, _shape_of, _infer_op_shape
-import catopt.om as OM                      # registers cmask/fill/attnbias
-import catopt.xcarrier as XC                # registers omd/affd bindings
+from catopt.ir import IR, Const, Op, Param, TensorType
 from catopt.regime import default_rules
-
+from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 # ---------------------------------------------------------------------------
 #  The module — ScanAttnMH shape (bench_omd2.py)
 # ---------------------------------------------------------------------------
+
 
 class _ScanAttnMH(torch.nn.Module):
     """h_t = a_t⊙h + x_t; v/q/k = W·(stack h or x) split into heads via
@@ -67,11 +67,13 @@ class _ScanAttnMH(torch.nn.Module):
         # ~1e-8 output deviation; an export artifact, not a catopt
         # issue — same note as bench_omd2.ScanAttnMQA).
         self.register_buffer(
-            "sq", torch.tensor(hd ** -0.5, dtype=torch.float64))
+            "sq", torch.tensor(hd**-0.5, dtype=torch.float64)
+        )
         mask = torch.zeros(T, T)
         mask.masked_fill_(
             torch.triu(torch.ones(T, T, dtype=torch.bool), 1),
-            float("-inf"))
+            float("-inf"),
+        )
         self.register_buffer("cm", mask)
 
     def scan(self, x):
@@ -102,15 +104,20 @@ def _build_mha_egraph(T: int, D: int = 64, nh: int = 4, hd: int = 16):
     ir, src = export_to_ir(m, x)
     eg = EGraph()
     root = eg.add_term(ir.root)
-    eg.run(default_rules(), root, max_iterations=6,
-           max_nodes=300_000)
-    lifts = (XC.gather_applyd_stack(eg) + XC.gather_apply_stack(eg)
-             + XC.omd_tree_lift(eg))
+    eg.run(default_rules(), root, max_iterations=6, max_nodes=300_000)
+    lifts = (
+        XC.gather_applyd_stack(eg)
+        + XC.gather_apply_stack(eg)
+        + XC.omd_tree_lift(eg)
+    )
     if lifts:
         eg.rebuild()
     eg.run(XC.XC_LAWS, root, max_iterations=4, max_nodes=300_000)
-    more = (XC.gather_applyd_stack(eg) + XC.gather_apply_stack(eg)
-            + XC.omd_tree_lift(eg))
+    more = (
+        XC.gather_applyd_stack(eg)
+        + XC.gather_apply_stack(eg)
+        + XC.omd_tree_lift(eg)
+    )
     if more:
         eg.rebuild()
     return eg, root, ir, src, m, x
@@ -126,8 +133,9 @@ def _om_classes(eg: EGraph):
             continue
         for n in ec.nodes:
             if n.op == "om_elem" and len(n.children) == 2:
-                out.append((eg.find(n.children[0]),
-                            eg.find(n.children[1])))
+                out.append(
+                    (eg.find(n.children[0]), eg.find(n.children[1]))
+                )
     return out
 
 
@@ -143,6 +151,7 @@ def _member_term(eg: EGraph, node) -> Op | None:
 #  Unit-level: the () policy in _infer_op_shape
 # ---------------------------------------------------------------------------
 
+
 def test_scalar_operand_axis_ops_report_none():
     """A ``()``-shaped operand under an op that cannot be scalar means
     a carrier-internal member is being read as a tensor — the shape is
@@ -151,20 +160,32 @@ def test_scalar_operand_axis_ops_report_none():
     v4 = Param("v4", TensorType((4,)))
     m44 = Param("m44", TensorType((4, 4)))
     # the ZeroDivisionError site: transpose on a ()-shaped operand
-    assert _infer_op_shape(
-        Op.make("transpose", scalar, arg1=0, arg2=1)) is None
+    assert (
+        _infer_op_shape(Op.make("transpose", scalar, arg1=0, arg2=1))
+        is None
+    )
     # every other axis-indexing op takes the same policy
     assert _infer_op_shape(Op.make("squeeze", scalar, arg1=0)) is None
-    assert _infer_op_shape(Op.make("select", scalar, arg1=0,
-                                   arg2=0)) is None
+    assert (
+        _infer_op_shape(Op.make("select", scalar, arg1=0, arg2=0))
+        is None
+    )
     assert _infer_op_shape(Op.make("slice", scalar, arg1=0)) is None
     assert _infer_op_shape(Op.make("unbind", scalar, arg1=0)) is None
-    assert _infer_op_shape(Op.make("chunk", scalar, dim=0,
-                                   chunks=2)) is None
-    assert _infer_op_shape(
-        Op.make("split", scalar, dim=0, sizes=(1, 1), index=0)) is None
-    assert _infer_op_shape(
-        Op.make("concat", scalar, scalar, dim=0)) is None
+    assert (
+        _infer_op_shape(Op.make("chunk", scalar, dim=0, chunks=2))
+        is None
+    )
+    assert (
+        _infer_op_shape(
+            Op.make("split", scalar, dim=0, sizes=(1, 1), index=0)
+        )
+        is None
+    )
+    assert (
+        _infer_op_shape(Op.make("concat", scalar, scalar, dim=0))
+        is None
+    )
     assert _infer_op_shape(Op.make("flatten", scalar)) is None
     # explicit-dim reduce on a scalar (dim=None full-reduce stays ())
     assert _infer_op_shape(Op.make("sum", scalar, dim=0)) is None
@@ -174,11 +195,14 @@ def test_scalar_operand_axis_ops_report_none():
     assert _infer_op_shape(Op.make("linear", scalar, m44)) is None
     # carrier convention slots resolve () -> None
     assert _infer_op_shape(Op.make("om_elem", scalar, v4)) is None
-    assert _infer_op_shape(
-        Op.make("applyd",
-                Op.make("aff_diag", v4, v4), scalar)) is None
+    assert (
+        _infer_op_shape(
+            Op.make("applyd", Op.make("aff_diag", v4, v4), scalar)
+        )
+        is None
+    )
     # genuine scalar results are unaffected
-    assert _infer_op_shape(Op.make("matmul", v4, v4)) == ()   # dot
+    assert _infer_op_shape(Op.make("matmul", v4, v4)) == ()  # dot
     assert _shape_of(scalar) == ()
 
 
@@ -202,15 +226,18 @@ def test_om_lift_check_uses_value_shapes():
                 if v_term is None:
                     continue
                 assert OM._check_om_lift(
-                    {"s": s_term, "v": v_term, "$attr:SD": -1}), (
+                    {"s": s_term, "v": v_term, "$attr:SD": -1}
+                ), (
                     f"om_lift vetoed on s={sn.op} "
                     f"(shape {_shape_of(s_term)}), v={vn.op} "
-                    f"(shape {_shape_of(v_term)})")
+                    f"(shape {_shape_of(v_term)})"
+                )
 
 
 # ---------------------------------------------------------------------------
 #  E2E — T=32 and T=64
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("T", [32, 64])
 def test_mha_om_lift_fires_and_extract_is_exact(T: int):
@@ -235,7 +262,8 @@ def test_mha_om_lift_fires_and_extract_is_exact(T: int):
     assert term is not None
 
     mod = ir_to_torch_module(
-        IR(root=term, inputs=ir.inputs, params=ir.params), src)
+        IR(root=term, inputs=ir.inputs, params=ir.params), src
+    )
     with torch.no_grad():
         ref = m(x)
         out = mod(x)

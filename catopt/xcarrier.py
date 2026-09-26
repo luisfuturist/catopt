@@ -136,14 +136,14 @@ from typing import Any
 import torch
 
 from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Op, Var, TensorType
+from catopt.ir import Op, TensorType, Var
 from catopt.rules import R
 from catopt.torch_bridge import _IR_TO_TORCH
 
 __all__ = [
     "XC_LAWS",
-    "gather_applyd_stack",
     "gather_apply_stack",
+    "gather_applyd_stack",
     "omd_tree_lift",
 ]
 
@@ -151,24 +151,30 @@ __all__ = [
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
     from catopt.cost import _shape_of as _so
+
     return _so(t)
 
 
 def _broadcast_ok(a, b) -> bool:
-    from catopt.cost import _broadcast, _INVALID
+    from catopt.cost import _INVALID, _broadcast
+
     return _broadcast(a, b) is not _INVALID
 
 
 def _bc(a, b):
     """Broadcast result, or None when incompatible/unknown."""
-    from catopt.cost import _broadcast, _INVALID
+    from catopt.cost import _INVALID, _broadcast
+
     r = _broadcast(a, b)
     return None if r is _INVALID else r
 
 
 def _concrete(s) -> bool:
-    return (isinstance(s, tuple) and len(s) > 0
-            and all(isinstance(d, int) for d in s))
+    return (
+        isinstance(s, tuple)
+        and len(s) > 0
+        and all(isinstance(d, int) for d in s)
+    )
 
 
 def _vec(t) -> bool:
@@ -217,10 +223,16 @@ def _xshape_rec(t: Any, memo: dict):
         # value = a⊙h + b — broadcast of all three factors
         f, h = args
         hs = _xshape(h, memo)
-        if isinstance(f, Op) and f.op == "aff_diag" and len(f.args) == 2:
-            return _bc(_bc(_xshape(f.args[0], memo), hs),
-                       _xshape(f.args[1], memo))
-        fs = _shape_of(f)      # opaque map: a-part convention
+        if (
+            isinstance(f, Op)
+            and f.op == "aff_diag"
+            and len(f.args) == 2
+        ):
+            return _bc(
+                _bc(_xshape(f.args[0], memo), hs),
+                _xshape(f.args[1], memo),
+            )
+        fs = _shape_of(f)  # opaque map: a-part convention
         return _bc(fs, hs)
     if op == "apply" and len(args) == 2:
         # value = A@h + c — A (…,o,i) contracts h's axis, + c
@@ -231,7 +243,7 @@ def _xshape_rec(t: Any, memo: dict):
             if isinstance(As, tuple) and len(As) >= 1:
                 return _bc(tuple(As[:-1]), cs)
             return cs
-        fs = _shape_of(f)      # dense map convention: (…,o,i)
+        fs = _shape_of(f)  # dense map convention: (…,o,i)
         if isinstance(fs, tuple) and len(fs) >= 2:
             return tuple(fs[:-1])
         return _shape_of(t)
@@ -246,8 +258,8 @@ def _xshape_rec(t: Any, memo: dict):
             return _xshape(f.args[1], memo)
         fs = _shape_of(f)
         if op == "aff_b" and isinstance(fs, tuple) and len(fs) >= 2:
-            return tuple(fs[:-1])       # dense b-part ≈ output shape
-        return fs                        # diag b-part ≈ a-part shape
+            return tuple(fs[:-1])  # dense b-part ≈ output shape
+        return fs  # diag b-part ≈ a-part shape
     # The fused/deferred om family — the applied VALUE shape, the same
     # convention om_elem uses: score prefix ++ value's last dim.
     if op == "om_elem_affd" and len(args) == 4:
@@ -272,7 +284,7 @@ def _xshape_rec(t: Any, memo: dict):
     if op in ("omd_apply", "omd_applym") and len(args) == 2:
         return _xshape(args[0], memo)
     if op == "omd" and len(args) == 4:
-        return _xshape(args[3], memo)    # fb — applied numerator shape
+        return _xshape(args[3], memo)  # fb — applied numerator shape
     # generic op: re-dispatch _shape_of on surrogate leaves carrying
     # the corrected child shapes.
     fixed = list(args)
@@ -297,6 +309,7 @@ def _shape(t):
 #  Torch bindings — registered into the bridge's op table (additive).
 # ---------------------------------------------------------------------------
 
+
 def _affd_a(f, *a, **kw):
     return f[0]
 
@@ -305,8 +318,9 @@ def _affd_b(f, *a, **kw):
     return f[1]
 
 
-def _om_elem_affd(s: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
-                  h: torch.Tensor):
+def _om_elem_affd(
+    s: torch.Tensor, a: torch.Tensor, b: torch.Tensor, h: torch.Tensor
+):
     """om_elem whose value block is diagonal-affine in h:
     elem(s, a⊙h+b) = (m, l, (e@a)⊙h + e@b).  Same triple as
     ``om_elem(s, applyd(aff_diag(a,b),h))`` — fp64-identical modulo
@@ -316,8 +330,9 @@ def _om_elem_affd(s: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
     return m, e.sum(dim=-1, keepdim=True), (e @ a) * h + e @ b
 
 
-def _om_elem_aff(s: torch.Tensor, A: torch.Tensor, b: torch.Tensor,
-                 h: torch.Tensor):
+def _om_elem_aff(
+    s: torch.Tensor, A: torch.Tensor, b: torch.Tensor, h: torch.Tensor
+):
     """om_elem with dense-affine values: v = A@h + b with per-key
     A : (…,K, d, i).  numerator = (e@A)@h + e@b where e@A contracts the
     key axis — computed via reshape (the IR has no einsum).  Leading
@@ -326,8 +341,8 @@ def _om_elem_aff(s: torch.Tensor, A: torch.Tensor, b: torch.Tensor,
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
     d, i = A.shape[-2], A.shape[-1]
-    ea = e @ A.reshape(*A.shape[:-2], d * i)   # (…,Tq,d·i)
-    ea = ea.reshape(*ea.shape[:-1], d, i)      # (…,Tq,d,i)
+    ea = e @ A.reshape(*A.shape[:-2], d * i)  # (…,Tq,d·i)
+    ea = ea.reshape(*ea.shape[:-1], d, i)  # (…,Tq,d,i)
     return m, e.sum(dim=-1, keepdim=True), ea @ h + e @ b
 
 
@@ -377,11 +392,15 @@ def _omd_compose(f, g):
     zl1, zl2 = torch.zeros_like(l1), torch.zeros_like(l2)
     za1, za2 = torch.zeros_like(fa1), torch.zeros_like(fa2)
     zb1, zb2 = torch.zeros_like(fb1), torch.zeros_like(fb2)
-    l = torch.where(fin1, l1 * e1, zl1) + torch.where(fin2, l2 * e2, zl2)
+    l = torch.where(fin1, l1 * e1, zl1) + torch.where(
+        fin2, l2 * e2, zl2
+    )
     fa = torch.where(fin1f, fa1 * e1f, za1) + torch.where(
-        fin2f, fa2 * e2f, za2)
+        fin2f, fa2 * e2f, za2
+    )
     fb = torch.where(fin1, fb1 * e1, zb1) + torch.where(
-        fin2, fb2 * e2, zb2)
+        fin2, fb2 * e2, zb2
+    )
     return mx, l, fa, fb
 
 
@@ -413,6 +432,7 @@ _IR_TO_TORCH["omd_applym"] = _omd_applym
 #  Guards
 # ---------------------------------------------------------------------------
 
+
 def _check_matmul_applyd_vec(bound: dict) -> bool:
     """matmul(W, applyd(aff_diag(a,b),h)) — W contracts the FEATURE
     axis: a,b,h all (d,), W (o,d).  The dense promotion:
@@ -420,8 +440,9 @@ def _check_matmul_applyd_vec(bound: dict) -> bool:
     W, a, b, h = (_shape(bound.get(k)) for k in ("W", "a", "b", "h"))
     if not all(_concrete(s) for s in (W, a, b, h)):
         return False
-    return (len(W) == 2 and len(a) == 1 and a == b == h
-            and W[-1] == a[-1])
+    return (
+        len(W) == 2 and len(a) == 1 and a == b == h and W[-1] == a[-1]
+    )
 
 
 def _check_matmul_apply(bound: dict) -> bool:
@@ -431,8 +452,14 @@ def _check_matmul_apply(bound: dict) -> bool:
     W, A, c, h = (_shape(bound.get(k)) for k in ("W", "A", "c", "h"))
     if not all(_concrete(s) for s in (W, A, c, h)):
         return False
-    return (len(W) == 2 and len(A) == 2 and A[0] == A[1] == W[-1]
-            and len(c) == 1 and c == h and c[-1] == A[-1])
+    return (
+        len(W) == 2
+        and len(A) == 2
+        and A[0] == A[1] == W[-1]
+        and len(c) == 1
+        and c == h
+        and c[-1] == A[-1]
+    )
 
 
 def _check_linear_applyd(bound: dict) -> bool:
@@ -442,8 +469,13 @@ def _check_linear_applyd(bound: dict) -> bool:
     W, a, b, h = (_shape(bound.get(k)) for k in ("W", "a", "b", "h"))
     if not all(_concrete(s) for s in (W, a, b, h)):
         return False
-    return (len(W) == 2 and len(a) >= 1 and a == b
-            and len(h) == 1 and h[-1] == a[-1] == W[-1])
+    return (
+        len(W) == 2
+        and len(a) >= 1
+        and a == b
+        and len(h) == 1
+        and h[-1] == a[-1] == W[-1]
+    )
 
 
 def _check_linear_apply(bound: dict) -> bool:
@@ -452,16 +484,25 @@ def _check_linear_apply(bound: dict) -> bool:
     W, A, c, h = (_shape(bound.get(k)) for k in ("W", "A", "c", "h"))
     if not all(_concrete(s) for s in (W, A, c, h)):
         return False
-    if not (len(W) == 2 and len(A) >= 2 and A[-1] == A[-2] == W[-1]
-            and len(h) == 1 and h[-1] == A[-1] and len(c) >= 1):
+    if not (
+        len(W) == 2
+        and len(A) >= 2
+        and A[-1] == A[-2] == W[-1]
+        and len(h) == 1
+        and h[-1] == A[-1]
+        and len(c) >= 1
+    ):
         return False
     return _broadcast_ok(c, A[:-1])
 
 
 def _scalar_or_broadcast(bound: dict, rkey: str, tshape) -> bool:
     rs = _shape(bound.get(rkey))
-    return rs is not None and _broadcast_ok(rs, tshape) and (
-        len(rs) == 0 or rs == tshape or rs == (tshape[-1],))
+    return (
+        rs is not None
+        and _broadcast_ok(rs, tshape)
+        and (len(rs) == 0 or rs == tshape or rs == (tshape[-1],))
+    )
 
 
 def _named_scale(bound: dict, rkey: str) -> bool:
@@ -507,8 +548,12 @@ def _check_scale_apply(bound: dict) -> bool:
         return False
     if not _named_scale(bound, "r"):
         return False
-    if not (len(A) >= 2 and A[-1] == A[-2] and len(h) == 1
-            and h[-1] == A[-1]):
+    if not (
+        len(A) >= 2
+        and A[-1] == A[-2]
+        and len(h) == 1
+        and h[-1] == A[-1]
+    ):
         return False
     if not _broadcast_ok(c, A[:-1]):
         return False
@@ -522,8 +567,11 @@ def _check_scale_apply(bound: dict) -> bool:
         return True
     if rs == A[:-1]:
         return True
-    return (len(rs) == len(A) - 1 and rs[-1] == 1
-            and _broadcast_ok(rs[:-1], A[:-2]))
+    return (
+        len(rs) == len(A) - 1
+        and rs[-1] == 1
+        and _broadcast_ok(rs[:-1], A[:-2])
+    )
 
 
 def _check_add_applyd(bound: dict) -> bool:
@@ -542,8 +590,13 @@ def _check_add_apply(bound: dict) -> bool:
     f, g, h = (_shape(bound.get(k)) for k in ("f", "g", "h"))
     if not all(_concrete(s) for s in (f, g, h)):
         return False
-    return (f == g and len(f) >= 2 and f[-1] == f[-2]
-            and len(h) == 1 and h[-1] == f[-1])
+    return (
+        f == g
+        and len(f) >= 2
+        and f[-1] == f[-2]
+        and len(h) == 1
+        and h[-1] == f[-1]
+    )
 
 
 def _check_chunk_applyd(bound: dict, split: bool = False) -> bool:
@@ -551,8 +604,9 @@ def _check_chunk_applyd(bound: dict, split: bool = False) -> bool:
     be the FEATURE axis (h is not chunked), i.e. D % rank < rank-1."""
     a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
     D = bound.get("$attr:D")
-    if not (all(_concrete(s) for s in (a, b, h))
-            and isinstance(D, int)):
+    if not (
+        all(_concrete(s) for s in (a, b, h)) and isinstance(D, int)
+    ):
         return False
     if a != b or len(a) < 2 or len(h) != 1 or h[-1] != a[-1]:
         return False
@@ -565,18 +619,26 @@ def _check_chunk_apply(bound: dict) -> tuple[bool, int | None]:
     is LAST).  Any axis of c is sound.  Returns (ok, DA)."""
     A, c, h = (_shape(bound.get(k)) for k in ("A", "c", "h"))
     D = bound.get("$attr:D")
-    if not (all(_concrete(s) for s in (A, c, h)) and isinstance(D, int)):
+    if not (
+        all(_concrete(s) for s in (A, c, h)) and isinstance(D, int)
+    ):
         return False, None
-    if not (len(c) >= 1 and len(A) == len(c) + 1 and A[:-1] == c
-            and len(h) == 1 and h[-1] == A[-1]):
+    if not (
+        len(c) >= 1
+        and len(A) == len(c) + 1
+        and A[:-1] == c
+        and len(h) == 1
+        and h[-1] == A[-1]
+    ):
         return False, None
     return True, D % len(c)
 
 
 def _check_split_sizes_int(bound: dict) -> bool:
     sz = bound.get("$attr:SZ")
-    return (isinstance(sz, (list, tuple))
-            and all(isinstance(x, int) for x in sz))
+    return isinstance(sz, (list, tuple)) and all(
+        isinstance(x, int) for x in sz
+    )
 
 
 def _check_chunk_applyd_ok(bound: dict) -> bool:
@@ -597,7 +659,9 @@ def _derive_chunk_apply(bound: dict):
 
 
 def _check_split_apply(bound: dict) -> bool:
-    return _check_chunk_apply_ok(bound) and _check_split_sizes_int(bound)
+    return _check_chunk_apply_ok(bound) and _check_split_sizes_int(
+        bound
+    )
 
 
 def _check_om_elem_affd(bound: dict) -> bool:
@@ -606,8 +670,7 @@ def _check_om_elem_affd(bound: dict) -> bool:
     s, a, b, h = (_shape(bound.get(k)) for k in ("s", "a", "b", "h"))
     if not all(_concrete(x) for x in (s, a, b, h)):
         return False
-    if not (len(s) >= 2 and len(a) >= 2 and a == b
-            and len(h) == 1):
+    if not (len(s) >= 2 and len(a) >= 2 and a == b and len(h) == 1):
         return False
     if s[-1] != a[-2] or h[-1] != a[-1]:
         return False
@@ -623,8 +686,14 @@ def _check_om_elem_aff(bound: dict) -> bool:
     s, A, b, h = (_shape(bound.get(k)) for k in ("s", "A", "b", "h"))
     if not all(_concrete(x) for x in (s, A, b, h)):
         return False
-    if not (len(s) >= 2 and len(A) >= 3 and s[-1] == A[-3]
-            and b == A[:-1] and len(h) == 1 and h[-1] == A[-1]):
+    if not (
+        len(s) >= 2
+        and len(A) >= 3
+        and s[-1] == A[-3]
+        and b == A[:-1]
+        and len(h) == 1
+        and h[-1] == A[-1]
+    ):
         return False
     return _broadcast_ok(s[:-2], A[:-3])
 
@@ -644,25 +713,38 @@ def _check_omd_pair(bound: dict) -> bool:
     must satisfy the elem-applyd shape relation and the two score
     blocks must agree off the key axis."""
     ok1 = _check_om_elem_affd(
-        {"s": bound.get("s1"), "a": bound.get("a1"),
-         "b": bound.get("b1"), "h": bound.get("h")})
+        {
+            "s": bound.get("s1"),
+            "a": bound.get("a1"),
+            "b": bound.get("b1"),
+            "h": bound.get("h"),
+        }
+    )
     ok2 = _check_om_elem_affd(
-        {"s": bound.get("s2"), "a": bound.get("a2"),
-         "b": bound.get("b2"), "h": bound.get("h")})
+        {
+            "s": bound.get("s2"),
+            "a": bound.get("a2"),
+            "b": bound.get("b2"),
+            "h": bound.get("h"),
+        }
+    )
     if not (ok1 and ok2):
         return False
     s1, s2 = _shape(bound.get("s1")), _shape(bound.get("s2"))
     a1, a2 = _shape(bound.get("a1")), _shape(bound.get("a2"))
-    return (all(s1[i] == s2[i] for i in range(len(s1) - 1))
-            and all(a1[i] == a2[i] for i in range(len(a1))
-                    if i != len(a1) - 2))
+    return all(s1[i] == s2[i] for i in range(len(s1) - 1)) and all(
+        a1[i] == a2[i] for i in range(len(a1)) if i != len(a1) - 2
+    )
 
 
 def _check_omd_split(bound: dict) -> bool:
     """omd_elem(cat s, cat a, cat b) splits like om_elem: scores cat on
     the LAST dim (keys), a/b cat on dim -2 (the same key axis)."""
-    sd, ad, bd = (bound.get("$attr:SD"), bound.get("$attr:AD"),
-                  bound.get("$attr:BD"))
+    sd, ad, bd = (
+        bound.get("$attr:SD"),
+        bound.get("$attr:AD"),
+        bound.get("$attr:BD"),
+    )
     s1, s2 = _shape(bound.get("s1")), _shape(bound.get("s2"))
     a1, a2 = _shape(bound.get("a1")), _shape(bound.get("a2"))
     b1, b2 = _shape(bound.get("b1")), _shape(bound.get("b2"))
@@ -678,12 +760,15 @@ def _check_omd_split(bound: dict) -> bool:
         return False
     if not all(s1[i] == s2[i] for i in range(len(s1) - 1)):
         return False
-    if not (all(a1[i] == a2[i] for i in range(len(a1))
-                if i != len(a1) - 2)
-            and s1[-1] == a1[-2] and s2[-1] == a2[-2]):
+    if not (
+        all(a1[i] == a2[i] for i in range(len(a1)) if i != len(a1) - 2)
+        and s1[-1] == a1[-2]
+        and s2[-1] == a2[-2]
+    ):
         return False
-    return (_broadcast_ok(s1[:-2], a1[:-2])
-            and _broadcast_ok(s2[:-2], a2[:-2]))
+    return _broadcast_ok(s1[:-2], a1[:-2]) and _broadcast_ok(
+        s2[:-2], a2[:-2]
+    )
 
 
 def _matmul_applyd_rows_via_f(bound: dict) -> bool:
@@ -719,169 +804,229 @@ def _matmul_applyd_rows_via_f(bound: dict) -> bool:
 XC_MATMUL_APPLYD_ROWS = R(
     "xc_matmul_applyd_rows",
     Op.make("matmul", "E", Op.make("applyd", "f", "h")),
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("matmul", "E",
-                            Op.make("affd_a", "f")),
-                    Op.make("matmul", "E",
-                            Op.make("affd_b", "f"))),
-            "h"),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make("matmul", "E", Op.make("affd_a", "f")),
+            Op.make("matmul", "E", Op.make("affd_b", "f")),
+        ),
+        "h",
+    ),
     law="A left linear map on a diagonal-affine vector block contracts "
-        "the ROW axis and stays diagonal: E@(a⊙h+b) = (E@a)⊙h + E@b.  "
-        "This is the om numerator's shape (e@v) — the readout law that "
-        "crosses into the softmax carrier.",
-    check=_matmul_applyd_rows_via_f)
+    "the ROW axis and stays diagonal: E@(a⊙h+b) = (E@a)⊙h + E@b.  "
+    "This is the om numerator's shape (e@v) — the readout law that "
+    "crosses into the softmax carrier.",
+    check=_matmul_applyd_rows_via_f,
+)
 
 XC_MATMUL_APPLYD_ROWS_REV = R(
     "xc_matmul_applyd_rows_rev",
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("matmul", "E",
-                            Op.make("affd_a", "f")),
-                    Op.make("matmul", "E",
-                            Op.make("affd_b", "f"))),
-            "h"),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make("matmul", "E", Op.make("affd_a", "f")),
+            Op.make("matmul", "E", Op.make("affd_b", "f")),
+        ),
+        "h",
+    ),
     Op.make("matmul", "E", Op.make("applyd", "f", "h")),
-    law="reverse of xc_matmul_applyd_rows")
+    law="reverse of xc_matmul_applyd_rows",
+)
 
 #: W contracts the FEATURE axis of a vector state: promotes the
 #: diagonal carrier into the dense one (W·diag(a) is dense).
 XC_MATMUL_APPLYD_VEC = R(
     "xc_matmul_applyd_vec",
-    Op.make("matmul", "W", Op.make("applyd",
-                                   Op.make("aff_diag", "a", "b"), "h")),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("mul", "W", "a"),
-                    Op.make("matmul", "W", "b")),
-            "h"),
+    Op.make(
+        "matmul",
+        "W",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff", Op.make("mul", "W", "a"), Op.make("matmul", "W", "b")
+        ),
+        "h",
+    ),
     law="Feature-axis contraction of a diagonal-affine vector is a "
-        "DENSE affine map: W(a⊙h+b) = (W·diag a)h + Wb.  Carrier "
-        "promotion aff_diag → aff.",
-    check=_check_matmul_applyd_vec)
+    "DENSE affine map: W(a⊙h+b) = (W·diag a)h + Wb.  Carrier "
+    "promotion aff_diag → aff.",
+    check=_check_matmul_applyd_vec,
+)
 
 XC_MATMUL_APPLYD_VEC_REV = R(
     "xc_matmul_applyd_vec_rev",
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("mul", "W", "a"),
-                    Op.make("matmul", "W", "b")),
-            "h"),
-    Op.make("matmul", "W", Op.make("applyd",
-                                   Op.make("aff_diag", "a", "b"), "h")),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff", Op.make("mul", "W", "a"), Op.make("matmul", "W", "b")
+        ),
+        "h",
+    ),
+    Op.make(
+        "matmul",
+        "W",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+    ),
     law="reverse promotion (only matches the exact promoted form)",
-    check=_check_matmul_applyd_vec)
+    check=_check_matmul_applyd_vec,
+)
 
 #: Post-composition through the dense carrier (tightening):
 #: matmul(W, apply(aff(A,c),h)) = apply(aff(WA, Wc), h).
 XC_MATMUL_APPLY = R(
     "xc_matmul_apply",
-    Op.make("matmul", "W",
-            Op.make("apply", Op.make("aff", "A", "c"), "h")),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("matmul", "W", "A"),
-                    Op.make("matmul", "W", "c")),
-            "h"),
+    Op.make(
+        "matmul", "W", Op.make("apply", Op.make("aff", "A", "c"), "h")
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("matmul", "W", "A"),
+            Op.make("matmul", "W", "c"),
+        ),
+        "h",
+    ),
     law="Linear post-context exits the carrier: W·(Ah+c) = (WA)h + Wc.",
-    check=_check_matmul_apply)
+    check=_check_matmul_apply,
+)
 
 XC_MATMUL_APPLY_REV = R(
     "xc_matmul_apply_rev",
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("matmul", "W", "A"),
-                    Op.make("matmul", "W", "c")),
-            "h"),
-    Op.make("matmul", "W",
-            Op.make("apply", Op.make("aff", "A", "c"), "h")),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("matmul", "W", "A"),
+            Op.make("matmul", "W", "c"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "matmul", "W", Op.make("apply", Op.make("aff", "A", "c"), "h")
+    ),
     law="reverse tightening",
-    check=_check_matmul_apply)
+    check=_check_matmul_apply,
+)
 
 #: F.linear forms — what torch.export actually emits.
 XC_LINEAR_APPLYD = R(
     "xc_linear_applyd",
-    Op.make("linear",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-            "W"),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("mul",
-                            Op.make("unsqueeze", "a", dim=-2),
-                            "W"),
-                    Op.make("linear", "b", "W")),
-            "h"),
+    Op.make(
+        "linear",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        "W",
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("mul", Op.make("unsqueeze", "a", dim=-2), "W"),
+            Op.make("linear", "b", "W"),
+        ),
+        "h",
+    ),
     law="linear readout of a diagonal-affine state is a DENSE affine "
-        "map in h: W(a⊙h+b) = (W·diag a)h + Wb, and W·diag(a_t) for a "
-        "batched (T,i) a is mul(unsqueeze(a,-2), W) : (T,o,i).",
-    check=_check_linear_applyd)
+    "map in h: W(a⊙h+b) = (W·diag a)h + Wb, and W·diag(a_t) for a "
+    "batched (T,i) a is mul(unsqueeze(a,-2), W) : (T,o,i).",
+    check=_check_linear_applyd,
+)
 
 XC_LINEAR_APPLYD_REV = R(
     "xc_linear_applyd_rev",
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("mul",
-                            Op.make("unsqueeze", "a", dim=-2),
-                            "W"),
-                    Op.make("linear", "b", "W")),
-            "h"),
-    Op.make("linear",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-            "W"),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("mul", Op.make("unsqueeze", "a", dim=-2), "W"),
+            Op.make("linear", "b", "W"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "linear",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        "W",
+    ),
     law="reverse promotion",
-    check=_check_linear_applyd)
+    check=_check_linear_applyd,
+)
 
 XC_LINEAR_APPLY = R(
     "xc_linear_apply",
-    Op.make("linear",
-            Op.make("apply", Op.make("aff", "A", "c"), "h"),
-            "W"),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("matmul", "W", "A"),
-                    Op.make("linear", "c", "W")),
-            "h"),
+    Op.make(
+        "linear", Op.make("apply", Op.make("aff", "A", "c"), "h"), "W"
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("matmul", "W", "A"),
+            Op.make("linear", "c", "W"),
+        ),
+        "h",
+    ),
     law="F.linear post-composition through the dense carrier: "
-        "(Ah+c)Wᵀ = (WA)h + cWᵀ — batched A (…,i,i) broadcasts W.",
-    check=_check_linear_apply)
+    "(Ah+c)Wᵀ = (WA)h + cWᵀ — batched A (…,i,i) broadcasts W.",
+    check=_check_linear_apply,
+)
 
 XC_LINEAR_APPLY_REV = R(
     "xc_linear_apply_rev",
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("matmul", "W", "A"),
-                    Op.make("linear", "c", "W")),
-            "h"),
-    Op.make("linear",
-            Op.make("apply", Op.make("aff", "A", "c"), "h"),
-            "W"),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("matmul", "W", "A"),
+            Op.make("linear", "c", "W"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "linear", Op.make("apply", Op.make("aff", "A", "c"), "h"), "W"
+    ),
     law="reverse",
-    check=_check_linear_apply)
+    check=_check_linear_apply,
+)
 
 
 # ---------------------------------------------------------------------------
 #  Scalar scale / same-state add — carrier arithmetic on the value side
 # ---------------------------------------------------------------------------
 
+
 def _scale_applyd(name, r_first):
-    mul = (lambda x, y: Op.make("mul", x, y))
-    lhs = mul("r", Op.make("applyd",
-                           Op.make("aff_diag", "a", "b"), "h")) \
-        if r_first else mul(
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"), "r")
+    mul = lambda x, y: Op.make("mul", x, y)
+    lhs = (
+        mul("r", Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"))
+        if r_first
+        else mul(
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"), "r"
+        )
+    )
     return R(
-        name, lhs,
-        Op.make("applyd",
-                Op.make("aff_diag",
-                        Op.make("mul", "a", "r"),
-                        Op.make("mul", "b", "r")),
-                "h"),
+        name,
+        lhs,
+        Op.make(
+            "applyd",
+            Op.make(
+                "aff_diag",
+                Op.make("mul", "a", "r"),
+                Op.make("mul", "b", "r"),
+            ),
+            "h",
+        ),
         law="A named (leaf) scale commutes into the carrier: "
-            "r⊙(a⊙h+b) = (r⊙a)⊙h + r⊙b.  r must resolve to a leaf — a "
-            "computed factor (e.g. a per-step decay on a recurrence "
-            "spine) is already reachable through affd_compose and "
-            "would loop with affd_unlift.",
-        check=_check_scale_applyd)
+        "r⊙(a⊙h+b) = (r⊙a)⊙h + r⊙b.  r must resolve to a leaf — a "
+        "computed factor (e.g. a per-step decay on a recurrence "
+        "spine) is already reachable through affd_compose and "
+        "would loop with affd_unlift.",
+        check=_check_scale_applyd,
+    )
 
 
 XC_SCALE_APPLYD = _scale_applyd("xc_scale_applyd", r_first=False)
@@ -890,19 +1035,28 @@ XC_SCALE_APPLYD_PRE = _scale_applyd("xc_scale_applyd_pre", r_first=True)
 
 def _scale_apply(name, r_first):
     base = Op.make("apply", Op.make("aff", "A", "c"), "h")
-    lhs = Op.make("mul", "r", base) if r_first else Op.make(
-        "mul", base, "r")
+    lhs = (
+        Op.make("mul", "r", base)
+        if r_first
+        else Op.make("mul", base, "r")
+    )
     return R(
-        name, lhs,
-        Op.make("apply",
-                Op.make("aff",
-                        Op.make("mul", "A", "r"),
-                        Op.make("mul", "c", "r")),
-                "h"),
+        name,
+        lhs,
+        Op.make(
+            "apply",
+            Op.make(
+                "aff",
+                Op.make("mul", "A", "r"),
+                Op.make("mul", "c", "r"),
+            ),
+            "h",
+        ),
         law="Scalar/row scale commutes into the dense carrier: "
-            "r·(Ah+c) = (rA)h + rc.  Same leaf restriction as the "
-            "diagonal variant.",
-        check=_check_scale_apply)
+        "r·(Ah+c) = (rA)h + rc.  Same leaf restriction as the "
+        "diagonal variant.",
+        check=_check_scale_apply,
+    )
 
 
 XC_SCALE_APPLY = _scale_apply("xc_scale_apply", r_first=False)
@@ -911,73 +1065,101 @@ XC_SCALE_APPLY_PRE = _scale_apply("xc_scale_apply_pre", r_first=True)
 #: add of two same-state applications — residual stream around a scan.
 XC_ADD_APPLYD = R(
     "xc_add_applyd",
-    Op.make("add",
-            Op.make("applyd", "f", "h"),
-            Op.make("applyd", "g", "h")),
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("add",
-                            Op.make("affd_a", "f"),
-                            Op.make("affd_a", "g")),
-                    Op.make("add",
-                            Op.make("affd_b", "f"),
-                            Op.make("affd_b", "g"))),
-            "h"),
+    Op.make(
+        "add", Op.make("applyd", "f", "h"), Op.make("applyd", "g", "h")
+    ),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make(
+                "add", Op.make("affd_a", "f"), Op.make("affd_a", "g")
+            ),
+            Op.make(
+                "add", Op.make("affd_b", "f"), Op.make("affd_b", "g")
+            ),
+        ),
+        "h",
+    ),
     law="Same-state affine applications add componentwise — residual "
-        "addition around a scan stays in the carrier.",
-    check=_check_add_applyd)
+    "addition around a scan stays in the carrier.",
+    check=_check_add_applyd,
+)
 
 XC_ADD_APPLY = R(
     "xc_add_apply",
-    Op.make("add",
-            Op.make("apply", "f", "h"),
-            Op.make("apply", "g", "h")),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("add",
-                            Op.make("aff_A", "f"),
-                            Op.make("aff_A", "g")),
-                    Op.make("add",
-                            Op.make("aff_b", "f"),
-                            Op.make("aff_b", "g"))),
-            "h"),
+    Op.make(
+        "add", Op.make("apply", "f", "h"), Op.make("apply", "g", "h")
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make(
+                "add", Op.make("aff_A", "f"), Op.make("aff_A", "g")
+            ),
+            Op.make(
+                "add", Op.make("aff_b", "f"), Op.make("aff_b", "g")
+            ),
+        ),
+        "h",
+    ),
     law="Dense analog of xc_add_applyd.",
-    check=_check_add_apply)
+    check=_check_add_apply,
+)
 
 
 # ---------------------------------------------------------------------------
 #  Slice (chunk/split) commutes through a carrier application
 # ---------------------------------------------------------------------------
 
+
 def _chunk_applyd(name, op, extra_check):
-    lhs = (Op.make("chunk", Op.make("applyd",
-                                    Op.make("aff_diag", "a", "b"),
-                                    "h"),
-                   chunks="N", dim="D", index="I")
-           if op == "chunk" else
-           Op.make("split", Op.make("applyd",
-                                    Op.make("aff_diag", "a", "b"),
-                                    "h"),
-                   sizes="SZ", dim="D", index="I"))
-    inner = (Op.make("chunk", "a", chunks="N", dim="D", index="I"),
-             Op.make("chunk", "b", chunks="N", dim="D", index="I")) \
-        if op == "chunk" else (
+    lhs = (
+        Op.make(
+            "chunk",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+            chunks="N",
+            dim="D",
+            index="I",
+        )
+        if op == "chunk"
+        else Op.make(
+            "split",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+            sizes="SZ",
+            dim="D",
+            index="I",
+        )
+    )
+    inner = (
+        (
+            Op.make("chunk", "a", chunks="N", dim="D", index="I"),
+            Op.make("chunk", "b", chunks="N", dim="D", index="I"),
+        )
+        if op == "chunk"
+        else (
             Op.make("split", "a", sizes="SZ", dim="D", index="I"),
-            Op.make("split", "b", sizes="SZ", dim="D", index="I"))
+            Op.make("split", "b", sizes="SZ", dim="D", index="I"),
+        )
+    )
     return R(
-        name, lhs,
-        Op.make("applyd",
-                Op.make("aff_diag", inner[0], inner[1]), "h"),
+        name,
+        lhs,
+        Op.make("applyd", Op.make("aff_diag", inner[0], inner[1]), "h"),
         law=f"{op} distributes over a diagonal-affine application on "
-            "any non-feature axis — block i of a scanned value stream "
-            "is applyd of the block-sliced map.",
-        check=extra_check)
+        "any non-feature axis — block i of a scanned value stream "
+        "is applyd of the block-sliced map.",
+        check=extra_check,
+    )
 
 
-XC_CHUNK_APPLYD = _chunk_applyd("xc_chunk_applyd", "chunk",
-                                _check_chunk_applyd_ok)
-XC_SPLIT_APPLYD = _chunk_applyd("xc_split_applyd", "split",
-                                _check_split_applyd)
+XC_CHUNK_APPLYD = _chunk_applyd(
+    "xc_chunk_applyd", "chunk", _check_chunk_applyd_ok
+)
+XC_SPLIT_APPLYD = _chunk_applyd(
+    "xc_split_applyd", "split", _check_split_applyd
+)
 
 
 def _chunk_apply(name, op, check):
@@ -995,18 +1177,23 @@ def _chunk_apply(name, op, check):
         ia = Op.make("split", "A", sizes="SZ", dim="DA", index="I")
         ib = Op.make("split", "c", sizes="SZ", dim="D", index="I")
     return R(
-        name, lhs,
+        name,
+        lhs,
         Op.make("apply", Op.make("aff", ia, ib), "h"),
         law=f"{op} distributes over a dense-affine application — sound "
-            "on EVERY axis of c (the map's input axis is last, never "
-            "sliced).",
-        check=check, derive=_derive_chunk_apply)
+        "on EVERY axis of c (the map's input axis is last, never "
+        "sliced).",
+        check=check,
+        derive=_derive_chunk_apply,
+    )
 
 
-XC_CHUNK_APPLY = _chunk_apply("xc_chunk_apply", "chunk",
-                              _check_chunk_apply_ok)
-XC_SPLIT_APPLY = _chunk_apply("xc_split_apply", "split",
-                              _check_split_apply)
+XC_CHUNK_APPLY = _chunk_apply(
+    "xc_chunk_apply", "chunk", _check_chunk_apply_ok
+)
+XC_SPLIT_APPLY = _chunk_apply(
+    "xc_split_apply", "split", _check_split_apply
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1241,7 @@ XC_SPLIT_APPLY = _chunk_apply("xc_split_apply", "split",
 #      feature axis under applyd is a DIFFERENT affine map (h would
 #      have to permute too), not expressible here.
 
+
 def _numel_of(s) -> int:
     n = 1
     for d in s:
@@ -1082,8 +1270,9 @@ def _resolve_view_shape(S, numel_in: int):
     if negs:
         if known <= 0 or numel_in % known:
             return None
-        return tuple(numel_in // known if d == -1 else int(d)
-                     for d in S)
+        return tuple(
+            numel_in // known if d == -1 else int(d) for d in S
+        )
     if known != numel_in:
         return None
     return tuple(int(d) for d in S)
@@ -1105,8 +1294,9 @@ def _apply_value_shapes(bound: dict):
     A, b, h = (_shape(bound.get(k)) for k in ("A", "b", "h"))
     if not all(_concrete(s) for s in (A, b, h)):
         return None
-    if not (len(A) >= 2 and b == A[:-1]
-            and len(h) == 1 and h[-1] == A[-1]):
+    if not (
+        len(A) >= 2 and b == A[:-1] and len(h) == 1 and h[-1] == A[-1]
+    ):
         return None
     return A
 
@@ -1117,8 +1307,7 @@ def _applyd_value_shapes(bound: dict):
     a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
     if not all(_concrete(s) for s in (a, b, h)):
         return None
-    if not (a == b and len(a) >= 1
-            and len(h) == 1 and h[-1] == a[-1]):
+    if not (a == b and len(a) >= 1 and len(h) == 1 and h[-1] == a[-1]):
         return None
     return a
 
@@ -1127,8 +1316,10 @@ def _check_reshape_apply(bound: dict) -> bool:
     A = _apply_value_shapes(bound)
     if A is None:
         return False
-    return _resolve_view_shape(bound.get("$attr:S"),
-                               _numel_of(A[:-1])) is not None
+    return (
+        _resolve_view_shape(bound.get("$attr:S"), _numel_of(A[:-1]))
+        is not None
+    )
 
 
 def _derive_reshape_apply(bound: dict):
@@ -1200,77 +1391,111 @@ def _derive_transpose_applyd(bound: dict):
 #: split).
 XC_RESHAPE_APPLY = R(
     "xc_reshape_apply",
-    Op.make("reshape",
-            Op.make("apply", Op.make("aff", "A", "b"), "h"),
-            shape="S"),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("reshape", "A", shape="SA"),
-                    Op.make("reshape", "b", shape="S")),
-            "h"),
+    Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", "A", "b"), "h"),
+        shape="S",
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("reshape", "A", shape="SA"),
+            Op.make("reshape", "b", shape="S"),
+        ),
+        "h",
+    ),
     law="A view on the VALUE axes of a dense-affine application sinks "
-        "into the map: reshape(A@h+b, S) = reshape(A, S+(i,))@h + "
-        "reshape(b, S) — the contracted axis is last and never "
-        "relabelled, so this is exact for ANY well-typed S (the MHA "
-        "head-split: (T,nh·hd) -> (T,nh,hd)).  Requires b == A[:-1] "
-        "exactly (a broadcast-smaller b is vetoed — documented).",
-    check=_check_reshape_apply, derive=_derive_reshape_apply)
+    "into the map: reshape(A@h+b, S) = reshape(A, S+(i,))@h + "
+    "reshape(b, S) — the contracted axis is last and never "
+    "relabelled, so this is exact for ANY well-typed S (the MHA "
+    "head-split: (T,nh·hd) -> (T,nh,hd)).  Requires b == A[:-1] "
+    "exactly (a broadcast-smaller b is vetoed — documented).",
+    check=_check_reshape_apply,
+    derive=_derive_reshape_apply,
+)
 
 XC_TRANSPOSE_APPLY = R(
     "xc_transpose_apply",
-    Op.make("transpose",
-            Op.make("apply", Op.make("aff", "A", "b"), "h"),
-            arg1="D1", arg2="D2"),
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("transpose", "A", arg1="DA1", arg2="DA2"),
-                    Op.make("transpose", "b", arg1="DA1", arg2="DA2")),
-            "h"),
+    Op.make(
+        "transpose",
+        Op.make("apply", Op.make("aff", "A", "b"), "h"),
+        arg1="D1",
+        arg2="D2",
+    ),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("transpose", "A", arg1="DA1", arg2="DA2"),
+            Op.make("transpose", "b", arg1="DA1", arg2="DA2"),
+        ),
+        "h",
+    ),
     law="transpose(A@h+b, d1, d2) = transpose(A, d1', d2')@h + "
-        "transpose(b, d1', d2') — a permutation of the value axes "
-        "permutes the map's output axes (dims are normalised mod the "
-        "value rank so the stored map dims never touch the input "
-        "axis).  Exact — the MHA (T,nh,hd)->(nh,T,hd) head swap.",
-    check=_check_transpose_apply, derive=_derive_transpose_apply)
+    "transpose(b, d1', d2') — a permutation of the value axes "
+    "permutes the map's output axes (dims are normalised mod the "
+    "value rank so the stored map dims never touch the input "
+    "axis).  Exact — the MHA (T,nh,hd)->(nh,T,hd) head swap.",
+    check=_check_transpose_apply,
+    derive=_derive_transpose_apply,
+)
 
 #: Diagonal forward laws — restricted to views that keep the feature
 #: axis LAST (h is not permuted).
 XC_RESHAPE_APPLYD = R(
     "xc_reshape_applyd",
-    Op.make("reshape",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-            shape="S"),
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("reshape", "a", shape="S"),
-                    Op.make("reshape", "b", shape="S")),
-            "h"),
+    Op.make(
+        "reshape",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        shape="S",
+    ),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make("reshape", "a", shape="S"),
+            Op.make("reshape", "b", shape="S"),
+        ),
+        "h",
+    ),
     law="reshape(a⊙h+b, S) = reshape(a,S)⊙h + reshape(b,S) — sound "
-        "ONLY when the resolved S[-1] stays the feature dim d: then "
-        "the flat-order relabel never mixes feature components into "
-        "leading axes and h still broadcasts correctly.  Head-PACKING "
-        "views pass; head-SPLITTING ones (d -> nh×hd) are vetoed — "
-        "use the dense promotion for those.",
-    check=_check_reshape_applyd)
+    "ONLY when the resolved S[-1] stays the feature dim d: then "
+    "the flat-order relabel never mixes feature components into "
+    "leading axes and h still broadcasts correctly.  Head-PACKING "
+    "views pass; head-SPLITTING ones (d -> nh×hd) are vetoed — "
+    "use the dense promotion for those.",
+    check=_check_reshape_applyd,
+)
 
 XC_TRANSPOSE_APPLYD = R(
     "xc_transpose_applyd",
-    Op.make("transpose",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-            arg1="D1", arg2="D2"),
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("transpose", "a", arg1="DA1", arg2="DA2"),
-                    Op.make("transpose", "b", arg1="DA1", arg2="DA2")),
-            "h"),
+    Op.make(
+        "transpose",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        arg1="D1",
+        arg2="D2",
+    ),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make("transpose", "a", arg1="DA1", arg2="DA2"),
+            Op.make("transpose", "b", arg1="DA1", arg2="DA2"),
+        ),
+        "h",
+    ),
     law="transpose(a⊙h+b, d1, d2) = transpose(a,d1',d2')⊙h + "
-        "transpose(b,d1',d2') — the per-element diagonal map commutes "
-        "with any permutation that leaves the feature axis last "
-        "(h is NOT permuted; a transpose touching it is vetoed).",
-    check=_check_transpose_applyd, derive=_derive_transpose_applyd)
+    "transpose(b,d1',d2') — the per-element diagonal map commutes "
+    "with any permutation that leaves the feature axis last "
+    "(h is NOT permuted; a transpose touching it is vetoed).",
+    check=_check_transpose_applyd,
+    derive=_derive_transpose_applyd,
+)
 
 
 # --- reverse forms: the pushed-through member re-fuses ---------------
+
 
 def _transpose_apply_rev_dims(bound: dict):
     """For the dense reverse: the dims stored on the map's transpose
@@ -1286,7 +1511,7 @@ def _transpose_apply_rev_dims(bound: dict):
     if not all(isinstance(d, int) for d in (p1, p2, q1, q2)):
         return None
     d1, d2 = p1 % n1, p2 % n1
-    if d1 >= n or d2 >= n:            # permutes the map's input axis
+    if d1 >= n or d2 >= n:  # permutes the map's input axis
         return None
     if {d1, d2} != {q1 % n, q2 % n}:  # A and b permute different axes
         # (transpose(x,a,b) == transpose(x,b,a) — unordered compare)
@@ -1307,18 +1532,26 @@ def _derive_transpose_apply_rev(bound: dict):
 
 XC_TRANSPOSE_APPLY_REV = R(
     "xc_transpose_apply_rev",
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("transpose", "A", arg1="P1", arg2="P2"),
-                    Op.make("transpose", "b", arg1="Q1", arg2="Q2")),
-            "h"),
-    Op.make("transpose",
-            Op.make("apply", Op.make("aff", "A", "b"), "h"),
-            arg1="RD1", arg2="RD2"),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("transpose", "A", arg1="P1", arg2="P2"),
+            Op.make("transpose", "b", arg1="Q1", arg2="Q2"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "transpose",
+        Op.make("apply", Op.make("aff", "A", "b"), "h"),
+        arg1="RD1",
+        arg2="RD2",
+    ),
     law="reverse of xc_transpose_apply — the pushed-through form "
-        "re-fuses when both transposes agree on the same value axes.",
+    "re-fuses when both transposes agree on the same value axes.",
     check=_check_transpose_apply_rev,
-    derive=_derive_transpose_apply_rev)
+    derive=_derive_transpose_apply_rev,
+)
 
 
 def _transpose_applyd_rev_dims(bound: dict):
@@ -1333,7 +1566,7 @@ def _transpose_applyd_rev_dims(bound: dict):
     d1, d2 = p1 % n, p2 % n
     if {d1, d2} != {q1 % n, q2 % n}:
         return None
-    if d1 >= n - 1 or d2 >= n - 1:    # feature axis moved — unsound
+    if d1 >= n - 1 or d2 >= n - 1:  # feature axis moved — unsound
         return None
     return d1, d2
 
@@ -1351,19 +1584,27 @@ def _derive_transpose_applyd_rev(bound: dict):
 
 XC_TRANSPOSE_APPLYD_REV = R(
     "xc_transpose_applyd_rev",
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("transpose", "a", arg1="P1", arg2="P2"),
-                    Op.make("transpose", "b", arg1="Q1", arg2="Q2")),
-            "h"),
-    Op.make("transpose",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-            arg1="RD1", arg2="RD2"),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make("transpose", "a", arg1="P1", arg2="P2"),
+            Op.make("transpose", "b", arg1="Q1", arg2="Q2"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "transpose",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        arg1="RD1",
+        arg2="RD2",
+    ),
     law="reverse of xc_transpose_applyd — same feature-axis "
-        "restriction: the stored dims must agree and stay off the "
-        "last axis.",
+    "restriction: the stored dims must agree and stay off the "
+    "last axis.",
     check=_check_transpose_applyd_rev,
-    derive=_derive_transpose_applyd_rev)
+    derive=_derive_transpose_applyd_rev,
+)
 
 
 def _check_reshape_apply_rev(bound: dict) -> bool:
@@ -1376,8 +1617,9 @@ def _check_reshape_apply_rev(bound: dict) -> bool:
     if A is None:
         return False
     SA, SB = bound.get("$attr:SA"), bound.get("$attr:SB")
-    if not (isinstance(SA, (tuple, list))
-            and isinstance(SB, (tuple, list))):
+    if not (
+        isinstance(SA, (tuple, list)) and isinstance(SB, (tuple, list))
+    ):
         return False
     if len(SA) != len(SB) + 1 or tuple(SA[:-1]) != tuple(SB):
         return False
@@ -1388,18 +1630,25 @@ def _check_reshape_apply_rev(bound: dict) -> bool:
 
 XC_RESHAPE_APPLY_REV = R(
     "xc_reshape_apply_rev",
-    Op.make("apply",
-            Op.make("aff",
-                    Op.make("reshape", "A", shape="SA"),
-                    Op.make("reshape", "b", shape="SB")),
-            "h"),
-    Op.make("reshape",
-            Op.make("apply", Op.make("aff", "A", "b"), "h"),
-            shape="SB"),
+    Op.make(
+        "apply",
+        Op.make(
+            "aff",
+            Op.make("reshape", "A", shape="SA"),
+            Op.make("reshape", "b", shape="SB"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", "A", "b"), "h"),
+        shape="SB",
+    ),
     law="reverse of xc_reshape_apply — only matches when the map's "
-        "reshape is literally S+(i,), the spelling the forward law "
-        "produces.",
-    check=_check_reshape_apply_rev)
+    "reshape is literally S+(i,), the spelling the forward law "
+    "produces.",
+    check=_check_reshape_apply_rev,
+)
 
 
 def _check_reshape_applyd_rev(bound: dict) -> bool:
@@ -1409,9 +1658,11 @@ def _check_reshape_applyd_rev(bound: dict) -> bool:
     if a is None:
         return False
     SA, SB = bound.get("$attr:SA"), bound.get("$attr:SB")
-    if not (isinstance(SA, (tuple, list))
-            and isinstance(SB, (tuple, list))
-            and tuple(SA) == tuple(SB)):
+    if not (
+        isinstance(SA, (tuple, list))
+        and isinstance(SB, (tuple, list))
+        and tuple(SA) == tuple(SB)
+    ):
         return False
     rs = _resolve_view_shape(SA, _numel_of(a))
     return rs is not None and rs[-1] == a[-1]
@@ -1419,17 +1670,24 @@ def _check_reshape_applyd_rev(bound: dict) -> bool:
 
 XC_RESHAPE_APPLYD_REV = R(
     "xc_reshape_applyd_rev",
-    Op.make("applyd",
-            Op.make("aff_diag",
-                    Op.make("reshape", "a", shape="SA"),
-                    Op.make("reshape", "b", shape="SB")),
-            "h"),
-    Op.make("reshape",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-            shape="SA"),
+    Op.make(
+        "applyd",
+        Op.make(
+            "aff_diag",
+            Op.make("reshape", "a", shape="SA"),
+            Op.make("reshape", "b", shape="SB"),
+        ),
+        "h",
+    ),
+    Op.make(
+        "reshape",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        shape="SA",
+    ),
     law="reverse of xc_reshape_applyd — same resolved-S[-1]==d "
-        "restriction.",
-    check=_check_reshape_applyd_rev)
+    "restriction.",
+    check=_check_reshape_applyd_rev,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1438,40 +1696,52 @@ XC_RESHAPE_APPLYD_REV = R(
 
 XC_OM_ELEM_AFFD = R(
     "xc_om_elem_affd",
-    Op.make("om_elem", "s",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h")),
+    Op.make(
+        "om_elem",
+        "s",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+    ),
     Op.make("om_elem_affd", "s", "a", "b", "h"),
     law="The om numerator e@v is a matmul in v — the readout law: "
-        "om_elem(s, a⊙h+b) = (m, l, (e@a)⊙h + e@b).  An om leaf whose "
-        "value block is a scan image folds the scan inside the "
-        "carrier; the result is an ordinary om triple and composes "
-        "freely under om_compose.",
-    check=_check_om_elem_affd)
+    "om_elem(s, a⊙h+b) = (m, l, (e@a)⊙h + e@b).  An om leaf whose "
+    "value block is a scan image folds the scan inside the "
+    "carrier; the result is an ordinary om triple and composes "
+    "freely under om_compose.",
+    check=_check_om_elem_affd,
+)
 
 XC_OM_ELEM_AFFD_REV = R(
     "xc_om_elem_affd_rev",
     Op.make("om_elem_affd", "s", "a", "b", "h"),
-    Op.make("om_elem", "s",
-            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h")),
+    Op.make(
+        "om_elem",
+        "s",
+        Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+    ),
     law="unfold the fused element",
-    check=_check_om_elem_affd)
+    check=_check_om_elem_affd,
+)
 
 XC_OM_ELEM_AFF = R(
     "xc_om_elem_aff",
-    Op.make("om_elem", "s",
-            Op.make("apply", Op.make("aff", "A", "b"), "h")),
+    Op.make(
+        "om_elem", "s", Op.make("apply", Op.make("aff", "A", "b"), "h")
+    ),
     Op.make("om_elem_aff", "s", "A", "b", "h"),
     law="Dense counterpart of xc_om_elem_affd: v = A@h+b with per-key "
-        "A (K,d,i); numerator = reshape(e@A)@h + e@b.",
-    check=_check_om_elem_aff)
+    "A (K,d,i); numerator = reshape(e@A)@h + e@b.",
+    check=_check_om_elem_aff,
+)
 
 XC_OM_ELEM_AFF_REV = R(
     "xc_om_elem_aff_rev",
     Op.make("om_elem_aff", "s", "A", "b", "h"),
-    Op.make("om_elem", "s",
-            Op.make("apply", Op.make("aff", "A", "b"), "h")),
+    Op.make(
+        "om_elem", "s", Op.make("apply", Op.make("aff", "A", "b"), "h")
+    ),
     law="unfold",
-    check=_check_om_elem_aff)
+    check=_check_om_elem_aff,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1480,84 +1750,122 @@ XC_OM_ELEM_AFF_REV = R(
 
 XC_OMD_LIFT = R(
     "xc_omd_lift",
-    Op.make("om_apply",
-            Op.make("om_elem", "s",
-                    Op.make("applyd",
-                            Op.make("aff_diag", "a", "b"), "h"))),
+    Op.make(
+        "om_apply",
+        Op.make(
+            "om_elem",
+            "s",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        ),
+    ),
     Op.make("omd_apply", Op.make("omd_elem", "s", "a", "b"), "h"),
     law="Single-block attention over diagonal-affine values IS a "
-        "diagonal-affine map of the shared state: the softmax data "
-        "becomes the coefficient.  (m,l,e@a,e@b) defers h to the "
-        "apply.",
-    check=_check_omd_lift)
+    "diagonal-affine map of the shared state: the softmax data "
+    "becomes the coefficient.  (m,l,e@a,e@b) defers h to the "
+    "apply.",
+    check=_check_omd_lift,
+)
 
 XC_OMD_UNLIFT = R(
     "xc_omd_unlift",
     Op.make("omd_apply", Op.make("omd_elem", "s", "a", "b"), "h"),
-    Op.make("om_apply",
-            Op.make("om_elem", "s",
-                    Op.make("applyd",
-                            Op.make("aff_diag", "a", "b"), "h"))),
+    Op.make(
+        "om_apply",
+        Op.make(
+            "om_elem",
+            "s",
+            Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
+        ),
+    ),
     law="unfold the deferred carrier",
-    check=_check_omd_lift)
+    check=_check_omd_lift,
+)
 
 XC_OMD_LIFT_DENSE = R(
     "xc_omd_lift_dense",
-    Op.make("om_apply",
-            Op.make("om_elem", "s",
-                    Op.make("apply", Op.make("aff", "A", "b"), "h"))),
+    Op.make(
+        "om_apply",
+        Op.make(
+            "om_elem",
+            "s",
+            Op.make("apply", Op.make("aff", "A", "b"), "h"),
+        ),
+    ),
     Op.make("omd_applym", Op.make("omd_elem", "s", "A", "b"), "h"),
     law="Dense-fiber variant: the numerator pair (e@A : (…,Tq,d,i), "
-        "e@b) defers h; omd_applym contracts the last axis.",
-    check=_check_omd_lift_dense)
+    "e@b) defers h; omd_applym contracts the last axis.",
+    check=_check_omd_lift_dense,
+)
 
 XC_OMD_UNLIFT_DENSE = R(
     "xc_omd_unlift_dense",
     Op.make("omd_applym", Op.make("omd_elem", "s", "A", "b"), "h"),
-    Op.make("om_apply",
-            Op.make("om_elem", "s",
-                    Op.make("apply", Op.make("aff", "A", "b"), "h"))),
+    Op.make(
+        "om_apply",
+        Op.make(
+            "om_elem",
+            "s",
+            Op.make("apply", Op.make("aff", "A", "b"), "h"),
+        ),
+    ),
     law="unfold",
-    check=_check_omd_lift_dense)
+    check=_check_omd_lift_dense,
+)
 
 XC_OMD_PAIR_LIFT = R(
     "xc_omd_pair_lift",
-    Op.make("om_apply",
-            Op.make("om_compose",
-                    Op.make("om_elem", "s1",
-                            Op.make("applyd",
-                                    Op.make("aff_diag", "a1", "b1"),
-                                    "h")),
-                    Op.make("om_elem", "s2",
-                            Op.make("applyd",
-                                    Op.make("aff_diag", "a2", "b2"),
-                                    "h")))),
-    Op.make("omd_apply",
-            Op.make("omd_compose",
-                    Op.make("omd_elem", "s1", "a1", "b1"),
-                    Op.make("omd_elem", "s2", "a2", "b2")),
-            "h"),
+    Op.make(
+        "om_apply",
+        Op.make(
+            "om_compose",
+            Op.make(
+                "om_elem",
+                "s1",
+                Op.make("applyd", Op.make("aff_diag", "a1", "b1"), "h"),
+            ),
+            Op.make(
+                "om_elem",
+                "s2",
+                Op.make("applyd", Op.make("aff_diag", "a2", "b2"), "h"),
+            ),
+        ),
+    ),
+    Op.make(
+        "omd_apply",
+        Op.make(
+            "omd_compose",
+            Op.make("omd_elem", "s1", "a1", "b1"),
+            Op.make("omd_elem", "s2", "a2", "b2"),
+        ),
+        "h",
+    ),
     law="Two-block case of the deferred lift — the matcher enforces "
-        "the SHARED h across leaves.  Deeper trees are non-local (the "
-        "shared-h condition is global): see omd_tree_lift.",
-    check=_check_omd_pair)
+    "the SHARED h across leaves.  Deeper trees are non-local (the "
+    "shared-h condition is global): see omd_tree_lift.",
+    check=_check_omd_pair,
+)
 
 
 def _omd_split(name, ak):
     return R(
         name,
-        Op.make("omd_elem",
-                Op.make("concat", "s1", "s2", **{ak: "SD"}),
-                Op.make("concat", "a1", "a2", **{ak: "AD"}),
-                Op.make("concat", "b1", "b2", **{ak: "BD"})),
-        Op.make("omd_compose",
-                Op.make("omd_elem", "s1", "a1", "b1"),
-                Op.make("omd_elem", "s2", "a2", "b2")),
+        Op.make(
+            "omd_elem",
+            Op.make("concat", "s1", "s2", **{ak: "SD"}),
+            Op.make("concat", "a1", "a2", **{ak: "AD"}),
+            Op.make("concat", "b1", "b2", **{ak: "BD"}),
+        ),
+        Op.make(
+            "omd_compose",
+            Op.make("omd_elem", "s1", "a1", "b1"),
+            Op.make("omd_elem", "s2", "a2", "b2"),
+        ),
         law="The om homomorphism holds on the deferred carrier: "
-            "omd_elem(cat s, cat a, cat b) = omd_elem ⊕ omd_elem — "
-            "chunked attention over scanned values decomposes while "
-            "staying affine in h.",
-        check=_check_omd_split)
+        "omd_elem(cat s, cat a, cat b) = omd_elem ⊕ omd_elem — "
+        "chunked attention over scanned values decomposes while "
+        "staying affine in h.",
+        check=_check_omd_split,
+    )
 
 
 XC_OMD_SPLIT = _omd_split("xc_omd_split", "dim")
@@ -1566,25 +1874,45 @@ XC_OMD_SPLIT_ARG1 = _omd_split("xc_omd_split_arg1", "arg1")
 
 #: The whole cross-carrier law set.
 XC_LAWS: list[Rewrite] = [
-    XC_MATMUL_APPLYD_ROWS, XC_MATMUL_APPLYD_ROWS_REV,
-    XC_MATMUL_APPLYD_VEC, XC_MATMUL_APPLYD_VEC_REV,
-    XC_MATMUL_APPLY, XC_MATMUL_APPLY_REV,
-    XC_LINEAR_APPLYD, XC_LINEAR_APPLYD_REV,
-    XC_LINEAR_APPLY, XC_LINEAR_APPLY_REV,
-    XC_SCALE_APPLYD, XC_SCALE_APPLYD_PRE,
-    XC_SCALE_APPLY, XC_SCALE_APPLY_PRE,
-    XC_ADD_APPLYD, XC_ADD_APPLY,
-    XC_CHUNK_APPLYD, XC_SPLIT_APPLYD, XC_CHUNK_APPLY, XC_SPLIT_APPLY,
-    XC_RESHAPE_APPLY, XC_TRANSPOSE_APPLY,
-    XC_RESHAPE_APPLYD, XC_TRANSPOSE_APPLYD,
-    XC_RESHAPE_APPLY_REV, XC_TRANSPOSE_APPLY_REV,
-    XC_RESHAPE_APPLYD_REV, XC_TRANSPOSE_APPLYD_REV,
-    XC_OM_ELEM_AFFD, XC_OM_ELEM_AFFD_REV,
-    XC_OM_ELEM_AFF, XC_OM_ELEM_AFF_REV,
-    XC_OMD_LIFT, XC_OMD_UNLIFT,
-    XC_OMD_LIFT_DENSE, XC_OMD_UNLIFT_DENSE,
+    XC_MATMUL_APPLYD_ROWS,
+    XC_MATMUL_APPLYD_ROWS_REV,
+    XC_MATMUL_APPLYD_VEC,
+    XC_MATMUL_APPLYD_VEC_REV,
+    XC_MATMUL_APPLY,
+    XC_MATMUL_APPLY_REV,
+    XC_LINEAR_APPLYD,
+    XC_LINEAR_APPLYD_REV,
+    XC_LINEAR_APPLY,
+    XC_LINEAR_APPLY_REV,
+    XC_SCALE_APPLYD,
+    XC_SCALE_APPLYD_PRE,
+    XC_SCALE_APPLY,
+    XC_SCALE_APPLY_PRE,
+    XC_ADD_APPLYD,
+    XC_ADD_APPLY,
+    XC_CHUNK_APPLYD,
+    XC_SPLIT_APPLYD,
+    XC_CHUNK_APPLY,
+    XC_SPLIT_APPLY,
+    XC_RESHAPE_APPLY,
+    XC_TRANSPOSE_APPLY,
+    XC_RESHAPE_APPLYD,
+    XC_TRANSPOSE_APPLYD,
+    XC_RESHAPE_APPLY_REV,
+    XC_TRANSPOSE_APPLY_REV,
+    XC_RESHAPE_APPLYD_REV,
+    XC_TRANSPOSE_APPLYD_REV,
+    XC_OM_ELEM_AFFD,
+    XC_OM_ELEM_AFFD_REV,
+    XC_OM_ELEM_AFF,
+    XC_OM_ELEM_AFF_REV,
+    XC_OMD_LIFT,
+    XC_OMD_UNLIFT,
+    XC_OMD_LIFT_DENSE,
+    XC_OMD_UNLIFT_DENSE,
     XC_OMD_PAIR_LIFT,
-    XC_OMD_SPLIT, XC_OMD_SPLIT_ARG1,
+    XC_OMD_SPLIT,
+    XC_OMD_SPLIT_ARG1,
 ]
 
 
@@ -1600,13 +1928,19 @@ XC_LAWS: list[Rewrite] = [
 #  projections, which work for ANY map term (leaf or compose tree).
 # ---------------------------------------------------------------------------
 
+
 def _stack_dim(attrs: dict) -> int:
     d = attrs.get("dim", attrs.get("arg1", 0))
     return d if isinstance(d, int) else 0
 
 
-def _offer_witness(eg: EGraph, cid: int, offered: Any,
-                   offered_eid: int, provenance: str):
+def _offer_witness(
+    eg: EGraph,
+    cid: int,
+    offered: Any,
+    offered_eid: int,
+    provenance: str,
+):
     """Pointwise Rewrite certifying a non-local offer — the same
     convention as ``trace_lift._lift_witness``: lhs is the oldest
     member of the class, rhs the offered term; the merge replays as a
@@ -1616,10 +1950,14 @@ def _offer_witness(eg: EGraph, cid: int, offered: Any,
         return None
     return Rewrite(
         name=f"{provenance}#{offered_eid}",
-        lhs=src, rhs=offered,
-        law=("pointwise witness for a non-local offer: stack of "
-             "same-state carrier applications is one application of "
-             "the stacked map"))
+        lhs=src,
+        rhs=offered,
+        law=(
+            "pointwise witness for a non-local offer: stack of "
+            "same-state carrier applications is one application of "
+            "the stacked map"
+        ),
+    )
 
 
 def _map_out_shape(f_shape, h_shape, kind: str):
@@ -1629,15 +1967,25 @@ def _map_out_shape(f_shape, h_shape, kind: str):
     dense: v = A@h+b  → A[:-1] (h contracts the last axis)."""
     if kind == "diag":
         return _bc(f_shape, h_shape)
-    if (isinstance(f_shape, tuple) and len(f_shape) >= 2
-            and f_shape[-1] == f_shape[-2]):
+    if (
+        isinstance(f_shape, tuple)
+        and len(f_shape) >= 2
+        and f_shape[-1] == f_shape[-2]
+    ):
         return f_shape[:-1]
     return None
 
 
-def _gather_stack(eg: EGraph, apply_op: str, proj_a: str, proj_b: str,
-                  pack_op: str, kind: str, witness: bool,
-                  provenance: str) -> list[dict]:
+def _gather_stack(
+    eg: EGraph,
+    apply_op: str,
+    proj_a: str,
+    proj_b: str,
+    pack_op: str,
+    kind: str,
+    witness: bool,
+    provenance: str,
+) -> list[dict]:
     """Shared engine for gather_applyd_stack / gather_apply_stack.
 
     Finds ``stack`` enodes whose children ALL expose an ``apply_op``
@@ -1686,16 +2034,16 @@ def _gather_stack(eg: EGraph, apply_op: str, proj_a: str, proj_b: str,
                         ft = eg.any_term(f)
                         fs = _shape(ft) if ft is not None else None
                         vs = _map_out_shape(fs, hs, kind)
-                        if (vs is None or not _concrete(vs)
-                                or vs in m):
+                        if vs is None or not _concrete(vs) or vs in m:
                             continue
                         # require the map's shape to align exactly —
                         # no broadcast-shrinkage inside the pack:
                         # diag: fs == vs (a_i is vs-shaped);
                         # dense: fs == vs + (i,) and h fills axis -1.
                         if (kind == "diag" and fs != vs) or (
-                                kind == "dense"
-                                and fs != tuple(vs) + (hs[0],)):
+                            kind == "dense"
+                            and fs != tuple(vs) + (hs[0],)
+                        ):
                             continue
                         m[vs] = f
                     vs_map.append(m)
@@ -1711,42 +2059,88 @@ def _gather_stack(eg: EGraph, apply_op: str, proj_a: str, proj_b: str,
                     f_ids = [m[S] for m in vs_map]
                     attrs = dict(node.attrs)
                     sa = eg.add_enode(
-                        "stack", tuple(eg.add_enode(proj_a, (f,))
-                                       for f in f_ids), attrs)
+                        "stack",
+                        tuple(
+                            eg.add_enode(proj_a, (f,)) for f in f_ids
+                        ),
+                        attrs,
+                    )
                     sb = eg.add_enode(
-                        "stack", tuple(eg.add_enode(proj_b, (f,))
-                                       for f in f_ids), attrs)
+                        "stack",
+                        tuple(
+                            eg.add_enode(proj_b, (f,)) for f in f_ids
+                        ),
+                        attrs,
+                    )
                     fmap = eg.add_enode(pack_op, (sa, sb))
                     out = eg.add_enode(apply_op, (fmap, h_eid))
                     offered_term = eg.any_term(out)
-                    w = (_offer_witness(eg, c, offered_term, out,
-                                        provenance)
-                         if witness and offered_term is not None
-                         else None)
-                    eg.union(c, out, witness=w,
-                             note=(f"{provenance}: stack of "
-                                   f"{len(kids)} {apply_op} members "
-                                   "over shared h"))
-                    offers.append({"stack_eid": c, "h_eid": h_eid,
-                                   "out_eid": out,
-                                   "term": offered_term})
+                    w = (
+                        _offer_witness(
+                            eg, c, offered_term, out, provenance
+                        )
+                        if witness and offered_term is not None
+                        else None
+                    )
+                    eg.union(
+                        c,
+                        out,
+                        witness=w,
+                        note=(
+                            f"{provenance}: stack of "
+                            f"{len(kids)} {apply_op} members "
+                            "over shared h"
+                        ),
+                    )
+                    offers.append(
+                        {
+                            "stack_eid": c,
+                            "h_eid": h_eid,
+                            "out_eid": out,
+                            "term": offered_term,
+                        }
+                    )
     return offers
 
 
-def gather_applyd_stack(eg: EGraph, *, witness: bool = True,
-                        provenance: str = "xc_stack_diag") -> list:
+def gather_applyd_stack(
+    eg: EGraph,
+    *,
+    witness: bool = True,
+    provenance: str = "xc_stack_diag",
+) -> list:
     """Offer ``applyd(aff_diag(stack affd_a f_i, stack affd_b f_i), h)``
     for every ``stack`` enode whose children are applyd applications
     over a shared initial state — the scan sequence as ONE map."""
-    return _gather_stack(eg, "applyd", "affd_a", "affd_b", "aff_diag",
-                         "diag", witness, provenance)
+    return _gather_stack(
+        eg,
+        "applyd",
+        "affd_a",
+        "affd_b",
+        "aff_diag",
+        "diag",
+        witness,
+        provenance,
+    )
 
 
-def gather_apply_stack(eg: EGraph, *, witness: bool = True,
-                       provenance: str = "xc_stack_dense") -> list:
+def gather_apply_stack(
+    eg: EGraph,
+    *,
+    witness: bool = True,
+    provenance: str = "xc_stack_dense",
+) -> list:
     """Dense analog: ``apply(aff(stack aff_A f_i, stack aff_b f_i), h)``."""
-    return _gather_stack(eg, "apply", "aff_A", "aff_b", "aff",
-                         "dense", witness, provenance)
+    return _gather_stack(
+        eg,
+        "apply",
+        "aff_A",
+        "aff_b",
+        "aff",
+        "dense",
+        witness,
+        provenance,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1759,6 +2153,7 @@ def gather_apply_stack(eg: EGraph, *, witness: bool = True,
 #  offers ``omd_apply(omd-tree, h)`` / ``omd_applym(omd-tree, h)``.
 #  The shared-h condition spans the whole tree, so this is non-local.
 # ---------------------------------------------------------------------------
+
 
 def _elem_affine_options(eg: EGraph, v_cid: int) -> dict[int, list]:
     """For a value-block e-class: ``{h_eid: [(kind, a_eid, b_eid)]}`` —
@@ -1775,13 +2170,23 @@ def _elem_affine_options(eg: EGraph, v_cid: int) -> dict[int, list]:
         for fn in eg.get_class(fcid).nodes:
             if fn.op == pack and len(fn.children) == 2:
                 out.setdefault(hcid, []).append(
-                    (kind, eg.find(fn.children[0]),
-                     eg.find(fn.children[1])))
+                    (
+                        kind,
+                        eg.find(fn.children[0]),
+                        eg.find(fn.children[1]),
+                    )
+                )
     return out
 
 
-def _omd_convert(eg: EGraph, cid: int, h_eid: int, kind: str,
-                 memo: dict, stack: frozenset):
+def _omd_convert(
+    eg: EGraph,
+    cid: int,
+    h_eid: int,
+    kind: str,
+    memo: dict,
+    stack: frozenset,
+):
     """Convert an om-carrier e-class to an omd-carrier eid, or None.
 
     Tries each member: om_elem leaves convert when the value class has
@@ -1796,8 +2201,10 @@ def _omd_convert(eg: EGraph, cid: int, h_eid: int, kind: str,
         return None
     stack = stack | {cid}
     res = None
-    for n in sorted(eg.get_class(cid).nodes,
-                    key=lambda x: (x.op, x.children, repr(x.attrs))):
+    for n in sorted(
+        eg.get_class(cid).nodes,
+        key=lambda x: (x.op, x.children, repr(x.attrs)),
+    ):
         if n.op == "om_elem" and len(n.children) == 2:
             opts = _elem_affine_options(eg, n.children[1]).get(h_eid)
             if opts:
@@ -1805,13 +2212,16 @@ def _omd_convert(eg: EGraph, cid: int, h_eid: int, kind: str,
                 if pick is not None:
                     res = eg.add_enode(
                         "omd_elem",
-                        (eg.find(n.children[0]), pick[1], pick[2]))
+                        (eg.find(n.children[0]), pick[1], pick[2]),
+                    )
                     break
         elif n.op == "om_compose" and len(n.children) == 2:
-            f = _omd_convert(eg, n.children[0], h_eid, kind, memo,
-                             stack)
-            g = _omd_convert(eg, n.children[1], h_eid, kind, memo,
-                             stack)
+            f = _omd_convert(
+                eg, n.children[0], h_eid, kind, memo, stack
+            )
+            g = _omd_convert(
+                eg, n.children[1], h_eid, kind, memo, stack
+            )
             if f is not None and g is not None:
                 res = eg.add_enode("omd_compose", (f, g))
                 break
@@ -1819,8 +2229,9 @@ def _omd_convert(eg: EGraph, cid: int, h_eid: int, kind: str,
     return res
 
 
-def omd_tree_lift(eg: EGraph, *, witness: bool = True,
-                  provenance: str = "omd_lift") -> list[dict]:
+def omd_tree_lift(
+    eg: EGraph, *, witness: bool = True, provenance: str = "omd_lift"
+) -> list[dict]:
     """Lift ``om_apply`` members whose carrier tree is entirely
     scan-valued into the deferred ``omd`` carrier.
 
@@ -1851,7 +2262,8 @@ def omd_tree_lift(eg: EGraph, *, witness: bool = True,
                 for n in eg.get_class(ccid).nodes:
                     if n.op == "om_elem" and len(n.children) == 2:
                         h_cands.update(
-                            _elem_affine_options(eg, n.children[1]))
+                            _elem_affine_options(eg, n.children[1])
+                        )
                     elif n.op == "om_compose" and len(n.children) == 2:
                         _collect(n.children[0], seen)
                         _collect(n.children[1], seen)
@@ -1859,22 +2271,39 @@ def omd_tree_lift(eg: EGraph, *, witness: bool = True,
             _collect(carrier)
             memo: dict = {}
             for h_eid in sorted(h_cands):
-                for kind, apply_op in (("diag", "omd_apply"),
-                                       ("dense", "omd_applym")):
-                    root = _omd_convert(eg, carrier, h_eid, kind,
-                                        memo, frozenset())
+                for kind, apply_op in (
+                    ("diag", "omd_apply"),
+                    ("dense", "omd_applym"),
+                ):
+                    root = _omd_convert(
+                        eg, carrier, h_eid, kind, memo, frozenset()
+                    )
                     if root is None:
                         continue
                     out = eg.add_enode(apply_op, (root, h_eid))
                     offered = eg.any_term(out)
-                    w = (_offer_witness(eg, c, offered, out,
-                                        provenance)
-                         if witness and offered is not None else None)
-                    eg.union(c, out, witness=w,
-                             note=(f"{provenance}: om tree over "
-                                   f"{kind}-affine values, shared h"))
-                    offers.append({"om_apply_eid": c, "h_eid": h_eid,
-                                   "out_eid": out, "term": offered,
-                                   "kind": kind})
+                    w = (
+                        _offer_witness(eg, c, offered, out, provenance)
+                        if witness and offered is not None
+                        else None
+                    )
+                    eg.union(
+                        c,
+                        out,
+                        witness=w,
+                        note=(
+                            f"{provenance}: om tree over "
+                            f"{kind}-affine values, shared h"
+                        ),
+                    )
+                    offers.append(
+                        {
+                            "om_apply_eid": c,
+                            "h_eid": h_eid,
+                            "out_eid": out,
+                            "term": offered,
+                            "kind": kind,
+                        }
+                    )
                     break  # one kind per h is enough
     return offers

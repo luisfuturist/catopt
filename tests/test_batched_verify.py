@@ -31,27 +31,31 @@ from __future__ import annotations
 
 import copy
 
-import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from catopt.cost import _INVALID, _shape_of, flops_cost
 from catopt.egraph import EGraph
-from catopt.ir import Op, Var, TensorType
-from catopt.cost import _shape_of, _INVALID, flops_cost
+from catopt.ir import Op, TensorType, Var
 from catopt.optimize import optimize_compositional, optimize_model
-
 
 # ---------------------------------------------------------------------------
 #  A batched rope-style block — mirrors bench/decode_bench.py's BatchedBlock
 # ---------------------------------------------------------------------------
 
+
 class RopeBlock(nn.Module):
     """The reported failure shape: a rank-5 ``stack`` -> ``reshape``
     rope, plus the qkv/mlp GEMM groups the pairing pass fuses."""
 
-    def __init__(self, dim: int = 96, hidden: int = 192,
-                 nh: int = 4, hd: int = 24) -> None:
+    def __init__(
+        self,
+        dim: int = 96,
+        hidden: int = 192,
+        nh: int = 4,
+        hd: int = 24,
+    ) -> None:
         super().__init__()
         self.nh, self.hd = nh, hd
         self.wq = nn.Linear(dim, nh * hd, bias=False)
@@ -62,8 +66,9 @@ class RopeBlock(nn.Module):
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
 
-    def rope(self, x: torch.Tensor, cos: torch.Tensor,
-             sin: torch.Tensor) -> torch.Tensor:
+    def rope(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
         B, T = x.shape[0], x.shape[1]
         x = x.reshape(B, T, self.nh, self.hd)
         x1, x2 = x[..., ::2], x[..., 1::2]
@@ -71,8 +76,9 @@ class RopeBlock(nn.Module):
         out = torch.stack([x1 * c - x2 * s, x1 * s + x2 * c], -1)
         return out.reshape(B, T, self.nh * self.hd)
 
-    def forward(self, h: torch.Tensor, cos: torch.Tensor,
-                sin: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
         B, T = h.shape[0], h.shape[1]
         q = self.rope(self.wq(h), cos, sin)
         k = self.rope(self.wk(h), cos, sin)
@@ -89,13 +95,21 @@ class RopeBlock(nn.Module):
 class RopeStories(nn.Module):
     """emb -> ModuleList(RopeBlock) -> head, like the bench model."""
 
-    def __init__(self, dim: int = 96, hidden: int = 192, nh: int = 4,
-                 hd: int = 24, depth: int = 2, seq: int = 1024,
-                 vocab: int = 256) -> None:
+    def __init__(
+        self,
+        dim: int = 96,
+        hidden: int = 192,
+        nh: int = 4,
+        hd: int = 24,
+        depth: int = 2,
+        seq: int = 1024,
+        vocab: int = 256,
+    ) -> None:
         super().__init__()
         self.emb = nn.Embedding(vocab, dim)
         self.blocks = nn.ModuleList(
-            RopeBlock(dim, hidden, nh, hd) for _ in range(depth))
+            RopeBlock(dim, hidden, nh, hd) for _ in range(depth)
+        )
         self.head = nn.Linear(dim, vocab, bias=False)
         freqs = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
         outer = torch.outer(torch.arange(seq).float(), freqs)
@@ -118,7 +132,7 @@ def _V(name: str, shape) -> Var:
 def _numel(shape) -> int:
     n = 1
     for d in shape:
-        n *= (d if isinstance(d, int) and d > 0 else 1)
+        n *= d if isinstance(d, int) and d > 0 else 1
     return n
 
 
@@ -137,6 +151,7 @@ def _all_terms(term, seen=None):
 # ---------------------------------------------------------------------------
 #  Shape-inference guard: an ill-typed reshape is _INVALID, never a shape
 # ---------------------------------------------------------------------------
+
 
 def test_reshape_inference_flags_numel_mismatch():
     """``reshape(x, S)`` where ``numel(S) != numel(x)`` is ill-typed:
@@ -160,23 +175,24 @@ def test_extract_best_never_picks_illtyped_reshape():
     torch.manual_seed(0)
     from catopt.ir import IR
     from catopt.torch_bridge import ir_to_torch_module
+
     B, T, D = 16, 256, 768
     x = _V("x", (B, T, D))
     eg = EGraph()
-    root = eg.add_term(Op.make("mul", x, x))   # a real (costly) member
+    root = eg.add_term(Op.make("mul", x, x))  # a real (costly) member
     # hand-mint the reported failure shape as a sibling member of the
     # root class — a reshape view that halved the wrong axis
     x_eid = eg.add_leaf(repr(x))
-    bad_eid = eg.add_enode("reshape", (x_eid,),
-                           {"shape": (B, T // 2, 12, 64)})
-    eg.union(root, bad_eid)                    # one class, two members
+    bad_eid = eg.add_enode(
+        "reshape", (x_eid,), {"shape": (B, T // 2, 12, 64)}
+    )
+    eg.union(root, bad_eid)  # one class, two members
 
     term = eg.extract_best(root, flops_cost)
     # must be the well-typed member — never the ill-typed free view
     assert isinstance(term, Op) and term.op == "mul", term
     # and it must actually evaluate
-    mod = ir_to_torch_module(IR(root=term, inputs=[x]),
-                             param_values={})
+    mod = ir_to_torch_module(IR(root=term, inputs=[x]), param_values={})
     with torch.no_grad():
         out = mod(torch.randn(B, T, D))
     assert out.shape == (B, T, D)
@@ -186,15 +202,16 @@ def test_extract_best_never_picks_illtyped_reshape():
 #  Minted-member invariant on the real batched-rope e-graph
 # ---------------------------------------------------------------------------
 
+
 def test_batched_rope_egraph_reshapes_welltyped():
     """Replicate ``optimize_model``'s saturation on a batched-rope
     block and audit EVERY reshape enode: attr numel must equal the
     child class's inferred numel — the reported minted shape may never
     appear ill-typed."""
     torch.manual_seed(0)
-    from catopt.torch_bridge import export_to_ir
-    from catopt.rules import all_rules
     from catopt.optimize import _EXPANSIVE_RULES
+    from catopt.rules import all_rules
+    from catopt.torch_bridge import export_to_ir
 
     blk = RopeBlock().eval()
     B, T, D = 16, 128, 96
@@ -204,8 +221,12 @@ def test_batched_rope_egraph_reshapes_welltyped():
 
     eg = EGraph()
     root = eg.add_term(ir.root)
-    _SUB = {"swiglu_fuse", "parallel_mul_fuse", "qkv_fuse",
-            "qkv_fuse_asym"}
+    _SUB = {
+        "swiglu_fuse",
+        "parallel_mul_fuse",
+        "qkv_fuse",
+        "qkv_fuse_asym",
+    }
     rules = [r for r in all_rules() if r.name not in _SUB]
     budgets = {n: 2048 for n in _EXPANSIVE_RULES}
     eg.run(rules, root, rule_budgets=budgets)
@@ -219,9 +240,11 @@ def test_batched_rope_egraph_reshapes_welltyped():
             continue
         child = eg.any_term(en.children[0])
         cs = _shape_of(child)
-        if (isinstance(cs, tuple)
-                and all(isinstance(d, int) for d in cs)
-                and _numel(cs) != _numel(s)):
+        if (
+            isinstance(cs, tuple)
+            and all(isinstance(d, int) for d in cs)
+            and _numel(cs) != _numel(s)
+        ):
             bad.append((s, cs))
     assert bad == [], f"ill-typed reshape enodes minted: {bad}"
 
@@ -229,6 +252,7 @@ def test_batched_rope_egraph_reshapes_welltyped():
 # ---------------------------------------------------------------------------
 #  Caller-model integrity across sequential optimize_compositional cells
 # ---------------------------------------------------------------------------
+
 
 def test_compositional_leaves_caller_model_pristine():
     """Sequential cells (the decode_bench sweep pattern): each call
@@ -285,8 +309,8 @@ def test_compositional_inplace_fallback_preserves_model():
     # IRModules — calling it at a different T crashes with the stale
     # baked shape (the reported 'shape [B, T1, nh, hd] invalid').
     with torch.no_grad():
-        model(torch.randint(0, 256, (4, 128)))   # must not raise
-        model(idx64)                            # still fine at T=64
+        model(torch.randint(0, 256, (4, 128)))  # must not raise
+        model(idx64)  # still fine at T=64
 
 
 def test_batched_rope_optimize_model_multi_shape():

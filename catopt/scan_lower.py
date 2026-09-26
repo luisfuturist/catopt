@@ -36,15 +36,15 @@ from typing import Any
 
 import torch
 
+from catopt.cost import _shape_of
 from catopt.ir import IR, Op, Param
 from catopt.torch_bridge import IRModule
-from catopt.cost import _shape_of
 
 __all__ = [
     "BatchedScanModule",
-    "to_batched_scan_module",
-    "is_scan_apply_term",
     "build_scan_plan",
+    "is_scan_apply_term",
+    "to_batched_scan_module",
 ]
 
 
@@ -69,8 +69,7 @@ def _fold_nested_apply(term: Any) -> Any:
         args = [go(a) for a in t.args]
         t = Op.make(t.op, *args, **t.attrs) if args else t
         if t.op in ("apply", "applyd"):
-            comp = ("affd_compose" if t.op == "applyd"
-                    else "aff_compose")
+            comp = "affd_compose" if t.op == "applyd" else "aff_compose"
             f, h = t.args
             while isinstance(h, Op) and h.op == t.op:
                 f = Op.make(comp, f, h.args[0])
@@ -102,10 +101,12 @@ def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
             kids = [_is_aff_tree(a, memo) for a in term.args]
             # Domain purity: all leaves one carrier, and the compose
             # op must match it (aff_compose over aff leaves, etc.).
-            want = {"aff": "aff_compose",
-                    "aff_diag": "affd_compose"}
-            ok = (kids[0] is not None and kids[0] == kids[1]
-                  and term.op == want[kids[0]])
+            want = {"aff": "aff_compose", "aff_diag": "affd_compose"}
+            ok = (
+                kids[0] is not None
+                and kids[0] == kids[1]
+                and term.op == want[kids[0]]
+            )
             dom = kids[0] if ok else None
     memo[key] = dom
     return dom
@@ -139,18 +140,27 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
     b0 = _shape_of(leaves[0].args[1])
     if leaves[0].op == "aff_diag":
         # Diagonal carrier: a and b are both (d,) vectors.
-        ok = (isinstance(a0, tuple) and isinstance(b0, tuple)
-              and a0 == b0
-              and all(isinstance(d, int) for d in a0))
+        ok = (
+            isinstance(a0, tuple)
+            and isinstance(b0, tuple)
+            and a0 == b0
+            and all(isinstance(d, int) for d in a0)
+        )
     else:
-        ok = (isinstance(a0, tuple) and len(a0) >= 2
-              and all(isinstance(d, int) for d in a0)
-              and isinstance(b0, tuple) and b0 == a0[:-1])
+        ok = (
+            isinstance(a0, tuple)
+            and len(a0) >= 2
+            and all(isinstance(d, int) for d in a0)
+            and isinstance(b0, tuple)
+            and b0 == a0[:-1]
+        )
     if not ok:
         return False
     for leaf in leaves[1:]:
-        if (_shape_of(leaf.args[0]) != a0
-                or _shape_of(leaf.args[1]) != b0):
+        if (
+            _shape_of(leaf.args[0]) != a0
+            or _shape_of(leaf.args[1]) != b0
+        ):
             return False
     return True
 
@@ -162,9 +172,11 @@ def _select_index(term: Op) -> tuple[Any, int, int] | None:
     ``select(x, arg1=dim, arg2=i)`` shape torch.export emits for
     ``x[i]`` indexing.
     """
-    if not isinstance(term, Op) \
-            or term.op not in ("select", "getitem") \
-            or len(term.args) != 1:
+    if (
+        not isinstance(term, Op)
+        or term.op not in ("select", "getitem")
+        or len(term.args) != 1
+    ):
         return None
     dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
     idx = term.attrs.get("arg2", term.attrs.get("index"))
@@ -263,17 +275,24 @@ def build_scan_plan(root: Any) -> dict | None:
     a0 = leaves[0].args[0]
     leaf_a_shared = all(
         leaf.args[0] is a0
-        or (isinstance(leaf.args[0], Param) and isinstance(a0, Param)
-            and leaf.args[0].name == a0.name)
+        or (
+            isinstance(leaf.args[0], Param)
+            and isinstance(a0, Param)
+            and leaf.args[0].name == a0.name
+        )
         for leaf in leaves
     )
-    return {"leaves": leaves, "levels": levels,
-            "level_gather": level_gather,
-            "root_slot": slot[id(f_term)],
-            "leaf_b_gather": _leaf_b_gather(leaves),
-            "leaf_a_shared": leaf_a_shared,
-            "diagonal": diag,
-            "f": f_term, "h": h_term}
+    return {
+        "leaves": leaves,
+        "levels": levels,
+        "level_gather": level_gather,
+        "root_slot": slot[id(f_term)],
+        "leaf_b_gather": _leaf_b_gather(leaves),
+        "leaf_a_shared": leaf_a_shared,
+        "diagonal": diag,
+        "f": f_term,
+        "h": h_term,
+    }
 
 
 class BatchedScanModule(torch.nn.Module):
@@ -330,8 +349,10 @@ class BatchedScanModule(torch.nn.Module):
         return self._graph is not None
 
     def capture_cuda_graph(
-        self, *example_inputs: torch.Tensor, warmup: int = 3,
-    ) -> "BatchedScanModule":
+        self,
+        *example_inputs: torch.Tensor,
+        warmup: int = 3,
+    ) -> BatchedScanModule:
         """Capture the batched forward into a CUDA graph.
 
         After capture, ``forward`` copies each input into static
@@ -363,7 +384,10 @@ class BatchedScanModule(torch.nn.Module):
         with torch.cuda.graph(g):
             out = self._forward_impl(*static_ins)
         self._graph, self._graph_inputs, self._graph_out = (
-            g, static_ins, out)
+            g,
+            static_ins,
+            out,
+        )
         return self
 
     def drop_cuda_graph(self) -> None:
@@ -376,18 +400,29 @@ class BatchedScanModule(torch.nn.Module):
 
     def forward(self, *xs: torch.Tensor) -> torch.Tensor:
         g = self._graph
-        if (g is not None and len(xs) == len(self._graph_inputs)
-                and all(t.shape == b.shape and t.dtype == b.dtype
-                        and t.device == b.device
-                        for t, b in zip(xs, self._graph_inputs))):
+        if (
+            g is not None
+            and len(xs) == len(self._graph_inputs)
+            and all(
+                t.shape == b.shape
+                and t.dtype == b.dtype
+                and t.device == b.device
+                for t, b in zip(xs, self._graph_inputs)
+            )
+        ):
             for buf, t in zip(self._graph_inputs, xs):
                 buf.copy_(t, non_blocking=True)
             g.replay()
             return self._graph_out
         return self._forward_impl(*xs)
 
-    def _cached(self, key: tuple, like: torch.Tensor, make,
-                dtype: torch.dtype | None = None) -> torch.Tensor:
+    def _cached(
+        self,
+        key: tuple,
+        like: torch.Tensor,
+        make,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         """Device/dtype-aware tensor cache (index tensors, pad rows).
 
         ``like`` supplies the device; ``dtype`` defaults to ``like``'s
@@ -402,10 +437,13 @@ class BatchedScanModule(torch.nn.Module):
 
     def _gather_idx(self, slots: list[int], like: torch.Tensor):
         return self._cached(
-            ("idx", tuple(slots)), like,
-            lambda t: torch.tensor(slots, dtype=torch.long,
-                                   device=t.device),
-            dtype=torch.long)
+            ("idx", tuple(slots)),
+            like,
+            lambda t: torch.tensor(
+                slots, dtype=torch.long, device=t.device
+            ),
+            dtype=torch.long,
+        )
 
     def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
         if self._plan is None:
@@ -432,8 +470,9 @@ class BatchedScanModule(torch.nn.Module):
         else:
             leaf_As = [ev(leaf.args[0]) for leaf in leaves]
             if all(a is leaf_As[0] for a in leaf_As):
-                a_vals = leaf_As[0].unsqueeze(0).expand(
-                    n, *leaf_As[0].shape)
+                a_vals = (
+                    leaf_As[0].unsqueeze(0).expand(n, *leaf_As[0].shape)
+                )
             else:
                 a_vals = torch.stack(leaf_As)
 
@@ -447,7 +486,8 @@ class BatchedScanModule(torch.nn.Module):
                 b_vals = base
             else:
                 b_vals = base.index_select(
-                    dim, self._gather_idx(indices, base))
+                    dim, self._gather_idx(indices, base)
+                )
             if dim != 0:
                 b_vals = b_vals.movedim(dim, 0)
         else:
@@ -459,13 +499,17 @@ class BatchedScanModule(torch.nn.Module):
             a_all, b_all = a_vals, b_vals
             for f_idx, g_idx in self._plan["level_gather"]:
                 a_f = a_all.index_select(
-                    0, self._gather_idx(f_idx, a_all))
+                    0, self._gather_idx(f_idx, a_all)
+                )
                 a_g = a_all.index_select(
-                    0, self._gather_idx(g_idx, a_all))
+                    0, self._gather_idx(g_idx, a_all)
+                )
                 b_f = b_all.index_select(
-                    0, self._gather_idx(f_idx, b_all))
+                    0, self._gather_idx(f_idx, b_all)
+                )
                 b_g = b_all.index_select(
-                    0, self._gather_idx(g_idx, b_all))
+                    0, self._gather_idx(g_idx, b_all)
+                )
                 a_all = torch.cat([a_all, a_f * a_g])
                 b_all = torch.cat([b_all, a_f * b_g + b_f])
             h = ev(self._plan["h"])

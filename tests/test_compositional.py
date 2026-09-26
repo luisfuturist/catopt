@@ -10,22 +10,28 @@ and grafts the lowered IRModules back into a clone of the model.
 
 import time
 
-import pytest
 import torch
 import torch.nn as nn
 
-from catopt.models import ParallelBlock, ParallelLinear, DeepParallel
+from catopt.models import DeepParallel, ParallelBlock, ParallelLinear
 from catopt.optimize import optimize_compositional
 
 
 class MiniGPT(nn.Module):
     """Minimal PaLM/GPT-J-style stack: ModuleList of ParallelBlocks."""
 
-    def __init__(self, dim: int = 64, n_heads: int = 4,
-                 depth: int = 4, hidden_mult: int = 2) -> None:
+    def __init__(
+        self,
+        dim: int = 64,
+        n_heads: int = 4,
+        depth: int = 4,
+        hidden_mult: int = 2,
+    ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
-            ParallelBlock(dim, n_heads, hidden_mult) for _ in range(depth))
+            ParallelBlock(dim, n_heads, hidden_mult)
+            for _ in range(depth)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for b in self.blocks:
@@ -64,7 +70,8 @@ def test_compositional_parallel_block_stack():
 
     # End-to-end equivalence (fp32).
     assert stats["end_to_end"]["max_rel_diff"] < 1e-4
-    model.eval(); opt.eval()
+    model.eval()
+    opt.eval()
     with torch.no_grad():
         d = (model(x.clone()) - opt(x.clone())).abs().max().item()
     assert d < 1e-4
@@ -79,7 +86,8 @@ def test_compositional_sequential_stack_fp64():
         def __init__(self, dim: int = 32, depth: int = 4) -> None:
             super().__init__()
             self.net = nn.Sequential(
-                *[DeepParallel(dim, dim, dim) for _ in range(depth)])
+                *[DeepParallel(dim, dim, dim) for _ in range(depth)]
+            )
 
         def forward(self, x):
             return self.net(x)
@@ -120,7 +128,9 @@ def test_compositional_fallback_keeps_original():
     class MixedStack(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            mods = [ParallelLinear(dim, n_experts=2) for _ in range(depth)]
+            mods = [
+                ParallelLinear(dim, n_experts=2) for _ in range(depth)
+            ]
             mods.insert(1, _DataDependentBlock(dim))
             self.blocks = nn.ModuleList(mods)
 
@@ -141,7 +151,9 @@ def test_compositional_fallback_keeps_original():
     assert opt.blocks[1] is not None
     assert isinstance(opt.blocks[1], _DataDependentBlock)
     assert opt.blocks[1] is not model.blocks[1]  # clone, same weights
-    assert torch.equal(opt.blocks[1].lin.weight, model.blocks[1].lin.weight)
+    assert torch.equal(
+        opt.blocks[1].lin.weight, model.blocks[1].lin.weight
+    )
 
     # The healthy blocks still optimized — pairing fires on each
     # ParallelLinear (two linears sharing one input).

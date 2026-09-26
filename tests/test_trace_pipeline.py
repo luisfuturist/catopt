@@ -31,25 +31,29 @@ Everything is fp64 (``.double()``) — verification is exact, not
 tolerance-lottery.
 """
 
-import torch
 import pytest
+import torch
 
 import catopt.trace as cat_trace  # noqa: F401  (registers torch bindings)
-from catopt.egraph import EGraph
 from catopt import meta
 from catopt import rules as R
-from catopt.ir import IR, Op, Var, Param, TensorType, op_repr
-from catopt.om import OM_LAWS
-from catopt.trace import TRACE_LAWS
-from catopt.models.ssm import DiagonalSSM
-from catopt.models.hybrid import HybridBlock
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.cost import flops_cost
+from catopt.egraph import EGraph
+from catopt.ir import IR, Op, Param, TensorType, Var, op_repr
+from catopt.models.hybrid import HybridBlock
+from catopt.models.ssm import DiagonalSSM
+from catopt.om import OM_LAWS
 from catopt.regime import (
-    CARRIER_LAWS, EXECUTORS, Regime,
-    build_egraph, regime_frontier, regime_dispatch,
+    CARRIER_LAWS,
+    EXECUTORS,
+    Regime,
+    build_egraph,
     is_trace_rooted_term,
+    regime_dispatch,
+    regime_frontier,
 )
+from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt.trace import TRACE_LAWS
 
 
 @pytest.fixture(autouse=True)
@@ -64,30 +68,36 @@ def _fp64():
 #  helpers
 # ---------------------------------------------------------------------------
 
+
 def _rand(seed: int, *shape: int) -> torch.Tensor:
-    return torch.randn(*shape,
-                       generator=torch.Generator().manual_seed(seed))
+    return torch.randn(
+        *shape, generator=torch.Generator().manual_seed(seed)
+    )
 
 
-def _mkf(du: int, dx: int, dy: int, seed: int,
-         s_scale: float = 0.25) -> torch.Tensor:
+def _mkf(
+    du: int, dx: int, dy: int, seed: int, s_scale: float = 0.25
+) -> torch.Tensor:
     """Feedback-first block matrix [[S,R],[Q,P]], contractive S."""
     S = _rand(seed + 1, du, du) * s_scale
     Rm = _rand(seed + 2, du, dx) * 0.4
     Q = _rand(seed + 3, dy, du) * 0.4
     P = _rand(seed + 4, dy, dx) * 0.4
-    return torch.cat([torch.cat([S, Rm], dim=1),
-                      torch.cat([Q, P], dim=1)], dim=0)
+    return torch.cat(
+        [torch.cat([S, Rm], dim=1), torch.cat([Q, P], dim=1)], dim=0
+    )
 
 
 def _op_census(eg):
     from collections import Counter
+
     return Counter(n.op for n in eg._node_to_class)
 
 
 def _tr_fires(eg):
-    return {k: v for k, v in eg.rule_fires.items()
-            if k.startswith("tr_")}
+    return {
+        k: v for k, v in eg.rule_fires.items() if k.startswith("tr_")
+    }
 
 
 _TRACE_FAMILY = ("trace", "bdiag", "parl", "eye", "cswap", "inv")
@@ -97,12 +107,14 @@ _TRACE_FAMILY = ("trace", "bdiag", "parl", "eye", "cswap", "inv")
 #  (a) trace is IN the pipeline law set / executor table
 # ---------------------------------------------------------------------------
 
+
 class TestTraceInPipeline:
     def test_trace_laws_in_carrier_laws(self):
         for r in TRACE_LAWS:
             assert r in CARRIER_LAWS, r.name
         # default_rules() (what build_egraph saturates with) carries them
         from catopt.regime import default_rules
+
         names = {r.name for r in default_rules()}
         assert {r.name for r in TRACE_LAWS} <= names
 
@@ -119,17 +131,18 @@ class TestTraceInPipeline:
         Fv = Var("F", TensorType((du + dy, du + dx)))
         tr = Op.make("trace", Fv, usize=du)
         assert is_trace_rooted_term(tr)
-        split = Op.make("bdiag", tr,
-                        Op.make("trace", Fv, usize=du))
+        split = Op.make("bdiag", tr, Op.make("trace", Fv, usize=du))
         assert is_trace_rooted_term(split)
         assert not is_trace_rooted_term(
-            Op.make("matmul", tr, Var("x", TensorType((dx,)))))
+            Op.make("matmul", tr, Var("x", TensorType((dx,))))
+        )
         assert not is_trace_rooted_term(Fv)
 
 
 # ---------------------------------------------------------------------------
 #  (b) the export boundary — honest negative on real models
 # ---------------------------------------------------------------------------
+
 
 class TestExportBoundary:
     """Raw exports contain no trace foothold — trace enters only via
@@ -159,11 +172,21 @@ class TestExportBoundary:
         eg = EGraph()
         # the stratified union harness (more contentful laws than
         # CARRIER_LAWS — stronger negative evidence)
-        laws = (R.SCAN_DIAG_LAWS + OM_LAWS + R.SIMPLIFICATION_RULES
-                + R.CATEGORICAL_RULES + TRACE_LAWS)
+        laws = (
+            R.SCAN_DIAG_LAWS
+            + OM_LAWS
+            + R.SIMPLIFICATION_RULES
+            + R.CATEGORICAL_RULES
+            + TRACE_LAWS
+        )
         out = meta.stratified_run(
-            eg, laws, ir.root, max_iterations=14, max_nodes=400_000,
-            extract_fn=eg.extract_min_depth)
+            eg,
+            laws,
+            ir.root,
+            max_iterations=14,
+            max_nodes=400_000,
+            extract_fn=eg.extract_min_depth,
+        )
         assert _tr_fires(eg) == {}
         census = _op_census(eg)
         for op in _TRACE_FAMILY:
@@ -201,11 +224,20 @@ class TestExportBoundary:
         T, D = 16, 16
         m = DiagonalSSM(D, D, T).eval().double()
         x = torch.randn(T, D)
-        disp = regime_dispatch(m, x, regimes=[
-            Regime("sequential", cost_fn=flops_cost, executor="generic"),
-            Regime("parallel", extract_fn=EGraph.extract_min_depth,
-                   executor="auto"),
-        ])
+        disp = regime_dispatch(
+            m,
+            x,
+            regimes=[
+                Regime(
+                    "sequential", cost_fn=flops_cost, executor="generic"
+                ),
+                Regime(
+                    "parallel",
+                    extract_fn=EGraph.extract_min_depth,
+                    executor="auto",
+                ),
+            ],
+        )
         for name, ch in disp.frontier.choices.items():
             assert "trace" not in op_repr(ch.term), name
         for name, v in disp.verification.items():
@@ -219,9 +251,14 @@ class TestExportBoundary:
         m = DiagonalSSM(D, D, T).eval().double()
         x = torch.randn(T, D)
         eg, root, ir, src, stats = build_egraph(m, x)
-        frontier = regime_frontier(eg, root, {
-            "fixpt": (flops_cost, "trace"),
-        }, ir=ir)
+        frontier = regime_frontier(
+            eg,
+            root,
+            {
+                "fixpt": (flops_cost, "trace"),
+            },
+            ir=ir,
+        )
         ch = frontier["fixpt"]
         assert ch.degraded and not ch.native
         assert not ch.carrier_present
@@ -236,6 +273,7 @@ class TestExportBoundary:
 #  (c) what IS reachable — seeded trace through the SAME pipeline
 # ---------------------------------------------------------------------------
 
+
 def _seeded_joint_loop():
     """matmul(trace(parl(F,G,u1,u2), (du,dv)), x) — a joint loop over
     two independent channels applied to a data vector."""
@@ -247,12 +285,19 @@ def _seeded_joint_loop():
     xv = Var("x", TensorType((2 * dx,)))
     term = Op.make(
         "matmul",
-        Op.make("trace",
-                Op.make("parl", Fp, Gp, u1=du, u2=dv),
-                usize=(du, dv)),
-        xv)
-    ir = IR(root=term, inputs=[xv], input_names={"x"},
-            params={"p_F": Fp, "p_G": Gp})
+        Op.make(
+            "trace",
+            Op.make("parl", Fp, Gp, u1=du, u2=dv),
+            usize=(du, dv),
+        ),
+        xv,
+    )
+    ir = IR(
+        root=term,
+        inputs=[xv],
+        input_names={"x"},
+        params={"p_F": Fp, "p_G": Gp},
+    )
     x = _rand(50, 2 * dx)
     env = {"p_F": F, "p_G": G}
     return ir, term, x, env
@@ -274,11 +319,17 @@ class TestSeededTracePipeline:
         # the channel-split form is a member of the root e-class
         # (matches() is e-class relative: match the whole rooted term)
         assert eg.matches(
-            Op.make("matmul",
-                    Op.make("bdiag",
-                            Op.make("trace", "f", usize="DU"),
-                            Op.make("trace", "g", usize="DV")),
-                    "x"), root)
+            Op.make(
+                "matmul",
+                Op.make(
+                    "bdiag",
+                    Op.make("trace", "f", usize="DU"),
+                    Op.make("trace", "g", usize="DV"),
+                ),
+                "x",
+            ),
+            root,
+        )
 
     def test_frontier_serves_trace_members_fp64(self):
         """regime_frontier extracts trace-bearing members; both the
@@ -289,14 +340,23 @@ class TestSeededTracePipeline:
         root = eg.add_term(term)
         eg.run(CARRIER_LAWS, root, max_iterations=10)
 
-        frontier = regime_frontier(eg, root, {
-            "work": (flops_cost, "auto"),
-            "depth": Regime("depth",
-                            extract_fn=EGraph.extract_min_depth,
-                            executor="auto"),
-            "fixpt": Regime("fixpt", cost_fn=flops_cost,
-                            executor="trace"),
-        }, ir=ir, src_term=term)
+        frontier = regime_frontier(
+            eg,
+            root,
+            {
+                "work": (flops_cost, "auto"),
+                "depth": Regime(
+                    "depth",
+                    extract_fn=EGraph.extract_min_depth,
+                    executor="auto",
+                ),
+                "fixpt": Regime(
+                    "fixpt", cost_fn=flops_cost, executor="trace"
+                ),
+            },
+            ir=ir,
+            src_term=term,
+        )
 
         ref = ir_to_torch_module(ir, param_values=env)(x)
         saw = {"joint": False, "split": False}
@@ -304,9 +364,13 @@ class TestSeededTracePipeline:
             ch = frontier[name]
             assert ch.term is not None and not ch.degraded
             rep = op_repr(ch.term)
-            assert "trace" in rep          # a trace member was served
-            opt = IR(root=ch.term, inputs=ir.inputs,
-                     input_names=ir.input_names, params=ir.params)
+            assert "trace" in rep  # a trace member was served
+            opt = IR(
+                root=ch.term,
+                inputs=ir.inputs,
+                input_names=ir.input_names,
+                params=ir.params,
+            )
             y = ir_to_torch_module(opt, param_values=env)(x)
             assert (y - ref).abs().max().item() < 1e-12, name
             if "bdiag" in rep:
@@ -338,13 +402,20 @@ class TestSeededTracePipeline:
                         break
             if pinned:
                 break
-        assert pinned is not None, "no channel-split member materialised"
-        split_term = eg.extract_best(canon, flops_cost,
-                                     overrides=pinned)
+        assert pinned is not None, (
+            "no channel-split member materialised"
+        )
+        split_term = eg.extract_best(
+            canon, flops_cost, overrides=pinned
+        )
         rep = op_repr(split_term)
         assert "bdiag" in rep and rep.count("trace") >= 2
-        opt = IR(root=split_term, inputs=ir.inputs,
-                 input_names=ir.input_names, params=ir.params)
+        opt = IR(
+            root=split_term,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        )
         ref = ir_to_torch_module(ir, param_values=env)(x)
         y = ir_to_torch_module(opt, param_values=env)(x)
         assert (y - ref).abs().max().item() < 1e-12
@@ -358,23 +429,36 @@ class TestSeededTracePipeline:
         xv = Var("x", TensorType((dx,)))
         # trace applied to data through the data wire — root is trace
         term = Op.make("matmul", Op.make("trace", Fp, usize=du), xv)
-        ir = IR(root=term, inputs=[xv], input_names={"x"},
-                params={"p_F": Fp})
+        ir = IR(
+            root=term,
+            inputs=[xv],
+            input_names={"x"},
+            params={"p_F": Fp},
+        )
         x = _rand(22, dx)
         eg = EGraph()
         root = eg.add_term(term)
         eg.run(CARRIER_LAWS, root, max_iterations=10)
 
-        frontier = regime_frontier(eg, root, {
-            "fixpt": (flops_cost, "trace"),
-        }, ir=ir)
+        frontier = regime_frontier(
+            eg,
+            root,
+            {
+                "fixpt": (flops_cost, "trace"),
+            },
+            ir=ir,
+        )
         ch = frontier["fixpt"]
         assert ch.executor == "trace"
-        assert ch.carrier_present        # trace census visible in term
+        assert ch.carrier_present  # trace census visible in term
         # served member verifies fp64
         ref = ir_to_torch_module(ir, param_values={"p_F": F})(x)
-        opt = IR(root=ch.term, inputs=ir.inputs,
-                 input_names=ir.input_names, params=ir.params)
+        opt = IR(
+            root=ch.term,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        )
         y = ir_to_torch_module(opt, param_values={"p_F": F})(x)
         assert (y - ref).abs().max().item() < 1e-12
 

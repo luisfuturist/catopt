@@ -11,6 +11,7 @@ used) is copied into the cache instead of re-downloaded.
     python bench/fetch.py --models 15M       # just one
     python bench/fetch.py --models 15M,110M
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,16 +28,20 @@ MODELS = {
     "15M": "stories15M.bin",
     "110M": "stories110M.bin",
 }
-CHUNK = 1 << 20                                      # 1 MiB
+CHUNK = 1 << 20  # 1 MiB
 
 
 def cache_dir() -> Path:
     """$XDG_CACHE_HOME/catopt, falling back to ~/.cache/catopt."""
-    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    root = os.environ.get("XDG_CACHE_HOME") or str(
+        Path.home() / ".cache"
+    )
     return Path(root) / "catopt"
 
 
-def _core_floats(dim: int, hidden: int, n_layers: int, vocab: int) -> int:
+def _core_floats(
+    dim: int, hidden: int, n_layers: int, vocab: int
+) -> int:
     """fp32 count of the documented llama2.c weight layout.
 
     Checkpoints may carry an extra fp32 tail (freq tables, untied
@@ -44,12 +49,14 @@ def _core_floats(dim: int, hidden: int, n_layers: int, vocab: int) -> int:
     a *minimum* size, not an exact one.
     """
     L = n_layers
-    return (vocab * dim                              # token_embedding
-            + L * dim                                # rms_att
-            + 4 * L * dim * dim                      # wq, wk, wv, wo
-            + L * dim                                # rms_ffn
-            + 3 * L * dim * hidden                   # w1, w2, w3
-            + dim)                                   # rms_final
+    return (
+        vocab * dim  # token_embedding
+        + L * dim  # rms_att
+        + 4 * L * dim * dim  # wq, wk, wv, wo
+        + L * dim  # rms_ffn
+        + 3 * L * dim * hidden  # w1, w2, w3
+        + dim
+    )  # rms_final
 
 
 def validate(path: Path) -> tuple[bool, str]:
@@ -68,23 +75,33 @@ def validate(path: Path) -> tuple[bool, str]:
     if hdr.size != 7:
         return False, "short header"
     dim, hidden, n_layers, _nh, _kv, vocab, _seq = (int(v) for v in hdr)
-    vocab = abs(vocab)              # llama2.c: negative means tied wcls
+    vocab = abs(vocab)  # llama2.c: negative means tied wcls
     if dim <= 0 or hidden <= 0 or n_layers <= 0 or vocab <= 0:
         return False, f"bad header {hdr.tolist()}"
     core = 28 + 4 * _core_floats(dim, hidden, n_layers, vocab)
     if size < core:
-        return False, f"truncated: {size} B < {core} B implied by header"
+        return (
+            False,
+            f"truncated: {size} B < {core} B implied by header",
+        )
     if (size - 28) % 4:
         return False, f"size {size} B not fp32-aligned"
-    return True, (f"dim={dim} hidden={hidden} n_layers={n_layers} "
-                  f"vocab={vocab} — {size / 1e6:.1f} MB")
+    return True, (
+        f"dim={dim} hidden={hidden} n_layers={n_layers} "
+        f"vocab={vocab} — {size / 1e6:.1f} MB"
+    )
 
 
 def download(url: str, dest: Path) -> None:
     """Stream ``url`` to ``dest`` via a .part temp file, with progress."""
     tmp = dest.with_name(dest.name + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "catopt-fetch"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "catopt-fetch"}
+    )
+    with (
+        urllib.request.urlopen(req, timeout=60) as r,
+        open(tmp, "wb") as f,
+    ):
         total = int(r.headers.get("Content-Length") or 0)
         got = 0
         while True:
@@ -113,7 +130,9 @@ def fetch_one(name: str, dest: Path) -> bool:
     if tmp_copy.exists():
         ok, detail = validate(tmp_copy)
         if ok:
-            print(f"{name}: valid copy at {tmp_copy} — copying into cache")
+            print(
+                f"{name}: valid copy at {tmp_copy} — copying into cache"
+            )
             shutil.copyfile(tmp_copy, dest)
             print(f"  ok: {detail}")
             return True
@@ -124,7 +143,7 @@ def fetch_one(name: str, dest: Path) -> bool:
     print(f"  -> {dest}")
     try:
         download(url, dest)
-    except Exception as e:                          # noqa: BLE001
+    except Exception as e:
         dest.with_name(dest.name + ".part").unlink(missing_ok=True)
         print(f"  FAILED: {e}")
         return False
@@ -139,22 +158,30 @@ def fetch_one(name: str, dest: Path) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--models", default="15M,110M",
-                    help="comma list — choices: " + ",".join(MODELS))
+    ap.add_argument(
+        "--models",
+        default="15M,110M",
+        help="comma list — choices: " + ",".join(MODELS),
+    )
     args = ap.parse_args()
 
     keys = [m.strip() for m in args.models.split(",") if m.strip()]
     bad = [m for m in keys if m not in MODELS]
     if bad or not keys:
-        ap.error(f"--models must be a comma list of {sorted(MODELS)}; "
-                 f"got {args.models!r}")
+        ap.error(
+            f"--models must be a comma list of {sorted(MODELS)}; "
+            f"got {args.models!r}"
+        )
 
     dest_dir = cache_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
     print(f"cache dir: {dest_dir}")
 
-    failed = [k for k in keys
-              if not fetch_one(MODELS[k], dest_dir / MODELS[k])]
+    failed = [
+        k
+        for k in keys
+        if not fetch_one(MODELS[k], dest_dir / MODELS[k])
+    ]
     if failed:
         sys.exit(f"fetch failed for: {', '.join(failed)}")
     print("done — all requested checkpoints present and valid")

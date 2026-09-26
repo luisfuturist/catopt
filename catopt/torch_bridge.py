@@ -2,14 +2,14 @@
 to correctly map graph placeholder targets (p_w1, p_w2, ...) to actual
 model parameter names (W1, W2, ...) and retrieve their shapes.
 """
+
 from __future__ import annotations
 
 from typing import Any
 
 import torch
 
-from catopt.ir import IR, Op, Var, Const, Param, TensorType
-
+from catopt.ir import IR, Const, Op, Param, TensorType, Var
 
 _ATEN_TO_IR: dict[str, str] = {
     "add": "add",
@@ -99,16 +99,37 @@ _ATTR_RENAMES: dict[str, dict[str, str]] = {
 
 #: Ops where a numeric argument is a scalar OPERAND (not an attribute).
 _SCALAR_OPERAND_OPS: set[str] = {
-    "pow", "mul", "div", "add", "sub", "rsub", "rmul", "rdiv",
-    "clamp", "clamp_min", "clamp_max", "leaky_relu",
+    "pow",
+    "mul",
+    "div",
+    "add",
+    "sub",
+    "rsub",
+    "rmul",
+    "rdiv",
+    "clamp",
+    "clamp_min",
+    "clamp_max",
+    "leaky_relu",
     # masked_fill(x, mask, -inf) / eq(x, 0) — the scalar is a Const
     # operand so rewrites can bind and check it.
-    "masked_fill", "eq", "ne", "lt", "le", "gt", "ge",
+    "masked_fill",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
 }
 
 
 def _strip_backend_suffix(name: str) -> str:
-    for suffix in (".default", ".deterministic", ".backend", ".assigned"):
+    for suffix in (
+        ".default",
+        ".deterministic",
+        ".backend",
+        ".assigned",
+    ):
         if name.endswith(suffix):
             return name[: -len(suffix)]
     return name
@@ -148,7 +169,8 @@ def _aten_name(target: Any) -> str:
 def _infer_shape(node_or_value: Any) -> tuple:
     if hasattr(node_or_value, "shape"):
         return tuple(
-            int(d) if d is not None else None for d in node_or_value.shape
+            int(d) if d is not None else None
+            for d in node_or_value.shape
         )
     return (None,)
 
@@ -167,14 +189,21 @@ def export_to_ir(
     names (e.g. 'W1'), so we can retrieve parameter shapes correctly.
     """
     model.eval()
-    args = example_input if isinstance(example_input, tuple) else (example_input,)
+    args = (
+        example_input
+        if isinstance(example_input, tuple)
+        else (example_input,)
+    )
     with torch.no_grad():
         exported = torch.export.export(model, args)
 
     graph = exported.graph
     mod = exported.module()  # the actual Module instance
-    state_dict = exported.state_dict if isinstance(
-        exported.state_dict, dict) else dict(exported.state_dict)
+    state_dict = (
+        exported.state_dict
+        if isinstance(exported.state_dict, dict)
+        else dict(exported.state_dict)
+    )
 
     # Dict to collect original parameter tensors for IRModule
     source_tensors: dict[str, torch.Tensor] = {}
@@ -183,14 +212,17 @@ def export_to_ir(
     # e.g. {'p_w1': 'W1', 'p_w2': 'W2', 'p_w3': 'W3'}
     inputs_to_params: dict[str, str] = {}
     try:
-        inputs_to_params = dict(exported._graph_signature.inputs_to_parameters)
+        inputs_to_params = dict(
+            exported._graph_signature.inputs_to_parameters
+        )
     except Exception:
         pass
     # Buffers (e.g. nanoGPT's causal-mask `bias`) are placeholders too —
     # they are constants, not user inputs: lift them like parameters.
     try:
         inputs_to_params.update(
-            exported._graph_signature.inputs_to_buffers)
+            exported._graph_signature.inputs_to_buffers
+        )
     except Exception:
         pass
 
@@ -220,8 +252,11 @@ def export_to_ir(
                 # exported node's own metadata shape — correct for
                 # multi-input graphs where placeholders differ.
                 meta_shape = getattr(
-                    getattr(node, "meta", {}), "get", lambda k: None)("val")
-                if meta_shape is not None and hasattr(meta_shape, "shape"):
+                    getattr(node, "meta", {}), "get", lambda k: None
+                )("val")
+                if meta_shape is not None and hasattr(
+                    meta_shape, "shape"
+                ):
                     shape = tuple(int(d) for d in meta_shape.shape)
                 elif len(inputs) < len(args):
                     shape = _infer_shape(args[len(inputs)])
@@ -245,14 +280,19 @@ def export_to_ir(
             attrs = {}
             positional_attrs = _POSITIONAL_ATTRS.get(ir_op, {})
             for i, arg_node in enumerate(node.args):
-                if i in positional_attrs and not hasattr(arg_node, "name"):
+                if i in positional_attrs and not hasattr(
+                    arg_node, "name"
+                ):
                     # e.g. conv2d(x, w, b, [s,s], [p,p], [d,d], g) —
                     # non-node positionals are named op attributes.
                     v = arg_node
                     attrs[positional_attrs[i]] = (
-                        tuple(v) if isinstance(v, (list, tuple)) else v)
+                        tuple(v) if isinstance(v, (list, tuple)) else v
+                    )
                     continue
-                if isinstance(arg_node, (int, float)) and not isinstance(arg_node, bool):
+                if isinstance(
+                    arg_node, (int, float)
+                ) and not isinstance(arg_node, bool):
                     # Scalar operands of arithmetic ops are real operands
                     # (e.g. pow(x, 2)); for reductions the scalar is a
                     # dim/arg attribute (e.g. x.mean(-1)).
@@ -267,27 +307,40 @@ def export_to_ir(
                         # A list of FX nodes (stack/cat take tensor lists)
                         # — each element is an operand.
                         for a in arg_node:
-                            key = a.name if hasattr(a, "name") else str(a)
+                            key = (
+                                a.name if hasattr(a, "name") else str(a)
+                            )
                             if key in env:
                                 args.append(env[key])
                     # e.g. dim=[-1] lists for reductions; for view/reshape
                     # the list is the target SHAPE, not a dim.
-                    elif ir_op == "reshape":
-                        attrs["shape"] = tuple(arg_node)
-                    elif ir_op in ("expand", "repeat"):
+                    elif ir_op == "reshape" or ir_op in ("expand", "repeat"):
                         attrs["shape"] = tuple(arg_node)
                     elif ir_op in ("split", "chunk"):
                         attrs["sizes"] = tuple(arg_node)
                     else:
                         attrs["dim"] = tuple(arg_node)
                 elif isinstance(arg_node, bool):
-                    if ir_op in ("mean", "sum", "max", "min", "prod",
-                                 "var", "std", "amax", "amin"):
+                    if ir_op in (
+                        "mean",
+                        "sum",
+                        "max",
+                        "min",
+                        "prod",
+                        "var",
+                        "std",
+                        "amax",
+                        "amin",
+                    ):
                         attrs["keepdim"] = arg_node
                     else:
                         attrs[f"arg{i}"] = arg_node
                 else:
-                    key = arg_node.name if hasattr(arg_node, "name") else str(arg_node)
+                    key = (
+                        arg_node.name
+                        if hasattr(arg_node, "name")
+                        else str(arg_node)
+                    )
                     if key in env:
                         args.append(env[key])
             for k, v in node.kwargs.items():
@@ -303,15 +356,21 @@ def export_to_ir(
             for old, new in _ATTR_RENAMES.get(ir_op, {}).items():
                 if old in attrs and new not in attrs:
                     attrs[new] = attrs.pop(old)
-            if (ir_op == "getitem" and args
-                    and isinstance(args[0], Op)
-                    and args[0].op in ("split", "chunk", "unbind")
-                    and isinstance(node.args[1], int)):
+            if (
+                ir_op == "getitem"
+                and args
+                and isinstance(args[0], Op)
+                and args[0].op in ("split", "chunk", "unbind")
+                and isinstance(node.args[1], int)
+            ):
                 # getitem(split(t), i) — fold the index into the
                 # splitter so the op yields element i directly.
                 base = args[0]
-                ir_node = Op.make(base.op, *base.args,
-                                  **{**dict(base.attrs), "index": node.args[1]})
+                ir_node = Op.make(
+                    base.op,
+                    *base.args,
+                    **{**dict(base.attrs), "index": node.args[1]},
+                )
             elif args:
                 ir_node = Op.make(ir_op, *args, **attrs)
             else:
@@ -329,7 +388,6 @@ def export_to_ir(
     if root is None and env:
         root = list(env.values())[-1]
 
-    
     return IR(
         root=root,
         inputs=inputs,
@@ -365,35 +423,55 @@ _IR_TO_TORCH: dict[str, Any] = {
     "sum": lambda x, *a, **kw: x.sum(*_dim_args(a, kw)),
     "mean": lambda x, *a, **kw: x.mean(*_dim_args(a, kw)),
     "transpose": lambda x, *a, **kw: (
-        x.t() if x.dim() == 2 and "arg1" not in kw
+        x.t()
+        if x.dim() == 2 and "arg1" not in kw
         else x.transpose(kw.get("arg1", -2), kw.get("arg2", -1))
     ),
     "reshape": lambda x, *a, **kw: x.reshape(
         tuple(kw["shape"]) if "shape" in kw else (-1,)
     ),
     "contiguous": lambda x, *a, **kw: x.contiguous(),
-    "sdpa": lambda q, k, v, *a, **kw: torch.nn.functional
-        .scaled_dot_product_attention(
-            q, k, v,
+    "sdpa": lambda q, k, v, *a, **kw: (
+        torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
             **({"attn_mask": a[0]} if a else {}),
-            **{("attn_mask" if kk == "arg3" else
-                "dropout_p" if kk == "arg4" else
-                "is_causal" if kk == "arg5" else
-                "scale" if kk == "arg6" else
-                "enable_gqa" if kk == "arg7" else kk): vv
-               for kk, vv in kw.items() if vv is not None},
-        ),
+            **{
+                (
+                    "attn_mask"
+                    if kk == "arg3"
+                    else "dropout_p"
+                    if kk == "arg4"
+                    else "is_causal"
+                    if kk == "arg5"
+                    else "scale"
+                    if kk == "arg6"
+                    else "enable_gqa"
+                    if kk == "arg7"
+                    else kk
+                ): vv
+                for kk, vv in kw.items()
+                if vv is not None
+            },
+        )
+    ),
     "broadcast": lambda x, *a, **kw: x,
     "linear": lambda x, w, *a, **kw: torch.nn.functional.linear(
         x, w, (a[0] if a else kw.get("bias"))
     ),
     "conv2d": lambda x, w, *a, **kw: torch.nn.functional.conv2d(
-        x, w, a[0] if a else kw.get("bias"),
-        stride=kw.get("stride", 1), padding=kw.get("padding", 0),
-        dilation=kw.get("dilation", 1), groups=kw.get("groups", 1),
+        x,
+        w,
+        a[0] if a else kw.get("bias"),
+        stride=kw.get("stride", 1),
+        padding=kw.get("padding", 0),
+        dilation=kw.get("dilation", 1),
+        groups=kw.get("groups", 1),
     ),
     "concat": lambda *ts, **kw: torch.cat(
-        list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))),
+        list(ts), dim=int(kw.get("dim", kw.get("arg1", 0)))
+    ),
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
         t, int(kw.get("arg1", chunks)), dim=int(kw.get("arg2", dim))
     )[index],
@@ -437,39 +515,61 @@ _IR_TO_TORCH: dict[str, Any] = {
     ),
     # embedding(W, idx) — row gather; factorised form gathers the small
     # factor then projects (eps.low_rank_gather).
-    "embedding": lambda w, idx, *a, **kw:
-        torch.nn.functional.embedding(idx, w),
+    "embedding": lambda w, idx, *a, **kw: torch.nn.functional.embedding(
+        idx, w
+    ),
     # gather along one axis.  The index is normally an attr (a tuple of
     # ints produced by share_duplicate_param_slices); a second tensor
     # operand (the raw aten spelling) is accepted too.
     "index_select": lambda t, *a, **kw: torch.index_select(
-        t, int(kw.get("dim", kw.get("arg1", 0))),
-        (a[0] if a and torch.is_tensor(a[0]) else torch.as_tensor(
-            [int(v) for v in kw.get(
-                "index", kw.get("arg2", a[0] if a else ()))],
-            dtype=torch.long, device=t.device))),
+        t,
+        int(kw.get("dim", kw.get("arg1", 0))),
+        (
+            a[0]
+            if a and torch.is_tensor(a[0])
+            else torch.as_tensor(
+                [
+                    int(v)
+                    for v in kw.get(
+                        "index", kw.get("arg2", a[0] if a else ())
+                    )
+                ],
+                dtype=torch.long,
+                device=t.device,
+            )
+        ),
+    ),
     "type_as": lambda x, t, *a, **kw: x.type_as(t),
     "cos": torch.cos,
     "sin": torch.sin,
     "float": lambda x, *a, **kw: x.to(
         getattr(torch, str(kw.get("dtype", "float32")))
         if isinstance(kw.get("dtype"), str)
-        else torch.float32),
+        else torch.float32
+    ),
     "alias": lambda x, *a, **kw: x,
     "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
         x, dim=int(kw.get("arg1", kw.get("dim", -1)))
     ),
     # aten.rms_norm(x, weight) with attrs dim=normalized_shape,
     # arg3=eps — the normalization Llama-family blocks are built on.
-    "rms_norm": lambda x, w=None, *a, **kw: torch.nn.functional
-        .rms_norm(x, tuple(kw.get("dim", kw.get("normalized_shape"))),
-                  weight=w,
-                  eps=float(kw.get("arg3", kw.get("eps", 1e-6)))),
+    "rms_norm": lambda x, w=None, *a, **kw: (
+        torch.nn.functional.rms_norm(
+            x,
+            tuple(kw.get("dim", kw.get("normalized_shape"))),
+            weight=w,
+            eps=float(kw.get("arg3", kw.get("eps", 1e-6))),
+        )
+    ),
     "layer_norm": lambda x, w=None, b=None, *a, **kw: (
         torch.nn.functional.layer_norm(
-            x, tuple(kw.get("dim", kw.get("normalized_shape"))),
-            weight=w, bias=b,
-            eps=float(kw.get("arg5", kw.get("eps", 1e-5))))),
+            x,
+            tuple(kw.get("dim", kw.get("normalized_shape"))),
+            weight=w,
+            bias=b,
+            eps=float(kw.get("arg5", kw.get("eps", 1e-5))),
+        )
+    ),
     "masked_fill": lambda x, m, v, *a, **kw: x.masked_fill(m, v),
     "eq": lambda x, y, *a, **kw: x == y,
     "ne": lambda x, y, *a, **kw: x != y,
@@ -483,8 +583,10 @@ _IR_TO_TORCH: dict[str, Any] = {
     # denoting h ↦ A@h + b; compose/apply pass pairs around — only
     # ``apply`` returns a tensor.
     "aff": lambda A, b, *a, **kw: (A, b),
-    "aff_compose": lambda f, g, *a, **kw: (f[0] @ g[0],
-                                           f[0] @ g[1] + f[1]),
+    "aff_compose": lambda f, g, *a, **kw: (
+        f[0] @ g[0],
+        f[0] @ g[1] + f[1],
+    ),
     "apply": lambda f, h, *a, **kw: f[0] @ h + f[1],
     # Online-softmax monoid (FlashAttention's combine as a monoid law —
     # see catopt/om.py).  An ``om`` value is a triple (m, l, a):
@@ -500,8 +602,10 @@ _IR_TO_TORCH: dict[str, Any] = {
     # (a, b) of same-shaped tensors; compose/apply are elementwise —
     # O(d) work per node instead of the dense carrier's d×d products.
     "aff_diag": lambda a, b, *x, **kw: (a, b),
-    "affd_compose": lambda f, g, *a, **kw: (f[0] * g[0],
-                                            f[0] * g[1] + f[1]),
+    "affd_compose": lambda f, g, *a, **kw: (
+        f[0] * g[0],
+        f[0] * g[1] + f[1],
+    ),
     "applyd": lambda f, h, *a, **kw: f[0] * h + f[1],
 }
 
@@ -530,10 +634,12 @@ def _om_compose(f, g):
     fin1, fin2 = torch.isfinite(m1), torch.isfinite(m2)
     e1 = torch.where(fin1, torch.exp(m1 - mx), torch.zeros_like(mx))
     e2 = torch.where(fin2, torch.exp(m2 - mx), torch.zeros_like(mx))
-    l = (torch.where(fin1, l1 * e1, torch.zeros_like(l1))
-         + torch.where(fin2, l2 * e2, torch.zeros_like(l2)))
-    a = (torch.where(fin1, a1 * e1, torch.zeros_like(a1))
-         + torch.where(fin2, a2 * e2, torch.zeros_like(a2)))
+    l = torch.where(fin1, l1 * e1, torch.zeros_like(l1)) + torch.where(
+        fin2, l2 * e2, torch.zeros_like(l2)
+    )
+    a = torch.where(fin1, a1 * e1, torch.zeros_like(a1)) + torch.where(
+        fin2, a2 * e2, torch.zeros_like(a2)
+    )
     return (mx, l, a)
 
 
@@ -632,34 +738,61 @@ class IRModule(torch.nn.Module):
             return memo_hit
 
         if isinstance(term, _Op):
-            folded_args = tuple(self._fold_weight_chains(a) for a in term.args)
+            folded_args = tuple(
+                self._fold_weight_chains(a) for a in term.args
+            )
             term = _Op.make(term.op, *folded_args, **dict(term.attrs))
             if not self._uses_input(term):
                 if term.op == "matmul":
-                    left = self._param_values.get(term.args[0].name) \
-                        if isinstance(term.args[0], _Param) else None
-                    right = self._param_values.get(term.args[1].name) \
-                        if isinstance(term.args[1], _Param) else None
+                    left = (
+                        self._param_values.get(term.args[0].name)
+                        if isinstance(term.args[0], _Param)
+                        else None
+                    )
+                    right = (
+                        self._param_values.get(term.args[1].name)
+                        if isinstance(term.args[1], _Param)
+                        else None
+                    )
                     if left is not None and right is not None:
                         with torch.no_grad():
                             fused = torch.matmul(left, right)
                         fused_name = f"fused_{len(self._param_map) + len(self._param_values)}"
-                        self._param_values[fused_name] = fused.detach().clone()
+                        self._param_values[fused_name] = (
+                            fused.detach().clone()
+                        )
                         shape = tuple(int(d) for d in fused.shape)
                         from catopt.ir import TensorType
-                        result = _Param(name=fused_name, typ=TensorType(shape))
+
+                        result = _Param(
+                            name=fused_name, typ=TensorType(shape)
+                        )
                         self._fold_memo[orig_id] = result
                         return result
                 elif term.op in (
-                    "add", "mul", "sub", "div", "neg", "square", "sqrt",
-                    "sigmoid", "silu", "tanh", "gelu", "exp", "pow",
+                    "add",
+                    "mul",
+                    "sub",
+                    "div",
+                    "neg",
+                    "square",
+                    "sqrt",
+                    "sigmoid",
+                    "silu",
+                    "tanh",
+                    "gelu",
+                    "exp",
+                    "pow",
                     "concat",
                 ):
                     # Try eager compile-time fold via _IR_TO_TORCH bindings
                     vals: list[torch.Tensor] = []
                     ok = True
                     for a in term.args:
-                        if isinstance(a, _Param) and a.name in self._param_values:
+                        if (
+                            isinstance(a, _Param)
+                            and a.name in self._param_values
+                        ):
                             vals.append(self._param_values[a.name])
                         elif isinstance(a, Const):
                             vals.append(torch.tensor(a.value))
@@ -672,13 +805,19 @@ class IRModule(torch.nn.Module):
                             with torch.no_grad():
                                 fused = fn(*vals, **dict(term.attrs))
                             if isinstance(fused, torch.Tensor):
-                                fused_name = (
-                                    f"fused_{len(self._param_map) + len(self._param_values)}"
+                                fused_name = f"fused_{len(self._param_map) + len(self._param_values)}"
+                                self._param_values[fused_name] = (
+                                    fused.detach().clone()
                                 )
-                                self._param_values[fused_name] = fused.detach().clone()
-                                shape = tuple(int(d) for d in fused.shape)
+                                shape = tuple(
+                                    int(d) for d in fused.shape
+                                )
                                 from catopt.ir import TensorType
-                                result = _Param(name=fused_name, typ=TensorType(shape))
+
+                                result = _Param(
+                                    name=fused_name,
+                                    typ=TensorType(shape),
+                                )
                                 self._fold_memo[orig_id] = result
                                 return result
                         except Exception:
@@ -699,7 +838,10 @@ class IRModule(torch.nn.Module):
                 return
             seen.add(id(t))
             if isinstance(t, _Param):
-                if t.name not in param_shapes and t.typ.size is not None:
+                if (
+                    t.name not in param_shapes
+                    and t.typ.size is not None
+                ):
                     param_shapes[t.name] = tuple(
                         d if d is not None else 1 for d in t.typ.shape
                     )
@@ -715,8 +857,10 @@ class IRModule(torch.nn.Module):
                 # registered without grad — Parameters require float.
                 v = self._param_values[name].clone()
                 p = torch.nn.Parameter(
-                    v, requires_grad=v.is_floating_point()
-                    or v.is_complex())
+                    v,
+                    requires_grad=v.is_floating_point()
+                    or v.is_complex(),
+                )
             else:
                 p = torch.nn.Parameter(torch.randn(*shape) * 0.02)
             # Use the IR name (e.g. p_w1) so _eval can find it
@@ -732,7 +876,10 @@ class IRModule(torch.nn.Module):
         return self._eval(self._root, env, x, {})
 
     def _eval(
-        self, term: Any, env: dict[str, torch.Tensor], x: torch.Tensor,
+        self,
+        term: Any,
+        env: dict[str, torch.Tensor],
+        x: torch.Tensor,
         memo: dict[int, torch.Tensor],
     ) -> torch.Tensor:
         if isinstance(term, Var):
@@ -743,7 +890,9 @@ class IRModule(torch.nn.Module):
             pid = self._param_map.get(term.name)
             if pid is not None:
                 return pid
-            shape = tuple(d if d is not None else 1 for d in term.typ.shape)
+            shape = tuple(
+                d if d is not None else 1 for d in term.typ.shape
+            )
             return torch.randn(*shape)
         if isinstance(term, Op):
             # Shared subtrees (e.g. one fused GEMM read by two chunk
@@ -762,6 +911,8 @@ class IRModule(torch.nn.Module):
         raise TypeError(f"Cannot evaluate term: {term}")
 
 
-def ir_to_torch_module(ir: IR, param_values: dict[str, torch.Tensor] | None = None) -> IRModule:
+def ir_to_torch_module(
+    ir: IR, param_values: dict[str, torch.Tensor] | None = None
+) -> IRModule:
     """Convert a catopt IR into a torch.nn.Module."""
     return IRModule(ir, param_values=param_values)

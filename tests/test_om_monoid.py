@@ -24,19 +24,22 @@ Covered here:
 
 import torch
 
+from catopt.cost import dag_cost, flops_cost
 from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, TensorType, op_repr
+from catopt.ir import IR, Op, TensorType, Var, op_repr
 from catopt.om import (
-    OM_LAWS, OM_SPLIT, OM_SPLIT_ARG1, CONCAT_BINARIZE,
+    CONCAT_BINARIZE,
     MATMUL_T_CONCAT,
+    OM_LAWS,
+    OM_SPLIT,
+    OM_SPLIT_ARG1,
 )
-from catopt.cost import flops_cost, dag_cost
-from catopt.torch_bridge import ir_to_torch_module, _IR_TO_TORCH
-
+from catopt.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
 
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
+
 
 def _om_elem(s, v):
     return _IR_TO_TORCH["om_elem"](s, v)
@@ -62,9 +65,9 @@ def _dense_chunked_term(q, ks, vs):
     kcat = _nested_cat(ks, -2)
     vcat = _nested_cat(vs, -2)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1))
-    return Op.make(
-        "matmul", Op.make("softmax", scores, arg1=-1), vcat)
+        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+    )
+    return Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
 
 
 def _dense_chunked_ref(q, ks, vs):
@@ -94,6 +97,7 @@ def _n_enodes_with_op(eg, opname):
 # ---------------------------------------------------------------------------
 #  (a) bindings
 # ---------------------------------------------------------------------------
+
 
 def test_om_elem_apply_matches_dense():
     """om_apply(om_elem(s,v)) == softmax(s) @ v, fp64."""
@@ -145,7 +149,8 @@ def test_om_compose_commutes_numerically():
     a = _om_apply(_om_compose(_om_elem(s1, v1), _om_elem(s2, v2)))
     b = _om_apply(_om_compose(_om_elem(s2, v2), _om_elem(s1, v1)))
     ref = torch.softmax(torch.cat([s1, s2], -1), -1) @ torch.cat(
-        [v1, v2], -2)
+        [v1, v2], -2
+    )
     assert (a - ref).abs().max().item() < 1e-12
     assert (b - ref).abs().max().item() < 1e-12
 
@@ -173,7 +178,8 @@ def test_om_fully_masked_block_contributes_zero():
     v2 = torch.randn(4, 3, dtype=torch.float64)
     out = _om_apply(_om_compose(_om_elem(s1, v1), _om_elem(s2, v2)))
     dense = torch.softmax(torch.cat([s1, s2], -1), -1) @ torch.cat(
-        [v1, v2], -2)
+        [v1, v2], -2
+    )
     assert torch.isfinite(dense).all()
     assert (out - dense).abs().max().item() < 1e-12
 
@@ -191,11 +197,16 @@ def test_om_packaging_op_is_identity_triple():
 #  (b) chunked equivalence via the e-graph
 # ---------------------------------------------------------------------------
 
+
 def _run_om(term, max_iterations=20, max_nodes=200_000):
     eg = EGraph()
     root = eg.add_term(term)
-    stats = eg.run(OM_LAWS, root, max_iterations=max_iterations,
-                   max_nodes=max_nodes)
+    stats = eg.run(
+        OM_LAWS,
+        root,
+        max_iterations=max_iterations,
+        max_nodes=max_nodes,
+    )
     return eg, root, stats
 
 
@@ -212,12 +223,15 @@ def _extract_chunked(eg, root, cost_fn=flops_cost):
     ov = {}
     for cid in list(eg._classes):
         c = eg.find(cid)
-        comps = [n for n in eg._classes[c].nodes if n.op == "om_compose"]
+        comps = [
+            n for n in eg._classes[c].nodes if n.op == "om_compose"
+        ]
         if comps:
             ov.setdefault(c, comps[0])
     for n in eg.get_class(canon).nodes:
-        if (n.op == "om_apply"
-                and _class_has_op(eg, n.children[0], "om_compose")):
+        if n.op == "om_apply" and _class_has_op(
+            eg, n.children[0], "om_compose"
+        ):
             o = dict(ov)
             o[canon] = n
             t = eg.extract_best(canon, cost_fn, overrides=o)
@@ -234,8 +248,12 @@ def test_chunked_attention_emerges_via_om_split():
     T, d, dv = 5, 4, 7
     ksizes = [3, 4, 6]
     q = Var("q", TensorType((T, d)))
-    ks = [Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)
+    ]
     term = _dense_chunked_term(q, ks, vs)
 
     eg, root, stats = _run_om(term)
@@ -247,9 +265,12 @@ def test_chunked_attention_emerges_via_om_split():
 
     # At least one om_apply enode reaches an om_compose — i.e. the
     # homomorphism actually split the carrier across blocks.
-    chunked = [n for n in eg.get_class(root).nodes
-               if n.op == "om_apply"
-               and _class_has_op(eg, n.children[0], "om_compose")]
+    chunked = [
+        n
+        for n in eg.get_class(root).nodes
+        if n.op == "om_apply"
+        and _class_has_op(eg, n.children[0], "om_compose")
+    ]
     assert chunked, "OM_SPLIT never produced a composed carrier"
 
     # Force-extract the chunked form and verify fp64-exact.
@@ -258,8 +279,12 @@ def test_chunked_attention_emerges_via_om_split():
     assert "om_compose" in op_repr(chunked_term)
 
     inputs = [q] + ks + vs
-    ir = IR(root=chunked_term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=chunked_term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
 
     tq = torch.randn(T, d, dtype=torch.float64)
@@ -278,28 +303,40 @@ def test_chunked_attention_batched():
     B, H, T, d, dv = 2, 3, 5, 4, 6
     ksizes = [2, 5]
     q = Var("q", TensorType((B, H, T, d)))
-    ks = [Var(f"k{i}", TensorType((B, H, k, d)))
-          for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((B, H, k, dv)))
-          for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((B, H, k, d)))
+        for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((B, H, k, dv)))
+        for i, k in enumerate(ksizes)
+    ]
     term = _dense_chunked_term(q, ks, vs)
 
     eg, root, _ = _run_om(term)
-    chunked = [n for n in eg.get_class(root).nodes
-               if n.op == "om_apply"
-               and _class_has_op(eg, n.children[0], "om_compose")]
+    chunked = [
+        n
+        for n in eg.get_class(root).nodes
+        if n.op == "om_apply"
+        and _class_has_op(eg, n.children[0], "om_compose")
+    ]
     assert chunked
     chunked_term = _extract_chunked(eg, root)
     assert chunked_term is not None
     inputs = [q] + ks + vs
-    ir = IR(root=chunked_term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=chunked_term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
 
     tq = torch.randn(B, H, T, d, dtype=torch.float64)
     tks = [torch.randn(B, H, k, d, dtype=torch.float64) for k in ksizes]
-    tvs = [torch.randn(B, H, k, dv, dtype=torch.float64)
-           for k in ksizes]
+    tvs = [
+        torch.randn(B, H, k, dv, dtype=torch.float64) for k in ksizes
+    ]
     ref = _dense_chunked_ref(tq, tks, tvs)
     with torch.no_grad():
         out = mod(tq, *tks, *tvs)
@@ -317,8 +354,12 @@ def test_greedy_extraction_also_verifies():
     eg, root, _ = _run_om(term)
     best = eg.extract_best(root, flops_cost)
     inputs = [q] + ks + vs
-    ir = IR(root=best, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=best,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     tq = torch.randn(4, 4, dtype=torch.float64)
     tks = [torch.randn(3, 4, dtype=torch.float64) for _ in ks]
@@ -332,6 +373,7 @@ def test_greedy_extraction_also_verifies():
 # ---------------------------------------------------------------------------
 #  (c) e-class diversity + alternatives
 # ---------------------------------------------------------------------------
+
 
 def test_diverse_class_shows_softmax_and_om_forms():
     """The root e-class's member sketches include both the softmax
@@ -364,13 +406,16 @@ def test_extract_alternatives_frontier_has_both_forms():
     # The split carrier shows up as a class holding both om_elem and
     # om_compose member sketches (per-class greedy extraction can never
     # surface it at the root: the unsplit elem is locally cheaper).
-    assert any("om_compose" in " ".join(d["members"])
-               for d in eg.diverse_classes())
+    assert any(
+        "om_compose" in " ".join(d["members"])
+        for d in eg.diverse_classes()
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Negative dim checks — well-typed but WRONG programs must be refused
 # ---------------------------------------------------------------------------
+
 
 def test_om_split_rejects_wrong_score_axis():
     """scores concat along the ROW axis (dim 0 for (T,K)) is not the
@@ -381,9 +426,11 @@ def test_om_split_rejects_wrong_score_axis():
     v2 = Var("v2", TensorType((3, 6)))
     # scores cat on dim 0 (rows), values cat on dim -2 (keys) —
     # mismatched axes: must not split.
-    t = Op.make("om_elem",
-                Op.make("concat", s1, s2, dim=0),
-                Op.make("concat", v1, v2, dim=-2))
+    t = Op.make(
+        "om_elem",
+        Op.make("concat", s1, s2, dim=0),
+        Op.make("concat", v1, v2, dim=-2),
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run([OM_SPLIT, OM_SPLIT_ARG1], root, max_iterations=5)
@@ -396,9 +443,11 @@ def test_om_split_rejects_wrong_value_axis():
     s2 = Var("s2", TensorType((4, 5)))
     v1 = Var("v1", TensorType((3, 6)))
     v2 = Var("v2", TensorType((5, 4)))
-    t = Op.make("om_elem",
-                Op.make("concat", s1, s2, dim=-1),
-                Op.make("concat", v1, v2, dim=-1))
+    t = Op.make(
+        "om_elem",
+        Op.make("concat", s1, s2, dim=-1),
+        Op.make("concat", v1, v2, dim=-1),
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run([OM_SPLIT, OM_SPLIT_ARG1], root, max_iterations=5)
@@ -412,9 +461,11 @@ def test_om_split_rejects_incompatible_chunks():
     s2 = Var("s2", TensorType((4, 5)))
     v1 = Var("v1", TensorType((3, 6)))
     v2 = Var("v2", TensorType((7, 6)))  # 7 != 5: wrong pair
-    t = Op.make("om_elem",
-                Op.make("concat", s1, s2, dim=-1),
-                Op.make("concat", v1, v2, dim=-2))
+    t = Op.make(
+        "om_elem",
+        Op.make("concat", s1, s2, dim=-1),
+        Op.make("concat", v1, v2, dim=-2),
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run([OM_SPLIT, OM_SPLIT_ARG1], root, max_iterations=5)
@@ -427,10 +478,16 @@ def test_matmul_t_concat_rejects_feature_axis():
     q = Var("q", TensorType((4, 8)))
     k1 = Var("k1", TensorType((3, 8)))
     k2 = Var("k2", TensorType((3, 8)))
-    t = Op.make("matmul", q,
-                Op.make("transpose",
-                        Op.make("concat", k1, k2, dim=-1),
-                        arg1=-2, arg2=-1))
+    t = Op.make(
+        "matmul",
+        q,
+        Op.make(
+            "transpose",
+            Op.make("concat", k1, k2, dim=-1),
+            arg1=-2,
+            arg2=-1,
+        ),
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run([MATMUL_T_CONCAT], root, max_iterations=5)
@@ -438,8 +495,9 @@ def test_matmul_t_concat_rejects_feature_axis():
     for n in eg._node_to_class:
         if n.op == "concat":
             for c in n.children:
-                assert not any(ch.op == "matmul"
-                               for ch in eg.get_class(c).nodes)
+                assert not any(
+                    ch.op == "matmul" for ch in eg.get_class(c).nodes
+                )
 
 
 def test_matmul_t_concat_rejects_partial_transpose():
@@ -450,23 +508,31 @@ def test_matmul_t_concat_rejects_partial_transpose():
     k2 = Var("k2", TensorType((2, 5, 8)))
     # concat on seq dim (-2) but transpose swaps dims 0 and -1 — the
     # cat axis does not land on scores' last dim.
-    t = Op.make("matmul", q,
-                Op.make("transpose",
-                        Op.make("concat", k1, k2, dim=-2),
-                        arg1=0, arg2=-1))
+    t = Op.make(
+        "matmul",
+        q,
+        Op.make(
+            "transpose",
+            Op.make("concat", k1, k2, dim=-2),
+            arg1=0,
+            arg2=-1,
+        ),
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run([MATMUL_T_CONCAT], root, max_iterations=5)
     for n in eg._node_to_class:
         if n.op == "concat":
             for c in n.children:
-                assert not any(ch.op == "matmul"
-                               for ch in eg.get_class(c).nodes)
+                assert not any(
+                    ch.op == "matmul" for ch in eg.get_class(c).nodes
+                )
 
 
 # ---------------------------------------------------------------------------
 #  concat binarization
 # ---------------------------------------------------------------------------
+
 
 def test_concat_binarize_nary_to_binary():
     """3-ary concat gains a nested-binary equivalent in its e-class,
@@ -479,8 +545,8 @@ def test_concat_binarize_nary_to_binary():
     root = eg.add_term(t)
     eg.run(CONCAT_BINARIZE, root, max_iterations=5)
     nodes = eg.get_class(root).nodes
-    assert any(len(n.children) == 3 for n in nodes)   # original n-ary
-    assert any(len(n.children) == 2 for n in nodes)   # binarized
+    assert any(len(n.children) == 3 for n in nodes)  # original n-ary
+    assert any(len(n.children) == 2 for n in nodes)  # binarized
 
     ta = torch.randn(4, 3, dtype=torch.float64)
     tb = torch.randn(4, 5, dtype=torch.float64)
@@ -490,10 +556,13 @@ def test_concat_binarize_nary_to_binary():
         if len(n.children) != 2:
             continue
         canon = eg.find(root)
-        term = eg.extract_best(canon, flops_cost,
-                               overrides={canon: n})
-        ir = IR(root=term, inputs=inputs,
-                input_names={v.name for v in inputs}, params={})
+        term = eg.extract_best(canon, flops_cost, overrides={canon: n})
+        ir = IR(
+            root=term,
+            inputs=inputs,
+            input_names={v.name for v in inputs},
+            params={},
+        )
         mod = ir_to_torch_module(ir)
         with torch.no_grad():
             out = mod(ta, tb, tc)
@@ -509,25 +578,36 @@ def test_concat_binarize_feeds_om_split():
     T, d, dv = 4, 4, 5
     ksizes = [2, 3, 4]
     q = Var("q", TensorType((T, d)))
-    ks = [Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)]
-    kcat = Op.make("concat", *ks, dim=-2)          # one n-ary concat
+    ks = [
+        Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)
+    ]
+    kcat = Op.make("concat", *ks, dim=-2)  # one n-ary concat
     vcat = Op.make("concat", *vs, dim=-2)
-    scores = Op.make("matmul", q,
-                     Op.make("transpose", kcat, arg1=-2, arg2=-1))
-    term = Op.make("matmul",
-                   Op.make("softmax", scores, arg1=-1), vcat)
+    scores = Op.make(
+        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+    )
+    term = Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
 
     eg, root, _ = _run_om(term)
-    chunked = [n for n in eg.get_class(root).nodes
-               if n.op == "om_apply"
-               and _class_has_op(eg, n.children[0], "om_compose")]
+    chunked = [
+        n
+        for n in eg.get_class(root).nodes
+        if n.op == "om_apply"
+        and _class_has_op(eg, n.children[0], "om_compose")
+    ]
     assert chunked, "n-ary concat never reached the chunked carrier"
     chunked_term = _extract_chunked(eg, root)
     assert chunked_term is not None
     inputs = [q] + ks + vs
-    ir = IR(root=chunked_term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=chunked_term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     tq = torch.randn(T, d, dtype=torch.float64)
     tks = [torch.randn(k, d, dtype=torch.float64) for k in ksizes]
@@ -542,9 +622,11 @@ def test_concat_binarize_feeds_om_split():
 #  cost model sanity — the om ops are priced, and `om` packaging is free
 # ---------------------------------------------------------------------------
 
+
 def test_om_cost_model_shapes_and_flops():
     """_infer_op_shape prices the carrier by its eventual tensor."""
     from catopt.cost import _shape_of
+
     s = Var("s", TensorType((4, 6)))
     v = Var("v", TensorType((6, 3)))
     e = Op.make("om_elem", s, v)

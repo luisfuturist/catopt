@@ -7,10 +7,10 @@ with ``torch.utils.benchmark``.
 
     python bench/stories15m_bench.py [--seq 128] [--device cuda]
 """
+
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
 import time
@@ -23,12 +23,14 @@ import torch.nn.functional as F
 from torch.utils.benchmark import Timer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from measure_weights import load_llama2c                      # noqa: E402
+from measure_weights import load_llama2c
 
 
 def cache_dir() -> Path:
     """$XDG_CACHE_HOME/catopt, falling back to ~/.cache/catopt."""
-    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    root = os.environ.get("XDG_CACHE_HOME") or str(
+        Path.home() / ".cache"
+    )
     return Path(root) / "catopt"
 
 
@@ -38,18 +40,22 @@ def resolve_ckpt(arg: str | None, name: str = "stories15M.bin") -> str:
         p = Path(arg)
         if p.is_file():
             return str(p)
-        alt = cache_dir() / p.name            # same basename in cache
+        alt = cache_dir() / p.name  # same basename in cache
         if alt.is_file():
             return str(alt)
-        sys.exit(f"checkpoint not found: {arg}\n"
-                 f"run `python bench/fetch.py` to download the llama2.c "
-                 f"checkpoints into {cache_dir()}")
+        sys.exit(
+            f"checkpoint not found: {arg}\n"
+            f"run `python bench/fetch.py` to download the llama2.c "
+            f"checkpoints into {cache_dir()}"
+        )
     for p in (cache_dir() / name, Path("/tmp") / name):
         if p.is_file():
             return str(p)
-    sys.exit(f"checkpoint {name} not found — looked in "
-             f"{cache_dir() / name} and /tmp/{name}.\n"
-             f"run `python bench/fetch.py` to download it")
+    sys.exit(
+        f"checkpoint {name} not found — looked in "
+        f"{cache_dir() / name} and /tmp/{name}.\n"
+        f"run `python bench/fetch.py` to download it"
+    )
 
 
 class Block(nn.Module):
@@ -73,8 +79,7 @@ class Block(nn.Module):
             x = x.reshape(T, self.nh, self.hd)
             x1, x2 = x[..., ::2], x[..., 1::2]
             c, s = cos[:, None, :], sin[:, None, :]
-            out = torch.stack([x1 * c - x2 * s,
-                               x1 * s + x2 * c], -1)
+            out = torch.stack([x1 * c - x2 * s, x1 * s + x2 * c], -1)
             return out.reshape(T, self.nh * self.hd)
 
         xn = F.rms_norm(h, (h.shape[-1],), self.rms_att, 1e-5)
@@ -82,8 +87,11 @@ class Block(nn.Module):
         k = rope(self.wk(xn)).reshape(T, self.nh, self.hd)
         v = self.wv(xn).reshape(T, self.nh, self.hd)
         out = F.scaled_dot_product_attention(
-            q.transpose(0, 1)[None], k.transpose(0, 1)[None],
-            v.transpose(0, 1)[None], is_causal=True)
+            q.transpose(0, 1)[None],
+            k.transpose(0, 1)[None],
+            v.transpose(0, 1)[None],
+            is_causal=True,
+        )
         out = out[0].transpose(0, 1).reshape(T, -1)
         h = h + self.wo(out)
         xn = F.rms_norm(h, (h.shape[-1],), self.rms_ffn, 1e-5)
@@ -99,11 +107,11 @@ class Stories15M(nn.Module):
         nh, hd = cfg["n_heads"], dim // cfg["n_heads"]
         self.emb = nn.Embedding(cfg["vocab"], dim)
         self.blocks = nn.ModuleList(
-            Block(dim, hidden, nh, hd) for _ in range(cfg["n_layers"]))
+            Block(dim, hidden, nh, hd) for _ in range(cfg["n_layers"])
+        )
         self.rms_final = nn.Parameter(torch.ones(dim))
         self.head = nn.Linear(dim, cfg["vocab"], bias=False)
-        freqs = 1.0 / (10000.0 ** (
-            torch.arange(0, hd, 2).float() / hd))
+        freqs = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
         outer = torch.outer(torch.arange(cfg["seq_len"]).float(), freqs)
         self.register_buffer("cos", outer.cos())
         self.register_buffer("sin", outer.sin())
@@ -120,12 +128,15 @@ class Stories15M(nn.Module):
                 # llama2.c stores FFN weights (out,in) row-major; the
                 # loader's (dim,hidden)/(hidden,dim) reshape scrambles —
                 # reshape recovers the true nn.Linear orientation.
-                b.w1.weight.copy_(torch.tensor(
-                    w["w1"][l].reshape(hidden, dim)))
-                b.w2.weight.copy_(torch.tensor(
-                    w["w2"][l].reshape(dim, hidden)))
-                b.w3.weight.copy_(torch.tensor(
-                    w["w3"][l].reshape(hidden, dim)))
+                b.w1.weight.copy_(
+                    torch.tensor(w["w1"][l].reshape(hidden, dim))
+                )
+                b.w2.weight.copy_(
+                    torch.tensor(w["w2"][l].reshape(dim, hidden))
+                )
+                b.w3.weight.copy_(
+                    torch.tensor(w["w3"][l].reshape(hidden, dim))
+                )
             self.rms_final.copy_(torch.tensor(w["rms_final"]))
 
     def forward(self, idx):
@@ -144,56 +155,79 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq", type=int, default=128)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--ckpt", default=None,
-                    help="checkpoint path — default resolves "
-                         "$XDG_CACHE_HOME/catopt/stories15M.bin then "
-                         "/tmp/stories15M.bin (see bench/fetch.py)")
+    ap.add_argument(
+        "--ckpt",
+        default=None,
+        help="checkpoint path — default resolves "
+        "$XDG_CACHE_HOME/catopt/stories15M.bin then "
+        "/tmp/stories15M.bin (see bench/fetch.py)",
+    )
     args = ap.parse_args()
     args.ckpt = resolve_ckpt(args.ckpt)
 
     w = load_llama2c(args.ckpt)
     # cfg from shapes + header (n_heads isn't inferable from shapes)
-    import struct
+
     with open(args.ckpt, "rb") as f:
         hdr = np.frombuffer(f.read(28), dtype=np.int32)
-    dim, hidden, L, nh = int(hdr[0]), int(hdr[1]), int(hdr[2]), int(hdr[3])
+    dim, hidden, L, nh = (
+        int(hdr[0]),
+        int(hdr[1]),
+        int(hdr[2]),
+        int(hdr[3]),
+    )
     vocab, seq = w["token_embedding"].shape[0], int(hdr[6])
-    cfg = dict(dim=dim, hidden=hidden, n_layers=L, n_heads=nh,
-               vocab=vocab, seq_len=seq)
+    cfg = dict(
+        dim=dim,
+        hidden=hidden,
+        n_layers=L,
+        n_heads=nh,
+        vocab=vocab,
+        seq_len=seq,
+    )
     m = Stories15M(w, cfg).eval().to(args.device)
-    idx = torch.randint(0, cfg["vocab"], (1, args.seq),
-                        device=args.device)
+    idx = torch.randint(
+        0, cfg["vocab"], (1, args.seq), device=args.device
+    )
     with torch.no_grad():
         ref = m(idx)
-    print(f"stories15M real checkpoint, T={args.seq}, "
-          f"device={args.device} — logits {tuple(ref.shape)}")
+    print(
+        f"stories15M real checkpoint, T={args.seq}, "
+        f"device={args.device} — logits {tuple(ref.shape)}"
+    )
 
     from catopt.optimize import optimize_compositional
+
     t0 = time.time()
     opt, rep = optimize_compositional(m, idx, verbose=False)
     pipeline = time.time() - t0
     with torch.no_grad():
         err = (opt(idx) - ref).abs().max().item()
-    print(f"catopt pipeline: {pipeline:.1f}s — "
-          f"blocks optimized {rep['n_optimized']}/{rep['n_blocks']} — "
-          f"max|Δout| = {err:.2e}")
+    print(
+        f"catopt pipeline: {pipeline:.1f}s — "
+        f"blocks optimized {rep['n_optimized']}/{rep['n_blocks']} — "
+        f"max|Δout| = {err:.2e}"
+    )
 
     for name, e in rep["blocks"].items():
         st = e.get("stats") or {}
-        print(f"  {name:12} {e.get('status','?'):10} "
-              f"paired={st.get('paired_extract')}")
+        print(
+            f"  {name:12} {e.get('status', '?'):10} "
+            f"paired={st.get('paired_extract')}"
+        )
 
     results = []
-    variants = [("eager", lambda: m(idx)),
-                ("catopt", lambda: opt(idx))]
+    variants = [("eager", lambda: m(idx)), ("catopt", lambda: opt(idx))]
     try:
         cmp_ = torch.compile(m)
         opt_cmp = torch.compile(opt)
         with torch.no_grad():
             cmp_(idx)
             opt_cmp(idx)
-        variants += [("inductor", lambda: cmp_(idx)),
-                     ("catopt+inductor", lambda: opt_cmp(idx))]
+        variants += [
+            ("inductor", lambda: cmp_(idx)),
+            ("catopt+inductor", lambda: opt_cmp(idx)),
+        ]
     except Exception as e:
         print(f"inductor skipped: {e}")
     for tag, fn in variants:
@@ -202,10 +236,14 @@ def main():
         r.description = tag
         results.append(r)
     base = results[0].median
-    print(f"{'variant':>16} {'median ms':>10} {'vs eager':>9} {'IQR ms':>8}")
+    print(
+        f"{'variant':>16} {'median ms':>10} {'vs eager':>9} {'IQR ms':>8}"
+    )
     for r in results:
-        print(f"{r.description:>16} {r.median*1e3:>10.3f} "
-              f"{r.median/base:>8.3f}x {r.iqr*1e3:>8.3f}")
+        print(
+            f"{r.description:>16} {r.median * 1e3:>10.3f} "
+            f"{r.median / base:>8.3f}x {r.iqr * 1e3:>8.3f}"
+        )
 
 
 if __name__ == "__main__":

@@ -57,7 +57,9 @@ class AttentionBlock(nn.Module):
     projections and the attention scaling.
     """
 
-    def __init__(self, dim: int, n_heads: int = 8, dropout: float = 0.0) -> None:
+    def __init__(
+        self, dim: int, n_heads: int = 8, dropout: float = 0.0
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -66,13 +68,25 @@ class AttentionBlock(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(x)
+            .view(B, T, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(x)
+            .view(B, T, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(x)
+            .view(B, T, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out)
@@ -117,7 +131,12 @@ class ParallelLinear(nn.Module):
     SAME input (a repeated metavariable).
     """
 
-    def __init__(self, dim: int, n_experts: int = 2, expert_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        dim: int,
+        n_experts: int = 2,
+        expert_dim: int | None = None,
+    ) -> None:
         super().__init__()
         out = expert_dim or dim
         self.linears = nn.ModuleList(
@@ -170,7 +189,9 @@ class NormLinear(nn.Module):
     per-channel gain ``w_norm`` (right diagonal — folds into W).
     """
 
-    def __init__(self, dim: int, out: int | None = None, eps: float = 1e-6) -> None:
+    def __init__(
+        self, dim: int, out: int | None = None, eps: float = 1e-6
+    ) -> None:
         super().__init__()
         self.eps = eps
         self.norm_weight = nn.Parameter(torch.ones(dim) * 0.5 + 1.0)
@@ -195,8 +216,13 @@ class TransformerBlock(nn.Module):
     The two norms are RMSNorm-style (``x * rms * w``).
     """
 
-    def __init__(self, dim: int, n_heads: int = 8,
-                 hidden_mult: int = 4, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        hidden_mult: int = 4,
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
         self.eps = eps
         self.norm1_w = nn.Parameter(torch.ones(dim))
@@ -229,8 +255,13 @@ class ParallelBlock(nn.Module):
     pairing composes, and the fused weight is ``cat(Wq,Wk,Wv,Wg,Wu)``.
     """
 
-    def __init__(self, dim: int, n_heads: int = 8,
-                 hidden_mult: int = 4, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        hidden_mult: int = 4,
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
         self.eps = eps
         self.norm_w = nn.Parameter(torch.ones(dim))
@@ -243,7 +274,11 @@ class ParallelBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         n = x * rms * self.norm_w
-        return x + self.attn(n) + self.down(F.silu(self.gate(n)) * self.up(n))
+        return (
+            x
+            + self.attn(n)
+            + self.down(F.silu(self.gate(n)) * self.up(n))
+        )
 
 
 class GQAAttention(nn.Module):
@@ -255,25 +290,46 @@ class GQAAttention(nn.Module):
     cannot express it; the IR needs a ``split`` with explicit sizes.
     """
 
-    def __init__(self, dim: int, n_heads: int = 8, n_kv_heads: int = 2) -> None:
+    def __init__(
+        self, dim: int, n_heads: int = 8, n_kv_heads: int = 2
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = dim // n_heads
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(
+            dim, n_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            dim, n_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            dim, n_kv_heads * self.head_dim, bias=False
+        )
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale,
-                                           enable_gqa=True)
+        q = (
+            self.q_proj(x)
+            .view(B, T, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(x)
+            .view(B, T, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(x)
+            .view(B, T, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        out = F.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, enable_gqa=True
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, self.dim)
         return self.out_proj(out)
 
@@ -342,13 +398,20 @@ class ParallelConv(nn.Module):
     cuDNN conv calls at all.
     """
 
-    def __init__(self, in_ch: int = 64, out_ch: int = 64,
-                 branches: int = 4, kernel: int = 1) -> None:
+    def __init__(
+        self,
+        in_ch: int = 64,
+        out_ch: int = 64,
+        branches: int = 4,
+        kernel: int = 1,
+    ) -> None:
         super().__init__()
-        self.convs = nn.ModuleList([
-            nn.Conv2d(in_ch, out_ch, kernel, bias=False)
-            for _ in range(branches)
-        ])
+        self.convs = nn.ModuleList(
+            [
+                nn.Conv2d(in_ch, out_ch, kernel, bias=False)
+                for _ in range(branches)
+            ]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return sum(c(x) for c in self.convs)
@@ -367,17 +430,20 @@ class LinearAttention(nn.Module):
     automatically and the calibrated cost model picks by shape.
     """
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor,
-                v: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
         return torch.matmul(torch.matmul(q, k.transpose(-2, -1)), v)
 
 
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """llama2.c-style KV head duplication: the diagonal Delta_r."""
     b, t, h, d = x.shape
-    return (x[:, :, :, None, :]
-            .expand(b, t, h, n_rep, d)
-            .reshape(b, t, h * n_rep, d))
+    return (
+        x[:, :, :, None, :]
+        .expand(b, t, h, n_rep, d)
+        .reshape(b, t, h * n_rep, d)
+    )
 
 
 class RepeatKVAttention(nn.Module):
@@ -385,8 +451,9 @@ class RepeatKVAttention(nn.Module):
     pattern.  ``enable_gqa`` inside SDPA computes the same broadcast for
     free; the absorb rule pushes the copy map into the kernel."""
 
-    def __init__(self, dim: int = 128, n_heads: int = 8,
-                 n_kv_heads: int = 2) -> None:
+    def __init__(
+        self, dim: int = 128, n_heads: int = 8, n_kv_heads: int = 2
+    ) -> None:
         super().__init__()
         self.h, self.hk = n_heads, n_kv_heads
         self.dh = dim // n_heads
@@ -413,15 +480,18 @@ class EagerAttention(nn.Module):
     discover the fused kernel form automatically.
     """
 
-    def __init__(self, dim: int = 128, n_heads: int = 4,
-                 block_size: int = 64) -> None:
+    def __init__(
+        self, dim: int = 128, n_heads: int = 4, block_size: int = 64
+    ) -> None:
         super().__init__()
         self.h = n_heads
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
         self.register_buffer(
             "mask",
-            torch.tril(torch.ones(block_size, block_size))
-                 .view(1, 1, block_size, block_size))
+            torch.tril(torch.ones(block_size, block_size)).view(
+                1, 1, block_size, block_size
+            ),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -430,7 +500,9 @@ class EagerAttention(nn.Module):
         k = k.view(b, t, self.h, c // self.h).transpose(1, 2)
         v = v.view(b, t, self.h, c // self.h).transpose(1, 2)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
+        att = att.masked_fill(
+            self.mask[:, :, :t, :t] == 0, float("-inf")
+        )
         att = F.softmax(att, dim=-1)
         return att @ v
 
@@ -438,16 +510,19 @@ class EagerAttention(nn.Module):
 class AdditiveMaskAttention(nn.Module):
     """HF-style eager attention: softmax(qk^T * s + additive_mask) @ v."""
 
-    def __init__(self, dim: int = 128, n_heads: int = 4,
-                 block_size: int = 64) -> None:
+    def __init__(
+        self, dim: int = 128, n_heads: int = 4, block_size: int = 64
+    ) -> None:
         super().__init__()
         self.h = n_heads
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
         neg = torch.full((block_size, block_size), float("-inf"))
         self.register_buffer(
-            "mask", torch.tril(torch.zeros(block_size, block_size))
-                    .add(torch.triu(neg, diagonal=1))
-                    .view(1, 1, block_size, block_size))
+            "mask",
+            torch.tril(torch.zeros(block_size, block_size))
+            .add(torch.triu(neg, diagonal=1))
+            .view(1, 1, block_size, block_size),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
@@ -455,7 +530,9 @@ class AdditiveMaskAttention(nn.Module):
         q = q.view(b, t, self.h, c // self.h).transpose(1, 2)
         k = k.view(b, t, self.h, c // self.h).transpose(1, 2)
         v = v.view(b, t, self.h, c // self.h).transpose(1, 2)
-        att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(k.size(-1))
+        att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
+            k.size(-1)
+        )
         att = att + self.mask[:, :, :t, :t]
         att = F.softmax(att, dim=-1)
         return torch.matmul(att, v)
@@ -482,4 +559,3 @@ class LinearRecurrence(nn.Module):
         for t in range(self.steps):
             h = self.A @ h + x[t]
         return h
-

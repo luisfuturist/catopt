@@ -35,11 +35,12 @@ CKPT = "/tmp/stories15M.bin"
 # stories15M geometry — the real head layout this test mirrors.
 DIM = 288
 N_HEADS = 6
-HEAD_DIM = DIM // N_HEADS          # 48
+HEAD_DIM = DIM // N_HEADS  # 48
 
 
-def _replicate_heads(unique_blocks: list[torch.Tensor],
-                     index_map: list[int]) -> torch.Tensor:
+def _replicate_heads(
+    unique_blocks: list[torch.Tensor], index_map: list[int]
+) -> torch.Tensor:
     """Materialise a (heads*head_dim, dim) weight from unique
     (head_dim, dim) blocks under a per-head index map — the GQA-style
     'replication baked into the checkpoint' pattern."""
@@ -63,27 +64,36 @@ class Stories15MAttnShape(torch.nn.Module):
         self.wo = torch.nn.Linear(DIM, DIM, bias=False)
         with torch.no_grad():
             for lin in (self.wq, self.wo):
-                lin.weight.copy_(torch.randn(
-                    DIM, DIM, generator=g, dtype=torch.float64))
+                lin.weight.copy_(
+                    torch.randn(
+                        DIM, DIM, generator=g, dtype=torch.float64
+                    )
+                )
             # KV projections: n_kv unique head-blocks repeated to fill
             # n_heads slots — bitwise-equal head slices.
-            for lin, imap in ((self.wk, kv_map_wk),
-                              (self.wv, kv_map_wv)):
-                uniq = [torch.randn(HEAD_DIM, DIM, generator=g,
-                                    dtype=torch.float64)
-                        for _ in range(max(imap) + 1)]
+            for lin, imap in (
+                (self.wk, kv_map_wk),
+                (self.wv, kv_map_wv),
+            ):
+                uniq = [
+                    torch.randn(
+                        HEAD_DIM, DIM, generator=g, dtype=torch.float64
+                    )
+                    for _ in range(max(imap) + 1)
+                ]
                 lin.weight.copy_(_replicate_heads(uniq, imap))
 
     def forward(self, x):
         q = self.wq(x[..., :DIM])
-        k = self.wk(x[..., DIM:2 * DIM])
-        v = self.wv(x[..., 2 * DIM:3 * DIM])
+        k = self.wk(x[..., DIM : 2 * DIM])
+        v = self.wv(x[..., 2 * DIM : 3 * DIM])
         return self.wo(q + k + v)
 
 
 # ---------------------------------------------------------------------------
 #  End-to-end: share_duplicate_param_slices on the real head layout
 # ---------------------------------------------------------------------------
+
 
 def test_gqa_head_dedup_stories15m_layout_end_to_end():
     """kv-head replication materialised in a 6-head, 288-dim checkpoint
@@ -93,12 +103,18 @@ def test_gqa_head_dedup_stories15m_layout_end_to_end():
     torch.manual_seed(0)
     # stories15M-style GQA: wk = 3 kv heads doubled, wv = 2 kv heads
     # tripled — index maps are the expand-pattern real GQA uses.
-    m = Stories15MAttnShape(kv_map_wk=[0, 0, 1, 1, 2, 2],
-                            kv_map_wv=[0, 0, 0, 1, 1, 1]).eval().double()
+    m = (
+        Stories15MAttnShape(
+            kv_map_wk=[0, 0, 1, 1, 2, 2], kv_map_wv=[0, 0, 0, 1, 1, 1]
+        )
+        .eval()
+        .double()
+    )
     x = torch.randn(4, 3 * DIM, dtype=torch.float64)
 
-    low, stats = optimize_model(m, x, cost_fn=param_bytes_cost_for(),
-                                verbose=False)
+    low, stats = optimize_model(
+        m, x, cost_fn=param_bytes_cost_for(), verbose=False
+    )
 
     # fp64-equivalent output (other exact rewrites may reassociate
     # fp ops — residual is fp64 noise, ~1e-13, NOT a sharing error).
@@ -109,10 +125,12 @@ def test_gqa_head_dedup_stories15m_layout_end_to_end():
 
     # The weights file shrank by exactly the duplicated head blocks.
     r = param_report(m, low)
-    wk_saved = (N_HEADS - 3) * HEAD_DIM * DIM * 8     # 3 unique of 6
-    wv_saved = (N_HEADS - 2) * HEAD_DIM * DIM * 8     # 2 unique of 6
+    wk_saved = (N_HEADS - 3) * HEAD_DIM * DIM * 8  # 3 unique of 6
+    wv_saved = (N_HEADS - 2) * HEAD_DIM * DIM * 8  # 2 unique of 6
     assert r["bytes_saved"] == wk_saved + wv_saved
-    assert r["optimized_bytes"] == r["original_bytes"] - r["bytes_saved"]
+    assert (
+        r["optimized_bytes"] == r["original_bytes"] - r["bytes_saved"]
+    )
 
     # Original kv weights eliminated; dedup stacks derived.
     assert "p_wk_weight" in r["eliminated"]
@@ -129,23 +147,26 @@ def test_gqa_head_dedup_stories15m_layout_end_to_end():
     assert tuple(sd["p_wk_weight__heads6"].shape) == (3, HEAD_DIM, DIM)
     assert tuple(sd["p_wv_weight__heads6"].shape) == (2, HEAD_DIM, DIM)
     orig_wk = m.wk.weight.detach()
-    assert torch.equal(sd["p_wk_weight__heads6"][0],
-                       orig_wk[:HEAD_DIM])
-    assert torch.equal(sd["p_wk_weight__heads6"][1],
-                       orig_wk[2 * HEAD_DIM:3 * HEAD_DIM])
-    assert torch.equal(sd["p_wk_weight__heads6"][2],
-                       orig_wk[4 * HEAD_DIM:5 * HEAD_DIM])
+    assert torch.equal(sd["p_wk_weight__heads6"][0], orig_wk[:HEAD_DIM])
+    assert torch.equal(
+        sd["p_wk_weight__heads6"][1],
+        orig_wk[2 * HEAD_DIM : 3 * HEAD_DIM],
+    )
+    assert torch.equal(
+        sd["p_wk_weight__heads6"][2],
+        orig_wk[4 * HEAD_DIM : 5 * HEAD_DIM],
+    )
 
     # The share itself is BITWISE-exact: gathering the stack under the
     # index map reproduces the original weight byte-for-byte.
     recon = torch.index_select(
-        sd["p_wk_weight__heads6"], 0,
-        torch.tensor([0, 0, 1, 1, 2, 2])).reshape(DIM, DIM)
+        sd["p_wk_weight__heads6"], 0, torch.tensor([0, 0, 1, 1, 2, 2])
+    ).reshape(DIM, DIM)
     assert torch.equal(recon, orig_wk)
     orig_wv = m.wv.weight.detach()
     recon_v = torch.index_select(
-        sd["p_wv_weight__heads6"], 0,
-        torch.tensor([0, 0, 0, 1, 1, 1])).reshape(DIM, DIM)
+        sd["p_wv_weight__heads6"], 0, torch.tensor([0, 0, 0, 1, 1, 1])
+    ).reshape(DIM, DIM)
     assert torch.equal(recon_v, orig_wv)
 
     # The pass ran inside the pipeline (witnessed non-local lift).
@@ -156,12 +177,19 @@ def test_slice_dedup_all_heads_identical():
     """Degenerate GQA: every head block equal (index_map all zeros) —
     one stored head serves all six."""
     torch.manual_seed(1)
-    m = Stories15MAttnShape(kv_map_wk=[0] * N_HEADS,
-                            kv_map_wv=[0, 0, 0, 0, 0, 0],
-                            seed=7).eval().double()
+    m = (
+        Stories15MAttnShape(
+            kv_map_wk=[0] * N_HEADS,
+            kv_map_wv=[0, 0, 0, 0, 0, 0],
+            seed=7,
+        )
+        .eval()
+        .double()
+    )
     x = torch.randn(2, 3 * DIM, dtype=torch.float64)
-    low, _ = optimize_model(m, x, cost_fn=param_bytes_cost_for(),
-                            verbose=False)
+    low, _ = optimize_model(
+        m, x, cost_fn=param_bytes_cost_for(), verbose=False
+    )
     with torch.no_grad():
         assert (low(x) - m(x)).abs().max() < 1e-9
     sd = low.state_dict()
@@ -173,12 +201,19 @@ def test_slice_dedup_no_fire_when_heads_distinct():
     (what the real stories15M actually contains) produce NO offer and
     NO storage change — the pass must not touch the module."""
     torch.manual_seed(2)
-    m = Stories15MAttnShape(kv_map_wk=list(range(N_HEADS)),
-                            kv_map_wv=list(range(N_HEADS)),
-                            seed=11).eval().double()
+    m = (
+        Stories15MAttnShape(
+            kv_map_wk=list(range(N_HEADS)),
+            kv_map_wv=list(range(N_HEADS)),
+            seed=11,
+        )
+        .eval()
+        .double()
+    )
     x = torch.randn(2, 3 * DIM, dtype=torch.float64)
-    low, _ = optimize_model(m, x, cost_fn=param_bytes_cost_for(),
-                            verbose=False)
+    low, _ = optimize_model(
+        m, x, cost_fn=param_bytes_cost_for(), verbose=False
+    )
     with torch.no_grad():
         assert (low(x) - m(x)).abs().max() < 1e-9
     r = param_report(m, low)
@@ -193,13 +228,19 @@ def test_slice_dedup_requires_storage_cost_axis():
     under param_bytes_cost.  Both are exact; only the realised file
     size differs."""
     torch.manual_seed(3)
-    m = Stories15MAttnShape(kv_map_wk=[0, 0, 1, 1, 2, 2],
-                            kv_map_wv=[0, 0, 0, 1, 1, 1],
-                            seed=13).eval().double()
+    m = (
+        Stories15MAttnShape(
+            kv_map_wk=[0, 0, 1, 1, 2, 2],
+            kv_map_wv=[0, 0, 0, 1, 1, 1],
+            seed=13,
+        )
+        .eval()
+        .double()
+    )
     x = torch.randn(2, 3 * DIM, dtype=torch.float64)
     low, _ = optimize_model(m, x, cost_fn=flops_cost, verbose=False)
     with torch.no_grad():
-        assert (low(x) - m(x)).abs().max() < 1e-9   # still exact
+        assert (low(x) - m(x)).abs().max() < 1e-9  # still exact
     r = param_report(m, low)
     # flop-axis extraction keeps the dense leaves: no storage win.
     assert not any("__heads" in n for n in low.state_dict())
@@ -209,6 +250,7 @@ def test_slice_dedup_requires_storage_cost_axis():
 #  Whole-tensor tying — the 'wcls stored twice' scenario
 # ---------------------------------------------------------------------------
 
+
 def test_tied_embedding_classifier_if_stored_twice():
     """stories15M ties wcls to token_embedding and stores it once.  If
     a checkpoint DID materialise the classifier as a second tensor,
@@ -216,6 +258,7 @@ def test_tied_embedding_classifier_if_stored_twice():
     optimised file stores one copy — the pass would have exposed the
     tying rather than needing it declared."""
     from catopt.optimize import param_report
+
     torch.manual_seed(4)
     vocab = 512
 
@@ -245,21 +288,27 @@ def test_tied_embedding_classifier_if_stored_twice():
 #  The real checkpoint itself — honest zero
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not os.path.exists(CKPT),
-                    reason="stories15M.bin not downloaded")
+
+@pytest.mark.skipif(
+    not os.path.exists(CKPT), reason="stories15M.bin not downloaded"
+)
 def test_real_stories15m_checkpoint_has_no_exact_duplicates():
     """Pins the probe's honest finding: stories15M contains ZERO
     bitwise-equal tensors and ZERO duplicated head/row-block slices —
     catopt's exact passes legitimately offer nothing on the real file.
     Also verifies wcls is stored once (tail is the rope cache)."""
     import sys
+
     import numpy as np
+
     sys.path.insert(0, REPO)
-    from measure_weights import load_llama2c
     from catopt.egraph import EGraph
     from catopt.ir import Param, TensorType
-    from catopt.rules import (share_duplicate_params,
-                              share_duplicate_param_slices)
+    from catopt.rules import (
+        share_duplicate_param_slices,
+        share_duplicate_params,
+    )
+    from measure_weights import load_llama2c
 
     w = load_llama2c(CKPT)
 
@@ -274,7 +323,8 @@ def test_real_stories15m_checkpoint_has_no_exact_duplicates():
         if t.ndim == 3:
             for i in range(t.shape[0]):
                 src[f"{name}_{i}"] = torch.from_numpy(
-                    np.array(t[i])).clone()
+                    np.array(t[i])
+                ).clone()
         else:
             src[name] = torch.from_numpy(np.array(t)).clone()
 

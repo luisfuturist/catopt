@@ -107,13 +107,20 @@ from catopt.torch_bridge import _IR_TO_TORCH
 
 __all__ = [
     "TRACE_LAWS",
-    "TR_VANISH_UNIT", "TR_VANISH_SPLIT", "TR_VANISH_MERGE",
-    "TR_SUPERPOSE", "TR_SUPERPOSE_REV",
-    "TR_SLIDE", "TR_SLIDE_REV",
-    "TR_TIGHTEN_OUT", "TR_TIGHTEN_OUT_REV",
-    "TR_TIGHTEN_IN", "TR_TIGHTEN_IN_REV",
+    "TR_COLLAPSE",
+    "TR_EXPAND",
+    "TR_SLIDE",
+    "TR_SLIDE_REV",
+    "TR_SUPERPOSE",
+    "TR_SUPERPOSE_REV",
+    "TR_TIGHTEN_IN",
+    "TR_TIGHTEN_IN_REV",
+    "TR_TIGHTEN_OUT",
+    "TR_TIGHTEN_OUT_REV",
+    "TR_VANISH_MERGE",
+    "TR_VANISH_SPLIT",
+    "TR_VANISH_UNIT",
     "TR_YANK",
-    "TR_EXPAND", "TR_COLLAPSE",
 ]
 
 
@@ -123,32 +130,53 @@ __all__ = [
 #  ir.py's predefined list, these calls only add registry entries)
 # ---------------------------------------------------------------------------
 
-op_def("trace", 1, 1,
-       law="Tr^U(f): feedback of the first-usize output block into the "
-           "first-usize input block; in FDVect the linear fixpoint "
-           "P + Q(I−S)⁻¹R.")
-op_def("bdiag", 2, 1,
-       law="Monoidal product of linear maps: f ⊗ g is block-diagonal "
-           "under concat wiring.")
-op_def("parl", 2, 1,
-       law="Tensor product re-laid to keep both feedback wires first — "
-           "the product the superposing axiom traces over.")
-op_def("eye", 0, 1,
-       law="Identity morphism id_n (a constant matrix).")
-op_def("cswap", 0, 1,
-       law="Symmetry σ : [a;b] ↦ [b;a] — a permutation matrix.")
-op_def("inv", 1, 1,
-       law="Matrix inverse; appears only inside the closed form of a "
-           "trace (the resolvent (I−S)⁻¹).")
+op_def(
+    "trace",
+    1,
+    1,
+    law="Tr^U(f): feedback of the first-usize output block into the "
+    "first-usize input block; in FDVect the linear fixpoint "
+    "P + Q(I−S)⁻¹R.",
+)
+op_def(
+    "bdiag",
+    2,
+    1,
+    law="Monoidal product of linear maps: f ⊗ g is block-diagonal "
+    "under concat wiring.",
+)
+op_def(
+    "parl",
+    2,
+    1,
+    law="Tensor product re-laid to keep both feedback wires first — "
+    "the product the superposing axiom traces over.",
+)
+op_def("eye", 0, 1, law="Identity morphism id_n (a constant matrix).")
+op_def(
+    "cswap",
+    0,
+    1,
+    law="Symmetry σ : [a;b] ↦ [b;a] — a permutation matrix.",
+)
+op_def(
+    "inv",
+    1,
+    1,
+    law="Matrix inverse; appears only inside the closed form of a "
+    "trace (the resolvent (I−S)⁻¹).",
+)
 
 
 # ---------------------------------------------------------------------------
 #  Small shared helpers
 # ---------------------------------------------------------------------------
 
+
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
     from catopt.cost import _shape_of as _so
+
     return _so(t)
 
 
@@ -164,8 +192,11 @@ def _usize_total(u: Any) -> int:
 def _dim2(t: Any):
     """Concrete 2-D shape of a bound term, or None."""
     s = _shape_of(t)
-    if (isinstance(s, tuple) and len(s) == 2
-            and all(isinstance(d, int) for d in s)):
+    if (
+        isinstance(s, tuple)
+        and len(s) == 2
+        and all(isinstance(d, int) for d in s)
+    ):
         return s
     return None
 
@@ -183,14 +214,18 @@ TR_VANISH_UNIT = R(
     Op.make("trace", "f", usize="U"),
     "f",
     law="Tr^I(f) = f — tracing over the monoidal unit (a zero-width "
-        "feedback wire) is the identity.",
-    check=lambda b: _usize_total(b.get("$attr:U")) == 0)
+    "feedback wire) is the identity.",
+    check=lambda b: _usize_total(b.get("$attr:U")) == 0,
+)
 
 
 def _usize_split2(bound: dict):
     u = bound.get("$attr:UV")
-    if (isinstance(u, (list, tuple)) and len(u) == 2
-            and all(isinstance(x, int) for x in u)):
+    if (
+        isinstance(u, (list, tuple))
+        and len(u) == 2
+        and all(isinstance(x, int) for x in u)
+    ):
         return tuple(u)
     return None
 
@@ -200,8 +235,11 @@ def _check_vanish_split(bound: dict) -> bool:
     if uv is None:
         return False
     fs = _dim2(bound.get("f"))
-    return fs is not None and fs[0] >= uv[0] + uv[1] \
+    return (
+        fs is not None
+        and fs[0] >= uv[0] + uv[1]
         and fs[1] >= uv[0] + uv[1]
+    )
 
 
 def _derive_vanish_split(bound: dict):
@@ -214,14 +252,13 @@ def _derive_vanish_split(bound: dict):
 TR_VANISH_SPLIT = R(
     "tr_vanish_split",
     Op.make("trace", "f", usize="UV"),
-    Op.make("trace",
-            Op.make("trace", "f", usize="DU"),
-            usize="DV"),
+    Op.make("trace", Op.make("trace", "f", usize="DU"), usize="DV"),
     law="Tr^{U⊗V}(f) = Tr^V(Tr^U(f)) — a product feedback wire "
-        "decomposes into nested traces (feedback-first wiring makes "
-        "the inner factor literally the leading block).",
+    "decomposes into nested traces (feedback-first wiring makes "
+    "the inner factor literally the leading block).",
     check=_check_vanish_split,
-    derive=_derive_vanish_split)
+    derive=_derive_vanish_split,
+)
 
 
 def _check_vanish_merge(bound: dict) -> bool:
@@ -236,14 +273,13 @@ def _check_vanish_merge(bound: dict) -> bool:
 
 TR_VANISH_MERGE = R(
     "tr_vanish_merge",
-    Op.make("trace",
-            Op.make("trace", "f", usize="DU"),
-            usize="DV"),
+    Op.make("trace", Op.make("trace", "f", usize="DU"), usize="DV"),
     Op.make("trace", "f", usize="UV"),
     law="Nested traces fuse into a trace over the product wire "
-        "U⊗V — the reverse of tr_vanish_split.",
+    "U⊗V — the reverse of tr_vanish_split.",
     check=_check_vanish_merge,
-    derive=lambda b: {"$attr:UV": (b["$attr:DU"], b["$attr:DV"])})
+    derive=lambda b: {"$attr:UV": (b["$attr:DU"], b["$attr:DV"])},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +291,7 @@ TR_VANISH_MERGE = R(
 #  may be scheduled in parallel.
 # ---------------------------------------------------------------------------
 
+
 def _check_superpose(bound: dict) -> bool:
     if not _both_int(bound, "$attr:DU", "$attr:DV"):
         return False
@@ -262,37 +299,48 @@ def _check_superpose(bound: dict) -> bool:
     if _usize_total(bound.get("$attr:UV")) != du + dv:
         return False
     fs, gs = _dim2(bound.get("f")), _dim2(bound.get("g"))
-    return (fs is not None and gs is not None
-            and fs[0] >= du and fs[1] >= du
-            and gs[0] >= dv and gs[1] >= dv)
+    return (
+        fs is not None
+        and gs is not None
+        and fs[0] >= du
+        and fs[1] >= du
+        and gs[0] >= dv
+        and gs[1] >= dv
+    )
 
 
 TR_SUPERPOSE = R(
     "tr_superpose",
-    Op.make("trace",
-            Op.make("parl", "f", "g", u1="DU", u2="DV"),
-            usize="UV"),
-    Op.make("bdiag",
-            Op.make("trace", "f", usize="DU"),
-            Op.make("trace", "g", usize="DV")),
+    Op.make(
+        "trace", Op.make("parl", "f", "g", u1="DU", u2="DV"), usize="UV"
+    ),
+    Op.make(
+        "bdiag",
+        Op.make("trace", "f", usize="DU"),
+        Op.make("trace", "g", usize="DV"),
+    ),
     law="Superposing: Tr^{U⊗V}(f ⊗ g) = Tr^U(f) ⊗ Tr^V(g) — a joint "
-        "loop over independent channels splits into parallel "
-        "independent loops.  (With g untraced, u2 = 0: context that "
-        "doesn't feed back simply rides along.)",
-    check=_check_superpose)
+    "loop over independent channels splits into parallel "
+    "independent loops.  (With g untraced, u2 = 0: context that "
+    "doesn't feed back simply rides along.)",
+    check=_check_superpose,
+)
 
 TR_SUPERPOSE_REV = R(
     "tr_superpose_rev",
-    Op.make("bdiag",
-            Op.make("trace", "f", usize="DU"),
-            Op.make("trace", "g", usize="DV")),
-    Op.make("trace",
-            Op.make("parl", "f", "g", u1="DU", u2="DV"),
-            usize="UV"),
+    Op.make(
+        "bdiag",
+        Op.make("trace", "f", usize="DU"),
+        Op.make("trace", "g", usize="DV"),
+    ),
+    Op.make(
+        "trace", Op.make("parl", "f", "g", u1="DU", u2="DV"), usize="UV"
+    ),
     law="Reverse superposing: independent loops fuse into one joint "
-        "loop — the eqsat-visible schedule/memory tradeoff.",
+    "loop — the eqsat-visible schedule/memory tradeoff.",
     check=lambda b: _both_int(b, "$attr:DU", "$attr:DV"),
-    derive=lambda b: {"$attr:UV": (b["$attr:DU"], b["$attr:DV"])})
+    derive=lambda b: {"$attr:UV": (b["$attr:DU"], b["$attr:DV"])},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +352,7 @@ TR_SUPERPOSE_REV = R(
 #  in and out of a loop.  Sound for the linear fixpoint:
 #  Q·H·(I−SH)⁻¹·R = Q·(I−HS)⁻¹·H·R.
 # ---------------------------------------------------------------------------
+
 
 def _check_slide(bound: dict) -> bool:
     if not _both_int(bound, "$attr:DU", "$attr:DX"):
@@ -325,25 +374,29 @@ def _derive_slide(bound: dict):
 
 _TR_SLIDE_LHS = Op.make(
     "trace",
-    Op.make("matmul", "g",
-            Op.make("bdiag", "h", Op.make("eye", dim="DX"))),
-    usize="DU")
+    Op.make(
+        "matmul", "g", Op.make("bdiag", "h", Op.make("eye", dim="DX"))
+    ),
+    usize="DU",
+)
 
 _TR_SLIDE_RHS = Op.make(
     "trace",
-    Op.make("matmul",
-            Op.make("bdiag", "h", Op.make("eye", dim="DY")),
-            "g"),
-    usize="DU")
+    Op.make(
+        "matmul", Op.make("bdiag", "h", Op.make("eye", dim="DY")), "g"
+    ),
+    usize="DU",
+)
 
 TR_SLIDE = R(
     "tr_slide",
     _TR_SLIDE_LHS,
     _TR_SLIDE_RHS,
     law="Sliding: Tr(g·(h⊕I_in)) = Tr((h⊕I_out)·g) — a map on the "
-        "feedback wire crosses the loop boundary.",
+    "feedback wire crosses the loop boundary.",
     check=_check_slide,
-    derive=_derive_slide)
+    derive=_derive_slide,
+)
 
 
 def _check_slide_rev(bound: dict) -> bool:
@@ -370,7 +423,8 @@ TR_SLIDE_REV = R(
     _TR_SLIDE_LHS,
     law="Sliding, reverse direction.",
     check=_check_slide_rev,
-    derive=_derive_slide_rev)
+    derive=_derive_slide_rev,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -383,64 +437,95 @@ TR_SLIDE_REV = R(
 #  data block.
 # ---------------------------------------------------------------------------
 
+
 def _check_tighten_out(bound: dict) -> bool:
     du = bound.get("$attr:DU")
     fs, ks = _dim2(bound.get("f")), _dim2(bound.get("k"))
-    return (isinstance(du, int) and fs is not None and ks is not None
-            and fs[0] == du + ks[1])
+    return (
+        isinstance(du, int)
+        and fs is not None
+        and ks is not None
+        and fs[0] == du + ks[1]
+    )
 
 
 TR_TIGHTEN_OUT = R(
     "tr_tighten_out",
-    Op.make("trace",
-            Op.make("matmul",
-                    Op.make("bdiag", Op.make("eye", dim="DU"), "k"),
-                    "f"),
-            usize="DU"),
+    Op.make(
+        "trace",
+        Op.make(
+            "matmul",
+            Op.make("bdiag", Op.make("eye", dim="DU"), "k"),
+            "f",
+        ),
+        usize="DU",
+    ),
     Op.make("matmul", "k", Op.make("trace", "f", usize="DU")),
     law="Tightening/naturality: Tr((I⊕k)·f) = k·Tr(f) — a map on the "
-        "output wire commutes out of the loop.",
-    check=_check_tighten_out)
+    "output wire commutes out of the loop.",
+    check=_check_tighten_out,
+)
 
 TR_TIGHTEN_OUT_REV = R(
     "tr_tighten_out_rev",
     Op.make("matmul", "k", Op.make("trace", "f", usize="DU")),
-    Op.make("trace",
-            Op.make("matmul",
-                    Op.make("bdiag", Op.make("eye", dim="DU"), "k"),
-                    "f"),
-            usize="DU"),
+    Op.make(
+        "trace",
+        Op.make(
+            "matmul",
+            Op.make("bdiag", Op.make("eye", dim="DU"), "k"),
+            "f",
+        ),
+        usize="DU",
+    ),
     law="Tightening, reverse: push a post-context map into the loop.",
-    check=_check_tighten_out)
+    check=_check_tighten_out,
+)
 
 
 def _check_tighten_in(bound: dict) -> bool:
     du = bound.get("$attr:DU")
     fs, js = _dim2(bound.get("f")), _dim2(bound.get("j"))
-    return (isinstance(du, int) and fs is not None and js is not None
-            and fs[1] == du + js[0])
+    return (
+        isinstance(du, int)
+        and fs is not None
+        and js is not None
+        and fs[1] == du + js[0]
+    )
 
 
 TR_TIGHTEN_IN = R(
     "tr_tighten_in",
-    Op.make("trace",
-            Op.make("matmul", "f",
-                    Op.make("bdiag", Op.make("eye", dim="DU"), "j")),
-            usize="DU"),
+    Op.make(
+        "trace",
+        Op.make(
+            "matmul",
+            "f",
+            Op.make("bdiag", Op.make("eye", dim="DU"), "j"),
+        ),
+        usize="DU",
+    ),
     Op.make("matmul", Op.make("trace", "f", usize="DU"), "j"),
     law="Tightening, input side: Tr(f·(I⊕j)) = Tr(f)·j — a map on the "
-        "input wire commutes out of the loop.",
-    check=_check_tighten_in)
+    "input wire commutes out of the loop.",
+    check=_check_tighten_in,
+)
 
 TR_TIGHTEN_IN_REV = R(
     "tr_tighten_in_rev",
     Op.make("matmul", Op.make("trace", "f", usize="DU"), "j"),
-    Op.make("trace",
-            Op.make("matmul", "f",
-                    Op.make("bdiag", Op.make("eye", dim="DU"), "j")),
-            usize="DU"),
+    Op.make(
+        "trace",
+        Op.make(
+            "matmul",
+            "f",
+            Op.make("bdiag", Op.make("eye", dim="DU"), "j"),
+        ),
+        usize="DU",
+    ),
     law="Tightening, reverse: push a pre-context map into the loop.",
-    check=_check_tighten_in)
+    check=_check_tighten_in,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -453,13 +538,12 @@ TR_TIGHTEN_IN_REV = R(
 
 TR_YANK = R(
     "tr_yank",
-    Op.make("trace",
-            Op.make("cswap", d1="D", d2="D"),
-            usize="D"),
+    Op.make("trace", Op.make("cswap", d1="D", d2="D"), usize="D"),
     Op.make("eye", dim="D"),
     law="Yanking: Tr^U(σ_{U,U}) = id_U — a pure crossover loop "
-        "collapses to the identity wire.",
-    check=lambda b: isinstance(b.get("$attr:D"), int))
+    "collapses to the identity wire.",
+    check=lambda b: isinstance(b.get("$attr:D"), int),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -473,52 +557,70 @@ TR_YANK = R(
 #  other carrier laws can see.
 # ---------------------------------------------------------------------------
 
+
 def _check_expand(bound: dict) -> bool:
     du = bound.get("$attr:DU")
     fs = _dim2(bound.get("f"))
-    return (isinstance(du, int) and du > 0 and fs is not None
-            and fs[0] > du and fs[1] > du)
+    return (
+        isinstance(du, int)
+        and du > 0
+        and fs is not None
+        and fs[0] > du
+        and fs[1] > du
+    )
 
 
 def _derive_expand(bound: dict):
     fs = _dim2(bound.get("f"))
     du = bound.get("$attr:DU")
-    if (fs is None or not isinstance(du, int) or du <= 0
-            or fs[0] <= du or fs[1] <= du):
+    if (
+        fs is None
+        or not isinstance(du, int)
+        or du <= 0
+        or fs[0] <= du
+        or fs[1] <= du
+    ):
         return None
-    return {"$attr:RS": (du, fs[0] - du),
-            "$attr:CS": (du, fs[1] - du)}
+    return {"$attr:RS": (du, fs[0] - du), "$attr:CS": (du, fs[1] - du)}
 
 
 def _blk(t: Any, sizes_attr: str, dim: int, idx: int) -> Op:
     return Op.make("split", t, sizes=sizes_attr, dim=dim, index=idx)
 
 
-_ROWS_U = _blk("f", "RS", -2, 0)          # the u' rows  [:du]
-_ROWS_Y = _blk("f", "RS", -2, 1)          # the y  rows  [du:]
-_S = _blk(_ROWS_U, "CS", -1, 0)           # u → u'
-_RM = _blk(_ROWS_U, "CS", -1, 1)          # x → u'
-_Q = _blk(_ROWS_Y, "CS", -1, 0)           # u → y
-_P = _blk(_ROWS_Y, "CS", -1, 1)           # x → y
+_ROWS_U = _blk("f", "RS", -2, 0)  # the u' rows  [:du]
+_ROWS_Y = _blk("f", "RS", -2, 1)  # the y  rows  [du:]
+_S = _blk(_ROWS_U, "CS", -1, 0)  # u → u'
+_RM = _blk(_ROWS_U, "CS", -1, 1)  # x → u'
+_Q = _blk(_ROWS_Y, "CS", -1, 0)  # u → y
+_P = _blk(_ROWS_Y, "CS", -1, 1)  # x → y
 
 _TR_EXPANDED = Op.make(
-    "add", _P,
-    Op.make("matmul", _Q,
-            Op.make("matmul",
-                    Op.make("inv",
-                            Op.make("sub",
-                                    Op.make("eye", dim="DU"), _S)),
-                    _RM)))
+    "add",
+    _P,
+    Op.make(
+        "matmul",
+        _Q,
+        Op.make(
+            "matmul",
+            Op.make(
+                "inv", Op.make("sub", Op.make("eye", dim="DU"), _S)
+            ),
+            _RM,
+        ),
+    ),
+)
 
 TR_EXPAND = R(
     "tr_expand",
     Op.make("trace", "f", usize="DU"),
     _TR_EXPANDED,
     law="Closed form of the trace: Tr(f) = P + Q·(I−S)⁻¹·R — the "
-        "resolvent lives on the feedback block.  The local bridge "
-        "from iterative to closed/parallel form.",
+    "resolvent lives on the feedback block.  The local bridge "
+    "from iterative to closed/parallel form.",
     check=_check_expand,
-    derive=_derive_expand)
+    derive=_derive_expand,
+)
 
 
 def _check_collapse(bound: dict) -> bool:
@@ -528,8 +630,12 @@ def _check_collapse(bound: dict) -> bool:
     rs, cs = bound.get("$attr:RS"), bound.get("$attr:CS")
     if not (isinstance(du, int) and du > 0):
         return False
-    if not (isinstance(rs, (list, tuple)) and len(rs) == 2
-            and isinstance(cs, (list, tuple)) and len(cs) == 2):
+    if not (
+        isinstance(rs, (list, tuple))
+        and len(rs) == 2
+        and isinstance(cs, (list, tuple))
+        and len(cs) == 2
+    ):
         return False
     return rs[0] == du and cs[0] == du
 
@@ -539,8 +645,9 @@ TR_COLLAPSE = R(
     _TR_EXPANDED,
     Op.make("trace", "f", usize="DU"),
     law="Closed → iterative: the resolvent form folds back into a "
-        "single trace node.",
-    check=_check_collapse)
+    "single trace node.",
+    check=_check_collapse,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -552,13 +659,20 @@ TR_COLLAPSE = R(
 #: ill-typed wiring is vetoed, matching the codebase's convention
 #: (cf. LINEAR_*_SCALE checks in rules.py).
 TRACE_LAWS: list[Rewrite] = [
-    TR_VANISH_UNIT, TR_VANISH_SPLIT, TR_VANISH_MERGE,
-    TR_SUPERPOSE, TR_SUPERPOSE_REV,
-    TR_SLIDE, TR_SLIDE_REV,
-    TR_TIGHTEN_OUT, TR_TIGHTEN_OUT_REV,
-    TR_TIGHTEN_IN, TR_TIGHTEN_IN_REV,
+    TR_VANISH_UNIT,
+    TR_VANISH_SPLIT,
+    TR_VANISH_MERGE,
+    TR_SUPERPOSE,
+    TR_SUPERPOSE_REV,
+    TR_SLIDE,
+    TR_SLIDE_REV,
+    TR_TIGHTEN_OUT,
+    TR_TIGHTEN_OUT_REV,
+    TR_TIGHTEN_IN,
+    TR_TIGHTEN_IN_REV,
     TR_YANK,
-    TR_EXPAND, TR_COLLAPSE,
+    TR_EXPAND,
+    TR_COLLAPSE,
 ]
 
 
@@ -568,6 +682,7 @@ TRACE_LAWS: list[Rewrite] = [
 #  All verify fp64-exact: the fixpoint is computed by solve, not
 #  iterated.
 # ---------------------------------------------------------------------------
+
 
 def _trace_torch(f: torch.Tensor, *a, **kw) -> torch.Tensor:
     """Tr(f) = P + Q·(I−S)⁻¹·R — the linear fixpoint (LFT).
@@ -585,7 +700,9 @@ def _trace_torch(f: torch.Tensor, *a, **kw) -> torch.Tensor:
     return P + Q @ torch.linalg.solve(eye - S, Rm)
 
 
-def _parl_torch(f: torch.Tensor, g: torch.Tensor, *a, **kw) -> torch.Tensor:
+def _parl_torch(
+    f: torch.Tensor, g: torch.Tensor, *a, **kw
+) -> torch.Tensor:
     """f ⊗ g re-laid to keep BOTH feedback wires first.
 
     Input  [u_f(u1); u_g(u2); x_f; x_g]
@@ -600,15 +717,15 @@ def _parl_torch(f: torch.Tensor, g: torch.Tensor, *a, **kw) -> torch.Tensor:
     du, dx, dy = u1 + u2, dxf + dxg, dyf + dyg
     out = f.new_zeros(du + dy, du + dx)
     # f's blocks on the outer (u_f, x_f) wires
-    out[:u1, :u1] = f[:u1, :u1]                      # S_f
-    out[:u1, du:du + dxf] = f[:u1, u1:]              # R_f
-    out[du:du + dyf, :u1] = f[u1:, :u1]              # Q_f
-    out[du:du + dyf, du:du + dxf] = f[u1:, u1:]      # P_f
+    out[:u1, :u1] = f[:u1, :u1]  # S_f
+    out[:u1, du : du + dxf] = f[:u1, u1:]  # R_f
+    out[du : du + dyf, :u1] = f[u1:, :u1]  # Q_f
+    out[du : du + dyf, du : du + dxf] = f[u1:, u1:]  # P_f
     # g's blocks on the inner (u_g, x_g) wires
-    out[u1:du, u1:du] = g[:u2, :u2]                  # S_g
-    out[u1:du, du + dxf:] = g[:u2, u2:]              # R_g
-    out[du + dyf:, u1:du] = g[u2:, :u2]              # Q_g
-    out[du + dyf:, du + dxf:] = g[u2:, u2:]          # P_g
+    out[u1:du, u1:du] = g[:u2, :u2]  # S_g
+    out[u1:du, du + dxf :] = g[:u2, u2:]  # R_g
+    out[du + dyf :, u1:du] = g[u2:, :u2]  # Q_g
+    out[du + dyf :, du + dxf :] = g[u2:, u2:]  # P_g
     return out
 
 
@@ -616,8 +733,7 @@ def _cswap_torch(*a, **kw) -> torch.Tensor:
     """σ_{d1,d2} : [a; b] ↦ [b; a] — a permutation matrix."""
     d1 = int(kw.get("d1", 0))
     d2 = int(kw.get("d2", 0))
-    m = torch.zeros(d1 + d2, d1 + d2,
-                    dtype=torch.get_default_dtype())
+    m = torch.zeros(d1 + d2, d1 + d2, dtype=torch.get_default_dtype())
     m[:d2, d1:] = torch.eye(d2)
     m[d2:, :d1] = torch.eye(d1)
     return m

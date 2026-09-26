@@ -92,7 +92,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import catopt.trace as _cat_trace  # noqa: F401  (torch bindings for
-                                   # trace/bdiag/parl/eye/cswap/inv)
+
+# trace/bdiag/parl/eye/cswap/inv)
 from catopt.cost import _shape_of
 from catopt.egraph import EGraph, Rewrite, _LeafRegistry
 from catopt.ir import Const, Op
@@ -103,8 +104,16 @@ __all__ = ["TraceLift", "lift_scan_to_trace"]
 
 #: Ops preferred when picking a class representative for the carrier
 #: path — the apply/applyd member over the raw tensor spine.
-_CARRIER_OPS = frozenset({
-    "apply", "applyd", "aff", "aff_diag", "aff_compose", "affd_compose"})
+_CARRIER_OPS = frozenset(
+    {
+        "apply",
+        "applyd",
+        "aff",
+        "aff_diag",
+        "aff_compose",
+        "affd_compose",
+    }
+)
 
 #: E-node ops that mark a class as a usable chain base: a leaf (the h0
 #: Param/Var/Const) or an already-lifted scan segment (whose value the
@@ -116,6 +125,7 @@ _BASE_OPS = frozenset({"leaf", "apply", "applyd"})
 #  Plans — a recognised recurrence spine, e-class ids throughout
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _Plan:
     """A recurrence recognised in the e-graph.
@@ -125,6 +135,7 @@ class _Plan:
     the (d,d) transition matrix.  ``step_states`` lists the e-class ids
     the spine decomposed through (used to drop prefix chains).
     """
+
     kind: str
     T: int
     d: int
@@ -138,12 +149,17 @@ def _term_of(eg: EGraph, eid: int) -> Any:
     return eg.any_term(eg.find(eid))
 
 
-def _consistent_shapes(eg: EGraph, kind: str, maps: list,
-                       ins: list, h0: int):
+def _consistent_shapes(
+    eg: EGraph, kind: str, maps: list, ins: list, h0: int
+):
     """All steps must share one concrete vector width — returns d."""
     hs = _shape_of(_term_of(eg, h0))
-    if not (isinstance(hs, tuple) and len(hs) == 1
-            and isinstance(hs[0], int) and hs[0] > 0):
+    if not (
+        isinstance(hs, tuple)
+        and len(hs) == 1
+        and isinstance(hs[0], int)
+        and hs[0] > 0
+    ):
         return None
     d = hs[0]
     want_map = (d,) if kind == "diag" else (d, d)
@@ -158,8 +174,13 @@ def _consistent_shapes(eg: EGraph, kind: str, maps: list,
 
 # -- carrier path: apply/applyd members (reuses scan_lower's plan) ----
 
-def _prefer_term(eg: EGraph, cid: int, prefer: frozenset,
-                 _seen: frozenset = frozenset()):
+
+def _prefer_term(
+    eg: EGraph,
+    cid: int,
+    prefer: frozenset,
+    _seen: frozenset = frozenset(),
+):
     """``any_term`` variant preferring enodes whose op is in *prefer*.
 
     Picks the apply/applyd-headed member of a class when one exists so
@@ -180,9 +201,10 @@ def _prefer_term(eg: EGraph, cid: int, prefer: frozenset,
             return 1
         return 2
 
-    for node in sorted(ec.nodes,
-                       key=lambda n: (rank(n), n.op, n.children,
-                                      repr(n.attrs))):
+    for node in sorted(
+        ec.nodes,
+        key=lambda n: (rank(n), n.op, n.children, repr(n.attrs)),
+    ):
         if node.op == "leaf":
             key = node.attrs[0][1] if node.attrs else "??"
             return _LeafRegistry.decode(key)
@@ -206,8 +228,9 @@ def _prefer_term(eg: EGraph, cid: int, prefer: frozenset,
 def _carrier_plan(eg: EGraph, cid: int):
     """Plan from an ``apply``/``applyd`` member of the class, if any."""
     ec = eg._classes.get(cid)
-    if ec is None or not any(n.op in ("apply", "applyd")
-                             for n in ec.nodes):
+    if ec is None or not any(
+        n.op in ("apply", "applyd") for n in ec.nodes
+    ):
         return None
     t = _prefer_term(eg, cid, _CARRIER_OPS)
     if t is None:
@@ -233,6 +256,7 @@ def _carrier_plan(eg: EGraph, cid: int):
 
 
 # -- raw-spine path: add(mul|matmul) chains over e-classes ------------
+
 
 class _Spine:
     """Walk ``add(mul(a_t, s), i_t)`` / ``add(matmul(A_t, s), i_t)``
@@ -262,15 +286,22 @@ class _Spine:
             return None
         kinds = {s["kind"] for s in steps}
         if len(kinds) != 1:
-            return None          # mixed dense/diagonal spine — decline
+            return None  # mixed dense/diagonal spine — decline
         kind = kinds.pop()
         maps = [s["map"] for s in steps]
         ins = [s["in"] for s in steps]
         d = _consistent_shapes(self.eg, kind, maps, ins, base)
         if d is None:
             return None
-        return _Plan(kind, len(steps), d, maps, ins, base,
-                     step_states=[s["state"] for s in steps])
+        return _Plan(
+            kind,
+            len(steps),
+            d,
+            maps,
+            ins,
+            base,
+            step_states=[s["state"] for s in steps],
+        )
 
     def _candidates(self, node) -> list:
         """Decompositions of ``add(c0, c1)`` as map·state + input.
@@ -291,14 +322,31 @@ class _Spine:
                     continue
                 if m.op == "mul":
                     f0, f1 = m.children
-                    out.append({"map": f1, "state": f0, "in": in_e,
-                                "kind": "diag"})
-                    out.append({"map": f0, "state": f1, "in": in_e,
-                                "kind": "diag"})
+                    out.append(
+                        {
+                            "map": f1,
+                            "state": f0,
+                            "in": in_e,
+                            "kind": "diag",
+                        }
+                    )
+                    out.append(
+                        {
+                            "map": f0,
+                            "state": f1,
+                            "in": in_e,
+                            "kind": "diag",
+                        }
+                    )
                 elif m.op == "matmul":
-                    out.append({"map": m.children[0],
-                                "state": m.children[1],
-                                "in": in_e, "kind": "dense"})
+                    out.append(
+                        {
+                            "map": m.children[0],
+                            "state": m.children[1],
+                            "in": in_e,
+                            "kind": "dense",
+                        }
+                    )
         return out
 
     def _walk(self, cid: int):
@@ -306,7 +354,7 @@ class _Spine:
         if cid in self._memo:
             return self._memo[cid]
         if cid in self._active:
-            return None                    # cycle cut
+            return None  # cycle cut
         ec = self.eg._classes.get(cid)
         if ec is None:
             return None
@@ -325,18 +373,22 @@ class _Spine:
                     if best is None or len(cur[0]) > len(best[0]):
                         best, tied = cur, False
                     elif len(cur[0]) == len(best[0]):
-                        sig = [(s["map"], s["in"], s["state"])
-                               for s in cur[0]]
-                        bsig = [(s["map"], s["in"], s["state"])
-                                for s in best[0]]
+                        sig = [
+                            (s["map"], s["in"], s["state"])
+                            for s in cur[0]
+                        ]
+                        bsig = [
+                            (s["map"], s["in"], s["state"])
+                            for s in best[0]
+                        ]
                         if sig != bsig:
-                            tied = True   # ambiguous: two equal-length
-                                          # decompositions — veto
+                            tied = True  # ambiguous: two equal-length
+                            # decompositions — veto
             if best is not None:
                 res = None if tied else best
             elif any(n.op in _BASE_OPS for n in ec.nodes):
-                res = ([], cid)            # chain base: h0 / carried
-            else:                          #   scan segment
+                res = ([], cid)  # chain base: h0 / carried
+            else:  #   scan segment
                 res = None
             self._memo[cid] = res
             return res
@@ -347,6 +399,7 @@ class _Spine:
 # ---------------------------------------------------------------------------
 #  Construction — the time-extended matrix as terms
 # ---------------------------------------------------------------------------
+
 
 class _Emit:
     """Builds every node twice: as an e-graph enode (eid, children are
@@ -361,8 +414,9 @@ class _Emit:
     def op(self, name: str, kids=(), attrs: dict | None = None):
         kids = list(kids)
         attrs = dict(attrs or {})
-        eid = self.eg.add_enode(name, tuple(k[0] for k in kids), attrs,
-                                provenance=self.prov)
+        eid = self.eg.add_enode(
+            name, tuple(k[0] for k in kids), attrs, provenance=self.prov
+        )
         return (eid, Op.make(name, *(k[1] for k in kids), **attrs))
 
     def ref(self, eid: int):
@@ -386,7 +440,7 @@ def _assemble_F(em: _Emit, maps: list, d: int):
     T = len(maps)
     eye = em.op("eye", (), {"dim": d})
     zero = em.leaf(Const(0.0))
-    Z = em.op("mul", (eye, zero))            # shared (d,d) zero block
+    Z = em.op("mul", (eye, zero))  # shared (d,d) zero block
     rows = []
     for i in range(T):
         # u'_i = h_{i+1} = M_{i+1}·u_{i-1} + b_{i+1} (+ M_1·h0 for i=0)
@@ -395,9 +449,11 @@ def _assemble_F(em: _Emit, maps: list, d: int):
         r_cols.append(maps[0] if i == 0 else Z)
         rows.append(em.op("concat", s_cols + r_cols, {"dim": -1}))
     # y = h_T: Q selects the last u block; P = 0.
-    rows.append(em.op("concat",
-                      [Z] * (T - 1) + [eye] + [Z] * (T + 1),
-                      {"dim": -1}))
+    rows.append(
+        em.op(
+            "concat", [Z] * (T - 1) + [eye] + [Z] * (T + 1), {"dim": -1}
+        )
+    )
     return em.op("concat", rows, {"dim": -2})
 
 
@@ -437,9 +493,12 @@ def _partitions(plan: _Plan, channel_splits) -> list:
         return []
     out = []
     for part in channel_splits:
-        if (isinstance(part, (tuple, list)) and len(part) == 2
-                and all(isinstance(x, int) and x > 0 for x in part)
-                and part[0] + part[1] == d):
+        if (
+            isinstance(part, (tuple, list))
+            and len(part) == 2
+            and all(isinstance(x, int) and x > 0 for x in part)
+            and part[0] + part[1] == d
+        ):
             out.append(tuple(part))
     return out
 
@@ -447,6 +506,7 @@ def _partitions(plan: _Plan, channel_splits) -> list:
 # ---------------------------------------------------------------------------
 #  The pass
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TraceLift:
@@ -457,6 +517,7 @@ class TraceLift:
     unioned into ``root_eid`` — the recurrence's class.  ``split`` is
     the channel partition for the ``parl`` form, else ``None``.
     """
+
     root_eid: int
     out_eid: int
     trace_eid: int
@@ -469,8 +530,13 @@ class TraceLift:
     split: tuple | None = None
 
 
-def _lift_witness(eg: EGraph, cid: int, offered: Any, offered_eid: int,
-                  provenance: str) -> Rewrite | None:
+def _lift_witness(
+    eg: EGraph,
+    cid: int,
+    offered: Any,
+    offered_eid: int,
+    provenance: str,
+) -> Rewrite | None:
     """Synthesise the pointwise :class:`Rewrite` certifying one offer.
 
     ``lhs`` is the *oldest* member of the recurrence class — the term
@@ -496,14 +562,23 @@ def _lift_witness(eg: EGraph, cid: int, offered: Any, offered_eid: int,
         name=f"{provenance}#{offered_eid}",
         lhs=src,
         rhs=offered,
-        law=("pointwise witness for a non-local offer: this unrolled "
-             "recurrence equals its nilpotent block-shift trace "
-             "fixpoint (equality established by construction in "
-             "lift_scan_to_trace)"))
+        law=(
+            "pointwise witness for a non-local offer: this unrolled "
+            "recurrence equals its nilpotent block-shift trace "
+            "fixpoint (equality established by construction in "
+            "lift_scan_to_trace)"
+        ),
+    )
 
 
-def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
-           provenance: str, witness: bool) -> list:
+def _offer(
+    eg: EGraph,
+    cid: int,
+    plan: _Plan,
+    channel_splits,
+    provenance: str,
+    witness: bool,
+) -> list:
     em = _Emit(eg, provenance)
     lifts: list[TraceLift] = []
     d, T = plan.d, plan.T
@@ -515,16 +590,32 @@ def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
     if not em.broken:
         F = _channel_F(em, plan.kind, maps, d)
         tr, vec, out = _emit_head(em, F, ins, h0, d, T * d)
-        eg.union(cid, out[0],
-                 witness=(_lift_witness(eg, cid, out[1], out[0],
-                                        provenance)
-                          if witness else None),
-                 note=(f"trace_lift: unrolled {plan.kind} recurrence "
-                      f"(T={T}, d={d}) → nilpotent block-shift fixpoint"))
-        lifts.append(TraceLift(
-            root_eid=cid, out_eid=out[0], trace_eid=tr[0],
-            f_eid=F[0], vec_eid=vec[0], term=out[1],
-            kind=plan.kind, T=T, d=d))
+        eg.union(
+            cid,
+            out[0],
+            witness=(
+                _lift_witness(eg, cid, out[1], out[0], provenance)
+                if witness
+                else None
+            ),
+            note=(
+                f"trace_lift: unrolled {plan.kind} recurrence "
+                f"(T={T}, d={d}) → nilpotent block-shift fixpoint"
+            ),
+        )
+        lifts.append(
+            TraceLift(
+                root_eid=cid,
+                out_eid=out[0],
+                trace_eid=tr[0],
+                f_eid=F[0],
+                vec_eid=vec[0],
+                term=out[1],
+                kind=plan.kind,
+                T=T,
+                d=d,
+            )
+        )
 
     # -- channel-split form (diagonal carriers only) -------------------
     for part in _partitions(plan, channel_splits):
@@ -546,24 +637,46 @@ def _offer(eg: EGraph, cid: int, plan: _Plan, channel_splits,
         trp = em.op("trace", (Fp,), {"usize": (u1, u2)})
         mvp = em.op("matmul", (trp, vec2))
         outp = em.op("reshape", (mvp,), {"shape": (d,)})
-        eg.union(cid, outp[0],
-                 witness=(_lift_witness(eg, cid, outp[1], outp[0],
-                                        provenance)
-                          if witness else None),
-                 note=(f"trace_lift: channel-split {part} of a T={T} "
-                      f"diagonal recurrence → joint trace over parl"))
-        lifts.append(TraceLift(
-            root_eid=cid, out_eid=outp[0], trace_eid=trp[0],
-            f_eid=Fp[0], vec_eid=vecp[0], term=outp[1],
-            kind=plan.kind, T=T, d=d, split=tuple(part)))
+        eg.union(
+            cid,
+            outp[0],
+            witness=(
+                _lift_witness(eg, cid, outp[1], outp[0], provenance)
+                if witness
+                else None
+            ),
+            note=(
+                f"trace_lift: channel-split {part} of a T={T} "
+                f"diagonal recurrence → joint trace over parl"
+            ),
+        )
+        lifts.append(
+            TraceLift(
+                root_eid=cid,
+                out_eid=outp[0],
+                trace_eid=trp[0],
+                f_eid=Fp[0],
+                vec_eid=vecp[0],
+                term=outp[1],
+                kind=plan.kind,
+                T=T,
+                d=d,
+                split=tuple(part),
+            )
+        )
     return lifts
 
 
-def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
-                       min_steps: int = 2, channel_splits="auto",
-                       maximal_only: bool = True,
-                       provenance: str = "trace_lift",
-                       witness: bool = True) -> list:
+def lift_scan_to_trace(
+    eg: EGraph,
+    root_eid: int | None = None,
+    *,
+    min_steps: int = 2,
+    channel_splits="auto",
+    maximal_only: bool = True,
+    provenance: str = "trace_lift",
+    witness: bool = True,
+) -> list:
     """Offer ``trace`` members for every unrolled recurrence in *eg*.
 
     For each e-class carrying a recognisable recurrence spine — an
@@ -605,7 +718,7 @@ def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
         plan = _carrier_plan(eg, c)
         if plan is None:
             plan = spine.plan(c)
-        if plan is not None and plan.T >= min_steps:
+        if plan is not None and min_steps <= plan.T:
             plans[c] = plan
 
     interior: set[int] = set()
@@ -638,8 +751,9 @@ def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
                     continue
                 if eg.find(p.h0) != qh0:
                     continue
-                if ([eg.find(m) for m in p.maps[:q.T]] == qmaps
-                        and [eg.find(i) for i in p.ins[:q.T]] == qins):
+                if [eg.find(m) for m in p.maps[: q.T]] == qmaps and [
+                    eg.find(i) for i in p.ins[: q.T]
+                ] == qins:
                     interior.add(qc)
                     break
 
@@ -647,6 +761,7 @@ def lift_scan_to_trace(eg: EGraph, root_eid: int | None = None, *,
     for c, p in plans.items():
         if c in interior:
             continue
-        lifts.extend(_offer(eg, c, p, channel_splits, provenance,
-                            witness))
+        lifts.extend(
+            _offer(eg, c, p, channel_splits, provenance, witness)
+        )
     return lifts

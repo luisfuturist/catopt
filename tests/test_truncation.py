@@ -13,15 +13,15 @@ import tracemalloc
 
 import pytest
 
+from catopt import rules as R
+from catopt.cost import count_cost
 from catopt.egraph import (
     Certificate,
     CertificateVerificationError,
     EGraph,
     verify_certificate,
 )
-from catopt.ir import Op, Var, Const, Param, TensorType, op_repr
-from catopt import rules as R
-from catopt.cost import count_cost
+from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
 
 
 def _t(d=4):
@@ -33,8 +33,11 @@ def _recurrence(T, d=4):
     A = Param("A", TensorType((d, d)))
     h = Var("h0", TensorType((d,)))
     for t in range(T):
-        h = Op.make("add", Op.make("matmul", A, h),
-                    Var(f"x{t}", TensorType((d,))))
+        h = Op.make(
+            "add",
+            Op.make("matmul", A, h),
+            Var(f"x{t}", TensorType((d,))),
+        )
     return h
 
 
@@ -44,14 +47,16 @@ def _verify_path(eg, src, dst, path):
     for s in path:
         if s.rule in eg._rule_objs:
             rules[s.rule] = eg._rule_objs[s.rule]
-    cert = Certificate(src=src, dst=dst, root_eid=None,
-                       steps=list(path), rules=rules)
+    cert = Certificate(
+        src=src, dst=dst, root_eid=None, steps=list(path), rules=rules
+    )
     return verify_certificate(src, cert)
 
 
 # ---------------------------------------------------------------------------
 #  (a) level 1 — pure quotient: no proof witnesses are stored
 # ---------------------------------------------------------------------------
+
 
 def test_truncation_level_selection():
     """The dial maps 1/2/3; explicit track_proofs overrides it."""
@@ -144,8 +149,9 @@ def test_level1_uses_less_memory():
         try:
             eg = EGraph(truncation_level=level)
             root = eg.add_term(src)
-            stats = eg.run(R.SCAN_LAWS, root, max_iterations=12,
-                           max_nodes=300_000)
+            stats = eg.run(
+                R.SCAN_LAWS, root, max_iterations=12, max_nodes=300_000
+            )
             _cur, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
@@ -162,15 +168,18 @@ def test_level1_uses_less_memory():
     assert eg1.n_proof_edges == 0
     assert eg2.n_proof_edges > 0
     assert mem1 < mem2
-    print(f"\n  level1 peak={mem1/1024:.0f}KiB "
-          f"level2 peak={mem2/1024:.0f}KiB "
-          f"(Δ={(mem2-mem1)/1024:.0f}KiB, "
-          f"{eg2.n_proof_edges} ProofEdges)")
+    print(
+        f"\n  level1 peak={mem1 / 1024:.0f}KiB "
+        f"level2 peak={mem2 / 1024:.0f}KiB "
+        f"(Δ={(mem2 - mem1) / 1024:.0f}KiB, "
+        f"{eg2.n_proof_edges} ProofEdges)"
+    )
 
 
 # ---------------------------------------------------------------------------
 #  (b) level 2 — unchanged witness behaviour
 # ---------------------------------------------------------------------------
+
 
 def test_level2_certificates_still_verify():
     x, y = Var("x", _t()), Var("y", _t())
@@ -203,6 +212,7 @@ def test_level2_matches_legacy_track_proofs():
 #  (c) level 3 — coherent_paths surfaces alternate derivations
 # ---------------------------------------------------------------------------
 
+
 def _comm_graph(level=3):
     """add(x, add(y,z)) saturated under comm+assoc: many members, and —
     crucially — many *orders* of rule application between them."""
@@ -224,11 +234,12 @@ def test_coherent_paths_finds_alternate_derivations():
     result = eg.coherent_paths(src, dst)
     assert result["same_eclass"]
     assert result["n_paths"] >= 2, (
-        f"expected >= 2 derivations, got {result['n_paths']}")
+        f"expected >= 2 derivations, got {result['n_paths']}"
+    )
 
     first_moves = {p[0].path for p in result["paths"]}
-    assert () in first_moves      # commute the root first
-    assert (1,) in first_moves    # commute the inner add first
+    assert () in first_moves  # commute the root first
+    assert (1,) in first_moves  # commute the inner add first
 
     # every enumerated derivation is a real proof: replays standalone
     for path in result["paths"]:
@@ -277,6 +288,7 @@ def test_all_proofs_identity_and_level2():
 #  (d) overhead curve — reported, not asserted
 # ---------------------------------------------------------------------------
 
+
 def test_overhead_curve_report():
     """Time + memory (enodes / ProofEdges / applications) per level on a
     T=6 scan saturation.  Numbers are reported; only behavioural
@@ -289,8 +301,9 @@ def test_overhead_curve_report():
             eg = EGraph(truncation_level=level)
             root = eg.add_term(src)
             t0 = time.perf_counter()
-            stats = eg.run(R.SCAN_LAWS, root, max_iterations=12,
-                           max_nodes=300_000)
+            stats = eg.run(
+                R.SCAN_LAWS, root, max_iterations=12, max_nodes=300_000
+            )
             dt = time.perf_counter() - t0
             _cur, peak = tracemalloc.get_traced_memory()
         finally:
@@ -300,21 +313,31 @@ def test_overhead_curve_report():
     print("\n  truncation overhead (T=6 scan, SCAN_LAWS):")
     base_t, base_m = rows[0][1], rows[0][2]
     for level, dt, peak, stats, eg in rows:
-        print(f"    level {level}: {dt*1000:7.1f} ms  "
-              f"peak {peak/1024:8.0f} KiB  "
-              f"enodes={stats['n_enodes']:5d}  "
-              f"classes={stats['n_classes']:4d}  "
-              f"proof_edges={stats['n_proof_edges']:4d}  "
-              f"apps={len(eg.applications):4d}  "
-              f"(×{dt/base_t:.2f} time, ×{peak/base_m:.2f} mem)")
+        print(
+            f"    level {level}: {dt * 1000:7.1f} ms  "
+            f"peak {peak / 1024:8.0f} KiB  "
+            f"enodes={stats['n_enodes']:5d}  "
+            f"classes={stats['n_classes']:4d}  "
+            f"proof_edges={stats['n_proof_edges']:4d}  "
+            f"apps={len(eg.applications):4d}  "
+            f"(×{dt / base_t:.2f} time, ×{peak / base_m:.2f} mem)"
+        )
 
     # the dial changes bookkeeping, never the quotient
-    assert rows[0][3]["n_enodes"] == rows[1][3]["n_enodes"] \
+    assert (
+        rows[0][3]["n_enodes"]
+        == rows[1][3]["n_enodes"]
         == rows[2][3]["n_enodes"]
-    assert rows[0][3]["n_classes"] == rows[1][3]["n_classes"] \
+    )
+    assert (
+        rows[0][3]["n_classes"]
+        == rows[1][3]["n_classes"]
         == rows[2][3]["n_classes"]
+    )
     assert rows[0][3]["n_proof_edges"] == 0
-    assert rows[1][3]["n_proof_edges"] == rows[2][3]["n_proof_edges"] > 0
+    assert (
+        rows[1][3]["n_proof_edges"] == rows[2][3]["n_proof_edges"] > 0
+    )
 
     # level 3 stores nothing extra — coherence is computed on demand.
     # dst: the source with its innermost step lifted once — a neighbour
@@ -323,15 +346,22 @@ def test_overhead_curve_report():
     eg3 = rows[2][4]
     A = Param("A", TensorType((4, 4)))
     h0 = Var("h0", TensorType((4,)))
-    dst = Op.make("apply", Op.make("aff", A, Var("x0", TensorType((4,)))),
-                  h0)
+    dst = Op.make(
+        "apply", Op.make("aff", A, Var("x0", TensorType((4,)))), h0
+    )
     for t in range(1, 6):
-        dst = Op.make("add", Op.make("matmul", A, dst),
-                      Var(f"x{t}", TensorType((4,))))
-    res = eg3.coherent_paths(src, dst, max_paths=8, max_steps=6,
-                             fuel=20000)
-    print(f"    level 3 coherent_paths(src, lifted): "
-          f"n_paths={res['n_paths']} same_eclass={res['same_eclass']} "
-          f"lens={[len(p) for p in res['paths']]}")
-    assert res["n_paths"] >= 2          # alternate derivations surface
+        dst = Op.make(
+            "add",
+            Op.make("matmul", A, dst),
+            Var(f"x{t}", TensorType((4,))),
+        )
+    res = eg3.coherent_paths(
+        src, dst, max_paths=8, max_steps=6, fuel=20000
+    )
+    print(
+        f"    level 3 coherent_paths(src, lifted): "
+        f"n_paths={res['n_paths']} same_eclass={res['same_eclass']} "
+        f"lens={[len(p) for p in res['paths']]}"
+    )
+    assert res["n_paths"] >= 2  # alternate derivations surface
     assert res["same_eclass"]

@@ -17,6 +17,7 @@ measured, per archetype, under the storage cost axis
 Usage:  python3 /tmp/exact_probe.py            (prints a markdown table)
         python3 -m pytest tests/test_exact_corner.py   (pinned results)
 """
+
 from __future__ import annotations
 
 import os
@@ -63,7 +64,14 @@ class DenseBlock(nn.Module):
         # a trained dense model legitimately carries.
         self.scale = nn.Parameter(_randn((d,), g))
         with torch.no_grad():
-            for lin in (self.wq, self.wk, self.wv, self.wo, self.w1, self.w2):
+            for lin in (
+                self.wq,
+                self.wk,
+                self.wv,
+                self.wo,
+                self.w1,
+                self.w2,
+            ):
                 lin.weight.copy_(_randn(lin.weight.shape, g))
 
     def forward(self, x):
@@ -83,7 +91,8 @@ class DenseLM(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab, d)
         self.blocks = nn.ModuleList(
-            [DenseBlock(d=d, seed=i + 1) for i in range(n_layers)])
+            [DenseBlock(d=d, seed=i + 1) for i in range(n_layers)]
+        )
         self.head = nn.Linear(d, vocab, bias=False)  # untied
 
     def forward(self, idx):
@@ -112,15 +121,19 @@ class GQAProj(nn.Module):
             for lin in (self.wq, self.wo):
                 lin.weight.copy_(_randn(lin.weight.shape, g))
             for lin in (self.wk, self.wv):
-                uniq = [_randn((self.HD, self.DIM), g)
-                        for _ in range(max(kv_map) + 1)]
-                lin.weight.copy_(torch.cat([uniq[i] for i in kv_map], dim=0))
+                uniq = [
+                    _randn((self.HD, self.DIM), g)
+                    for _ in range(max(kv_map) + 1)
+                ]
+                lin.weight.copy_(
+                    torch.cat([uniq[i] for i in kv_map], dim=0)
+                )
 
     def forward(self, x):
         # distinct input slices isolate the slice pass from qkv pairing
-        q = self.wq(x[..., :self.DIM])
-        k = self.wk(x[..., self.DIM:2 * self.DIM])
-        v = self.wv(x[..., 2 * self.DIM:3 * self.DIM])
+        q = self.wq(x[..., : self.DIM])
+        k = self.wk(x[..., self.DIM : 2 * self.DIM])
+        v = self.wv(x[..., 2 * self.DIM : 3 * self.DIM])
         return self.wo(q + k + v)
 
 
@@ -186,15 +199,20 @@ class MoERouted(nn.Module):
         w2 = _randn((d, hidden), g)
         self.experts = nn.ModuleList()
         for _ in range(n):
-            e = nn.Sequential(nn.Linear(d, hidden, bias=False), nn.GELU(),
-                            nn.Linear(hidden, d, bias=False))
+            e = nn.Sequential(
+                nn.Linear(d, hidden, bias=False),
+                nn.GELU(),
+                nn.Linear(hidden, d, bias=False),
+            )
             with torch.no_grad():
                 e[0].weight.copy_(w1)
                 e[2].weight.copy_(w2)
             self.experts.append(e)
 
-    def forward(self, x):           # x: (n_experts, T, d)
-        return torch.stack([e(x[i]) for i, e in enumerate(self.experts)])
+    def forward(self, x):  # x: (n_experts, T, d)
+        return torch.stack(
+            [e(x[i]) for i, e in enumerate(self.experts)]
+        )
 
 
 class MoEShared(nn.Module):
@@ -209,17 +227,23 @@ class MoEShared(nn.Module):
         w2 = _randn((d, hidden), g)
         self.experts = nn.ModuleList()
         for _ in range(n):
-            e = nn.Sequential(nn.Linear(d, hidden, bias=False), nn.GELU(),
-                            nn.Linear(hidden, d, bias=False))
+            e = nn.Sequential(
+                nn.Linear(d, hidden, bias=False),
+                nn.GELU(),
+                nn.Linear(hidden, d, bias=False),
+            )
             with torch.no_grad():
                 e[0].weight.copy_(w1)
                 e[2].weight.copy_(w2)
             self.experts.append(e)
-        self.gate = nn.Parameter(torch.full((n,), 1.0 / n,
-                                            dtype=torch.float64))
+        self.gate = nn.Parameter(
+            torch.full((n,), 1.0 / n, dtype=torch.float64)
+        )
 
     def forward(self, x):
-        return sum(self.gate[i] * e(x) for i, e in enumerate(self.experts))
+        return sum(
+            self.gate[i] * e(x) for i, e in enumerate(self.experts)
+        )
 
 
 class ComposedChain(nn.Module):
@@ -247,8 +271,9 @@ class DeadParam(nn.Module):
     def __init__(self, d=64, unused=4096):
         super().__init__()
         self.lin = nn.Linear(d, d, bias=False)
-        self.unused = nn.Parameter(_randn(
-            (unused, d), torch.Generator().manual_seed(0)))
+        self.unused = nn.Parameter(
+            _randn((unused, d), torch.Generator().manual_seed(0))
+        )
 
     def forward(self, x):
         return self.lin(x)
@@ -257,6 +282,7 @@ class DeadParam(nn.Module):
 # ----------------------------------------------------------------------
 #  Measurement driver
 # ----------------------------------------------------------------------
+
 
 def _mechanism(report, stats):
     """Attribute the byte change to the pass that produced it."""
@@ -274,8 +300,15 @@ def _mechanism(report, stats):
     return "; ".join(mech) if mech else "paired-GEMM realisation"
 
 
-def probe(model, example, name, *, max_iterations=12,
-          max_enodes=150_000, quiet=True):
+def probe(
+    model,
+    example,
+    name,
+    *,
+    max_iterations=12,
+    max_enodes=150_000,
+    quiet=True,
+):
     """optimize_model under the storage cost axis; verify fp64 equality;
     return the param_report row."""
     model = model.eval().double()
@@ -283,9 +316,13 @@ def probe(model, example, name, *, max_iterations=12,
         example = example.double()
     t0 = time.time()
     low, stats = optimize_model(
-        model, example, cost_fn=param_bytes_cost_for(),
-        max_iterations=max_iterations, max_enodes=max_enodes,
-        verbose=False)
+        model,
+        example,
+        cost_fn=param_bytes_cost_for(),
+        max_iterations=max_iterations,
+        max_enodes=max_enodes,
+        verbose=False,
+    )
     dt = time.time() - t0
     with torch.no_grad():
         ref = model(example.clone())
@@ -293,14 +330,21 @@ def probe(model, example, name, *, max_iterations=12,
     abs_diff = (out - ref).abs().max().item()
     rel_diff = abs_diff / (ref.abs().max().item() + 1e-8)
     r = param_report(model, low)
-    r.update(name=name, abs_diff=abs_diff, rel_diff=rel_diff,
-             mechanism=_mechanism(r, stats), seconds=dt,
-             stats=stats)
+    r.update(
+        name=name,
+        abs_diff=abs_diff,
+        rel_diff=rel_diff,
+        mechanism=_mechanism(r, stats),
+        seconds=dt,
+        stats=stats,
+    )
     if not quiet:
-        print(f"[{name}] {r['original_bytes']} -> {r['optimized_bytes']} B "
-              f"(-{r['bytes_saved']} B, "
-              f"{100 * r['bytes_saved'] / r['original_bytes']:.2f}%) "
-              f"max|d|={abs_diff:.2e} rel={rel_diff:.2e} ({dt:.1f}s)")
+        print(
+            f"[{name}] {r['original_bytes']} -> {r['optimized_bytes']} B "
+            f"(-{r['bytes_saved']} B, "
+            f"{100 * r['bytes_saved'] / r['original_bytes']:.2f}%) "
+            f"max|d|={abs_diff:.2e} rel={rel_diff:.2e} ({dt:.1f}s)"
+        )
         print(f"    mechanism: {r['mechanism']}")
         print(f"    eliminated: {r['eliminated']}")
         print(f"    derived:    {r['derived']}")
@@ -315,11 +359,14 @@ def probe_stories15m():
     if not os.path.exists(CKPT):
         return None
     import numpy as np
-    from measure_weights import load_llama2c
+
     from catopt.egraph import EGraph
     from catopt.ir import Param, TensorType
-    from catopt.rules import (share_duplicate_params,
-                              share_duplicate_param_slices)
+    from catopt.rules import (
+        share_duplicate_param_slices,
+        share_duplicate_params,
+    )
+    from measure_weights import load_llama2c
 
     w = load_llama2c(CKPT)
     src = {}
@@ -327,7 +374,8 @@ def probe_stories15m():
         if t.ndim == 3:
             for i in range(t.shape[0]):
                 src[f"{name}_{i}"] = torch.from_numpy(
-                    np.array(t[i])).clone()
+                    np.array(t[i])
+                ).clone()
         elif name != "_tail":
             src[name] = torch.from_numpy(np.array(t)).clone()
     total = sum(t.numel() * t.element_size() for t in src.values())
@@ -336,87 +384,156 @@ def probe_stories15m():
         eg.add_term(Param(n, TensorType(tuple(t.shape))))
     g_whole = share_duplicate_params(eg, src)
     g_slice = share_duplicate_param_slices(eg, src)
-    return {"name": "stories15M.bin (real, dense)",
-            "tensors": len(src), "total_bytes": total,
-            "whole_groups": g_whole, "slice_offers": g_slice,
-            "bytes_saved": 0, "pct": 0.0}
+    return {
+        "name": "stories15M.bin (real, dense)",
+        "tensors": len(src),
+        "total_bytes": total,
+        "whole_groups": g_whole,
+        "slice_offers": g_slice,
+        "bytes_saved": 0,
+        "pct": 0.0,
+    }
 
 
 # ----------------------------------------------------------------------
 #  Main — build every archetype, measure, print the REPORT-ready table.
 # ----------------------------------------------------------------------
 
+
 def run_all(quiet=False):
     rows = []
 
     real = probe_stories15m()
-    rows.append(real if real else
-                {"name": "stories15M.bin", "skipped": True})
+    rows.append(
+        real if real else {"name": "stories15M.bin", "skipped": True}
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(DenseLM(n_layers=2), torch.randint(0, 128, (2, 8)),
-                      "dense transformer (synth, 2L)", quiet=quiet))
+    rows.append(
+        probe(
+            DenseLM(n_layers=2),
+            torch.randint(0, 128, (2, 8)),
+            "dense transformer (synth, 2L)",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(GQAProj(kv_map=[0, 0, 0, 0, 1, 1, 1, 1]),
-                      torch.randn(4, 3 * GQAProj.DIM),
-                      "GQA 8q/2kv (repeat_kv materialised)", quiet=quiet))
+    rows.append(
+        probe(
+            GQAProj(kv_map=[0, 0, 0, 0, 1, 1, 1, 1]),
+            torch.randn(4, 3 * GQAProj.DIM),
+            "GQA 8q/2kv (repeat_kv materialised)",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(AdapterMerged(), torch.randn(4, 128),
-                      "adapter-merged (W + B·A stored)", quiet=quiet))
+    rows.append(
+        probe(
+            AdapterMerged(),
+            torch.randn(4, 128),
+            "adapter-merged (W + B·A stored)",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(AdapterUnmerged(), torch.randn(4, 128),
-                      "adapter UNmerged (honest limit)", quiet=quiet))
+    rows.append(
+        probe(
+            AdapterUnmerged(),
+            torch.randn(4, 128),
+            "adapter UNmerged (honest limit)",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(ComposedChain(), torch.randn(4, 128),
-                      "composed linears w2(w1 x), no act", quiet=quiet))
+    rows.append(
+        probe(
+            ComposedChain(),
+            torch.randn(4, 128),
+            "composed linears w2(w1 x), no act",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(TiedTwice(), torch.randint(0, 512, (8,)),
-                      "tied embed/cls stored twice", quiet=quiet))
+    rows.append(
+        probe(
+            TiedTwice(),
+            torch.randint(0, 512, (8,)),
+            "tied embed/cls stored twice",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(MoERouted(), torch.randn(4, 4, 64),
-                      "MoE: 4 weight-tied experts (routed)", quiet=quiet))
+    rows.append(
+        probe(
+            MoERouted(),
+            torch.randn(4, 4, 64),
+            "MoE: 4 weight-tied experts (routed)",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(MoEShared(), torch.randn(4, 64),
-                      "MoE: 4 weight-tied experts (shared input)",
-                      quiet=quiet))
+    rows.append(
+        probe(
+            MoEShared(),
+            torch.randn(4, 64),
+            "MoE: 4 weight-tied experts (shared input)",
+            quiet=quiet,
+        )
+    )
 
     torch.manual_seed(0)
-    rows.append(probe(DeadParam(), torch.randn(4, 64),
-                      "dead param (unused 4096×64)", quiet=quiet))
+    rows.append(
+        probe(
+            DeadParam(),
+            torch.randn(4, 64),
+            "dead param (unused 4096×64)",
+            quiet=quiet,
+        )
+    )
     return rows
 
 
 def fmt_table(rows):
-    out = ["| archetype | orig params (B) | optimized (B) | saved | % | "
-           "max|Δout| (fp64) | mechanism |",
-           "|---|---:|---:|---:|---:|---:|---|"]
+    out = [
+        "| archetype | orig params (B) | optimized (B) | saved | % | "
+        "max|Δout| (fp64) | mechanism |",
+        "|---|---:|---:|---:|---:|---:|---|",
+    ]
     for r in rows:
         if r.get("skipped"):
-            out.append(f"| {r['name']} | – | – | – | – | – | "
-                       "checkpoint not present |")
+            out.append(
+                f"| {r['name']} | – | – | – | – | – | "
+                "checkpoint not present |"
+            )
             continue
-        if "total_bytes" in r:                      # stories15M direct
-            out.append(f"| {r['name']} | {r['total_bytes']:,} | "
-                       f"{r['total_bytes']:,} | 0 B | 0.00% | – | "
-                       "no duplicate tensors / head-slices "
-                       f"({r['tensors']} tensors probed) |")
+        if "total_bytes" in r:  # stories15M direct
+            out.append(
+                f"| {r['name']} | {r['total_bytes']:,} | "
+                f"{r['total_bytes']:,} | 0 B | 0.00% | – | "
+                "no duplicate tensors / head-slices "
+                f"({r['tensors']} tensors probed) |"
+            )
             continue
         pct = 100 * r["bytes_saved"] / max(r["original_bytes"], 1)
-        out.append(f"| {r['name']} | {r['original_bytes']:,} | "
-                   f"{r['optimized_bytes']:,} | {r['bytes_saved']:,} B | "
-                   f"{pct:.2f}% | {r['abs_diff']:.1e} | {r['mechanism']} |")
+        out.append(
+            f"| {r['name']} | {r['original_bytes']:,} | "
+            f"{r['optimized_bytes']:,} | {r['bytes_saved']:,} B | "
+            f"{pct:.2f}% | {r['abs_diff']:.1e} | {r['mechanism']} |"
+        )
     return "\n".join(out)
 
 
 def main():
-    print("# exact_probe: the exact-structure corner across archetypes\n")
+    print(
+        "# exact_probe: the exact-structure corner across archetypes\n"
+    )
     rows = run_all(quiet=False)
     print("\n## REPORT-ready table (param bytes, fp64 models)\n")
     print(fmt_table(rows))

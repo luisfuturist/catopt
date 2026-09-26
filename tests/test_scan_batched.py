@@ -13,10 +13,10 @@ import math
 import pytest
 import torch
 
+from catopt import rules as R
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, op_repr
 from catopt.models import LinearRecurrence, SwiGLU
-from catopt import rules as R
 from catopt.scan_lower import (
     BatchedScanModule,
     build_scan_plan,
@@ -32,7 +32,9 @@ def _opdepth(t, memo):
         return 0
     k = id(t)
     if k not in memo:
-        memo[k] = 1 + max((_opdepth(a, memo) for a in t.args), default=0)
+        memo[k] = 1 + max(
+            (_opdepth(a, memo) for a in t.args), default=0
+        )
     return memo[k]
 
 
@@ -46,8 +48,12 @@ def _scan_term(model_dim, steps, dtype=torch.float64, seed=0):
     root = eg.add_term(ir.root)
     eg.run(R.SCAN_LAWS, root, max_iterations=14, max_nodes=300_000)
     best = eg.extract_min_depth(root)
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     return m, x, opt_ir, source
 
 
@@ -63,8 +69,9 @@ def _balanced_scan_ir(model, x_var, ir, steps):
     p_h0 = ir.params["p_h0"]
 
     def leaf(t):
-        return Op.make("aff", p_a,
-                       Op.make("select", x_var, arg1=0, arg2=t))
+        return Op.make(
+            "aff", p_a, Op.make("select", x_var, arg1=0, arg2=t)
+        )
 
     def tree(lo, hi):
         if hi - lo == 1:
@@ -74,13 +81,18 @@ def _balanced_scan_ir(model, x_var, ir, steps):
         return Op.make("aff_compose", tree(mid, hi), tree(lo, mid))
 
     root = Op.make("apply", tree(0, steps), p_h0)
-    return IR(root=root, inputs=ir.inputs,
-              input_names=ir.input_names, params=ir.params)
+    return IR(
+        root=root,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Numerical equivalence vs the sequential recurrence
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("steps", [16, 32])
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
@@ -117,7 +129,9 @@ def test_batched_scan_matches_serial_lowering():
     scan_ir = _balanced_scan_ir(m, ir.inputs[0], ir, steps)
 
     serial = ir_to_torch_module(scan_ir, param_values=source).eval()
-    batched = to_batched_scan_module(scan_ir, param_values=source).eval()
+    batched = to_batched_scan_module(
+        scan_ir, param_values=source
+    ).eval()
     assert batched.is_batched
     with torch.no_grad():
         diff = (serial(x) - batched(x)).abs().max().item()
@@ -127,6 +141,7 @@ def test_batched_scan_matches_serial_lowering():
 # ---------------------------------------------------------------------------
 #  Detection on the real extracted term (EGraph + SCAN_LAWS + depth cost)
 # ---------------------------------------------------------------------------
+
 
 def test_detects_extracted_scan_term():
     """The module recognises the term SCAN_LAWS + depth extraction emit.
@@ -167,6 +182,7 @@ def test_extracted_scan_term_t32_equivalent():
 #  Plan structure / API surface
 # ---------------------------------------------------------------------------
 
+
 def test_plan_levels_are_independent():
     """build_scan_plan groups composes by depth; leaves = aff nodes."""
     torch.manual_seed(0)
@@ -195,6 +211,7 @@ def test_plan_rejects_non_scan_root():
 # ---------------------------------------------------------------------------
 #  CUDA graph replay (optional fast path)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_cuda
 def test_cuda_graph_replay_matches_eager():
@@ -232,6 +249,7 @@ def test_cuda_graph_replay_matches_eager():
 #  Fallback: non-scan IR keeps working
 # ---------------------------------------------------------------------------
 
+
 def test_fallback_matches_plain_lowering():
     """Non-scan IR: BatchedScanModule delegates to serial evaluation."""
     torch.manual_seed(0)
@@ -243,7 +261,8 @@ def test_fallback_matches_plain_lowering():
     assert isinstance(mod, BatchedScanModule)
     assert not mod.is_batched
     ref = ir_to_torch_module(ir, param_values=source)
-    mod.eval(); ref.eval()
+    mod.eval()
+    ref.eval()
     with torch.no_grad():
         assert torch.equal(mod(x.clone()), ref(x.clone()))
         assert (m(x.clone()) - mod(x.clone())).abs().max().item() < 1e-6
@@ -266,8 +285,12 @@ def test_fallback_on_scan_ops_outside_apply():
         Op.make("aff", p_a, Op.make("select", xv, arg1=0, arg2=1)),
         Op.make("aff", p_a, Op.make("select", xv, arg1=0, arg2=0)),
     )
-    weird_ir = IR(root=bare, inputs=ir.inputs,
-                  input_names=ir.input_names, params=ir.params)
+    weird_ir = IR(
+        root=bare,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = to_batched_scan_module(weird_ir, param_values=source)
     assert not mod.is_batched
     # Serial eval of a bare aff_compose returns the (A, b) pair:

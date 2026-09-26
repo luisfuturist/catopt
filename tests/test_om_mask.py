@@ -25,11 +25,11 @@ Covered here:
 
 import torch
 
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, Const, TensorType, op_repr
-from catopt.om import OM_LAWS, OM_MASK_LAWS
 from catopt.cost import flops_cost
-from catopt.torch_bridge import ir_to_torch_module, _IR_TO_TORCH
+from catopt.egraph import EGraph
+from catopt.ir import IR, Const, Op, TensorType, Var, op_repr
+from catopt.om import OM_LAWS, OM_MASK_LAWS
+from catopt.torch_bridge import ir_to_torch_module
 
 NEG_INF = Const(float("-inf"))
 
@@ -38,6 +38,7 @@ NEG_INF = Const(float("-inf"))
 #  helpers
 # ---------------------------------------------------------------------------
 
+
 def _nested_cat(ts, dim, attr_key="dim"):
     out = ts[0]
     for t in ts[1:]:
@@ -45,8 +46,9 @@ def _nested_cat(ts, dim, attr_key="dim"):
     return out
 
 
-def _masked_dense_term(q, ks, vs, m, style="masked_fill",
-                       attr_key="dim"):
+def _masked_dense_term(
+    q, ks, vs, m, style="masked_fill", attr_key="dim"
+):
     """softmax(mask(q @ cat(k_i).T)) @ cat(v_i) as an IR term.
 
     ``style`` selects the masking idiom:
@@ -58,7 +60,8 @@ def _masked_dense_term(q, ks, vs, m, style="masked_fill",
     kcat = _nested_cat(ks, -2, attr_key)
     vcat = _nested_cat(vs, -2, attr_key)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1))
+        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+    )
     if style == "masked_fill":
         masked = Op.make("masked_fill", scores, m, NEG_INF)
     elif style == "add":
@@ -69,8 +72,7 @@ def _masked_dense_term(q, ks, vs, m, style="masked_fill",
         masked = Op.make("where", m, scores, NEG_INF)
     else:
         raise ValueError(style)
-    return Op.make(
-        "matmul", Op.make("softmax", masked, arg1=-1), vcat)
+    return Op.make("matmul", Op.make("softmax", masked, arg1=-1), vcat)
 
 
 def _masked_dense_ref(q, ks, vs, m, style="masked_fill"):
@@ -80,16 +82,21 @@ def _masked_dense_ref(q, ks, vs, m, style="masked_fill"):
     elif style in ("add", "add_r"):
         s = s + m
     elif style == "where":
-        s = torch.where(m, s, torch.tensor(float("-inf"),
-                                           dtype=s.dtype))
+        s = torch.where(
+            m, s, torch.tensor(float("-inf"), dtype=s.dtype)
+        )
     return torch.softmax(s, dim=-1) @ torch.cat(list(vs), dim=-2)
 
 
 def _run_om(term, max_iterations=20, max_nodes=200_000):
     eg = EGraph()
     root = eg.add_term(term)
-    stats = eg.run(OM_LAWS, root, max_iterations=max_iterations,
-                   max_nodes=max_nodes)
+    stats = eg.run(
+        OM_LAWS,
+        root,
+        max_iterations=max_iterations,
+        max_nodes=max_nodes,
+    )
     return eg, root, stats
 
 
@@ -115,12 +122,15 @@ def _extract_chunked(eg, root):
     ov = {}
     for cid in list(eg._classes):
         c = eg.find(cid)
-        comps = [n for n in eg._classes[c].nodes if n.op == "om_compose"]
+        comps = [
+            n for n in eg._classes[c].nodes if n.op == "om_compose"
+        ]
         if comps:
             ov.setdefault(c, comps[0])
     for n in eg.get_class(canon).nodes:
-        if (n.op == "om_apply"
-                and _class_has_op(eg, n.children[0], "om_compose")):
+        if n.op == "om_apply" and _class_has_op(
+            eg, n.children[0], "om_compose"
+        ):
             o = dict(ov)
             o[canon] = n
             t = eg.extract_best(canon, flops_cost, overrides=o)
@@ -146,22 +156,26 @@ def _causal_mask(T, K):
 #  (a) the distribution laws fire — and are fp64-exact
 # ---------------------------------------------------------------------------
 
+
 def test_masked_fill_distributes_over_concat_slice():
     """masked_fill(cat(s1,s2,-1), M, -inf) gains the concat-of-masked
     member with per-block mask slices, and evaluates identically."""
     s1 = Var("s1", TensorType((4, 3)))
     s2 = Var("s2", TensorType((4, 5)))
     m = Var("m", TensorType((4, 8)))
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=-1),
-                m, NEG_INF)
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=-1), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
     assert eg.rule_fires.get("masked_fill_cat_slice_dim", 0) > 0
 
     torch.manual_seed(0)
-    ts1, ts2 = (torch.randn(4, 3, dtype=torch.float64),
-                torch.randn(4, 5, dtype=torch.float64))
+    ts1, ts2 = (
+        torch.randn(4, 3, dtype=torch.float64),
+        torch.randn(4, 5, dtype=torch.float64),
+    )
     tm = torch.rand(4, 8) < 0.4
     ref = torch.cat([ts1, ts2], -1).masked_fill(tm, float("-inf"))
     # The concat member whose children are masked_fills is the new form.
@@ -174,15 +188,19 @@ def test_masked_fill_distributes_over_concat_slice():
         if all(any(x.op == "masked_fill" for x in ks) for ks in kids):
             hit = n
     assert hit is not None, "concat-of-masked_fills never materialised"
-    term = eg.extract_best(canon, flops_cost,
-                           overrides={canon: hit})
-    ir = IR(root=term, inputs=[s1, s2, m],
-            input_names={"s1", "s2", "m"}, params={})
+    term = eg.extract_best(canon, flops_cost, overrides={canon: hit})
+    ir = IR(
+        root=term,
+        inputs=[s1, s2, m],
+        input_names={"s1", "s2", "m"},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     with torch.no_grad():
         out = mod(ts1, ts2, tm)
-    assert torch.equal(torch.isnan(out), torch.isnan(ref)) or \
-        torch.equal(out, ref)
+    assert torch.equal(
+        torch.isnan(out), torch.isnan(ref)
+    ) or torch.equal(out, ref)
 
 
 def test_masked_fill_distributes_over_concat_broadcast_reuse():
@@ -190,9 +208,10 @@ def test_masked_fill_distributes_over_concat_broadcast_reuse():
     no split nodes should be needed."""
     s1 = Var("s1", TensorType((4, 3)))
     s2 = Var("s2", TensorType((4, 5)))
-    m = Var("m", TensorType((4, 1)))          # broadcasts along -1
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=-1),
-                m, NEG_INF)
+    m = Var("m", TensorType((4, 1)))  # broadcasts along -1
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=-1), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
@@ -200,20 +219,25 @@ def test_masked_fill_distributes_over_concat_broadcast_reuse():
     assert eg.rule_fires.get("masked_fill_cat_slice_dim", 0) == 0
 
     torch.manual_seed(0)
-    ts1, ts2 = (torch.randn(4, 3, dtype=torch.float64),
-                torch.randn(4, 5, dtype=torch.float64))
+    ts1, ts2 = (
+        torch.randn(4, 3, dtype=torch.float64),
+        torch.randn(4, 5, dtype=torch.float64),
+    )
     tm = torch.rand(4, 1) < 0.5
     ref = torch.cat([ts1, ts2], -1).masked_fill(tm, float("-inf"))
     canon = eg.find(root)
     for n in eg.get_class(canon).nodes:
         if n.op != "concat":
             continue
-        term = eg.extract_best(canon, flops_cost,
-                               overrides={canon: n})
+        term = eg.extract_best(canon, flops_cost, overrides={canon: n})
         if "masked_fill" not in op_repr(term):
             continue
-        ir = IR(root=term, inputs=[s1, s2, m],
-                input_names={"s1", "s2", "m"}, params={})
+        ir = IR(
+            root=term,
+            inputs=[s1, s2, m],
+            input_names={"s1", "s2", "m"},
+            params={},
+        )
         mod = ir_to_torch_module(ir)
         with torch.no_grad():
             out = mod(ts1, ts2, tm)
@@ -230,30 +254,46 @@ def test_add_mask_distributes_over_concat_both_orders():
         s2 = Var("s2", TensorType((4, 5)))
         m = Var("m", TensorType((4, 8)))
         cat = Op.make("concat", s1, s2, dim=-1)
-        t = (Op.make("add", cat, m) if order == "post"
-             else Op.make("add", m, cat))
+        t = (
+            Op.make("add", cat, m)
+            if order == "post"
+            else Op.make("add", m, cat)
+        )
         eg = EGraph()
         root = eg.add_term(t)
         eg.run(OM_MASK_LAWS, root, max_iterations=5)
-        name = f"add_{'cat_m' if order == 'post' else 'm_cat'}_slice_dim"
+        name = (
+            f"add_{'cat_m' if order == 'post' else 'm_cat'}_slice_dim"
+        )
         assert eg.rule_fires.get(name, 0) > 0, name
 
-        ts1, ts2 = (torch.randn(4, 3, dtype=torch.float64),
-                    torch.randn(4, 5, dtype=torch.float64))
-        tm = torch.where(torch.rand(4, 8) < 0.3,
-                         torch.tensor(float("-inf"), dtype=torch.float64),
-                         torch.zeros(4, 8, dtype=torch.float64))
+        ts1, ts2 = (
+            torch.randn(4, 3, dtype=torch.float64),
+            torch.randn(4, 5, dtype=torch.float64),
+        )
+        tm = torch.where(
+            torch.rand(4, 8) < 0.3,
+            torch.tensor(float("-inf"), dtype=torch.float64),
+            torch.zeros(4, 8, dtype=torch.float64),
+        )
         ref = torch.cat([ts1, ts2], -1) + tm
         canon = eg.find(root)
         for n in eg.get_class(canon).nodes:
             if n.op != "concat":
                 continue
-            term = eg.extract_best(canon, flops_cost,
-                                   overrides={canon: n})
-            if "add" not in op_repr(term) or "split" not in op_repr(term):
+            term = eg.extract_best(
+                canon, flops_cost, overrides={canon: n}
+            )
+            if "add" not in op_repr(term) or "split" not in op_repr(
+                term
+            ):
                 continue
-            ir = IR(root=term, inputs=[s1, s2, m],
-                    input_names={"s1", "s2", "m"}, params={})
+            ir = IR(
+                root=term,
+                inputs=[s1, s2, m],
+                input_names={"s1", "s2", "m"},
+                params={},
+            )
             mod = ir_to_torch_module(ir)
             with torch.no_grad():
                 out = mod(ts1, ts2, tm)
@@ -275,11 +315,16 @@ def test_where_distributes_over_concat():
     assert eg.rule_fires.get("where_cat_x_slice_dim", 0) > 0
 
     torch.manual_seed(0)
-    ts1, ts2 = (torch.randn(4, 3, dtype=torch.float64),
-                torch.randn(4, 5, dtype=torch.float64))
+    ts1, ts2 = (
+        torch.randn(4, 3, dtype=torch.float64),
+        torch.randn(4, 5, dtype=torch.float64),
+    )
     tm = torch.rand(4, 8) < 0.6
-    ref = torch.where(tm, torch.cat([ts1, ts2], -1),
-                      torch.tensor(float("-inf"), dtype=torch.float64))
+    ref = torch.where(
+        tm,
+        torch.cat([ts1, ts2], -1),
+        torch.tensor(float("-inf"), dtype=torch.float64),
+    )
     canon = eg.find(root)
     for n in eg.get_class(canon).nodes:
         if n.op != "concat":
@@ -287,8 +332,12 @@ def test_where_distributes_over_concat():
         term = eg.extract_best(canon, flops_cost, overrides={canon: n})
         if "where" not in op_repr(term):
             continue
-        ir = IR(root=term, inputs=[s1, s2, m],
-                input_names={"s1", "s2", "m"}, params={})
+        ir = IR(
+            root=term,
+            inputs=[s1, s2, m],
+            input_names={"s1", "s2", "m"},
+            params={},
+        )
         mod = ir_to_torch_module(ir)
         with torch.no_grad():
             out = mod(ts1, ts2, tm)
@@ -300,10 +349,19 @@ def test_where_distributes_over_concat():
 def test_cat_hom_add_mask_itself_concatd():
     """add(cat(s1,s2), cat(M1,M2)) → cat(add(s1,M1), add(s2,M2)) — the
     free concat homomorphism when the mask arrives pre-chunked."""
-    s1, s2 = Var("s1", TensorType((4, 3))), Var("s2", TensorType((4, 5)))
-    m1, m2 = Var("m1", TensorType((4, 3))), Var("m2", TensorType((4, 5)))
-    t = Op.make("add", Op.make("concat", s1, s2, dim=-1),
-                Op.make("concat", m1, m2, dim=-1))
+    s1, s2 = (
+        Var("s1", TensorType((4, 3))),
+        Var("s2", TensorType((4, 5))),
+    )
+    m1, m2 = (
+        Var("m1", TensorType((4, 3))),
+        Var("m2", TensorType((4, 5))),
+    )
+    t = Op.make(
+        "add",
+        Op.make("concat", s1, s2, dim=-1),
+        Op.make("concat", m1, m2, dim=-1),
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
@@ -321,8 +379,12 @@ def test_cat_hom_add_mask_itself_concatd():
         r = op_repr(term)
         if "add" not in r or "split" in r:
             continue
-        ir = IR(root=term, inputs=[s1, s2, m1, m2],
-                input_names={"s1", "s2", "m1", "m2"}, params={})
+        ir = IR(
+            root=term,
+            inputs=[s1, s2, m1, m2],
+            input_names={"s1", "s2", "m1", "m2"},
+            params={},
+        )
         mod = ir_to_torch_module(ir)
         with torch.no_grad():
             out = mod(*vals, *mvals)
@@ -336,17 +398,20 @@ def test_distribution_along_non_key_axis():
     query-side chunking pays its row offset the same way."""
     s1 = Var("s1", TensorType((3, 6)))
     s2 = Var("s2", TensorType((2, 6)))
-    m = Var("m", TensorType((5, 6)))          # rows split 3+2
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=0),
-                m, NEG_INF)
+    m = Var("m", TensorType((5, 6)))  # rows split 3+2
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=0), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
     assert eg.rule_fires.get("masked_fill_cat_slice_dim", 0) > 0
 
     torch.manual_seed(0)
-    ts1, ts2 = (torch.randn(3, 6, dtype=torch.float64),
-                torch.randn(2, 6, dtype=torch.float64))
+    ts1, ts2 = (
+        torch.randn(3, 6, dtype=torch.float64),
+        torch.randn(2, 6, dtype=torch.float64),
+    )
     tm = torch.rand(5, 6) < 0.4
     ref = torch.cat([ts1, ts2], 0).masked_fill(tm, float("-inf"))
     canon = eg.find(root)
@@ -356,8 +421,12 @@ def test_distribution_along_non_key_axis():
         term = eg.extract_best(canon, flops_cost, overrides={canon: n})
         if "split" not in op_repr(term):
             continue
-        ir = IR(root=term, inputs=[s1, s2, m],
-                input_names={"s1", "s2", "m"}, params={})
+        ir = IR(
+            root=term,
+            inputs=[s1, s2, m],
+            input_names={"s1", "s2", "m"},
+            params={},
+        )
         mod = ir_to_torch_module(ir)
         with torch.no_grad():
             out = mod(ts1, ts2, tm)
@@ -371,17 +440,20 @@ def test_lower_rank_mask_slices_on_its_own_axis():
     mask's own last dim — slice it there."""
     s1 = Var("s1", TensorType((4, 3)))
     s2 = Var("s2", TensorType((4, 5)))
-    m = Var("m", TensorType((8,)))            # broadcasts over rows
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=-1),
-                m, NEG_INF)
+    m = Var("m", TensorType((8,)))  # broadcasts over rows
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=-1), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
     assert eg.rule_fires.get("masked_fill_cat_slice_dim", 0) > 0
 
     torch.manual_seed(0)
-    ts1, ts2 = (torch.randn(4, 3, dtype=torch.float64),
-                torch.randn(4, 5, dtype=torch.float64))
+    ts1, ts2 = (
+        torch.randn(4, 3, dtype=torch.float64),
+        torch.randn(4, 5, dtype=torch.float64),
+    )
     tm = torch.rand(8) < 0.4
     ref = torch.cat([ts1, ts2], -1).masked_fill(tm, float("-inf"))
     canon = eg.find(root)
@@ -391,8 +463,12 @@ def test_lower_rank_mask_slices_on_its_own_axis():
         term = eg.extract_best(canon, flops_cost, overrides={canon: n})
         if "split" not in op_repr(term):
             continue
-        ir = IR(root=term, inputs=[s1, s2, m],
-                input_names={"s1", "s2", "m"}, params={})
+        ir = IR(
+            root=term,
+            inputs=[s1, s2, m],
+            input_names={"s1", "s2", "m"},
+            params={},
+        )
         mod = ir_to_torch_module(ir)
         with torch.no_grad():
             out = mod(ts1, ts2, tm)
@@ -405,28 +481,41 @@ def test_lower_rank_mask_slices_on_its_own_axis():
 #  (b) the full chain: masked chunked attention via OM_LAWS
 # ---------------------------------------------------------------------------
 
-def _masked_chunked_ok(style, ksizes, mask_fn, T=5, d=4, dv=7,
-                       seed=0, attr_key="dim"):
+
+def _masked_chunked_ok(
+    style, ksizes, mask_fn, T=5, d=4, dv=7, seed=0, attr_key="dim"
+):
     """Saturate a masked chunked attention term, force-extract the
     om_compose carrier, verify fp64 vs dense masked reference."""
     torch.manual_seed(seed)
     q = Var("q", TensorType((T, d)))
-    ks = [Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)
+    ]
     m = Var("m", TensorType(mask_fn(T, sum(ksizes)).shape))
     term = _masked_dense_term(q, ks, vs, m, style, attr_key)
 
     eg, root, _ = _run_om(term)
-    chunked = [n for n in eg.get_class(root).nodes
-               if n.op == "om_apply"
-               and _class_has_op(eg, n.children[0], "om_compose")]
+    chunked = [
+        n
+        for n in eg.get_class(root).nodes
+        if n.op == "om_apply"
+        and _class_has_op(eg, n.children[0], "om_compose")
+    ]
     assert chunked, f"{style}: om_split never produced a carrier"
     term = _extract_chunked(eg, root)
     assert term is not None and "om_compose" in op_repr(term)
 
     inputs = [q] + ks + vs + [m]
-    ir = IR(root=term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
 
     tq = torch.randn(T, d, dtype=torch.float64)
@@ -445,7 +534,8 @@ def test_causal_masked_chunked_attention_fp64():
     softmax(mask(q·cat kᵀ)) @ cat v ≡ om_apply(⊕ om_elem(masked sᵢ, vᵢ))
     with per-block mask slices carrying the absolute key offset."""
     eg, term = _masked_chunked_ok(
-        "masked_fill", [3, 6], lambda T, K: _causal_mask(T, K))
+        "masked_fill", [3, 6], lambda T, K: _causal_mask(T, K)
+    )
     assert eg.rule_fires.get("masked_fill_cat_slice_dim", 0) > 0
     assert eg.rule_fires.get("om_split", 0) > 0
     # The extracted term slices the mask per block — the positional
@@ -457,26 +547,31 @@ def test_causal_masked_chunked_attention_fp64():
 def test_additive_mask_chunked_attention_fp64():
     """Additive 0/−inf bias masks distribute the same way (the HF
     attn_bias idiom)."""
+
     def addmask(T, K):
         return torch.where(
             torch.rand(T, K) < 0.35,
             torch.tensor(float("-inf"), dtype=torch.float64),
-            torch.zeros(T, K, dtype=torch.float64))
+            torch.zeros(T, K, dtype=torch.float64),
+        )
+
     _masked_chunked_ok("add", [3, 6], addmask)
-    _masked_chunked_ok("add_r", [3, 6], addmask)   # commuted operand
+    _masked_chunked_ok("add_r", [3, 6], addmask)  # commuted operand
 
 
 def test_where_mask_chunked_attention_fp64():
     """torch.where keep-mask idiom: where(m, s, -inf)."""
-    _masked_chunked_ok("where", [3, 6],
-                       lambda T, K: torch.rand(T, K) < 0.6)
+    _masked_chunked_ok(
+        "where", [3, 6], lambda T, K: torch.rand(T, K) < 0.6
+    )
 
 
 def test_masked_chunked_three_blocks_nary():
     """A 3-ary concat binarises first; the mask slices cascade —
     split(split(m)) is the block-2 offset paid twice over."""
-    _masked_chunked_ok("masked_fill", [2, 3, 4],
-                       lambda T, K: _causal_mask(T, K))
+    _masked_chunked_ok(
+        "masked_fill", [2, 3, 4], lambda T, K: _causal_mask(T, K)
+    )
 
 
 def test_masked_chunked_batched_heads():
@@ -486,29 +581,41 @@ def test_masked_chunked_batched_heads():
     B, H, T, d, dv = 2, 3, 5, 4, 6
     ksizes = [2, 5]
     q = Var("q", TensorType((B, H, T, d)))
-    ks = [Var(f"k{i}", TensorType((B, H, k, d)))
-          for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((B, H, k, dv)))
-          for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((B, H, k, d)))
+        for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((B, H, k, dv)))
+        for i, k in enumerate(ksizes)
+    ]
     m = Var("m", TensorType((B, 1, T, sum(ksizes))))
     term = _masked_dense_term(q, ks, vs, m, "masked_fill")
 
     eg, root, _ = _run_om(term)
-    chunked = [n for n in eg.get_class(root).nodes
-               if n.op == "om_apply"
-               and _class_has_op(eg, n.children[0], "om_compose")]
+    chunked = [
+        n
+        for n in eg.get_class(root).nodes
+        if n.op == "om_apply"
+        and _class_has_op(eg, n.children[0], "om_compose")
+    ]
     assert chunked
     term = _extract_chunked(eg, root)
     assert term is not None
 
     inputs = [q] + ks + vs + [m]
-    ir = IR(root=term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     tq = torch.randn(B, H, T, d, dtype=torch.float64)
     tks = [torch.randn(B, H, k, d, dtype=torch.float64) for k in ksizes]
-    tvs = [torch.randn(B, H, k, dv, dtype=torch.float64)
-           for k in ksizes]
+    tvs = [
+        torch.randn(B, H, k, dv, dtype=torch.float64) for k in ksizes
+    ]
     tm = torch.rand(B, 1, T, sum(ksizes)) < 0.4
     ref = _masked_dense_ref(tq, tks, tvs, tm, "masked_fill")
     with torch.no_grad():
@@ -520,6 +627,7 @@ def test_masked_chunked_batched_heads():
 #  (c) −inf / NaN edge semantics — must match torch.softmax exactly
 # ---------------------------------------------------------------------------
 
+
 def test_fully_masked_row_nan_positions_match():
     """A row masked across ALL blocks → NaN there in both forms, finite
     elsewhere.  om_apply stays unclamped: a/l = 0/0 = NaN."""
@@ -529,13 +637,17 @@ def test_fully_masked_row_nan_positions_match():
 
     def mask_fn(t_, k_):
         m = torch.rand(t_, k_) < 0.3
-        m[1] = True                    # row 1 fully masked → NaN row
-        m[3] = True                    # row 3 fully masked → NaN row
+        m[1] = True  # row 1 fully masked → NaN row
+        m[3] = True  # row 3 fully masked → NaN row
         return m
 
     q = Var("q", TensorType((T, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((k, 5))) for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 5))) for i, k in enumerate(ksizes)
+    ]
     m = Var("m", TensorType((T, K)))
     term = _masked_dense_term(q, ks, vs, m, "masked_fill")
     eg, root, _ = _run_om(term)
@@ -543,8 +655,12 @@ def test_fully_masked_row_nan_positions_match():
     assert term is not None
 
     inputs = [q] + ks + vs + [m]
-    ir = IR(root=term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     tq = torch.randn(T, 4, dtype=torch.float64)
     tks = [torch.randn(k, 4, dtype=torch.float64) for k in ksizes]
@@ -567,12 +683,16 @@ def test_fully_masked_block_contributes_zero():
 
     def mask_fn(t_, k_):
         m = torch.zeros(t_, k_, dtype=torch.bool)
-        m[:, ksizes[0]:] = True        # block 1 entirely masked
+        m[:, ksizes[0] :] = True  # block 1 entirely masked
         return m
 
     q = Var("q", TensorType((T, 4)))
-    ks = [Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((k, 5))) for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, 5))) for i, k in enumerate(ksizes)
+    ]
     m = Var("m", TensorType((T, K)))
     term = _masked_dense_term(q, ks, vs, m, "masked_fill")
     eg, root, _ = _run_om(term)
@@ -580,8 +700,12 @@ def test_fully_masked_block_contributes_zero():
     assert term is not None
 
     inputs = [q] + ks + vs + [m]
-    ir = IR(root=term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     tq = torch.randn(T, 4, dtype=torch.float64)
     tks = [torch.randn(k, 4, dtype=torch.float64) for k in ksizes]
@@ -601,8 +725,12 @@ def test_causal_mask_row_zero_is_fine():
     T, d, dv = 4, 3, 5
     ksizes = [2, 2]
     q = Var("q", TensorType((T, d)))
-    ks = [Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((k, d))) for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((k, dv))) for i, k in enumerate(ksizes)
+    ]
     m = Var("m", TensorType((T, sum(ksizes))))
     term = _masked_dense_term(q, ks, vs, m, "masked_fill")
     eg, root, _ = _run_om(term)
@@ -610,15 +738,19 @@ def test_causal_mask_row_zero_is_fine():
     assert term is not None
 
     inputs = [q] + ks + vs + [m]
-    ir = IR(root=term, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=term,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = ir_to_torch_module(ir)
     tq = torch.randn(T, d, dtype=torch.float64)
     tks = [torch.randn(k, d, dtype=torch.float64) for k in ksizes]
     tvs = [torch.randn(k, dv, dtype=torch.float64) for k in ksizes]
     tm = _causal_mask(T, sum(ksizes))
     ref = _masked_dense_ref(tq, tks, tvs, tm, "masked_fill")
-    assert torch.equal(ref[0], tvs[0][0])     # dense: row0 = v0 exactly
+    assert torch.equal(ref[0], tvs[0][0])  # dense: row0 = v0 exactly
     with torch.no_grad():
         out = mod(tq, *tks, *tvs, tm)
     _assert_close_or_nan(out, ref)
@@ -629,18 +761,21 @@ def test_causal_mask_row_zero_is_fine():
 #  (d) negative checks — wrong extents/axes must NOT fire
 # ---------------------------------------------------------------------------
 
+
 def test_mask_with_mismatched_extent_does_not_distribute():
     """Mask extent neither 1 nor K1+K2 on the cat axis → veto."""
     s1 = Var("s1", TensorType((4, 3)))
     s2 = Var("s2", TensorType((4, 5)))
-    m = Var("m", TensorType((4, 6)))          # 6 != 8 and != 1
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=-1),
-                m, NEG_INF)
+    m = Var("m", TensorType((4, 6)))  # 6 != 8 and != 1
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=-1), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
-    assert not any(k.startswith("masked_fill_cat_")
-                   for k in eg.rule_fires)
+    assert not any(
+        k.startswith("masked_fill_cat_") for k in eg.rule_fires
+    )
 
 
 def test_mask_on_wrong_axis_does_not_distribute():
@@ -649,14 +784,16 @@ def test_mask_on_wrong_axis_does_not_distribute():
     produce a semantically different program)."""
     s1 = Var("s1", TensorType((4, 3)))
     s2 = Var("s2", TensorType((4, 5)))
-    m = Var("m", TensorType((8, 4)))          # transposed-ish: vetoes
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=-1),
-                m, NEG_INF)
+    m = Var("m", TensorType((8, 4)))  # transposed-ish: vetoes
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=-1), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
-    assert not any(k.startswith("masked_fill_cat_")
-                   for k in eg.rule_fires)
+    assert not any(
+        k.startswith("masked_fill_cat_") for k in eg.rule_fires
+    )
 
 
 def test_unknown_block_extent_does_not_distribute():
@@ -664,10 +801,12 @@ def test_unknown_block_extent_does_not_distribute():
     s1 = Var("s1", TensorType((4, None)))
     s2 = Var("s2", TensorType((4, 5)))
     m = Var("m", TensorType((4, 8)))
-    t = Op.make("masked_fill", Op.make("concat", s1, s2, dim=-1),
-                m, NEG_INF)
+    t = Op.make(
+        "masked_fill", Op.make("concat", s1, s2, dim=-1), m, NEG_INF
+    )
     eg = EGraph()
     root = eg.add_term(t)
     eg.run(OM_MASK_LAWS, root, max_iterations=5)
-    assert not any(k.startswith("masked_fill_cat_")
-                   for k in eg.rule_fires)
+    assert not any(
+        k.startswith("masked_fill_cat_") for k in eg.rule_fires
+    )

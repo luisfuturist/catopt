@@ -44,19 +44,24 @@ torch_bridge.py, or eps.py.  (``eps._LIP_FREE`` additionally gains the
 two op names so ``model_bound``'s Lipschitz walk treats the ≈identity
 decode correctly.)
 """
+
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 
-from typing import Any
-
 from catopt.egraph import EGraph, ENode, Rewrite
-from catopt.ir import (Op, Var, Const, Param, TensorType, op_repr, op_def)
+from catopt.ir import Const, Op, Param, TensorType, Var, op_def, op_repr
 
-__all__ = ["act_quant", "act_low_rank", "calibrate",
-           "extract_with_offers", "ACT_EPS_OPS"]
+__all__ = [
+    "ACT_EPS_OPS",
+    "act_low_rank",
+    "act_quant",
+    "calibrate",
+    "extract_with_offers",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +74,20 @@ __all__ = ["act_quant", "act_low_rank", "calibrate",
 ACT_EPS_OPS = ("aquant", "adequant")
 
 op_def(
-    "aquant", 1, 1,
+    "aquant",
+    1,
+    1,
     law="Per-call symmetric activation quantization: evaluates to the "
-        "(q:int8, s) pair with s = |x|max/(2^{bits-1}-1).  Runtime "
-        "contract: ‖x − dequant(quant(x))‖_F ≤ s(x)/2·√n per call.")
+    "(q:int8, s) pair with s = |x|max/(2^{bits-1}-1).  Runtime "
+    "contract: ‖x − dequant(quant(x))‖_F ≤ s(x)/2·√n per call.",
+)
 op_def(
-    "adequant", 1, 1,
+    "adequant",
+    1,
+    1,
     law="Decode half of the activation quant pair: (q, s) ↦ q·s — the "
-        "identity map up to the certified rounding bound.")
+    "identity map up to the certified rounding bound.",
+)
 
 
 def _aquant_torch(x, *a, **kw):
@@ -102,6 +113,7 @@ def _adequant_torch(pair, *a, **kw):
 
 def _register_extensions() -> None:
     from catopt.torch_bridge import _IR_TO_TORCH
+
     _IR_TO_TORCH.setdefault("aquant", _aquant_torch)
     _IR_TO_TORCH.setdefault("adequant", _adequant_torch)
     # The decode is ≈identity: let eps.model_bound's Lipschitz walk pass
@@ -109,6 +121,7 @@ def _register_extensions() -> None:
     # rewrite's error_bound).  Registry extension, not an eps.py edit.
     try:
         from catopt import eps as _eps
+
         _eps._LIP_FREE.update(("aquant", "adequant"))
     except Exception:
         pass
@@ -120,6 +133,7 @@ _register_extensions()
 # ---------------------------------------------------------------------------
 #  Helpers
 # ---------------------------------------------------------------------------
+
 
 def _has_var(t, _memo: dict | None = None) -> bool:
     """True when the term mentions a Var leaf (data-dependent subtree —
@@ -164,7 +178,7 @@ def _site_absmax(calib, key: str):
     return None
 
 
-def _activation_classes(eg: EGraph) -> dict[int, Any]:  # noqa: F821
+def _activation_classes(eg: EGraph) -> dict[int, Any]:
     """E-class id -> representative term for every *activation-producing*
     class: a class whose oldest member is a non-leaf Op that depends on
     an input Var.  Excludes Param leaves, input Vars, param-only
@@ -175,15 +189,24 @@ def _activation_classes(eg: EGraph) -> dict[int, Any]:  # noqa: F821
         if c in out:
             continue
         rep = eg._oldest_term(c) or eg.any_term(c)
-        if (isinstance(rep, Op) and rep.op not in ACT_EPS_OPS
-                and _has_var(rep)):
+        if (
+            isinstance(rep, Op)
+            and rep.op not in ACT_EPS_OPS
+            and _has_var(rep)
+        ):
             out[c] = rep
     return out
 
 
-def _wrap_sites(eg: EGraph, act: dict[int, Any],
-                wrap_factory, bound_of,
-                tag: str, law_of, witness: bool) -> list[dict]:
+def _wrap_sites(
+    eg: EGraph,
+    act: dict[int, Any],
+    wrap_factory,
+    bound_of,
+    tag: str,
+    law_of,
+    witness: bool,
+) -> list[dict]:
     """For every consumer enode ``f(…, c, …)`` whose child ``c`` is an
     activation class, offer the member ``f(…, wrap(c), …)`` into the
     consumer's own e-class, witnessed by a bound-carrying Rewrite.
@@ -215,7 +238,8 @@ def _wrap_sites(eg: EGraph, act: dict[int, Any],
                 dq = eg.find(wrap_cache[ch_c])
                 children = tuple(
                     dq if j == i else eg.find(c2)
-                    for j, c2 in enumerate(node.children))
+                    for j, c2 in enumerate(node.children)
+                )
                 meid = eg.add_enode(node.op, children, dict(node.attrs))
                 member_en = ENode(node.op, children, node.attrs)
                 key = (cc, member_en)
@@ -230,22 +254,42 @@ def _wrap_sites(eg: EGraph, act: dict[int, Any],
                 # bound-carrying) ones, keeping certificates tight.
                 offer_term = eg._oldest_term(meid) or eg.any_term(meid)
                 wit = None
-                if (witness and src_term is not None
-                        and offer_term is not None):
+                if (
+                    witness
+                    and src_term is not None
+                    and offer_term is not None
+                ):
                     wit = Rewrite(
-                        name=f"{tag}#{meid}", lhs=src_term,
-                        rhs=offer_term, law=law_of(ch_c, i, node, bound),
-                        error_bound=bound, bound_norm=norm)
+                        name=f"{tag}#{meid}",
+                        lhs=src_term,
+                        rhs=offer_term,
+                        law=law_of(ch_c, i, node, bound),
+                        error_bound=bound,
+                        bound_norm=norm,
+                    )
                 merged = eg.union(
-                    cc, meid, witness=wit,
-                    note=(f"{tag}: wrap input {i} of {node.op} "
-                          f"(activation class {ch_c}), ε={bound:.3e}"))
-                offers.append({
-                    "site_eid": cc, "quant_eid": ch_c, "pos": i,
-                    "op": node.op, "member": member_en,
-                    "member_eid": meid, "bound": bound,
-                    "bound_norm": norm, "merged": merged,
-                    "cyclic": cc == ch_c})
+                    cc,
+                    meid,
+                    witness=wit,
+                    note=(
+                        f"{tag}: wrap input {i} of {node.op} "
+                        f"(activation class {ch_c}), ε={bound:.3e}"
+                    ),
+                )
+                offers.append(
+                    {
+                        "site_eid": cc,
+                        "quant_eid": ch_c,
+                        "pos": i,
+                        "op": node.op,
+                        "member": member_en,
+                        "member_eid": meid,
+                        "bound": bound,
+                        "bound_norm": norm,
+                        "merged": merged,
+                        "cyclic": cc == ch_c,
+                    }
+                )
     return offers
 
 
@@ -253,8 +297,10 @@ def _wrap_sites(eg: EGraph, act: dict[int, Any],
 #  Calibration
 # ---------------------------------------------------------------------------
 
-def calibrate(model, inputs, source_tensors=None, *,
-              keep_tensors: bool = False) -> dict:
+
+def calibrate(
+    model, inputs, source_tensors=None, *, keep_tensors: bool = False
+) -> dict:
     """Run activations, collect absmax statistics per site.
 
     Two modes:
@@ -295,10 +341,13 @@ def calibrate(model, inputs, source_tensors=None, *,
                     per_site[name] = max(per_site.get(name, 0.0), v)
                     if keep_tensors:
                         tensors[name] = out.detach().clone()
+
             return h
 
         for name, mod in model.named_modules():
-            handles.append(mod.register_forward_hook(hook(name or "model")))
+            handles.append(
+                mod.register_forward_hook(hook(name or "model"))
+            )
         try:
             with torch.no_grad():
                 model(*args)
@@ -309,6 +358,7 @@ def calibrate(model, inputs, source_tensors=None, *,
         # IR term evaluation — sites keyed by op_repr, matching
         # act_quant's e-class representative keys.
         from catopt.torch_bridge import _IR_TO_TORCH
+
         ir = model
         src = source_tensors or {}
         if isinstance(xs, dict):
@@ -348,9 +398,11 @@ def calibrate(model, inputs, source_tensors=None, *,
         with torch.no_grad():
             ev(ir.root)
 
-    out = {"per_site": per_site,
-           "global": max(per_site.values(), default=0.0),
-           "n_sites": len(per_site)}
+    out = {
+        "per_site": per_site,
+        "global": max(per_site.values(), default=0.0),
+        "n_sites": len(per_site),
+    }
     if keep_tensors:
         out["tensors"] = tensors
     return out
@@ -360,9 +412,15 @@ def calibrate(model, inputs, source_tensors=None, *,
 #  act_quant — dynamic quantize/dequantize offers on activation edges
 # ---------------------------------------------------------------------------
 
-def act_quant(eg: EGraph, source_tensors: dict, *,
-              bits: int = 8, calib=None,
-              witness: bool = True) -> list[dict]:
+
+def act_quant(
+    eg: EGraph,
+    source_tensors: dict,
+    *,
+    bits: int = 8,
+    calib=None,
+    witness: bool = True,
+) -> list[dict]:
     """Offer ``f(…, x, …) → f(…, adequant(aquant(x)), …)`` at every
     consumer edge whose child is an activation-producing e-class.
 
@@ -405,8 +463,12 @@ def act_quant(eg: EGraph, source_tensors: dict, *,
         dq = eg.add_enode("adequant", (aq,), {})
         amax = _site_absmax(calib, op_repr(rep))
         shape = _shape_of(rep)
-        n = (math.prod(shape) if isinstance(shape, tuple)
-             and all(isinstance(d, int) for d in shape) else None)
+        n = (
+            math.prod(shape)
+            if isinstance(shape, tuple)
+            and all(isinstance(d, int) for d in shape)
+            else None
+        )
         if amax is None:
             bound, norm = float("inf"), "frobenius"
         elif n is not None:
@@ -424,29 +486,43 @@ def act_quant(eg: EGraph, source_tensors: dict, *,
 
     def law_of(c, i, node, bound):
         amax, n = info[c][2], info[c][3]
-        formula = (f"‖Δx‖_F ≤ s(x)/2·√n per call, "
-                   f"s(x) = |x|max/{levels} (runtime-computable)")
+        formula = (
+            f"‖Δx‖_F ≤ s(x)/2·√n per call, "
+            f"s(x) = |x|max/{levels} (runtime-computable)"
+        )
         if amax is None:
-            return (f"dynamic int{bits} activation quant at input {i} "
-                    f"of {node.op}: {formula}; UNCALIBRATED — no static "
-                    f"bound without calibration data")
+            return (
+                f"dynamic int{bits} activation quant at input {i} "
+                f"of {node.op}: {formula}; UNCALIBRATED — no static "
+                f"bound without calibration data"
+            )
         scale = amax / levels
         nn_ = f"n={n}" if n is not None else "n=? (L∞ bound)"
-        return (f"dynamic int{bits} activation quant at input {i} of "
-                f"{node.op}: {formula}; calibrated |x|max = {amax:.3e} "
-                f"→ s ≤ {scale:.3e}, ε ≤ {bound:.3e} ({nn_})")
+        return (
+            f"dynamic int{bits} activation quant at input {i} of "
+            f"{node.op}: {formula}; calibrated |x|max = {amax:.3e} "
+            f"→ s ≤ {scale:.3e}, ε ≤ {bound:.3e} ({nn_})"
+        )
 
-    return _wrap_sites(eg, act, wrap_factory, bound_of,
-                       f"act_q{bits}", law_of, witness)
+    return _wrap_sites(
+        eg, act, wrap_factory, bound_of, f"act_q{bits}", law_of, witness
+    )
 
 
 # ---------------------------------------------------------------------------
 #  act_low_rank — random-projection bottleneck on activation edges (stretch)
 # ---------------------------------------------------------------------------
 
-def act_low_rank(eg: EGraph, source_tensors: dict, *,
-                 rank: int, calib=None, seed: int = 0,
-                 witness: bool = True) -> list[dict]:
+
+def act_low_rank(
+    eg: EGraph,
+    source_tensors: dict,
+    *,
+    rank: int,
+    calib=None,
+    seed: int = 0,
+    witness: bool = True,
+) -> list[dict]:
     """Offer ``f(…, x, …) → f(…, matmul(matmul(x, P), Pᵀ), …)`` at every
     consumer edge of an activation class whose last dim ``d`` exceeds
     ``rank``.
@@ -468,6 +544,7 @@ def act_low_rank(eg: EGraph, source_tensors: dict, *,
     """
     act = _activation_classes(eg)
     from catopt.cost import _shape_of
+
     gen = torch.Generator().manual_seed(seed)
 
     info: dict[int, tuple] = {}
@@ -475,28 +552,40 @@ def act_low_rank(eg: EGraph, source_tensors: dict, *,
     def wrap_factory(c):
         rep = act[c]
         shape = _shape_of(rep)
-        if (not isinstance(shape, tuple) or not shape
-                or not isinstance(shape[-1], int)):
+        if (
+            not isinstance(shape, tuple)
+            or not shape
+            or not isinstance(shape[-1], int)
+        ):
             return None
         d = shape[-1]
         if rank >= d:
             return None
-        n = (math.prod(shape)
-             if all(isinstance(dd, int) for dd in shape) else None)
+        n = (
+            math.prod(shape)
+            if all(isinstance(dd, int) for dd in shape)
+            else None
+        )
         key = op_repr(rep)
         amax = _site_absmax(calib, key)
-        P = torch.linalg.qr(
-            torch.randn(d, rank, generator=gen,
-                        dtype=torch.float64)).Q[:, :rank].contiguous()
+        P = (
+            torch.linalg.qr(
+                torch.randn(d, rank, generator=gen, dtype=torch.float64)
+            )
+            .Q[:, :rank]
+            .contiguous()
+        )
         # measured residual when calibration kept the activation samples
         resid = None
-        samples = (calib.get("tensors", {}).get(key)
-                   if isinstance(calib, dict) else None)
+        samples = (
+            calib.get("tensors", {}).get(key)
+            if isinstance(calib, dict)
+            else None
+        )
         if torch.is_tensor(samples):
             xd = samples.detach().double()
-            resid = float(torch.linalg.norm(
-                xd - (xd @ P) @ P.T))
-            P = P.to(samples.dtype)   # match the activation's dtype
+            resid = float(torch.linalg.norm(xd - (xd @ P) @ P.T))
+            P = P.to(samples.dtype)  # match the activation's dtype
         pname = f"act_lrP_{c}"
         ptname = f"act_lrPt_{c}"
         source_tensors[pname] = P
@@ -505,9 +594,11 @@ def act_low_rank(eg: EGraph, source_tensors: dict, *,
         pt_eid = eg.add_term(Param(ptname, TensorType((rank, d))))
         inner = eg.add_enode("matmul", (c, p_eid), {})
         dq = eg.add_enode("matmul", (inner, pt_eid), {})
-        bound = (amax * math.sqrt(n)
-                 if (amax is not None and n is not None)
-                 else float("inf"))
+        bound = (
+            amax * math.sqrt(n)
+            if (amax is not None and n is not None)
+            else float("inf")
+        )
         info[c] = (bound, "frobenius", amax, n, d, resid)
         return dq
 
@@ -515,28 +606,45 @@ def act_low_rank(eg: EGraph, source_tensors: dict, *,
         return info[c][0], info[c][1]
 
     def law_of(c, i, node, bound):
-        amax, n, d, resid = info[c][2], info[c][3], info[c][4], info[c][5]
-        base = (f"rank-{rank} random projection of activation at input "
-                f"{i} of {node.op}: x ↦ x·PPᵀ, P∈ℝ^{{{d}×{rank}}} "
-                f"orthonormal ⇒ ‖Δx‖_F ≤ ‖x‖_F ≤ √n·|x|max")
+        amax, n, d, resid = (
+            info[c][2],
+            info[c][3],
+            info[c][4],
+            info[c][5],
+        )
+        base = (
+            f"rank-{rank} random projection of activation at input "
+            f"{i} of {node.op}: x ↦ x·PPᵀ, P∈ℝ^{{{d}×{rank}}} "
+            f"orthonormal ⇒ ‖Δx‖_F ≤ ‖x‖_F ≤ √n·|x|max"
+        )
         if amax is not None:
             base += f" = {bound:.3e} (calibrated |x|max = {amax:.3e})"
         else:
             base += "; UNCALIBRATED"
         if resid is not None:
-            base += f"; measured residual {resid:.3e} on calibration batch"
+            base += (
+                f"; measured residual {resid:.3e} on calibration batch"
+            )
         return base
 
-    return _wrap_sites(eg, act, wrap_factory, bound_of,
-                       "act_lr", law_of, witness)
+    return _wrap_sites(
+        eg, act, wrap_factory, bound_of, "act_lr", law_of, witness
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Extraction helper — force the offered bounded members
 # ---------------------------------------------------------------------------
 
-def extract_with_offers(eg: EGraph, root_eid: int, offers: list[dict], *,
-                        cost_fn=None, quant_eids=None):
+
+def extract_with_offers(
+    eg: EGraph,
+    root_eid: int,
+    offers: list[dict],
+    *,
+    cost_fn=None,
+    quant_eids=None,
+):
     """Extract a term forced through the offered bounded members.
 
     Activation quantization is a runtime *contract*, not a compute win —
@@ -551,8 +659,9 @@ def extract_with_offers(eg: EGraph, root_eid: int, offers: list[dict], *,
     """
     if cost_fn is None:
         from catopt.cost import count_cost
+
         cost_fn = count_cost
-    keep = (set(quant_eids) if quant_eids is not None else None)
+    keep = set(quant_eids) if quant_eids is not None else None
     ov: dict[int, ENode] = {}
     for o in offers:
         if keep is not None and o["quant_eid"] not in keep:

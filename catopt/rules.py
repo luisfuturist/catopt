@@ -14,15 +14,23 @@ Groups:
 """
 
 from typing import Any
+
 from catopt.egraph import Rewrite
-from catopt.ir import Op, Const
+from catopt.ir import Const, Op
 
 
-def R(name: str, lhs: Any, rhs: Any, law: str = "", check=None,
-      derive=None) -> Rewrite:
+def R(
+    name: str,
+    lhs: Any,
+    rhs: Any,
+    law: str = "",
+    check=None,
+    derive=None,
+) -> Rewrite:
     """Shorthand for creating a rewrite rule."""
-    return Rewrite(name=name, lhs=lhs, rhs=rhs, law=law, check=check,
-                   derive=derive)
+    return Rewrite(
+        name=name, lhs=lhs, rhs=rhs, law=law, check=check, derive=derive
+    )
 
 
 #: id()-keyed shape memo for the check-hook path.  The bound terms it
@@ -39,6 +47,7 @@ _SHAPE_KEEP: dict[int, Any] = {}
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
     from catopt.cost import _shape_of as _so
+
     _SHAPE_KEEP[id(t)] = t
     return _so(t, _SHAPE_MEMO)
 
@@ -199,18 +208,18 @@ SILU_MUL_FORM = R(
 DISTRIBUTE_MUL = R(
     "distribute_matmul_over_add",
     Op.make("matmul", "W", Op.make("add", "a", "b")),
-    Op.make("add",
-            Op.make("matmul", "W", "a"),
-            Op.make("matmul", "W", "b")),
+    Op.make(
+        "add", Op.make("matmul", "W", "a"), Op.make("matmul", "W", "b")
+    ),
     law="Distributivity of linear maps over addition (bilinearity).",
 )
 
 # add(matmul(W, a), matmul(W, b)) → matmul(W, add(a, b))  [reverse]
 FACTOR_MUL = R(
     "factor_matmul",
-    Op.make("add",
-            Op.make("matmul", "W", "a"),
-            Op.make("matmul", "W", "b")),
+    Op.make(
+        "add", Op.make("matmul", "W", "a"), Op.make("matmul", "W", "b")
+    ),
     Op.make("matmul", "W", Op.make("add", "a", "b")),
     law="Factoring common linear maps (reverse distributivity).",
 )
@@ -224,18 +233,18 @@ FACTOR_MUL = R(
 RIGHT_DISTRIBUTE = R(
     "right_distribute_matmul",
     Op.make("matmul", Op.make("add", "a", "b"), "W"),
-    Op.make("add",
-            Op.make("matmul", "a", "W"),
-            Op.make("matmul", "b", "W")),
+    Op.make(
+        "add", Op.make("matmul", "a", "W"), Op.make("matmul", "b", "W")
+    ),
     law="Bilinearity: linear maps distribute over addition in BOTH slots.",
 )
 
 # a@W + b@W = (a + b) @ W
 RIGHT_FACTOR = R(
     "right_factor_matmul",
-    Op.make("add",
-            Op.make("matmul", "a", "W"),
-            Op.make("matmul", "b", "W")),
+    Op.make(
+        "add", Op.make("matmul", "a", "W"), Op.make("matmul", "b", "W")
+    ),
     Op.make("matmul", Op.make("add", "a", "b"), "W"),
     law="Factor a shared right-weight (the slot `x @ W` uses).",
 )
@@ -245,9 +254,9 @@ RIGHT_FACTOR = R(
 # LoRA/adapter/model-soup merge that deployment tooling does by hand.
 WEIGHT_FACTOR = R(
     "weight_factor_matmul",
-    Op.make("add",
-            Op.make("matmul", "x", "W"),
-            Op.make("matmul", "x", "W2")),
+    Op.make(
+        "add", Op.make("matmul", "x", "W"), Op.make("matmul", "x", "W2")
+    ),
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input projections: x@W1 + x@W2 = x@(W1+W2).",
 )
@@ -256,9 +265,9 @@ WEIGHT_FACTOR = R(
 WEIGHT_DISTRIBUTE = R(
     "weight_distribute_matmul",
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
-    Op.make("add",
-            Op.make("matmul", "x", "W"),
-            Op.make("matmul", "x", "W2")),
+    Op.make(
+        "add", Op.make("matmul", "x", "W"), Op.make("matmul", "x", "W2")
+    ),
     law="Reverse weight merge (lets eqsat weigh fused vs split forms).",
 )
 
@@ -272,12 +281,12 @@ WEIGHT_DISTRIBUTE = R(
 # x@W1.T + x@W2.T = x @ (W1+W2).T   ->   linear(x, W1+W2)
 WEIGHT_FACTOR_LINEAR = R(
     "weight_factor_linear",
-    Op.make("add",
-            Op.make("linear", "x", "W"),
-            Op.make("linear", "x", "W2")),
+    Op.make(
+        "add", Op.make("linear", "x", "W"), Op.make("linear", "x", "W2")
+    ),
     Op.make("linear", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input nn.Linears: linear(x,W1)+linear(x,W2)"
-         " = linear(x, W1+W2)  (transpose distributes over +).",
+    " = linear(x, W1+W2)  (transpose distributes over +).",
 )
 
 # linear(linear(x, A), B) = x @ A.T @ B.T = x @ (B@A).T = linear(x, B@A)
@@ -287,7 +296,7 @@ ASSOC_LINEAR = R(
     Op.make("linear", Op.make("linear", "x", "A"), "B"),
     Op.make("linear", "x", Op.make("matmul", "B", "A")),
     law="Compose stacked nn.Linears: fused weight is B @ A"
-         " (transposes flip the product order).",
+    " (transposes flip the product order).",
 )
 
 # ------------------------------------------------------------------
@@ -318,6 +327,7 @@ ASSOC_LINEAR = R(
 #  broadcast add, and the b2 leaf.
 # ------------------------------------------------------------------
 
+
 def _check_linear_bias_compose(bound: dict) -> bool:
     """Shape guard: the chain dims must compose for B·b1 + b2 to be
     well-typed — A (h, i), B (o, h), b1 (h,), b2 (o,) or scalar.
@@ -332,35 +342,45 @@ def _check_linear_bias_compose(bound: dict) -> bool:
     b = _shape_of(bound.get("B"))
     b1 = _shape_of(bound.get("b1"))
     b2 = _shape_of(bound.get("b2"))
-    if not (isinstance(a, tuple) and isinstance(b, tuple)
-            and len(a) == 2 and len(b) == 2):
+    if not (
+        isinstance(a, tuple)
+        and isinstance(b, tuple)
+        and len(a) == 2
+        and len(b) == 2
+    ):
         return False
     h, i, o = a[0], a[1], b[0]
-    if b[1] != h:                               # B consumes A's out dim
+    if b[1] != h:  # B consumes A's out dim
         return False
     if not (isinstance(b1, tuple) and len(b1) == 1 and b1[0] == h):
-        return False                            # inner bias: exactly (h,)
-    if b2 != () and not (isinstance(b2, tuple)
-                         and len(b2) == 1 and b2[0] == o):
-        return False                            # outer bias: scalar|(o,)
+        return False  # inner bias: exactly (h,)
+    if b2 != () and not (
+        isinstance(b2, tuple) and len(b2) == 1 and b2[0] == o
+    ):
+        return False  # outer bias: scalar|(o,)
     if not (isinstance(x, tuple) and len(x) >= 1 and x[-1] == i):
-        return False                            # x feeds A's input dim
+        return False  # x feeds A's input dim
     return True
 
 
 ASSOC_LINEAR_BIAS = R(
     "assoc_linear_bias",
     Op.make("linear", Op.make("linear", "x", "A", "b1"), "B", "b2"),
-    Op.make("add",
-            Op.make("linear", "x",
-                    Op.make("matmul", "B", "A"),
-                    Op.make("matmul", "B", "b1")),
-            "b2"),
+    Op.make(
+        "add",
+        Op.make(
+            "linear",
+            "x",
+            Op.make("matmul", "B", "A"),
+            Op.make("matmul", "B", "b1"),
+        ),
+        "b2",
+    ),
     law="Affine-map composition: (B,b2)∘(A,b1) = (BA, B·b1 + b2).  "
-        "Fused weight is B @ A (same transpose flip as assoc_linear); "
-        "the fused bias is spelled linear(x, BA, B·b1) + b2 so both "
-        "B-products fold at compile time — one GEMM plus one "
-        "broadcast add at runtime.",
+    "Fused weight is B @ A (same transpose flip as assoc_linear); "
+    "the fused bias is spelled linear(x, BA, B·b1) + b2 so both "
+    "B-products fold at compile time — one GEMM plus one "
+    "broadcast add at runtime.",
     check=_check_linear_bias_compose,
 )
 
@@ -368,11 +388,16 @@ ASSOC_LINEAR_BIAS = R(
 # wins when the hidden dim sits below the oi/(i+o) break-even.
 ASSOC_LINEAR_BIAS_REV = R(
     "assoc_linear_bias_rev",
-    Op.make("add",
-            Op.make("linear", "x",
-                    Op.make("matmul", "B", "A"),
-                    Op.make("matmul", "B", "b1")),
-            "b2"),
+    Op.make(
+        "add",
+        Op.make(
+            "linear",
+            "x",
+            Op.make("matmul", "B", "A"),
+            Op.make("matmul", "B", "b1"),
+        ),
+        "b2",
+    ),
     Op.make("linear", Op.make("linear", "x", "A", "b1"), "B", "b2"),
     law="Reverse affine composition (eqsat weighs fused vs split).",
     check=_check_linear_bias_compose,
@@ -381,9 +406,9 @@ ASSOC_LINEAR_BIAS_REV = R(
 # a@W.T + b@W.T = (a+b)@W.T   ->   linear(add(a,b), W)
 RIGHT_FACTOR_LINEAR = R(
     "right_factor_linear",
-    Op.make("add",
-            Op.make("linear", "a", "W"),
-            Op.make("linear", "b", "W")),
+    Op.make(
+        "add", Op.make("linear", "a", "W"), Op.make("linear", "b", "W")
+    ),
     Op.make("linear", Op.make("add", "a", "b"), "W"),
     law="Factor a shared right-hand nn.Linear weight.",
 )
@@ -392,9 +417,9 @@ RIGHT_FACTOR_LINEAR = R(
 WEIGHT_DISTRIBUTE_LINEAR = R(
     "weight_distribute_linear",
     Op.make("linear", "x", Op.make("add", "W", "W2")),
-    Op.make("add",
-            Op.make("linear", "x", "W"),
-            Op.make("linear", "x", "W2")),
+    Op.make(
+        "add", Op.make("linear", "x", "W"), Op.make("linear", "x", "W2")
+    ),
     law="Expand a merged nn.Linear so eqsat can compare both forms.",
 )
 
@@ -417,22 +442,36 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
 # chunk projections read the same e-class.
 SWIGLU_FUSE = R(
     "swiglu_fuse",
-    Op.make("mul",
-            Op.make("silu", Op.make("linear", "x", "A")),
-            Op.make("linear", "x", "B")),
-    Op.make("mul",
-            Op.make("silu",
-                    Op.make("chunk",
-                            Op.make("linear", "x",
-                                    Op.make("concat", "A", "B", dim=0)),
-                            chunks=2, dim=-1, index=0)),
-            Op.make("chunk",
-                    Op.make("linear", "x",
-                            Op.make("concat", "A", "B", dim=0)),
-                    chunks=2, dim=-1, index=1)),
+    Op.make(
+        "mul",
+        Op.make("silu", Op.make("linear", "x", "A")),
+        Op.make("linear", "x", "B"),
+    ),
+    Op.make(
+        "mul",
+        Op.make(
+            "silu",
+            Op.make(
+                "chunk",
+                Op.make(
+                    "linear", "x", Op.make("concat", "A", "B", dim=0)
+                ),
+                chunks=2,
+                dim=-1,
+                index=0,
+            ),
+        ),
+        Op.make(
+            "chunk",
+            Op.make("linear", "x", Op.make("concat", "A", "B", dim=0)),
+            chunks=2,
+            dim=-1,
+            index=1,
+        ),
+    ),
     law="Product universal property: <f,g> = (f x g) . Delta.  Two "
-        "projections of the same input are ONE GEMM into V x V, then "
-        "project.  (Fused SwiGLU gate/up — MergedColumnParallelLinear.)",
+    "projections of the same input are ONE GEMM into V x V, then "
+    "project.  (Fused SwiGLU gate/up — MergedColumnParallelLinear.)",
 )
 
 # (x@A.T) * (x@B.T)  ->  chunk form without the gate nonlinearity.
@@ -440,20 +479,28 @@ SWIGLU_FUSE = R(
 # projections.
 PARALLEL_MUL_FUSE = R(
     "parallel_mul_fuse",
-    Op.make("mul",
-            Op.make("linear", "x", "A"),
-            Op.make("linear", "x", "B")),
-    Op.make("mul",
-            Op.make("chunk",
-                    Op.make("linear", "x",
-                            Op.make("concat", "A", "B", dim=0)),
-                    chunks=2, dim=-1, index=0),
-            Op.make("chunk",
-                    Op.make("linear", "x",
-                            Op.make("concat", "A", "B", dim=0)),
-                    chunks=2, dim=-1, index=1)),
+    Op.make(
+        "mul", Op.make("linear", "x", "A"), Op.make("linear", "x", "B")
+    ),
+    Op.make(
+        "mul",
+        Op.make(
+            "chunk",
+            Op.make("linear", "x", Op.make("concat", "A", "B", dim=0)),
+            chunks=2,
+            dim=-1,
+            index=0,
+        ),
+        Op.make(
+            "chunk",
+            Op.make("linear", "x", Op.make("concat", "A", "B", dim=0)),
+            chunks=2,
+            dim=-1,
+            index=1,
+        ),
+    ),
     law="Pairing without a gate nonlinearity: mul(<pi1 f>, <pi2 g>) "
-        "recovers the parallel-product form.",
+    "recovers the parallel-product form.",
 )
 
 # ---------------------------------------------------------------------------
@@ -483,7 +530,7 @@ LINEAR_CHANNEL_SCALE = R(
     Op.make("linear", Op.make("mul", "x", "c"), "W"),
     Op.make("linear", "x", Op.make("mul", "W", "c")),
     law="Channel scale is a right diagonal: (xD)W = x(DW).  Folds the "
-        "norm's affine gain into the weight at compile time.",
+    "norm's affine gain into the weight at compile time.",
     check=_is_channel_scale,
 )
 
@@ -500,7 +547,7 @@ LINEAR_ROW_SCALE = R(
     Op.make("linear", Op.make("mul", "x", "r"), "W"),
     Op.make("mul", Op.make("linear", "x", "W"), "r"),
     law="Row scale is a left diagonal: commutes through the linear map "
-        "to the output (naturality of scalar action).",
+    "to the output (naturality of scalar action).",
     check=lambda b: _is_row_scale(b["r"]),
 )
 
@@ -527,46 +574,84 @@ LINEAR_ROW_SCALE_REV = R(
 #  is what makes this rule shape-polymorphic.
 # ---------------------------------------------------------------------------
 
+
 def _head(t: str) -> Op:
     """The head-splitting view: view(t, S) then transpose(1, 2)."""
-    return Op.make("transpose",
-                   Op.make("reshape", t, shape="S"),
-                   arg1=1, arg2=2)
+    return Op.make(
+        "transpose", Op.make("reshape", t, shape="S"), arg1=1, arg2=2
+    )
 
 
 QKV_FUSE = R(
     "qkv_fuse",
-    Op.make("sdpa",
-            _head(Op.make("linear", "x", "Q")),
-            _head(Op.make("linear", "x", "K")),
-            _head(Op.make("linear", "x", "V")),
-            scale="SC"),
-    Op.make("sdpa",
-            _head(Op.make("chunk",
-                          Op.make("linear", "x",
-                                  Op.make("concat",
-                                          Op.make("concat", "Q", "K",
-                                                  dim=0),
-                                          "V", dim=0)),
-                          chunks=3, dim=-1, index=0)),
-            _head(Op.make("chunk",
-                          Op.make("linear", "x",
-                                  Op.make("concat",
-                                          Op.make("concat", "Q", "K",
-                                                  dim=0),
-                                          "V", dim=0)),
-                          chunks=3, dim=-1, index=1)),
-            _head(Op.make("chunk",
-                          Op.make("linear", "x",
-                                  Op.make("concat",
-                                          Op.make("concat", "Q", "K",
-                                                  dim=0),
-                                          "V", dim=0)),
-                          chunks=3, dim=-1, index=2)),
-            scale="SC"),
+    Op.make(
+        "sdpa",
+        _head(Op.make("linear", "x", "Q")),
+        _head(Op.make("linear", "x", "K")),
+        _head(Op.make("linear", "x", "V")),
+        scale="SC",
+    ),
+    Op.make(
+        "sdpa",
+        _head(
+            Op.make(
+                "chunk",
+                Op.make(
+                    "linear",
+                    "x",
+                    Op.make(
+                        "concat",
+                        Op.make("concat", "Q", "K", dim=0),
+                        "V",
+                        dim=0,
+                    ),
+                ),
+                chunks=3,
+                dim=-1,
+                index=0,
+            )
+        ),
+        _head(
+            Op.make(
+                "chunk",
+                Op.make(
+                    "linear",
+                    "x",
+                    Op.make(
+                        "concat",
+                        Op.make("concat", "Q", "K", dim=0),
+                        "V",
+                        dim=0,
+                    ),
+                ),
+                chunks=3,
+                dim=-1,
+                index=1,
+            )
+        ),
+        _head(
+            Op.make(
+                "chunk",
+                Op.make(
+                    "linear",
+                    "x",
+                    Op.make(
+                        "concat",
+                        Op.make("concat", "Q", "K", dim=0),
+                        "V",
+                        dim=0,
+                    ),
+                ),
+                chunks=3,
+                dim=-1,
+                index=2,
+            )
+        ),
+        scale="SC",
+    ),
     law="Triple pairing <q,k,v> : X -> V^3 — three projections of the "
-        "same input are ONE GEMM into the product space, then three "
-        "zero-cost chunk projections.  (Fused QKV.)",
+    "same input are ONE GEMM into the product space, then three "
+    "zero-cost chunk projections.  (Fused QKV.)",
 )
 
 
@@ -578,11 +663,15 @@ QKV_FUSE = R(
 #  the bound weight shapes.  (vLLM's QKVParallelLinear.)
 # ---------------------------------------------------------------------------
 
+
 def _head_v(t: Any, shape_var: str) -> Op:
     """Head view with a per-projection shape metavariable."""
-    return Op.make("transpose",
-                   Op.make("reshape", t, shape=shape_var),
-                   arg1=1, arg2=2)
+    return Op.make(
+        "transpose",
+        Op.make("reshape", t, shape=shape_var),
+        arg1=1,
+        arg2=2,
+    )
 
 
 def _derive_split_sizes(bound: dict) -> dict | None:
@@ -597,28 +686,58 @@ def _derive_split_sizes(bound: dict) -> dict | None:
     return {"$attr:SZ": tuple(sizes)}
 
 
-_QKV_CAT = Op.make("concat",
-                   Op.make("concat", "Q", "K", dim=0),
-                   "V", dim=0)
+_QKV_CAT = Op.make(
+    "concat", Op.make("concat", "Q", "K", dim=0), "V", dim=0
+)
 
 QKV_FUSE_ASYM = R(
     "qkv_fuse_asym",
-    Op.make("sdpa",
-            _head_v(Op.make("linear", "x", "Q"), "S1"),
-            _head_v(Op.make("linear", "x", "K"), "S2"),
-            _head_v(Op.make("linear", "x", "V"), "S3"),
-            scale="SC", enable_gqa="G"),
-    Op.make("sdpa",
-            _head_v(Op.make("split", Op.make("linear", "x", _QKV_CAT),
-                            sizes="SZ", dim=-1, index=0), "S1"),
-            _head_v(Op.make("split", Op.make("linear", "x", _QKV_CAT),
-                            sizes="SZ", dim=-1, index=1), "S2"),
-            _head_v(Op.make("split", Op.make("linear", "x", _QKV_CAT),
-                            sizes="SZ", dim=-1, index=2), "S3"),
-            scale="SC", enable_gqa="G"),
+    Op.make(
+        "sdpa",
+        _head_v(Op.make("linear", "x", "Q"), "S1"),
+        _head_v(Op.make("linear", "x", "K"), "S2"),
+        _head_v(Op.make("linear", "x", "V"), "S3"),
+        scale="SC",
+        enable_gqa="G",
+    ),
+    Op.make(
+        "sdpa",
+        _head_v(
+            Op.make(
+                "split",
+                Op.make("linear", "x", _QKV_CAT),
+                sizes="SZ",
+                dim=-1,
+                index=0,
+            ),
+            "S1",
+        ),
+        _head_v(
+            Op.make(
+                "split",
+                Op.make("linear", "x", _QKV_CAT),
+                sizes="SZ",
+                dim=-1,
+                index=1,
+            ),
+            "S2",
+        ),
+        _head_v(
+            Op.make(
+                "split",
+                Op.make("linear", "x", _QKV_CAT),
+                sizes="SZ",
+                dim=-1,
+                index=2,
+            ),
+            "S3",
+        ),
+        scale="SC",
+        enable_gqa="G",
+    ),
     law="Asymmetric triple pairing: the same product law as qkv_fuse, "
-        "but the three projections have different output dims — one "
-        "GEMM, three uneven split views.  (GQA fused QKV.)",
+    "but the three projections have different output dims — one "
+    "GEMM, three uneven split views.  (GQA fused QKV.)",
     derive=_derive_split_sizes,
 )
 
@@ -634,18 +753,24 @@ QKV_FUSE_ASYM = R(
 #  pattern lives across three view ops plus a fused kernel flag.
 # ---------------------------------------------------------------------------
 
+
 def _check_repeat_chain(bound: dict, pre: str) -> bool:
     """reshape(expand(unsqueeze(t, d))) must be exactly repeat_interleave
     on dim d-1: unsqueeze inserts a 1, expand broadcasts only that dim
     by r, and the reshape merges dims d-1,d into one."""
     from catopt.cost import _shape_of as _so
+
     d = bound.get(f"$attr:UD{pre}")
     es = bound.get(f"$attr:ES{pre}")
     rs = bound.get(f"$attr:RS{pre}")
     base = bound.get(pre)
     bs = _so(base)
-    if not (isinstance(d, int) and isinstance(es, tuple)
-            and isinstance(rs, tuple) and isinstance(bs, tuple)):
+    if not (
+        isinstance(d, int)
+        and isinstance(es, tuple)
+        and isinstance(rs, tuple)
+        and isinstance(bs, tuple)
+    ):
         return False
     if any(x is None for x in bs):
         return False
@@ -659,7 +784,7 @@ def _check_repeat_chain(bound: dict, pre: str) -> bool:
         return False
     if any(es[i] != us[i] for i in range(len(us)) if i != d):
         return False  # expand may only grow the inserted dim
-    merged = us[:d - 1] + ((us[d - 1] or 0) * r,) + us[d + 1:]
+    merged = us[: d - 1] + ((us[d - 1] or 0) * r,) + us[d + 1 :]
     return rs == merged
 
 
@@ -667,6 +792,7 @@ def _check_gqa_absorb(bound: dict) -> bool:
     """Both k and v must be repeat-chains with the SAME repeat factor r,
     and q's head count must equal kv_heads * r."""
     from catopt.cost import _shape_of as _so
+
     for side in ("k", "v"):
         if not _check_repeat_chain(bound, side):
             return False
@@ -675,8 +801,12 @@ def _check_gqa_absorb(bound: dict) -> bool:
     d = bound["$attr:UDk"] % (len(_so(bound["k"])) + 1)
     r = bound["$attr:ESk"][d]
     qs, ks = _so(bound["q"]), _so(bound["k"])
-    if not (isinstance(qs, tuple) and isinstance(ks, tuple)
-            and len(qs) >= 2 and len(ks) >= 2):
+    if not (
+        isinstance(qs, tuple)
+        and isinstance(ks, tuple)
+        and len(qs) >= 2
+        and len(ks) >= 2
+    ):
         return False
     if None in qs or None in ks:
         return False
@@ -685,38 +815,53 @@ def _check_gqa_absorb(bound: dict) -> bool:
 
 _REPEAT_KV = Op.make(
     "transpose",
-    Op.make("reshape",
-            Op.make("expand",
-                    Op.make("unsqueeze", "k", arg1="UDk"),
-                    shape="ESk"),
-            shape="RSk"),
-    arg1=1, arg2=2)
+    Op.make(
+        "reshape",
+        Op.make(
+            "expand", Op.make("unsqueeze", "k", arg1="UDk"), shape="ESk"
+        ),
+        shape="RSk",
+    ),
+    arg1=1,
+    arg2=2,
+)
 
 _REPEAT_V = Op.make(
     "transpose",
-    Op.make("reshape",
-            Op.make("expand",
-                    Op.make("unsqueeze", "v", arg1="UDv"),
-                    shape="ESv"),
-            shape="RSv"),
-    arg1=1, arg2=2)
+    Op.make(
+        "reshape",
+        Op.make(
+            "expand", Op.make("unsqueeze", "v", arg1="UDv"), shape="ESv"
+        ),
+        shape="RSv",
+    ),
+    arg1=1,
+    arg2=2,
+)
 
 GQA_ABSORB = R(
     "gqa_absorb_repeat",
-    Op.make("sdpa",
-            Op.make("transpose", "q", arg1=1, arg2=2),
-            _REPEAT_KV,
-            _REPEAT_V,
-            arg4="D", arg5="C"),
-    Op.make("sdpa",
-            Op.make("transpose", "q", arg1=1, arg2=2),
-            Op.make("transpose", "k", arg1=1, arg2=2),
-            Op.make("transpose", "v", arg1=1, arg2=2),
-            arg4="D", arg5="C", arg7=True),
+    Op.make(
+        "sdpa",
+        Op.make("transpose", "q", arg1=1, arg2=2),
+        _REPEAT_KV,
+        _REPEAT_V,
+        arg4="D",
+        arg5="C",
+    ),
+    Op.make(
+        "sdpa",
+        Op.make("transpose", "q", arg1=1, arg2=2),
+        Op.make("transpose", "k", arg1=1, arg2=2),
+        Op.make("transpose", "v", arg1=1, arg2=2),
+        arg4="D",
+        arg5="C",
+        arg7=True,
+    ),
     law="The diagonal is natural: unsqueeze->expand->reshape copies each "
-        "kv head r times (repeat_kv).  SDPA implements that copy inside "
-        "the kernel via enable_gqa — pushing Delta into the consumer "
-        "deletes the materialisation entirely.",
+    "kv head r times (repeat_kv).  SDPA implements that copy inside "
+    "the kernel via enable_gqa — pushing Delta into the consumer "
+    "deletes the materialisation entirely.",
     check=_check_gqa_absorb,
 )
 
@@ -736,7 +881,8 @@ GQA_ABSORB = R(
 # ---------------------------------------------------------------------------
 
 _QK_SCORES = Op.make(
-    "matmul", "Q", Op.make("transpose", "K", arg1="TD1", arg2="TD2"))
+    "matmul", "Q", Op.make("transpose", "K", arg1="TD1", arg2="TD2")
+)
 
 
 def _const_val(t):
@@ -747,8 +893,12 @@ def _check_score_transpose(bound) -> bool:
     """k must be transposed on its last two dims — matmul(q, k^T)."""
     ks = _shape_of(bound.get("K"))
     d1, d2 = bound.get("$attr:TD1"), bound.get("$attr:TD2")
-    if not (isinstance(ks, tuple) and all(isinstance(x, int) for x in ks)
-            and isinstance(d1, int) and isinstance(d2, int)):
+    if not (
+        isinstance(ks, tuple)
+        and all(isinstance(x, int) for x in ks)
+        and isinstance(d1, int)
+        and isinstance(d2, int)
+    ):
         return False
     nd = len(ks)
     return {d1 % nd, d2 % nd} == {nd - 2, nd - 1}
@@ -805,39 +955,76 @@ def _make_sdpa_fold_rules() -> list:
     """6 mask/scale forms × optional eval-mode dropout wrapper."""
     out = []
     scaled = (
-        ("mul", lambda: Op.make("mul", _QK_SCORES, "S"),
-         _check_sdpa_scaled, _check_sdpa_mf_scaled, _derive_scale_mul),
-        ("div", lambda: Op.make("div", _QK_SCORES, "S"),
-         _check_sdpa_scaled, _check_sdpa_mf_scaled, _derive_scale_div),
-        ("", lambda: _QK_SCORES,
-         _check_sdpa_base, _check_sdpa_mf, _derive_scale_one),
+        (
+            "mul",
+            lambda: Op.make("mul", _QK_SCORES, "S"),
+            _check_sdpa_scaled,
+            _check_sdpa_mf_scaled,
+            _derive_scale_mul,
+        ),
+        (
+            "div",
+            lambda: Op.make("div", _QK_SCORES, "S"),
+            _check_sdpa_scaled,
+            _check_sdpa_mf_scaled,
+            _derive_scale_div,
+        ),
+        (
+            "",
+            lambda: _QK_SCORES,
+            _check_sdpa_base,
+            _check_sdpa_mf,
+            _derive_scale_one,
+        ),
     )
     wraps = (
         ("", lambda sm: sm),
-        ("_drop", lambda sm: Op.make("dropout", sm, arg1="DP", arg2="DT")),
+        (
+            "_drop",
+            lambda sm: Op.make("dropout", sm, arg1="DP", arg2="DT"),
+        ),
     )
     for sname, scores, check_add, check_mf, derive in scaled:
         for wname, wrap in wraps:
             sm = lambda inner: wrap(
-                Op.make("softmax", inner, arg1="SD"))
-            out.append(R(
-                f"sdpa_fold_add{sname}{wname}",
-                Op.make("matmul", sm(Op.make("add", scores(), "M")), "V"),
-                Op.make("sdpa", "Q", "K", "V", "M", scale="SC"),
-                law="softmax(qk^T s + m) v is sdpa — the additive mask is "
+                Op.make("softmax", inner, arg1="SD")
+            )
+            out.append(
+                R(
+                    f"sdpa_fold_add{sname}{wname}",
+                    Op.make(
+                        "matmul", sm(Op.make("add", scores(), "M")), "V"
+                    ),
+                    Op.make("sdpa", "Q", "K", "V", "M", scale="SC"),
+                    law="softmax(qk^T s + m) v is sdpa — the additive mask is "
                     "the kernel's attn_mask argument.",
-                check=check_add, derive=derive))
-            out.append(R(
-                f"sdpa_fold_masked_fill{sname}{wname}",
-                Op.make("matmul",
+                    check=check_add,
+                    derive=derive,
+                )
+            )
+            out.append(
+                R(
+                    f"sdpa_fold_masked_fill{sname}{wname}",
+                    Op.make(
+                        "matmul",
                         sm(Op.make("masked_fill", scores(), "MK", "F")),
-                        "V"),
-                Op.make("sdpa", "Q", "K", "V",
-                        Op.make("logical_not", "MK"), scale="SC"),
-                law="masked_fill(m, -inf) before softmax is a boolean "
+                        "V",
+                    ),
+                    Op.make(
+                        "sdpa",
+                        "Q",
+                        "K",
+                        "V",
+                        Op.make("logical_not", "MK"),
+                        scale="SC",
+                    ),
+                    law="masked_fill(m, -inf) before softmax is a boolean "
                     "attn_mask — logical_not turns the fill-mask into "
                     "SDPA's keep-mask.",
-                check=check_mf, derive=derive))
+                    check=check_mf,
+                    derive=derive,
+                )
+            )
     return out
 
 
@@ -875,7 +1062,7 @@ ASSOC_MATMUL_REV = R(
     "assoc_matmul_rev",
     Op.make("matmul", Op.make("matmul", "A", "B"), "C"),
     Op.make("matmul", "A", Op.make("matmul", "B", "C")),
-        law="Reverse associativity: f∘(g∘h) = (f∘g)∘h.",
+    law="Reverse associativity: f∘(g∘h) = (f∘g)∘h.",
 )
 
 
@@ -898,8 +1085,10 @@ ASSOC_MATMUL_REV = R(
 #  every weight must be param-only so the concat folds at compile time.
 # ---------------------------------------------------------------------------
 
+
 def _term_has_var(t: Any) -> bool:
     from catopt.ir import Var
+
     if isinstance(t, Var):
         return True
     if isinstance(t, Op):
@@ -907,8 +1096,9 @@ def _term_has_var(t: Any) -> bool:
     return False
 
 
-def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
-                       cluster_key) -> list[dict[int, Any]]:
+def _pair_shared_input(
+    eg: Any, *, op: str, split_dim: int, cluster_key
+) -> list[dict[int, Any]]:
     """Product law over an arbitrary projection signature.
 
     Groups ``op`` e-nodes by shared input e-class and offers each member
@@ -954,9 +1144,9 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
             # second concat; keeping the pairing arity at (x, w).
             if node.op != op or len(node.children) != 2:
                 continue
-            by_input.setdefault(
-                eg.find(node.children[0]), []
-            ).append((node, cid, eg.find(node.children[1])))
+            by_input.setdefault(eg.find(node.children[0]), []).append(
+                (node, cid, eg.find(node.children[1]))
+            )
 
     groups: list[dict[int, Any]] = []
     for x_eid, members in by_input.items():
@@ -1006,18 +1196,30 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
             cat = weights[0]
             for w in weights[1:]:
                 cat = eg.add_enode("concat", (cat, w), {"dim": 0})
-            fused = eg.add_enode(op, (x_eid, cat),
-                                 dict(cluster[0][0].attrs))
+            fused = eg.add_enode(
+                op, (x_eid, cat), dict(cluster[0][0].attrs)
+            )
             index_of = {w: i for i, w in enumerate(weights)}
             group: dict[int, Any] = {}
             for _, cid, w in cluster:
-                enode = ENode("split", (fused,), (
-                    ("dim", split_dim), ("index", index_of[w]),
-                    ("sizes", tuple(sizes)),
-                ))
-                split_eid = eg.add_enode("split", (fused,), {
-                    "sizes": tuple(sizes), "dim": split_dim,
-                    "index": index_of[w]})
+                enode = ENode(
+                    "split",
+                    (fused,),
+                    (
+                        ("dim", split_dim),
+                        ("index", index_of[w]),
+                        ("sizes", tuple(sizes)),
+                    ),
+                )
+                split_eid = eg.add_enode(
+                    "split",
+                    (fused,),
+                    {
+                        "sizes": tuple(sizes),
+                        "dim": split_dim,
+                        "index": index_of[w],
+                    },
+                )
                 # Replayable witness: the member's own class term ->
                 # its section of the fused GEMM.  Pointwise honesty —
                 # asserts this instance, exactly what the pass proved.
@@ -1027,11 +1229,15 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
                 if src is not None and split_term is not None:
                     wit = Rewrite(
                         name=f"pair#{split_eid}",
-                        lhs=src, rhs=split_term,
-                        law=("pointwise witness for a non-local offer: "
-                             "this member equals its split section of "
-                             "the shared fused weight (equality "
-                             "established by the pairing pass)"))
+                        lhs=src,
+                        rhs=split_term,
+                        law=(
+                            "pointwise witness for a non-local offer: "
+                            "this member equals its split section of "
+                            "the shared fused weight (equality "
+                            "established by the pairing pass)"
+                        ),
+                    )
                 eg.union(cid, split_eid, witness=wit)
                 group.setdefault(cid, enode)
             groups.append(group)
@@ -1040,6 +1246,7 @@ def _pair_shared_input(eg: Any, *, op: str, split_dim: int,
 
 def _wshape(t: Any):
     from catopt.cost import _shape_of as _so
+
     return _so(t)
 
 
@@ -1056,13 +1263,17 @@ def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:
 
     Idempotent: re-running rebuilds the same (hash-consed) enodes.
     """
+
     def key(enode, wt):
         s = _wshape(wt)
         # 2-D weight only (a 1-D "weight" cannot cat along out-dim).
-        return ("lin",) if isinstance(s, tuple) and len(s) == 2 else None
+        return (
+            ("lin",) if isinstance(s, tuple) and len(s) == 2 else None
+        )
 
-    return _pair_shared_input(eg, op="linear", split_dim=-1,
-                              cluster_key=key)
+    return _pair_shared_input(
+        eg, op="linear", split_dim=-1, cluster_key=key
+    )
 
 
 _CONV_ATTR_KEYS = ("stride", "padding", "dilation", "groups")
@@ -1075,6 +1286,7 @@ def pair_shared_input_convs(eg: Any) -> list[dict[int, Any]]:
     when members share stride/padding/dilation/groups and kernel dims;
     the projections split the output along the channel dim (1).
     """
+
     def key(enode, wt):
         a = dict(enode.attrs)
         if a.get("groups", 1) != 1:
@@ -1084,15 +1296,19 @@ def pair_shared_input_convs(eg: Any) -> list[dict[int, Any]]:
             return None
         # same non-weight attrs AND same (in_ch, kh, kw) — cat on O
         # requires identical trailing weight dims.
-        return (tuple(sorted(
-            (k, a[k]) for k in _CONV_ATTR_KEYS if k in a)), s[1:])
+        return (
+            tuple(sorted((k, a[k]) for k in _CONV_ATTR_KEYS if k in a)),
+            s[1:],
+        )
 
-    return _pair_shared_input(eg, op="conv2d", split_dim=1,
-                              cluster_key=key)
+    return _pair_shared_input(
+        eg, op="conv2d", split_dim=1, cluster_key=key
+    )
 
 
-def share_duplicate_params(eg: Any, source_tensors: dict,
-                           *, witness: bool = True) -> list[list[str]]:
+def share_duplicate_params(
+    eg: Any, source_tensors: dict, *, witness: bool = True
+) -> list[list[str]]:
     """Union the e-classes of Param leaves holding identical tensors —
     exact weight *tying* discovered, not declared.
 
@@ -1113,6 +1329,7 @@ def share_duplicate_params(eg: Any, source_tensors: dict,
     passes — certificates replay it as a rule step.
     """
     import torch as _t
+
     from catopt.ir import Param, TensorType
 
     by_sig: dict[tuple, list[str]] = {}
@@ -1146,8 +1363,9 @@ def share_duplicate_params(eg: Any, source_tensors: dict,
     for cluster in groups:
         canon = cluster[0]
         ct = source_tensors[canon]
-        canon_term = Param(canon, TensorType(tuple(int(d)
-                                               for d in ct.shape)))
+        canon_term = Param(
+            canon, TensorType(tuple(int(d) for d in ct.shape))
+        )
         canon_eid = eg.add_term(canon_term)
         for name in cluster[1:]:
             t = source_tensors[name]
@@ -1163,16 +1381,25 @@ def share_duplicate_params(eg: Any, source_tensors: dict,
                         "pointwise witness for exact weight tying: "
                         "the two parameter leaves hold bitwise-equal "
                         "tensors (equality established by the sharing "
-                        "pass over source tensors)"))
-            eg.union(eid, canon_eid, witness=wit,
-                     note=f"share_duplicate_params: {name} == {canon}")
+                        "pass over source tensors)"
+                    ),
+                )
+            eg.union(
+                eid,
+                canon_eid,
+                witness=wit,
+                note=f"share_duplicate_params: {name} == {canon}",
+            )
     return groups
 
 
 def share_duplicate_param_slices(
-        eg: Any, source_tensors: dict, *,
-        witness: bool = True,
-        head_counts: range = range(2, 65)) -> list[dict]:
+    eg: Any,
+    source_tensors: dict,
+    *,
+    witness: bool = True,
+    head_counts: range = range(2, 65),
+) -> list[dict]:
     """Slice-level weight sharing: deduplicate bitwise-equal row-blocks
     INSIDE a single 2-D parameter — the intra-tensor analogue of
     :func:`share_duplicate_params`.
@@ -1223,6 +1450,7 @@ def share_duplicate_param_slices(
       stored_before, stored_after, eid}``.
     """
     import torch as _t
+
     from catopt.egraph import ENode
     from catopt.ir import Param, TensorType
 
@@ -1246,9 +1474,14 @@ def share_duplicate_param_slices(
             # Group head-blocks by raw bytes — bitwise equality, not
             # torch.equal's value equality.
             sigs = [
-                t[j * d:(j + 1) * d].detach().cpu().contiguous()
-                .numpy().tobytes()
-                for j in range(h)]
+                t[j * d : (j + 1) * d]
+                .detach()
+                .cpu()
+                .contiguous()
+                .numpy()
+                .tobytes()
+                for j in range(h)
+            ]
             uniq: list[bytes] = []
             imap: list[int] = []
             for s in sigs:
@@ -1261,8 +1494,13 @@ def share_duplicate_param_slices(
             stored = k * d * i
             if k < h and (best is None or stored < best[0]):
                 first = [imap.index(u) for u in range(k)]
-                best = (stored, h, d, tuple(imap),
-                        [t[f * d:(f + 1) * d] for f in first])
+                best = (
+                    stored,
+                    h,
+                    d,
+                    tuple(imap),
+                    [t[f * d : (f + 1) * d] for f in first],
+                )
         if best is None:
             continue
         stored, h, d, imap, uniques = best
@@ -1272,8 +1510,10 @@ def share_duplicate_param_slices(
             dedup = _t.stack(uniques, dim=0).detach().clone()
         dedup_name = f"{name}__heads{h}"
         # Fresh registration; reuse an identical prior entry on re-run.
-        if not (dedup_name in source_tensors
-                and _t.equal(source_tensors[dedup_name], dedup)):
+        if not (
+            dedup_name in source_tensors
+            and _t.equal(source_tensors[dedup_name], dedup)
+        ):
             base_name, n = dedup_name, 0
             while dedup_name in source_tensors:
                 n += 1
@@ -1284,30 +1524,49 @@ def share_duplicate_param_slices(
         member = Op.make(
             "reshape",
             Op.make("index_select", p_dedup, dim=0, index=imap),
-            shape=(o, i))
+            shape=(o, i),
+        )
         member_eid = eg.add_term(
-            member, provenance="share_duplicate_param_slices")
+            member, provenance="share_duplicate_param_slices"
+        )
         w_term = Param(name, TensorType((o, i)))
         wit = None
         if witness:
             wit = Rewrite(
                 name=f"share_slices#{member_eid}",
-                lhs=w_term, rhs=member,
-                law=("pointwise witness for slice-level weight sharing: "
-                     "the parameter's head row-blocks are bitwise-equal "
-                     "to blocks of the deduplicated stack under "
-                     "index_map (equality established by the sharing "
-                     "pass over source tensors)"),
-                error_bound=None)
-        eg.union(w_eid, member_eid, witness=wit,
-                 note=(f"share_duplicate_param_slices: {name} (o={o}) "
-                       f"= {h} heads x {d} rows -> {k} unique"))
-        offers.append({
-            "param": name, "heads": h, "head_dim": d, "unique": k,
-            "index_map": imap, "dedup_param": dedup_name,
-            "stored_before": o * i, "stored_after": k * d * i,
-            "eid": member_eid,
-        })
+                lhs=w_term,
+                rhs=member,
+                law=(
+                    "pointwise witness for slice-level weight sharing: "
+                    "the parameter's head row-blocks are bitwise-equal "
+                    "to blocks of the deduplicated stack under "
+                    "index_map (equality established by the sharing "
+                    "pass over source tensors)"
+                ),
+                error_bound=None,
+            )
+        eg.union(
+            w_eid,
+            member_eid,
+            witness=wit,
+            note=(
+                f"share_duplicate_param_slices: {name} (o={o}) "
+                f"= {h} heads x {d} rows -> {k} unique"
+            ),
+        )
+        offers.append(
+            {
+                "param": name,
+                "heads": h,
+                "head_dim": d,
+                "unique": k,
+                "index_map": imap,
+                "dedup_param": dedup_name,
+                "stored_before": o * i,
+                "stored_after": k * d * i,
+                "eid": member_eid,
+            }
+        )
     return offers
 
 
@@ -1385,54 +1644,64 @@ CATEGORICAL_RULES: list[Rewrite] = [
 # ``aff_compose(f,g)`` — f∘g as an affine object
 # ``apply(f, h)``    — evaluate the map on h (back in tensor-land)
 
-AFF_LIFT = R("aff_lift",
-             Op.make("add", Op.make("matmul", "A", "h"), "x"),
-             Op.make("apply", Op.make("aff", "A", "x"), "h"),
-             law="recurrence step is affine-map application")
+AFF_LIFT = R(
+    "aff_lift",
+    Op.make("add", Op.make("matmul", "A", "h"), "x"),
+    Op.make("apply", Op.make("aff", "A", "x"), "h"),
+    law="recurrence step is affine-map application",
+)
 
-AFF_LIFT_STEP = R("aff_lift_step",
-                  Op.make("add",
-                          Op.make("matmul", "A",
-                                  Op.make("apply", "f", "h")),
-                          "x"),
-                  Op.make("apply",
-                          Op.make("aff_compose",
-                                  Op.make("aff", "A", "x"), "f"),
-                          "h"),
-                  law="compose step with the preceding map")
+AFF_LIFT_STEP = R(
+    "aff_lift_step",
+    Op.make(
+        "add", Op.make("matmul", "A", Op.make("apply", "f", "h")), "x"
+    ),
+    Op.make(
+        "apply",
+        Op.make("aff_compose", Op.make("aff", "A", "x"), "f"),
+        "h",
+    ),
+    law="compose step with the preceding map",
+)
 
-AFF_UNLIFT = R("aff_unlift",
-               Op.make("apply", Op.make("aff", "A", "x"), "h"),
-               Op.make("add", Op.make("matmul", "A", "h"), "x"),
-               law="affine application unfolds")
+AFF_UNLIFT = R(
+    "aff_unlift",
+    Op.make("apply", Op.make("aff", "A", "x"), "h"),
+    Op.make("add", Op.make("matmul", "A", "h"), "x"),
+    law="affine application unfolds",
+)
 
-AFF_COMPOSE_UNFOLD = R("aff_compose_unfold",
-                       Op.make("apply",
-                               Op.make("aff_compose", "f", "g"), "h"),
-                       Op.make("apply", "f",
-                               Op.make("apply", "g", "h")),
-                       law="composition is sequential application")
+AFF_COMPOSE_UNFOLD = R(
+    "aff_compose_unfold",
+    Op.make("apply", Op.make("aff_compose", "f", "g"), "h"),
+    Op.make("apply", "f", Op.make("apply", "g", "h")),
+    law="composition is sequential application",
+)
 
-AFF_ASSOC = R("aff_assoc",
-              Op.make("aff_compose",
-                      Op.make("aff_compose", "f", "g"), "h"),
-              Op.make("aff_compose", "f",
-                      Op.make("aff_compose", "g", "h")),
-              law="affine composition is associative")
+AFF_ASSOC = R(
+    "aff_assoc",
+    Op.make("aff_compose", Op.make("aff_compose", "f", "g"), "h"),
+    Op.make("aff_compose", "f", Op.make("aff_compose", "g", "h")),
+    law="affine composition is associative",
+)
 
-AFF_ASSOC_REV = R("aff_assoc_rev",
-                  Op.make("aff_compose", "f",
-                          Op.make("aff_compose", "g", "h")),
-                  Op.make("aff_compose",
-                          Op.make("aff_compose", "f", "g"), "h"),
-                  law="affine composition is associative")
+AFF_ASSOC_REV = R(
+    "aff_assoc_rev",
+    Op.make("aff_compose", "f", Op.make("aff_compose", "g", "h")),
+    Op.make("aff_compose", Op.make("aff_compose", "f", "g"), "h"),
+    law="affine composition is associative",
+)
 
 #: Minimal law set for scan discovery.  Deliberately excludes
 #: ``comm_add``: commutativity is the explosive law (permutation space)
 #: and Blelloch reassociation is order-preserving.
 SCAN_LAWS: list[Rewrite] = [
-    AFF_LIFT, AFF_LIFT_STEP, AFF_UNLIFT, AFF_COMPOSE_UNFOLD,
-    AFF_ASSOC, AFF_ASSOC_REV,
+    AFF_LIFT,
+    AFF_LIFT_STEP,
+    AFF_UNLIFT,
+    AFF_COMPOSE_UNFOLD,
+    AFF_ASSOC,
+    AFF_ASSOC_REV,
 ]
 
 
@@ -1485,80 +1754,95 @@ def _affd_state_like(bound: dict) -> bool:
 # cross-bindings (state vs input swapped) from firing spuriously, so
 # exactly one variant fires per ``add`` e-node.
 
-AFFD_LIFT = R("affd_lift",
-              Op.make("add", Op.make("mul", "a", "h"), "x"),
-              Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
-              law="diagonal recurrence step is diagonal-affine "
-                  "application: a⊙h + x = (aff_diag(a,x))(h)",
-              check=_affd_state_like)
+AFFD_LIFT = R(
+    "affd_lift",
+    Op.make("add", Op.make("mul", "a", "h"), "x"),
+    Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+    law="diagonal recurrence step is diagonal-affine "
+    "application: a⊙h + x = (aff_diag(a,x))(h)",
+    check=_affd_state_like,
+)
 
-AFFD_LIFT_SWAP = R("affd_lift_swap",
-                   Op.make("add", Op.make("mul", "h", "a"), "x"),
-                   Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
-                   law="mul-order variant of affd_lift (canonicalised "
-                       "terms put the state operand first)",
-                   check=_affd_state_like)
+AFFD_LIFT_SWAP = R(
+    "affd_lift_swap",
+    Op.make("add", Op.make("mul", "h", "a"), "x"),
+    Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+    law="mul-order variant of affd_lift (canonicalised "
+    "terms put the state operand first)",
+    check=_affd_state_like,
+)
 
-AFFD_LIFT_POST = R("affd_lift_post",
-                   Op.make("add", "x", Op.make("mul", "a", "h")),
-                   Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
-                   law="add-order variant of affd_lift (state-mul in "
-                       "the second add slot)",
-                   check=_affd_state_like)
+AFFD_LIFT_POST = R(
+    "affd_lift_post",
+    Op.make("add", "x", Op.make("mul", "a", "h")),
+    Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+    law="add-order variant of affd_lift (state-mul in "
+    "the second add slot)",
+    check=_affd_state_like,
+)
 
-AFFD_LIFT_POST_SWAP = R("affd_lift_post_swap",
-                        Op.make("add", "x", Op.make("mul", "h", "a")),
-                        Op.make("applyd",
-                                Op.make("aff_diag", "a", "x"), "h"),
-                        law="remaining operand position of affd_lift",
-                        check=_affd_state_like)
+AFFD_LIFT_POST_SWAP = R(
+    "affd_lift_post_swap",
+    Op.make("add", "x", Op.make("mul", "h", "a")),
+    Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+    law="remaining operand position of affd_lift",
+    check=_affd_state_like,
+)
 
 # The step rules need no side condition: the ``applyd`` inside the mul
 # already pins the state operand — an input e-class contains no
 # ``applyd`` enode, so only the true direction matches.
-AFFD_LIFT_STEP = R("affd_lift_step",
-                   Op.make("add",
-                           Op.make("mul", "a",
-                                   Op.make("applyd", "f", "h")),
-                           "x"),
-                   Op.make("applyd",
-                           Op.make("affd_compose",
-                                   Op.make("aff_diag", "a", "x"), "f"),
-                           "h"),
-                   law="compose step with the preceding map")
+AFFD_LIFT_STEP = R(
+    "affd_lift_step",
+    Op.make(
+        "add", Op.make("mul", "a", Op.make("applyd", "f", "h")), "x"
+    ),
+    Op.make(
+        "applyd",
+        Op.make("affd_compose", Op.make("aff_diag", "a", "x"), "f"),
+        "h",
+    ),
+    law="compose step with the preceding map",
+)
 
 AFFD_LIFT_STEP_SWAP = R(
     "affd_lift_step_swap",
-    Op.make("add",
-            Op.make("mul", Op.make("applyd", "f", "h"), "a"),
-            "x"),
-    Op.make("applyd",
-            Op.make("affd_compose",
-                    Op.make("aff_diag", "a", "x"), "f"),
-            "h"),
-    law="mul-order variant of affd_lift_step")
+    Op.make(
+        "add", Op.make("mul", Op.make("applyd", "f", "h"), "a"), "x"
+    ),
+    Op.make(
+        "applyd",
+        Op.make("affd_compose", Op.make("aff_diag", "a", "x"), "f"),
+        "h",
+    ),
+    law="mul-order variant of affd_lift_step",
+)
 
 AFFD_LIFT_STEP_POST = R(
     "affd_lift_step_post",
-    Op.make("add", "x",
-            Op.make("mul", "a",
-                    Op.make("applyd", "f", "h"))),
-    Op.make("applyd",
-            Op.make("affd_compose",
-                    Op.make("aff_diag", "a", "x"), "f"),
-            "h"),
-    law="add-order variant of affd_lift_step")
+    Op.make(
+        "add", "x", Op.make("mul", "a", Op.make("applyd", "f", "h"))
+    ),
+    Op.make(
+        "applyd",
+        Op.make("affd_compose", Op.make("aff_diag", "a", "x"), "f"),
+        "h",
+    ),
+    law="add-order variant of affd_lift_step",
+)
 
 AFFD_LIFT_STEP_POST_SWAP = R(
     "affd_lift_step_post_swap",
-    Op.make("add", "x",
-            Op.make("mul",
-                    Op.make("applyd", "f", "h"), "a")),
-    Op.make("applyd",
-            Op.make("affd_compose",
-                    Op.make("aff_diag", "a", "x"), "f"),
-            "h"),
-    law="remaining operand position of affd_lift_step")
+    Op.make(
+        "add", "x", Op.make("mul", Op.make("applyd", "f", "h"), "a")
+    ),
+    Op.make(
+        "applyd",
+        Op.make("affd_compose", Op.make("aff_diag", "a", "x"), "f"),
+        "h",
+    ),
+    law="remaining operand position of affd_lift_step",
+)
 
 # --- unit lift: pure accumulation -----------------------------------
 # ``add(h, x)`` — the recurrence ``h_t = h_{t-1} + x_t`` (cumsum,
@@ -1598,15 +1882,18 @@ def _derive_affd_unit(bound: dict) -> dict | None:
     materialise at the add's output shape (all ones).  Vetoes the
     firing when either bound term's shape is non-concrete."""
     from catopt.cost import _broadcast
+
     s = _broadcast(_shape_of(bound.get("h")), _shape_of(bound.get("x")))
-    if not (isinstance(s, tuple)
-            and all(isinstance(d, int) for d in s)):
+    if not (
+        isinstance(s, tuple) and all(isinstance(d, int) for d in s)
+    ):
         return None
     # The RHS embeds ``Const(1.0)`` as a leaf; ``_instantiate`` adds
     # leaf enodes keyed by repr WITHOUT registering the term, so
     # ``any_term``/extraction would decode the raw string "1.0" unless
     # the leaf is registered here, ahead of instantiation.
     from catopt.egraph import _LeafRegistry
+
     _LeafRegistry.register(Const(1.0))
     return {"$attr:US": tuple(s)}
 
@@ -1626,18 +1913,20 @@ AFFD_LIFT_UNIT = R(
     Op.make("add", "h", "x"),
     Op.make("applyd", Op.make("aff_diag", _AFFD_UNIT, "x"), "h"),
     law="Unit introduction: pure accumulation h + x IS the diagonal "
-        "affine map with a ≡ 1 — applyd(aff_diag(1, x), h).",
+    "affine map with a ≡ 1 — applyd(aff_diag(1, x), h).",
     check=_affd_unit_state_like,
-    derive=_derive_affd_unit)
+    derive=_derive_affd_unit,
+)
 
 AFFD_LIFT_UNIT_POST = R(
     "affd_lift_unit_post",
     Op.make("add", "x", "h"),
     Op.make("applyd", Op.make("aff_diag", _AFFD_UNIT, "x"), "h"),
     law="add-order variant of affd_lift_unit (state operand in the "
-        "second add slot)",
+    "second add slot)",
     check=_affd_unit_state_like,
-    derive=_derive_affd_unit)
+    derive=_derive_affd_unit,
+)
 
 # The step rules need no side condition: the ``applyd`` inside the add
 # already pins the state operand — an input e-class contains no
@@ -1646,53 +1935,60 @@ AFFD_LIFT_UNIT_POST = R(
 # first, then h ↦ 1⊙(f·h) + x = f(h) + x.
 AFFD_LIFT_UNIT_STEP = R(
     "affd_lift_unit_step",
-    Op.make("add",
-            Op.make("applyd", "f", "h"),
-            "x"),
-    Op.make("applyd",
-            Op.make("affd_compose",
-                    Op.make("aff_diag", _AFFD_UNIT, "x"), "f"),
-            "h"),
+    Op.make("add", Op.make("applyd", "f", "h"), "x"),
+    Op.make(
+        "applyd",
+        Op.make(
+            "affd_compose", Op.make("aff_diag", _AFFD_UNIT, "x"), "f"
+        ),
+        "h",
+    ),
     law="compose a unit (pure-accumulation) step with the preceding "
-        "map — the h ↦ h + x analogue of affd_lift_step",
-    derive=_derive_affd_unit)
+    "map — the h ↦ h + x analogue of affd_lift_step",
+    derive=_derive_affd_unit,
+)
 
 AFFD_LIFT_UNIT_STEP_POST = R(
     "affd_lift_unit_step_post",
-    Op.make("add", "x",
-            Op.make("applyd", "f", "h")),
-    Op.make("applyd",
-            Op.make("affd_compose",
-                    Op.make("aff_diag", _AFFD_UNIT, "x"), "f"),
-            "h"),
+    Op.make("add", "x", Op.make("applyd", "f", "h")),
+    Op.make(
+        "applyd",
+        Op.make(
+            "affd_compose", Op.make("aff_diag", _AFFD_UNIT, "x"), "f"
+        ),
+        "h",
+    ),
     law="add-order variant of affd_lift_unit_step",
-    derive=_derive_affd_unit)
+    derive=_derive_affd_unit,
+)
 
-AFFD_UNLIFT = R("affd_unlift",
-                Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
-                Op.make("add", Op.make("mul", "a", "h"), "x"),
-                law="diagonal-affine application unfolds")
+AFFD_UNLIFT = R(
+    "affd_unlift",
+    Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
+    Op.make("add", Op.make("mul", "a", "h"), "x"),
+    law="diagonal-affine application unfolds",
+)
 
-AFFD_COMPOSE_UNFOLD = R("affd_compose_unfold",
-                        Op.make("applyd",
-                                Op.make("affd_compose", "f", "g"), "h"),
-                        Op.make("applyd", "f",
-                                Op.make("applyd", "g", "h")),
-                        law="composition is sequential application")
+AFFD_COMPOSE_UNFOLD = R(
+    "affd_compose_unfold",
+    Op.make("applyd", Op.make("affd_compose", "f", "g"), "h"),
+    Op.make("applyd", "f", Op.make("applyd", "g", "h")),
+    law="composition is sequential application",
+)
 
-AFFD_ASSOC = R("affd_assoc",
-               Op.make("affd_compose",
-                       Op.make("affd_compose", "f", "g"), "h"),
-               Op.make("affd_compose", "f",
-                       Op.make("affd_compose", "g", "h")),
-               law="diagonal-affine composition is associative")
+AFFD_ASSOC = R(
+    "affd_assoc",
+    Op.make("affd_compose", Op.make("affd_compose", "f", "g"), "h"),
+    Op.make("affd_compose", "f", Op.make("affd_compose", "g", "h")),
+    law="diagonal-affine composition is associative",
+)
 
-AFFD_ASSOC_REV = R("affd_assoc_rev",
-                   Op.make("affd_compose", "f",
-                           Op.make("affd_compose", "g", "h")),
-                   Op.make("affd_compose",
-                           Op.make("affd_compose", "f", "g"), "h"),
-                   law="diagonal-affine composition is associative")
+AFFD_ASSOC_REV = R(
+    "affd_assoc_rev",
+    Op.make("affd_compose", "f", Op.make("affd_compose", "g", "h")),
+    Op.make("affd_compose", Op.make("affd_compose", "f", "g"), "h"),
+    law="diagonal-affine composition is associative",
+)
 
 #: Minimal law set for diagonal-scan discovery — the mul-form mirror of
 #: ``SCAN_LAWS``, plus the unit lift for pure accumulations.  Covers
@@ -1700,12 +1996,22 @@ AFFD_ASSOC_REV = R("affd_assoc_rev",
 #: comm-normalisation; ``_affd_state_like``/``_affd_unit_state_like``
 #: suppress the sideways firings.
 SCAN_DIAG_LAWS: list[Rewrite] = [
-    AFFD_LIFT, AFFD_LIFT_SWAP, AFFD_LIFT_POST, AFFD_LIFT_POST_SWAP,
-    AFFD_LIFT_STEP, AFFD_LIFT_STEP_SWAP,
-    AFFD_LIFT_STEP_POST, AFFD_LIFT_STEP_POST_SWAP,
-    AFFD_LIFT_UNIT, AFFD_LIFT_UNIT_POST,
-    AFFD_LIFT_UNIT_STEP, AFFD_LIFT_UNIT_STEP_POST,
-    AFFD_UNLIFT, AFFD_COMPOSE_UNFOLD, AFFD_ASSOC, AFFD_ASSOC_REV,
+    AFFD_LIFT,
+    AFFD_LIFT_SWAP,
+    AFFD_LIFT_POST,
+    AFFD_LIFT_POST_SWAP,
+    AFFD_LIFT_STEP,
+    AFFD_LIFT_STEP_SWAP,
+    AFFD_LIFT_STEP_POST,
+    AFFD_LIFT_STEP_POST_SWAP,
+    AFFD_LIFT_UNIT,
+    AFFD_LIFT_UNIT_POST,
+    AFFD_LIFT_UNIT_STEP,
+    AFFD_LIFT_UNIT_STEP_POST,
+    AFFD_UNLIFT,
+    AFFD_COMPOSE_UNFOLD,
+    AFFD_ASSOC,
+    AFFD_ASSOC_REV,
 ]
 
 

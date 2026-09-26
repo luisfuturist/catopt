@@ -42,18 +42,16 @@ Honest limits, exercised here as vetoes:
 from __future__ import annotations
 
 import torch
-import pytest
 
-from catopt.egraph import EGraph
-from catopt import meta
-from catopt.ir import Op, Var, TensorType
-from catopt.torch_bridge import _IR_TO_TORCH
 import catopt.xcarrier as XC
-
+from catopt import meta
+from catopt.egraph import EGraph
+from catopt.ir import Op, TensorType, Var
 
 # ---------------------------------------------------------------------------
 #  helpers (same conventions as test_xcarrier.py)
 # ---------------------------------------------------------------------------
+
 
 def _V(name: str, shape) -> Var:
     return Var(name, TensorType(tuple(shape)))
@@ -70,8 +68,8 @@ def _law(rule, t0, env, tol=1e-10):
     a = meta._eval_term(t0, env)
     b = meta._eval_term(applied, env)
     assert meta._eval_allclose(a, b, tol=tol), (
-        f"{rule.name}: fp64 mismatch "
-        f"{(a - b).abs().max().item():.3e}")
+        f"{rule.name}: fp64 mismatch {(a - b).abs().max().item():.3e}"
+    )
     return applied
 
 
@@ -87,23 +85,33 @@ def _class_ops(eg: EGraph, eid: int) -> set:
 #  A. The view-commute laws — dense fiber
 # ---------------------------------------------------------------------------
 
+
 def test_reshape_apply_dense_headsplit():
     """The MHA head split: reshape(apply(aff(A,b),h), (T,nh,hd))
     sinks into the map — A's input axis stays last."""
     T, nh, hd, i = 8, 4, 3, 5
     o = nh * hd
     A, b, h = _V("A", (T, o, i)), _V("b", (T, o)), _V("h", (i,))
-    env = {A: _rand((T, o, i), 1), b: _rand((T, o), 2),
-           h: _rand((i,), 3)}
-    t0 = Op.make("reshape",
-                 Op.make("apply", Op.make("aff", A, b), h),
-                 shape=(T, nh, hd))
+    env = {
+        A: _rand((T, o, i), 1),
+        b: _rand((T, o), 2),
+        h: _rand((i,), 3),
+    }
+    t0 = Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", A, b), h),
+        shape=(T, nh, hd),
+    )
     out = _law(XC.XC_RESHAPE_APPLY, t0, env)
     # the minted form really is apply(aff(reshape A, reshape b), h)
     assert out.op == "apply" and out.args[0].op == "aff"
     amap = out.args[0].args[0]
     assert amap.op == "reshape" and tuple(amap.attrs["shape"]) == (
-        T, nh, hd, i)
+        T,
+        nh,
+        hd,
+        i,
+    )
     # reverse refolds
     back = _law(XC.XC_RESHAPE_APPLY_REV, out, env)
 
@@ -112,13 +120,21 @@ def test_reshape_apply_dense_merge():
     """Any well-typed value reshape works — also merging axes back:
     (T,nh,hd) -> (T, nh*hd)."""
     T, nh, hd, i = 8, 4, 3, 5
-    A, b, h = _V("A", (T, nh, hd, i)), _V("b", (T, nh, hd)), \
-        _V("h", (i,))
-    env = {A: _rand((T, nh, hd, i), 4), b: _rand((T, nh, hd), 5),
-           h: _rand((i,), 6)}
-    t0 = Op.make("reshape",
-                 Op.make("apply", Op.make("aff", A, b), h),
-                 shape=(T, nh * hd))
+    A, b, h = (
+        _V("A", (T, nh, hd, i)),
+        _V("b", (T, nh, hd)),
+        _V("h", (i,)),
+    )
+    env = {
+        A: _rand((T, nh, hd, i), 4),
+        b: _rand((T, nh, hd), 5),
+        h: _rand((i,), 6),
+    }
+    t0 = Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", A, b), h),
+        shape=(T, nh * hd),
+    )
     _law(XC.XC_RESHAPE_APPLY, t0, env)
 
 
@@ -126,13 +142,21 @@ def test_reshape_apply_dense_minus1():
     """Exported views can carry a literal -1 — it resolves against the
     value numel and is carried verbatim onto the map's reshape."""
     T, nh, hd, i = 8, 4, 3, 5
-    A, b, h = _V("A", (T, nh * hd, i)), _V("b", (T, nh * hd)), \
-        _V("h", (i,))
-    env = {A: _rand((T, nh * hd, i), 7), b: _rand((T, nh * hd), 8),
-           h: _rand((i,), 9)}
-    t0 = Op.make("reshape",
-                 Op.make("apply", Op.make("aff", A, b), h),
-                 shape=(T, -1, hd))
+    A, b, h = (
+        _V("A", (T, nh * hd, i)),
+        _V("b", (T, nh * hd)),
+        _V("h", (i,)),
+    )
+    env = {
+        A: _rand((T, nh * hd, i), 7),
+        b: _rand((T, nh * hd), 8),
+        h: _rand((i,), 9),
+    }
+    t0 = Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", A, b), h),
+        shape=(T, -1, hd),
+    )
     _law(XC.XC_RESHAPE_APPLY, t0, env)
 
 
@@ -141,14 +165,18 @@ def test_reshape_apply_vetoes():
     vetoed; (ii) a numel-inconsistent shape is not a view — vetoed."""
     T, o, i = 8, 12, 5
     A, b, h = _V("A", (T, o, i)), _V("b", (T, o)), _V("h", (i,))
-    bb = _V("bb", (o,))                       # broadcast-smaller b
-    t0 = Op.make("reshape",
-                 Op.make("apply", Op.make("aff", A, bb), h),
-                 shape=(T, 4, 3))
+    bb = _V("bb", (o,))  # broadcast-smaller b
+    t0 = Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", A, bb), h),
+        shape=(T, 4, 3),
+    )
     _no_fire(XC.XC_RESHAPE_APPLY, t0)
-    t0 = Op.make("reshape",
-                 Op.make("apply", Op.make("aff", A, b), h),
-                 shape=(T, 5, 3))             # 8*12 != 8*5*3
+    t0 = Op.make(
+        "reshape",
+        Op.make("apply", Op.make("aff", A, b), h),
+        shape=(T, 5, 3),
+    )  # 8*12 != 8*5*3
     _no_fire(XC.XC_RESHAPE_APPLY, t0)
 
 
@@ -157,20 +185,32 @@ def test_transpose_apply_dense():
     permutation into the map's output axes — value dims are normalised
     mod the value rank so the map's input axis is never touched."""
     nh, T, hd, i = 4, 8, 3, 5
-    A, b, h = _V("A", (T, nh, hd, i)), _V("b", (T, nh, hd)), \
-        _V("h", (i,))
-    env = {A: _rand((T, nh, hd, i), 10), b: _rand((T, nh, hd), 11),
-           h: _rand((i,), 12)}
-    t0 = Op.make("transpose",
-                 Op.make("apply", Op.make("aff", A, b), h),
-                 arg1=0, arg2=1)
+    A, b, h = (
+        _V("A", (T, nh, hd, i)),
+        _V("b", (T, nh, hd)),
+        _V("h", (i,)),
+    )
+    env = {
+        A: _rand((T, nh, hd, i), 10),
+        b: _rand((T, nh, hd), 11),
+        h: _rand((i,), 12),
+    }
+    t0 = Op.make(
+        "transpose",
+        Op.make("apply", Op.make("aff", A, b), h),
+        arg1=0,
+        arg2=1,
+    )
     out = _law(XC.XC_TRANSPOSE_APPLY, t0, env)
     assert out.op == "apply" and out.args[0].op == "aff"
     # negative dims are normalised against the VALUE rank (3), not the
     # map rank (4): transpose(v, -3, -2) == transpose(v, 0, 1).
-    t0 = Op.make("transpose",
-                 Op.make("apply", Op.make("aff", A, b), h),
-                 arg1=-3, arg2=-2)
+    t0 = Op.make(
+        "transpose",
+        Op.make("apply", Op.make("aff", A, b), h),
+        arg1=-3,
+        arg2=-2,
+    )
     _law(XC.XC_TRANSPOSE_APPLY, t0, env)
     # reverse: the pushed-through member re-fuses.
     back = _law(XC.XC_TRANSPOSE_APPLY_REV, out, env)
@@ -184,39 +224,58 @@ def test_transpose_apply_rev_veto_input_axis():
     A, b, h = _V("A", (T, o, i)), _V("b", (T, o)), _V("h", (i,))
     t0 = Op.make(
         "apply",
-        Op.make("aff",
-                Op.make("transpose", A, arg1=1, arg2=2),   # o <-> i !
-                Op.make("transpose", b, arg1=0, arg2=1)),
-        h)
+        Op.make(
+            "aff",
+            Op.make("transpose", A, arg1=1, arg2=2),  # o <-> i !
+            Op.make("transpose", b, arg1=0, arg2=1),
+        ),
+        h,
+    )
     _no_fire(XC.XC_TRANSPOSE_APPLY_REV, t0)
     # ...and disagreement between the two coefficient views vetoes too
     t0 = Op.make(
         "apply",
-        Op.make("aff",
-                Op.make("transpose", A, arg1=0, arg2=1),
-                Op.make("transpose", b, arg1=1, arg2=0)),
-        h)
+        Op.make(
+            "aff",
+            Op.make("transpose", A, arg1=0, arg2=1),
+            Op.make("transpose", b, arg1=1, arg2=0),
+        ),
+        h,
+    )
     # dims {0,1} vs {1,0} are the SAME swap — this one is actually
     # legal; use a genuinely different pair for the veto:
-    _law(XC.XC_TRANSPOSE_APPLY_REV, t0,
-         {A: _rand((T, o, i), 13), b: _rand((T, o), 14),
-          h: _rand((i,), 15)})
+    _law(
+        XC.XC_TRANSPOSE_APPLY_REV,
+        t0,
+        {
+            A: _rand((T, o, i), 13),
+            b: _rand((T, o), 14),
+            h: _rand((i,), 15),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
 #  B. The view-commute laws — diagonal fiber (restricted)
 # ---------------------------------------------------------------------------
 
+
 def test_transpose_applyd_head_swap():
     """Diagonal maps commute with head-axis transposes: the feature
     axis stays last, h is not permuted."""
     nh, T, d = 4, 7, 3
     a, b, h = _V("a", (T, nh, d)), _V("b", (T, nh, d)), _V("h", (d,))
-    env = {a: _rand((T, nh, d), 20), b: _rand((T, nh, d), 21),
-           h: _rand((d,), 22)}
-    t0 = Op.make("transpose",
-                 Op.make("applyd", Op.make("aff_diag", a, b), h),
-                 arg1=0, arg2=1)
+    env = {
+        a: _rand((T, nh, d), 20),
+        b: _rand((T, nh, d), 21),
+        h: _rand((d,), 22),
+    }
+    t0 = Op.make(
+        "transpose",
+        Op.make("applyd", Op.make("aff_diag", a, b), h),
+        arg1=0,
+        arg2=1,
+    )
     out = _law(XC.XC_TRANSPOSE_APPLYD, t0, env)
     _law(XC.XC_TRANSPOSE_APPLYD_REV, out, env)
 
@@ -227,10 +286,14 @@ def test_transpose_applyd_veto_feature_axis():
     nh, T, d = 4, 7, 3
     a, b, h = _V("a", (nh, T, d)), _V("b", (nh, T, d)), _V("h", (d,))
     base = Op.make("applyd", Op.make("aff_diag", a, b), h)
-    _no_fire(XC.XC_TRANSPOSE_APPLYD,
-             Op.make("transpose", base, arg1=1, arg2=2))
-    _no_fire(XC.XC_TRANSPOSE_APPLYD,
-             Op.make("transpose", base, arg1=-1, arg2=0))
+    _no_fire(
+        XC.XC_TRANSPOSE_APPLYD,
+        Op.make("transpose", base, arg1=1, arg2=2),
+    )
+    _no_fire(
+        XC.XC_TRANSPOSE_APPLYD,
+        Op.make("transpose", base, arg1=-1, arg2=0),
+    )
 
 
 def test_reshape_applyd_feature_last():
@@ -240,8 +303,11 @@ def test_reshape_applyd_feature_last():
     longer broadcast — that path is the dense promotion's job)."""
     T, d, nh, hd = 8, 12, 4, 3
     a, b, h = _V("a", (T, d)), _V("b", (T, d)), _V("h", (d,))
-    env = {a: _rand((T, d), 30), b: _rand((T, d), 31),
-           h: _rand((d,), 32)}
+    env = {
+        a: _rand((T, d), 30),
+        b: _rand((T, d), 31),
+        h: _rand((d,), 32),
+    }
     base = Op.make("applyd", Op.make("aff_diag", a, b), h)
     # packing / regrouping that keeps the feature axis intact
     t0 = Op.make("reshape", base, shape=(T, 1, d))
@@ -250,47 +316,67 @@ def test_reshape_applyd_feature_last():
     t0 = Op.make("reshape", base, shape=(2, 4, d))
     _law(XC.XC_RESHAPE_APPLYD, t0, env)
     # UNSOUND forms — vetoed
-    _no_fire(XC.XC_RESHAPE_APPLYD,
-             Op.make("reshape", base, shape=(T, nh, hd)))   # split d
-    _no_fire(XC.XC_RESHAPE_APPLYD,
-             Op.make("reshape", base, shape=(nh * hd, T)))  # mix axes
-    _no_fire(XC.XC_RESHAPE_APPLYD,
-             Op.make("reshape", base, shape=(T * d,)))      # merge all
+    _no_fire(
+        XC.XC_RESHAPE_APPLYD,
+        Op.make("reshape", base, shape=(T, nh, hd)),
+    )  # split d
+    _no_fire(
+        XC.XC_RESHAPE_APPLYD,
+        Op.make("reshape", base, shape=(nh * hd, T)),
+    )  # mix axes
+    _no_fire(
+        XC.XC_RESHAPE_APPLYD, Op.make("reshape", base, shape=(T * d,))
+    )  # merge all
 
 
 # ---------------------------------------------------------------------------
 #  C. Batched dense om/omd — the rank-4 (per-head) map
 # ---------------------------------------------------------------------------
 
+
 def test_om_elem_aff_batched_heads():
     """om_elem(s, apply(aff(A,b),h)) with a PER-HEAD map A (nh,K,d,i):
     the head axis is a matmul batch dim in both the concrete and the
     fused element — fp64-identical."""
     nh, Tq, K, d, i = 4, 5, 7, 3, 6
-    s, A, b, h = _V("s", (nh, Tq, K)), _V("A", (nh, K, d, i)), \
-        _V("b", (nh, K, d)), _V("h", (i,))
-    env = {s: _rand((nh, Tq, K), 40), A: _rand((nh, K, d, i), 41),
-           b: _rand((nh, K, d), 42), h: _rand((i,), 43)}
-    t0 = Op.make("om_elem", s,
-                 Op.make("apply", Op.make("aff", A, b), h))
+    s, A, b, h = (
+        _V("s", (nh, Tq, K)),
+        _V("A", (nh, K, d, i)),
+        _V("b", (nh, K, d)),
+        _V("h", (i,)),
+    )
+    env = {
+        s: _rand((nh, Tq, K), 40),
+        A: _rand((nh, K, d, i), 41),
+        b: _rand((nh, K, d), 42),
+        h: _rand((i,), 43),
+    }
+    t0 = Op.make(
+        "om_elem", s, Op.make("apply", Op.make("aff", A, b), h)
+    )
     applied = meta.apply_rewrite_at(XC.XC_OM_ELEM_AFF, t0, ())
     assert applied is not None, "batched om_elem_aff vetoed"
     a = meta._eval_term(t0, env)
     bb = meta._eval_term(applied, env)
-    assert all(meta._eval_allclose(x, y, tol=1e-12)
-               for x, y in zip(a, bb))
+    assert all(
+        meta._eval_allclose(x, y, tol=1e-12) for x, y in zip(a, bb)
+    )
     # unfold direction too
-    _law(XC.XC_OM_ELEM_AFF_REV,
-         Op.make("om_elem_aff", s, A, b, h), env)
+    _law(XC.XC_OM_ELEM_AFF_REV, Op.make("om_elem_aff", s, A, b, h), env)
 
 
 def test_om_elem_aff_veto_bad_batch():
     """Head counts that don't broadcast between s and A must veto."""
     nh, Tq, K, d, i = 4, 5, 7, 3, 6
-    s, A, b, h = _V("s", (nh, Tq, K)), _V("A", (nh + 1, K, d, i)), \
-        _V("b", (nh + 1, K, d)), _V("h", (i,))
-    t0 = Op.make("om_elem", s,
-                 Op.make("apply", Op.make("aff", A, b), h))
+    s, A, b, h = (
+        _V("s", (nh, Tq, K)),
+        _V("A", (nh + 1, K, d, i)),
+        _V("b", (nh + 1, K, d)),
+        _V("h", (i,)),
+    )
+    t0 = Op.make(
+        "om_elem", s, Op.make("apply", Op.make("aff", A, b), h)
+    )
     _no_fire(XC.XC_OM_ELEM_AFF, t0)
 
 
@@ -299,19 +385,30 @@ def test_omd_lift_dense_batched():
     omd_elem(s, A, b) with A (nh,K,d,i) — h contracts the last axis,
     heads ride along."""
     nh, Tq, K, d, i = 4, 5, 7, 3, 6
-    s, A, b, h = _V("s", (nh, Tq, K)), _V("A", (nh, K, d, i)), \
-        _V("b", (nh, K, d)), _V("h", (i,))
-    env = {s: _rand((nh, Tq, K), 50), A: _rand((nh, K, d, i), 51),
-           b: _rand((nh, K, d), 52), h: _rand((i,), 53)}
-    t0 = Op.make("om_apply",
-                 Op.make("om_elem", s,
-                         Op.make("apply", Op.make("aff", A, b), h)))
+    s, A, b, h = (
+        _V("s", (nh, Tq, K)),
+        _V("A", (nh, K, d, i)),
+        _V("b", (nh, K, d)),
+        _V("h", (i,)),
+    )
+    env = {
+        s: _rand((nh, Tq, K), 50),
+        A: _rand((nh, K, d, i), 51),
+        b: _rand((nh, K, d), 52),
+        h: _rand((i,), 53),
+    }
+    t0 = Op.make(
+        "om_apply",
+        Op.make(
+            "om_elem", s, Op.make("apply", Op.make("aff", A, b), h)
+        ),
+    )
     out = _law(XC.XC_OMD_LIFT_DENSE, t0, env, tol=1e-12)
     assert out.op == "omd_applym"
     # the deferred numerator evaluates to softmax(s) @ (A@h+b)
     assert meta._eval_allclose(
-        meta._eval_term(out, env), meta._eval_term(t0, env),
-        tol=1e-12)
+        meta._eval_term(out, env), meta._eval_term(t0, env), tol=1e-12
+    )
     _law(XC.XC_OMD_UNLIFT_DENSE, out, env)
 
 
@@ -323,22 +420,40 @@ def test_omd_compose_batched_pair():
     A1, b1 = _V("A1", (nh, K1, d, i)), _V("b1", (nh, K1, d))
     A2, b2 = _V("A2", (nh, K2, d, i)), _V("b2", (nh, K2, d))
     h = _V("h", (i,))
-    env = {s1: _rand((nh, Tq, K1), 60), s2: _rand((nh, Tq, K2), 61),
-           A1: _rand((nh, K1, d, i), 62), b1: _rand((nh, K1, d), 63),
-           A2: _rand((nh, K2, d, i), 64), b2: _rand((nh, K2, d), 65),
-           h: _rand((i,), 66)}
-    defer = Op.make("omd_applym",
-                    Op.make("omd_compose",
-                            Op.make("omd_elem", s1, A1, b1),
-                            Op.make("omd_elem", s2, A2, b2)),
-                    h)
+    env = {
+        s1: _rand((nh, Tq, K1), 60),
+        s2: _rand((nh, Tq, K2), 61),
+        A1: _rand((nh, K1, d, i), 62),
+        b1: _rand((nh, K1, d), 63),
+        A2: _rand((nh, K2, d, i), 64),
+        b2: _rand((nh, K2, d), 65),
+        h: _rand((i,), 66),
+    }
+    defer = Op.make(
+        "omd_applym",
+        Op.make(
+            "omd_compose",
+            Op.make("omd_elem", s1, A1, b1),
+            Op.make("omd_elem", s2, A2, b2),
+        ),
+        h,
+    )
     conc = Op.make(
         "om_apply",
-        Op.make("om_compose",
-                Op.make("om_elem", s1,
-                        Op.make("apply", Op.make("aff", A1, b1), h)),
-                Op.make("om_elem", s2,
-                        Op.make("apply", Op.make("aff", A2, b2), h))))
+        Op.make(
+            "om_compose",
+            Op.make(
+                "om_elem",
+                s1,
+                Op.make("apply", Op.make("aff", A1, b1), h),
+            ),
+            Op.make(
+                "om_elem",
+                s2,
+                Op.make("apply", Op.make("aff", A2, b2), h),
+            ),
+        ),
+    )
     a = meta._eval_term(conc, env)
     bb = meta._eval_term(defer, env)
     assert meta._eval_allclose(a, bb, tol=1e-12)
@@ -350,6 +465,7 @@ def test_omd_compose_batched_pair():
 #     class held only reshape/transpose members, so _elem_affine_options
 #     was empty and no omd member existed anywhere.
 # ---------------------------------------------------------------------------
+
 
 class _ScanAttnMH(torch.nn.Module):
     """h_t = a_t⊙h + x_t; v/q/k = W·(stack h) split into heads via
@@ -371,11 +487,13 @@ class _ScanAttnMH(torch.nn.Module):
         # ~1e-8 output deviation; an export artifact, not a catopt
         # issue — same note as bench_omd2.ScanAttnMQA).
         self.register_buffer(
-            "sq", torch.tensor(hd ** -0.5, dtype=torch.float64))
+            "sq", torch.tensor(hd**-0.5, dtype=torch.float64)
+        )
         mask = torch.zeros(T, T)
         mask.masked_fill_(
             torch.triu(torch.ones(T, T, dtype=torch.bool), 1),
-            float("-inf"))
+            float("-inf"),
+        )
         self.register_buffer("cm", mask)
 
     def forward(self, x):
@@ -420,12 +538,16 @@ def test_mha_omd_fires_and_is_exact():
     ``omd_applym`` lands in the om_apply class — nested (wo follows
     the attention, so omd is NOT at the root — same as the chunked-MH
     variant).  The extracted member evaluates fp64-exact."""
+    from catopt.ir import IR
     from catopt.regime import default_rules
     from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-    from catopt.ir import IR
-    from catopt.xcarrier import (gather_applyd_stack,
-                                 gather_apply_stack, omd_tree_lift,
-                                 XC_LAWS, _elem_affine_options)
+    from catopt.xcarrier import (
+        XC_LAWS,
+        _elem_affine_options,
+        gather_apply_stack,
+        gather_applyd_stack,
+        omd_tree_lift,
+    )
 
     torch.manual_seed(0)
     T, D, nh, hd = 8, 16, 2, 8
@@ -437,15 +559,20 @@ def test_mha_omd_fires_and_is_exact():
     root = eg.add_term(ir.root)
     # bounded saturation: core carriers -> non-local lifts -> XC tier
     # -> lifts again (same shape as bench_omd2.bounded_build_xc).
-    eg.run(default_rules(), root, max_iterations=6,
-           max_nodes=300_000)
-    lifts = (gather_applyd_stack(eg) + gather_apply_stack(eg)
-             + omd_tree_lift(eg))
+    eg.run(default_rules(), root, max_iterations=6, max_nodes=300_000)
+    lifts = (
+        gather_applyd_stack(eg)
+        + gather_apply_stack(eg)
+        + omd_tree_lift(eg)
+    )
     if lifts:
         eg.rebuild()
     eg.run(XC_LAWS, root, max_iterations=5, max_nodes=300_000)
-    more = (gather_applyd_stack(eg) + gather_apply_stack(eg)
-            + omd_tree_lift(eg))
+    more = (
+        gather_applyd_stack(eg)
+        + gather_apply_stack(eg)
+        + omd_tree_lift(eg)
+    )
     if more:
         eg.rebuild()
 
@@ -467,15 +594,20 @@ def test_mha_omd_fires_and_is_exact():
 
     assert saw_affine_value, (
         "no om leaf sees an affine value member — the view-commute "
-        "laws did not surface the apply")
+        "laws did not surface the apply"
+    )
     assert omd_classes, "no omd member minted on ScanAttnMH"
 
     # ---- exactness: splice the omd member for the om_apply it
     # replaces, inside the original root term --------------------------
     mm_path = _find_path(
         ir.root,
-        lambda t: t.op == "matmul" and isinstance(t.args[0], Op)
-        and t.args[0].op == "softmax")
+        lambda t: (
+            t.op == "matmul"
+            and isinstance(t.args[0], Op)
+            and t.args[0].op == "softmax"
+        ),
+    )
     assert mm_path is not None, "softmax@value matmul not in root term"
 
     cls = next(iter(omd_classes))
@@ -483,12 +615,14 @@ def test_mha_omd_fires_and_is_exact():
     omd_term = Op.make(
         node.op,
         *(eg.any_term(eg.find(ch)) for ch in node.children),
-        **dict(node.attrs))
+        **dict(node.attrs),
+    )
     assert node.op == "omd_applym"  # dense fiber — promoted Wv map
 
     new_root = _replace_path(ir.root, mm_path, omd_term)
     mod = ir_to_torch_module(
-        IR(root=new_root, inputs=ir.inputs, params=ir.params), src)
+        IR(root=new_root, inputs=ir.inputs, params=ir.params), src
+    )
     with torch.no_grad():
         ref = m(x)
         out = mod(x)
@@ -501,12 +635,16 @@ def test_mha_omd_value_member_is_viewed_apply():
     the om leaf contains apply(aff(map,h)) whose A part is a
     transpose/reshape view of the projected scan coefficients —
     rank-4 (nh,T,hd,D)."""
+    from catopt.cost import _shape_of
     from catopt.regime import default_rules
     from catopt.torch_bridge import export_to_ir
-    from catopt.xcarrier import (gather_applyd_stack,
-                                 gather_apply_stack, omd_tree_lift,
-                                 XC_LAWS, _elem_affine_options)
-    from catopt.cost import _shape_of
+    from catopt.xcarrier import (
+        XC_LAWS,
+        _elem_affine_options,
+        gather_apply_stack,
+        gather_applyd_stack,
+        omd_tree_lift,
+    )
 
     torch.manual_seed(0)
     T, D, nh, hd = 8, 16, 2, 8
@@ -516,10 +654,12 @@ def test_mha_omd_value_member_is_viewed_apply():
 
     eg = EGraph()
     root = eg.add_term(ir.root)
-    eg.run(default_rules(), root, max_iterations=6,
-           max_nodes=300_000)
-    lifts = (gather_applyd_stack(eg) + gather_apply_stack(eg)
-             + omd_tree_lift(eg))
+    eg.run(default_rules(), root, max_iterations=6, max_nodes=300_000)
+    lifts = (
+        gather_applyd_stack(eg)
+        + gather_apply_stack(eg)
+        + omd_tree_lift(eg)
+    )
     if lifts:
         eg.rebuild()
     eg.run(XC_LAWS, root, max_iterations=5, max_nodes=300_000)
@@ -534,15 +674,21 @@ def test_mha_omd_value_member_is_viewed_apply():
         for n in ec.nodes:
             if n.op == "om_elem" and len(n.children) == 2:
                 for h_eid, opts in _elem_affine_options(
-                        eg, n.children[1]).items():
+                    eg, n.children[1]
+                ).items():
                     for kind, a_eid, b_eid in opts:
                         if kind != "dense":
                             continue
                         at = eg.any_term(a_eid)
                         s = _shape_of(at)
-                        if (isinstance(s, tuple) and len(s) == 4
-                                and s[0] == nh and s[-1] == D):
+                        if (
+                            isinstance(s, tuple)
+                            and len(s) == 4
+                            and s[0] == nh
+                            and s[-1] == D
+                        ):
                             found_rank4 = True
     assert found_rank4, (
         "expected a per-head dense map (nh,T,hd,D) in the value "
-        "class — the view laws did not produce it")
+        "class — the view laws did not produce it"
+    )

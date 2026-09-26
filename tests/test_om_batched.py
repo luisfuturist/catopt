@@ -15,10 +15,11 @@ import math
 import pytest
 import torch
 
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, TensorType, op_repr
-from catopt.om import OM_LAWS
 from catopt.cost import flops_cost
+from catopt.egraph import EGraph
+from catopt.ir import IR, Op, TensorType, Var, op_repr
+from catopt.models import SwiGLU
+from catopt.om import OM_LAWS
 from catopt.om_lower import (
     BatchedOMModule,
     build_om_plan,
@@ -26,12 +27,11 @@ from catopt.om_lower import (
     to_batched_om_module,
 )
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.models import SwiGLU
-
 
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
+
 
 def _dense_ref(q, ks, vs):
     s = q @ torch.cat(list(ks), dim=-2).transpose(-2, -1)
@@ -40,8 +40,7 @@ def _dense_ref(q, ks, vs):
 
 def _qk_leaf(q, k, v):
     """om_elem(q @ k.T, v) — the leaf shape OM_SPLIT extraction emits."""
-    s = Op.make("matmul", q,
-                Op.make("transpose", k, arg1=-2, arg2=-1))
+    s = Op.make("matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1))
     return Op.make("om_elem", s, v)
 
 
@@ -50,9 +49,11 @@ def _compose_tree(leaves):
     if len(leaves) == 1:
         return leaves[0]
     mid = len(leaves) // 2
-    return Op.make("om_compose",
-                   _compose_tree(leaves[:mid]),
-                   _compose_tree(leaves[mid:]))
+    return Op.make(
+        "om_compose",
+        _compose_tree(leaves[:mid]),
+        _compose_tree(leaves[mid:]),
+    )
 
 
 def _om_ir(q, ks, vs, leaf_fn=_qk_leaf):
@@ -60,16 +61,24 @@ def _om_ir(q, ks, vs, leaf_fn=_qk_leaf):
     leaves = [leaf_fn(q, k, v) for k, v in zip(ks, vs)]
     root = Op.make("om_apply", _compose_tree(leaves))
     inputs = [q] + list(ks) + list(vs)
-    return IR(root=root, inputs=inputs,
-              input_names={v.name for v in inputs}, params={})
+    return IR(
+        root=root,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
 
 
 def _qk_vars(B, H, T, d, dv, ksizes):
     q = Var("q", TensorType((B, H, T, d)))
-    ks = [Var(f"k{i}", TensorType((B, H, k, d)))
-          for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((B, H, k, dv)))
-          for i, k in enumerate(ksizes)]
+    ks = [
+        Var(f"k{i}", TensorType((B, H, k, d)))
+        for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((B, H, k, dv)))
+        for i, k in enumerate(ksizes)
+    ]
     return q, ks, vs
 
 
@@ -98,9 +107,9 @@ def _dense_chunked_term(q, ks, vs):
     kcat = _nested_cat(ks, -2)
     vcat = _nested_cat(vs, -2)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1))
-    return Op.make(
-        "matmul", Op.make("softmax", scores, arg1=-1), vcat)
+        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+    )
+    return Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
 
 
 def _extract_chunked(eg, root, cost_fn=flops_cost):
@@ -110,12 +119,15 @@ def _extract_chunked(eg, root, cost_fn=flops_cost):
     ov = {}
     for cid in list(eg._classes):
         c = eg.find(cid)
-        comps = [n for n in eg._classes[c].nodes if n.op == "om_compose"]
+        comps = [
+            n for n in eg._classes[c].nodes if n.op == "om_compose"
+        ]
         if comps:
             ov.setdefault(c, comps[0])
     for n in eg.get_class(canon).nodes:
-        if (n.op == "om_apply"
-                and _class_has_op(eg, n.children[0], "om_compose")):
+        if n.op == "om_apply" and _class_has_op(
+            eg, n.children[0], "om_compose"
+        ):
             o = dict(ov)
             o[canon] = n
             t = eg.extract_best(canon, cost_fn, overrides=o)
@@ -127,6 +139,7 @@ def _extract_chunked(eg, root, cost_fn=flops_cost):
 # ---------------------------------------------------------------------------
 #  Numerical equivalence vs dense softmax
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("n_blocks", [4, 6, 8])
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
@@ -170,11 +183,16 @@ def test_batched_om_matches_serial_lowering():
     assert batched.is_batched
     tq = torch.randn(B, H, T, d, dtype=torch.float64)
     tks = [torch.randn(B, H, k, d, dtype=torch.float64) for k in ksizes]
-    tvs = [torch.randn(B, H, k, dv, dtype=torch.float64)
-           for k in ksizes]
+    tvs = [
+        torch.randn(B, H, k, dv, dtype=torch.float64) for k in ksizes
+    ]
     with torch.no_grad():
-        diff = (serial(tq, *tks, *tvs)
-                - batched(tq, *tks, *tvs)).abs().max().item()
+        diff = (
+            (serial(tq, *tks, *tvs) - batched(tq, *tks, *tvs))
+            .abs()
+            .max()
+            .item()
+        )
     assert diff < 1e-12
 
 
@@ -194,8 +212,9 @@ def test_mixed_block_sizes():
 
     tq = torch.randn(B, H, T, d, dtype=torch.float64)
     tks = [torch.randn(B, H, k, d, dtype=torch.float64) for k in ksizes]
-    tvs = [torch.randn(B, H, k, dv, dtype=torch.float64)
-           for k in ksizes]
+    tvs = [
+        torch.randn(B, H, k, dv, dtype=torch.float64) for k in ksizes
+    ]
     ref = _dense_ref(tq, tks, tvs)
     with torch.no_grad():
         out = mod(tq, *tks, *tvs)
@@ -208,24 +227,32 @@ def test_score_vars_directly():
     torch.manual_seed(0)
     B, H, T, dv = 2, 3, 48, 16
     ksizes = [16] * 6
-    ss = [Var(f"s{i}", TensorType((B, H, T, k)))
-          for i, k in enumerate(ksizes)]
-    vs = [Var(f"v{i}", TensorType((B, H, k, dv)))
-          for i, k in enumerate(ksizes)]
+    ss = [
+        Var(f"s{i}", TensorType((B, H, T, k)))
+        for i, k in enumerate(ksizes)
+    ]
+    vs = [
+        Var(f"v{i}", TensorType((B, H, k, dv)))
+        for i, k in enumerate(ksizes)
+    ]
     leaves = [Op.make("om_elem", s, v) for s, v in zip(ss, vs)]
     root = Op.make("om_apply", _compose_tree(leaves))
     inputs = ss + vs
-    ir = IR(root=root, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=root,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert mod.is_batched
     grp = mod._plan["leaf_groups"][0]
     assert grp["s_mode"] == "stack" and len(grp["members"]) == 6
 
-    tss = [torch.randn(B, H, T, k, dtype=torch.float64)
-           for k in ksizes]
-    tvs = [torch.randn(B, H, k, dv, dtype=torch.float64)
-           for k in ksizes]
+    tss = [torch.randn(B, H, T, k, dtype=torch.float64) for k in ksizes]
+    tvs = [
+        torch.randn(B, H, k, dv, dtype=torch.float64) for k in ksizes
+    ]
     ref = torch.softmax(torch.cat(tss, -1), -1) @ torch.cat(tvs, -2)
     with torch.no_grad():
         out = mod(*tss, *tvs)
@@ -235,6 +262,7 @@ def test_score_vars_directly():
 # ---------------------------------------------------------------------------
 #  Operand-gather fast paths
 # ---------------------------------------------------------------------------
+
 
 def test_chunked_kv_dense_score_path():
     """k_i = chunk(K,-2,i), v_i = chunk(V,-2,i): the elem level must
@@ -252,10 +280,15 @@ def test_chunked_kv_dense_score_path():
         return _qk_leaf(q, ki, vi)
 
     inputs = [q, Kb, Vb]
-    root = Op.make("om_apply", _compose_tree(
-        [leaf(None, i) for i in range(n)]))
-    ir = IR(root=root, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    root = Op.make(
+        "om_apply", _compose_tree([leaf(None, i) for i in range(n)])
+    )
+    ir = IR(
+        root=root,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert mod.is_batched
     grp = mod._plan["leaf_groups"][0]
@@ -279,15 +312,21 @@ def test_chunked_scores_slice_path():
     Sb = Var("S", TensorType((B, H, T, n * K)))
     Vb = Var("V", TensorType((B, H, n * K, dv)))
     leaves = [
-        Op.make("om_elem",
-                Op.make("chunk", Sb, arg1=n, arg2=-1, index=i),
-                Op.make("chunk", Vb, arg1=n, arg2=-2, index=i))
+        Op.make(
+            "om_elem",
+            Op.make("chunk", Sb, arg1=n, arg2=-1, index=i),
+            Op.make("chunk", Vb, arg1=n, arg2=-2, index=i),
+        )
         for i in range(n)
     ]
     root = Op.make("om_apply", _compose_tree(leaves))
     inputs = [Sb, Vb]
-    ir = IR(root=root, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=root,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert mod.is_batched
     grp = mod._plan["leaf_groups"][0]
@@ -314,21 +353,30 @@ def test_om_packaging_leaf():
     a3 = Var("a3", TensorType((B, H, T, dv)))
     tree = Op.make(
         "om_compose",
-        Op.make("om_compose",
-                Op.make("om_elem", ss[0], vs[0]),
-                Op.make("om", m3, l3, a3)),
-        Op.make("om_elem", ss[1], vs[1]))
+        Op.make(
+            "om_compose",
+            Op.make("om_elem", ss[0], vs[0]),
+            Op.make("om", m3, l3, a3),
+        ),
+        Op.make("om_elem", ss[1], vs[1]),
+    )
     root = Op.make("om_apply", tree)
     inputs = ss + vs + [m3, l3, a3]
-    ir = IR(root=root, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=root,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert mod.is_batched
 
-    tss = [torch.randn(B, H, T, K, dtype=torch.float64)
-           for _ in range(2)]
-    tvs = [torch.randn(B, H, K, dv, dtype=torch.float64)
-           for _ in range(2)]
+    tss = [
+        torch.randn(B, H, T, K, dtype=torch.float64) for _ in range(2)
+    ]
+    tvs = [
+        torch.randn(B, H, K, dv, dtype=torch.float64) for _ in range(2)
+    ]
     # Build the third block's carrier the way om_elem would.
     s3 = torch.randn(B, H, T, K, dtype=torch.float64)
     v3 = torch.randn(B, H, K, dv, dtype=torch.float64)
@@ -336,8 +384,9 @@ def test_om_packaging_leaf():
     e3 = torch.exp(s3 - mm)
     tm, tl = mm, e3.sum(-1, keepdim=True)
     ta = e3 @ v3
-    ref = torch.softmax(torch.cat(tss + [s3], -1), -1) \
-        @ torch.cat(tvs + [v3], -2)
+    ref = torch.softmax(torch.cat(tss + [s3], -1), -1) @ torch.cat(
+        tvs + [v3], -2
+    )
     with torch.no_grad():
         out = mod(*tss, *tvs, tm, tl, ta)
     assert (out - ref).abs().max().item() < 1e-12
@@ -347,6 +396,7 @@ def test_om_packaging_leaf():
 #  NaN semantics
 # ---------------------------------------------------------------------------
 
+
 def test_fully_masked_row_nan_matches_dense():
     """A row masked in EVERY block is NaN, matching dense softmax —
     om_apply stays unclamped in the batched path too."""
@@ -354,21 +404,31 @@ def test_fully_masked_row_nan_matches_dense():
     B, H, T, dv, n, K = 2, 2, 32, 8, 4, 8
     ss = [Var(f"s{i}", TensorType((B, H, T, K))) for i in range(n)]
     vs = [Var(f"v{i}", TensorType((B, H, K, dv))) for i in range(n)]
-    root = Op.make("om_apply", _compose_tree(
-        [Op.make("om_elem", s, v) for s, v in zip(ss, vs)]))
+    root = Op.make(
+        "om_apply",
+        _compose_tree(
+            [Op.make("om_elem", s, v) for s, v in zip(ss, vs)]
+        ),
+    )
     inputs = ss + vs
-    ir = IR(root=root, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=root,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert mod.is_batched
 
-    tss = [torch.randn(B, H, T, K, dtype=torch.float64)
-           for _ in range(n)]
-    tvs = [torch.randn(B, H, K, dv, dtype=torch.float64)
-           for _ in range(n)]
+    tss = [
+        torch.randn(B, H, T, K, dtype=torch.float64) for _ in range(n)
+    ]
+    tvs = [
+        torch.randn(B, H, K, dv, dtype=torch.float64) for _ in range(n)
+    ]
     for t in tss:
-        t[..., 5, :] = float("-inf")      # row 5 fully masked
-    tss[1][..., 0, :] = float("-inf")     # row 0 masked in block 1 only
+        t[..., 5, :] = float("-inf")  # row 5 fully masked
+    tss[1][..., 0, :] = float("-inf")  # row 0 masked in block 1 only
     with torch.no_grad():
         out = mod(*tss, *tvs)
     dense = torch.softmax(torch.cat(tss, -1), -1) @ torch.cat(tvs, -2)
@@ -382,6 +442,7 @@ def test_fully_masked_row_nan_matches_dense():
 # ---------------------------------------------------------------------------
 #  Detection on the real extracted term (EGraph + OM_LAWS)
 # ---------------------------------------------------------------------------
+
 
 def test_detects_extracted_om_term():
     """The module recognises the term OM_LAWS extraction emits:
@@ -402,15 +463,20 @@ def test_detects_extracted_om_term():
     assert "om_compose" in op_repr(chunked)
 
     inputs = [q] + ks + vs
-    ir = IR(root=chunked, inputs=inputs,
-            input_names={v.name for v in inputs}, params={})
+    ir = IR(
+        root=chunked,
+        inputs=inputs,
+        input_names={v.name for v in inputs},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert mod.is_batched
 
     tq = torch.randn(B, H, T, d, dtype=torch.float64)
     tks = [torch.randn(B, H, k, d, dtype=torch.float64) for k in ksizes]
-    tvs = [torch.randn(B, H, k, dv, dtype=torch.float64)
-           for k in ksizes]
+    tvs = [
+        torch.randn(B, H, k, dv, dtype=torch.float64) for k in ksizes
+    ]
     ref = _dense_ref(tq, tks, tvs)
     mod.eval()
     with torch.no_grad():
@@ -421,6 +487,7 @@ def test_detects_extracted_om_term():
 # ---------------------------------------------------------------------------
 #  Plan structure / API surface
 # ---------------------------------------------------------------------------
+
 
 def test_plan_levels_are_independent():
     """build_om_plan groups composes by depth; leaves = om_elem nodes."""
@@ -452,8 +519,7 @@ def test_single_elem_apply_is_batched():
     s = Var("s", TensorType((4, 6)))
     v = Var("v", TensorType((6, 3)))
     root = Op.make("om_apply", Op.make("om_elem", s, v))
-    ir = IR(root=root, inputs=[s, v],
-            input_names={"s", "v"}, params={})
+    ir = IR(root=root, inputs=[s, v], input_names={"s", "v"}, params={})
     mod = to_batched_om_module(ir)
     assert mod.is_batched and mod.n_levels == 0 and mod.n_blocks == 1
     ts = torch.randn(4, 6, dtype=torch.float64)
@@ -466,6 +532,7 @@ def test_single_elem_apply_is_batched():
 # ---------------------------------------------------------------------------
 #  CUDA graph replay (optional fast path)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_cuda
 def test_cuda_graph_replay_matches_eager():
@@ -489,8 +556,7 @@ def test_cuda_graph_replay_matches_eager():
         out1 = mod(tq, *tks, *tvs).clone()
         tq2 = torch.randn(B, H, T, d, device="cuda")
         tks2 = [torch.randn(B, H, k, d, device="cuda") for k in ksizes]
-        tvs2 = [torch.randn(B, H, k, dv, device="cuda")
-                for k in ksizes]
+        tvs2 = [torch.randn(B, H, k, dv, device="cuda") for k in ksizes]
         out2 = mod(tq2, *tks2, *tvs2).clone()
         ref1 = _dense_ref(tq, tks, tvs)
         ref2 = _dense_ref(tq2, tks2, tvs2)
@@ -507,6 +573,7 @@ def test_cuda_graph_replay_matches_eager():
 #  Fallback: non-om IR keeps working
 # ---------------------------------------------------------------------------
 
+
 def test_fallback_matches_plain_lowering():
     """Non-om IR: BatchedOMModule delegates to serial evaluation."""
     torch.manual_seed(0)
@@ -518,7 +585,8 @@ def test_fallback_matches_plain_lowering():
     assert isinstance(mod, BatchedOMModule)
     assert not mod.is_batched
     ref = ir_to_torch_module(ir, param_values=source)
-    mod.eval(); ref.eval()
+    mod.eval()
+    ref.eval()
     with torch.no_grad():
         assert torch.equal(mod(x.clone()), ref(x.clone()))
         assert (m(x.clone()) - mod(x.clone())).abs().max().item() < 1e-6
@@ -533,11 +601,17 @@ def test_fallback_on_om_ops_outside_apply():
     s2 = Var("s2", TensorType((4, 5)))
     v1 = Var("v1", TensorType((3, 6)))
     v2 = Var("v2", TensorType((5, 6)))
-    bare = Op.make("om_compose",
-                   Op.make("om_elem", s1, v1),
-                   Op.make("om_elem", s2, v2))
-    ir = IR(root=bare, inputs=[s1, s2, v1, v2],
-            input_names={"s1", "s2", "v1", "v2"}, params={})
+    bare = Op.make(
+        "om_compose",
+        Op.make("om_elem", s1, v1),
+        Op.make("om_elem", s2, v2),
+    )
+    ir = IR(
+        root=bare,
+        inputs=[s1, s2, v1, v2],
+        input_names={"s1", "s2", "v1", "v2"},
+        params={},
+    )
     mod = to_batched_om_module(ir)
     assert not mod.is_batched
     ts1 = torch.randn(4, 3, dtype=torch.float64)
@@ -549,5 +623,7 @@ def test_fallback_on_om_ops_outside_apply():
     assert isinstance(out, tuple) and len(out) == 3
     s = torch.cat([ts1, ts2], -1)
     e = torch.exp(s - s.amax(-1, keepdim=True))
-    assert torch.allclose(out[2] / out[1],
-                          torch.softmax(s, -1) @ torch.cat([tv1, tv2], -2))
+    assert torch.allclose(
+        out[2] / out[1],
+        torch.softmax(s, -1) @ torch.cat([tv1, tv2], -2),
+    )

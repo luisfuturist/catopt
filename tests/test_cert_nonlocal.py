@@ -28,13 +28,13 @@ What these tests prove:
   need to adopt: a synthesised Rewrite per offered member).
 """
 
-import math
 
 import pytest
 import torch
 
-import catopt.trace as _cat_trace          # noqa: F401  torch bindings
-                                             # (trace/parl/eye/concat)
+import catopt.trace as _cat_trace  # noqa: F401  torch bindings
+
+# (trace/parl/eye/concat)
 from catopt.egraph import (
     CertificateVerificationError,
     EGraph,
@@ -60,6 +60,7 @@ def _fp64():
 #  Term builders (same as tests/test_trace_lift.py)
 # ---------------------------------------------------------------------------
 
+
 def _diag_term(T: int, d: int):
     """h_t = a_t * h_{t-1} + b_t * x_t — the Mamba-faithful spine."""
     a = Param("pa", TensorType((T, d)))
@@ -69,29 +70,36 @@ def _diag_term(T: int, d: int):
     h = h0
     for t in range(T):
         a_t = Op.make("select", a, arg1=0, arg2=t)
-        in_t = Op.make("mul", Op.make("select", b, arg1=0, arg2=t),
-                       Op.make("select", x, arg1=0, arg2=t))
+        in_t = Op.make(
+            "mul",
+            Op.make("select", b, arg1=0, arg2=t),
+            Op.make("select", x, arg1=0, arg2=t),
+        )
         h = Op.make("add", Op.make("mul", a_t, h), in_t)
     return h, [x], {"pa": a, "pb": b, "h0": h0}
 
 
 def _env(T: int, d: int, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
-    env = {"pa": torch.rand(T, d, generator=g) * 0.9,
-           "pb": torch.randn(T, d, generator=g),
-           "h0": torch.randn(d, generator=g)}
+    env = {
+        "pa": torch.rand(T, d, generator=g) * 0.9,
+        "pb": torch.randn(T, d, generator=g),
+        "h0": torch.randn(d, generator=g),
+    }
     x = torch.randn(T, d, generator=g)
     return env, x
 
 
 def _eval(term, inputs, env, x):
-    return ir_to_torch_module(IR(root=term, inputs=inputs),
-                              param_values=env)(x)
+    return ir_to_torch_module(
+        IR(root=term, inputs=inputs), param_values=env
+    )(x)
 
 
 # ---------------------------------------------------------------------------
 #  (a) witnessed offers give fully replayable certificates
 # ---------------------------------------------------------------------------
+
 
 def test_lifted_trace_certificate_fully_replayable():
     """union(..., witness=pointwise rule) -> cert with no
@@ -100,8 +108,9 @@ def test_lifted_trace_certificate_fully_replayable():
     term, _, _ = _diag_term(T, d)
     eg = EGraph()
     root = eg.add_term(term)
-    lifts = lift_scan_to_trace(eg, root_eid=root, channel_splits=None,
-                               witness=True)
+    lifts = lift_scan_to_trace(
+        eg, root_eid=root, channel_splits=None, witness=True
+    )
     assert len(lifts) == 1
     cert = eg.certificate(term, lifts[0].term, root_eid=root)
     assert cert.replayable
@@ -143,8 +152,9 @@ def test_witness_step_at_subterm_position():
     term, _, _ = _diag_term(T, d)
     eg = EGraph()
     root = eg.add_term(term)
-    lift = lift_scan_to_trace(eg, root_eid=root, channel_splits=None,
-                              witness=True)[0]
+    lift = lift_scan_to_trace(
+        eg, root_eid=root, channel_splits=None, witness=True
+    )[0]
     # embed src/dst under an outer op so the merge sits at path (0,)
     src2 = Op.make("tanh", term)
     dst2 = Op.make("tanh", lift.term)
@@ -160,6 +170,7 @@ def test_witness_step_at_subterm_position():
 #  (b) the witness replays standalone on fresh tensors
 # ---------------------------------------------------------------------------
 
+
 def test_witness_replays_standalone_fp64():
     """The cert's witness is a self-contained Rewrite: re-match its LHS
     on the real term, re-instantiate the RHS, and evaluate BOTH sides
@@ -168,8 +179,9 @@ def test_witness_replays_standalone_fp64():
     term, inputs, _ = _diag_term(T, d)
     eg = EGraph()
     root = eg.add_term(term)
-    lift = lift_scan_to_trace(eg, root_eid=root, channel_splits=None,
-                              witness=True)[0]
+    lift = lift_scan_to_trace(
+        eg, root_eid=root, channel_splits=None, witness=True
+    )[0]
     cert = eg.certificate(term, lift.term, root_eid=root)
     step = cert.steps[0]
     rule = cert.rules[step.rule]
@@ -177,7 +189,7 @@ def test_witness_replays_standalone_fp64():
 
     # standalone replay of the rule object itself — no e-graph:
     m = _term_match(rule.lhs, term)
-    assert m is not None                       # concrete LHS matches
+    assert m is not None  # concrete LHS matches
     r = _term_instantiate(rule.rhs, m)
     assert op_repr(r) == op_repr(step.rhs)
 
@@ -193,6 +205,7 @@ def test_witness_replays_standalone_fp64():
 #  (c) no witness attached -> pre-fix behaviour preserved
 # ---------------------------------------------------------------------------
 
+
 def test_unwitnessed_offer_stays_egraph_dependent():
     """``witness=False`` keeps the merge honestly flagged and strict
     replay refuses it — the pre-witness behaviour."""
@@ -200,8 +213,9 @@ def test_unwitnessed_offer_stays_egraph_dependent():
     term, _, _ = _diag_term(T, d)
     eg = EGraph()
     root = eg.add_term(term)
-    lifts = lift_scan_to_trace(eg, root_eid=root, channel_splits=None,
-                               witness=False)
+    lifts = lift_scan_to_trace(
+        eg, root_eid=root, channel_splits=None, witness=False
+    )
     assert len(lifts) == 1
     cert = eg.certificate(term, lifts[0].term, root_eid=root)
     assert cert.n_egraph_dependent >= 1
@@ -233,17 +247,19 @@ def test_bare_union_without_witness_untouched():
 #  (d) the generic API — what pair_shared_input_linears would adopt
 # ---------------------------------------------------------------------------
 
+
 def test_union_witness_api_on_manual_merge():
     """``eg.union(a, b, witness=Rewrite(lhs, rhs))``: the pass asserts
     ``lhs == rhs`` for these concrete terms; the certificate replays
     the assertion as a named rewrite step."""
     x = Var("x", TensorType((4,)))
     src = Op.make("neg", x)
-    dst = Op.make("mul", x, Const(-1.0))     # a true pointwise equality
+    dst = Op.make("mul", x, Const(-1.0))  # a true pointwise equality
     eg = EGraph()
     ea, eb = eg.add_term(src), eg.add_term(dst)
-    w = Rewrite("demo_witness", lhs=src, rhs=dst,
-                law="demo: neg(x) = x * -1")
+    w = Rewrite(
+        "demo_witness", lhs=src, rhs=dst, law="demo: neg(x) = x * -1"
+    )
     assert eg.union(ea, eb, witness=w)
     assert eg.merge_log[-1].rule == "demo_witness"
 

@@ -29,7 +29,7 @@ from catopt.cost import param_bytes_cost_for
 from catopt.ir import Op, Param
 from catopt.optimize import optimize_model, param_report
 
-BYTES = 8          # fp64
+BYTES = 8  # fp64
 
 
 def _randn(shape, g):
@@ -54,6 +54,7 @@ def _walk_term(term):
 #  1. optimize_weight: compressed offers are never bound-free
 # ---------------------------------------------------------------------------
 
+
 def test_optimize_weight_offers_carry_explicit_bounds():
     """A random dense weight is the entropy-dense (trained-like) case:
     certified compression may still be *offered* — e.g. int8 RTN — but
@@ -69,8 +70,9 @@ def test_optimize_weight_offers_carry_explicit_bounds():
     # offers are (kind, size, bound) triples; the bound is the contract
     for offer in res["offers"]:
         kind, _, bound = offer
-        assert math.isfinite(bound) and bound > 0, \
+        assert math.isfinite(bound) and bound > 0, (
             f"{kind} offer without a certified nonzero bound: {offer}"
+        )
 
     # if the extracted program stores fewer bytes than the original
     # weight, the certificate must carry a nonzero bound — "free"
@@ -85,11 +87,13 @@ def test_optimize_weight_offers_carry_explicit_bounds():
 #  2. unmerged adapter: storage billing never reports a phantom win
 # ---------------------------------------------------------------------------
 
+
 class _AdapterUnmerged(nn.Module):
     """``base(x) + lb(la(x))`` — the corner where leaf-name dedup once
     made a materialised ``concat`` copy look free (a phantom −82.8%
     "saving").  Mirrors ``tests/test_exact_corner.py``; kept small.
     """
+
     I, O, R = 64, 64, 8
 
     def __init__(self, seed=0):
@@ -116,19 +120,20 @@ def test_unmerged_adapter_no_phantom_savings():
     torch.manual_seed(0)
     model = _AdapterUnmerged().eval().double()
     x = torch.randn(4, _AdapterUnmerged.I, dtype=torch.float64)
-    low, stats = optimize_model(model, x,
-                                cost_fn=param_bytes_cost_for(),
-                                verbose=False)
+    low, stats = optimize_model(
+        model, x, cost_fn=param_bytes_cost_for(), verbose=False
+    )
     with torch.no_grad():
         ref = model(x.clone())
         out = low(x.clone())
-    rel = ((out - ref).abs().max().item()
-           / (ref.abs().max().item() + 1e-8))
-    assert rel < 1e-12                                     # exact
+    rel = (out - ref).abs().max().item() / (
+        ref.abs().max().item() + 1e-8
+    )
+    assert rel < 1e-12  # exact
 
     r = param_report(model, low)
-    assert r["bytes_saved"] >= 0    # storage billing never goes negative
-    assert r["bytes_saved"] <= 0    # honest bound: nothing to save
+    assert r["bytes_saved"] >= 0  # storage billing never goes negative
+    assert r["bytes_saved"] <= 0  # honest bound: nothing to save
     assert r["optimized_bytes"] == r["original_bytes"]
     # no materialised copy survived extraction — neither the paired
     # concat (``fused_*``) nor any ε-derived factor.
@@ -140,10 +145,12 @@ def test_unmerged_adapter_no_phantom_savings():
 #  3. ε offers are opt-in — default extraction contains no eps_* members
 # ---------------------------------------------------------------------------
 
+
 class _NearLowRank(nn.Module):
     """A near-rank-8 weight — the shape that *would* attract
     ``eps.low_rank_params`` if the ε passes ran.  It must not: the
     toolkit is opt-in."""
+
     def __init__(self, seed=0):
         super().__init__()
         g = torch.Generator().manual_seed(seed)
@@ -151,8 +158,7 @@ class _NearLowRank(nn.Module):
         V = _randn((8, 64), g)
         self.lin = nn.Linear(64, 64, bias=False)
         with torch.no_grad():
-            self.lin.weight.copy_(
-                U @ V + 0.01 * _randn((64, 64), g))
+            self.lin.weight.copy_(U @ V + 0.01 * _randn((64, 64), g))
 
     def forward(self, x):
         return self.lin(x) + x
@@ -169,14 +175,15 @@ def test_eps_members_require_opt_in():
     x = torch.randn(4, 64, dtype=torch.float64)
     # param_bytes_cost_for: the axis under which an eps offer, had one
     # been made, would win extraction — the strongest bait.
-    low, stats = optimize_model(model, x,
-                                cost_fn=param_bytes_cost_for(),
-                                verbose=False)
+    low, stats = optimize_model(
+        model, x, cost_fn=param_bytes_cost_for(), verbose=False
+    )
     assert "eps_offers" not in stats
 
     ops = {t.op for t in _walk_term(low._root) if isinstance(t, Op)}
-    params = {t.name for t in _walk_term(low._root)
-              if isinstance(t, Param)}
+    params = {
+        t.name for t in _walk_term(low._root) if isinstance(t, Param)
+    }
     assert not [o for o in ops if o.startswith("eps_")]
     assert not [n for n in params if n.startswith("eps_")]
     assert not any(n.startswith("eps_") for n in low.state_dict())
@@ -184,6 +191,7 @@ def test_eps_members_require_opt_in():
     with torch.no_grad():
         ref = model(x.clone())
         out = low(x.clone())
-    rel = ((out - ref).abs().max().item()
-           / (ref.abs().max().item() + 1e-8))
-    assert rel < 1e-12                                     # exact
+    rel = (out - ref).abs().max().item() / (
+        ref.abs().max().item() + 1e-8
+    )
+    assert rel < 1e-12  # exact

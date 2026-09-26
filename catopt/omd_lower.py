@@ -54,17 +54,18 @@ from typing import Any
 
 import torch
 
-from catopt.ir import IR, Op
-from catopt.torch_bridge import IRModule, _IR_TO_TORCH
-from catopt.cost import _shape_of
 import catopt.xcarrier  # noqa: F401 — registers the omd_* / affd_*
-                        # torch bindings into _IR_TO_TORCH.
+from catopt.cost import _shape_of
+from catopt.ir import IR, Op
+from catopt.torch_bridge import _IR_TO_TORCH, IRModule
+
+# torch bindings into _IR_TO_TORCH.
 
 __all__ = [
     "BatchedOmdModule",
-    "to_batched_omd_module",
-    "is_omd_apply_term",
     "build_omd_plan",
+    "is_omd_apply_term",
+    "to_batched_omd_module",
 ]
 
 #: Projection ops → (component index into the map tuple, carrier domain).
@@ -89,8 +90,11 @@ def _stack_dim(attrs: dict) -> int:
 
 def _select_index(term: Any):
     """Decompose ``select(base, dim, i)`` → ``(base, dim, i)`` or None."""
-    if (not isinstance(term, Op) or term.op not in ("select", "getitem")
-            or len(term.args) != 1):
+    if (
+        not isinstance(term, Op)
+        or term.op not in ("select", "getitem")
+        or len(term.args) != 1
+    ):
         return None
     dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
     idx = term.attrs.get("arg2", term.attrs.get("index"))
@@ -100,8 +104,11 @@ def _select_index(term: Any):
 
 
 def _concrete(s) -> bool:
-    return (isinstance(s, tuple) and len(s) > 0
-            and all(isinstance(d, int) for d in s))
+    return (
+        isinstance(s, tuple)
+        and len(s) > 0
+        and all(isinstance(d, int) for d in s)
+    )
 
 
 def _is_omd_tree(t: Any, memo: dict | None = None) -> bool:
@@ -117,8 +124,9 @@ def _is_omd_tree(t: Any, memo: dict | None = None) -> bool:
     ok = False
     if isinstance(t, Op):
         if t.op == "omd_compose" and len(t.args) == 2:
-            ok = (_is_omd_tree(t.args[0], memo)
-                  and _is_omd_tree(t.args[1], memo))
+            ok = _is_omd_tree(t.args[0], memo) and _is_omd_tree(
+                t.args[1], memo
+            )
         else:
             ok = t.op in _OMD_LEAF_OPS
     memo[k] = ok
@@ -128,10 +136,12 @@ def _is_omd_tree(t: Any, memo: dict | None = None) -> bool:
 def is_omd_apply_term(root: Any) -> bool:
     """True if ``root`` is ``omd_apply[m](<omd tree>, h)`` — deferred
     affine attention applied to the shared initial state."""
-    return (isinstance(root, Op)
-            and root.op in ("omd_apply", "omd_applym")
-            and len(root.args) == 2
-            and _is_omd_tree(root.args[0]))
+    return (
+        isinstance(root, Op)
+        and root.op in ("omd_apply", "omd_applym")
+        and len(root.args) == 2
+        and _is_omd_tree(root.args[0])
+    )
 
 
 def _flatten_map(t: Any, out: list) -> None:
@@ -144,8 +154,12 @@ def _flatten_map(t: Any, out: list) -> None:
     stack = [t]
     while stack:
         u = stack.pop()
-        if isinstance(u, Op) and u.op in _COMPOSE_OP and len(u.args) == 2:
-            stack.append(u.args[0])   # left child applies LAST
+        if (
+            isinstance(u, Op)
+            and u.op in _COMPOSE_OP
+            and len(u.args) == 2
+        ):
+            stack.append(u.args[0])  # left child applies LAST
             stack.append(u.args[1])
         else:
             out.append(u)
@@ -169,8 +183,13 @@ def _leaf_sig(leaf: Any, domain: str):
         return False
     if leaf.op == "aff":
         A, b = _shape_of(leaf.args[0]), _shape_of(leaf.args[1])
-        if (_concrete(A) and len(A) >= 2 and A[-1] == A[-2]
-                and _concrete(b) and b == A[:-1]):
+        if (
+            _concrete(A)
+            and len(A) >= 2
+            and A[-1] == A[-2]
+            and _concrete(b)
+            and b == A[:-1]
+        ):
             return ("dense", A)
         return False
     return None
@@ -185,8 +204,11 @@ def _part_gather(leaves: list, argidx: int):
     """
     parts = []
     for leaf in leaves:
-        if (not isinstance(leaf, Op) or leaf.op not in _LEAF_OP
-                or len(leaf.args) != 2):
+        if (
+            not isinstance(leaf, Op)
+            or leaf.op not in _LEAF_OP
+            or len(leaf.args) != 2
+        ):
             return None
         p = _select_index(leaf.args[argidx])
         if p is None:
@@ -266,15 +288,18 @@ def build_omd_plan(root: Any) -> dict | None:
     omd_gather = []
     for nodes in omd_levels:
         omd_gather.append(
-            ([slot[id(t.args[0])] for t in nodes],
-             [slot[id(t.args[1])] for t in nodes]))
+            (
+                [slot[id(t.args[0])] for t in nodes],
+                [slot[id(t.args[1])] for t in nodes],
+            )
+        )
         for t in nodes:
             slot[id(t)] = nxt
             nxt += 1
 
     # ---- scan leaf tensor args (and h) for map projections -----------
-    targets: dict[int, tuple[Any, str]] = {}   # map id -> (term, domain)
-    raw_proj: list[tuple[Op, int, Any]] = []   # (node, comp_idx, map)
+    targets: dict[int, tuple[Any, str]] = {}  # map id -> (term, domain)
+    raw_proj: list[tuple[Op, int, Any]] = []  # (node, comp_idx, map)
     raw_stack: list[tuple[Op, int, str, list, int]] = []
     scanned: set[int] = set()
     bad = False
@@ -304,9 +329,13 @@ def build_omd_plan(root: Any) -> dict | None:
             _register(t.args[0], pinfo[1])
             return
         if t.op == "stack" and t.args:
-            infos = [_PROJECTIONS.get(c.op) if isinstance(c, Op) else None
-                     for c in t.args]
-            if infos[0] is not None and all(i == infos[0] for i in infos):
+            infos = [
+                _PROJECTIONS.get(c.op) if isinstance(c, Op) else None
+                for c in t.args
+            ]
+            if infos[0] is not None and all(
+                i == infos[0] for i in infos
+            ):
                 if inside_map_leaf:
                     bad = True
                     return
@@ -315,7 +344,8 @@ def build_omd_plan(root: Any) -> dict | None:
                 for mp in maps:
                     _register(mp, dom)
                 raw_stack.append(
-                    (t, ci, dom, maps, _stack_dim(dict(t.attrs))))
+                    (t, ci, dom, maps, _stack_dim(dict(t.attrs)))
+                )
                 for c in t.args:
                     raw_proj.append((c, ci, c.args[0]))
                 return
@@ -333,8 +363,11 @@ def build_omd_plan(root: Any) -> dict | None:
     def _ctx(dom: str) -> dict:
         d = domains.get(dom)
         if d is None:
-            d = domains[dom] = {"leaves": [], "levels": [],
-                                "level_of": {}}
+            d = domains[dom] = {
+                "leaves": [],
+                "levels": [],
+                "level_of": {},
+            }
         return d
 
     def walk_map(root_mp: Any, expected: str) -> None:
@@ -348,8 +381,11 @@ def build_omd_plan(root: Any) -> dict | None:
         while stack:
             mp, exp, done = stack.pop()
             tid = id(mp)
-            if (isinstance(mp, Op) and mp.op in _COMPOSE_OP
-                    and len(mp.args) == 2):
+            if (
+                isinstance(mp, Op)
+                and mp.op in _COMPOSE_OP
+                and len(mp.args) == 2
+            ):
                 dom = _COMPOSE_OP[mp.op]
                 if dom != exp:
                     bad = True
@@ -362,22 +398,27 @@ def build_omd_plan(root: Any) -> dict | None:
                     for a in mp.args:
                         stack.append((a, dom, False))
                     continue
-                lv = max(d["level_of"].get(id(a), 0)
-                         for a in mp.args) + 1
+                lv = (
+                    max(d["level_of"].get(id(a), 0) for a in mp.args)
+                    + 1
+                )
                 d["level_of"][tid] = lv
                 while len(d["levels"]) < lv:
                     d["levels"].append([])
                 d["levels"][lv - 1].append(mp)
                 continue
             # leaf position
-            if isinstance(mp, Op) and mp.op in _LEAF_OP \
-                    and len(mp.args) == 2:
+            if (
+                isinstance(mp, Op)
+                and mp.op in _LEAF_OP
+                and len(mp.args) == 2
+            ):
                 dom = _LEAF_OP[mp.op]
                 if dom != exp:
                     bad = True
                     continue
             else:
-                dom = exp   # opaque leaf (any term evaluating to a pair)
+                dom = exp  # opaque leaf (any term evaluating to a pair)
             d = _ctx(dom)
             if tid in d["level_of"]:
                 continue
@@ -446,14 +487,15 @@ def build_omd_plan(root: Any) -> dict | None:
     chain = len(tdoms) == 1
     if chain:
         for seq in seqs.values():
-            if seq != base[:len(seq)]:
+            if seq != base[: len(seq)]:
                 chain = False
                 break
     if chain:
         dom = next(iter(tdoms))
-        if (any(isinstance(l, Op) and _LEAF_OP.get(l.op) not in
-                (None, dom) for l in base)
-                or not _sig_uniform(base, dom)):
+        if any(
+            isinstance(l, Op) and _LEAF_OP.get(l.op) not in (None, dom)
+            for l in base
+        ) or not _sig_uniform(base, dom):
             chain = False
 
     if chain:
@@ -468,7 +510,8 @@ def build_omd_plan(root: Any) -> dict | None:
             plan["proj_seeds"].append((node, ci, src, pos_of[id(mp)]))
         for node, ci, _d, maps, dim in raw_stack:
             plan["stack_seeds"].append(
-                (node, ci, src, [pos_of[id(m)] for m in maps], dim))
+                (node, ci, src, [pos_of[id(m)] for m in maps], dim)
+            )
         for tid, (mp, _d) in targets.items():
             plan["map_seeds"].append((mp, src, pos_of[tid]))
         return plan
@@ -482,8 +525,11 @@ def build_omd_plan(root: Any) -> dict | None:
         gather = []
         for nodes in d["levels"]:
             gather.append(
-                ([slot_d[id(t.args[0])] for t in nodes],
-                 [slot_d[id(t.args[1])] for t in nodes]))
+                (
+                    [slot_d[id(t.args[0])] for t in nodes],
+                    [slot_d[id(t.args[1])] for t in nodes],
+                )
+            )
             for t in nodes:
                 slot_d[id(t)] = nxt_d
                 nxt_d += 1
@@ -496,14 +542,22 @@ def build_omd_plan(root: Any) -> dict | None:
     for node, ci, mp in raw_proj:
         dom = targets[id(mp)][1]
         plan["proj_seeds"].append(
-            (node, ci, ("forest", dom), domains[dom]["slot"][id(mp)]))
+            (node, ci, ("forest", dom), domains[dom]["slot"][id(mp)])
+        )
     for node, ci, dom, maps, dim in raw_stack:
         plan["stack_seeds"].append(
-            (node, ci, ("forest", dom),
-             [domains[dom]["slot"][id(m)] for m in maps], dim))
+            (
+                node,
+                ci,
+                ("forest", dom),
+                [domains[dom]["slot"][id(m)] for m in maps],
+                dim,
+            )
+        )
     for tid, (mp, dom) in targets.items():
         plan["map_seeds"].append(
-            (mp, ("forest", dom), domains[dom]["slot"][id(mp)]))
+            (mp, ("forest", dom), domains[dom]["slot"][id(mp)])
+        )
     return plan
 
 
@@ -543,7 +597,7 @@ class BatchedOmdModule(torch.nn.Module):
         self._graph = None
         self._graph_inputs: list[torch.Tensor] = []
         self._graph_out: torch.Tensor | None = None
-        self.fallbacks = 0   # times the batched path declined at runtime
+        self.fallbacks = 0  # times the batched path declined at runtime
 
     @property
     def is_batched(self) -> bool:
@@ -562,8 +616,10 @@ class BatchedOmdModule(torch.nn.Module):
         return self._graph is not None
 
     def capture_cuda_graph(
-        self, *example_inputs: torch.Tensor, warmup: int = 3,
-    ) -> "BatchedOmdModule":
+        self,
+        *example_inputs: torch.Tensor,
+        warmup: int = 3,
+    ) -> BatchedOmdModule:
         """Record the batched forward into a CUDA graph.
 
         Same contract as
@@ -586,7 +642,10 @@ class BatchedOmdModule(torch.nn.Module):
         with torch.cuda.graph(g):
             out = self._forward_impl(*static_ins)
         self._graph, self._graph_inputs, self._graph_out = (
-            g, static_ins, out)
+            g,
+            static_ins,
+            out,
+        )
         return self
 
     def drop_cuda_graph(self) -> None:
@@ -598,18 +657,29 @@ class BatchedOmdModule(torch.nn.Module):
 
     def forward(self, *xs: torch.Tensor) -> torch.Tensor:
         g = self._graph
-        if (g is not None and len(xs) == len(self._graph_inputs)
-                and all(t.shape == b.shape and t.dtype == b.dtype
-                        and t.device == b.device
-                        for t, b in zip(xs, self._graph_inputs))):
+        if (
+            g is not None
+            and len(xs) == len(self._graph_inputs)
+            and all(
+                t.shape == b.shape
+                and t.dtype == b.dtype
+                and t.device == b.device
+                for t, b in zip(xs, self._graph_inputs)
+            )
+        ):
             for buf, t in zip(self._graph_inputs, xs):
                 buf.copy_(t, non_blocking=True)
             g.replay()
             return self._graph_out
         return self._forward_impl(*xs)
 
-    def _cached(self, key: tuple, like: torch.Tensor, make,
-                dtype: torch.dtype | None = None) -> torch.Tensor:
+    def _cached(
+        self,
+        key: tuple,
+        like: torch.Tensor,
+        make,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         want = dtype or like.dtype
         t = self._const_cache.get(key)
         if t is None or t.device != like.device or t.dtype != want:
@@ -619,17 +689,23 @@ class BatchedOmdModule(torch.nn.Module):
 
     def _gidx(self, slots, like: torch.Tensor) -> torch.Tensor:
         return self._cached(
-            ("idx", tuple(slots)), like,
-            lambda t: torch.tensor(slots, dtype=torch.long,
-                                   device=t.device),
-            dtype=torch.long)
+            ("idx", tuple(slots)),
+            like,
+            lambda t: torch.tensor(
+                slots, dtype=torch.long, device=t.device
+            ),
+            dtype=torch.long,
+        )
 
     def _leaf_part(self, leaf: Any, i: int, ev) -> torch.Tensor:
         """Part i of a map leaf's value — for ``aff``/``aff_diag`` the
         arg directly; for opaque leaves ``v[i]`` mirrors the generic
         ``f[0]``/``f[1]`` indexing exactly (tuple or tensor)."""
-        if (isinstance(leaf, Op) and leaf.op in _LEAF_OP
-                and len(leaf.args) == 2):
+        if (
+            isinstance(leaf, Op)
+            and leaf.op in _LEAF_OP
+            and len(leaf.args) == 2
+        ):
             return ev(leaf.args[i])
         v = ev(leaf)
         return v[i]
@@ -670,14 +746,17 @@ class BatchedOmdModule(torch.nn.Module):
             ida = eye.reshape(*([1] * (len(a_shape) - 2)), i, i)
             ida = ida.expand(*a_shape)
         else:
-            ida = torch.ones(*a_shape, dtype=like.dtype,
-                             device=like.device)
-        idb = torch.zeros(*b_shape, dtype=like.dtype,
-                          device=like.device)
+            ida = torch.ones(
+                *a_shape, dtype=like.dtype, device=like.device
+            )
+        idb = torch.zeros(
+            *b_shape, dtype=like.dtype, device=like.device
+        )
         return ida, idb
 
-    def _prefix_scan(self, A: torch.Tensor, B: torch.Tensor,
-                     domain: str):
+    def _prefix_scan(
+        self, A: torch.Tensor, B: torch.Tensor, domain: str
+    ):
         """All prefix maps of the leaf sequence ``(A_t, B_t)``.
 
         Two-level blocked associative scan: local prefixes within
@@ -696,37 +775,39 @@ class BatchedOmdModule(torch.nn.Module):
         shape_a, shape_b = A.shape[1:], B.shape[1:]
         ida, idb = self._id_map(shape_a, shape_b, domain, A)
         if pad:
-            A = torch.cat(
-                [A, ida.unsqueeze(0).expand(pad, *shape_a)])
-            B = torch.cat(
-                [B, idb.unsqueeze(0).expand(pad, *shape_b)])
+            A = torch.cat([A, ida.unsqueeze(0).expand(pad, *shape_a)])
+            B = torch.cat([B, idb.unsqueeze(0).expand(pad, *shape_b)])
         A = A.reshape(C, blk, *shape_a)
         B = B.reshape(C, blk, *shape_b)
 
         las = [A[:, 0]]
         lbs = [B[:, 0]]
         for k in range(1, blk):
-            na, nb = _compose_pair(A[:, k], B[:, k],
-                                   las[-1], lbs[-1], domain)
+            na, nb = _compose_pair(
+                A[:, k], B[:, k], las[-1], lbs[-1], domain
+            )
             las.append(na)
             lbs.append(nb)
-        La = torch.stack(las, dim=1)   # (C, blk, ...) local prefixes
+        La = torch.stack(las, dim=1)  # (C, blk, ...) local prefixes
         Lb = torch.stack(lbs, dim=1)
 
         # carry into block c = total of blocks < c (latest leftmost)
         cpa = [ida]
         cpb = [idb]
         for c in range(1, C):
-            na, nb = _compose_pair(La[c - 1, -1], Lb[c - 1, -1],
-                                   cpa[-1], cpb[-1], domain)
+            na, nb = _compose_pair(
+                La[c - 1, -1], Lb[c - 1, -1], cpa[-1], cpb[-1], domain
+            )
             cpa.append(na)
             cpb.append(nb)
-        CPa = torch.stack(cpa, dim=0).unsqueeze(1)   # (C, 1, ...)
+        CPa = torch.stack(cpa, dim=0).unsqueeze(1)  # (C, 1, ...)
         CPb = torch.stack(cpb, dim=0).unsqueeze(1)
         Pa, Pb = _compose_pair(La, Lb, CPa, CPb, domain)
         n = C * blk
-        return (Pa.reshape(n, *shape_a)[:T],
-                Pb.reshape(n, *shape_b)[:T])
+        return (
+            Pa.reshape(n, *shape_a)[:T],
+            Pb.reshape(n, *shape_b)[:T],
+        )
 
     def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
         plan = self._plan
@@ -747,14 +828,19 @@ class BatchedOmdModule(torch.nn.Module):
             mode = plan["map_mode"]
             if mode == "chain":
                 A, B = self._eval_leaf_parts(
-                    plan["chain_leaves"], plan["chain_a_gather"],
-                    plan["chain_b_gather"], ev)
+                    plan["chain_leaves"],
+                    plan["chain_a_gather"],
+                    plan["chain_b_gather"],
+                    ev,
+                )
                 stores[("chain",)] = self._prefix_scan(
-                    A, B, plan["chain_domain"])
+                    A, B, plan["chain_domain"]
+                )
             elif mode == "forest":
                 for dom, d in plan["forest"].items():
                     A, B = self._eval_leaf_parts(
-                        d["leaves"], d["a_gather"], d["b_gather"], ev)
+                        d["leaves"], d["a_gather"], d["b_gather"], ev
+                    )
                     for f_idx, g_idx in d["gather"]:
                         ixf = self._gidx(f_idx, A)
                         ixg = self._gidx(g_idx, A)
@@ -762,19 +848,22 @@ class BatchedOmdModule(torch.nn.Module):
                             A.index_select(0, ixf),
                             B.index_select(0, ixf),
                             A.index_select(0, ixg),
-                            B.index_select(0, ixg), dom)
+                            B.index_select(0, ixg),
+                            dom,
+                        )
                         A = torch.cat([A, an])
                         B = torch.cat([B, bn])
                     stores[("forest", dom)] = (A, B)
 
             # ---- 2. memo seeds: projections / stacks / map tuples ----
-            views = {k: (v[0].unbind(0), v[1].unbind(0))
-                     for k, v in stores.items()}
+            views = {
+                k: (v[0].unbind(0), v[1].unbind(0))
+                for k, v in stores.items()
+            }
             for node, ci, src, pos in plan["proj_seeds"]:
                 memo[id(node)] = views[src][ci][pos]
             for mp, src, pos in plan["map_seeds"]:
-                memo[id(mp)] = (views[src][0][pos],
-                                views[src][1][pos])
+                memo[id(mp)] = (views[src][0][pos], views[src][1][pos])
             for node, ci, src, poss, dim in plan["stack_seeds"]:
                 srcs = stores[src][ci]
                 t = srcs.index_select(0, self._gidx(poss, srcs))
@@ -788,18 +877,29 @@ class BatchedOmdModule(torch.nn.Module):
             vals: list = []
             for leaf in plan["omd_leaves"]:
                 if leaf.op == "omd_elem" and len(leaf.args) == 3:
-                    vals.append(omd_elem(ev(leaf.args[0]),
-                                         ev(leaf.args[1]),
-                                         ev(leaf.args[2])))
+                    vals.append(
+                        omd_elem(
+                            ev(leaf.args[0]),
+                            ev(leaf.args[1]),
+                            ev(leaf.args[2]),
+                        )
+                    )
                 else:
                     vals.append(ev(leaf))
 
             # ---- 4. compose levels ------------------------------------
-            uniform = bool(vals) and all(
-                isinstance(v, tuple) and len(v) == 4
-                for v in vals) and all(
-                all(v[c].shape == vals[0][c].shape for c in range(4))
-                for v in vals[1:])
+            uniform = (
+                bool(vals)
+                and all(
+                    isinstance(v, tuple) and len(v) == 4 for v in vals
+                )
+                and all(
+                    all(
+                        v[c].shape == vals[0][c].shape for c in range(4)
+                    )
+                    for v in vals[1:]
+                )
+            )
             if uniform:
                 m_all = torch.stack([v[0] for v in vals])
                 l_all = torch.stack([v[1] for v in vals])
@@ -808,33 +908,40 @@ class BatchedOmdModule(torch.nn.Module):
                 for f_idx, g_idx in plan["omd_gather"]:
                     ixf = self._gidx(f_idx, m_all)
                     ixg = self._gidx(g_idx, m_all)
-                    m1, l1 = (t.index_select(0, ixf)
-                              for t in (m_all, l_all))
-                    fa1, fb1 = (t.index_select(0, ixf)
-                                for t in (fa_all, fb_all))
-                    m2, l2 = (t.index_select(0, ixg)
-                              for t in (m_all, l_all))
-                    fa2, fb2 = (t.index_select(0, ixg)
-                                for t in (fa_all, fb_all))
+                    m1, l1 = (
+                        t.index_select(0, ixf) for t in (m_all, l_all)
+                    )
+                    fa1, fb1 = (
+                        t.index_select(0, ixf) for t in (fa_all, fb_all)
+                    )
+                    m2, l2 = (
+                        t.index_select(0, ixg) for t in (m_all, l_all)
+                    )
+                    fa2, fb2 = (
+                        t.index_select(0, ixg) for t in (fa_all, fb_all)
+                    )
                     # _omd_compose verbatim, batched over slot dim.
                     mx = torch.maximum(m1, m2)
                     fin1, fin2 = torch.isfinite(m1), torch.isfinite(m2)
-                    e1 = torch.where(fin1, torch.exp(m1 - mx),
-                                     torch.zeros_like(mx))
-                    e2 = torch.where(fin2, torch.exp(m2 - mx),
-                                     torch.zeros_like(mx))
-                    l_n = torch.where(fin1, l1 * e1,
-                                      torch.zeros_like(l1)) + \
-                        torch.where(fin2, l2 * e2,
-                                    torch.zeros_like(l2))
-                    fa_n = torch.where(fin1, fa1 * e1,
-                                       torch.zeros_like(fa1)) + \
-                        torch.where(fin2, fa2 * e2,
-                                    torch.zeros_like(fa2))
-                    fb_n = torch.where(fin1, fb1 * e1,
-                                       torch.zeros_like(fb1)) + \
-                        torch.where(fin2, fb2 * e2,
-                                    torch.zeros_like(fb2))
+                    e1 = torch.where(
+                        fin1, torch.exp(m1 - mx), torch.zeros_like(mx)
+                    )
+                    e2 = torch.where(
+                        fin2, torch.exp(m2 - mx), torch.zeros_like(mx)
+                    )
+                    l_n = torch.where(
+                        fin1, l1 * e1, torch.zeros_like(l1)
+                    ) + torch.where(fin2, l2 * e2, torch.zeros_like(l2))
+                    fa_n = torch.where(
+                        fin1, fa1 * e1, torch.zeros_like(fa1)
+                    ) + torch.where(
+                        fin2, fa2 * e2, torch.zeros_like(fa2)
+                    )
+                    fb_n = torch.where(
+                        fin1, fb1 * e1, torch.zeros_like(fb1)
+                    ) + torch.where(
+                        fin2, fb2 * e2, torch.zeros_like(fb2)
+                    )
                     m_all = torch.cat([m_all, mx])
                     l_all = torch.cat([l_all, l_n])
                     fa_all = torch.cat([fa_all, fa_n])

@@ -1,9 +1,10 @@
 """Tests for the e-graph and equality saturation."""
 
-import pytest
-from catopt.egraph import EGraph, ENode, Rewrite, UnionFind
-from catopt.ir import Op, Var, Const, Param, TensorType, op_repr
-from catopt.rules import ASSOC_MATMUL, ASSOC_MATMUL_REV, NATURALITY_SCALAR, CATEGORICAL_RULES
+from catopt.egraph import EGraph, ENode, UnionFind
+from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt.rules import (
+    CATEGORICAL_RULES,
+)
 
 
 def test_union_find_basic():
@@ -107,19 +108,23 @@ def test_repeated_metavar_enforces_same_eclass():
 
     # Pattern requiring the same input twice.
     pattern = Op.make(
-        "add", Op.make("matmul", "x", "W1"), Op.make("matmul", "x", "W2")
+        "add",
+        Op.make("matmul", "x", "W1"),
+        Op.make("matmul", "x", "W2"),
     )
 
     # Case 1: same input x in both — must match.
-    same = Op.make("add", Op.make("matmul", x, w1),
-                   Op.make("matmul", x, w2))
+    same = Op.make(
+        "add", Op.make("matmul", x, w1), Op.make("matmul", x, w2)
+    )
     eg_same = EGraph()
     eid_same = eg_same.add_term(same)
     assert len(eg_same.matches(pattern, eg_same.find(eid_same))) >= 1
 
     # Case 2: different inputs x and y — must NOT match.
-    diff = Op.make("add", Op.make("matmul", x, w1),
-                   Op.make("matmul", y, w2))
+    diff = Op.make(
+        "add", Op.make("matmul", x, w1), Op.make("matmul", y, w2)
+    )
     eg_diff = EGraph()
     eid_diff = eg_diff.add_term(diff)
     assert len(eg_diff.matches(pattern, eg_diff.find(eid_diff))) == 0
@@ -137,6 +142,7 @@ def test_extract_best():
 
     # Cost function: prefer fewer ops (count_cost)
     from catopt.cost import count_cost
+
     best = eg.extract_best(eid, count_cost)
     # Should extract either add(x, 0) or x (they're in the same e-class
     # only if we've applied rewrites, but we haven't here — so best = add(x,0))
@@ -151,21 +157,22 @@ def test_associativity_rewriting():
     C = Param("C", TensorType((4, 4)))
 
     # x @ A @ B @ C = ((x @ A) @ B) @ C  (left-nested)
-    left_nested = Op.make("matmul",
-                          Op.make("matmul",
-                                  Op.make("matmul", x, A),
-                                  B),
-                          C)
+    left_nested = Op.make(
+        "matmul", Op.make("matmul", Op.make("matmul", x, A), B), C
+    )
 
     eg = EGraph()
     eid = eg.add_term(left_nested)
 
     # Run with both associativity directions
-    stats = eg.run(CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=10000)
+    stats = eg.run(
+        CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=10000
+    )
     print(f"Stats: {stats}")
 
     # Extract the best (minimum FLOPs) form
     from catopt.cost import flops_cost
+
     best = eg.extract_best(eid, flops_cost)
     print(f"Best: {op_repr(best)}")
 
@@ -201,6 +208,7 @@ def test_naturality_rewriting():
     eg.run(CATEGORICAL_RULES, eid, max_iterations=5, max_nodes=1000)
 
     from catopt.cost import count_cost
+
     best = eg.extract_best(eid, count_cost)
 
     root_class = eg.get_class(eid)
@@ -208,7 +216,8 @@ def test_naturality_rewriting():
     assert len(root_class.nodes) >= 2
     eg.run(CATEGORICAL_RULES, eid, max_iterations=5, max_nodes=1000)
 
-    from catopt.cost import flops_cost, count_cost
+    from catopt.cost import count_cost, flops_cost
+
     best = eg.extract_best(eid, flops_cost)
 
     # The naturality rule should have produced: mul(matmul(x, W), c)
@@ -227,7 +236,9 @@ def test_saturation_terminates():
     eg = EGraph()
     eid = eg.add_term(term)
 
-    stats = eg.run(CATEGORICAL_RULES, eid, max_iterations=50, max_nodes=10000)
+    stats = eg.run(
+        CATEGORICAL_RULES, eid, max_iterations=50, max_nodes=10000
+    )
     # Should terminate well before 50 iterations
     assert stats["iterations"] < 50
 
@@ -235,6 +246,7 @@ def test_saturation_terminates():
 # ---------------------------------------------------------------------------
 #  Incremental (dirty-frontier) saturation + bounded saturation
 # ---------------------------------------------------------------------------
+
 
 def test_incremental_frontier_refires_at_dirtied_classes():
     """After saturation, a rule must re-match classes changed by merges.
@@ -256,6 +268,7 @@ def test_incremental_frontier_refires_at_dirtied_classes():
     eg = EGraph()
     eid = eg.add_term(term)
     from catopt.rules import ASSOC_ADD, COMM_ADD
+
     stats = eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=20)
     root = eg.get_class(eid)
     # Saturation reached every bracketing of the 3-summand chain:
@@ -289,19 +302,26 @@ def test_rule_budgets_bound_expansion():
     eg = EGraph()
     eid = eg.add_term(term)
     from catopt.rules import ASSOC_ADD, COMM_ADD
+
     eg_full = EGraph()
     eid_full = eg_full.add_term(term)
-    stats_full = eg_full.run([ASSOC_ADD, COMM_ADD], eid_full,
-                             max_iterations=30)
+    stats_full = eg_full.run(
+        [ASSOC_ADD, COMM_ADD], eid_full, max_iterations=30
+    )
     assert stats_full["n_enodes"] > 100  # the closure is big
 
-    stats = eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=30,
-                   rule_budgets={"assoc_add": 20, "comm_add": 20})
+    stats = eg.run(
+        [ASSOC_ADD, COMM_ADD],
+        eid,
+        max_iterations=30,
+        rule_budgets={"assoc_add": 20, "comm_add": 20},
+    )
     assert stats["n_enodes"] < stats_full["n_enodes"]
     assert stats["rule_budgets"]["assoc_add"] >= 20
     assert "assoc_add" in stats["budget_suspended"]
     # Extraction still works and returns a valid member.
     from catopt.cost import count_cost
+
     best = eg.extract_best(eid, count_cost)
     assert best is not None
 
@@ -316,12 +336,21 @@ def test_rule_budget_persists_across_run_calls():
     eg = EGraph()
     eid = eg.add_term(term)
     from catopt.rules import ASSOC_ADD, COMM_ADD
-    eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=10,
-           rule_budgets={"assoc_add": 8})
+
+    eg.run(
+        [ASSOC_ADD, COMM_ADD],
+        eid,
+        max_iterations=10,
+        rule_budgets={"assoc_add": 8},
+    )
     spent1 = eg._budget_spent["assoc_add"]
     assert spent1 >= 8
-    eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=10,
-           rule_budgets={"assoc_add": 8})
+    eg.run(
+        [ASSOC_ADD, COMM_ADD],
+        eid,
+        max_iterations=10,
+        rule_budgets={"assoc_add": 8},
+    )
     # Still suspended: cumulative spend stays at the first-run level.
     assert eg._budget_spent["assoc_add"] == spent1
 
@@ -329,18 +358,25 @@ def test_rule_budget_persists_across_run_calls():
 def test_matches_max_results_cap():
     """matches(pattern, eid, max_results) truncates enumeration."""
     xs = [Var(f"v{i}", TensorType((1, 4))) for i in range(4)]
-    term = Op.make("add", xs[0],
-                   Op.make("add", xs[1],
-                           Op.make("add", xs[2], xs[3])))
+    term = Op.make(
+        "add",
+        xs[0],
+        Op.make("add", xs[1], Op.make("add", xs[2], xs[3])),
+    )
     eg = EGraph()
     eid = eg.add_term(term)
     from catopt.rules import ASSOC_ADD, COMM_ADD
+
     eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=10)
     root = eg.find(eid)
-    full = eg.matches(Op.make("add", "a", Op.make("add", "b", "c")),
-                      root)
-    capped = eg.matches(Op.make("add", "a", Op.make("add", "b", "c")),
-                        root, max_results=3)
+    full = eg.matches(
+        Op.make("add", "a", Op.make("add", "b", "c")), root
+    )
+    capped = eg.matches(
+        Op.make("add", "a", Op.make("add", "b", "c")),
+        root,
+        max_results=3,
+    )
     assert len(capped) == 3
     assert len(full) > 3
 
@@ -352,6 +388,7 @@ def test_min_term_returns_smallest_member():
     eg = EGraph()
     eid = eg.add_term(Op.make("add", x, zero))
     from catopt.rules import ID_ADD
+
     eg.run([ID_ADD], eid, max_iterations=5)
     t, s = eg._min_term(eid, {})
     assert s == 1  # the bare Var beats add(x, 0)
@@ -372,9 +409,10 @@ def test_fresh_rule_full_scan_after_saturation():
     term = Op.make("add", x, Op.make("add", y, zero))
     eg = EGraph()
     eid = eg.add_term(term)
-    from catopt.rules import ID_ADD, COMM_ADD
+    from catopt.rules import COMM_ADD, ID_ADD
+
     eg.run([ID_ADD], eid, max_iterations=5)
-    assert not eg._dirty           # saturated: frontier is empty
+    assert not eg._dirty  # saturated: frontier is empty
     assert "comm_add" not in eg.rule_fires
     # comm_add has never scanned this graph — it must get a full pass
     # and find the commuted members despite the empty frontier.
@@ -391,18 +429,21 @@ def test_incremental_saturation_same_fixed_point():
     A = Param("A", TensorType((4, 4)))
     B = Param("B", TensorType((4, 4)))
     C = Param("C", TensorType((4, 4)))
-    term = Op.make("matmul",
-                   Op.make("matmul",
-                           Op.make("matmul", x, A), B), C)
+    term = Op.make(
+        "matmul", Op.make("matmul", Op.make("matmul", x, A), B), C
+    )
     eg = EGraph()
     eid = eg.add_term(term)
     from catopt.rules import CATEGORICAL_RULES
+
     eg.run(CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=10000)
     n1 = eg.n_enodes
-    stats2 = eg.run(CATEGORICAL_RULES, eid, max_iterations=10,
-                    max_nodes=10000)
-    assert stats2["iterations"] <= 1   # clean frontier: no work
+    stats2 = eg.run(
+        CATEGORICAL_RULES, eid, max_iterations=10, max_nodes=10000
+    )
+    assert stats2["iterations"] <= 1  # clean frontier: no work
     assert eg.n_enodes == n1
     from catopt.cost import flops_cost
+
     best = eg.extract_best(eid, flops_cost)
     assert best is not None

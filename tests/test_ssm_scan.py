@@ -34,8 +34,8 @@ import math
 import pytest
 import torch
 
-from catopt.egraph import EGraph
 from catopt import rules as R
+from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Var, op_repr
 from catopt.models.ssm import DiagDenseSSM, DiagonalSSM, SelectiveSSM
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
@@ -47,7 +47,9 @@ def _opdepth(t, memo):
         return 0
     k = id(t)
     if k not in memo:
-        memo[k] = 1 + max((_opdepth(a, memo) for a in t.args), default=0)
+        memo[k] = 1 + max(
+            (_opdepth(a, memo) for a in t.args), default=0
+        )
     return memo[k]
 
 
@@ -68,8 +70,9 @@ def _scan(m, x, max_nodes=400_000):
     ir, st = export_to_ir(m, x)
     eg = EGraph()
     root = eg.add_term(ir.root)
-    stats = eg.run(R.SCAN_LAWS, root, max_iterations=14,
-                   max_nodes=max_nodes)
+    stats = eg.run(
+        R.SCAN_LAWS, root, max_iterations=14, max_nodes=max_nodes
+    )
     best = eg.extract_min_depth(root)
     return ir, st, best, stats
 
@@ -110,8 +113,12 @@ def test_selective_ssm_affine_lift_reaches_log_depth():
     # measured: T=8→12, T=16→13, T=32→17 — well inside this bound.
     assert d_best <= 4 * math.ceil(math.log2(T)) + 8
 
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -126,8 +133,12 @@ def test_selective_ssm_scan_t32():
     x = torch.randn(T, D, dtype=torch.float64)
     ir, st, best, _ = _scan(m, x)
     assert _opdepth(best, {}) <= 4 * math.ceil(math.log2(T)) + 8
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -145,8 +156,12 @@ def test_diag_dense_ssm_affine_lift():
     ir, st, best, _ = _scan(m, x)
     assert "aff_compose" in op_repr(best)
     assert _opdepth(best, {}) < _opdepth(ir.root, {})
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -190,11 +205,20 @@ def test_selective_ssm_gpu_wallclock():
     m = SelectiveSSM(D, D, T).eval().double()
     x = torch.randn(T, D, dtype=torch.float64)
     ir, st, best, _ = _scan(m, x)
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     m, x = m.cuda(), x.cuda()
-    mod = ir_to_torch_module(opt_ir, param_values={
-        k: v.cuda() for k, v in st.items()}).cuda().double()
+    mod = (
+        ir_to_torch_module(
+            opt_ir, param_values={k: v.cuda() for k, v in st.items()}
+        )
+        .cuda()
+        .double()
+    )
 
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -212,5 +236,7 @@ def test_selective_ssm_gpu_wallclock():
         return (time.perf_counter() - t0) / n * 1e6  # us
 
     t_seq, t_opt = bench(m), bench(mod)
-    print(f"\n[cuda] sequential {t_seq:.1f} us  extracted {t_opt:.1f} us"
-          f"  (ratio {t_opt / t_seq:.2f}x)")
+    print(
+        f"\n[cuda] sequential {t_seq:.1f} us  extracted {t_opt:.1f} us"
+        f"  (ratio {t_opt / t_seq:.2f}x)"
+    )

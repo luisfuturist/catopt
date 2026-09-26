@@ -90,6 +90,7 @@ def _shape_of(t: Any):
     load-bearing, only now on truthful shapes.
     """
     from catopt.xcarrier import _xshape
+
     return _xshape(t)
 
 
@@ -99,13 +100,15 @@ def _dim_eq(a: Any, b: Any) -> bool:
 
 
 def _broadcast_ok(a, b) -> bool:
-    from catopt.cost import _broadcast, _INVALID
+    from catopt.cost import _INVALID, _broadcast
+
     return _broadcast(a, b) is not _INVALID
 
 
 # ---------------------------------------------------------------------------
 #  Lift / unlift — enter and leave the carrier
 # ---------------------------------------------------------------------------
+
 
 def _check_om_lift(bound: dict) -> bool:
     """softmax must be over the scores' LAST dim (the key axis), and the
@@ -114,8 +117,12 @@ def _check_om_lift(bound: dict) -> bool:
     load-bearing."""
     sd = bound.get("$attr:SD", -1)
     ss, vs = _shape_of(bound.get("s")), _shape_of(bound.get("v"))
-    if not (isinstance(ss, tuple) and isinstance(vs, tuple)
-            and len(ss) >= 2 and len(vs) >= 2):
+    if not (
+        isinstance(ss, tuple)
+        and isinstance(vs, tuple)
+        and len(ss) >= 2
+        and len(vs) >= 2
+    ):
         return False
     if not isinstance(sd, int) or sd % len(ss) != len(ss) - 1:
         return False
@@ -123,16 +130,20 @@ def _check_om_lift(bound: dict) -> bool:
 
 
 def _om_lift(name: str, attr_key: str | None) -> Rewrite:
-    sm = (Op.make("softmax", "s", **{attr_key: "SD"})
-          if attr_key is not None else Op.make("softmax", "s"))
+    sm = (
+        Op.make("softmax", "s", **{attr_key: "SD"})
+        if attr_key is not None
+        else Op.make("softmax", "s")
+    )
     return R(
         name,
         Op.make("matmul", sm, "v"),
         Op.make("om_apply", Op.make("om_elem", "s", "v")),
         law="matmul(softmax(s), v) lifts into the online-softmax monoid: "
-            "softmax does not distribute over concat, but elem does — "
-            "the carrier (m, l, a) is what distributes.",
-        check=_check_om_lift)
+        "softmax does not distribute over concat, but elem does — "
+        "the carrier (m, l, a) is what distributes.",
+        check=_check_om_lift,
+    )
 
 
 #: torch.export emits softmax(x, dim) with the dim in ``arg1``.
@@ -153,6 +164,7 @@ OM_UNLIFT = R(
 #  The homomorphism — elem distributes over concat
 # ---------------------------------------------------------------------------
 
+
 def _chunks_compatible(s1, s2, v1, v2) -> bool:
     """Chunk pair i must contract s_i[...,K_i] with v_i[...,K_i,d]; the
     two chunks must be cat-compatible off the concatenated axis, and
@@ -162,14 +174,15 @@ def _chunks_compatible(s1, s2, v1, v2) -> bool:
         return False
     if not all(_dim_eq(s1[i], s2[i]) for i in range(ns - 1)):
         return False
-    if not all(_dim_eq(v1[i], v2[i])
-               for i in range(nv) if i != nv - 2):
+    if not all(_dim_eq(v1[i], v2[i]) for i in range(nv) if i != nv - 2):
         return False
-    if not (_dim_eq(s1[-1], v1[nv - 2])
-            and _dim_eq(s2[-1], v2[nv - 2])):
+    if not (
+        _dim_eq(s1[-1], v1[nv - 2]) and _dim_eq(s2[-1], v2[nv - 2])
+    ):
         return False
-    return (_broadcast_ok(s1[:-2], v1[:-2])
-            and _broadcast_ok(s2[:-2], v2[:-2]))
+    return _broadcast_ok(s1[:-2], v1[:-2]) and _broadcast_ok(
+        s2[:-2], v2[:-2]
+    )
 
 
 def _check_om_concat_dims(bound: dict) -> bool:
@@ -193,16 +206,21 @@ def _check_om_concat_dims(bound: dict) -> bool:
 def _om_split(name: str, attr_key: str) -> Rewrite:
     return R(
         name,
-        Op.make("om_elem",
-                Op.make("concat", "s1", "s2", **{attr_key: "SD"}),
-                Op.make("concat", "v1", "v2", **{attr_key: "VD"})),
-        Op.make("om_compose",
-                Op.make("om_elem", "s1", "v1"),
-                Op.make("om_elem", "s2", "v2")),
+        Op.make(
+            "om_elem",
+            Op.make("concat", "s1", "s2", **{attr_key: "SD"}),
+            Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
+        ),
+        Op.make(
+            "om_compose",
+            Op.make("om_elem", "s1", "v1"),
+            Op.make("om_elem", "s2", "v2"),
+        ),
         law="Homomorphism: elem(cat(s1,s2), cat(v1,v2)) = "
-            "elem(s1,v1) ⊕ elem(s2,v2) — the law tensor algebra cannot "
-            "state (softmax does not distribute over concat).",
-        check=_check_om_concat_dims)
+        "elem(s1,v1) ⊕ elem(s2,v2) — the law tensor algebra cannot "
+        "state (softmax does not distribute over concat).",
+        check=_check_om_concat_dims,
+    )
 
 
 OM_SPLIT = _om_split("om_split", "dim")
@@ -224,15 +242,20 @@ def _derive_om_concat_dims(bound: dict) -> dict | None:
 
 OM_MERGE = R(
     "om_merge",
-    Op.make("om_compose",
-            Op.make("om_elem", "s1", "v1"),
-            Op.make("om_elem", "s2", "v2")),
-    Op.make("om_elem",
-            Op.make("concat", "s1", "s2", dim="SD"),
-            Op.make("concat", "v1", "v2", dim="VD")),
+    Op.make(
+        "om_compose",
+        Op.make("om_elem", "s1", "v1"),
+        Op.make("om_elem", "s2", "v2"),
+    ),
+    Op.make(
+        "om_elem",
+        Op.make("concat", "s1", "s2", dim="SD"),
+        Op.make("concat", "v1", "v2", dim="VD"),
+    ),
     law="Reverse homomorphism: two block elements merge into the "
-        "element of the concatenated block — chunking is reversible.",
-    derive=_derive_om_concat_dims)
+    "element of the concatenated block — chunking is reversible.",
+    derive=_derive_om_concat_dims,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -241,25 +264,24 @@ OM_MERGE = R(
 
 OM_ASSOC = R(
     "om_assoc",
-    Op.make("om_compose",
-            Op.make("om_compose", "f", "g"), "h"),
-    Op.make("om_compose", "f",
-            Op.make("om_compose", "g", "h")),
+    Op.make("om_compose", Op.make("om_compose", "f", "g"), "h"),
+    Op.make("om_compose", "f", Op.make("om_compose", "g", "h")),
     law="⊕ is associative: (f ⊕ g) ⊕ h = f ⊕ (g ⊕ h).  Every "
-        "bracketing of the block product is a legal attention schedule.")
+    "bracketing of the block product is a legal attention schedule.",
+)
 
 OM_ASSOC_REV = R(
     "om_assoc_rev",
-    Op.make("om_compose", "f",
-            Op.make("om_compose", "g", "h")),
-    Op.make("om_compose",
-            Op.make("om_compose", "f", "g"), "h"),
-    law="⊕ is associative: f ⊕ (g ⊕ h) = (f ⊕ g) ⊕ h.")
+    Op.make("om_compose", "f", Op.make("om_compose", "g", "h")),
+    Op.make("om_compose", Op.make("om_compose", "f", "g"), "h"),
+    law="⊕ is associative: f ⊕ (g ⊕ h) = (f ⊕ g) ⊕ h.",
+)
 
 
 # ---------------------------------------------------------------------------
 #  concat is variadic in the IR; the homomorphism is binary.
 # ---------------------------------------------------------------------------
+
 
 def _concat_binarize(n: int, attr_key: str) -> Rewrite:
     xs = [f"x{i}" for i in range(n)]
@@ -271,14 +293,16 @@ def _concat_binarize(n: int, attr_key: str) -> Rewrite:
         Op.make("concat", *xs, **{attr_key: "D"}),
         rhs,
         law="n-ary concat is iterated binary concat — cat is a binary "
-            "tensor product applied repeatedly.")
+        "tensor product applied repeatedly.",
+    )
 
 
 #: 3..6-ary concats, both attr spellings.  Structural only — needs no
 #: shape check (binarisation preserves well-typedness identically).
 CONCAT_BINARIZE: list[Rewrite] = [
     _concat_binarize(n, ak)
-    for n in range(3, 7) for ak in ("dim", "arg1")
+    for n in range(3, 7)
+    for ak in ("dim", "arg1")
 ]
 
 
@@ -286,13 +310,17 @@ CONCAT_BINARIZE: list[Rewrite] = [
 #  matmul distributes over concat in the transposed operand
 # ---------------------------------------------------------------------------
 
+
 def _check_matmul_t_concat(bound: dict) -> bool:
     """q @ cat(k1,k2,dim).T splits only when the key concat is on the
     SEQUENCE axis (dim -2 of k, i.e. keys) and the transpose is exactly
     .T on the last two dims — so that after the transpose the concat
     lands on the scores' last dim."""
-    kd, t1, t2 = (bound.get("$attr:KD"), bound.get("$attr:T1"),
-                  bound.get("$attr:T2"))
+    kd, t1, t2 = (
+        bound.get("$attr:KD"),
+        bound.get("$attr:T1"),
+        bound.get("$attr:T2"),
+    )
     k1, k2 = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
     q = _shape_of(bound.get("q"))
     if not all(isinstance(x, int) for x in (kd, t1, t2)):
@@ -306,8 +334,7 @@ def _check_matmul_t_concat(bound: dict) -> bool:
         return False  # keys concat on the sequence axis, not features
     if {t1 % nk, t2 % nk} != {nk - 2, nk - 1}:
         return False  # transpose must be exactly .T (last two dims)
-    if not all(_dim_eq(k1[i], k2[i])
-               for i in range(nk) if i != nk - 2):
+    if not all(_dim_eq(k1[i], k2[i]) for i in range(nk) if i != nk - 2):
         return False
     # q[...,d] contracts with k.T[...,d,K] — k's LAST dim is d.
     if not _dim_eq(q[-1], k1[-1]):
@@ -328,23 +355,36 @@ def _derive_score_concat_dim(bound: dict) -> dict | None:
 def _matmul_t_concat(name: str, attr_key: str) -> Rewrite:
     return R(
         name,
-        Op.make("matmul", "q",
-                Op.make("transpose",
-                        Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
-                        arg1="T1", arg2="T2")),
-        Op.make("concat",
-                Op.make("matmul", "q",
-                        Op.make("transpose", "k1",
-                                arg1="T1", arg2="T2")),
-                Op.make("matmul", "q",
-                        Op.make("transpose", "k2",
-                                arg1="T1", arg2="T2")),
-                dim="SD"),
+        Op.make(
+            "matmul",
+            "q",
+            Op.make(
+                "transpose",
+                Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
+                arg1="T1",
+                arg2="T2",
+            ),
+        ),
+        Op.make(
+            "concat",
+            Op.make(
+                "matmul",
+                "q",
+                Op.make("transpose", "k1", arg1="T1", arg2="T2"),
+            ),
+            Op.make(
+                "matmul",
+                "q",
+                Op.make("transpose", "k2", arg1="T1", arg2="T2"),
+            ),
+            dim="SD",
+        ),
         law="matmul distributes over concat in the transposed operand: "
-            "q @ cat(k1,k2).T = cat(q@k1.T, q@k2.T) — the score blocks "
-            "surface as one concat so OM_SPLIT can chunk the softmax.",
+        "q @ cat(k1,k2).T = cat(q@k1.T, q@k2.T) — the score blocks "
+        "surface as one concat so OM_SPLIT can chunk the softmax.",
         check=_check_matmul_t_concat,
-        derive=_derive_score_concat_dim)
+        derive=_derive_score_concat_dim,
+    )
 
 
 MATMUL_T_CONCAT = _matmul_t_concat("matmul_t_concat", "dim")
@@ -382,8 +422,10 @@ MATMUL_T_CONCAT_ARG1 = _matmul_t_concat("matmul_t_concat_arg1", "arg1")
 #    chunking anyway.
 # ---------------------------------------------------------------------------
 
-def _cat_axis_plan(bound: dict, sliced_key: str,
-                   fixed_keys: tuple = ()) -> dict | None:
+
+def _cat_axis_plan(
+    bound: dict, sliced_key: str, fixed_keys: tuple = ()
+) -> dict | None:
     """Plan how an elementwise op's operands distribute over
     ``concat(s1, s2, dim=D)``.
 
@@ -413,24 +455,28 @@ def _cat_axis_plan(bound: dict, sliced_key: str,
     """
     s1, s2 = _shape_of(bound.get("s1")), _shape_of(bound.get("s2"))
     D = bound.get("$attr:D")
-    if not (isinstance(s1, tuple) and isinstance(s2, tuple)
-            and s1 and len(s1) == len(s2)):
+    if not (
+        isinstance(s1, tuple)
+        and isinstance(s2, tuple)
+        and s1
+        and len(s1) == len(s2)
+    ):
         return None
     if not isinstance(D, int):
         return None
     r, d = len(s1), D % len(s1)
     if not all(_dim_eq(s1[i], s2[i]) for i in range(r) if i != d):
-        return None                          # ill-typed cat
+        return None  # ill-typed cat
     k1, k2 = s1[d], s2[d]
     if not (isinstance(k1, int) and isinstance(k2, int)):
-        return None                          # unknown block extents
+        return None  # unknown block extents
 
     shapes: dict[str, tuple] = {}
     out_rank = r
     for key in (sliced_key, *fixed_keys):
         sh = _shape_of(bound.get(key))
         if not isinstance(sh, tuple):
-            return None                      # unknown shape: can't prove
+            return None  # unknown shape: can't prove
         shapes[key] = sh
         out_rank = max(out_rank, len(sh))
 
@@ -439,7 +485,7 @@ def _cat_axis_plan(bound: dict, sliced_key: str,
         blocks (extra leading dims are fine — they rank up the output
         identically on both sides)."""
         for j, ext in enumerate(sh):
-            dj = j + r - len(sh)             # operand dim → score dim
+            dj = j + r - len(sh)  # operand dim → score dim
             if dj < 0 or dj == d:
                 continue
             if not (ext is None or ext == 1 or _dim_eq(ext, s1[dj])):
@@ -450,17 +496,17 @@ def _cat_axis_plan(bound: dict, sliced_key: str,
         fs = shapes[key]
         if not _off_axis_ok(fs):
             return None
-        fd = d + len(fs) - r                 # cat axis in f's coords
+        fd = d + len(fs) - r  # cat axis in f's coords
         if fd >= 0:
             ext = fs[fd]
             if not (ext == 1 or (k1 == k2 and ext == k1)):
-                return None                  # needs its own slice
+                return None  # needs its own slice
 
     ms = shapes[sliced_key]
     if not _off_axis_ok(ms):
         return None
-    md = d + len(ms) - r                     # cat axis in mask coords
-    do = d + out_rank - r                    # cat axis of the result
+    md = d + len(ms) - r  # cat axis in mask coords
+    do = d + out_rank - r  # cat axis of the result
     if md < 0:
         return {"mode": "reuse", "sizes": None, "md": None, "do": do}
     ext = ms[md]
@@ -477,6 +523,7 @@ def _check_mask_cat(sliced_key: str, fixed_keys: tuple, mode: str):
     def check(bound: dict) -> bool:
         plan = _cat_axis_plan(bound, sliced_key, fixed_keys)
         return plan is not None and plan["mode"] == mode
+
     return check
 
 
@@ -490,6 +537,7 @@ def _derive_mask_cat(sliced_key: str, fixed_keys: tuple):
             out["$attr:SZ"] = plan["sizes"]
             out["$attr:MD"] = plan["md"]
         return out
+
     return derive
 
 
@@ -509,23 +557,30 @@ def _masked_fill_cat(name: str, attr_key: str, mode: str) -> Rewrite:
     m2 = _mask_slice("m", 1) if mode == "slice" else "m"
     return R(
         name,
-        Op.make("masked_fill",
-                Op.make("concat", "s1", "s2", **{attr_key: "D"}),
-                "m", "v"),
-        Op.make("concat",
-                Op.make("masked_fill", "s1", m1, "v"),
-                Op.make("masked_fill", "s2", m2, "v"),
-                dim="DO"),
+        Op.make(
+            "masked_fill",
+            Op.make("concat", "s1", "s2", **{attr_key: "D"}),
+            "m",
+            "v",
+        ),
+        Op.make(
+            "concat",
+            Op.make("masked_fill", "s1", m1, "v"),
+            Op.make("masked_fill", "s2", m2, "v"),
+            dim="DO",
+        ),
         check=_check_mask_cat("m", ("v",), mode),
         derive=_derive_mask_cat("m", ("v",)),
         law="masked_fill distributes over concat: masking a "
-            "concatenated score matrix equals concatenating the masked "
-            "blocks, each with its slice of the mask — a causal mask's "
-            "block offset lives inside the slice.")
+        "concatenated score matrix equals concatenating the masked "
+        "blocks, each with its slice of the mask — a causal mask's "
+        "block offset lives inside the slice.",
+    )
 
 
-def _add_cat(name: str, attr_key: str, mode: str,
-             mask_first: bool) -> Rewrite:
+def _add_cat(
+    name: str, attr_key: str, mode: str, mask_first: bool
+) -> Rewrite:
     """add(cat(s1,s2,D), m) / add(m, cat(s1,s2,D)) → cat of per-block
     adds — the additive-mask counterpart of masked_fill_cat.  add is
     commutative, but COMM_ADD is deliberately absent from OM_LAWS, so
@@ -533,22 +588,36 @@ def _add_cat(name: str, attr_key: str, mode: str,
     m1 = _mask_slice("m", 0) if mode == "slice" else "m"
     m2 = _mask_slice("m", 1) if mode == "slice" else "m"
     cat = Op.make("concat", "s1", "s2", **{attr_key: "D"})
-    lhs = (Op.make("add", "m", cat) if mask_first
-           else Op.make("add", cat, "m"))
-    b1 = Op.make("add", m1, "s1") if mask_first else Op.make("add", "s1", m1)
-    b2 = Op.make("add", m2, "s2") if mask_first else Op.make("add", "s2", m2)
+    lhs = (
+        Op.make("add", "m", cat)
+        if mask_first
+        else Op.make("add", cat, "m")
+    )
+    b1 = (
+        Op.make("add", m1, "s1")
+        if mask_first
+        else Op.make("add", "s1", m1)
+    )
+    b2 = (
+        Op.make("add", m2, "s2")
+        if mask_first
+        else Op.make("add", "s2", m2)
+    )
     return R(
-        name, lhs,
+        name,
+        lhs,
         Op.make("concat", b1, b2, dim="DO"),
         check=_check_mask_cat("m", (), mode),
         derive=_derive_mask_cat("m", ()),
         law="An additive mask distributes over concat: add(cat s, m) = "
-            "cat(add(s_i, m_i)) — concat is a homomorphism for "
-            "elementwise ops, with the mask sliced on the cat axis.")
+        "cat(add(s_i, m_i)) — concat is a homomorphism for "
+        "elementwise ops, with the mask sliced on the cat axis.",
+    )
 
 
-def _where_cat(name: str, attr_key: str, mode: str,
-               cat_in_x: bool) -> Rewrite:
+def _where_cat(
+    name: str, attr_key: str, mode: str, cat_in_x: bool
+) -> Rewrite:
     """where(m, cat(s1,s2,D), v) / where(m, v, cat(s1,s2,D)) → cat of
     per-block wheres — the torch.where masking idiom."""
     m1 = _mask_slice("m", 0) if mode == "slice" else "m"
@@ -563,12 +632,14 @@ def _where_cat(name: str, attr_key: str, mode: str,
         b1 = Op.make("where", m1, "v", "s1")
         b2 = Op.make("where", m2, "v", "s2")
     return R(
-        name, lhs,
+        name,
+        lhs,
         Op.make("concat", b1, b2, dim="DO"),
         check=_check_mask_cat("m", ("v",), mode),
         derive=_derive_mask_cat("m", ("v",)),
         law="where distributes over concat in the masked operand: "
-            "where(m, cat s, v) = cat(where(m_i, s_i, v)).")
+        "where(m, cat s, v) = cat(where(m_i, s_i, v)).",
+    )
 
 
 def _check_cat_pair(bound: dict) -> int | None:
@@ -593,12 +664,13 @@ def _check_cat_pair(bound: dict) -> int | None:
     ro = max(ra, rb)
     oa, ob = da + ro - ra, db + ro - rb
     if oa != ob:
-        return None                          # different axes — wrong
+        return None  # different axes — wrong
     if not all(_dim_eq(a1[i], a2[i]) for i in range(ra) if i != da):
         return None
     if not all(_dim_eq(b1[i], b2[i]) for i in range(rb) if i != db):
         return None
-    from catopt.cost import _broadcast, _INVALID
+    from catopt.cost import _INVALID, _broadcast
+
     ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
     if ba is _INVALID or bb is _INVALID:
         return None
@@ -622,17 +694,22 @@ def _cat_hom_add(name: str, attr_key: str) -> Rewrite:
     form of the additive-mask law when the mask is itself concat'd."""
     return R(
         name,
-        Op.make("add",
-                Op.make("concat", "a1", "a2", **{attr_key: "DA"}),
-                Op.make("concat", "b1", "b2", **{attr_key: "DB"})),
-        Op.make("concat",
-                Op.make("add", "a1", "b1"),
-                Op.make("add", "a2", "b2"),
-                dim="DO"),
+        Op.make(
+            "add",
+            Op.make("concat", "a1", "a2", **{attr_key: "DA"}),
+            Op.make("concat", "b1", "b2", **{attr_key: "DB"}),
+        ),
+        Op.make(
+            "concat",
+            Op.make("add", "a1", "b1"),
+            Op.make("add", "a2", "b2"),
+            dim="DO",
+        ),
         check=_cat_pair_check,
         derive=_cat_pair_derive,
         law="concat homomorphism over add: cat(a1,a2)+cat(b1,b2) = "
-            "cat(a1+b1, a2+b2) — the free case of mask distribution.")
+        "cat(a1+b1, a2+b2) — the free case of mask distribution.",
+    )
 
 
 def _cat_hom_masked_fill(name: str, attr_key: str) -> Rewrite:
@@ -641,20 +718,25 @@ def _cat_hom_masked_fill(name: str, attr_key: str) -> Rewrite:
     masks); block i pairs s_i with m_i directly, no split needed."""
     return R(
         name,
-        Op.make("masked_fill",
-                Op.make("concat", "a1", "a2", **{attr_key: "DA"}),
-                Op.make("concat", "b1", "b2", **{attr_key: "DB"}),
-                "v"),
-        Op.make("concat",
-                Op.make("masked_fill", "a1", "b1", "v"),
-                Op.make("masked_fill", "a2", "b2", "v"),
-                dim="DO"),
+        Op.make(
+            "masked_fill",
+            Op.make("concat", "a1", "a2", **{attr_key: "DA"}),
+            Op.make("concat", "b1", "b2", **{attr_key: "DB"}),
+            "v",
+        ),
+        Op.make(
+            "concat",
+            Op.make("masked_fill", "a1", "b1", "v"),
+            Op.make("masked_fill", "a2", "b2", "v"),
+            dim="DO",
+        ),
         check=_cat_pair_check,
         derive=_cat_pair_derive,
         law="masked_fill over two concat'd operands: the score concat "
-            "and mask concat share an axis, so block i's mask is just "
-            "m_i — the offset was already paid when the mask was "
-            "concatenated.")
+        "and mask concat share an axis, so block i's mask is just "
+        "m_i — the offset was already paid when the mask was "
+        "concatenated.",
+    )
 
 
 #: Elementwise-mask ops pushed through a concat'd operand.  "slice"
@@ -663,21 +745,32 @@ def _cat_hom_masked_fill(name: str, attr_key: str) -> Rewrite:
 #: spellings, both ``add`` operand orders, both ``where`` positions.
 MASKED_FILL_CAT: list[Rewrite] = [
     _masked_fill_cat(f"masked_fill_cat_{mode}_{ak}", ak, mode)
-    for mode in ("slice", "reuse") for ak in ("dim", "arg1")
+    for mode in ("slice", "reuse")
+    for ak in ("dim", "arg1")
 ]
 
 ADD_MASK_CAT: list[Rewrite] = [
-    _add_cat(f"add_{'m' if mask_first else 'cat'}_"
-             f"{'cat' if mask_first else 'm'}_{mode}_{ak}",
-             ak, mode, mask_first)
-    for mode in ("slice", "reuse") for mask_first in (False, True)
+    _add_cat(
+        f"add_{'m' if mask_first else 'cat'}_"
+        f"{'cat' if mask_first else 'm'}_{mode}_{ak}",
+        ak,
+        mode,
+        mask_first,
+    )
+    for mode in ("slice", "reuse")
+    for mask_first in (False, True)
     for ak in ("dim", "arg1")
 ]
 
 WHERE_CAT: list[Rewrite] = [
-    _where_cat(f"where_cat_{'x' if cat_in_x else 'y'}_{mode}_{ak}",
-               ak, mode, cat_in_x)
-    for mode in ("slice", "reuse") for cat_in_x in (True, False)
+    _where_cat(
+        f"where_cat_{'x' if cat_in_x else 'y'}_{mode}_{ak}",
+        ak,
+        mode,
+        cat_in_x,
+    )
+    for mode in ("slice", "reuse")
+    for cat_in_x in (True, False)
     for ak in ("dim", "arg1")
 ]
 
@@ -695,7 +788,10 @@ CAT_HOM: list[Rewrite] = [
 #: ``softmax(mask(q @ cat kᵢ.T)) @ cat vᵢ`` — masked or causal — into
 #: ``om_apply(⊕ᵢ om_elem(masked sᵢ, vᵢ))``.
 OM_MASK_LAWS: list[Rewrite] = [
-    *CAT_HOM, *MASKED_FILL_CAT, *ADD_MASK_CAT, *WHERE_CAT,
+    *CAT_HOM,
+    *MASKED_FILL_CAT,
+    *ADD_MASK_CAT,
+    *WHERE_CAT,
 ]
 
 
@@ -786,27 +882,37 @@ OM_MASK_LAWS: list[Rewrite] = [
 # ---------------------------------------------------------------------------
 
 op_def(
-    "cmask", 1, 1,
+    "cmask",
+    1,
+    1,
     law="Causal-mask generator: cmask(x)[...,t,j] = (j + off > t) — "
-        "the strict upper triangle of x's score plane, shifted off "
-        "keys; materialises what sdpa's is_causal flag hides.")
+    "the strict upper triangle of x's score plane, shifted off "
+    "keys; materialises what sdpa's is_causal flag hides.",
+)
 op_def(
-    "fill", 1, 1,
+    "fill",
+    1,
+    1,
     law="Constant map x ↦ c·1 (full_like): the vehicle for derived "
-        "scalar constants, which can only occupy attribute positions.")
+    "scalar constants, which can only occupy attribute positions.",
+)
 op_def(
-    "attnbias", 1, 1,
+    "attnbias",
+    1,
+    1,
     law="sdpa's attn_mask in additive-bias form: a float mask passes "
-        "through, a bool keep-mask becomes where(m, 0, -inf) — torch's "
-        "own coercion, which the untyped (shape-only) term cannot "
-        "spell.  Lets ONE sdpa-cat law serve both mask dtypes.")
+    "through, a bool keep-mask becomes where(m, 0, -inf) — torch's "
+    "own coercion, which the untyped (shape-only) term cannot "
+    "spell.  Lets ONE sdpa-cat law serve both mask dtypes.",
+)
 
 
 def _cmask_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
     off = int(kw.get("off", kw.get("arg1", 0)) or 0)
     t, k = x.shape[-2], x.shape[-1]
-    keep = torch.ones(t, k, dtype=torch.bool,
-                      device=x.device).tril(-off)
+    keep = torch.ones(t, k, dtype=torch.bool, device=x.device).tril(
+        -off
+    )
     return keep.logical_not().expand(x.shape)
 
 
@@ -824,7 +930,8 @@ def _attnbias_torch(m: torch.Tensor, *a, **kw) -> torch.Tensor:
         return torch.where(
             m,
             torch.zeros((), device=m.device),
-            torch.full((), float("-inf"), device=m.device))
+            torch.full((), float("-inf"), device=m.device),
+        )
     return m
 
 
@@ -849,25 +956,31 @@ def _check_sdpa_cat(bound: dict) -> bool:
     qs = _shape_of(bound.get("q"))
     k1s, k2s = _shape_of(bound.get("k1")), _shape_of(bound.get("k2"))
     v1s, v2s = _shape_of(bound.get("v1")), _shape_of(bound.get("v2"))
-    if not all(isinstance(s, tuple)
-               for s in (qs, k1s, k2s, v1s, v2s)):
+    if not all(isinstance(s, tuple) for s in (qs, k1s, k2s, v1s, v2s)):
         return False
-    if (len(qs) < 2 or len(k1s) < 2 or len(v1s) < 2
-            or len(k2s) != len(k1s) or len(v2s) != len(v1s)):
+    if (
+        len(qs) < 2
+        or len(k1s) < 2
+        or len(v1s) < 2
+        or len(k2s) != len(k1s)
+        or len(v2s) != len(v1s)
+    ):
         return False
     kd, vd = bound.get("$attr:KD"), bound.get("$attr:VD")
     if not (isinstance(kd, int) and isinstance(vd, int)):
         return False
     nk, nv = len(k1s), len(v1s)
     if kd % nk != nk - 2:
-        return False                          # keys cat on seq axis
+        return False  # keys cat on seq axis
     if vd % nv != nv - 2:
-        return False                          # values cat on seq axis
-    if not all(_dim_eq(k1s[i], k2s[i])
-               for i in range(nk) if i != nk - 2):
+        return False  # values cat on seq axis
+    if not all(
+        _dim_eq(k1s[i], k2s[i]) for i in range(nk) if i != nk - 2
+    ):
         return False
-    if not all(_dim_eq(v1s[i], v2s[i])
-               for i in range(nv) if i != nv - 2):
+    if not all(
+        _dim_eq(v1s[i], v2s[i]) for i in range(nv) if i != nv - 2
+    ):
         return False
     # q[...,d] contracts k[...,d]; k_i's key count is v_i's.
     if not (_dim_eq(qs[-1], k1s[-1]) and _dim_eq(qs[-1], k2s[-1])):
@@ -876,19 +989,22 @@ def _check_sdpa_cat(bound: dict) -> bool:
         return False
     # Per-block batch broadcast: q vs k_i, q vs v_i, k_i vs v_i.
     for ks, vs in ((k1s, v1s), (k2s, v2s)):
-        if not (_broadcast_ok(qs[:-2], ks[:-2])
-                and _broadcast_ok(qs[:-2], vs[:-2])
-                and _broadcast_ok(ks[:-2], vs[:-2])):
+        if not (
+            _broadcast_ok(qs[:-2], ks[:-2])
+            and _broadcast_ok(qs[:-2], vs[:-2])
+            and _broadcast_ok(ks[:-2], vs[:-2])
+        ):
             return False
     dp = bound.get("$attr:DP")
     if dp is not None and dp != 0:
-        return False                          # dropout: not pure math
+        return False  # dropout: not pure math
     sc = bound.get("$attr:SC")
     if sc is not None and (
-            isinstance(sc, bool) or not isinstance(sc, (int, float))):
-        return False                          # non-numeric scale
+        isinstance(sc, bool) or not isinstance(sc, (int, float))
+    ):
+        return False  # non-numeric scale
     if sc is None and not isinstance(qs[-1], int):
-        return False                          # cannot derive 1/√E
+        return False  # cannot derive 1/√E
     return True
 
 
@@ -912,38 +1028,51 @@ def _sdpa_cat_rhs(causal: bool) -> Op:
     ``cmask``; the per-block chunking is left to OM_MASK_LAWS +
     OM_SPLIT."""
     qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
-    mm1 = Op.make("matmul", qs,
-                  Op.make("transpose", "k1", arg1=-2, arg2=-1))
-    mm2 = Op.make("matmul", qs,
-                  Op.make("transpose", "k2", arg1=-2, arg2=-1))
+    mm1 = Op.make(
+        "matmul", qs, Op.make("transpose", "k1", arg1=-2, arg2=-1)
+    )
+    mm2 = Op.make(
+        "matmul", qs, Op.make("transpose", "k2", arg1=-2, arg2=-1)
+    )
     scores = Op.make("concat", mm1, mm2, dim=-1)
     if causal:
-        scores = Op.make("masked_fill", scores,
-                         Op.make("cmask", scores), _NEG_INF)
+        scores = Op.make(
+            "masked_fill", scores, Op.make("cmask", scores), _NEG_INF
+        )
     return Op.make(
         "om_apply",
-        Op.make("om_elem", scores,
-                Op.make("concat", "v1", "v2", dim="VD")))
+        Op.make(
+            "om_elem", scores, Op.make("concat", "v1", "v2", dim="VD")
+        ),
+    )
 
 
-def _sdpa_cat(name: str, attr_key: str, sdpa_attrs: dict,
-              causal: bool) -> Rewrite:
+def _sdpa_cat(
+    name: str, attr_key: str, sdpa_attrs: dict, causal: bool
+) -> Rewrite:
     return R(
         name,
-        Op.make("sdpa", "q",
-                Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
-                Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
-                **sdpa_attrs),
+        Op.make(
+            "sdpa",
+            "q",
+            Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
+            Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
+            **sdpa_attrs,
+        ),
         _sdpa_cat_rhs(causal),
         check=_check_sdpa_cat,
         derive=_derive_sdpa_cat,
-        law=("is_causal unfolds to a materialised causal mask: "
-             "sdpa(q, cat k, cat v, is_causal) = om_apply(om_elem("
-             "masked_fill(cat scaled-scores, cmask), cat v)) — the "
-             "flag chunked, not the mask." if causal else
-             "unmasked sdpa over concatenated keys/values is the plain "
-             "om homomorphism on scaled scores: sdpa(q, cat k, cat v) "
-             "= om_apply(om_elem(cat(qs@k_i.T), cat v_i))."))
+        law=(
+            "is_causal unfolds to a materialised causal mask: "
+            "sdpa(q, cat k, cat v, is_causal) = om_apply(om_elem("
+            "masked_fill(cat scaled-scores, cmask), cat v)) — the "
+            "flag chunked, not the mask."
+            if causal
+            else "unmasked sdpa over concatenated keys/values is the plain "
+            "om homomorphism on scaled scores: sdpa(q, cat k, cat v) "
+            "= om_apply(om_elem(cat(qs@k_i.T), cat v_i))."
+        ),
+    )
 
 
 #: torch.export emits sdpa positionally: arg4 = dropout_p,
@@ -987,8 +1116,9 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
         return False
     k1, k2 = k1s[-2], k2s[-2]
     if not (isinstance(k1, int) and isinstance(k2, int)):
-        return False                          # can't derive split sizes
-    from catopt.cost import _broadcast, _INVALID
+        return False  # can't derive split sizes
+    from catopt.cost import _INVALID, _broadcast
+
     bb = _broadcast(qs[:-2], k1s[:-2])
     if bb is _INVALID:
         return False
@@ -1011,34 +1141,44 @@ def _sdpa_cat_mask_rhs() -> Op:
     the carrier and fully-masked blocks exercise om_compose's isfinite
     guard."""
     qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
-    mm1 = Op.make("matmul", qs,
-                  Op.make("transpose", "k1", arg1=-2, arg2=-1))
-    mm2 = Op.make("matmul", qs,
-                  Op.make("transpose", "k2", arg1=-2, arg2=-1))
+    mm1 = Op.make(
+        "matmul", qs, Op.make("transpose", "k1", arg1=-2, arg2=-1)
+    )
+    mm2 = Op.make(
+        "matmul", qs, Op.make("transpose", "k2", arg1=-2, arg2=-1)
+    )
     scores = Op.make("concat", mm1, mm2, dim=-1)
     masked = Op.make("add", scores, Op.make("attnbias", "m"))
     return Op.make(
         "om_apply",
-        Op.make("om_elem", masked,
-                Op.make("concat", "v1", "v2", dim="VD")))
+        Op.make(
+            "om_elem", masked, Op.make("concat", "v1", "v2", dim="VD")
+        ),
+    )
 
 
-def _sdpa_cat_masked(name: str, attr_key: str,
-                     sdpa_attrs: dict) -> Rewrite:
+def _sdpa_cat_masked(
+    name: str, attr_key: str, sdpa_attrs: dict
+) -> Rewrite:
     return R(
         name,
-        Op.make("sdpa", "q",
-                Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
-                Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
-                "m", **sdpa_attrs),
+        Op.make(
+            "sdpa",
+            "q",
+            Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
+            Op.make("concat", "v1", "v2", **{attr_key: "VD"}),
+            "m",
+            **sdpa_attrs,
+        ),
         _sdpa_cat_mask_rhs(),
         check=_check_sdpa_mask_cat,
         derive=_derive_sdpa_cat,
         law="explicit attn_mask over concatenated keys/values: "
-            "sdpa(q, cat k, cat v, m) = om_apply(om_elem(add(cat "
-            "scaled-scores, attnbias(m)), cat v)) — the mask slices on "
-            "the key axis in parallel with the k/v blocks, dtype-"
-            "agnostic through the attnbias coercion.")
+        "sdpa(q, cat k, cat v, m) = om_apply(om_elem(add(cat "
+        "scaled-scores, attnbias(m)), cat v)) — the mask slices on "
+        "the key axis in parallel with the k/v blocks, dtype-"
+        "agnostic through the attnbias coercion.",
+    )
 
 
 #: Attr spellings for the masked form: torch.export emits the mask as
@@ -1062,15 +1202,21 @@ _SDPA_MASK_ATTRS: tuple[dict, ...] = (
 #: companion, and the explicit-attn_mask form — over both concat attr
 #: spellings.
 SDPA_CAT_LAWS: list[Rewrite] = [
-    *(_sdpa_cat(f"sdpa_cat_causal_{i}_{ak}", ak, dict(attrs), True)
-      for i, attrs in enumerate(_SDPA_CAUSAL_ATTRS)
-      for ak in ("dim", "arg1")),
-    *(_sdpa_cat(f"sdpa_cat_{i}_{ak}", ak, dict(attrs), False)
-      for i, attrs in enumerate(_SDPA_PLAIN_ATTRS)
-      for ak in ("dim", "arg1")),
-    *(_sdpa_cat_masked(f"sdpa_cat_mask_{i}_{ak}", ak, dict(attrs))
-      for i, attrs in enumerate(_SDPA_MASK_ATTRS)
-      for ak in ("dim", "arg1")),
+    *(
+        _sdpa_cat(f"sdpa_cat_causal_{i}_{ak}", ak, dict(attrs), True)
+        for i, attrs in enumerate(_SDPA_CAUSAL_ATTRS)
+        for ak in ("dim", "arg1")
+    ),
+    *(
+        _sdpa_cat(f"sdpa_cat_{i}_{ak}", ak, dict(attrs), False)
+        for i, attrs in enumerate(_SDPA_PLAIN_ATTRS)
+        for ak in ("dim", "arg1")
+    ),
+    *(
+        _sdpa_cat_masked(f"sdpa_cat_mask_{i}_{ak}", ak, dict(attrs))
+        for i, attrs in enumerate(_SDPA_MASK_ATTRS)
+        for ak in ("dim", "arg1")
+    ),
 ]
 
 
@@ -1083,11 +1229,18 @@ SDPA_CAT_LAWS: list[Rewrite] = [
 #: law, same as SCAN_LAWS; block order is preserved by the concat
 #: structure itself.
 OM_LAWS: list[Rewrite] = [
-    OM_LIFT, OM_LIFT_DIM, OM_LIFT_PLAIN, OM_UNLIFT,
-    OM_SPLIT, OM_SPLIT_ARG1, OM_MERGE,
-    OM_ASSOC, OM_ASSOC_REV,
+    OM_LIFT,
+    OM_LIFT_DIM,
+    OM_LIFT_PLAIN,
+    OM_UNLIFT,
+    OM_SPLIT,
+    OM_SPLIT_ARG1,
+    OM_MERGE,
+    OM_ASSOC,
+    OM_ASSOC_REV,
     *CONCAT_BINARIZE,
-    MATMUL_T_CONCAT, MATMUL_T_CONCAT_ARG1,
+    MATMUL_T_CONCAT,
+    MATMUL_T_CONCAT_ARG1,
     *OM_MASK_LAWS,
     *SDPA_CAT_LAWS,
 ]

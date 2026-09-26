@@ -14,7 +14,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=5.0",
+    "pytest-xdist>=3.0",
+    "ruff>=0.6",
+    "coverage>=7.0",
+    "pre-commit>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=5.0",
+    "pytest-xdist>=3.0",
+    "ruff>=0.6",
+    "coverage>=7.0",
+    "pre-commit>=3.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -24,4 +41,33 @@ include = ["catopt*"]
 testpaths = ["tests"]
 markers = [
     "requires_cuda: test allocates CUDA tensors; skipped at setup when CUDA is absent or OOMs on a probe allocation",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 72
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",     # line length — math/notation lines exceed 72 legitimately
+    "B008",     # function-call in default arg — used for cost-fn defaults
+    "SIM108",   # ternary suggestion — if/else often clearer here
+]
+
+[tool.coverage.run]
+source = ["catopt"]
+branch = true
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+fail_under = 80        # ratcheted upward each refactor phase; target 100
+show_missing = true
+exclude_also = [
+    "if __name__ == ['\"]__main__['\"]:",
+    "if TYPE_CHECKING:",
+    "def __repr__",
+    "raise NotImplementedError",
+    "@overload",
+    "return NotImplemented",
 ]

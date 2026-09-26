@@ -49,17 +49,20 @@ Findings encoded as tests:
 
 import math
 
-import pytest
 import torch
 
-from catopt.egraph import EGraph
-from catopt import rules as R
 from catopt import meta
-from catopt.ir import IR, Op, Var, op_repr
+from catopt import rules as R
+from catopt.cost import dag_cost, flops_cost
+from catopt.egraph import EGraph
+from catopt.ir import IR, Op, op_repr
 from catopt.models.ssm import DiagDenseSSM, DiagonalSSM
 from catopt.scan_lower import is_scan_apply_term, to_batched_scan_module
-from catopt.torch_bridge import _IR_TO_TORCH, export_to_ir, ir_to_torch_module
-from catopt.cost import flops_cost, dag_cost
+from catopt.torch_bridge import (
+    _IR_TO_TORCH,
+    export_to_ir,
+    ir_to_torch_module,
+)
 
 
 def _opdepth(t, memo):
@@ -68,7 +71,9 @@ def _opdepth(t, memo):
         return 0
     k = id(t)
     if k not in memo:
-        memo[k] = 1 + max((_opdepth(a, memo) for a in t.args), default=0)
+        memo[k] = 1 + max(
+            (_opdepth(a, memo) for a in t.args), default=0
+        )
     return memo[k]
 
 
@@ -87,14 +92,19 @@ def _scan(m, x, laws=None, max_nodes=400_000):
 #  (a) Bindings: the monoid algebra is correct
 # ---------------------------------------------------------------------------
 
+
 def test_affd_bindings_compose_correctly():
     """affd_compose(f,g) = f∘g pointwise; applyd evaluates the map."""
     torch.manual_seed(0)
     d = 8
-    a1, b1 = torch.randn(d, dtype=torch.float64), torch.randn(
-        d, dtype=torch.float64)
-    a2, b2 = torch.randn(d, dtype=torch.float64), torch.randn(
-        d, dtype=torch.float64)
+    a1, b1 = (
+        torch.randn(d, dtype=torch.float64),
+        torch.randn(d, dtype=torch.float64),
+    )
+    a2, b2 = (
+        torch.randn(d, dtype=torch.float64),
+        torch.randn(d, dtype=torch.float64),
+    )
     h = torch.randn(d, dtype=torch.float64)
 
     aff_diag = _IR_TO_TORCH["aff_diag"]
@@ -122,6 +132,7 @@ def test_affd_bindings_compose_correctly():
 #  (b) DiagonalSSM reaches log-depth and stays fp64-exact
 # ---------------------------------------------------------------------------
 
+
 def test_diagonal_ssm_lifts_to_log_depth():
     """add(mul(a_t,h), mul(b_t,x_t)) lifts into the diagonal monoid and
     reassociates to the balanced (Blelloch) bracketing."""
@@ -141,8 +152,12 @@ def test_diagonal_ssm_lifts_to_log_depth():
     # measured: T=16 -> 11 (leaf chains ~5 + ~log2 T compose levels)
     assert d_best <= 4 * math.ceil(math.log2(T)) + 8
 
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -157,8 +172,12 @@ def test_diagonal_ssm_scan_t32():
     x = torch.randn(T, D, dtype=torch.float64)
     ir, st, best, _ = _scan(m, x)
     assert _opdepth(best, {}) <= 4 * math.ceil(math.log2(T)) + 8
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -168,6 +187,7 @@ def test_diagonal_ssm_scan_t32():
 # ---------------------------------------------------------------------------
 #  (c) The diagonal carrier is cheaper than dense aff
 # ---------------------------------------------------------------------------
+
 
 def test_diag_carrier_cheaper_than_dense_aff():
     """Same recurrence, two spellings: DiagonalSSM (mul-form) under
@@ -200,6 +220,7 @@ def test_diag_carrier_cheaper_than_dense_aff():
 #  (d) Stratified run: canonicalize + contentful-only saturation
 # ---------------------------------------------------------------------------
 
+
 def test_stratified_run_reaches_log_depth():
     """stratified_run on the same graph: canonicalize comm-sorts the
     add/mul operands (``add(mul(h,a), mul(b,x))`` for t>0,
@@ -218,9 +239,13 @@ def test_stratified_run_reaches_log_depth():
 
     eg = EGraph()
     out = meta.stratified_run(
-        eg, R.SCAN_DIAG_LAWS, ir.root, max_iterations=14,
+        eg,
+        R.SCAN_DIAG_LAWS,
+        ir.root,
+        max_iterations=14,
         max_nodes=400_000,
-        extract_fn=eg.extract_min_depth)
+        extract_fn=eg.extract_min_depth,
+    )
 
     best = out["canonical_best"]
     rep = op_repr(best)
@@ -228,8 +253,12 @@ def test_stratified_run_reaches_log_depth():
     assert "applyd" in rep
     assert _opdepth(best, {}) <= 4 * math.ceil(math.log2(T)) + 8
 
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -250,9 +279,13 @@ def test_stratified_run_documents_meta_gap():
 
     eg = EGraph()
     out = meta.stratified_run(
-        eg, R.SCAN_DIAG_LAWS, ir.root, max_iterations=14,
+        eg,
+        R.SCAN_DIAG_LAWS,
+        ir.root,
+        max_iterations=14,
         max_nodes=200_000,
-        extract_fn=eg.extract_min_depth)
+        extract_fn=eg.extract_min_depth,
+    )
 
     # The assoc pair is now classified coherent — canonicalize
     # rebalances affd_compose chains post-hoc (meta._ASSOC_ONLY
@@ -262,13 +295,16 @@ def test_stratified_run_documents_meta_gap():
     # ...and the extracted term is still the balanced scan.
     rep = op_repr(out["canonical_best"])
     assert "affd_compose" in rep
-    assert _opdepth(out["canonical_best"], {}) <= \
-        4 * math.ceil(math.log2(T)) + 8
+    assert (
+        _opdepth(out["canonical_best"], {})
+        <= 4 * math.ceil(math.log2(T)) + 8
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Lowering: BatchedScanModule falls back to serial eval on applyd trees
 # ---------------------------------------------------------------------------
+
 
 def test_batched_scan_module_handles_applyd():
     """``is_scan_apply_term`` recognises the diagonal ``applyd`` root —
@@ -282,8 +318,12 @@ def test_batched_scan_module_handles_applyd():
     ir, st, best, _ = _scan(m, x)
 
     assert is_scan_apply_term(best)
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = to_batched_scan_module(opt_ir, param_values=st)
     assert mod.is_batched
     mod.eval()

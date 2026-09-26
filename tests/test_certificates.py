@@ -13,15 +13,14 @@ import time
 
 import pytest
 
+from catopt import rules as R
+from catopt.cost import count_cost
 from catopt.egraph import (
-    Certificate,
     CertificateVerificationError,
     EGraph,
     verify_certificate,
 )
-from catopt.ir import Op, Var, Const, Param, TensorType, op_repr
-from catopt import rules as R
-from catopt.cost import count_cost
+from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt.rules import pair_shared_input_linears
 
 
@@ -35,7 +34,9 @@ def _opdepth(t, memo):
         return 0
     k = id(t)
     if k not in memo:
-        memo[k] = 1 + max((_opdepth(a, memo) for a in t.args), default=0)
+        memo[k] = 1 + max(
+            (_opdepth(a, memo) for a in t.args), default=0
+        )
     return memo[k]
 
 
@@ -45,14 +46,18 @@ def _recurrence(T, d=4):
     A = Param("A", TensorType((d, d)))
     h = Var("h0", TensorType((d,)))
     for t in range(T):
-        h = Op.make("add", Op.make("matmul", A, h),
-                    Var(f"x{t}", TensorType((d,))))
+        h = Op.make(
+            "add",
+            Op.make("matmul", A, h),
+            Var(f"x{t}", TensorType((d,))),
+        )
     return h
 
 
 # ---------------------------------------------------------------------------
 #  (a) saturate -> extract -> certificate replays to the same term
 # ---------------------------------------------------------------------------
+
 
 def test_certificate_comm_add():
     """add(x, y) under comm_add: the commuted member certifies in one step."""
@@ -95,7 +100,9 @@ def test_certificate_weight_factor():
     exactly the weight_factor_matmul step."""
     x = Var("x", _t())
     W1, W2 = Param("W1", _t()), Param("W2", _t())
-    src = Op.make("add", Op.make("matmul", x, W1), Op.make("matmul", x, W2))
+    src = Op.make(
+        "add", Op.make("matmul", x, W1), Op.make("matmul", x, W2)
+    )
     eg = EGraph()
     root = eg.add_term(src)
     eg.run([R.WEIGHT_FACTOR], root, max_iterations=5)
@@ -114,8 +121,9 @@ def test_certificate_scan_laws_t4():
     src = _recurrence(4)
     eg = EGraph()
     root = eg.add_term(src)
-    stats = eg.run(R.SCAN_LAWS, root, max_iterations=14,
-                   max_nodes=300_000)
+    stats = eg.run(
+        R.SCAN_LAWS, root, max_iterations=14, max_nodes=300_000
+    )
     best = eg.extract_min_depth(root)
     assert "aff_compose" in op_repr(best)  # sanity: scan form reached
 
@@ -128,8 +136,13 @@ def test_certificate_scan_laws_t4():
     assert cert.n_steps >= 3
     assert "aff_lift" in cert.rules_used
     assert set(cert.rules_used) <= {
-        "aff_lift", "aff_lift_step", "aff_unlift",
-        "aff_compose_unfold", "aff_assoc", "aff_assoc_rev"}
+        "aff_lift",
+        "aff_lift_step",
+        "aff_unlift",
+        "aff_compose_unfold",
+        "aff_assoc",
+        "aff_assoc_rev",
+    }
 
 
 def test_certificate_identity_derivation():
@@ -148,6 +161,7 @@ def test_certificate_identity_derivation():
 #  (b) provenance: the certificate names the rules that actually fired
 # ---------------------------------------------------------------------------
 
+
 def test_certificate_provenance_names_fired_rules():
     x, y = Var("x", _t()), Var("y", _t())
     src = Op.make("sub", Op.make("add", x, Const(0)), y)
@@ -155,7 +169,9 @@ def test_certificate_provenance_names_fired_rules():
     root = eg.add_term(src)
     eg.run([R.SUB_TO_ADD, R.ID_ADD, R.COMM_ADD], root, max_iterations=5)
 
-    dst = Op.make("add", x, Op.make("neg", y))  # via sub_to_add + id_add
+    dst = Op.make(
+        "add", x, Op.make("neg", y)
+    )  # via sub_to_add + id_add
     cert = eg.certificate(src, dst)
     out = verify_certificate(src, cert)
     assert op_repr(out) == op_repr(dst)
@@ -190,6 +206,7 @@ def test_proof_edges_record_merges():
 # ---------------------------------------------------------------------------
 #  (c) tampered certificates fail verification
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def comm_cert():
@@ -240,6 +257,7 @@ def test_tampered_dst_claim_fails(comm_cert):
 #  e-graph-dependent steps: recorded, flagged, never silently passed
 # ---------------------------------------------------------------------------
 
+
 def test_pairing_pass_merges_are_witnessed():
     """The non-local pairing pass attaches a pointwise witness rule per
     member — certificate steps replay standalone instead of being
@@ -247,7 +265,9 @@ def test_pairing_pass_merges_are_witnessed():
     x = Var("x", TensorType((2, 4)))
     W1 = Param("W1", TensorType((8, 4)))
     W2 = Param("W2", TensorType((8, 4)))
-    src = Op.make("add", Op.make("linear", x, W1), Op.make("linear", x, W2))
+    src = Op.make(
+        "add", Op.make("linear", x, W1), Op.make("linear", x, W2)
+    )
     eg = EGraph()
     root = eg.add_term(src)
     eg.run([], root, max_iterations=1)
@@ -255,7 +275,9 @@ def test_pairing_pass_merges_are_witnessed():
     assert groups, "expected a pairing group"
     eg.rebuild()
 
-    overrides = {eg.find(cid): en for g in groups for cid, en in g.items()}
+    overrides = {
+        eg.find(cid): en for g in groups for cid, en in g.items()
+    }
     dst = eg.extract_best(root, count_cost, overrides=overrides)
     assert "split" in op_repr(dst)
 
@@ -273,6 +295,7 @@ def test_pairing_pass_merges_are_witnessed():
 #  (d) overhead: proof tracking does not perturb saturation
 # ---------------------------------------------------------------------------
 
+
 def test_proof_tracking_overhead_small():
     """Same saturation result with and without tracking; one O(1)
     record per merge/enode — no second pass over the proof space."""
@@ -282,8 +305,9 @@ def test_proof_tracking_overhead_small():
         eg = EGraph(track_proofs=track)
         root = eg.add_term(src)
         t0 = time.perf_counter()
-        stats = eg.run(R.SCAN_LAWS, root, max_iterations=14,
-                       max_nodes=300_000)
+        stats = eg.run(
+            R.SCAN_LAWS, root, max_iterations=14, max_nodes=300_000
+        )
         return eg, stats, time.perf_counter() - t0
 
     eg_on, stats_on, t_on = saturate(True)

@@ -1,9 +1,14 @@
 """Tests for the IR / term algebra."""
 
-import pytest
 from catopt.ir import (
-    Var, Const, Param, Op, IR, TensorType,
-    generator, op_repr, op_def, _OP_REGISTRY,
+    IR,
+    Const,
+    Op,
+    Param,
+    TensorType,
+    Var,
+    generator,
+    op_repr,
 )
 
 

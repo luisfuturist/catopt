@@ -31,11 +31,16 @@ import math
 import pytest
 import torch
 
-import catopt.trace as cat_trace              # registers torch bindings
+import catopt.trace as cat_trace  # registers torch bindings
 import catopt.trace_lift as TL
 from catopt import rules as R
-from catopt.cost import (_INVALID_COST, dag_cost, depth_cost,
-                         flops_cost, roofline_cost)
+from catopt.cost import (
+    _INVALID_COST,
+    dag_cost,
+    depth_cost,
+    flops_cost,
+    roofline_cost,
+)
 from catopt.egraph import EGraph, verify_certificate
 from catopt.ir import IR, Op, Param, TensorType, Var, op_repr
 from catopt.models.ssm import DiagDenseSSM, DiagonalSSM
@@ -56,6 +61,7 @@ def _fp64():
 #  Term builders — unrolled recurrences over Var/Param leaves
 # ---------------------------------------------------------------------------
 
+
 def _diag_term(T: int, d: int):
     """h_t = a_t ⊙ h_{t−1} + b_t ⊙ x_t — the Mamba-faithful spine."""
     a = Param("pa", TensorType((T, d)))
@@ -65,8 +71,11 @@ def _diag_term(T: int, d: int):
     h = h0
     for t in range(T):
         a_t = Op.make("select", a, arg1=0, arg2=t)
-        in_t = Op.make("mul", Op.make("select", b, arg1=0, arg2=t),
-                       Op.make("select", x, arg1=0, arg2=t))
+        in_t = Op.make(
+            "mul",
+            Op.make("select", b, arg1=0, arg2=t),
+            Op.make("select", x, arg1=0, arg2=t),
+        )
         h = Op.make("add", Op.make("mul", a_t, h), in_t)
     return h, [x], {"pa": a, "pb": b, "h0": h0}
 
@@ -80,8 +89,11 @@ def _dense_term(T: int, d: int):
     h = h0
     for t in range(T):
         A_t = Op.make("select", A, arg1=0, arg2=t)
-        in_t = Op.make("mul", Op.make("select", b, arg1=0, arg2=t),
-                       Op.make("select", x, arg1=0, arg2=t))
+        in_t = Op.make(
+            "mul",
+            Op.make("select", b, arg1=0, arg2=t),
+            Op.make("select", x, arg1=0, arg2=t),
+        )
         h = Op.make("add", Op.make("matmul", A_t, h), in_t)
     return h, [x], {"pA": A, "pb": b, "h0": h0}
 
@@ -90,7 +102,9 @@ def _env(T: int, d: int, seed: int = 0, dense: bool = False):
     g = torch.Generator().manual_seed(seed)
     env = {}
     if dense:
-        env["pA"] = torch.randn(T, d, d, generator=g) / math.sqrt(d) * 0.5
+        env["pA"] = (
+            torch.randn(T, d, d, generator=g) / math.sqrt(d) * 0.5
+        )
     else:
         env["pa"] = torch.rand(T, d, generator=g) * 0.9
     env["pb"] = torch.randn(T, d, generator=g)
@@ -100,8 +114,9 @@ def _env(T: int, d: int, seed: int = 0, dense: bool = False):
 
 
 def _eval(term, inputs, env, x):
-    return ir_to_torch_module(IR(root=term, inputs=inputs),
-                              param_values=env)(x)
+    return ir_to_torch_module(
+        IR(root=term, inputs=inputs), param_values=env
+    )(x)
 
 
 def _applyd_term(T: int, d: int):
@@ -115,8 +130,11 @@ def _applyd_term(T: int, d: int):
     leaves = []
     for t in range(T):
         a_t = Op.make("select", a, arg1=0, arg2=t)
-        in_t = Op.make("mul", Op.make("select", b, arg1=0, arg2=t),
-                       Op.make("select", x, arg1=0, arg2=t))
+        in_t = Op.make(
+            "mul",
+            Op.make("select", b, arg1=0, arg2=t),
+            Op.make("select", x, arg1=0, arg2=t),
+        )
         leaves.append(Op.make("aff_diag", a_t, in_t))
     f = leaves[-1]
     for leaf in reversed(leaves[:-1]):
@@ -127,6 +145,7 @@ def _applyd_term(T: int, d: int):
 # ---------------------------------------------------------------------------
 #  (a) e-graph insertion
 # ---------------------------------------------------------------------------
+
 
 class TestInsertion:
     def test_raw_diag_spine_gets_trace_member(self):
@@ -150,7 +169,8 @@ class TestInsertion:
         pat = Op.make(
             "reshape",
             Op.make("matmul", Op.make("trace", "f", usize="U"), "v"),
-            shape="S")
+            shape="S",
+        )
         assert eg.matches(pat, root)
 
     def test_certificate_records_nonlocal_step(self):
@@ -158,16 +178,18 @@ class TestInsertion:
         term, _, _ = _diag_term(T, d)
         eg = EGraph()
         root = eg.add_term(term)
-        lifts = TL.lift_scan_to_trace(eg, root_eid=root,
-                                      channel_splits=None)
+        lifts = TL.lift_scan_to_trace(
+            eg, root_eid=root, channel_splits=None
+        )
         assert len(lifts) == 1
         cert = eg.certificate(term, lifts[0].term, root_eid=root)
         assert cert is not None
         # the lift carries a pointwise witness rule — fully replayable
         assert cert.n_egraph_dependent == 0
         assert verify_certificate(term, cert, strict=True) is not None
-        assert op_repr(verify_certificate(term, cert)) == \
-            op_repr(lifts[0].term)
+        assert op_repr(verify_certificate(term, cert)) == op_repr(
+            lifts[0].term
+        )
 
     def test_idempotent(self):
         term, _, _ = _diag_term(4, 4)
@@ -176,7 +198,7 @@ class TestInsertion:
         TL.lift_scan_to_trace(eg)
         n1 = eg.n_enodes
         lifts2 = TL.lift_scan_to_trace(eg)
-        assert lifts2 and eg.n_enodes == n1   # same hash-consed enodes
+        assert lifts2 and eg.n_enodes == n1  # same hash-consed enodes
 
     def test_lift_only_root(self):
         """maximal_only drops strict-prefix chains."""
@@ -193,6 +215,7 @@ class TestInsertion:
 # ---------------------------------------------------------------------------
 #  (b) fp64 numerical equivalence
 # ---------------------------------------------------------------------------
+
 
 class TestNumerics:
     def test_diag_spine_fp64(self):
@@ -268,7 +291,8 @@ class TestNumerics:
         for l in lifts:
             got = ir_to_torch_module(
                 IR(root=l.term, inputs=ir.inputs),
-                param_values=src_tensors)(x)
+                param_values=src_tensors,
+            )(x)
             assert (got - want).abs().max().item() < 1e-9
 
     def test_exported_dense_ssm_fp64(self):
@@ -285,13 +309,15 @@ class TestNumerics:
         for l in lifts:
             got = ir_to_torch_module(
                 IR(root=l.term, inputs=ir.inputs),
-                param_values=src_tensors)(x)
+                param_values=src_tensors,
+            )(x)
             assert (got - want).abs().max().item() < 1e-9
 
 
 # ---------------------------------------------------------------------------
 #  (c) post-lift saturation — trace laws on genuinely lifted members
 # ---------------------------------------------------------------------------
+
 
 class TestPostLiftSaturation:
     def test_superpose_exposes_bdiag_of_channel_traces(self):
@@ -312,11 +338,17 @@ class TestPostLiftSaturation:
         # root class's reshape→matmul member
         pat = Op.make(
             "reshape",
-            Op.make("matmul",
-                    Op.make("bdiag", Op.make("trace", "f1", usize="U1"),
-                            Op.make("trace", "f2", usize="U2")),
-                    "v"),
-            shape="S")
+            Op.make(
+                "matmul",
+                Op.make(
+                    "bdiag",
+                    Op.make("trace", "f1", usize="U1"),
+                    Op.make("trace", "f2", usize="U2"),
+                ),
+                "v",
+            ),
+            shape="S",
+        )
         binds = eg.matches(pat, root)
         assert binds, "bdiag-of-traces not reachable after saturation"
 
@@ -328,8 +360,9 @@ class TestPostLiftSaturation:
                 bdiag_node = node
                 break
         assert bdiag_node is not None
-        term2 = eg.extract_best(root, flops_cost,
-                                overrides={tr_cid: bdiag_node})
+        term2 = eg.extract_best(
+            root, flops_cost, overrides={tr_cid: bdiag_node}
+        )
         got = _eval(term2, inputs, env, x)
         want = _eval(term, inputs, env, x)
         assert (got - want).abs().max().item() < 1e-11
@@ -348,12 +381,13 @@ class TestPostLiftSaturation:
         assert eg.rule_fires.get("tr_expand", 0) >= 1
         resolvent = None
         for node in eg.get_class(tr_cid).nodes:
-            if node.op == "add":        # P + Q(I−S)⁻¹R
+            if node.op == "add":  # P + Q(I−S)⁻¹R
                 resolvent = node
                 break
         assert resolvent is not None, "resolvent member absent"
-        term2 = eg.extract_best(root, flops_cost,
-                                overrides={tr_cid: resolvent})
+        term2 = eg.extract_best(
+            root, flops_cost, overrides={tr_cid: resolvent}
+        )
         got = _eval(term2, inputs, env, x)
         want = _eval(term, inputs, env, x)
         assert (got - want).abs().max().item() < 1e-10
@@ -366,9 +400,12 @@ class TestPostLiftSaturation:
         env, x = _env(T, d, seed=7)
         eg = EGraph()
         root = eg.add_term(term)
-        lifts = TL.lift_scan_to_trace(eg)          # split member has
-        eg.run(TRACE_LAWS, root,                   # usize=(Td1, Td2)
-               max_iterations=10)
+        lifts = TL.lift_scan_to_trace(eg)  # split member has
+        eg.run(
+            TRACE_LAWS,
+            root,  # usize=(Td1, Td2)
+            max_iterations=10,
+        )
         fires = eg.rule_fires
         assert fires.get("tr_superpose", 0) >= 1
         assert fires.get("tr_vanish_split", 0) >= 1
@@ -390,6 +427,7 @@ class TestPostLiftSaturation:
 # ---------------------------------------------------------------------------
 #  (d) minted-F storage bound — one F per horizon, not one per step
 # ---------------------------------------------------------------------------
+
 
 class TestStorageBound:
     def test_saturated_prefixes_do_not_multiply_F(self):
@@ -428,7 +466,7 @@ class TestStorageBound:
         root = eg.add_term(term)
         eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=6)
         lifts = TL.lift_scan_to_trace(eg, maximal_only=False)
-        assert len(lifts) > T            # per-prefix minting returns
+        assert len(lifts) > T  # per-prefix minting returns
         lifts_max = TL.lift_scan_to_trace(eg)
         assert len(lifts_max) <= 2
 
@@ -436,6 +474,7 @@ class TestStorageBound:
         """The lifted member stores the same leaves as the loop body —
         no per-step F param materialises in the weights file."""
         from catopt.cost import param_bytes_cost
+
         T, d = 10, 6
         term, _, _ = _diag_term(T, d)
         eg = EGraph()
@@ -444,21 +483,23 @@ class TestStorageBound:
         orig = param_bytes_cost(term)
         for l in lifts:
             got = param_bytes_cost(l.term)
-            assert got <= 2 * orig       # ~parity, never ~2T×
-            assert got == orig           # same named leaves, in fact
+            assert got <= 2 * orig  # ~parity, never ~2T×
+            assert got == orig  # same named leaves, in fact
 
 
 # ---------------------------------------------------------------------------
 #  (e) graceful no-op
 # ---------------------------------------------------------------------------
 
+
 class TestNoOp:
     def test_non_recurrence_is_untouched(self):
         x = Var("x", TensorType((8,)))
         w = Param("w", TensorType((8, 8)))
         v = Param("v", TensorType((8,)))
-        term = Op.make("tanh",
-                       Op.make("add", Op.make("matmul", w, x), v))
+        term = Op.make(
+            "tanh", Op.make("add", Op.make("matmul", w, x), v)
+        )
         eg = EGraph()
         root = eg.add_term(term)
         n0 = eg.n_enodes

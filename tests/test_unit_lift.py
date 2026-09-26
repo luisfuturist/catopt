@@ -46,14 +46,18 @@ import pytest
 import torch
 import torch.nn as nn
 
-from catopt.egraph import EGraph
-from catopt import rules as R
-from catopt import meta
-from catopt.ir import Const, IR, Op, Param, TensorType, Var, op_repr
-from catopt.scan_lower import is_scan_apply_term, to_batched_scan_module
-from catopt.torch_bridge import _IR_TO_TORCH, export_to_ir, ir_to_torch_module
 import catopt.trace  # noqa: F401 — registers trace/eye/parl bindings
+from catopt import meta
+from catopt import rules as R
 from catopt import trace_lift as TL
+from catopt.egraph import EGraph
+from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
+from catopt.scan_lower import is_scan_apply_term, to_batched_scan_module
+from catopt.torch_bridge import (
+    _IR_TO_TORCH,
+    export_to_ir,
+    ir_to_torch_module,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +74,9 @@ def _opdepth(t, memo):
         return 0
     k = id(t)
     if k not in memo:
-        memo[k] = 1 + max((_opdepth(a, memo) for a in t.args), default=0)
+        memo[k] = 1 + max(
+            (_opdepth(a, memo) for a in t.args), default=0
+        )
     return memo[k]
 
 
@@ -82,8 +88,9 @@ class CumsumSSM(nn.Module):
     carrier enodes under ``SCAN_DIAG_LAWS``.
     """
 
-    def __init__(self, d_inner: int = 16, d_in: int = 16,
-                 steps: int = 16) -> None:
+    def __init__(
+        self, d_inner: int = 16, d_in: int = 16, steps: int = 16
+    ) -> None:
         super().__init__()
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
         self.h0 = nn.Parameter(torch.zeros(d_inner))
@@ -108,18 +115,24 @@ def _cumsum_term(T: int, d: int):
     return h, [x]
 
 
-_UNIT_RULES = ("affd_lift_unit", "affd_lift_unit_post",
-               "affd_lift_unit_step", "affd_lift_unit_step_post")
+_UNIT_RULES = (
+    "affd_lift_unit",
+    "affd_lift_unit_post",
+    "affd_lift_unit_step",
+    "affd_lift_unit_step_post",
+)
 
 
 def _fires(eg, prefix="affd_lift_unit"):
-    return {k: v for k, v in eg.rule_fires.items()
-            if k.startswith(prefix)}
+    return {
+        k: v for k, v in eg.rule_fires.items() if k.startswith(prefix)
+    }
 
 
 # ---------------------------------------------------------------------------
 #  (a) The unit coefficient is an all-ones diagonal at the step's shape
 # ---------------------------------------------------------------------------
+
 
 def test_unit_diagonal_is_ones_of_the_state_shape():
     """``expand(Const(1.0), shape=S)`` materialises 1_S; the lift writes
@@ -134,8 +147,11 @@ def test_unit_diagonal_is_ones_of_the_state_shape():
     assert unit.shape == (d,)
     assert torch.equal(unit, torch.ones(d, dtype=torch.float64))
 
-    a, b, h = unit, torch.randn(d, dtype=torch.float64), torch.randn(
-        d, dtype=torch.float64)
+    a, b, h = (
+        unit,
+        torch.randn(d, dtype=torch.float64),
+        torch.randn(d, dtype=torch.float64),
+    )
     assert torch.equal(applyd(aff_diag(a, b), h), h + b)
 
 
@@ -154,8 +170,8 @@ def test_unit_lift_fires_on_cumsum_spine():
     eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=8)
 
     fires = _fires(eg)
-    assert fires["affd_lift_unit"] == T          # one per step
-    assert fires["affd_lift_unit_step"] > 0      # composed chains
+    assert fires["affd_lift_unit"] == T  # one per step
+    assert fires["affd_lift_unit_step"] > 0  # composed chains
 
     ops = {n.op for c in eg._classes.values() for n in c.nodes}
     assert {"applyd", "aff_diag", "affd_compose", "expand"} <= ops
@@ -172,13 +188,15 @@ def test_unit_lift_fires_on_cumsum_spine():
     xt = torch.randn(T, d, dtype=torch.float64)
     ref = ir_to_torch_module(ir, param_values=st)(xt)
     out = ir_to_torch_module(
-        IR(root=best, inputs=inputs), param_values=st)(xt)
+        IR(root=best, inputs=inputs), param_values=st
+    )(xt)
     assert (out - ref).abs().max().item() < 1e-10
 
 
 # ---------------------------------------------------------------------------
 #  (b) End-to-end: an exported accumulator reaches the balanced scan
 # ---------------------------------------------------------------------------
+
 
 def test_cumsum_ssm_reaches_log_depth_scan():
     """CumsumSSM exports a bare add spine; with the unit lift the
@@ -192,8 +210,7 @@ def test_cumsum_ssm_reaches_log_depth_scan():
 
     eg = EGraph()
     root = eg.add_term(ir.root)
-    eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=14,
-           max_nodes=400_000)
+    eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=14, max_nodes=400_000)
 
     best = eg.extract_min_depth(root)
     rep = op_repr(best)
@@ -202,8 +219,12 @@ def test_cumsum_ssm_reaches_log_depth_scan():
     assert is_scan_apply_term(best)
     assert _opdepth(best, {}) <= 4 * math.ceil(math.log2(T)) + 8
 
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -222,13 +243,16 @@ def test_batched_scan_executes_unit_accumulation():
 
     eg = EGraph()
     root = eg.add_term(ir.root)
-    eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=14,
-           max_nodes=400_000)
+    eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=14, max_nodes=400_000)
     best = eg.extract_min_depth(root)
 
     assert is_scan_apply_term(best)
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = to_batched_scan_module(opt_ir, param_values=st)
     assert mod.is_batched
     mod.eval()
@@ -249,8 +273,7 @@ def test_trace_lift_accepts_unit_carrier():
 
     eg = EGraph()
     root = eg.add_term(ir.root)
-    eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=14,
-           max_nodes=400_000)
+    eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=14, max_nodes=400_000)
 
     lifts = TL.lift_scan_to_trace(eg, root)
     assert len(lifts) >= 1
@@ -258,7 +281,8 @@ def test_trace_lift_accepts_unit_carrier():
         ref = m(x)
         for l in lifts:
             mod = ir_to_torch_module(
-                IR(root=l.term, inputs=ir.inputs), param_values=st)
+                IR(root=l.term, inputs=ir.inputs), param_values=st
+            )
             assert (mod(x) - ref).abs().max().item() < 1e-10
 
 
@@ -275,19 +299,30 @@ def test_stratified_run_lifts_canonicalised_adds():
 
     eg = EGraph()
     out = meta.stratified_run(
-        eg, R.SCAN_DIAG_LAWS, ir.root, max_iterations=14,
-        max_nodes=400_000, extract_fn=eg.extract_min_depth)
+        eg,
+        R.SCAN_DIAG_LAWS,
+        ir.root,
+        max_iterations=14,
+        max_nodes=400_000,
+        extract_fn=eg.extract_min_depth,
+    )
 
     fires = _fires(eg)
     assert sum(fires.values()) > 0
-    assert fires.get("affd_lift_unit_post", 0) > 0 \
+    assert (
+        fires.get("affd_lift_unit_post", 0) > 0
         or fires.get("affd_lift_unit_step_post", 0) > 0
+    )
     ops = {n.op for c in eg._classes.values() for n in c.nodes}
     assert "applyd" in ops and "aff_diag" in ops
 
     best = out["canonical_best"]
-    opt_ir = IR(root=best, inputs=ir.inputs,
-                input_names=ir.input_names, params=ir.params)
+    opt_ir = IR(
+        root=best,
+        inputs=ir.inputs,
+        input_names=ir.input_names,
+        params=ir.params,
+    )
     mod = ir_to_torch_module(opt_ir, param_values=st)
     with torch.no_grad():
         diff = (m(x) - mod(x)).abs().max().item()
@@ -297,6 +332,7 @@ def test_stratified_run_lifts_canonicalised_adds():
 # ---------------------------------------------------------------------------
 #  (c) Guard: per-step / non-state adds do not lift
 # ---------------------------------------------------------------------------
+
 
 def test_unit_lift_ignores_non_state_adds():
     """``add(matmul(W,x), mul(a,y))`` — neither operand is state-like —
@@ -322,17 +358,20 @@ def test_unit_lift_ignores_add_of_increments():
     no state — fires no unit rule.  A Const operand is likewise not a
     state: ``add(Const, x)`` stays put."""
     x = Var("x", TensorType((4, 4)))
-    term = Op.make("add",
-                   Op.make("select", x, arg1=0, arg2=0),
-                   Op.make("select", x, arg1=0, arg2=1))
+    term = Op.make(
+        "add",
+        Op.make("select", x, arg1=0, arg2=0),
+        Op.make("select", x, arg1=0, arg2=1),
+    )
     eg = EGraph()
     root = eg.add_term(term)
     eg.run(R.SCAN_DIAG_LAWS, root, max_iterations=8)
     for name in _UNIT_RULES:
         assert eg.rule_fires.get(name, 0) == 0
 
-    term2 = Op.make("add", Const(2.0),
-                    Op.make("select", x, arg1=0, arg2=0))
+    term2 = Op.make(
+        "add", Const(2.0), Op.make("select", x, arg1=0, arg2=0)
+    )
     eg2 = EGraph()
     r2 = eg2.add_term(term2)
     eg2.run(R.SCAN_DIAG_LAWS, r2, max_iterations=8)

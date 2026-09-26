@@ -30,14 +30,21 @@ from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, TensorType, Var
 from catopt.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
 from catopt.trace import (
-    TRACE_LAWS,
-    TR_COLLAPSE, TR_EXPAND,
-    TR_SLIDE, TR_SLIDE_REV,
-    TR_SUPERPOSE, TR_SUPERPOSE_REV,
-    TR_TIGHTEN_IN, TR_TIGHTEN_IN_REV,
-    TR_TIGHTEN_OUT, TR_TIGHTEN_OUT_REV,
-    TR_VANISH_MERGE, TR_VANISH_SPLIT, TR_VANISH_UNIT,
+    TR_COLLAPSE,
+    TR_EXPAND,
+    TR_SLIDE,
+    TR_SLIDE_REV,
+    TR_SUPERPOSE,
+    TR_SUPERPOSE_REV,
+    TR_TIGHTEN_IN,
+    TR_TIGHTEN_IN_REV,
+    TR_TIGHTEN_OUT,
+    TR_TIGHTEN_OUT_REV,
+    TR_VANISH_MERGE,
+    TR_VANISH_SPLIT,
+    TR_VANISH_UNIT,
     TR_YANK,
+    TRACE_LAWS,
 )
 
 
@@ -53,21 +60,24 @@ def _fp64():
 #  Helpers
 # ---------------------------------------------------------------------------
 
+
 def _rand(seed: int, *shape: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
     return torch.randn(*shape, generator=g)
 
 
-def _mkf(du: int, dx: int, dy: int, seed: int,
-         s_scale: float = 0.25) -> torch.Tensor:
+def _mkf(
+    du: int, dx: int, dy: int, seed: int, s_scale: float = 0.25
+) -> torch.Tensor:
     """Random f : U⊗X → U⊗Y as a feedback-first block matrix
     ``[[S, R], [Q, P]]`` with contractive S (well-posed fixpoint)."""
     S = _rand(seed + 1, du, du) * s_scale
     R = _rand(seed + 2, du, dx) * 0.4
     Q = _rand(seed + 3, dy, du) * 0.4
     P = _rand(seed + 4, dy, dx) * 0.4
-    return torch.cat([torch.cat([S, R], dim=1),
-                      torch.cat([Q, P], dim=1)], dim=0)
+    return torch.cat(
+        [torch.cat([S, R], dim=1), torch.cat([Q, P], dim=1)], dim=0
+    )
 
 
 def _var(name: str, shape) -> Var:
@@ -84,10 +94,13 @@ def _ev(term, env: dict | None = None) -> torch.Tensor:
         if isinstance(t, (Var, Param)):
             return env[t.name]
         if isinstance(t, Const):
-            return torch.tensor(t.value,
-                                dtype=torch.get_default_dtype())
-        return _IR_TO_TORCH[t.op](*[go(a) for a in t.args],
-                                  **dict(t.attrs))
+            return torch.tensor(
+                t.value, dtype=torch.get_default_dtype()
+            )
+        return _IR_TO_TORCH[t.op](
+            *[go(a) for a in t.args], **dict(t.attrs)
+        )
+
     return go(term)
 
 
@@ -97,13 +110,17 @@ def _all_nodes(eg: EGraph):
 
 
 def _trace_enode(eg: EGraph, usize):
-    return [n for n in _all_nodes(eg)
-            if n.op == "trace" and dict(n.attrs).get("usize") == usize]
+    return [
+        n
+        for n in _all_nodes(eg)
+        if n.op == "trace" and dict(n.attrs).get("usize") == usize
+    ]
 
 
 # ---------------------------------------------------------------------------
 #  Semantics: trace IS the linear fixpoint
 # ---------------------------------------------------------------------------
+
 
 def test_trace_is_linear_fixpoint():
     du, dx, dy = 3, 4, 2
@@ -132,13 +149,18 @@ def test_irmodule_evaluates_trace():
     F = _mkf(du, dx, dy, seed=5)
     Fp = Param("p_F", TensorType(tuple(F.shape)))
     term = Op.make("trace", Fp, usize=du)
-    ir = IR(root=term, inputs=[_var("x", (dx, dy))],
-            input_names={"x"}, params={"p_F": Fp})
+    ir = IR(
+        root=term,
+        inputs=[_var("x", (dx, dy))],
+        input_names={"x"},
+        params={"p_F": Fp},
+    )
     mod = ir_to_torch_module(ir, param_values={"p_F": F})
     x = _rand(6, dx, dy)
     got = mod(x)
     want = F[du:, du:] + F[du:, :du] @ torch.linalg.solve(
-        torch.eye(du) - F[:du, :du], F[:du, du:])
+        torch.eye(du) - F[:du, :du], F[:du, du:]
+    )
     assert torch.allclose(got @ x, want @ x, atol=1e-10)
     assert torch.allclose(got, want, atol=1e-10)
 
@@ -146,6 +168,7 @@ def test_irmodule_evaluates_trace():
 # ---------------------------------------------------------------------------
 #  Vanishing — Tr^I = id, Tr^{U⊗V} = Tr^V ∘ Tr^U
 # ---------------------------------------------------------------------------
+
 
 def test_vanishing_unit():
     du, dx, dy = 3, 4, 2
@@ -168,9 +191,7 @@ def test_vanishing_split_and_merge():
     F = _mkf(du + dv, dx, dy, seed=20)
     Fv = _var("F", F.shape)
     lhs = Op.make("trace", Fv, usize=(du, dv))
-    rhs = Op.make("trace",
-                  Op.make("trace", Fv, usize=du),
-                  usize=dv)
+    rhs = Op.make("trace", Op.make("trace", Fv, usize=du), usize=dv)
     # numerics: product-wire trace == nested traces
     assert (_ev(lhs, {"F": F}) - _ev(rhs, {"F": F})).abs().max() < 1e-12
 
@@ -180,8 +201,9 @@ def test_vanishing_split_and_merge():
     eg.run([TR_VANISH_SPLIT], eid)
     assert eg.rule_fires.get("tr_vanish_split", 0) >= 1
     assert eg.matches(
-        Op.make("trace", Op.make("trace", "f", usize="DU"),
-                usize="DV"), eid)
+        Op.make("trace", Op.make("trace", "f", usize="DU"), usize="DV"),
+        eid,
+    )
 
     # merge fires back
     eg2 = EGraph()
@@ -195,6 +217,7 @@ def test_vanishing_split_and_merge():
 #  Superposing — joint loop splits into independent channels
 # ---------------------------------------------------------------------------
 
+
 def test_superpose_splits_independent_channels():
     """The headline transform: one joint loop over two independent
     recurrences → block-diagonal of two independent traces that can be
@@ -205,12 +228,14 @@ def test_superpose_splits_independent_channels():
     Fv, Gv = _var("F", F.shape), _var("G", G.shape)
     env = {"F": F, "G": G}
 
-    lhs = Op.make("trace",
-                  Op.make("parl", Fv, Gv, u1=du, u2=dv),
-                  usize=(du, dv))
-    rhs = Op.make("bdiag",
-                  Op.make("trace", Fv, usize=du),
-                  Op.make("trace", Gv, usize=dv))
+    lhs = Op.make(
+        "trace", Op.make("parl", Fv, Gv, u1=du, u2=dv), usize=(du, dv)
+    )
+    rhs = Op.make(
+        "bdiag",
+        Op.make("trace", Fv, usize=du),
+        Op.make("trace", Gv, usize=dv),
+    )
     assert (_ev(lhs, env) - _ev(rhs, env)).abs().max() < 1e-12
 
     eg = EGraph()
@@ -219,9 +244,13 @@ def test_superpose_splits_independent_channels():
     assert eg.rule_fires.get("tr_superpose", 0) >= 1
     # the split form is a member of the root e-class
     assert eg.matches(
-        Op.make("bdiag",
-                Op.make("trace", "f", usize="DU"),
-                Op.make("trace", "g", usize="DV")), eid)
+        Op.make(
+            "bdiag",
+            Op.make("trace", "f", usize="DU"),
+            Op.make("trace", "g", usize="DV"),
+        ),
+        eid,
+    )
 
     # reverse direction: independent loops fuse back into the joint loop
     eg2 = EGraph()
@@ -240,12 +269,14 @@ def test_superpose_with_untraced_context():
     Fv, Gv = _var("F", F.shape), _var("G", G.shape)
     env = {"F": F, "G": G}
 
-    lhs = Op.make("trace",
-                  Op.make("parl", Fv, Gv, u1=du, u2=0),
-                  usize=(du, 0))
-    rhs = Op.make("bdiag",
-                  Op.make("trace", Fv, usize=du),
-                  Op.make("trace", Gv, usize=0))
+    lhs = Op.make(
+        "trace", Op.make("parl", Fv, Gv, u1=du, u2=0), usize=(du, 0)
+    )
+    rhs = Op.make(
+        "bdiag",
+        Op.make("trace", Fv, usize=du),
+        Op.make("trace", Gv, usize=0),
+    )
     assert (_ev(lhs, env) - _ev(rhs, env)).abs().max() < 1e-12
 
     # tr_superpose + tr_vanish_unit chain: g's trivial trace vanishes
@@ -256,12 +287,14 @@ def test_superpose_with_untraced_context():
     assert eg.rule_fires.get("tr_vanish_unit", 0) >= 1
     # root e-class contains bdiag(trace(F, du), G)
     assert eg.matches(
-        Op.make("bdiag", Op.make("trace", "f", usize="DU"), "g"), eid)
+        Op.make("bdiag", Op.make("trace", "f", usize="DU"), "g"), eid
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Sliding — a map on the loop wire crosses the trace boundary
 # ---------------------------------------------------------------------------
+
 
 def _slide_terms(du, dx, dy, seed):
     G = _mkf(du, dx, dy, seed=seed)
@@ -269,15 +302,18 @@ def _slide_terms(du, dx, dy, seed):
     Gv, Hv = _var("G", G.shape), _var("H", H.shape)
     lhs = Op.make(
         "trace",
-        Op.make("matmul", Gv,
-                Op.make("bdiag", Hv, Op.make("eye", dim=dx))),
-        usize=du)
+        Op.make(
+            "matmul", Gv, Op.make("bdiag", Hv, Op.make("eye", dim=dx))
+        ),
+        usize=du,
+    )
     rhs = Op.make(
         "trace",
-        Op.make("matmul",
-                Op.make("bdiag", Hv, Op.make("eye", dim=dy)),
-                Gv),
-        usize=du)
+        Op.make(
+            "matmul", Op.make("bdiag", Hv, Op.make("eye", dim=dy)), Gv
+        ),
+        usize=du,
+    )
     return lhs, rhs, {"G": G, "H": H}
 
 
@@ -292,12 +328,17 @@ def test_slide():
     eg.run([TR_SLIDE], eid)
     assert eg.rule_fires.get("tr_slide", 0) >= 1
     assert eg.matches(
-        Op.make("trace",
-                Op.make("matmul",
-                        Op.make("bdiag", "h",
-                                Op.make("eye", dim="DY")),
-                        "g"),
-                usize="DU"), eid)
+        Op.make(
+            "trace",
+            Op.make(
+                "matmul",
+                Op.make("bdiag", "h", Op.make("eye", dim="DY")),
+                "g",
+            ),
+            usize="DU",
+        ),
+        eid,
+    )
 
     # reverse direction
     eg2 = EGraph()
@@ -319,37 +360,50 @@ def test_slide_pulls_matrix_out_of_recurrence():
     # both orientations coexist in the class
     assert eg.rule_fires.get("tr_slide", 0) >= 1
     assert eg.matches(
-        Op.make("trace",
-                Op.make("matmul", "g",
-                        Op.make("bdiag", "h",
-                                Op.make("eye", dim="DX"))),
-                usize="DU"), eid)
+        Op.make(
+            "trace",
+            Op.make(
+                "matmul",
+                "g",
+                Op.make("bdiag", "h", Op.make("eye", dim="DX")),
+            ),
+            usize="DU",
+        ),
+        eid,
+    )
     assert eg.matches(
-        Op.make("trace",
-                Op.make("matmul",
-                        Op.make("bdiag", "h",
-                                Op.make("eye", dim="DY")),
-                        "g"),
-                usize="DU"), eid)
+        Op.make(
+            "trace",
+            Op.make(
+                "matmul",
+                Op.make("bdiag", "h", Op.make("eye", dim="DY")),
+                "g",
+            ),
+            usize="DU",
+        ),
+        eid,
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Tightening — context maps commute out of the loop
 # ---------------------------------------------------------------------------
 
+
 def test_tighten_out():
     du, dx, dy, dz = 2, 3, 4, 1
     F = _mkf(du, dx, dy, seed=80)
-    K = _rand(81, dz, dy) * 0.5          # readout: y → z
+    K = _rand(81, dz, dy) * 0.5  # readout: y → z
     Fv, Kv = _var("F", F.shape), _var("K", K.shape)
     env = {"F": F, "K": K}
 
     lhs = Op.make(
         "trace",
-        Op.make("matmul",
-                Op.make("bdiag", Op.make("eye", dim=du), Kv),
-                Fv),
-        usize=du)
+        Op.make(
+            "matmul", Op.make("bdiag", Op.make("eye", dim=du), Kv), Fv
+        ),
+        usize=du,
+    )
     rhs = Op.make("matmul", Kv, Op.make("trace", Fv, usize=du))
     assert (_ev(lhs, env) - _ev(rhs, env)).abs().max() < 1e-12
 
@@ -358,8 +412,8 @@ def test_tighten_out():
     eg.run([TR_TIGHTEN_OUT], eid)
     assert eg.rule_fires.get("tr_tighten_out", 0) >= 1
     assert eg.matches(
-        Op.make("matmul", "k", Op.make("trace", "f", usize="DU")),
-        eid)
+        Op.make("matmul", "k", Op.make("trace", "f", usize="DU")), eid
+    )
 
     eg2 = EGraph()
     eid2 = eg2.add_term(rhs)
@@ -370,15 +424,17 @@ def test_tighten_out():
 def test_tighten_in():
     du, dx, dy, dw = 2, 3, 2, 4
     F = _mkf(du, dx, dy, seed=90)
-    J = _rand(91, dx, dw) * 0.5          # lift: w → x
+    J = _rand(91, dx, dw) * 0.5  # lift: w → x
     Fv, Jv = _var("F", F.shape), _var("J", J.shape)
     env = {"F": F, "J": J}
 
     lhs = Op.make(
         "trace",
-        Op.make("matmul", Fv,
-                Op.make("bdiag", Op.make("eye", dim=du), Jv)),
-        usize=du)
+        Op.make(
+            "matmul", Fv, Op.make("bdiag", Op.make("eye", dim=du), Jv)
+        ),
+        usize=du,
+    )
     rhs = Op.make("matmul", Op.make("trace", Fv, usize=du), Jv)
     assert (_ev(lhs, env) - _ev(rhs, env)).abs().max() < 1e-12
 
@@ -387,8 +443,8 @@ def test_tighten_in():
     eg.run([TR_TIGHTEN_IN], eid)
     assert eg.rule_fires.get("tr_tighten_in", 0) >= 1
     assert eg.matches(
-        Op.make("matmul", Op.make("trace", "f", usize="DU"), "j"),
-        eid)
+        Op.make("matmul", Op.make("trace", "f", usize="DU"), "j"), eid
+    )
 
     eg2 = EGraph()
     eid2 = eg2.add_term(rhs)
@@ -399,6 +455,7 @@ def test_tighten_in():
 # ---------------------------------------------------------------------------
 #  Yanking — a crossover loop is the identity
 # ---------------------------------------------------------------------------
+
 
 def test_yank():
     d = 4
@@ -413,13 +470,17 @@ def test_yank():
     eg.run([TR_YANK], eid)
     assert eg.rule_fires.get("tr_yank", 0) >= 1
     best = eg.extract_best(eid, count_cost)
-    assert isinstance(best, Op) and best.op == "eye" \
+    assert (
+        isinstance(best, Op)
+        and best.op == "eye"
         and best.attrs["dim"] == d
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Closed form — iterative ↔ resolvent
 # ---------------------------------------------------------------------------
+
 
 def test_expand_reaches_closed_form():
     du, dx, dy = 3, 4, 2
@@ -430,6 +491,7 @@ def test_expand_reaches_closed_form():
     # the expanded resolvent term, built explicitly for numerics
     def blk(t, sizes, dim, idx):
         return Op.make("split", t, sizes=sizes, dim=dim, index=idx)
+
     rows_u = blk(Fv, (du, dy), -2, 0)
     rows_y = blk(Fv, (du, dy), -2, 1)
     S = blk(rows_u, (du, dx), -1, 0)
@@ -437,13 +499,20 @@ def test_expand_reaches_closed_form():
     Q = blk(rows_y, (du, dx), -1, 0)
     P = blk(rows_y, (du, dx), -1, 1)
     rhs = Op.make(
-        "add", P,
-        Op.make("matmul", Q,
-                Op.make("matmul",
-                        Op.make("inv",
-                                Op.make("sub",
-                                        Op.make("eye", dim=du), S)),
-                        R)))
+        "add",
+        P,
+        Op.make(
+            "matmul",
+            Q,
+            Op.make(
+                "matmul",
+                Op.make(
+                    "inv", Op.make("sub", Op.make("eye", dim=du), S)
+                ),
+                R,
+            ),
+        ),
+    )
     env = {"F": F}
     assert (_ev(lhs, env) - _ev(rhs, env)).abs().max() < 1e-12
 
@@ -462,19 +531,29 @@ def test_collapse_folds_closed_form_back():
 
     def blk(t, sizes, dim, idx):
         return Op.make("split", t, sizes=sizes, dim=dim, index=idx)
+
     rows_u = blk(Fv, (du, dy), -2, 0)
     rows_y = blk(Fv, (du, dy), -2, 1)
     closed = Op.make(
         "add",
         blk(rows_y, (du, dx), -1, 1),
-        Op.make("matmul",
-                blk(rows_y, (du, dx), -1, 0),
-                Op.make("matmul",
-                        Op.make("inv",
-                                Op.make("sub",
-                                        Op.make("eye", dim=du),
-                                        blk(rows_u, (du, dx), -1, 0))),
-                        blk(rows_u, (du, dx), -1, 1))))
+        Op.make(
+            "matmul",
+            blk(rows_y, (du, dx), -1, 0),
+            Op.make(
+                "matmul",
+                Op.make(
+                    "inv",
+                    Op.make(
+                        "sub",
+                        Op.make("eye", dim=du),
+                        blk(rows_u, (du, dx), -1, 0),
+                    ),
+                ),
+                blk(rows_u, (du, dx), -1, 1),
+            ),
+        ),
+    )
     eg = EGraph()
     eid = eg.add_term(closed)
     eg.run([TR_COLLAPSE], eid)
@@ -485,6 +564,7 @@ def test_collapse_folds_closed_form_back():
 # ---------------------------------------------------------------------------
 #  Payoff: the recurrence h_t = A·h_{t−1} + B·x_t is a trace
 # ---------------------------------------------------------------------------
+
 
 def test_recurrence_is_trace_and_matches_aff_carrier():
     """The payoff: h_t = A·h_{t−1} + B·x_t as a trace equals both the
@@ -501,19 +581,19 @@ def test_recurrence_is_trace_and_matches_aff_carrier():
     F = torch.zeros(du + T * d, du + n_in)
     # S = Z·A_blk (block t, t−1), nilpotent ⇒ fixpoint = finite unroll
     for t in range(1, T):
-        F[t * d:(t + 1) * d, (t - 1) * d:t * d] = A
+        F[t * d : (t + 1) * d, (t - 1) * d : t * d] = A
     # R : [x_1..x_T; h0] → [u'_1..u'_T]
     for t in range(T):
-        F[t * d:(t + 1) * d, du + t * dx:du + (t + 1) * dx] = B
-    F[0:d, du + T * dx:du + T * dx + d] = A          # h0 → u'_1
+        F[t * d : (t + 1) * d, du + t * dx : du + (t + 1) * dx] = B
+    F[0:d, du + T * dx : du + T * dx + d] = A  # h0 → u'_1
     # Q = I (u → y), P = 0
-    F[du:du + T * d, :du] = torch.eye(T * d)
+    F[du : du + T * d, :du] = torch.eye(T * d)
 
     Fv = _var("F", F.shape)
     tr_term = Op.make("trace", Fv, usize=du)
-    tr_val = _ev(tr_term, {"F": F})                # (T·d) × (T·dx + d)
+    tr_val = _ev(tr_term, {"F": F})  # (T·d) × (T·dx + d)
     vec = torch.cat([X.reshape(-1), h0])
-    got = tr_val @ vec                              # h_1..h_T
+    got = tr_val @ vec  # h_1..h_T
 
     # 1) the unrolled loop
     h = h0.clone()
@@ -546,13 +626,15 @@ def test_trace_laws_are_shape_checked():
     u-block (du×du); an h of the wrong size is vetoed by the check."""
     du, dx, dy = 2, 3, 2
     G = _mkf(du, dx, dy, seed=130)
-    H_bad = _rand(131, dx, dx) * 0.5   # dx×dx, not du×du — wrong wire
+    H_bad = _rand(131, dx, dx) * 0.5  # dx×dx, not du×du — wrong wire
     Gv, Hv = _var("G", G.shape), _var("H", H_bad.shape)
     bad = Op.make(
         "trace",
-        Op.make("matmul", Gv,
-                Op.make("bdiag", Hv, Op.make("eye", dim=dx))),
-        usize=du)
+        Op.make(
+            "matmul", Gv, Op.make("bdiag", Hv, Op.make("eye", dim=dx))
+        ),
+        usize=du,
+    )
     # bdiag(dx×dx, I_dx) is (2dx)×(2dx) = 6×6 ≠ (du+dx)×(du+dx) = 5×5
     # for du≠dx — matmul is already ill-typed; check vetoes.
     eg = EGraph()
@@ -570,12 +652,12 @@ def test_trace_laws_collection_runs_together():
     term = Op.make("trace", Fv, usize=(du, dv))
     eg = EGraph()
     eid = eg.add_term(term)
-    stats = eg.run(TRACE_LAWS, eid, max_iterations=10,
-                   max_nodes=20_000)
+    stats = eg.run(TRACE_LAWS, eid, max_iterations=10, max_nodes=20_000)
     assert stats["n_enodes"] < 20_000
     # split form reachable
     assert eg.matches(
-        Op.make("trace", Op.make("trace", "f", usize="DU"),
-                usize="DV"), eid)
+        Op.make("trace", Op.make("trace", "f", usize="DU"), usize="DV"),
+        eid,
+    )
     # closed form reachable
     assert any(n.op == "inv" for n in _all_nodes(eg))

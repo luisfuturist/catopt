@@ -44,3 +44,4 @@ checkpoints/
 Thumbs.db
 .~lock.*#
 project/
+.venv/

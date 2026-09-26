@@ -48,27 +48,28 @@ from typing import Any
 
 import torch
 
-from catopt.ir import IR, Op, Param
-from catopt.torch_bridge import IRModule, _om_elem, _om_compose
 from catopt.cost import _shape_of
+from catopt.ir import IR, Op, Param
+from catopt.torch_bridge import IRModule, _om_compose, _om_elem
 
 __all__ = [
     "BatchedOMModule",
     "StreamingOMModule",
-    "to_batched_om_module",
-    "to_streaming_om_module",
-    "is_om_apply_term",
     "build_om_plan",
+    "is_om_apply_term",
+    "om_apply_state",
     "om_empty_state",
     "om_step",
     "om_step_qk",
-    "om_apply_state",
+    "to_batched_om_module",
+    "to_streaming_om_module",
 ]
 
 
 # ---------------------------------------------------------------------------
 #  Shape detection
 # ---------------------------------------------------------------------------
+
 
 def _is_om_tree(term: Any, memo: dict | None = None) -> bool:
     """True if ``term`` is a pure om carrier tree.
@@ -81,13 +82,13 @@ def _is_om_tree(term: Any, memo: dict | None = None) -> bool:
     key = id(term)
     if key in memo:
         return memo[key]
-    ok = (
-        isinstance(term, Op)
-        and (
-            (term.op == "om_elem" and len(term.args) == 2)
-            or (term.op == "om" and len(term.args) == 3)
-            or (term.op == "om_compose" and len(term.args) == 2
-                and all(_is_om_tree(a, memo) for a in term.args))
+    ok = isinstance(term, Op) and (
+        (term.op == "om_elem" and len(term.args) == 2)
+        or (term.op == "om" and len(term.args) == 3)
+        or (
+            term.op == "om_compose"
+            and len(term.args) == 2
+            and all(_is_om_tree(a, memo) for a in term.args)
         )
     )
     memo[key] = ok
@@ -105,8 +106,11 @@ def is_om_apply_term(root: Any) -> bool:
 
 
 def _concrete(shape: Any) -> bool:
-    return (isinstance(shape, tuple) and len(shape) > 0
-            and all(isinstance(d, int) for d in shape))
+    return (
+        isinstance(shape, tuple)
+        and len(shape) > 0
+        and all(isinstance(d, int) for d in shape)
+    )
 
 
 def _same_term(ts: list[Any]) -> bool:
@@ -114,8 +118,11 @@ def _same_term(ts: list[Any]) -> bool:
     t0 = ts[0]
     return all(
         t is t0
-        or (isinstance(t, Param) and isinstance(t0, Param)
-            and t.name == t0.name)
+        or (
+            isinstance(t, Param)
+            and isinstance(t0, Param)
+            and t.name == t0.name
+        )
         for t in ts[1:]
     )
 
@@ -123,6 +130,7 @@ def _same_term(ts: list[Any]) -> bool:
 # ---------------------------------------------------------------------------
 #  Operand gathers — recognise slices of a common base tensor
 # ---------------------------------------------------------------------------
+
 
 def _slice_index(term: Any):
     """Decompose ``select``/``getitem``/``chunk``/``split`` slice ops.
@@ -166,7 +174,9 @@ def _slice_index(term: Any):
             return (term.args[0], "chunk", dim, idx, n, None)
         sizes = a.get("sizes")
         if isinstance(sizes, (list, tuple)) and sizes:
-            part = sizes[0] if all(s == sizes[0] for s in sizes) else None
+            part = (
+                sizes[0] if all(s == sizes[0] for s in sizes) else None
+            )
             return (term.args[0], "chunk", dim, idx, len(sizes), part)
         return None
     return None
@@ -194,7 +204,9 @@ def _sliced_gather(parts: list) -> tuple | None:
             return None
         if idx != i:
             return None
-        if kind == "chunk" and (n != n0 or part is None or part != part0):
+        if kind == "chunk" and (
+            n != n0 or part is None or part != part0
+        ):
             return None
     if kind0 == "select":
         n = bshape[dim0n]
@@ -213,12 +225,18 @@ def _qk_parts(term: Any):
     check MATMUL_T_CONCAT performs — a partial transpose would scatter
     the key axis elsewhere).
     """
-    if not (isinstance(term, Op) and term.op == "matmul"
-            and len(term.args) == 2):
+    if not (
+        isinstance(term, Op)
+        and term.op == "matmul"
+        and len(term.args) == 2
+    ):
         return None
     tr = term.args[1]
-    if not (isinstance(tr, Op) and tr.op == "transpose"
-            and len(tr.args) == 1):
+    if not (
+        isinstance(tr, Op)
+        and tr.op == "transpose"
+        and len(tr.args) == 1
+    ):
         return None
     d0 = tr.attrs.get("arg1", tr.attrs.get("dim0"))
     d1 = tr.attrs.get("arg2", tr.attrs.get("dim1"))
@@ -237,6 +255,7 @@ def _qk_parts(term: Any):
 # ---------------------------------------------------------------------------
 #  The plan
 # ---------------------------------------------------------------------------
+
 
 def _analyze_elem_group(members: list[Op]) -> dict:
     """Decide how a uniform-shape group of ``om_elem`` leaves evaluates.
@@ -260,27 +279,31 @@ def _analyze_elem_group(members: list[Op]) -> dict:
     s_terms = [leaf.args[0] for leaf in members]
     v_terms = [leaf.args[1] for leaf in members]
 
-    grp["v_gather"] = _sliced_gather(
-        [_slice_index(t) for t in v_terms])
+    grp["v_gather"] = _sliced_gather([_slice_index(t) for t in v_terms])
 
     qks = [_qk_parts(t) for t in s_terms]
     if all(p is not None for p in qks) and _same_term(
-            [p[0] for p in qks]):
+        [p[0] for p in qks]
+    ):
         grp["q"] = qks[0][0]
         k_terms = [p[1] for p in qks]
         kg = _sliced_gather([_slice_index(t) for t in k_terms])
-        if (kg is not None and kg[1] == "chunk"):
+        if kg is not None and kg[1] == "chunk":
             # slices along the KEY axis (dim -2 of k) ⇒ concat of the
             # k_i rebuilds K on -2 ⇒ s_i are column chunks of q @ K.T.
             bshape = _shape_of(kg[0])
-            if _concrete(bshape) and kg[2] % len(bshape) == len(bshape) - 2:
+            if (
+                _concrete(bshape)
+                and kg[2] % len(bshape) == len(bshape) - 2
+            ):
                 grp["s_mode"] = "dense_qk"
                 grp["k_base"] = kg[0]
                 grp["k_gather"] = kg
                 return grp
         k_shapes = [_shape_of(t) for t in k_terms]
-        if (_concrete(k_shapes[0])
-                and all(s == k_shapes[0] for s in k_shapes)):
+        if _concrete(k_shapes[0]) and all(
+            s == k_shapes[0] for s in k_shapes
+        ):
             grp["s_mode"] = "bmm_qk"
             grp["k_terms"] = k_terms
             grp["k_gather"] = kg
@@ -370,8 +393,11 @@ def build_om_plan(root: Any) -> dict | None:
         if leaf.op == "om_elem":
             ss = _shape_of(leaf.args[0])
             vs = _shape_of(leaf.args[1])
-            key = ("elem", ss, vs) if (_concrete(ss) and _concrete(vs)) \
+            key = (
+                ("elem", ss, vs)
+                if (_concrete(ss) and _concrete(vs))
                 else ("serial", id(leaf))
+            )
         else:
             key = ("serial", id(leaf))
         grp = by_key.get(key)
@@ -407,14 +433,20 @@ def build_om_plan(root: Any) -> dict | None:
             slot[id(t)] = next_slot
             next_slot += 1
 
-    return {"leaves": leaves, "leaf_groups": groups,
-            "levels": levels, "level_gather": level_gather,
-            "root_slot": slot[id(f_term)], "f": f_term}
+    return {
+        "leaves": leaves,
+        "leaf_groups": groups,
+        "levels": levels,
+        "level_gather": level_gather,
+        "root_slot": slot[id(f_term)],
+        "f": f_term,
+    }
 
 
 # ---------------------------------------------------------------------------
 #  The batched kernels
 # ---------------------------------------------------------------------------
+
 
 def _stretch(t: torch.Tensor, tail: torch.Size) -> torch.Tensor:
     """``t``: ``(n, *t_tail)`` → ``(n, *tail)`` broadcasting batch dims.
@@ -465,6 +497,7 @@ def _batched_compose(m1, l1, a1, m2, l2, a2):
 # ---------------------------------------------------------------------------
 #  The module
 # ---------------------------------------------------------------------------
+
 
 class BatchedOMModule(torch.nn.Module):
     """nn.Module that runs an ``om_apply(<om tree>)`` term level-batched.
@@ -526,8 +559,10 @@ class BatchedOMModule(torch.nn.Module):
         return self._graph is not None
 
     def capture_cuda_graph(
-        self, *example_inputs: torch.Tensor, warmup: int = 3,
-    ) -> "BatchedOMModule":
+        self,
+        *example_inputs: torch.Tensor,
+        warmup: int = 3,
+    ) -> BatchedOMModule:
         """Capture the batched forward into a CUDA graph.
 
         After capture, ``forward`` copies each input into static
@@ -555,7 +590,10 @@ class BatchedOMModule(torch.nn.Module):
         with torch.cuda.graph(g):
             out = self._forward_impl(*static_ins)
         self._graph, self._graph_inputs, self._graph_out = (
-            g, static_ins, out)
+            g,
+            static_ins,
+            out,
+        )
         return self
 
     def drop_cuda_graph(self) -> None:
@@ -564,7 +602,7 @@ class BatchedOMModule(torch.nn.Module):
         self._graph_inputs = []
         self._graph_out = None
 
-    def compile(self, **kwargs) -> "BatchedOMModule":
+    def compile(self, **kwargs) -> BatchedOMModule:
         """Compile the batched forward with ``torch.compile``.
 
         Inductor fuses the elem-level ``sub``/``exp``/``sum`` chain and
@@ -582,10 +620,16 @@ class BatchedOMModule(torch.nn.Module):
 
     def forward(self, *xs: torch.Tensor) -> torch.Tensor:
         g = self._graph
-        if (g is not None and len(xs) == len(self._graph_inputs)
-                and all(t.shape == b.shape and t.dtype == b.dtype
-                        and t.device == b.device
-                        for t, b in zip(xs, self._graph_inputs))):
+        if (
+            g is not None
+            and len(xs) == len(self._graph_inputs)
+            and all(
+                t.shape == b.shape
+                and t.dtype == b.dtype
+                and t.device == b.device
+                for t, b in zip(xs, self._graph_inputs)
+            )
+        ):
             for buf, t in zip(self._graph_inputs, xs):
                 buf.copy_(t, non_blocking=True)
             g.replay()
@@ -594,8 +638,13 @@ class BatchedOMModule(torch.nn.Module):
             return self._compiled(*xs)
         return self._forward_impl(*xs)
 
-    def _cached(self, key: tuple, like: torch.Tensor, make,
-                dtype: torch.dtype | None = None) -> torch.Tensor:
+    def _cached(
+        self,
+        key: tuple,
+        like: torch.Tensor,
+        make,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         """Device/dtype-aware tensor cache (index tensors)."""
         want = dtype or like.dtype
         t = self._const_cache.get(key)
@@ -609,10 +658,13 @@ class BatchedOMModule(torch.nn.Module):
         group's stacked leaves to their DAG multiplicities."""
         rep = [i for i, c in enumerate(counts) for _ in range(c)]
         return self._cached(
-            ("rep", tuple(counts)), like,
-            lambda t: torch.tensor(rep, dtype=torch.long,
-                                   device=t.device),
-            dtype=torch.long)
+            ("rep", tuple(counts)),
+            like,
+            lambda t: torch.tensor(
+                rep, dtype=torch.long, device=t.device
+            ),
+            dtype=torch.long,
+        )
 
     def _eval_sliced(self, info: tuple, ev) -> torch.Tensor:
         """Stack ``(n, *leaf_shape)`` from a common-base slice gather.
@@ -626,7 +678,7 @@ class BatchedOMModule(torch.nn.Module):
         d = dim % t.dim()
         if kind == "select":
             return t.movedim(d, 0)
-        t = t.reshape(*t.shape[:d], n, part, *t.shape[d + 1:])
+        t = t.reshape(*t.shape[:d], n, part, *t.shape[d + 1 :])
         return t.movedim(d, 0)
 
     def _stacked_scores(self, grp: dict, ev) -> torch.Tensor:
@@ -637,7 +689,7 @@ class BatchedOMModule(torch.nn.Module):
             # matrix once, then re-chunk the key axis by a view.
             q = ev(grp["q"])
             kb = ev(grp["k_base"])
-            s = q @ kb.transpose(-2, -1)          # (..., T, nK)
+            s = q @ kb.transpose(-2, -1)  # (..., T, nK)
             n = len(grp["members"])
             k = s.shape[-1] // n
             return s.reshape(*s.shape[:-1], n, k).movedim(-2, 0)
@@ -650,20 +702,22 @@ class BatchedOMModule(torch.nn.Module):
             q = ev(grp["q"])
             kg = grp.get("k_gather")
             if kg is not None:
-                k = self._eval_sliced(kg, ev)   # (n, ..., K, d)
+                k = self._eval_sliced(kg, ev)  # (n, ..., K, d)
             else:
                 k = torch.stack([ev(t) for t in grp["k_terms"]])
             # Normalise batch ranks (slot axis excluded): left-pad the
             # rank-poor side with 1s, then stretch mismatched dims —
             # einsum's ellipsis needs equal broadcast shapes.
-            gap = k.dim() - 1 - q.dim()          # len(kb) - len(qb)
+            gap = k.dim() - 1 - q.dim()  # len(kb) - len(qb)
             if gap > 0:
                 q = q.reshape(*((1,) * gap), *q.shape)
             elif gap < 0:
-                k = k.reshape(k.shape[0],
-                              *((1,) * (-gap)), *k.shape[1:])
+                k = k.reshape(
+                    k.shape[0], *((1,) * (-gap)), *k.shape[1:]
+                )
             bt = torch.broadcast_shapes(
-                tuple(q.shape[:-2]), tuple(k.shape[1:-2]))
+                tuple(q.shape[:-2]), tuple(k.shape[1:-2])
+            )
             if tuple(q.shape[:-2]) != bt:
                 q = q.expand(*bt, *q.shape[-2:])
             if tuple(k.shape[1:-2]) != bt:
@@ -672,7 +726,8 @@ class BatchedOMModule(torch.nn.Module):
         if mode == "slice":
             return self._eval_sliced(grp["s_gather"], ev)
         return torch.stack(
-            [ev(leaf.args[0]) for leaf in grp["members"]])
+            [ev(leaf.args[0]) for leaf in grp["members"]]
+        )
 
     def _stacked_values(self, grp: dict, ev) -> torch.Tensor:
         """All of a group's value operands as ``(n, ..., K, d)``."""
@@ -680,7 +735,8 @@ class BatchedOMModule(torch.nn.Module):
         if vg is not None:
             return self._eval_sliced(vg, ev)
         return torch.stack(
-            [ev(leaf.args[1]) for leaf in grp["members"]])
+            [ev(leaf.args[1]) for leaf in grp["members"]]
+        )
 
     def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
         if self._plan is None:
@@ -701,8 +757,8 @@ class BatchedOMModule(torch.nn.Module):
         a_parts: list[torch.Tensor] = []
         for grp in self._plan["leaf_groups"]:
             if grp["kind"] == "elem":
-                s = self._stacked_scores(grp, ev)   # (g,...,T,K)
-                v = self._stacked_values(grp, ev)   # (g,...,K,d)
+                s = self._stacked_scores(grp, ev)  # (g,...,T,K)
+                v = self._stacked_values(grp, ev)  # (g,...,K,d)
                 m, l, a = _batched_elem(s, v)
                 mults = grp["mults"]
                 if any(c != 1 for c in mults):
@@ -716,7 +772,7 @@ class BatchedOMModule(torch.nn.Module):
                 a_parts.append(a)
             else:
                 for leaf, c in zip(grp["members"], grp["mults"]):
-                    f = ev(leaf)                    # (m, l, a) triple
+                    f = ev(leaf)  # (m, l, a) triple
                     for _ in range(c):
                         m_parts.append(f[0].unsqueeze(0))
                         l_parts.append(f[1].unsqueeze(0))
@@ -727,17 +783,19 @@ class BatchedOMModule(torch.nn.Module):
         # along the slot axis — one contiguous tensor per component.
         # A single part skips the cat entirely (cat of one tensor is
         # still a full copy).
-        m_tail = torch.broadcast_shapes(
-            *[t.shape[1:] for t in m_parts])
-        l_tail = torch.broadcast_shapes(
-            *[t.shape[1:] for t in l_parts])
-        a_tail = torch.broadcast_shapes(
-            *[t.shape[1:] for t in a_parts])
+        m_tail = torch.broadcast_shapes(*[t.shape[1:] for t in m_parts])
+        l_tail = torch.broadcast_shapes(*[t.shape[1:] for t in l_parts])
+        a_tail = torch.broadcast_shapes(*[t.shape[1:] for t in a_parts])
 
         def _stack_parts(parts, tail):
-            if len(parts) == 1 and tuple(parts[0].shape[1:]) == tuple(tail):
-                return parts[0].contiguous() \
-                    if not parts[0].is_contiguous() else parts[0]
+            if len(parts) == 1 and tuple(parts[0].shape[1:]) == tuple(
+                tail
+            ):
+                return (
+                    parts[0].contiguous()
+                    if not parts[0].is_contiguous()
+                    else parts[0]
+                )
             return torch.cat([_stretch(t, tail) for t in parts])
 
         m_all = _stack_parts(m_parts, m_tail)
@@ -766,12 +824,17 @@ class BatchedOMModule(torch.nn.Module):
             n = m_all.shape[0]
             h = n // 2
             m_new, l_new, a_new = _batched_compose(
-                m_all[0:2 * h:2], l_all[0:2 * h:2], a_all[0:2 * h:2],
-                m_all[1:2 * h:2], l_all[1:2 * h:2], a_all[1:2 * h:2])
+                m_all[0 : 2 * h : 2],
+                l_all[0 : 2 * h : 2],
+                a_all[0 : 2 * h : 2],
+                m_all[1 : 2 * h : 2],
+                l_all[1 : 2 * h : 2],
+                a_all[1 : 2 * h : 2],
+            )
             if n % 2:
-                m_new = torch.cat([m_new, m_all[n - 1:]])
-                l_new = torch.cat([l_new, l_all[n - 1:]])
-                a_new = torch.cat([a_new, a_all[n - 1:]])
+                m_new = torch.cat([m_new, m_all[n - 1 :]])
+                l_new = torch.cat([l_new, l_all[n - 1 :]])
+                a_new = torch.cat([a_new, a_all[n - 1 :]])
             m_all, l_all, a_all = m_new, l_new, a_new
 
         # ---- Root apply: a / l (unclamped — NaN semantics kept) ------
@@ -806,8 +869,10 @@ def to_batched_om_module(
 # /tmp/bench_om_regime.py: flat ~89 MiB at 2M keys, where materialising
 # K,V or the score matrix is impossible).
 
+
 def om_empty_state(
-    shape: tuple, dv: int,
+    shape: tuple,
+    dv: int,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -818,15 +883,18 @@ def om_empty_state(
     ``a: (B,H,Tq,dv)``.  Composing it with any carrier returns that
     carrier, so a decode loop can start from it instead of ``None``.
     """
-    m = torch.full((*shape, 1), float("-inf"),
-                   device=device, dtype=dtype)
+    m = torch.full(
+        (*shape, 1), float("-inf"), device=device, dtype=dtype
+    )
     l = torch.zeros(*shape, 1, device=device, dtype=dtype)
     a = torch.zeros(*shape, dv, device=device, dtype=dtype)
     return (m, l, a)
 
 
 def om_step(
-    state: tuple | None, s: torch.Tensor, v: torch.Tensor,
+    state: tuple | None,
+    s: torch.Tensor,
+    v: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Incremental step: ``state ⊕ om_elem(s, v)`` in O(block) work.
 
@@ -842,7 +910,10 @@ def om_step(
 
 
 def om_step_qk(
-    state: tuple | None, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    state: tuple | None,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """om_step for the canonical ``s = q @ k.T`` score form."""
     return om_step(state, q @ k.transpose(-2, -1), v)
@@ -919,7 +990,8 @@ class StreamingOMModule(torch.nn.Module):
         return om_apply_state(self.forward_state(*xs))
 
     def forward_state(
-        self, *xs: torch.Tensor,
+        self,
+        *xs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Streaming fold → the raw ``(m, l, a)`` carrier.
 
@@ -948,7 +1020,9 @@ class StreamingOMModule(torch.nn.Module):
                 e = self.eval_mod._eval(leaf, env, x, memo)
                 # A DAG-shared leaf contributes once per occurrence.
                 for _ in range(c):
-                    state = e if state is None else _om_compose(state, e)
+                    state = (
+                        e if state is None else _om_compose(state, e)
+                    )
         return state
 
 

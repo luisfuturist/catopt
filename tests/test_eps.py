@@ -6,15 +6,20 @@ certificates aggregate the bound.  These tests pin the mechanics:
 the offer exists, it stores fewer values, the bound is real, and the
 executed member honours it.
 """
+
 import torch
 import torch.nn as nn
 
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, TensorType, op_repr
-from catopt.rules import all_rules
-from catopt.eps import (low_rank_params, kron_linear_params,
-                        low_rank_gather, quant_params)
 from catopt.cost import param_bytes_cost_for
+from catopt.egraph import EGraph
+from catopt.eps import (
+    kron_linear_params,
+    low_rank_gather,
+    low_rank_params,
+    quant_params,
+)
+from catopt.ir import IR, Op, TensorType, Var
+from catopt.rules import all_rules
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 
@@ -96,23 +101,25 @@ def test_eps_bound_certified_and_honoured():
         c0 = eg.any_term(eg.find(n.children[0]))
         if isinstance(c0, Op) and c0.op == "linear":
             chained = Op.make(
-                n.op, c0,
+                n.op,
+                c0,
                 *[eg.any_term(eg.find(c)) for c in n.children[1:]],
-                **dict(n.attrs))
+                **dict(n.attrs),
+            )
     assert chained is not None
 
     xv = Var("x", TensorType((4, 64)))
     mod = ir_to_torch_module(
         IR(root=Op.make("add", chained, xv), params={}, inputs=[xv]),
-        src)
+        src,
+    )
     with torch.no_grad():
         err = (mod(x) - m(x)).abs().max().item()
     x_norm = torch.linalg.norm(x, dim=-1).max().item()
     assert err <= o["bound"] * x_norm + 1e-9
 
     # certificate reports the accumulated bound
-    cert = eg.certificate(ir.root,
-                          Op.make("add", chained, xv))
+    cert = eg.certificate(ir.root, Op.make("add", chained, xv))
     assert cert.error_bound >= o["bound"]
     assert not cert.exact
     assert "eps_lr" in " ".join(cert.rules_used)
@@ -128,8 +135,9 @@ def _kron_model(seed=0):
             A = torch.randn(16, 16)
             B = torch.randn(4, 4)
             self.lin = nn.Linear(64, 64, bias=False)
-            self.lin.weight.data = torch.kron(A, B) \
-                + 0.02 * torch.randn(64, 64)
+            self.lin.weight.data = torch.kron(
+                A, B
+            ) + 0.02 * torch.randn(64, 64)
 
         def forward(self, x):
             return self.lin(x)
@@ -148,8 +156,7 @@ def test_kron_offer_executes_within_frobenius_bound():
     assert offers, "expected a Kronecker-sum offer"
     o = offers[0]
     assert o["stored"] < o["original"]
-    assert all(n.startswith("eps_k") for n in src
-               if "eps_" in n)
+    assert all(n.startswith("eps_k") for n in src if "eps_" in n)
 
     cand = None
     for n in eg.get_class(o["site_eid"]).nodes:
@@ -157,13 +164,13 @@ def test_kron_offer_executes_within_frobenius_bound():
             cand = Op.make(
                 n.op,
                 *[eg.any_term(eg.find(c)) for c in n.children],
-                **dict(n.attrs))
+                **dict(n.attrs),
+            )
             break
     assert cand is not None
 
     xv = Var("x", TensorType((3, 64)))
-    mod = ir_to_torch_module(
-        IR(root=cand, params={}, inputs=[xv]), src)
+    mod = ir_to_torch_module(IR(root=cand, params={}, inputs=[xv]), src)
     with torch.no_grad():
         err = (mod(x) - m(x)).abs().max().item()
     x_norm = torch.linalg.norm(x, dim=-1).max().item()
@@ -193,18 +200,19 @@ def test_quant_params_int8_certified():
     o = offers[0]
     assert o["bound"] > 0
 
-    term = eg.extract_best(root, param_bytes_cost_for(src,
-                                                    by_bytes=True))
+    term = eg.extract_best(
+        root, param_bytes_cost_for(src, by_bytes=True)
+    )
     xv = Var("x", TensorType((4, 64)))
-    mod = ir_to_torch_module(
-        IR(root=term, params={}, inputs=[xv]), src)
+    mod = ir_to_torch_module(IR(root=term, params={}, inputs=[xv]), src)
     with torch.no_grad():
         err = (mod(x) - m(x)).abs().max().item()
     assert err <= o["bound"] + 1e-9
     assert any(p.dtype == torch.int8 for p in mod.parameters())
-    assert (sum(t.numel() * t.element_size()
-                for t in mod.parameters())
-            < 64 * 64 * 8 / 2)  # int8 < fp64
+    assert (
+        sum(t.numel() * t.element_size() for t in mod.parameters())
+        < 64 * 64 * 8 / 2
+    )  # int8 < fp64
     cert = eg.certificate(ir.root, term, root_eid=root)
     assert cert.error_bound == o["bound"] and cert.replayable
     assert not cert.exact
@@ -214,6 +222,7 @@ def test_model_bound_propagates_through_graph():
     """eps.model_bound: site-local bounds × Lipschitz path
     sensitivities -> a finite whole-model certificate."""
     from catopt.eps import model_bound
+
     torch.manual_seed(0)
 
     class M(nn.Module):
@@ -233,17 +242,20 @@ def test_model_bound_propagates_through_graph():
     eg.run(all_rules(), root, max_iterations=2)
     offers = quant_params(eg, src, bits=8)
     assert len(offers) == 2
-    term = eg.extract_best(root, param_bytes_cost_for(src,
-                                                    by_bytes=True))
+    term = eg.extract_best(
+        root, param_bytes_cost_for(src, by_bytes=True)
+    )
     xv = Var("x", TensorType((4, 32)))
-    mod = ir_to_torch_module(
-        IR(root=term, params={}, inputs=[xv]), src)
+    mod = ir_to_torch_module(IR(root=term, params={}, inputs=[xv]), src)
     with torch.no_grad():
         err = (mod(x) - m(x)).abs().max().item()
     cert = eg.certificate(ir.root, term, root_eid=root)
-    mb = model_bound(term, cert, src,
-                     input_norm=torch.linalg.norm(x, dim=-1)
-                     .max().item())
+    mb = model_bound(
+        term,
+        cert,
+        src,
+        input_norm=torch.linalg.norm(x, dim=-1).max().item(),
+    )
     # finite, certified, and above the measured error
     assert mb["bound"] != float("inf")
     assert mb["bound"] >= err
@@ -254,6 +266,7 @@ def test_eps_families_compose():
     """The unifying claim: gather-low-rank + quantization + exact
     sharing coexist in one e-graph, one extraction, one certificate."""
     from catopt.eps import model_bound
+
     torch.manual_seed(0)
 
     class M(nn.Module):
@@ -279,15 +292,15 @@ def test_eps_families_compose():
     g = low_rank_gather(eg, src, rtol=0.05)
     q = quant_params(eg, src, bits=8)
     assert g and q
-    term = eg.extract_best(root, param_bytes_cost_for(src,
-                                                    by_bytes=True))
+    term = eg.extract_best(
+        root, param_bytes_cost_for(src, by_bytes=True)
+    )
     xv = Var("x", TensorType((8,)))
-    mod = ir_to_torch_module(
-        IR(root=term, params={}, inputs=[xv]), src)
+    mod = ir_to_torch_module(IR(root=term, params={}, inputs=[xv]), src)
     with torch.no_grad():
         err = (mod(idx) - m(idx)).abs().max().item()
     nb = sum(t.numel() * t.element_size() for t in mod.parameters())
-    assert nb < orig / 4                     # real compression
+    assert nb < orig / 4  # real compression
     cert = eg.certificate(ir.root, term, root_eid=root)
     assert cert.replayable and not cert.exact
     mb = model_bound(term, cert, src, input_norm=1.0)
@@ -299,21 +312,28 @@ def test_optimize_weight_program():
     the leaf, offers certified realizations, saturates them under the
     ordinary laws, and extracts the cheapest under storage cost."""
     from catopt.eps import optimize_weight
+    from catopt.ir import IR, TensorType, Var
     from catopt.torch_bridge import IRModule
-    from catopt.ir import IR, Var, TensorType
+
     torch.manual_seed(0)
-    W = (torch.randn(128, 6) @ torch.randn(6, 128)
-         + 0.01 * torch.randn(128, 128)).double()
+    W = (
+        torch.randn(128, 6) @ torch.randn(6, 128)
+        + 0.01 * torch.randn(128, 128)
+    ).double()
     res = optimize_weight("W", W, rtol=0.02)
-    assert res["offers"]                       # something was offered
-    assert res["bytes"] < res["orig_bytes"]    # storage shrank
+    assert res["offers"]  # something was offered
+    assert res["bytes"] < res["orig_bytes"]  # storage shrank
     cert = res["certificate"]
     assert cert.replayable
     # the extracted program *executes* and meets its bound
     mod = IRModule(
-        IR(root=res["term"], params={},
-           inputs=[Var("x", TensorType((1,)))]),
-        res["source_tensors"])
+        IR(
+            root=res["term"],
+            params={},
+            inputs=[Var("x", TensorType((1,)))],
+        ),
+        res["source_tensors"],
+    )
     with torch.no_grad():
         What = mod(torch.randn(1, dtype=torch.float64))
     err = float(torch.linalg.norm(What - W, 2))
@@ -372,13 +392,12 @@ def test_low_rank_gather_factors_embedding():
     for n in eg.get_class(o["site_eid"]).nodes:
         if n.op == "matmul":
             cand = Op.make(
-                n.op,
-                *[eg.any_term(eg.find(c)) for c in n.children])
+                n.op, *[eg.any_term(eg.find(c)) for c in n.children]
+            )
             break
     assert cand is not None
     xv = Var("x", TensorType((8,)))
-    mod = ir_to_torch_module(
-        IR(root=cand, params={}, inputs=[xv]), src)
+    mod = ir_to_torch_module(IR(root=cand, params={}, inputs=[xv]), src)
     with torch.no_grad():
         err = (mod(idx) - m(idx)).abs().max().item()
     # per-row spectral bound is conservative here

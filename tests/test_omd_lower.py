@@ -17,25 +17,28 @@ fp64-equivalent to both the eager model and the serial lowering.
 import pytest
 import torch
 
+from catopt.cost import flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.regime import default_rules
-from catopt.trace_lift import lift_scan_to_trace
-from catopt.xcarrier import (gather_applyd_stack, gather_apply_stack,
-                             omd_tree_lift)
-from catopt.cost import flops_cost
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt.omd_lower import (
     BatchedOmdModule,
     build_omd_plan,
     is_omd_apply_term,
     to_batched_omd_module,
 )
-
+from catopt.regime import default_rules
+from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt.trace_lift import lift_scan_to_trace
+from catopt.xcarrier import (
+    gather_apply_stack,
+    gather_applyd_stack,
+    omd_tree_lift,
+)
 
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
+
 
 def _P(name: str, shape) -> Param:
     return Param(name=name, typ=TensorType(tuple(shape)))
@@ -51,9 +54,11 @@ def _chain_maps(a_t: Param, xs, steps: int):
     affd_compose(aff_diag(a[i], x[i]), f_{i-1})`` — the shape
     gather_applyd_stack + extraction emit for an unrolled scan."""
     leaves = [
-        Op.make("aff_diag",
-                Op.make("select", a_t, arg1=0, arg2=t),
-                Op.make("select", xs, arg1=0, arg2=t))
+        Op.make(
+            "aff_diag",
+            Op.make("select", a_t, arg1=0, arg2=t),
+            Op.make("select", xs, arg1=0, arg2=t),
+        )
         for t in range(steps)
     ]
     fs = [leaves[0]]
@@ -64,10 +69,8 @@ def _chain_maps(a_t: Param, xs, steps: int):
 
 def _stacked_maps(fs):
     """``stack(affd_a f_i)`` / ``stack(affd_b f_i)`` coefficient terms."""
-    a_map = Op.make("stack",
-                    *(Op.make("affd_a", f) for f in fs), dim=0)
-    b_map = Op.make("stack",
-                    *(Op.make("affd_b", f) for f in fs), dim=0)
+    a_map = Op.make("stack", *(Op.make("affd_a", f) for f in fs), dim=0)
+    b_map = Op.make("stack", *(Op.make("affd_b", f) for f in fs), dim=0)
     return a_map, b_map
 
 
@@ -78,6 +81,7 @@ def _scan_attn_omd_term(T: int, D: int, seed: int = 0):
     non-local lifts (bounded — the full build_egraph re-saturation does
     not terminate quickly at T>=64).
     """
+
     class _ScanAttn(torch.nn.Module):
         def __init__(self, T, D):
             super().__init__()
@@ -102,10 +106,13 @@ def _scan_attn_omd_term(T: int, D: int, seed: int = 0):
     ir, src = export_to_ir(m, x)
     eg = EGraph()
     root = eg.add_term(ir.root)
-    eg.run(default_rules(), root, max_iterations=4,
-           max_nodes=200_000)
-    lifts = (lift_scan_to_trace(eg) + gather_applyd_stack(eg)
-             + gather_apply_stack(eg) + omd_tree_lift(eg))
+    eg.run(default_rules(), root, max_iterations=4, max_nodes=200_000)
+    lifts = (
+        lift_scan_to_trace(eg)
+        + gather_applyd_stack(eg)
+        + gather_apply_stack(eg)
+        + omd_tree_lift(eg)
+    )
     if lifts:
         eg.rebuild()
     rc = eg.find(root)
@@ -123,26 +130,37 @@ def _scan_attn_omd_term(T: int, D: int, seed: int = 0):
 #  Detection / plan structure
 # ---------------------------------------------------------------------------
 
+
 def test_is_omd_apply_term():
     Tq, K, d = 4, 5, 3
-    s, a, b, h = _P("s", (Tq, K)), _P("a", (K, d)), _P("b", (K, d)), \
-        _P("h", (d,))
+    s, a, b, h = (
+        _P("s", (Tq, K)),
+        _P("a", (K, d)),
+        _P("b", (K, d)),
+        _P("h", (d,)),
+    )
     good = Op.make("omd_apply", Op.make("omd_elem", s, a, b), h)
     assert is_omd_apply_term(good)
-    comp = Op.make("omd_compose",
-                   Op.make("omd_elem", s, a, b),
-                   Op.make("omd_elem", s, a, b))
+    comp = Op.make(
+        "omd_compose",
+        Op.make("omd_elem", s, a, b),
+        Op.make("omd_elem", s, a, b),
+    )
     assert is_omd_apply_term(Op.make("omd_apply", comp, h))
     # negatives
     assert not is_omd_apply_term(
-        Op.make("om_apply", Op.make("om_elem", s, a)))
+        Op.make("om_apply", Op.make("om_elem", s, a))
+    )
     assert not is_omd_apply_term(Op.make("matmul", s, a))
     assert not is_omd_apply_term(s)
     # foreign leaf in the tree
     assert not is_omd_apply_term(
-        Op.make("omd_apply",
-                Op.make("omd_compose", Op.make("omd_elem", s, a, b), s),
-                h))
+        Op.make(
+            "omd_apply",
+            Op.make("omd_compose", Op.make("omd_elem", s, a, b), s),
+            h,
+        )
+    )
 
 
 def test_plan_chain_mode_on_prefix_stacks():
@@ -152,8 +170,7 @@ def test_plan_chain_mode_on_prefix_stacks():
     s, h = _P("s", (Tq, T)), _P("h", (d,))
     fs = _chain_maps(a_p, x_v, T)
     a_map, b_map = _stacked_maps(fs)
-    term = Op.make("omd_apply",
-                   Op.make("omd_elem", s, a_map, b_map), h)
+    term = Op.make("omd_apply", Op.make("omd_elem", s, a_map, b_map), h)
     plan = build_omd_plan(term)
     assert plan is not None
     assert plan["map_mode"] == "chain"
@@ -171,27 +188,37 @@ def test_plan_forest_mode_on_disjoint_trees():
     a = [_P(f"a{i}", (d,)) for i in range(4)]
     b = [_P(f"b{i}", (d,)) for i in range(4)]
     # two independent compose trees over different leaf sets
-    t1 = Op.make("affd_compose", Op.make("aff_diag", a[1], b[1]),
-                 Op.make("aff_diag", a[0], b[0]))
-    t2 = Op.make("affd_compose", Op.make("aff_diag", a[3], b[3]),
-                 Op.make("aff_diag", a[2], b[2]))
-    a_map = Op.make("stack",
-                    Op.make("affd_a", t1), Op.make("affd_a", t2), dim=0)
-    b_map = Op.make("stack",
-                    Op.make("affd_b", t1), Op.make("affd_b", t2), dim=0)
+    t1 = Op.make(
+        "affd_compose",
+        Op.make("aff_diag", a[1], b[1]),
+        Op.make("aff_diag", a[0], b[0]),
+    )
+    t2 = Op.make(
+        "affd_compose",
+        Op.make("aff_diag", a[3], b[3]),
+        Op.make("aff_diag", a[2], b[2]),
+    )
+    a_map = Op.make(
+        "stack", Op.make("affd_a", t1), Op.make("affd_a", t2), dim=0
+    )
+    b_map = Op.make(
+        "stack", Op.make("affd_b", t1), Op.make("affd_b", t2), dim=0
+    )
     s, h = _P("s", (3, 2)), _P("h", (d,))
-    term = Op.make("omd_apply",
-                   Op.make("omd_elem", s, a_map, b_map), h)
+    term = Op.make("omd_apply", Op.make("omd_elem", s, a_map, b_map), h)
     plan = build_omd_plan(term)
     assert plan is not None
     assert plan["map_mode"] == "forest"
     assert len(plan["forest"]["diag"]["leaves"]) == 4
-    assert len(plan["forest"]["diag"]["gather"]) == 1  # one compose level
+    assert (
+        len(plan["forest"]["diag"]["gather"]) == 1
+    )  # one compose level
 
 
 # ---------------------------------------------------------------------------
 #  Numerical equivalence — hand-built terms
 # ---------------------------------------------------------------------------
+
 
 def _params_dict(*ps):
     return {p.name: p for p in ps}
@@ -207,13 +234,16 @@ def test_batched_matches_generic_single_elem():
 
     fs = _chain_maps(p_a, x_v, T)
     a_map, b_map = _stacked_maps(fs)
-    term = Op.make("omd_apply",
-                   Op.make("omd_elem", p_s, a_map, b_map), p_h)
-    ir = IR(root=term, inputs=[x_v],
-            params=_params_dict(p_a, p_h, p_s))
+    term = Op.make(
+        "omd_apply", Op.make("omd_elem", p_s, a_map, b_map), p_h
+    )
+    ir = IR(root=term, inputs=[x_v], params=_params_dict(p_a, p_h, p_s))
 
-    pv = {"p_a": _rand((T, d), 1), "p_h": _rand((d,), 2),
-          "p_s": _rand((Tq, T), 3)}
+    pv = {
+        "p_a": _rand((T, d), 1),
+        "p_h": _rand((d,), 2),
+        "p_s": _rand((Tq, T), 3),
+    }
     x = _rand((T, d), 4)
 
     gen = ir_to_torch_module(ir, pv).eval()
@@ -249,14 +279,24 @@ def test_batched_matches_generic_two_blocks():
     a_map, b_map = _stacked_maps(fs)
     term = Op.make(
         "omd_apply",
-        Op.make("omd_compose",
-                Op.make("omd_elem", p_s1, a_map, b_map),
-                Op.make("omd_elem", p_s2, a_map, b_map)),
-        p_h)
-    ir = IR(root=term, inputs=[x_v],
-            params=_params_dict(p_a, p_h, p_s1, p_s2))
-    pv = {"p_a": _rand((T, d), 10) * 0.3, "p_h": _rand((d,), 11),
-          "s1": _rand((Tq, T), 12), "s2": _rand((Tq, T), 13)}
+        Op.make(
+            "omd_compose",
+            Op.make("omd_elem", p_s1, a_map, b_map),
+            Op.make("omd_elem", p_s2, a_map, b_map),
+        ),
+        p_h,
+    )
+    ir = IR(
+        root=term,
+        inputs=[x_v],
+        params=_params_dict(p_a, p_h, p_s1, p_s2),
+    )
+    pv = {
+        "p_a": _rand((T, d), 10) * 0.3,
+        "p_h": _rand((d,), 11),
+        "s1": _rand((Tq, T), 12),
+        "s2": _rand((Tq, T), 13),
+    }
     x = _rand((T, d), 14)
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(ir, pv).eval()
@@ -279,19 +319,29 @@ def test_batched_masked_scores_match():
     a_map, b_map = _stacked_maps(fs)
     term = Op.make(
         "omd_apply",
-        Op.make("omd_compose",
-                Op.make("omd_elem", p_s1, a_map, b_map),
-                Op.make("omd_elem", p_s2, a_map, b_map)),
-        p_h)
-    ir = IR(root=term, inputs=[x_v],
-            params=_params_dict(p_a, p_h, p_s1, p_s2))
+        Op.make(
+            "omd_compose",
+            Op.make("omd_elem", p_s1, a_map, b_map),
+            Op.make("omd_elem", p_s2, a_map, b_map),
+        ),
+        p_h,
+    )
+    ir = IR(
+        root=term,
+        inputs=[x_v],
+        params=_params_dict(p_a, p_h, p_s1, p_s2),
+    )
     s1 = _rand((Tq, T), 20)
     s2 = _rand((Tq, T), 21)
-    s2[0, :] = float("-inf")          # row 0 live only in block 1
+    s2[0, :] = float("-inf")  # row 0 live only in block 1
     s1[1, :] = float("-inf")
-    s2[1, :] = float("-inf")          # row 1 fully masked → NaN
-    pv = {"p_a": _rand((T, d), 22) * 0.2, "p_h": _rand((d,), 23),
-          "s1": s1, "s2": s2}
+    s2[1, :] = float("-inf")  # row 1 fully masked → NaN
+    pv = {
+        "p_a": _rand((T, d), 22) * 0.2,
+        "p_h": _rand((d,), 23),
+        "s1": s1,
+        "s2": s2,
+    }
     x = _rand((T, d), 24)
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(ir, pv).eval()
@@ -299,8 +349,9 @@ def test_batched_masked_scores_match():
         o_gen, o_bat = gen(x), bat(x)
     assert bat.fallbacks == 0
     assert torch.isnan(o_gen[1]).all() and torch.isnan(o_bat[1]).all()
-    assert torch.allclose(o_gen, o_bat, atol=1e-12, rtol=1e-12,
-                          equal_nan=True)
+    assert torch.allclose(
+        o_gen, o_bat, atol=1e-12, rtol=1e-12, equal_nan=True
+    )
 
 
 def test_batched_dense_fiber_applym():
@@ -312,9 +363,11 @@ def test_batched_dense_fiber_applym():
     x_v = Var("x", TensorType((T, d)))
 
     leaves = [
-        Op.make("aff",
-                Op.make("select", p_A, arg1=0, arg2=t),
-                Op.make("select", x_v, arg1=0, arg2=t))
+        Op.make(
+            "aff",
+            Op.make("select", p_A, arg1=0, arg2=t),
+            Op.make("select", x_v, arg1=0, arg2=t),
+        )
         for t in range(T)
     ]
     fs = [leaves[0]]
@@ -322,12 +375,15 @@ def test_batched_dense_fiber_applym():
         fs.append(Op.make("aff_compose", leaves[t], fs[-1]))
     a_map = Op.make("stack", *(Op.make("aff_A", f) for f in fs), dim=0)
     b_map = Op.make("stack", *(Op.make("aff_b", f) for f in fs), dim=0)
-    term = Op.make("omd_applym",
-                   Op.make("omd_elem", p_s, a_map, b_map), p_h)
-    ir = IR(root=term, inputs=[x_v],
-            params=_params_dict(p_A, p_h, p_s))
-    pv = {"p_A": _rand((T, d, d), 30) * 0.2, "p_h": _rand((d,), 31),
-          "p_s": _rand((Tq, T), 32)}
+    term = Op.make(
+        "omd_applym", Op.make("omd_elem", p_s, a_map, b_map), p_h
+    )
+    ir = IR(root=term, inputs=[x_v], params=_params_dict(p_A, p_h, p_s))
+    pv = {
+        "p_A": _rand((T, d, d), 30) * 0.2,
+        "p_h": _rand((d,), 31),
+        "p_s": _rand((Tq, T), 32),
+    }
     x = _rand((T, d), 33)
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(ir, pv).eval()
@@ -346,22 +402,30 @@ def test_batched_forest_mode_equivalence():
     d = 4
     a = [_P(f"a{i}", (d,)) for i in range(4)]
     b = [_P(f"b{i}", (d,)) for i in range(4)]
-    t1 = Op.make("affd_compose", Op.make("aff_diag", a[1], b[1]),
-                 Op.make("aff_diag", a[0], b[0]))
-    t2 = Op.make("affd_compose", Op.make("aff_diag", a[3], b[3]),
-                 Op.make("aff_diag", a[2], b[2]))
-    a_map = Op.make("stack",
-                    Op.make("affd_a", t1), Op.make("affd_a", t2), dim=0)
-    b_map = Op.make("stack",
-                    Op.make("affd_b", t1), Op.make("affd_b", t2), dim=0)
+    t1 = Op.make(
+        "affd_compose",
+        Op.make("aff_diag", a[1], b[1]),
+        Op.make("aff_diag", a[0], b[0]),
+    )
+    t2 = Op.make(
+        "affd_compose",
+        Op.make("aff_diag", a[3], b[3]),
+        Op.make("aff_diag", a[2], b[2]),
+    )
+    a_map = Op.make(
+        "stack", Op.make("affd_a", t1), Op.make("affd_a", t2), dim=0
+    )
+    b_map = Op.make(
+        "stack", Op.make("affd_b", t1), Op.make("affd_b", t2), dim=0
+    )
     s, h = _P("s", (3, 2)), _P("h", (d,))
-    xv = Var("x", TensorType((1,)))   # dummy input so forward(*xs) works
-    term = Op.make("omd_apply",
-                   Op.make("omd_elem", s, a_map, b_map), h)
-    ir = IR(root=term, inputs=[xv],
-            params=_params_dict(s, h, *a, *b))
-    pv = {p.name: _rand(p.typ.shape, 40 + i)
-          for i, p in enumerate([s, h] + a + b)}
+    xv = Var("x", TensorType((1,)))  # dummy input so forward(*xs) works
+    term = Op.make("omd_apply", Op.make("omd_elem", s, a_map, b_map), h)
+    ir = IR(root=term, inputs=[xv], params=_params_dict(s, h, *a, *b))
+    pv = {
+        p.name: _rand(p.typ.shape, 40 + i)
+        for i, p in enumerate([s, h] + a + b)
+    }
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(ir, pv).eval()
     assert bat.is_batched and bat.map_mode == "forest"
@@ -381,13 +445,21 @@ def test_projection_inside_tensor_context():
     x_v = Var("x", TensorType((T, d)))
     fs = _chain_maps(p_a, x_v, T)
     a_map, b_map = _stacked_maps(fs)
-    a_map2 = Op.make("matmul", p_E, a_map)   # projection used inside matmul
-    term = Op.make("omd_apply",
-                   Op.make("omd_elem", p_s, a_map2, b_map), p_h)
-    ir = IR(root=term, inputs=[x_v],
-            params=_params_dict(p_a, p_h, p_s, p_E))
-    pv = {"p_a": _rand((T, d), 70) * 0.3, "p_h": _rand((d,), 71),
-          "p_s": _rand((Tq, T), 72), "p_E": _rand((T, T), 73)}
+    a_map2 = Op.make(
+        "matmul", p_E, a_map
+    )  # projection used inside matmul
+    term = Op.make(
+        "omd_apply", Op.make("omd_elem", p_s, a_map2, b_map), p_h
+    )
+    ir = IR(
+        root=term, inputs=[x_v], params=_params_dict(p_a, p_h, p_s, p_E)
+    )
+    pv = {
+        "p_a": _rand((T, d), 70) * 0.3,
+        "p_h": _rand((d,), 71),
+        "p_s": _rand((Tq, T), 72),
+        "p_E": _rand((T, T), 73),
+    }
     x = _rand((T, d), 74)
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(ir, pv).eval()
@@ -401,6 +473,7 @@ def test_projection_inside_tensor_context():
 # ---------------------------------------------------------------------------
 #  End-to-end: real extracted member, T = 16 / 64
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("T", [16, 64])
 def test_scanattn_omd_member_end_to_end(T):
@@ -426,9 +499,11 @@ def test_scanattn_omd_member_end_to_end(T):
 #  Fallback / determinism
 # ---------------------------------------------------------------------------
 
+
 def test_fallback_non_omd_root():
     """Non-omd IR: BatchedOmdModule delegates to serial evaluation."""
     from catopt.models import SwiGLU
+
     torch.manual_seed(0)
     m = SwiGLU(16, hidden_mult=2).eval()
     x = torch.randn(2, 3, 16)
@@ -437,7 +512,8 @@ def test_fallback_non_omd_root():
     assert isinstance(mod, BatchedOmdModule)
     assert not mod.is_batched
     ref = ir_to_torch_module(ir, param_values=src)
-    mod.eval(); ref.eval()
+    mod.eval()
+    ref.eval()
     with torch.no_grad():
         assert torch.equal(mod(x.clone()), ref(x.clone()))
         assert (m(x.clone()) - mod(x.clone())).abs().max().item() < 1e-6
@@ -448,13 +524,18 @@ def test_fallback_bare_compose_tree():
     serial eval returns the (m, l, fa, fb) tuple."""
     Tq, K, d = 3, 4, 5
     s, a, b = _P("s", (Tq, K)), _P("a", (K, d)), _P("b", (K, d))
-    t = Op.make("omd_compose",
-                Op.make("omd_elem", s, a, b),
-                Op.make("omd_elem", s, a, b))
+    t = Op.make(
+        "omd_compose",
+        Op.make("omd_elem", s, a, b),
+        Op.make("omd_elem", s, a, b),
+    )
     xv = Var("x", TensorType((1,)))
     ir = IR(root=t, inputs=[xv], params=_params_dict(s, a, b))
-    pv = {"s": _rand((Tq, K), 80), "a": _rand((K, d), 81),
-          "b": _rand((K, d), 82)}
+    pv = {
+        "s": _rand((Tq, K), 80),
+        "a": _rand((K, d), 81),
+        "b": _rand((K, d), 82),
+    }
     mod = to_batched_omd_module(ir, pv)
     assert not mod.is_batched
     with torch.no_grad():
@@ -470,12 +551,15 @@ def test_determinism():
     x_v = Var("x", TensorType((T, d)))
     fs = _chain_maps(p_a, x_v, T)
     a_map, b_map = _stacked_maps(fs)
-    term = Op.make("omd_apply",
-                   Op.make("omd_elem", p_s, a_map, b_map), p_h)
-    ir = IR(root=term, inputs=[x_v],
-            params=_params_dict(p_a, p_h, p_s))
-    pv = {"p_a": _rand((T, d), 90), "p_h": _rand((d,), 91),
-          "p_s": _rand((Tq, T), 92)}
+    term = Op.make(
+        "omd_apply", Op.make("omd_elem", p_s, a_map, b_map), p_h
+    )
+    ir = IR(root=term, inputs=[x_v], params=_params_dict(p_a, p_h, p_s))
+    pv = {
+        "p_a": _rand((T, d), 90),
+        "p_h": _rand((d,), 91),
+        "p_s": _rand((Tq, T), 92),
+    }
     x = _rand((T, d), 93)
     bat1 = to_batched_omd_module(ir, pv).eval()
     bat2 = to_batched_omd_module(ir, pv).eval()
@@ -489,14 +573,21 @@ def test_determinism():
 def test_omd_apply_term_accepting_bare_term():
     """to_batched_omd_module also accepts a bare term (wraps in IR)."""
     Tq, K, d = 2, 3, 4
-    s, a, b, h = _P("s", (Tq, K)), _P("a", (K, d)), _P("b", (K, d)), \
-        _P("h", (d,))
+    s, a, b, h = (
+        _P("s", (Tq, K)),
+        _P("a", (K, d)),
+        _P("b", (K, d)),
+        _P("h", (d,)),
+    )
     term = Op.make("omd_apply", Op.make("omd_elem", s, a, b), h)
     xv = Var("x", TensorType((1,)))
-    ir = IR(root=term, inputs=[xv],
-            params=_params_dict(s, a, b, h))
-    pv = {"s": _rand((Tq, K), 100), "a": _rand((K, d), 101),
-          "b": _rand((K, d), 102), "h": _rand((d,), 103)}
+    ir = IR(root=term, inputs=[xv], params=_params_dict(s, a, b, h))
+    pv = {
+        "s": _rand((Tq, K), 100),
+        "a": _rand((K, d), 101),
+        "b": _rand((K, d), 102),
+        "h": _rand((d,), 103),
+    }
     gen = ir_to_torch_module(ir, pv).eval()
     bat = to_batched_omd_module(term, pv).eval()
     assert bat.is_batched

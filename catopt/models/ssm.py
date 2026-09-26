@@ -54,8 +54,9 @@ class SelectiveSSM(nn.Module):
         steps:   sequence length T — the loop is unrolled at export time.
     """
 
-    def __init__(self, d_inner: int = 16, d_in: int = 16,
-                 steps: int = 16) -> None:
+    def __init__(
+        self, d_inner: int = 16, d_in: int = 16, steps: int = 16
+    ) -> None:
         super().__init__()
         self.A = nn.Parameter(torch.randn(d_inner, d_inner) * 0.05)
         self.delta_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -66,8 +67,8 @@ class SelectiveSSM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (T, d_in)
-        delta = torch.tanh(self.delta_proj(x))   # (T, d_inner), |Δ| < 1
-        B = self.B_proj(x)                       # (T, d_inner)
+        delta = torch.tanh(self.delta_proj(x))  # (T, d_inner), |Δ| < 1
+        B = self.B_proj(x)  # (T, d_inner)
         h = self.h0
         for t in range(self.steps):
             A_t = self.eye + delta[t].unsqueeze(-1) * self.A  # (d, d)
@@ -85,8 +86,9 @@ class DiagDenseSSM(nn.Module):
     reaches the same balanced scan as for :class:`SelectiveSSM`.
     """
 
-    def __init__(self, d_inner: int = 16, d_in: int = 16,
-                 steps: int = 16) -> None:
+    def __init__(
+        self, d_inner: int = 16, d_in: int = 16, steps: int = 16
+    ) -> None:
         super().__init__()
         self.decay_proj = nn.Linear(d_in, d_inner, bias=False)
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -95,7 +97,7 @@ class DiagDenseSSM(nn.Module):
         self.steps = steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = torch.sigmoid(self.decay_proj(x))    # (T, d_inner) in (0,1)
+        a = torch.sigmoid(self.decay_proj(x))  # (T, d_inner) in (0,1)
         B = self.B_proj(x)
         h = self.h0
         for t in range(self.steps):
@@ -114,8 +116,9 @@ class DiagonalSSM(nn.Module):
     This is the honest negative result for elementwise SSMs.
     """
 
-    def __init__(self, d_inner: int = 16, d_in: int = 16,
-                 steps: int = 16) -> None:
+    def __init__(
+        self, d_inner: int = 16, d_in: int = 16, steps: int = 16
+    ) -> None:
         super().__init__()
         self.decay_proj = nn.Linear(d_in, d_inner, bias=False)
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
