@@ -1,6 +1,23 @@
 # Plan 0005 — Cost-model fidelity vs measured latency
 
-Status: in progress
+Status: measured (bench landed) — fix identified, not yet implemented
+
+## Measured (RTX 2050 + CPU)
+
+- chain k=4 (win regime): rho 0.91-0.97 all cost fns, correct pick.
+- retnet T=128 (loss regime): rho -0.24 to -0.38 — INVERTED.
+  inductor pred 8/measured 1; canon_irmod pred 2-6/measured 9.
+- Root cause: term-level cost is blind to the lowering — same term
+  6-30x latency across executors (fused kernel vs per-leaf eval).
+  trace-carrier members hide linalg.solve (14.5s) under normal prices.
+- attn/swiglu frontier: 1 distinct member at T=128 (thin).
+
+## Named fix (next plan)
+
+Price (term, lowering) pairs — executor-aware cost terms:
+per-level launch count for batched carriers, per-leaf generic-eval
+dispatch for IRModule, fused-kernel discount for compiled lowering;
+hidden solver ops (linalg.solve) priced honestly.
 
 ## Hypothesis
 
