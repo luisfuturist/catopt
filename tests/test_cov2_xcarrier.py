@@ -781,14 +781,14 @@ def test_omd_split_guard_and_eval():
     assert meta._eval_allclose(_eval(t0, env), _eval(out, env), tol=1e-12)
 
 
-def test_omd_split_arg1_spelling():
+def test_omd_split_check_dim_spelling():
     bound = {
         "s1": _v("s1", 4, 3), "s2": _v("s2", 4, 5),
         "a1": _v("a1", 3, 4), "a2": _v("a2", 5, 4),
         "b1": _v("b1", 3, 4), "b2": _v("b2", 5, 4),
         "$attr:SD": -1, "$attr:AD": -2, "$attr:BD": -2,
     }
-    assert XC.XC_OMD_SPLIT_ARG1.check(bound)
+    assert XC.XC_OMD_SPLIT.check(bound)
 
 
 def test_matmul_applyd_rows_guard():
@@ -929,7 +929,7 @@ def test_transpose_apply_guard_and_derive():
     t0 = Op.make(
         "transpose",
         Op.make("apply", Op.make("aff", A, b), h),
-        arg1=0, arg2=1,
+        dim0=0, dim1=1,
     )
     _law(XC.XC_TRANSPOSE_APPLY, t0, env)
     # negative dims normalise mod value rank
@@ -990,7 +990,7 @@ def test_transpose_applyd_guard_and_derive():
     t0 = Op.make(
         "transpose",
         Op.make("applyd", Op.make("aff_diag", a, b), h),
-        arg1=0, arg2=1,
+        dim0=0, dim1=1,
     )
     _law(XC.XC_TRANSPOSE_APPLYD, t0, env)
     # contract fail / rank < 2 → line 1368
@@ -1042,8 +1042,8 @@ def test_transpose_apply_rev_dims():
         "apply",
         Op.make(
             "aff",
-            Op.make("transpose", A, arg1=0, arg2=1),
-            Op.make("transpose", b, arg1=0, arg2=1),
+            Op.make("transpose", A, dim0=0, dim1=1),
+            Op.make("transpose", b, dim0=0, dim1=1),
         ),
         h,
     )

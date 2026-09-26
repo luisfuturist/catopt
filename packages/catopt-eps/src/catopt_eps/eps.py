@@ -202,8 +202,8 @@ def optimize_weight(
                                 ),
                                 shape=(m1, n1, m2, n2),
                             ),
-                            arg1=1,
-                            arg2=2,
+                            dim0=1,
+                            dim1=2,
                         ),
                         shape=(o, i),
                     )
@@ -812,7 +812,7 @@ def _kron_member(eg, x_eid, terms, spec):
                 eg.add_enode(
                     "transpose",
                     (eg.add_term(B_t),),
-                    {"arg1": -2, "arg2": -1},
+                    {"dim0": -2, "dim1": -1},
                 ),
             ),
         )

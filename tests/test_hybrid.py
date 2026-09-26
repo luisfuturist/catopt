@@ -20,16 +20,12 @@ Findings encoded as tests (T=16, d=16 unless noted):
   ``linear(stack(applyd …))``.  No bespoke rule encodes this nesting;
   it falls out of metavariable binding.
 
-* **Exported-attr spelling gap (found, honest negative).**
-  torch.export spells ``cat``'s axis ``arg1=-2`` and ``chunk``'s dims
-  ``arg1/arg2``; the om rule family produces ``dim=``/``chunks=``/
-  ``dim=``.  On the RAW exported IR, ``matmul_t_concat`` is vetoed by
-  its shape check (the ``chunk`` mis-read makes k_i look (16,8)) and
-  ``om_split`` can never reunite (its LHS wants both concats in ONE
-  spelling, but rule-produced score concats are ``dim`` while exported
-  value concats are ``arg1``).  A spelling normalisation in the test
-  harness unblocks the whole chain — this is a bridge↔rules interface
-  bug a real pipeline would fix in the bridge.
+* **Exported-attr spelling gap (found, then fixed in the bridge).**
+  torch.export spells ``cat``'s axis and ``chunk``'s dims positionally;
+  the export boundary now canonicalises them to ``dim=``/``chunks=``
+  (``ATTR_SCHEMA``), so the om rule family and raw exports speak ONE
+  spelling.  ``_normalize_attrs`` is kept as a defensive identity; see
+  ``test_raw_export_fires_om_split`` for the raw-export check.
 
 * **Extraction does not mix carriers greedily.**  Under ``flops_cost``
   the scan returns to raw ``add(mul)`` steps (5d per lifted step vs 3d
@@ -76,15 +72,13 @@ from catopt.torch_bridge import export_to_ir, ir_to_torch_module
 
 
 def _normalize_attrs(term, memo=None):
-    """Unify exported positional attr spellings with the rule-side ones.
+    """Defensive identity over the term.
 
-    torch.export emits ``cat(ts, -2)`` as ``concat(arg1=-2)`` and
-    ``t.chunk(n, -2)`` as ``chunk(arg1=n, arg2=-2)``, while every
-    rule-produced concat/chunk uses ``dim=``/``chunks=``.  The om
-    homomorphism needs ONE spelling on both concat slots; the chunk
-    mis-spelling also breaks ``_shape_of`` (reads ``dim``), which is
-    what actually vetoes ``matmul_t_concat`` on raw exports.
-    Semantically a no-op — the torch bindings accept both spellings.
+    torch.export spells ``cat``'s axis and ``chunk``'s dims positionally,
+    but the export boundary canonicalises them to ``dim=``/``chunks=``
+    (``ATTR_SCHEMA``) — so exported terms already match the rule-side
+    spelling and this rebuild is a no-op.  Kept as the harness's
+    normalisation hook.
     """
     if memo is None:
         memo = {}
@@ -95,21 +89,7 @@ def _normalize_attrs(term, memo=None):
         memo[k] = term
         return term
     args = tuple(_normalize_attrs(a, memo) for a in term.args)
-    attrs = dict(term.attrs)
-    if term.op == "concat" and "dim" not in attrs and "arg1" in attrs:
-        attrs["dim"] = attrs.pop("arg1")
-    elif term.op == "chunk":
-        if "chunks" not in attrs and "arg1" in attrs:
-            attrs["chunks"] = attrs.pop("arg1")
-        if "dim" not in attrs and "arg2" in attrs:
-            attrs["dim"] = attrs.pop("arg2")
-    elif (
-        term.op == "split"
-        and "dim" not in attrs
-        and "arg2" in attrs
-    ):
-        attrs["dim"] = attrs.pop("arg2")
-    out = Op.make(term.op, *args, **attrs)
+    out = Op.make(term.op, *args, **dict(term.attrs))
     memo[k] = out
     return out
 
@@ -331,13 +311,13 @@ def test_om_elems_consume_scan_outputs():
 
 
 # ---------------------------------------------------------------------------
-#  (c) the attr-spelling gap — honest negative on RAW export
+#  (c) the attr-spelling gap — fixed at the export boundary
 # ---------------------------------------------------------------------------
 
 
 def test_raw_export_fires_om_split():
-    """The bridge now canonicalises exported positional spellings
-    (``concat(arg1=-2)`` → ``dim=``, ``chunk(arg1,arg2)`` →
+    """The bridge canonicalises exported positional spellings
+    (``cat``'s axis → ``dim=``, ``chunk``'s dims →
     ``chunks=``/``dim=``) at the boundary, so the om homomorphism
     fires on RAW exports — no test-side normalisation needed.
     (Was ``test_raw_export_blocks_om_split``: this used to be the
@@ -354,14 +334,8 @@ def test_raw_export_fires_om_split():
     # The whole om chain fires on the raw export now.
     assert eg.rule_fires.get("om_lift", 0) >= 1
     assert census["om_compose"] > 0
-    assert (
-        eg.rule_fires.get("om_split", 0)
-        + eg.rule_fires.get("om_split_arg1", 0)
-    ) > 0
-    assert (
-        eg.rule_fires.get("matmul_t_concat", 0)
-        + eg.rule_fires.get("matmul_t_concat_arg1", 0)
-    ) > 0
+    assert eg.rule_fires.get("om_split", 0) > 0
+    assert eg.rule_fires.get("matmul_t_concat", 0) > 0
 
 
 # ---------------------------------------------------------------------------

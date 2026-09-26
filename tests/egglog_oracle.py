@@ -209,8 +209,8 @@ def build_program(term: Any) -> Term:
         if op == "relu":
             return relu(args[0])
         if op == "transpose":
-            a1 = int(term.attrs.get("arg1", -2))
-            a2 = int(term.attrs.get("arg2", -1))
+            a1 = int(term.attrs.get("dim0", -2))
+            a2 = int(term.attrs.get("dim1", -1))
             return transpose(args[0], a1, a2)
     raise ValueError(f"cannot translate term: {op_repr(term)}")
 
@@ -240,7 +240,7 @@ _BUILDERS: dict[str, Callable[[list, dict], Any]] = {
     "linear_b": lambda a, env: Op.make("linear", a[0], a[1], a[2]),
     "relu": lambda a, env: Op.make("relu", a[0]),
     "transpose": lambda a, env: Op.make(
-        "transpose", a[0], arg1=a[1], arg2=a[2]
+        "transpose", a[0], dim0=a[1], dim1=a[2]
     ),
 }
 
@@ -476,8 +476,8 @@ class EgglogEngine:
         attrs: dict[str, Any] = {}
         if name == "transpose":
             attrs = {
-                "arg1": _from_decl(inner.args[1], self.env),
-                "arg2": _from_decl(inner.args[2], self.env),
+                "dim0": _from_decl(inner.args[1], self.env),
+                "dim1": _from_decl(inner.args[2], self.env),
             }
         node = Op.make(op_name, *args, **attrs)
         param_only = all(c.param_only for c in children_costs)
@@ -647,7 +647,7 @@ def evaluate(
         if op == "transpose":
             return np.swapaxes(
                 a[0],
-                int(term.attrs.get("arg1", -2)),
-                int(term.attrs.get("arg2", -1)),
+                int(term.attrs.get("dim0", -2)),
+                int(term.attrs.get("dim1", -1)),
             )
     raise ValueError(f"cannot evaluate {term!r}")

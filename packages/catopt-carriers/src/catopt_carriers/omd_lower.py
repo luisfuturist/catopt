@@ -92,7 +92,7 @@ _OMD_LEAF_OPS = ("omd_elem", "omd")
 
 
 def _stack_dim(attrs: dict) -> int:
-    d = attrs.get("dim", attrs.get("arg1", 0))
+    d = attrs.get("dim", 0)
     return d if isinstance(d, int) else 0
 
 
@@ -105,14 +105,14 @@ def _select_index(term: Any):
     ):
         return None
     if term.op == "getitem":
-        # t[i] — arg1/index IS the index; always dim 0 (matches
+        # t[i] — index IS the index; always dim 0 (matches
         # scan_lower._select_index and the torch_bridge binding).
-        idx = term.attrs.get("arg1", term.attrs.get("index"))
+        idx = term.attrs.get("index")
         if not isinstance(idx, int):
             return None
         return (term.args[0], 0, idx)
-    dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
-    idx = term.attrs.get("arg2", term.attrs.get("index"))
+    dim = term.attrs.get("dim", 0)
+    idx = term.attrs.get("index")
     if not isinstance(dim, int) or not isinstance(idx, int):
         return None
     return (term.args[0], dim, idx)

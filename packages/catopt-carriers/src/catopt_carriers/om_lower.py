@@ -152,24 +152,24 @@ def _slice_index(term: Any):
         return None
     a = term.attrs
     if term.op == "select":
-        dim = a.get("arg1", a.get("dim"))
-        idx = a.get("arg2", a.get("index"))
+        dim = a.get("dim")
+        idx = a.get("index")
         if isinstance(dim, int) and isinstance(idx, int):
             return (term.args[0], "select", dim, idx, None, None)
         return None
     if term.op == "getitem":
         # t[i] — always indexes dim 0 (see torch_bridge binding).
-        idx = a.get("arg1", a.get("index"))
+        idx = a.get("index")
         if isinstance(idx, int):
             return (term.args[0], "select", 0, idx, None, None)
         return None
     if term.op in ("chunk", "split"):
-        dim = a.get("arg2", a.get("dim"))
-        idx = a.get("index", a.get("arg3", 0))
+        dim = a.get("dim")
+        idx = a.get("index", 0)
         if not isinstance(dim, int) or not isinstance(idx, int):
             return None
         if term.op == "chunk":
-            n = a.get("arg1", a.get("chunks"))
+            n = a.get("chunks")
             if not isinstance(n, int):
                 return None
             base_shape = _shape_of(term.args[0])
@@ -244,8 +244,8 @@ def _qk_parts(term: Any):
         and len(tr.args) == 1
     ):
         return None
-    d0 = tr.attrs.get("arg1", tr.attrs.get("dim0"))
-    d1 = tr.attrs.get("arg2", tr.attrs.get("dim1"))
+    d0 = tr.attrs.get("dim0")
+    d1 = tr.attrs.get("dim1")
     if not (isinstance(d0, int) and isinstance(d1, int)):
         return None
     ks = _shape_of(tr.args[0])

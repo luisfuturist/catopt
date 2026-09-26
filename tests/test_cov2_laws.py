@@ -296,18 +296,18 @@ def test_gqa_absorb_real_firing_and_veto():
                 "reshape",
                 Op.make(
                     "expand",
-                    Op.make("unsqueeze", t, arg1=3),
+                    Op.make("unsqueeze", t, dim=3),
                     shape=(1, 4, 2, 4, 3),
                 ),
                 shape=(1, 4, 8, 3),
             ),
-            arg1=1,
-            arg2=2,
+            dim0=1,
+            dim1=2,
         )
 
     term = Op.make(
         "sdpa",
-        Op.make("transpose", q, arg1=1, arg2=2),
+        Op.make("transpose", q, dim0=1, dim1=2),
         rep(k),
         rep(v),
         arg4=0.0,
@@ -324,7 +324,7 @@ def test_gqa_absorb_real_firing_and_veto():
     # q with 7 heads (2 kv * 4 = 8 required) → the check vetoes.
     bad = Op.make(
         "sdpa",
-        Op.make("transpose", _p("qb", 1, 4, 7, 3), arg1=1, arg2=2),
+        Op.make("transpose", _p("qb", 1, 4, 7, 3), dim0=1, dim1=2),
         rep(k),
         rep(v),
         arg4=0.0,
@@ -406,7 +406,7 @@ def test_head_and_repeat_template_terms():
     """The shared pattern builders mint the expected structure."""
     t = _head("w")
     assert t.op == "transpose" and t.args[0].op == "reshape"
-    assert dict(t.attrs) == {"arg1": 1, "arg2": 2}
+    assert dict(t.attrs) == {"dim0": 1, "dim1": 2}
     assert dict(t.args[0].attrs) == {"shape": "S"}
     tv = _head_v("w", "S9")
     assert dict(tv.args[0].attrs) == {"shape": "S9"}

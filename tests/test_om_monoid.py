@@ -32,7 +32,6 @@ from catopt.om import (
     MATMUL_T_CONCAT,
     OM_LAWS,
     OM_SPLIT,
-    OM_SPLIT_ARG1,
 )
 from catopt.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
 
@@ -65,9 +64,9 @@ def _dense_chunked_term(q, ks, vs):
     kcat = _nested_cat(ks, -2)
     vcat = _nested_cat(vs, -2)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", kcat, dim0=-2, dim1=-1)
     )
-    return Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
+    return Op.make("matmul", Op.make("softmax", scores, dim=-1), vcat)
 
 
 def _dense_chunked_ref(q, ks, vs):
@@ -433,7 +432,7 @@ def test_om_split_rejects_wrong_score_axis():
     )
     eg = EGraph()
     root = eg.add_term(t)
-    eg.run([OM_SPLIT, OM_SPLIT_ARG1], root, max_iterations=5)
+    eg.run([OM_SPLIT], root, max_iterations=5)
     assert _n_enodes_with_op(eg, "om_compose") == 0
 
 
@@ -450,7 +449,7 @@ def test_om_split_rejects_wrong_value_axis():
     )
     eg = EGraph()
     root = eg.add_term(t)
-    eg.run([OM_SPLIT, OM_SPLIT_ARG1], root, max_iterations=5)
+    eg.run([OM_SPLIT], root, max_iterations=5)
     assert _n_enodes_with_op(eg, "om_compose") == 0
 
 
@@ -468,7 +467,7 @@ def test_om_split_rejects_incompatible_chunks():
     )
     eg = EGraph()
     root = eg.add_term(t)
-    eg.run([OM_SPLIT, OM_SPLIT_ARG1], root, max_iterations=5)
+    eg.run([OM_SPLIT], root, max_iterations=5)
     assert _n_enodes_with_op(eg, "om_compose") == 0
 
 
@@ -484,8 +483,8 @@ def test_matmul_t_concat_rejects_feature_axis():
         Op.make(
             "transpose",
             Op.make("concat", k1, k2, dim=-1),
-            arg1=-2,
-            arg2=-1,
+            dim0=-2,
+            dim1=-1,
         ),
     )
     eg = EGraph()
@@ -514,8 +513,8 @@ def test_matmul_t_concat_rejects_partial_transpose():
         Op.make(
             "transpose",
             Op.make("concat", k1, k2, dim=-2),
-            arg1=0,
-            arg2=-1,
+            dim0=0,
+            dim1=-1,
         ),
     )
     eg = EGraph()
@@ -587,9 +586,9 @@ def test_concat_binarize_feeds_om_split():
     kcat = Op.make("concat", *ks, dim=-2)  # one n-ary concat
     vcat = Op.make("concat", *vs, dim=-2)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", kcat, dim0=-2, dim1=-1)
     )
-    term = Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
+    term = Op.make("matmul", Op.make("softmax", scores, dim=-1), vcat)
 
     eg, root, _ = _run_om(term)
     chunked = [

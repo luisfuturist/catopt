@@ -18,7 +18,7 @@ splits the carrier.
 Covered here:
 
 * the law fires on both flag spellings — kwarg ``is_causal=True`` and
-  torch.export's positional ``arg4=0.0, arg5=True`` — and on the
+  the positional ``arg4=0.0, arg5=True`` form — and on the
   unmasked companion;
 * fp64-exact equivalence with ``F.scaled_dot_product_attention`` —
   even/uneven blocks, n-ary concats, batched heads, custom scale,
@@ -64,8 +64,7 @@ def _sdpa_cat_term(
     """sdpa(q, cat(k_i), cat(v_i), is_causal) as an IR term.
 
     ``spelling`` selects the flag encoding:
-      "export" — positional attrs: arg4=dropout_p, arg5=is_causal
-                 (what torch.export actually emits);
+      "export" — positional attrs: arg4=dropout_p, arg5=is_causal;
       "kwarg"  — is_causal=True / is_causal=False named attrs.
     """
     kcat = _nested_cat(ks, -2, attr_key)
@@ -226,13 +225,13 @@ def _causal_chunked_ok(
 
 
 # ---------------------------------------------------------------------------
-#  (a) the law fires — both flag spellings, both concat spellings
+#  (a) the law fires — both flag spellings, the canonical concat spelling
 # ---------------------------------------------------------------------------
 
 
 def test_causal_law_fires_export_spelling():
-    """sdpa(q, cat k, cat v, arg4=0.0, arg5=True) — the exact term
-    torch.export emits — gains the om_apply member."""
+    """sdpa(q, cat k, cat v, arg4=0.0, arg5=True) — the positional
+    flag form — gains the om_apply member."""
     q = Var("q", TensorType((5, 4)))
     ks = [
         Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
@@ -262,8 +261,8 @@ def test_causal_law_fires_kwarg_spelling():
     assert any(k.startswith("sdpa_cat_causal_") for k in eg.rule_fires)
 
 
-def test_causal_law_fires_arg1_concat_spelling():
-    """Concat dims spelled arg1= (raw positional) also match."""
+def test_causal_law_fires_dim_concat_spelling():
+    """Concat dims spelled with the canonical ``dim`` match."""
     q = Var("q", TensorType((5, 4)))
     ks = [
         Var(f"k{i}", TensorType((k, 4))) for i, k in enumerate((3, 6))
@@ -271,10 +270,10 @@ def test_causal_law_fires_arg1_concat_spelling():
     vs = [
         Var(f"v{i}", TensorType((k, 7))) for i, k in enumerate((3, 6))
     ]
-    term = _sdpa_cat_term(q, ks, vs, attr_key="arg1", spelling="export")
+    term = _sdpa_cat_term(q, ks, vs, attr_key="dim", spelling="export")
     eg, _root, _ = _run_om(term)
     assert any(
-        k.startswith("sdpa_cat_causal_") and k.endswith("arg1")
+        k.startswith("sdpa_cat_causal_") and k.endswith("dim")
         for k in eg.rule_fires
     )
 

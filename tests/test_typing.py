@@ -39,40 +39,40 @@ scalar = Const(1.0)
 
 #: (op term, expected shape) — one row per contract point.
 SHAPE_CASES = [
-    # --- slice incl. strided step (arg4) ----------------------------------
+    # --- slice incl. strided step -----------------------------------------
     pytest.param(
-        Op.make("slice", x234, arg1=2, arg2=0, arg3=None, arg4=1),
+        Op.make("slice", x234, dim=2, start=0, end=None, step=1),
         (2, 3, 4),
         id="slice/full-range",
     ),
     pytest.param(
-        Op.make("slice", x234, arg1=2, arg2=0, arg3=None, arg4=2),
+        Op.make("slice", x234, dim=2, start=0, end=None, step=2),
         (2, 3, 2),
         id="slice/strided-step2",
     ),
     pytest.param(
-        Op.make("slice", x234, arg1=2, arg2=1, arg3=4, arg4=2),
+        Op.make("slice", x234, dim=2, start=1, end=4, step=2),
         (2, 3, 2),
         id="slice/bounded-strided",
     ),
     pytest.param(
-        Op.make("slice", x234, dim=1, arg2=0, arg3=2, arg4=1),
+        Op.make("slice", x234, dim=1, start=0, end=2, step=1),
         (2, 2, 4),
         id="slice/dim-attr-spelling",
     ),
-    # --- split: both attr spellings + section index -----------------------
+    # --- split: sizes/index + section index -------------------------------
     pytest.param(
         Op.make("split", vec8, sizes=(3, 5), index=1, dim=0),
         (5,),
         id="split/sizes-index-spelling",
     ),
     pytest.param(
-        Op.make("split", vec8, arg1=(3, 5), arg3=0, dim=0),
+        Op.make("split", vec8, sizes=(3, 5), index=0, dim=0),
         (3,),
-        id="split/arg1-arg3-spelling",
+        id="split/sizes-index-zero",
     ),
     pytest.param(
-        Op.make("split", vec8, arg1=4, arg3=1, dim=0),
+        Op.make("split", vec8, sizes=4, index=1, dim=0),
         (4,),
         id="split/equal-sections",
     ),
@@ -252,7 +252,7 @@ SHAPE_CASES = [
             Var("h", TensorType((4, 64))),
             Param("g", TensorType((64,))),
             dim=(64,),
-            arg3=1e-6,
+            eps=1e-6,
         ),
         (4, 64),
         id="rms_norm/dim-attr-passthrough",

@@ -92,9 +92,9 @@ def _chunked_attention(n_blocks=4, B=2, H=2, T=16, d=8, dv=8, seed=0):
     ]
     kcat, vcat = _nested_cat(ks, -2), _nested_cat(vs, -2)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", kcat, dim0=-2, dim1=-1)
     )
-    term = Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
+    term = Op.make("matmul", Op.make("softmax", scores, dim=-1), vcat)
     ir = IR(
         root=term,
         inputs=[q, Kv, Vv],

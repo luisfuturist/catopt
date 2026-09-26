@@ -159,7 +159,7 @@ def test_flop_helpers_match_formulas():
 
 def test_select_index_getitem_nonint_index():
     base = _v("b", 8, 4)
-    assert _select_index(Op.make("getitem", base, arg1=2)) == (
+    assert _select_index(Op.make("getitem", base, index=2)) == (
         base,
         0,
         2,
@@ -167,7 +167,7 @@ def test_select_index_getitem_nonint_index():
     # a non-integer index is not a leaf-select pattern
     assert (
         _select_index(
-            Op.make("getitem", base, arg1="x", validate=False)
+            Op.make("getitem", base, index="x", validate=False)
         )
         is None
     )
@@ -199,7 +199,7 @@ def test_scan_batched_leaf_gather_on_nonzero_dim():
         Op.make(
             "aff",
             _p(f"A{t}", d, d),
-            Op.make("select", x, arg1=1, arg2=t),
+            Op.make("select", x, dim=1, index=t),
         )
         for t in range(T)
     ]
@@ -229,7 +229,7 @@ def test_scan_capture_and_replay_edges(monkeypatch):
         Op.make(
             "aff_diag",
             _p("a", d),
-            Op.make("select", x, arg1=0, arg2=t),
+            Op.make("select", x, dim=0, index=t),
         )
         for t in range(T)
     ]
@@ -287,18 +287,18 @@ def test_slice_index_and_gather_rejections():
     # select/getitem/chunk with non-int position attrs are declined
     assert (
         _slice_index(
-            Op.make("select", b48, arg1="x", arg2=0, validate=False)
+            Op.make("select", b48, dim="x", index=0, validate=False)
         )
         is None
     )
     assert (
-        _slice_index(Op.make("getitem", b48, arg1="x", validate=False))
+        _slice_index(Op.make("getitem", b48, index="x", validate=False))
         is None
     )
     assert (
         _slice_index(
             Op.make(
-                "chunk", b48, arg1=3, arg2=1, index="x", validate=False
+                "chunk", b48, chunks=3, dim=1, index="x", validate=False
             )
         )
         is None
@@ -306,13 +306,13 @@ def test_slice_index_and_gather_rejections():
     assert (
         _slice_index(
             Op.make(
-                "chunk", b48, arg1="n", arg2=1, index=0, validate=False
+                "chunk", b48, chunks="n", dim=1, index=0, validate=False
             )
         )
         is None
     )
     # getitem resolves to a dim-0 select
-    assert _slice_index(Op.make("getitem", b48, arg1=2)) == (
+    assert _slice_index(Op.make("getitem", b48, index=2)) == (
         b48,
         "select",
         0,
@@ -322,63 +322,63 @@ def test_slice_index_and_gather_rejections():
     )
     # chunk on a non-concrete base → part size is unknown
     assert _slice_index(
-        Op.make("chunk", bnc, arg1=4, arg2=1, index=0)
+        Op.make("chunk", bnc, chunks=4, dim=1, index=0)
     ) == (bnc, "chunk", 1, 0, 4, None)
     # ...as is a chunk that doesn't divide the axis evenly
     assert _slice_index(
-        Op.make("chunk", b49, arg1=4, arg2=1, index=0)
+        Op.make("chunk", b49, chunks=4, dim=1, index=0)
     ) == (b49, "chunk", 1, 0, 4, None)
     # anything else isn't a slice
     assert _slice_index(Op.make("relu", b48)) is None
     assert _slice_index(b48) is None
     # split parts: equal sizes → known part; ragged → None
     assert _slice_index(
-        Op.make("split", b49, sizes=(3, 3, 3), arg2=1, index=1)
+        Op.make("split", b49, sizes=(3, 3, 3), dim=1, index=1)
     ) == (b49, "chunk", 1, 1, 3, 3)
     sp = _slice_index(
-        Op.make("split", b49, sizes=(3, 2, 4), arg2=1, index=2)
+        Op.make("split", b49, sizes=(3, 2, 4), dim=1, index=2)
     )
     assert sp is not None and sp[-1] is None
     assert (
         _slice_index(
-            Op.make("split", b49, arg2=1, index=0, validate=False)
+            Op.make("split", b49, dim=1, index=0, validate=False)
         )
         is None
     )
     # gathers over a symbolic base decline
     sym_parts = [
-        _slice_index(Op.make("select", bnc, arg1=0, arg2=i))
+        _slice_index(Op.make("select", bnc, dim=0, index=i))
         for i in range(2)
     ]
     assert _sliced_gather(sym_parts) is None
     # parts must share base, kind, and dim
     b48b = _v("b48b", 4, 8)
     mixed_base = [
-        _slice_index(Op.make("select", b48, arg1=0, arg2=0)),
-        _slice_index(Op.make("select", b48b, arg1=0, arg2=1)),
+        _slice_index(Op.make("select", b48, dim=0, index=0)),
+        _slice_index(Op.make("select", b48b, dim=0, index=1)),
     ]
     assert _sliced_gather(mixed_base) is None
     # ...and be the i-th slice in order
     out_of_order = [
-        _slice_index(Op.make("select", b48, arg1=0, arg2=0)),
-        _slice_index(Op.make("select", b48, arg1=0, arg2=2)),
+        _slice_index(Op.make("select", b48, dim=0, index=0)),
+        _slice_index(Op.make("select", b48, dim=0, index=2)),
     ]
     assert _sliced_gather(out_of_order) is None
     # select parts must cover the whole sliced axis
     partial = [
-        _slice_index(Op.make("select", b48, arg1=0, arg2=i))
+        _slice_index(Op.make("select", b48, dim=0, index=i))
         for i in range(2)
     ]
     assert _sliced_gather(partial) is None
     # chunk parts must share the divisor n
     mixed_n = [
-        _slice_index(Op.make("chunk", b48, arg1=4, arg2=1, index=0)),
-        _slice_index(Op.make("chunk", b48, arg1=2, arg2=1, index=1)),
+        _slice_index(Op.make("chunk", b48, chunks=4, dim=1, index=0)),
+        _slice_index(Op.make("chunk", b48, chunks=2, dim=1, index=1)),
     ]
     assert _sliced_gather(mixed_n) is None
     # ...and the number of parts must equal n (with real part sizes)
     short = [
-        _slice_index(Op.make("chunk", b49, arg1=3, arg2=1, index=i))
+        _slice_index(Op.make("chunk", b49, chunks=3, dim=1, index=i))
         for i in range(2)
     ]
     assert _sliced_gather(short) is None
@@ -395,7 +395,7 @@ def test_qk_parts_rejections():
                 "matmul",
                 q,
                 Op.make(
-                    "transpose", k, arg1="x", arg2=-1, validate=False
+                    "transpose", k, dim0="x", dim1=-1, validate=False
                 ),
             )
         )
@@ -407,7 +407,7 @@ def test_qk_parts_rejections():
             Op.make(
                 "matmul",
                 q,
-                Op.make("transpose", k, arg1=0, arg2=1),
+                Op.make("transpose", k, dim0=0, dim1=1),
             )
         )
         is None
@@ -420,7 +420,7 @@ def test_qk_parts_rejections():
             Op.make(
                 "matmul",
                 q,
-                Op.make("transpose", knc, arg1=0, arg2=1),
+                Op.make("transpose", knc, dim0=0, dim1=1),
             )
         )
         is None
@@ -429,7 +429,7 @@ def test_qk_parts_rejections():
         Op.make(
             "matmul",
             q,
-            Op.make("transpose", knc, arg1=-2, arg2=-1),
+            Op.make("transpose", knc, dim0=-2, dim1=-1),
         )
     ) == (q, knc)
 
@@ -447,9 +447,9 @@ def test_analyze_elem_group_modes():
                 q,
                 Op.make(
                     "transpose",
-                    Op.make("chunk", Kb, arg1=2, arg2=-1, index=i),
-                    arg1=-2,
-                    arg2=-1,
+                    Op.make("chunk", Kb, chunks=2, dim=-1, index=i),
+                    dim0=-2,
+                    dim1=-1,
                 ),
             ),
             vs[i],
@@ -467,7 +467,7 @@ def test_analyze_elem_group_modes():
                 "matmul",
                 q,
                 Op.make(
-                    "transpose", _v(f"k{i}", 2 + i, 8), arg1=-2, arg2=-1
+                    "transpose", _v(f"k{i}", 2 + i, 8), dim0=-2, dim1=-1
                 ),
             ),
             vs[i],
@@ -505,7 +505,7 @@ def _om_apply_ir(elems, inputs):
 def _qk_leaf(q, k, v):
     return Op.make(
         "om_elem",
-        Op.make("matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)),
+        Op.make("matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)),
         v,
     )
 
@@ -519,7 +519,7 @@ def test_om_batched_k_gather_on_nonkey_chunk_dim():
     vs = [_v(f"v{i}", 4, dv) for i in range(n)]
     elems = [
         _qk_leaf(
-            q, Op.make("chunk", Kb, arg1=n, arg2=-1, index=i), vs[i]
+            q, Op.make("chunk", Kb, chunks=n, dim=-1, index=i), vs[i]
         )
         for i in range(n)
     ]
@@ -589,7 +589,7 @@ def test_om_batched_select_v_gather():
     n, B, T, dv = 3, 2, 6, 4
     s, V = _v("s", B, T, 4), _v("V", n, B, 4, dv)
     elems = [
-        Op.make("om_elem", s, Op.make("select", V, arg1=0, arg2=i))
+        Op.make("om_elem", s, Op.make("select", V, dim=0, index=i))
         for i in range(n)
     ]
     ir = _om_apply_ir(elems, [s, V])
@@ -816,8 +816,8 @@ def _omd_chain(T, d, gather_dim=0, idxs=None, stack_dim=0):
     leaves = [
         Op.make(
             "aff_diag",
-            Op.make("select", a_p, arg1=gather_dim, arg2=i),
-            Op.make("select", x_v, arg1=gather_dim, arg2=i),
+            Op.make("select", a_p, dim=gather_dim, index=i),
+            Op.make("select", x_v, dim=gather_dim, index=i),
         )
         for i in idxs
     ]
@@ -828,7 +828,7 @@ def _omd_chain(T, d, gather_dim=0, idxs=None, stack_dim=0):
     def _stk(proj):
         node = Op.make("stack", *(proj(f) for f in fs), dim=stack_dim)
         if stack_dim:
-            node = Op.make("transpose", node, arg1=0, arg2=1)
+            node = Op.make("transpose", node, dim0=0, dim1=1)
         return node
 
     s_p = _p("s", 3, len(idxs))
@@ -1309,8 +1309,8 @@ def _spine(eg, h0, A, X, T):
     """``h_t = A[t] ⊙ h_{t-1} + X[t]`` built over select slices."""
     term, eid = h0, eg.add_term(h0)
     for t in range(T):
-        a_t = Op.make("select", A, arg1=0, arg2=t)
-        b_t = Op.make("select", X, arg1=0, arg2=t)
+        a_t = Op.make("select", A, dim=0, index=t)
+        b_t = Op.make("select", X, dim=0, index=t)
         term = Op.make("add", Op.make("mul", a_t, term), b_t)
         eid = eg.add_term(term)
     return eid
@@ -1387,7 +1387,7 @@ def test_spine_walk_edges():
     # — the dedup arm keeps the first, not a tie
     eg6 = EGraph()
     h6 = _p("h6", d)
-    sel = Op.make("select", _p("A6", 1, d), arg1=0, arg2=0)
+    sel = Op.make("select", _p("A6", 1, d), dim=0, index=0)
     i6 = _p("i6", d)
     n1 = eg6.add_enode(
         "add", (eg6.add_term(Op.make("mul", sel, h6)), eg6.add_term(i6))
@@ -1409,13 +1409,13 @@ def test_spine_shorter_alternative_candidate():
     A6, X6 = _p("A6", 2, d), _p("X6", 2, d)
     step_t = Op.make(
         "add",
-        Op.make("mul", Op.make("select", A6, arg1=0, arg2=0), h6),
-        Op.make("select", X6, arg1=0, arg2=0),
+        Op.make("mul", Op.make("select", A6, dim=0, index=0), h6),
+        Op.make("select", X6, dim=0, index=0),
     )
     root_t = Op.make(
         "add",
-        Op.make("mul", Op.make("select", A6, arg1=0, arg2=1), step_t),
-        Op.make("mul", Op.make("select", X6, arg1=0, arg2=1), h6),
+        Op.make("mul", Op.make("select", A6, dim=0, index=1), step_t),
+        Op.make("mul", Op.make("select", X6, dim=0, index=1), h6),
     )
     root = eg.add_term(root_t)
     plan = TL._Spine(eg).plan(eg.find(root))
@@ -1506,8 +1506,8 @@ def _dense_spine(eg, h0, A, IX, T):
     """``h_t = A_t @ h_{t-1} + I_t`` over select slices of dense maps."""
     term, eid = h0, eg.add_term(h0)
     for t in range(T):
-        a_t = Op.make("select", A, arg1=0, arg2=t)
-        i_t = Op.make("select", IX, arg1=0, arg2=t)
+        a_t = Op.make("select", A, dim=0, index=t)
+        i_t = Op.make("select", IX, dim=0, index=t)
         term = Op.make("add", Op.make("matmul", a_t, term), i_t)
         eid = eg.add_term(term)
     return eid
@@ -1569,8 +1569,8 @@ def test_carrier_plan_success_via_lift():
     leaves = [
         Op.make(
             "aff_diag",
-            Op.make("select", a_p, arg1=0, arg2=t),
-            Op.make("select", x_v, arg1=0, arg2=t),
+            Op.make("select", a_p, dim=0, index=t),
+            Op.make("select", x_v, dim=0, index=t),
         )
         for t in range(3)
     ]
@@ -1602,10 +1602,10 @@ def test_lift_root_filter_and_nonmaximal():
             "add",
             Op.make(
                 "mul",
-                Op.make("select", A, arg1=0, arg2=t),
+                Op.make("select", A, dim=0, index=t),
                 term,
             ),
-            Op.make("select", X, arg1=0, arg2=t),
+            Op.make("select", X, dim=0, index=t),
         )
         eid = eg.add_term(term)
         states.append(eid)
@@ -1638,10 +1638,10 @@ def test_lift_interior_detected_after_merge():
             "add",
             Op.make(
                 "mul",
-                Op.make("select", A, arg1=0, arg2=t),
+                Op.make("select", A, dim=0, index=t),
                 term,
             ),
-            Op.make("select", X, arg1=0, arg2=t),
+            Op.make("select", X, dim=0, index=t),
         )
         eid = eg.add_term(term)
         states.append(eid)

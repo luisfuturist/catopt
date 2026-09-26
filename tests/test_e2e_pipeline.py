@@ -260,14 +260,14 @@ def test_streaming_decode_state_continuation():
     k = _v("k", B, T, d)
     v = _v("v", B, T, dv)
     s_full = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     # split the score axis into chunk blocks
     blocks = [
         Op.make(
             "om_elem",
-            Op.make("chunk", s_full, arg1=n, arg2=-1, index=i),
-            Op.make("chunk", v, arg1=n, arg2=-2, index=i),
+            Op.make("chunk", s_full, chunks=n, dim=-1, index=i),
+            Op.make("chunk", v, chunks=n, dim=-2, index=i),
         )
         for i in range(n)
     ]

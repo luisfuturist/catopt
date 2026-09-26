@@ -20,7 +20,7 @@ Covered here:
 
 * the law fires on the spellings torch.export emits — bare 4-operand
   ``sdpa(q, cat k, cat v, m)`` and positional ``arg4``/``arg5``/``arg6``
-  — plus the kwarg forms, in both concat attr spellings;
+  — plus the kwarg forms, in the canonical concat attr spelling;
 * fp64-exact equivalence with ``F.scaled_dot_product_attention`` for
   BOTH mask dtypes — additive float (finite bias and 0/−inf) and bool
   keep-mask — including the ``logical_not(mk)`` operand shape that
@@ -293,11 +293,11 @@ def test_mask_law_fires_kwarg_spelling():
     assert any(k.startswith("sdpa_cat_mask_") for k in eg.rule_fires)
 
 
-def test_mask_law_fires_arg1_concat_spelling():
-    """Concat dims spelled arg1= (raw positional) also match."""
-    eg = _fires_mask_law(attr_key="arg1")
+def test_mask_law_fires_dim_concat_spelling():
+    """Concat dims spelled with the canonical ``dim`` match."""
+    eg = _fires_mask_law(attr_key="dim")
     assert any(
-        k.startswith("sdpa_cat_mask_") and k.endswith("arg1")
+        k.startswith("sdpa_cat_mask_") and k.endswith("dim")
         for k in eg.rule_fires
     )
 

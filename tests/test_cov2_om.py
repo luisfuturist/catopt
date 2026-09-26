@@ -83,17 +83,16 @@ SDPA = {r.name: r for r in OM.SDPA_CAT_LAWS}
 # ---------------------------------------------------------------------------
 
 
-def test_om_lift_fires_all_spellings_and_evals():
-    """matmul(softmax(s,-1), v) lifts to om_apply(om_elem(s,v)) under
-    each attr spelling; fp64-equal to dense softmax @ v.  T=1, K=3
-    (non-power-of-2) are deliberate."""
+def test_om_lift_fires_and_evals():
+    """matmul(softmax(s,-1), v) lifts to om_apply(om_elem(s,v)) for the
+    ``dim`` spelling and the bare form; fp64-equal to dense
+    softmax @ v.  T=1, K=3 (non-power-of-2) are deliberate."""
     T, K, d = 1, 3, 5
     s, v = _v("s", T, K), _v("v", K, d)
     env = {s: _rand((T, K), 1), v: _rand((K, d), 2)}
     ref = torch.softmax(env[s], dim=-1) @ env[v]
     for rule, sm in (
-        (OM.OM_LIFT, Op.make("softmax", s, arg1=-1)),
-        (OM.OM_LIFT_DIM, Op.make("softmax", s, dim=-1)),
+        (OM.OM_LIFT, Op.make("softmax", s, dim=-1)),
         (OM.OM_LIFT_PLAIN, Op.make("softmax", s)),
     ):
         t0 = Op.make("matmul", sm, v)
@@ -118,7 +117,7 @@ def test_om_lift_check_accepts_unknown_dims_and_batched():
         }
     )
     # negative-dim spelling of the last axis also passes
-    assert OM.OM_LIFT_DIM.check(
+    assert OM.OM_LIFT.check(
         {"s": _v("s", 2, 4, 7), "v": _v("v", 2, 7, 3), "$attr:SD": -1}
     )
 
@@ -148,7 +147,7 @@ def test_om_lift_no_fire_on_wrong_softmax_axis_term():
     rewrite (the check vetoes, not the matcher)."""
     t0 = Op.make(
         "matmul",
-        Op.make("softmax", _v("s", 4, 7), arg1=0),
+        Op.make("softmax", _v("s", 4, 7), dim=0),
         _v("v", 7, 3),
     )
     assert _fire(OM.OM_LIFT, t0) is None
@@ -204,15 +203,15 @@ def test_om_split_fires_and_evals_uneven_blocks():
     assert meta._eval_allclose(got, ref, tol=1e-12)
 
 
-def test_om_split_arg1_spelling_fires():
+def test_om_split_fires_dim_spelling():
     s1, s2 = _v("s1", 4, 3), _v("s2", 4, 5)
     v1, v2 = _v("v1", 3, 6), _v("v2", 5, 6)
     t0 = Op.make(
         "om_elem",
-        Op.make("concat", s1, s2, arg1=-1),
-        Op.make("concat", v1, v2, arg1=-2),
+        Op.make("concat", s1, s2, dim=-1),
+        Op.make("concat", v1, v2, dim=-2),
     )
-    assert _fire(OM.OM_SPLIT_ARG1, t0) is not None
+    assert _fire(OM.OM_SPLIT, t0) is not None
 
 
 def test_om_split_check_vetoes():
@@ -318,12 +317,11 @@ def test_om_assoc_both_directions_eval():
     assert _fire(OM.OM_ASSOC_REV, right) == left
 
 
-def test_concat_binarize_fires_both_spellings():
+def test_concat_binarize_fires():
     for r in OM.CONCAT_BINARIZE:
         n = int(r.name.split("_")[2])
-        ak = "dim" if r.name.endswith("_dim") else "arg1"
-        xs = [_v(f"x{n}{ak}{i}", 4, 3 + i) for i in range(n)]
-        t0 = Op.make("concat", *xs, **{ak: -1})
+        xs = [_v(f"x{n}dim{i}", 4, 3 + i) for i in range(n)]
+        t0 = Op.make("concat", *xs, dim=-1)
         out = _fire(r, t0)
         assert out is not None, r.name
 
@@ -358,8 +356,8 @@ def test_matmul_t_concat_fires_and_evals():
         Op.make(
             "transpose",
             Op.make("concat", k1, k2, dim=-2),
-            arg1=-2,
-            arg2=-1,
+            dim0=-2,
+            dim1=-1,
         ),
     )
     out = _fire(OM.MATMUL_T_CONCAT, t0)
@@ -553,7 +551,7 @@ def test_add_mask_cat_both_orders_and_modes():
     T, K1, K2 = 4, 3, 5
     s1, s2 = _v("s1", T, K1), _v("s2", T, K2)
     m_sl, m_ru = _v("m", T, K1 + K2), _v("m", 1)
-    for ak in ("dim", "arg1"):
+    for ak in ("dim",):
         for tag in ("cat_m", "m_cat"):  # mask-second / mask-first
             sl = AMC[f"add_{tag}_slice_{ak}"]
             ru = AMC[f"add_{tag}_reuse_{ak}"]
@@ -582,9 +580,9 @@ def test_add_mask_cat_both_orders_and_modes():
         _eval(out, env), _eval(t0, env), atol=1e-12, rtol=1e-12
     )
     t0r = Op.make(
-        "add", m_sl, Op.make("concat", s1, s2, arg1=-1)
+        "add", m_sl, Op.make("concat", s1, s2, dim=-1)
     )
-    outr = _fire(AMC["add_m_cat_slice_arg1"], t0r)
+    outr = _fire(AMC["add_m_cat_slice_dim"], t0r)
     assert outr is not None
     assert torch.allclose(
         _eval(outr, env), _eval(t0r, env), atol=1e-12, rtol=1e-12
@@ -597,7 +595,7 @@ def test_where_cat_both_positions():
     T, K1, K2 = 4, 3, 5
     s1, s2 = _v("s1", T, K1), _v("s2", T, K2)
     m = _v("m", T, K1 + K2)
-    for ak in ("dim", "arg1"):
+    for ak in ("dim",):
         for tag in ("x", "y"):  # cat in the then- / else-branch
             sl = WRC[f"where_cat_{tag}_slice_{ak}"]
             b = {
@@ -738,11 +736,11 @@ def test_cat_hom_masked_fill_fires():
     ninf = Const(float("-inf"))
     t0 = Op.make(
         "masked_fill",
-        Op.make("concat", a1, a2, arg1=-1),
-        Op.make("concat", b1, b2, arg1=-1),
+        Op.make("concat", a1, a2, dim=-1),
+        Op.make("concat", b1, b2, dim=-1),
         ninf,
     )
-    assert _fire(CH["cat_hom_masked_fill_arg1"], t0) is not None
+    assert _fire(CH["cat_hom_masked_fill_dim"], t0) is not None
 
 
 # ---------------------------------------------------------------------------

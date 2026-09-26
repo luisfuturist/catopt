@@ -53,7 +53,7 @@ def _om_lemma_seed():
     v2 = Var("v2", _T(4, 6))
     term = Op.make(
         "matmul",
-        Op.make("softmax", Op.make("concat", s1, s2, dim=-1), arg1=-1),
+        Op.make("softmax", Op.make("concat", s1, s2, dim=-1), dim=-1),
         Op.make("concat", v1, v2, dim=-2),
     )
     return term, (s1, s2, v1, v2)
@@ -66,14 +66,14 @@ def _left_scaled_attention_seed():
     v = Var("v", _T(7, 6))
     m = Var("m", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     term = Op.make(
         "matmul",
         Op.make(
             "softmax",
             Op.make("add", Op.make("mul", Const(0.5), scores), m),
-            arg1=-1,
+            dim=-1,
         ),
         v,
     )
@@ -181,14 +181,14 @@ def test_guarded_rule_roundtrip_check_vetoes_after_reload(tmp_path):
     # vetoes: a Var scale fails the composite guard (needs a Const)
     s_var = Var("s", _T())
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     bad = Op.make(
         "matmul",
         Op.make(
             "softmax",
             Op.make("add", Op.make("mul", s_var, scores), m),
-            arg1=-1,
+            dim=-1,
         ),
         v,
     )
@@ -222,9 +222,9 @@ def test_derive_placeholder_recomputed_on_new_instance(tmp_path):
             Op.make(
                 "matmul",
                 q,
-                Op.make("transpose", kcat, arg1=-2, arg2=-1),
+                Op.make("transpose", kcat, dim0=-2, dim1=-1),
             ),
-            arg1=-1,
+            dim=-1,
         ),
         vcat,
     )
@@ -258,11 +258,11 @@ def test_derive_placeholder_recomputed_on_new_instance(tmp_path):
                 Op.make(
                     "transpose",
                     Op.make("concat", k13, k23, dim=-2),
-                    arg1=-2,
-                    arg2=-1,
+                    dim0=-2,
+                    dim1=-1,
                 ),
             ),
-            arg1=-1,
+            dim=-1,
         ),
         Op.make("concat", v13, v23, dim=-2),
     )

@@ -62,7 +62,7 @@ def _scan_case():
         Op.make(
             "aff_diag",
             _p("a", d),
-            Op.make("select", x, arg1=0, arg2=t),
+            Op.make("select", x, dim=0, index=t),
         )
         for t in range(T)
     ]
@@ -89,7 +89,7 @@ def _om_case():
             Op.make(
                 "matmul",
                 q,
-                Op.make("transpose", k, arg1=-2, arg2=-1),
+                Op.make("transpose", k, dim0=-2, dim1=-1),
             ),
             vv,
         )
@@ -117,8 +117,8 @@ def _omd_case():
     leaves = [
         Op.make(
             "aff_diag",
-            Op.make("select", p_a, arg1=0, arg2=t),
-            Op.make("select", x, arg1=0, arg2=t),
+            Op.make("select", p_a, dim=0, index=t),
+            Op.make("select", x, dim=0, index=t),
         )
         for t in range(T)
     ]
@@ -325,14 +325,14 @@ def test_omd_select_index_getitem_branch():
     """The omd twin of ``scan_lower._select_index``'s getitem
     spelling — kept covered through ``_part_gather``'s recognizer."""
     base = _v("b", 8, 4)
-    assert _select_index(Op.make("getitem", base, arg1=2)) == (
+    assert _select_index(Op.make("getitem", base, index=2)) == (
         base,
         0,
         2,
     )
     assert (
         _select_index(
-            Op.make("getitem", base, arg1="i", validate=False)
+            Op.make("getitem", base, index="i", validate=False)
         )
         is None
     )

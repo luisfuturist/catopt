@@ -2,16 +2,16 @@
 
 ``catopt.attrs.ATTR_SCHEMA`` declares the canonical positional order
 per op; ``export_to_ir`` lands aten ``argN`` spellings in those names
-at the boundary, and ``Op.make`` canonicalises + validates at mint so
-a malformed term dies loudly at union time rather than silently at
-eval.  These tests pin all three:
+at the boundary, and ``Op.make`` validates at mint so a malformed term
+dies loudly at union time rather than silently at eval.  These tests
+pin all three:
 
 1. **Export canonicalisation** — per-op probe modules through
    ``export_to_ir``; every schema'd op must carry the canonical names
    and no bare ``argN`` at a schema-declared position.
-2. **Mint-time contract** — ``Op.make`` renames declared positionals,
-   rejects ``argN`` at undeclared positions and missing required
-   attrs, keeps partial/zero-attr terms, and honours ``validate=False``.
+2. **Mint-time contract** — ``Op.make`` rejects ``argN`` at undeclared
+   positions and missing required attrs, keeps partial/zero-attr
+   terms, and honours ``validate=False``.
 3. **Round-trip** — a batched rope-style block (the rank-5
    ``stack``→``reshape`` failure shape) exports, lowers through
    ``ir_to_torch_module``, and reproduces the module's outputs with
@@ -28,7 +28,6 @@ from catopt.attrs import (
     ATTR_REQUIRED,
     ATTR_SCHEMA,
     attr_of,
-    canonicalize_attrs,
 )
 from catopt.ir import Op, TensorType, Var
 from catopt.torch_bridge import export_to_ir, ir_to_torch_module
@@ -116,7 +115,8 @@ class _SDPA(torch.nn.Module):
 
 class _SDPADropout(torch.nn.Module):
     def forward(self, q, k, v):
-        # eval() → train=False positional arg; dropout_p is arg4.
+        # eval() → train=False positional arg; dropout_p is the
+        # canonical positional attr.
         return F.scaled_dot_product_attention(q, k, v, dropout_p=0.1)
 
 
@@ -186,12 +186,11 @@ class TestExportCanonicalization:
             "slice",
             None,
         )
-        # dim is canonical; start/end/step stay positional — declared
-        # as the canonical argN spelling (typing reads them literally).
+        # dim/start/end/step are the canonical names.
         assert t.attrs["dim"] == 2
-        assert t.attrs["arg2"] == 0
-        assert t.attrs["arg3"] == _INT64_MAX
-        assert t.attrs["arg4"] == 2
+        assert t.attrs["start"] == 0
+        assert t.attrs["end"] == _INT64_MAX
+        assert t.attrs["step"] == 2
 
     def test_slice_plain(self):
         (t,) = self._check(
@@ -201,8 +200,8 @@ class TestExportCanonicalization:
             None,
         )
         assert t.attrs["dim"] == 1
-        assert t.attrs["arg2"] == 1
-        assert t.attrs["arg3"] == 5
+        assert t.attrs["start"] == 1
+        assert t.attrs["end"] == 5
 
     def test_select(self):
         (t,) = self._check(
@@ -220,9 +219,7 @@ class TestExportCanonicalization:
             "unsqueeze",
             None,
         ):
-            # arg1 IS the canonical spelling for unsqueeze — rule
-            # patterns mint arg1; no dim-variant rules exist.
-            assert t.attrs == {"arg1": 1}
+            assert t.attrs == {"dim": 1}
 
     def test_squeeze(self):
         for t in self._check(
@@ -231,7 +228,7 @@ class TestExportCanonicalization:
             "squeeze",
             None,
         ):
-            assert t.attrs == {"arg1": 1}
+            assert t.attrs == {"dim": 1}
 
     def test_transpose(self):
         (t,) = self._check(
@@ -240,9 +237,8 @@ class TestExportCanonicalization:
             "transpose",
             None,
         )
-        # arg1/arg2 are the canonical spellings for transpose today —
-        # every rule pattern mints them.
-        assert t.attrs == {"arg1": 0, "arg2": 2}
+        # dim0/dim1 are the canonical spellings for transpose.
+        assert t.attrs == {"dim0": 0, "dim1": 2}
 
     def test_flatten(self):
         (t,) = self._check(
@@ -260,7 +256,7 @@ class TestExportCanonicalization:
             "softmax",
             None,
         )
-        assert t.attrs == {"arg1": -1}
+        assert t.attrs == {"dim": -1}
 
     def test_concat(self):
         (t,) = self._check(
@@ -356,9 +352,9 @@ class TestExportCanonicalization:
         assert t.attrs["eps"] == pytest.approx(1e-5)
 
     def test_layer_norm_eps_is_eps_not_cudnn(self):
-        """Regression: aten.layer_norm's eps is arg4 — arg5 is the
-        cudnn flag.  The old binding read arg5 and silently set
-        eps=0.0."""
+        """Regression: aten.layer_norm's eps is the 4th positional — the
+        5th is the cudnn flag.  The old binding read the cudnn flag's
+        position and silently set eps=0.0."""
         (t,) = self._check(
             _LayerNorm(), (torch.randn(2, 8),), "layer_norm", None
         )
@@ -401,9 +397,9 @@ class TestExportCanonicalization:
             "dropout",
             None,
         )
-        # arg1=p / arg2=train are the canonical spellings (rules mint
-        # them — rules.py's dropout-in-attention pattern).
-        assert t.attrs == {"arg1": 0.5, "arg2": True}
+        # p / train are the canonical spellings (rules mint them —
+        # rules.py's dropout-in-attention pattern).
+        assert t.attrs == {"p": 0.5, "train": True}
 
     def test_conv2d_positional_attrs(self):
         (t,) = self._check(
@@ -424,8 +420,8 @@ class TestMintValidation:
     x = _var((2, 8), "x")
 
     # -- declared-position argN is a legal minted spelling (preserved) --
-    # the *_arg1 rule variants in om.py/xcarrier.py pattern-match
-    # arg-spelled e-nodes — renaming at mint would kill them.
+    # the schema bounds WHICH positions may be spelled positionally; the
+    # spelling is preserved at mint (only the export boundary canonicalises).
     def test_argN_at_declared_position_preserved(self):
         t = Op.make("concat", self.x, self.x, arg1=-1)
         assert t.attrs == {"arg1": -1}
@@ -450,34 +446,49 @@ class TestMintValidation:
         )
         assert t.attrs == {"arg4": 0.0, "arg5": True, "arg7": True}
 
-    def test_slice_positional_canonical_spelling_kept(self):
-        # arg2/arg3/arg4 ARE the canonical names for slice today.
+    def test_slice_positional_spelling_preserved(self):
+        # a bare positional at a declared position is preserved as-is.
         t = Op.make("slice", self.x, arg1=2, arg2=0, arg3=4, arg4=2)
         assert t.attrs == {"arg1": 2, "arg2": 0, "arg3": 4, "arg4": 2}
 
     def test_mixed_spellings_coexist(self):
-        # the dual-spelling ecosystem: canonical dim + positional
-        # arg2/arg3 — exactly what test_contracts pins on _shape_of.
+        # canonical names + preserved positionals coexist on one term.
         t = Op.make("split", self.x, arg1=(4, 4), arg3=1, dim=0)
         assert t.attrs == {"arg1": (4, 4), "arg3": 1, "dim": 0}
 
-    def test_minted_argN_terms_evaluate_through_bindings(self):
-        # Preserved minted spellings still lower: the bindings' argN
-        # fallbacks are live code for these terms.
+    def test_canonical_terms_evaluate_through_bindings(self):
+        # Canonical-spelled terms lower through the bindings.
         from catopt.torch_bridge import _IR_TO_TORCH
 
         out = _IR_TO_TORCH["transpose"](
-            torch.arange(6).reshape(2, 3), arg1=0, arg2=1
+            torch.arange(6).reshape(2, 3), dim0=0, dim1=1
         )
         assert out.shape == (3, 2)
         out = _IR_TO_TORCH["select"](
-            torch.arange(6).reshape(2, 3), arg1=0, arg2=1
+            torch.arange(6).reshape(2, 3), dim=0, index=1
         )
         assert out.shape == (3,)
         out = _IR_TO_TORCH["concat"](
-            torch.ones(2, 2), torch.ones(2, 2), arg1=-1
+            torch.ones(2, 2), torch.ones(2, 2), dim=-1
         )
         assert out.shape == (2, 4)
+
+    def test_slice_binding_reads_start_end_step(self):
+        # The slice binding lowers through the canonical
+        # ``start``/``end``/``step`` (no positional fallback).
+        from catopt.torch_bridge import _IR_TO_TORCH
+
+        x = torch.arange(12).reshape(3, 4)
+        out = _IR_TO_TORCH["slice"](x, dim=1, start=0, end=4, step=2)
+        assert torch.equal(out, x[:, ::2])
+
+    def test_dropout_binding_reads_p_train(self):
+        # export_to_ir always exports eval()-mode graphs, so the dropout
+        # binding is a semantic identity reading p/train canonically.
+        from catopt.torch_bridge import _IR_TO_TORCH
+
+        x = torch.randn(4, 8)
+        assert _IR_TO_TORCH["dropout"](x, p=0.5, train=True) is x
 
     # -- loud failures ---------------------------------------------------
     def test_argN_past_schema_fails(self):
@@ -497,8 +508,8 @@ class TestMintValidation:
             Op.make("split", self.x, dim=-1)
 
     def test_missing_required_transpose_dim1_fails(self):
-        with pytest.raises(ValueError, match="arg2"):
-            Op.make("transpose", self.x, arg1=0)
+        with pytest.raises(ValueError, match="dim1"):
+            Op.make("transpose", self.x, dim0=0)
 
     # -- partial / bare terms stay legal ----------------------------------
     def test_zero_attr_term_is_partial(self):
@@ -540,28 +551,6 @@ class TestMintValidation:
             arg5=True,
         )
         assert t.attrs == {"is_causal": True}
-
-    # -- canonicalize_attrs: the explicit full-rename helper -------------
-    def test_canonicalize_renames_declared_positions(self):
-        assert canonicalize_attrs(
-            "split", {"arg1": 4, "arg2": -1, "arg3": 0}
-        ) == {"sizes": 4, "dim": -1, "index": 0}
-        # identity-canonical positions are a no-op
-        assert canonicalize_attrs(
-            "transpose", {"arg1": 1, "arg2": 2}
-        ) == {
-            "arg1": 1,
-            "arg2": 2,
-        }
-        # undeclared positions pass through
-        assert canonicalize_attrs("split", {"arg9": 1}) == {"arg9": 1}
-        # no schema → untouched
-        assert canonicalize_attrs("zzz", {"arg1": 1}) == {"arg1": 1}
-
-    def test_canonicalize_idempotent(self):
-        a = canonicalize_attrs("split", {"sizes": (4, 4), "dim": -1})
-        b = canonicalize_attrs("split", a)
-        assert a == b == {"sizes": (4, 4), "dim": -1}
 
 
 # ---------------------------------------------------------------------------

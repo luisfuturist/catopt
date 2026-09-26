@@ -93,7 +93,7 @@ def _elementwise_term():
         "relu",
         Op.make(
             "neg",
-            Op.make("mul", Op.make("transpose", x, arg1=-2, arg2=-1), p),
+            Op.make("mul", Op.make("transpose", x, dim0=-2, dim1=-1), p),
         ),
     )
     inputs = {"x": (2, 4)}

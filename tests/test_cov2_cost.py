@@ -187,7 +187,7 @@ def test_count_and_depth_on_view_and_carrier_ops():
     x = _v("x", 4, 8)
     # View ops and carrier packaging cost nothing under count_cost.
     for op_term in (
-        Op.make("transpose", x, arg1=0, arg2=1),
+        Op.make("transpose", x, dim0=0, dim1=1),
         Op.make("reshape", x, shape=(4, 8)),
         Op.make("aff", _v("A", 8, 8), _v("b", 8)),
         Op.make("om", _v("m", 4, 8), _v("l", 4, 8), _v("a", 4, 8)),
@@ -196,7 +196,7 @@ def test_count_and_depth_on_view_and_carrier_ops():
     ):
         assert count_cost(op_term) == 0.0, op_term
     # A view on top of real work counts the work only.
-    t = Op.make("transpose", Op.make("neg", x), arg1=0, arg2=1)
+    t = Op.make("transpose", Op.make("neg", x), dim0=0, dim1=1)
     assert count_cost(t) == 1.0
     # depth: a view adds no latency over its child.
     assert depth_cost(t) == pytest.approx(depth_cost(t.args[0]))
@@ -208,7 +208,7 @@ def test_launch_aware_view_ops_skip_penalty():
     assert launch_aware_cost(neg) == pytest.approx(
         flops_cost(neg) + 1.0
     )
-    tr = Op.make("transpose", neg, arg1=0, arg2=1)
+    tr = Op.make("transpose", neg, dim0=0, dim1=1)
     # The transpose itself launches nothing.
     assert launch_aware_cost(tr) == pytest.approx(
         launch_aware_cost(neg)

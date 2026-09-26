@@ -49,54 +49,54 @@ def _p(name, *shape):
 
 def test_slice_index_select_and_getitem():
     base = _v("base", 4, 8)
-    sel = Op.make("select", base, arg1=1, arg2=2)
+    sel = Op.make("select", base, dim=1, index=2)
     assert _slice_index(sel) == (base, "select", 1, 2, None, None)
     sel2 = Op.make("select", base, dim=0, index=1)
     assert _slice_index(sel2) == (base, "select", 0, 1, None, None)
-    gi = Op.make("getitem", base, arg1=3)
+    gi = Op.make("getitem", base, index=3)
     assert _slice_index(gi) == (base, "select", 0, 3, None, None)
     # missing/bad attrs → None
-    assert _slice_index(Op.make("select", base, arg1=0, arg2="x", validate=False)) is None
+    assert _slice_index(Op.make("select", base, dim=0, index="x", validate=False)) is None
     assert _slice_index(Op.make("relu", base)) is None
     assert _slice_index(base) is None
-    assert _slice_index(Op.make("select", base, _v("i", 1), arg1=0, arg2=0)) is None
+    assert _slice_index(Op.make("select", base, _v("i", 1), dim=0, index=0)) is None
 
 
 def test_slice_index_chunk_and_split():
     base = _v("base", 4, 8)
-    ch = Op.make("chunk", base, arg1=4, arg2=1, index=1)
+    ch = Op.make("chunk", base, chunks=4, dim=1, index=1)
     # 8 % 4 == 0 → part_size 2
     assert _slice_index(ch) == (base, "chunk", 1, 1, 4, 2)
-    ch2 = Op.make("chunk", base, arg1=3, arg2=0, index=0)
+    ch2 = Op.make("chunk", base, chunks=3, dim=0, index=0)
     # 4 % 3 != 0 (dim 0 of a (4,8) base) → uneven tail → part_size None
     assert _slice_index(ch2) == (base, "chunk", 0, 0, 3, None)
     # non-int n → None
-    ch3 = Op.make("chunk", base, arg1="z", arg2=0, index=0, validate=False)
+    ch3 = Op.make("chunk", base, chunks="z", dim=0, index=0, validate=False)
     assert _slice_index(ch3) is None
     # missing dim → None
-    ch4 = Op.make("chunk", base, arg1=2)
+    ch4 = Op.make("chunk", base, chunks=2)
     assert _slice_index(ch4) is None
     # split with uniform sizes → part known
-    sp = Op.make("split", base, sizes=[2, 2], arg2=1, index=0)
+    sp = Op.make("split", base, sizes=[2, 2], dim=1, index=0)
     assert _slice_index(sp) == (base, "chunk", 1, 0, 2, 2)
     # split with non-uniform sizes → part None
-    sp2 = Op.make("split", base, sizes=[3, 1], arg2=1, index=1)
+    sp2 = Op.make("split", base, sizes=[3, 1], dim=1, index=1)
     assert _slice_index(sp2) == (base, "chunk", 1, 1, 2, None)
-    sp3 = Op.make("split", base, arg2=1, index=0, validate=False)
+    sp3 = Op.make("split", base, dim=1, index=0, validate=False)
     assert _slice_index(sp3) is None
 
 
 def test_sliced_gather_select_and_chunk():
     base = _v("base", 4, 8)
     parts = [
-        _slice_index(Op.make("select", base, arg1=0, arg2=i))
+        _slice_index(Op.make("select", base, dim=0, index=i))
         for i in range(4)
     ]
     g = _sliced_gather(parts)
     assert g == (base, "select", 0, 4, 1)
     # chunk gather: n parts of equal size along dim 1
     ch = [
-        _slice_index(Op.make("chunk", base, arg1=4, arg2=1, index=i))
+        _slice_index(Op.make("chunk", base, chunks=4, dim=1, index=i))
         for i in range(4)
     ]
     g2 = _sliced_gather(ch)
@@ -108,7 +108,7 @@ def test_sliced_gather_select_and_chunk():
     base2 = _v("base2", 4, 8)
     parts_mix = [
         *parts[:1],
-        _slice_index(Op.make("select", base2, arg1=0, arg2=1)),
+        _slice_index(Op.make("select", base2, dim=0, index=1)),
         *parts[2:],
     ]
     assert _sliced_gather(parts_mix) is None
@@ -125,12 +125,12 @@ def test_sliced_gather_select_and_chunk():
 def test_qk_parts_and_same_term():
     q, k = _v("q", 2, 4, 8), _v("k", 2, 4, 6, 8)
     good = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     assert _qk_parts(good) == (q, k)
     # wrong transpose dims → None
     bad = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=0, arg2=1)
+        "matmul", q, Op.make("transpose", k, dim0=0, dim1=1)
     )
     assert _qk_parts(bad) is None
     # non-matmul / non-transpose → None
@@ -170,14 +170,14 @@ def test_analyze_elem_group_dense_qk_bmm_and_stack():
     K = _v("K", 8, 8)
     # k_i = chunk(K, -2, i) — consecutive equal chunks along key axis
     ks = [
-        Op.make("chunk", K, arg1=4, arg2=-2, index=i) for i in range(4)
+        Op.make("chunk", K, chunks=4, dim=-2, index=i) for i in range(4)
     ]
     vs = [_v(f"v{i}", 2, 4) for i in range(4)]
     leaves = [
         Op.make(
             "om_elem",
             Op.make(
-                "matmul", q, Op.make("transpose", kk, arg1=-2, arg2=-1)
+                "matmul", q, Op.make("transpose", kk, dim0=-2, dim1=-1)
             ),
             vv,
         )
@@ -193,7 +193,7 @@ def test_analyze_elem_group_dense_qk_bmm_and_stack():
         Op.make(
             "om_elem",
             Op.make(
-                "matmul", q, Op.make("transpose", kk, arg1=-2, arg2=-1)
+                "matmul", q, Op.make("transpose", kk, dim0=-2, dim1=-1)
             ),
             vv,
         )
@@ -215,7 +215,7 @@ def test_analyze_elem_group_dense_qk_bmm_and_stack():
     # scores as slices of one score tensor → "slice"
     S = _v("S", 4, 8)
     s_terms2 = [
-        Op.make("chunk", S, arg1=4, arg2=-1, index=i) for i in range(4)
+        Op.make("chunk", S, chunks=4, dim=-1, index=i) for i in range(4)
     ]
     leaves4 = [
         Op.make("om_elem", ss, vv)
@@ -266,7 +266,7 @@ def _qk_ir(B, T, d, dv, ksizes, leaf_fn=None):
 
     def default_leaf(qq, kk, vv):
         s = Op.make(
-            "matmul", qq, Op.make("transpose", kk, arg1=-2, arg2=-1)
+            "matmul", qq, Op.make("transpose", kk, dim0=-2, dim1=-1)
         )
         return Op.make("om_elem", s, vv)
 
@@ -312,7 +312,7 @@ def test_batched_matches_dense_serial_leaf_and_mults():
     e1 = Op.make(
         "om_elem",
         Op.make(
-            "matmul", q, Op.make("transpose", k1, arg1=-2, arg2=-1)
+            "matmul", q, Op.make("transpose", k1, dim0=-2, dim1=-1)
         ),
         v1,
     )
@@ -390,7 +390,7 @@ def test_batched_bmm_qk_mode_and_odd_count():
             Op.make(
                 "matmul",
                 qp,
-                Op.make("transpose", kk, arg1=-2, arg2=-1),
+                Op.make("transpose", kk, dim0=-2, dim1=-1),
             ),
             vv,
         )

@@ -347,7 +347,7 @@ def test_export_narrow_select_index_select_dropout():
     assert narrow.attrs["start"] == 1
     assert narrow.attrs["length"] == 4
     drop = _find(ir.root, "dropout")
-    assert drop and dict(drop[0].attrs).get("arg1") == 0.25
+    assert drop and dict(drop[0].attrs).get("p") == 0.25
     assert _find(ir.root, "index_select")
 
 

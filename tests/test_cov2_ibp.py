@@ -272,24 +272,21 @@ def test_ibp_non_tensor_binding_and_unknown_leaf():
 # ---------------------------------------------------------------------------
 
 
-def test_hop_transpose_both_attr_spellings():
-    """``transpose`` accepts ``arg1``/``arg2`` and ``dim0``/``dim1`` —
-    pin both: a last-two-dim swap preserves the bound; anything else
-    pays the rearrangement multiplier."""
+def test_hop_transpose_canonical_spelling():
+    """``transpose`` reads the canonical ``dim0``/``dim1`` spelling — a
+    last-two-dim swap preserves the bound; anything else pays the
+    rearrangement multiplier."""
     xb = _box(torch.randn(2, 4, 8), torch.randn(2, 4, 8))
     ob = _box(torch.randn(2, 8, 4), torch.randn(2, 8, 4))
     x = _v("x", 2, 4, 8)
-    for attrs in ({"arg1": 1, "arg2": 2}, {"dim0": 1, "dim1": 2}):
-        tr = Op.make("transpose", x, **attrs)
-        assert _hop(tr, 0, [xb], ob, "spec") == (1.0, "spec")
-    # swapping the row dim itself → rearrangement multiplier, same for
-    # both spellings
+    tr = Op.make("transpose", x, dim0=1, dim1=2)
+    assert _hop(tr, 0, [xb], ob, "spec") == (1.0, "spec")
+    # swapping the row dim itself → rearrangement multiplier
     ob2 = _box(torch.randn(8, 4, 2), torch.randn(8, 4, 2))
-    for attrs in ({"arg1": 0, "arg2": 2}, {"dim0": 0, "dim1": 2}):
-        tr = Op.make("transpose", x, **attrs)
-        m, k = _hop(tr, 0, [xb], ob2, "row")
-        assert k == "row"
-        assert m == pytest.approx(math.sqrt(64 / 2))
+    tr = Op.make("transpose", x, dim0=0, dim1=2)
+    m, k = _hop(tr, 0, [xb], ob2, "row")
+    assert k == "row"
+    assert m == pytest.approx(math.sqrt(64 / 2))
 
 
 def test_rearrange_mult_changes_last_dim():
@@ -552,7 +549,7 @@ def test_prop_delta_cast_ops_success_and_failure():
 def test_prop_delta_index_select_missing_and_bad_index():
     """``index_select`` without a binding → None; a binding whose eval
     raises (non-integer index tensor) → None."""
-    ix = Op.make("index_select", _v("a", 4, 3), _p("i", 2), arg1=0)
+    ix = Op.make("index_select", _v("a", 4, 3), _p("i", 2), dim=0)
     cur = torch.randn(4, 3, dtype=torch.float64)
     argb = _pb(torch.ones(4, 3), torch.tensor([0.5, 1.5]))
     saved = torch_bridge._CORE_TORCH_BINDINGS["index_select"]

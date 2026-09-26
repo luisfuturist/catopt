@@ -55,8 +55,8 @@ def _chain_maps(a_t: Param, xs, steps: int):
     leaves = [
         Op.make(
             "aff_diag",
-            Op.make("select", a_t, arg1=0, arg2=t),
-            Op.make("select", xs, arg1=0, arg2=t),
+            Op.make("select", a_t, dim=0, index=t),
+            Op.make("select", xs, dim=0, index=t),
         )
         for t in range(steps)
     ]
@@ -364,8 +364,8 @@ def test_batched_dense_fiber_applym():
     leaves = [
         Op.make(
             "aff",
-            Op.make("select", p_A, arg1=0, arg2=t),
-            Op.make("select", x_v, arg1=0, arg2=t),
+            Op.make("select", p_A, dim=0, index=t),
+            Op.make("select", x_v, dim=0, index=t),
         )
         for t in range(T)
     ]
@@ -616,8 +616,8 @@ def test_batched_dense_compose_levels_no_fallback():
         leaves = [
             Op.make(
                 "aff",
-                Op.make("select", p_A, arg1=0, arg2=t),
-                Op.make("select", x_v, arg1=0, arg2=t),
+                Op.make("select", p_A, dim=0, index=t),
+                Op.make("select", x_v, dim=0, index=t),
             )
             for t in range(T)
         ]

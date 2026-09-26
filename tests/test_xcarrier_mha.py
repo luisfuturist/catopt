@@ -198,8 +198,8 @@ def test_transpose_apply_dense():
     t0 = Op.make(
         "transpose",
         Op.make("apply", Op.make("aff", A, b), h),
-        arg1=0,
-        arg2=1,
+        dim0=0,
+        dim1=1,
     )
     out = _law(XC.XC_TRANSPOSE_APPLY, t0, env)
     assert out.op == "apply" and out.args[0].op == "aff"
@@ -208,8 +208,8 @@ def test_transpose_apply_dense():
     t0 = Op.make(
         "transpose",
         Op.make("apply", Op.make("aff", A, b), h),
-        arg1=-3,
-        arg2=-2,
+        dim0=-3,
+        dim1=-2,
     )
     _law(XC.XC_TRANSPOSE_APPLY, t0, env)
     # reverse: the pushed-through member re-fuses.
@@ -226,8 +226,8 @@ def test_transpose_apply_rev_veto_input_axis():
         "apply",
         Op.make(
             "aff",
-            Op.make("transpose", A, arg1=1, arg2=2),  # o <-> i !
-            Op.make("transpose", b, arg1=0, arg2=1),
+            Op.make("transpose", A, dim0=1, dim1=2),  # o <-> i !
+            Op.make("transpose", b, dim0=0, dim1=1),
         ),
         h,
     )
@@ -237,8 +237,8 @@ def test_transpose_apply_rev_veto_input_axis():
         "apply",
         Op.make(
             "aff",
-            Op.make("transpose", A, arg1=0, arg2=1),
-            Op.make("transpose", b, arg1=1, arg2=0),
+            Op.make("transpose", A, dim0=0, dim1=1),
+            Op.make("transpose", b, dim0=1, dim1=0),
         ),
         h,
     )
@@ -273,8 +273,8 @@ def test_transpose_applyd_head_swap():
     t0 = Op.make(
         "transpose",
         Op.make("applyd", Op.make("aff_diag", a, b), h),
-        arg1=0,
-        arg2=1,
+        dim0=0,
+        dim1=1,
     )
     out = _law(XC.XC_TRANSPOSE_APPLYD, t0, env)
     _law(XC.XC_TRANSPOSE_APPLYD_REV, out, env)
@@ -288,11 +288,11 @@ def test_transpose_applyd_veto_feature_axis():
     base = Op.make("applyd", Op.make("aff_diag", a, b), h)
     _no_fire(
         XC.XC_TRANSPOSE_APPLYD,
-        Op.make("transpose", base, arg1=1, arg2=2),
+        Op.make("transpose", base, dim0=1, dim1=2),
     )
     _no_fire(
         XC.XC_TRANSPOSE_APPLYD,
-        Op.make("transpose", base, arg1=-1, arg2=0),
+        Op.make("transpose", base, dim0=-1, dim1=0),
     )
 
 

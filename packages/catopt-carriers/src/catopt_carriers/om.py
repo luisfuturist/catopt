@@ -43,11 +43,10 @@ The rules:
   matmul distributes over concat in the transposed operand, exposing
   per-block score tensors for OM_SPLIT.
 
-Note on concat attrs: torch.export emits ``cat`` with the dim as the
-positional ``arg1`` attribute, while rule-produced concats (and
-hand-built terms, following rules.py convention) use ``dim``.  LHS
-patterns are generated in both spellings; all RHS-produced concats use
-``dim``.
+Note on concat attrs: the export boundary canonicalises ``cat``'s axis
+to ``dim`` (``ATTR_SCHEMA``), and rule-produced/hand-built terms use
+``dim`` too — every LHS pattern and RHS here speaks the one canonical
+spelling.
 
 MASKED ATTENTION
     A causal/additive mask wraps the score concat in ``masked_fill`` /
@@ -145,16 +144,14 @@ def _om_lift(name: str, attr_key: str | None) -> Rewrite:
     )
 
 
-#: torch.export emits softmax(x, dim) with the dim in ``arg1``.
-OM_LIFT = _om_lift("om_lift", "arg1")
-#: Same law for the ``dim=`` kwarg spelling and a bare softmax(-1).
-OM_LIFT_DIM = _om_lift("om_lift_dim", "dim")
+#: softmax's canonical ``dim`` spelling.
+OM_LIFT = _om_lift("om_lift", "dim")
 OM_LIFT_PLAIN = _om_lift("om_lift_plain", None)
 
 OM_UNLIFT = R(
     "om_unlift",
     Op.make("om_apply", Op.make("om_elem", "s", "v")),
-    Op.make("matmul", Op.make("softmax", "s", arg1=-1), "v"),
+    Op.make("matmul", Op.make("softmax", "s", dim=-1), "v"),
     law="om_apply(elem(s,v)) unfolds back to dense softmax(s) @ v.",
 )
 
@@ -223,7 +220,6 @@ def _om_split(name: str, attr_key: str) -> Rewrite:
 
 
 OM_SPLIT = _om_split("om_split", "dim")
-OM_SPLIT_ARG1 = _om_split("om_split_arg1", "arg1")
 
 
 def _derive_om_concat_dims(bound: dict) -> dict | None:
@@ -296,12 +292,10 @@ def _concat_binarize(n: int, attr_key: str) -> Rewrite:
     )
 
 
-#: 3..6-ary concats, both attr spellings.  Structural only — needs no
-#: shape check (binarisation preserves well-typedness identically).
+#: 3..6-ary concats, the canonical ``dim`` spelling.  Structural only —
+#: needs no shape check (binarisation preserves well-typedness).
 CONCAT_BINARIZE: list[Rewrite] = [
-    _concat_binarize(n, ak)
-    for n in range(3, 7)
-    for ak in ("dim", "arg1")
+    _concat_binarize(n, "dim") for n in range(3, 7)
 ]
 
 
@@ -360,8 +354,8 @@ def _matmul_t_concat(name: str, attr_key: str) -> Rewrite:
             Op.make(
                 "transpose",
                 Op.make("concat", "k1", "k2", **{attr_key: "KD"}),
-                arg1="T1",
-                arg2="T2",
+                dim0="T1",
+                dim1="T2",
             ),
         ),
         Op.make(
@@ -369,12 +363,12 @@ def _matmul_t_concat(name: str, attr_key: str) -> Rewrite:
             Op.make(
                 "matmul",
                 "q",
-                Op.make("transpose", "k1", arg1="T1", arg2="T2"),
+                Op.make("transpose", "k1", dim0="T1", dim1="T2"),
             ),
             Op.make(
                 "matmul",
                 "q",
-                Op.make("transpose", "k2", arg1="T1", arg2="T2"),
+                Op.make("transpose", "k2", dim0="T1", dim1="T2"),
             ),
             dim="SD",
         ),
@@ -387,7 +381,6 @@ def _matmul_t_concat(name: str, attr_key: str) -> Rewrite:
 
 
 MATMUL_T_CONCAT = _matmul_t_concat("matmul_t_concat", "dim")
-MATMUL_T_CONCAT_ARG1 = _matmul_t_concat("matmul_t_concat_arg1", "arg1")
 
 
 # ---------------------------------------------------------------------------
@@ -740,12 +733,13 @@ def _cat_hom_masked_fill(name: str, attr_key: str) -> Rewrite:
 
 #: Elementwise-mask ops pushed through a concat'd operand.  "slice"
 #: variants emit ``split`` projections of the mask; "reuse" variants
-#: fire when the mask broadcasts along the cat axis.  Both concat attr
-#: spellings, both ``add`` operand orders, both ``where`` positions.
+#: fire when the mask broadcasts along the cat axis.  The canonical
+#: ``dim`` spelling, both ``add`` operand orders, both ``where``
+#: positions.
 MASKED_FILL_CAT: list[Rewrite] = [
     _masked_fill_cat(f"masked_fill_cat_{mode}_{ak}", ak, mode)
     for mode in ("slice", "reuse")
-    for ak in ("dim", "arg1")
+    for ak in ("dim",)
 ]
 
 ADD_MASK_CAT: list[Rewrite] = [
@@ -758,7 +752,7 @@ ADD_MASK_CAT: list[Rewrite] = [
     )
     for mode in ("slice", "reuse")
     for mask_first in (False, True)
-    for ak in ("dim", "arg1")
+    for ak in ("dim",)
 ]
 
 WHERE_CAT: list[Rewrite] = [
@@ -770,7 +764,7 @@ WHERE_CAT: list[Rewrite] = [
     )
     for mode in ("slice", "reuse")
     for cat_in_x in (True, False)
-    for ak in ("dim", "arg1")
+    for ak in ("dim",)
 ]
 
 #: Concat homomorphism when BOTH operands arrive concat'd (a mask that
@@ -778,9 +772,7 @@ WHERE_CAT: list[Rewrite] = [
 #: rules: the two cat axes must coincide on the broadcast result.
 CAT_HOM: list[Rewrite] = [
     _cat_hom_add("cat_hom_add_dim", "dim"),
-    _cat_hom_add("cat_hom_add_arg1", "arg1"),
     _cat_hom_masked_fill("cat_hom_masked_fill_dim", "dim"),
-    _cat_hom_masked_fill("cat_hom_masked_fill_arg1", "arg1"),
 ]
 
 #: The mask-distribution law set.  Together with OM_SPLIT these turn
@@ -907,7 +899,7 @@ op_def(
 
 
 def _cmask_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
-    off = int(kw.get("off", kw.get("arg1", 0)) or 0)
+    off = int(kw.get("off", 0) or 0)
     t, k = x.shape[-2], x.shape[-1]
     keep = torch.ones(t, k, dtype=torch.bool, device=x.device).tril(
         -off
@@ -916,7 +908,7 @@ def _cmask_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
 
 
 def _fill_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
-    return torch.full_like(x, float(kw.get("value", kw.get("arg1", 0))))
+    return torch.full_like(x, float(kw.get("value", 0)))
 
 
 def _attnbias_torch(m: torch.Tensor, *a, **kw) -> torch.Tensor:
@@ -1033,10 +1025,10 @@ def _sdpa_cat_rhs(causal: bool) -> Op:
     OM_SPLIT."""
     qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
     mm1 = Op.make(
-        "matmul", qs, Op.make("transpose", "k1", arg1=-2, arg2=-1)
+        "matmul", qs, Op.make("transpose", "k1", dim0=-2, dim1=-1)
     )
     mm2 = Op.make(
-        "matmul", qs, Op.make("transpose", "k2", arg1=-2, arg2=-1)
+        "matmul", qs, Op.make("transpose", "k2", dim0=-2, dim1=-1)
     )
     scores = Op.make("concat", mm1, mm2, dim=-1)
     if causal:
@@ -1146,10 +1138,10 @@ def _sdpa_cat_mask_rhs() -> Op:
     guard."""
     qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
     mm1 = Op.make(
-        "matmul", qs, Op.make("transpose", "k1", arg1=-2, arg2=-1)
+        "matmul", qs, Op.make("transpose", "k1", dim0=-2, dim1=-1)
     )
     mm2 = Op.make(
-        "matmul", qs, Op.make("transpose", "k2", arg1=-2, arg2=-1)
+        "matmul", qs, Op.make("transpose", "k2", dim0=-2, dim1=-1)
     )
     scores = Op.make("concat", mm1, mm2, dim=-1)
     masked = Op.make("add", scores, Op.make("attnbias", "m"))
@@ -1203,23 +1195,23 @@ _SDPA_MASK_ATTRS: tuple[dict, ...] = (
 )
 
 #: sdpa-over-concat laws: the causal-flag unfold, the unmasked
-#: companion, and the explicit-attn_mask form — over both concat attr
-#: spellings.
+#: companion, and the explicit-attn_mask form — the canonical concat
+#: ``dim`` spelling.
 SDPA_CAT_LAWS: list[Rewrite] = [
     *(
         _sdpa_cat(f"sdpa_cat_causal_{i}_{ak}", ak, dict(attrs), True)
         for i, attrs in enumerate(_SDPA_CAUSAL_ATTRS)
-        for ak in ("dim", "arg1")
+        for ak in ("dim",)
     ),
     *(
         _sdpa_cat(f"sdpa_cat_{i}_{ak}", ak, dict(attrs), False)
         for i, attrs in enumerate(_SDPA_PLAIN_ATTRS)
-        for ak in ("dim", "arg1")
+        for ak in ("dim",)
     ),
     *(
         _sdpa_cat_masked(f"sdpa_cat_mask_{i}_{ak}", ak, dict(attrs))
         for i, attrs in enumerate(_SDPA_MASK_ATTRS)
-        for ak in ("dim", "arg1")
+        for ak in ("dim",)
     ),
 ]
 
@@ -1234,17 +1226,14 @@ SDPA_CAT_LAWS: list[Rewrite] = [
 #: structure itself.
 OM_LAWS: list[Rewrite] = [
     OM_LIFT,
-    OM_LIFT_DIM,
     OM_LIFT_PLAIN,
     OM_UNLIFT,
     OM_SPLIT,
-    OM_SPLIT_ARG1,
     OM_MERGE,
     OM_ASSOC,
     OM_ASSOC_REV,
     *CONCAT_BINARIZE,
     MATMUL_T_CONCAT,
-    MATMUL_T_CONCAT_ARG1,
     *OM_MASK_LAWS,
     *SDPA_CAT_LAWS,
 ]

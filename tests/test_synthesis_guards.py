@@ -49,7 +49,7 @@ def _om_lemma_seed():
     v2 = Var("v2", _T(4, 6))
     term = Op.make(
         "matmul",
-        Op.make("softmax", Op.make("concat", s1, s2, dim=-1), arg1=-1),
+        Op.make("softmax", Op.make("concat", s1, s2, dim=-1), dim=-1),
         Op.make("concat", v1, v2, dim=-2),
     )
     return term, (s1, s2, v1, v2)
@@ -66,9 +66,9 @@ def _attention_seed():
     kcat = Op.make("concat", k1, k2, dim=-2)
     vcat = Op.make("concat", v1, v2, dim=-2)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", kcat, dim0=-2, dim1=-1)
     )
-    term = Op.make("matmul", Op.make("softmax", scores, arg1=-1), vcat)
+    term = Op.make("matmul", Op.make("softmax", scores, dim=-1), vcat)
     return term, (q, k1, k2, v1, v2)
 
 
@@ -96,13 +96,10 @@ def test_guarded_rule_families_now_synthesizable():
     syn = {r.name for r in rules if meta._synthesizable(r)}
     for name in (
         "om_lift",
-        "om_lift_dim",
         "om_lift_plain",
         "om_split",
-        "om_split_arg1",
         "om_merge",
         "matmul_t_concat",
-        "matmul_t_concat_arg1",
         "naturality_scalar",
         "linear_row_scale",
         "linear_channel_scale",
@@ -160,7 +157,7 @@ def test_composite_check_accepts_and_rejects():
     v2_bad = Var("v2_bad", _T(9, 6))
     bad = Op.make(
         "matmul",
-        Op.make("softmax", Op.make("concat", s1, s2, dim=-1), arg1=-1),
+        Op.make("softmax", Op.make("concat", s1, s2, dim=-1), dim=-1),
         Op.make("concat", v1, v2_bad, dim=-2),
     )
     assert meta.apply_rewrite_at(lemma, bad, ()) is None
@@ -171,7 +168,7 @@ def test_composite_check_accepts_and_rejects():
     bad2 = Op.make(
         "matmul",
         Op.make(
-            "softmax", Op.make("concat", s1, s2_row, dim=0), arg1=-1
+            "softmax", Op.make("concat", s1, s2_row, dim=0), dim=-1
         ),
         Op.make("concat", v1, v2, dim=-2),
     )
@@ -193,8 +190,8 @@ def test_composite_check_symbolic_path():
     # naming the last axis — the composite check enforces it.
     s = Var("s", _T(4, 4))
     v = Var("v", _T(4, 6))
-    good = Op.make("matmul", Op.make("softmax", s, arg1=-1), v)
-    bad = Op.make("matmul", Op.make("softmax", s, arg1=0), v)
+    good = Op.make("matmul", Op.make("softmax", s, dim=-1), v)
+    bad = Op.make("matmul", Op.make("softmax", s, dim=0), v)
     assert meta.apply_rewrite_at(lemma, good, ()) is not None
     assert meta.apply_rewrite_at(lemma, bad, ()) is None
 
@@ -376,11 +373,11 @@ def test_attention_score_concat_lemma_with_derive_fp64():
                 Op.make(
                     "transpose",
                     Op.make("concat", k13, k23, dim=-2),
-                    arg1=-2,
-                    arg2=-1,
+                    dim0=-2,
+                    dim1=-1,
                 ),
             ),
-            arg1=-1,
+            dim=-1,
         ),
         Op.make("concat", v13, v23, dim=-2),
     )

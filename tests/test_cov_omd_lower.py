@@ -50,18 +50,18 @@ def _rand(shape, seed=0):
 
 def test_helpers_stack_dim_select_concrete():
     assert _stack_dim({"dim": 1}) == 1
-    assert _stack_dim({"arg1": 2}) == 2
+    assert _stack_dim({"dim": 2}) == 2
     assert _stack_dim({"dim": "x"}) == 0
     assert _stack_dim({}) == 0
 
     base = _v("b", 8, 4)
     assert _select_index(
-        Op.make("select", base, arg1=0, arg2=3)
+        Op.make("select", base, dim=0, index=3)
     ) == (base, 0, 3)
     assert (
         _select_index(
             Op.make(
-                "select", base, arg1=0, arg2="i", validate=False
+                "select", base, dim=0, index="i", validate=False
             )
         )
         is None
@@ -129,8 +129,8 @@ def test_part_gather():
     leaves = [
         Op.make(
             "aff_diag",
-            Op.make("select", base, arg1=0, arg2=i),
-            Op.make("select", base, arg1=0, arg2=i),
+            Op.make("select", base, dim=0, index=i),
+            Op.make("select", base, dim=0, index=i),
         )
         for i in range(3)
     ]
@@ -152,10 +152,10 @@ def test_part_gather():
             Op.make(
                 "select",
                 base if i else _v("y", 8, 4),
-                arg1=0,
-                arg2=1,
+                dim=0,
+                index=1,
             ),
-            Op.make("select", base, arg1=0, arg2=i),
+            Op.make("select", base, dim=0, index=i),
         )
         for i in range(2)
     ]
@@ -276,8 +276,8 @@ def _chain_term(T, Tq, d):
     leaves = [
         Op.make(
             "aff_diag",
-            Op.make("select", a_p, arg1=0, arg2=t),
-            Op.make("select", x_v, arg1=0, arg2=t),
+            Op.make("select", a_p, dim=0, index=t),
+            Op.make("select", x_v, dim=0, index=t),
         )
         for t in range(T)
     ]

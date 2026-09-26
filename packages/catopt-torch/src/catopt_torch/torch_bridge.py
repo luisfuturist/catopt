@@ -444,16 +444,15 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     "mean": lambda x, *a, **kw: x.mean(*_dim_args(a, kw)),
     "max": lambda x, *a, **kw: x.amax(*_dim_args(a, kw)),
     "min": lambda x, *a, **kw: x.amin(*_dim_args(a, kw)),
-    # Canonical names per ATTR_SCHEMA are listed first in each get;
-    # the argN spellings remain live fallbacks — rule variants and
-    # hand-minted terms legitimately carry them (Op.make preserves
-    # declared-position argN; only the export boundary is canonical).
+    # Every binding reads ONLY the canonical ATTR_SCHEMA name — the
+    # dual-spelling argN fallbacks are gone (the boundary emits
+    # canonical; nothing downstream mints a bare positional).
     "transpose": lambda x, *a, **kw: (
         x.t()
-        if x.dim() == 2 and "arg1" not in kw and "dim0" not in kw
+        if x.dim() == 2 and "dim0" not in kw and "dim1" not in kw
         else x.transpose(
-            attr_of(kw, "dim0", "arg1", default=-2),
-            attr_of(kw, "dim1", "arg2", default=-1),
+            attr_of(kw, "dim0", default=-2),
+            attr_of(kw, "dim1", default=-1),
         )
     ),
     "reshape": lambda x, *a, **kw: x.reshape(
@@ -499,18 +498,18 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         groups=kw.get("groups", 1),
     ),
     "concat": lambda *ts, **kw: torch.cat(
-        list(ts), dim=int(attr_of(kw, "dim", "arg1", default=0))
+        list(ts), dim=int(attr_of(kw, "dim", default=0))
     ),
     "chunk": lambda t, chunks=2, dim=-1, index=0, **kw: torch.chunk(
         t,
-        int(attr_of(kw, "chunks", "arg1", default=chunks)),
-        dim=int(attr_of(kw, "dim", "arg2", default=dim)),
-    )[int(attr_of(kw, "index", "arg3", default=index))],
+        int(attr_of(kw, "chunks", default=chunks)),
+        dim=int(attr_of(kw, "dim", default=dim)),
+    )[int(attr_of(kw, "index", default=index))],
     "split": lambda t, sizes=(), dim=-1, index=0, **kw: torch.split(
         t,
         _split_sizes(sizes, kw),
-        dim=int(attr_of(kw, "dim", "arg2", default=dim)),
-    )[int(attr_of(kw, "index", "arg3", default=index))],
+        dim=int(attr_of(kw, "dim", default=dim)),
+    )[int(attr_of(kw, "index", default=index))],
     # torch.export emits aten.dropout with train=False in eval mode —
     # the op is a semantic identity there.  This binding is only valid
     # because export_to_ir always exports eval()-mode graphs.
@@ -518,31 +517,31 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     # dtype casts are identity at the precision we verify (float32)
     "to": lambda x, *a, **kw: x,
     "clone": lambda x, *a, **kw: x.clone(),
-    "getitem": lambda t, **kw: t[attr_of(kw, "index", "arg1", default=0)],
+    "getitem": lambda t, **kw: t[attr_of(kw, "index", default=0)],
     "unbind": lambda t, *a, **kw: torch.unbind(
-        t, dim=int(attr_of(kw, "dim", "arg1", default=0))
-    )[int(attr_of(kw, "index", "arg2", "arg3", default=0))],
+        t, dim=int(attr_of(kw, "dim", default=0))
+    )[int(attr_of(kw, "index", default=0))],
     "stack": lambda *ts, **kw: torch.stack(
-        list(ts), dim=int(attr_of(kw, "dim", "arg1", default=0))
+        list(ts), dim=int(attr_of(kw, "dim", default=0))
     ),
     "expand": _expand_torch,
     "flatten": lambda x, *a, **kw: x.flatten(
-        int(attr_of(kw, "start_dim", "arg1", default=0)),
-        int(attr_of(kw, "end_dim", "arg2", default=-1)),
+        int(attr_of(kw, "start_dim", default=0)),
+        int(attr_of(kw, "end_dim", default=-1)),
     ),
     "slice": lambda t, *a, **kw: t[
-        (slice(None),) * int(attr_of(kw, "dim", "arg1", default=0))
-        + (slice(kw.get("arg2"), kw.get("arg3"), kw.get("arg4")),)
+        (slice(None),) * int(attr_of(kw, "dim", default=0))
+        + (slice(kw.get("start"), kw.get("end"), kw.get("step")),)
     ],
     "unsqueeze": lambda t, *a, **kw: t.unsqueeze(
-        int(attr_of(kw, "dim", "arg1", default=-1))
+        int(attr_of(kw, "dim", default=-1))
     ),
     "squeeze": lambda t, *a, **kw: t.squeeze(
-        int(attr_of(kw, "dim", "arg1", default=-1))
+        int(attr_of(kw, "dim", default=-1))
     ),
     "select": lambda t, *a, **kw: t.select(
-        int(attr_of(kw, "dim", "arg1", default=0)),
-        int(attr_of(kw, "index", "arg2", default=0)),
+        int(attr_of(kw, "dim", default=0)),
+        int(attr_of(kw, "index", default=0)),
     ),
     # embedding(W, idx) — row gather; factorised form gathers the small
     # factor then projects (eps.low_rank_gather).
@@ -554,7 +553,7 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     # operand (the raw aten spelling) is accepted too.
     "index_select": lambda t, *a, **kw: torch.index_select(
         t,
-        int(attr_of(kw, "dim", "arg1", default=0)),
+        int(attr_of(kw, "dim", default=0)),
         (
             a[0]
             if a and torch.is_tensor(a[0])
@@ -562,7 +561,7 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
                 [
                     int(v)
                     for v in attr_of(
-                        kw, "index", "arg2", default=a[0] if a else ()
+                        kw, "index", default=a[0] if a else ()
                     )
                 ],
                 dtype=torch.long,
@@ -580,17 +579,16 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     ),
     "alias": lambda x, *a, **kw: x,
     "softmax": lambda x, *a, **kw: torch.nn.functional.softmax(
-        x, dim=int(attr_of(kw, "dim", "arg1", default=-1))
+        x, dim=int(attr_of(kw, "dim", default=-1))
     ),
     # aten.rms_norm(x, normalized_shape, weight, eps) — canonical
-    # attrs dim=normalized_shape, eps=eps (Llama-family normalization);
-    # normalized_shape/arg3 are the legacy minted spellings.
+    # attrs dim=normalized_shape, eps=eps (Llama-family normalization).
     "rms_norm": lambda x, w=None, *a, **kw: (
         torch.nn.functional.rms_norm(
             x,
             tuple(attr_of(kw, "dim", "normalized_shape")),
             weight=w,
-            eps=float(attr_of(kw, "eps", "arg3", default=1e-6)),
+            eps=float(attr_of(kw, "eps", default=1e-6)),
         )
     ),
     "layer_norm": lambda x, w=None, b=None, *a, **kw: (
@@ -599,9 +597,9 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
             tuple(attr_of(kw, "dim", "normalized_shape")),
             weight=w,
             bias=b,
-            # eps is arg4 canonically — NOT arg5 (the cudnn flag):
-            # reading arg5 silently produced eps=0.0 before.
-            eps=float(attr_of(kw, "eps", "arg4", default=1e-5)),
+            # eps is the canonical ``eps`` attr — the old binding read
+            # the cudnn flag's position and silently produced eps=0.0.
+            eps=float(attr_of(kw, "eps", default=1e-5)),
         )
     ),
     "masked_fill": lambda x, m, v, *a, **kw: x.masked_fill(m, v),
@@ -747,12 +745,11 @@ def _om_compose(f, g):
 
 def _split_sizes(sizes: Any, kw: dict):
     """split(x, sizes_list) and split(x, int) both land under the
-    canonical ``sizes`` attr at the boundary; minted terms may still
-    carry the positional ``arg1`` spelling."""
+    canonical ``sizes`` attr."""
     sz = kw.get("sizes", sizes)
     if isinstance(sz, (list, tuple)) and sz:
         return list(sz)
-    return int(kw.get("arg1", sz if isinstance(sz, int) else 1))
+    return int(sz if isinstance(sz, int) else 1)
 
 
 def _dim_args(args: tuple, kwargs: dict) -> tuple:

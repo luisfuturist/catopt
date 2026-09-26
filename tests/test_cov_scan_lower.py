@@ -136,14 +136,14 @@ def test_leaf_shapes_consistent_and_select_index():
 
     base = _v("x", 8, 4)
     assert _select_index(
-        Op.make("select", base, arg1=0, arg2=2)
+        Op.make("select", base, dim=0, index=2)
     ) == (base, 0, 2)
     assert _select_index(
         Op.make("getitem", base, index=1)
     ) == (base, 0, 1)
     assert (
         _select_index(
-            Op.make("select", base, arg1=0, arg2="i", validate=False)
+            Op.make("select", base, dim=0, index="i", validate=False)
         )
         is None
     )
@@ -157,7 +157,7 @@ def test_leaf_b_gather():
         Op.make(
             "aff",
             _p(f"A{i}", 4, 4),
-            Op.make("select", base, arg1=0, arg2=i),
+            Op.make("select", base, dim=0, index=i),
         )
         for i in range(4)
     ]
@@ -168,7 +168,7 @@ def test_leaf_b_gather():
     leaves[1] = Op.make(
         "aff",
         _p("A1", 4, 4),
-        Op.make("select", _v("y", 8, 4), arg1=0, arg2=1),
+        Op.make("select", _v("y", 8, 4), dim=0, index=1),
     )
     assert _leaf_b_gather(leaves) is None
     # non-select b → None
@@ -198,7 +198,7 @@ def test_build_scan_plan_dense_diag_and_rejections():
     x = _v("x", T, d)
     # LTI recurrence: every leaf shares the same A term
     leaves = [
-        Op.make("aff", A, Op.make("select", x, arg1=0, arg2=t))
+        Op.make("aff", A, Op.make("select", x, dim=0, index=t))
         for t in range(T)
     ]
     root = Op.make("apply", _compose("aff_compose", leaves), h)
@@ -211,7 +211,7 @@ def test_build_scan_plan_dense_diag_and_rejections():
     # diagonal carrier
     a = _p("a", d)
     dleaves = [
-        Op.make("aff_diag", a, Op.make("select", x, arg1=0, arg2=t))
+        Op.make("aff_diag", a, Op.make("select", x, dim=0, index=t))
         for t in range(T)
     ]
     droot = Op.make("applyd", _compose("affd_compose", dleaves), h)
@@ -252,7 +252,7 @@ def _scan_ir_dense(T, d, shared_a=True, b_gather=True):
     for t in range(T):
         a_t = A if shared_a else _p(f"A{t}", d, d)
         b_t = (
-            Op.make("select", x, arg1=0, arg2=t)
+            Op.make("select", x, dim=0, index=t)
             if b_gather
             else _p(f"b{t}", d)
         )
@@ -305,7 +305,7 @@ def test_batched_diag_scan_matches_serial():
     T, d = 6, 4
     a, h, x = _p("a", d), _p("h", d), _v("x", T, d)
     leaves = [
-        Op.make("aff_diag", a, Op.make("select", x, arg1=0, arg2=t))
+        Op.make("aff_diag", a, Op.make("select", x, dim=0, index=t))
         for t in range(T)
     ]
     root = Op.make("applyd", _compose("affd_compose", leaves), h)
@@ -343,7 +343,7 @@ def test_batched_leaf_gather_and_nonshared_a():
         Op.make(
             "aff",
             As[t],
-            Op.make("select", x, arg1=0, arg2=2 * t),
+            Op.make("select", x, dim=0, index=2 * t),
         )
         for t in range(T)
     ]

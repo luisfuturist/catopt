@@ -1,7 +1,7 @@
 """Contract tests — plan 0001 phase 1c.
 
 Mechanical pins at the IR boundary, so that binding/attr/shape bugs
-(the ``rms_norm``-missing-binding class, the slice-``arg4``-dropped
+(the ``rms_norm``-missing-binding class, the slice-step-dropped
 class) fail loudly here instead of shipping silently through the
 integration suite.
 
@@ -13,14 +13,14 @@ Sections:
    table; canonicalized IR names (not raw aten spellings) are what
    must bind.
 2. **Shape contracts** — per-op ``cost._shape_of`` pins for the ops
-   whose attr spellings have already produced bugs: slice (arg4
-   step), split (``sizes``/``index`` vs ``arg1``/``arg3``), concat,
+   whose attr spellings have already produced bugs: slice (the
+   step), split (``sizes``/``dim``/``index``), concat,
    reshape numel-mismatch, rank-3 transpose, matvec linear,
    broadcast mismatch, rms_norm.
 3. **Attr canonicalization round-trip** — ``export_to_ir`` must land
    positional aten spellings in the canonical attr names
    (``dim``/``chunks``/``sizes``/``index``), and must never drop a
-   strided slice's ``arg4``.
+   strided slice's ``step``.
 4. **Law soundness fuzzer** — seeded random tensor bindings for every
    rule in ``SIMPLIFICATION_RULES`` + a safe subset of
    ``CATEGORICAL_RULES``; lhs and rhs are instantiated with the
@@ -144,49 +144,49 @@ _INT64_MAX = 2**63 - 1
 class TestShapeContracts:
     """``cost._shape_of`` per-op pins, built from Op terms directly."""
 
-    # -- slice: arg4 is the step (torch.export spells it positionally)
+    # -- slice: ``step`` is the stride (exported positionally)
     def test_slice_strided_last_dim(self):
         # x[..., ::2] on (2, 3, 8): torch.export emits
-        # slice(t, dim, start, end, step) = arg1..arg4.
+        # slice(t, dim, start, end, step).
         x = _var((2, 3, 8), "x")
         t = Op.make(
-            "slice", x, arg1=2, arg2=0, arg3=_INT64_MAX, arg4=2
+            "slice", x, dim=2, start=0, end=_INT64_MAX, step=2
         )
         assert _shape_of(t) == (2, 3, 4)
 
     def test_slice_strided_odd_extent(self):
         x = _var((2, 3, 7), "x")
-        t = Op.make("slice", x, arg1=2, arg2=0, arg3=None, arg4=2)
+        t = Op.make("slice", x, dim=2, start=0, end=None, step=2)
         assert _shape_of(t) == (2, 3, 4)  # ceil(7/2)
 
     def test_slice_default_step_is_identity(self):
         x = _var((2, 8), "x")
-        t = Op.make("slice", x, arg1=1, arg2=0, arg3=_INT64_MAX)
+        t = Op.make("slice", x, dim=1, start=0, end=_INT64_MAX)
         assert _shape_of(t) == (2, 8)
 
     def test_slice_dim_spelling(self):
-        # 'dim' is the accepted named alternative to arg1.
+        # 'dim' is the canonical axis name.
         x = _var((2, 8), "x")
-        t = Op.make("slice", x, dim=1, arg2=2, arg3=6)
+        t = Op.make("slice", x, dim=1, start=2, end=6)
         assert _shape_of(t) == (2, 4)
 
-    # -- split: BOTH spellings must shape identically
+    # -- split: canonical ``sizes``/``dim``/``index`` shapes correctly
     def test_split_sizes_index_spelling(self):
         x = _var((2, 12), "x")
         t = Op.make("split", x, sizes=(4, 8), dim=1, index=1)
         assert _shape_of(t) == (2, 8)
 
-    def test_split_argN_spelling_list(self):
-        # exported list-split keeps the list under arg1 and the
-        # getitem-fold index under arg3.
+    def test_split_sizes_list_spelling(self):
+        # exported list-split keeps the list under ``sizes`` and the
+        # getitem-fold index under ``index``.
         x = _var((2, 12), "x")
-        t = Op.make("split", x, arg1=(4, 8), arg3=1, dim=1)
+        t = Op.make("split", x, sizes=(4, 8), index=1, dim=1)
         assert _shape_of(t) == (2, 8)
 
-    def test_split_argN_spelling_int(self):
-        # torch.split(x, 4) — equal-size sections, int under arg1.
+    def test_split_sizes_int_spelling(self):
+        # torch.split(x, 4) — equal-size sections, int under ``sizes``.
         x = _var((2, 12), "x")
-        t = Op.make("split", x, arg1=4, arg3=0, dim=1)
+        t = Op.make("split", x, sizes=4, index=0, dim=1)
         assert _shape_of(t) == (2, 4)
 
     # -- concat sums operand extents along the cat axis
@@ -195,9 +195,9 @@ class TestShapeContracts:
         t = Op.make("concat", a, b, c, dim=1)
         assert _shape_of(t) == (2, 13)
 
-    def test_concat_arg1_spelling(self):
+    def test_concat_dim_spelling(self):
         a, b = _var((2, 4), "a"), _var((2, 8), "b")
-        t = Op.make("concat", a, b, arg1=-1)
+        t = Op.make("concat", a, b, dim=-1)
         assert _shape_of(t) == (2, 12)
 
     # -- reshape must preserve numel; a mismatch is _INVALID (poisonous)
@@ -217,10 +217,10 @@ class TestShapeContracts:
     def test_transpose_rank3(self):
         x = _var((2, 3, 4), "x")
         assert _shape_of(
-            Op.make("transpose", x, arg1=1, arg2=2)
+            Op.make("transpose", x, dim0=1, dim1=2)
         ) == (2, 4, 3)
         assert _shape_of(
-            Op.make("transpose", x, arg1=-2, arg2=-1)
+            Op.make("transpose", x, dim0=-2, dim1=-1)
         ) == (2, 4, 3)
 
     # -- matvec / linear rank-1 cases
@@ -246,10 +246,10 @@ class TestShapeContracts:
         a, b = _var((2, 1), "a"), _var((1, 3), "b")
         assert _shape_of(Op.make("add", a, b)) == (2, 3)
 
-    # -- rms_norm: exported attrs are dim=normalized_shape + arg3=eps
+    # -- rms_norm: exported attrs are dim=normalized_shape + eps=eps
     def test_rms_norm_passthrough_shape(self):
         x, w = _var((2, 8), "x"), _var((8,), "w")
-        t = Op.make("rms_norm", x, w, dim=(8,), arg3=1e-5)
+        t = Op.make("rms_norm", x, w, dim=(8,), eps=1e-5)
         assert _shape_of(t) == (2, 8)
 
 
@@ -337,10 +337,10 @@ class TestAttrCanonicalization:
         for t in ops:
             assert "sizes" in t.attrs, f"split missing 'sizes': {t.attrs}"
             assert "dim" in t.attrs, (
-                "split arg2 (the dim) must be renamed to 'dim'"
+                "split must carry the canonical 'dim'"
             )
             assert "index" in t.attrs, (
-                "split must carry the getitem-folded 'index', not arg3"
+                "split must carry the getitem-folded 'index'"
             )
             assert "arg2" not in t.attrs and "arg3" not in t.attrs, (
                 f"split carries bare positional attrs: {t.attrs}"
@@ -352,7 +352,7 @@ class TestAttrCanonicalization:
         )
         assert ops, "expected a slice node in the exported graph"
         (t,) = ops  # exactly one slice
-        assert t.attrs.get("arg4") == 2, (
+        assert t.attrs.get("step") == 2, (
             "CONTRACT VIOLATION: strided slice lost its step — "
             f"attrs are {t.attrs}"
         )

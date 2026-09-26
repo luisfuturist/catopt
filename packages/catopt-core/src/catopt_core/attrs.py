@@ -20,23 +20,22 @@ The contract has two halves:
 
 * **Boundary** — ``export_to_ir`` names non-node args at declared
   positions by the schema at emission, so exported terms carry ONLY
-  canonical spellings (``concat(dim=-2)``, ``sdpa(is_causal=True)``).
+  canonical spellings (``concat(dim=-2)``, ``sdpa(is_causal=True)``,
+  ``transpose(dim0=1, dim1=2)``, ``slice(dim=2, start=0, end=…,
+  step=2)``).
 * **Mint** — ``Op.make`` *validates*: a positional ``argN`` at a
   position the schema does not declare, or a required attr missing
   from a fully-attributed term, is a ``ValueError`` — a rewrite
   minting a malformed term dies at mint time, not silently at eval.
 
-  Minted ``argN`` at declared positions is PRESERVED, not renamed:
-  the ``*_arg1``-suffixed rule variants in ``om.py``/``xcarrier.py``
-  (and hand-minted terms across the suite) pattern-match arg-spelled
-  e-nodes, so renaming at mint would silently kill whole rule
-  families.  Canonical names and ``argN`` are both legal minted
-  spellings; the schema bounds WHICH positions may be spelled
-  positionally.  Positions whose canonical name IS the ``argN``
-  spelling (``slice``'s start/end/step — ``typing._shape_of`` reads
-  ``arg2``/``arg3``/``arg4`` literally) are declared with that name;
-  the rename to ``start``/``end``/``step`` lands with the downstream
-  get-chain cleanup.
+  Minted ``argN`` at declared positions is PRESERVED, not renamed —
+  the schema bounds WHICH positions may be spelled positionally, it
+  does not forbid the spelling.  Every downstream *reader* and *rule
+  matcher*, however, reads ONLY the canonical name (the dual-spelling
+  ``argN`` fallbacks were collapsed here); a term minted with a bare
+  positional therefore behaves as if that attr were absent.  The
+  canonical spelling is the ONE spelling the system produces and
+  consumes.
 
   When BOTH spellings arrive (``attrs["arg5"] = True`` patched onto a
   term already carrying ``is_causal`` — ``optimize._specialize_causal``
@@ -62,16 +61,15 @@ __all__ = [
     "ATTR_REQUIRED",
     "ATTR_SCHEMA",
     "attr_of",
-    "canonicalize_attrs",
     "is_positional_attr",
     "validate_attrs",
 ]
 
 #: arg position (the ``N`` in torch.export's ``argN``) -> canonical
 #: attr name.  Only *attribute* positions appear here — positions
-#: carrying tensor operands are never attrs.  Positions declared with
-#: an ``argN`` name keep the positional spelling as canonical (see the
-#: module docstring).
+#: carrying tensor operands are never attrs.  Every name is the ONE
+#: canonical spelling the boundary emits and the readers consume; no
+#: position declares an ``argN`` name (see the module docstring).
 ATTR_SCHEMA: dict[str, dict[int, str]] = {
     # --- product structure -------------------------------------------------
     "concat": {1: "dim"},
@@ -81,28 +79,20 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     "split": {1: "sizes", 2: "dim", 3: "index"},
     "getitem": {1: "index"},
     # --- axis ops -----------------------------------------------------------
-    # transpose/unsqueeze/squeeze/softmax/dropout: the positional
-    # spelling IS the canonical one today — every rule pattern mints
-    # argN (no dim0/dim1-pattern variants exist, and typing/ibp read
-    # argN first).  Canonicalising them at the boundary would orphan
-    # whole rule families; declared with argN names so the positions
-    # are still contracted (a stray arg3 on transpose fails loudly)
-    # and the downstream rename lands when the readers move.
-    "transpose": {1: "arg1", 2: "arg2"},
-    "unsqueeze": {1: "arg1"},
-    "squeeze": {1: "arg1"},
-    "softmax": {1: "arg1"},
+    # transpose(x, dim0, dim1) — the axes the rule patterns mint and
+    # every reader (typing, ibp, the torch binding) reads.
+    "transpose": {1: "dim0", 2: "dim1"},
+    "unsqueeze": {1: "dim"},
+    "squeeze": {1: "dim"},
+    "softmax": {1: "dim"},
     "select": {1: "dim", 2: "index"},
     "flatten": {1: "start_dim", 2: "end_dim"},
     "index_select": {1: "dim", 2: "index"},
     "gather": {1: "dim"},
     "narrow": {1: "dim", 2: "start", 3: "length"},
-    # slice's start/end/step stay positional: ``typing._shape_of`` and
-    # the ``_IR_TO_TORCH`` binding read ``arg2``/``arg3``/``arg4``
-    # literally — the ``start``/``end``/``step`` names land when the
-    # downstream readers are cleaned up.  Declared anyway so a stray
-    # ``arg5`` on slice fails loudly.
-    "slice": {1: "dim", 2: "arg2", 3: "arg3", 4: "arg4"},
+    # aten.slice(t, dim, start, end, step) — the trailing three are
+    # the slice bounds/stride, read by typing/ibp/the binding.
+    "slice": {1: "dim", 2: "start", 3: "end", 4: "step"},
     # --- attention / normalisation -----------------------------------------
     # sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa);
     # attn_mask is normally a tensor operand, the rest arrive as arg4..7.
@@ -121,8 +111,8 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     # cudnn_enabled): eps is arg4 — NOT arg5 (the cudnn flag).  The old
     # binding read arg5 for eps and silently produced eps=0.0.
     "layer_norm": {1: "dim", 4: "eps", 5: "cudnn_enabled"},
-    # aten.dropout(x, p, train) — patterns mint arg1/arg2.
-    "dropout": {1: "arg1", 2: "arg2"},
+    # aten.dropout(x, p, train).
+    "dropout": {1: "p", 2: "train"},
     # aten.conv2d positional tails — also intercepted operand-side by
     # the exporter (list-valued stride/padding never reach ``argN``).
     "conv2d": {3: "stride", 4: "padding", 5: "dilation", 6: "groups"},
@@ -141,15 +131,15 @@ ATTR_REQUIRED: dict[str, frozenset[str]] = {
     "chunk": frozenset({"chunks"}),
     "split": frozenset({"sizes"}),
     "getitem": frozenset({"index"}),
-    "transpose": frozenset({"arg1", "arg2"}),
-    "unsqueeze": frozenset({"arg1"}),
-    "squeeze": frozenset({"arg1"}),
+    "transpose": frozenset({"dim0", "dim1"}),
+    "unsqueeze": frozenset({"dim"}),
+    "squeeze": frozenset({"dim"}),
     "select": frozenset({"dim", "index"}),
     "flatten": frozenset({"start_dim"}),
     "index_select": frozenset({"dim"}),
     "gather": frozenset({"dim"}),
     "narrow": frozenset({"dim", "start", "length"}),
-    "softmax": frozenset({"arg1"}),
+    "softmax": frozenset({"dim"}),
     "slice": frozenset({"dim"}),
     "rms_norm": frozenset({"dim"}),
     "layer_norm": frozenset({"dim"}),
@@ -177,31 +167,6 @@ def attr_of(source: Any, *names: str, default: Any = None) -> Any:
 def is_positional_attr(key: Any) -> bool:
     """True for the ``argN`` positional-attr spelling."""
     return isinstance(key, str) and _ARG_RE.match(key) is not None
-
-
-def canonicalize_attrs(
-    op: str, attrs: dict[str, Any]
-) -> dict[str, Any]:
-    """Rename every schema-declared ``argN`` to its canonical name.
-
-    The positional ``argN`` wins over a pre-supplied canonical key —
-    imperative patches (``attrs["arg5"] = True``) must take effect —
-    then lands under the canonical name.  ``argN`` at positions the
-    schema does not declare are left untouched (they may be legal on
-    non-schema'd ops; mint-time validation owns the loud failure).
-    """
-    schema = ATTR_SCHEMA.get(op)
-    if schema is None:
-        return attrs
-    out = dict(attrs)
-    for key in list(out):
-        m = _ARG_RE.match(key)
-        if m is None:
-            continue
-        canon = schema.get(int(m.group(1)))
-        if canon is not None and canon != key:
-            out[canon] = out.pop(key)
-    return out
 
 
 def validate_attrs(

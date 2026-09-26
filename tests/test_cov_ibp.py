@@ -236,7 +236,7 @@ def test_eval_concrete_variants():
 def test_norm_input_box_forms():
     x = _v("x", 2, 3)
     y = _v("y", 4)
-    term = Op.make("add", x, Op.make("sum", y, arg1=0))
+    term = Op.make("add", x, Op.make("sum", y, dim=0))
     x0 = torch.randn(2, 3)
     y0 = torch.randn(4)
 
@@ -346,7 +346,7 @@ def test_ibp_reductions():
         ("max", torch.amax),
         ("min", torch.amin),
     ):
-        t = Op.make(op, x, arg1=-1)
+        t = Op.make(op, x, dim=-1)
         res = ibp_bound(t, {}, {"x": (lo, hi)})
         assert torch.allclose(res["lo"], ref(lo, dim=-1))
         assert torch.allclose(res["hi"], ref(hi, dim=-1))
@@ -431,7 +431,7 @@ def test_ibp_concat_and_structural_failure():
     # structural op that raises at eval (out-of-range select) →
     # honest unsupported flag (the interval map can't run)
     res = ibp_bound(
-        Op.make("select", a, arg1=0, arg2=5), {}, {"a": (la, ha)}
+        Op.make("select", a, dim=0, index=5), {}, {"a": (la, ha)}
     )
     assert "select" in res["unsupported"]
 
@@ -505,12 +505,12 @@ def test_hop_embedding_conv2d_and_preserving_ops():
 def test_hop_transpose_reshape_rearrange():
     xb = _box(torch.randn(4, 8), torch.randn(4, 8))
     ob_same = _box(torch.randn(8, 4), torch.randn(8, 4))
-    tr = Op.make("transpose", _v("x", 4, 8), arg1=-2, arg2=-1)
+    tr = Op.make("transpose", _v("x", 4, 8), dim0=-2, dim1=-1)
     # swapping the last two dims preserves the spectral bound
     assert _hop(tr, 0, [xb], ob_same, "spec") == (1.0, "spec")
     # swapping dim 0 ↔ 1 on a 3-D tensor is a rearrangement
     xb3 = _box(torch.randn(2, 4, 8), torch.randn(2, 4, 8))
-    tr3 = Op.make("transpose", _v("x", 2, 4, 8), arg1=0, arg2=1)
+    tr3 = Op.make("transpose", _v("x", 2, 4, 8), dim0=0, dim1=1)
     ob3 = _box(torch.randn(4, 2, 8), torch.randn(4, 2, 8))
     m, k = _hop(tr3, 0, [xb3], ob3, "row")
     assert m == 1.0 and k == "row"  # last dim (8) preserved
@@ -564,7 +564,7 @@ def test_hop_mul_div_pow():
 def test_hop_softmax_reductions_where_unary_and_unknown():
     xb = _box(torch.zeros(2, 3), torch.ones(2, 3))
     ob = _box(torch.zeros(3), torch.ones(3))
-    sm = Op.make("softmax", _v("x", 2, 3), arg1=-1)
+    sm = Op.make("softmax", _v("x", 2, 3), dim=-1)
     m, k = _hop(sm, 0, [xb], xb, "row")
     assert 0 < m <= 1.0 and k == "row"
     # sum over 6 inputs → 3 outputs: √(n_in/n_out) bound
@@ -624,7 +624,7 @@ def test_grid_lip_and_softmax_lip():
     v2 = _grid_lip(b2, torch.cos, (0.0,))
     assert v2 == pytest.approx(max(abs(math.cos(3)), abs(math.cos(4))))
     sm_box = _box(torch.zeros(1, 4), torch.ones(1, 4))
-    lip = _softmax_lip(sm_box, {"arg1": -1})
+    lip = _softmax_lip(sm_box, {"dim": -1})
     assert 0 < lip <= 1.0
 
 
@@ -761,7 +761,7 @@ def test_prop_delta_concat_stack_index_select_embedding():
     assert torch.equal(cur[1], d1)
 
     ix = Op.make(
-        "index_select", _v("a", 4, 3), _p("i", 2), arg1=0
+        "index_select", _v("a", 4, 3), _p("i", 2), dim=0
     )
     ivals = torch.tensor([0, 2])
     cur, _ = _prop_delta(
@@ -818,7 +818,7 @@ def test_prop_delta_mul_div_reductions_and_lip_ops():
         is None
     )
 
-    su = Op.make("sum", _v("a", 4), arg1=0)
+    su = Op.make("sum", _v("a", 4), dim=0)
     cur, _ = _prop_delta(
         su, 0, d, False, _pb(a), None, {}, {}
     )
@@ -915,7 +915,7 @@ def test_walk_site_and_artifact_direct():
     assert got == pytest.approx(ref)
     # degrade path: hop with a scalar rule but no tensor rule (softmax)
     sm_term = Op.make(
-        "linear", Op.make("softmax", inner, arg1=-1), _p("W2", 6, 8)
+        "linear", Op.make("softmax", inner, dim=-1), _p("W2", 6, 8)
     )
     ib3 = ibp_bound(sm_term, env, {"x": x0})
     got = _walk_site_artifact(

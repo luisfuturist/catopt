@@ -135,7 +135,7 @@ def test_structural_ops_preserve_boxes():
     res = ibp_bound(t, {}, {"x": b})
     assert res["lo"].shape == (4, 2)
     tr = ibp_bound(
-        Op.make("transpose", x, arg1=0, arg2=1), {}, {"x": b}
+        Op.make("transpose", x, dim0=0, dim1=1), {}, {"x": b}
     )
     assert tr["lo"].shape == (4, 2)
 

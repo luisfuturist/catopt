@@ -173,7 +173,7 @@ def _select_index(term: Op) -> tuple[Any, int, int] | None:
     """Decompose ``select(base, dim, i)``/getitem-style leaf operands.
 
     Returns ``(base_term, dim, index)`` or ``None``.  Covers the
-    ``select(x, arg1=dim, arg2=i)`` shape torch.export emits for
+    ``select(x, dim=…, index=i)`` shape the export boundary emits for
     ``x[i]`` indexing.
     """
     if (
@@ -183,14 +183,14 @@ def _select_index(term: Op) -> tuple[Any, int, int] | None:
     ):
         return None
     if term.op == "getitem":
-        # t[i] — arg1/index IS the index; always dim 0 (see the
+        # t[i] — index IS the index; always dim 0 (see the
         # torch_bridge binding).  Do not conflate with select.
-        idx = term.attrs.get("arg1", term.attrs.get("index"))
+        idx = term.attrs.get("index")
         if not isinstance(idx, int):
             return None
         return (term.args[0], 0, idx)
-    dim = term.attrs.get("arg1", term.attrs.get("dim", 0))
-    idx = term.attrs.get("arg2", term.attrs.get("index"))
+    dim = term.attrs.get("dim", 0)
+    idx = term.attrs.get("index")
     if not isinstance(dim, int) or not isinstance(idx, int):
         return None
     return (term.args[0], dim, idx)

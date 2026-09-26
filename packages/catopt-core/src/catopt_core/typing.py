@@ -222,8 +222,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if not base:
                 # () has no axes to permute (also guards d % len(base)).
                 return None
-            d0 = attr_of(op, "arg1", "dim0", default=-2)
-            d1 = attr_of(op, "arg2", "dim1", default=-1)
+            d0 = attr_of(op, "dim0", default=-2)
+            d1 = attr_of(op, "dim1", default=-1)
             d0, d1 = d0 % len(base), d1 % len(base)
             out = list(base)
             out[d0], out[d1] = out[d1], out[d0]
@@ -274,14 +274,14 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if base is None:  # pragma: no cover — dispatch filters None shapes
                 return None
-            d = attr_of(op, "arg1", "dim", default=-1)
+            d = attr_of(op, "dim", default=-1)
             d = d % (len(base) + 1)
             return (*tuple(base[:d]), 1, *tuple(base[d:]))
         case "squeeze":
             base = shapes[0]
             if not base:
                 return None
-            d = attr_of(op, "arg1", "dim", default=-1) % len(base)
+            d = attr_of(op, "dim", default=-1) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
         case "expand":
             s = op.attrs.get("shape")
@@ -291,7 +291,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if base is None:  # pragma: no cover — dispatch filters None shapes
                 return None
-            d = attr_of(op, "arg1", "dim", default=0)
+            d = attr_of(op, "dim", default=0)
             d = d % (len(base) + 1)
             n = len(op.args)
             return (*tuple(base[:d]), n, *tuple(base[d:]))
@@ -302,7 +302,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if not base:
                 # () has no dim to unbind — carrier-internal operand.
                 return None
-            d = attr_of(op, "arg1", "dim", default=-1) % len(base)
+            d = attr_of(op, "dim", default=-1) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
         case "getitem":
             # After unbind the element shape is already the arg's shape.
@@ -311,20 +311,21 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if not base:
                 return None
-            d = attr_of(op, "arg1", "dim", default=0) % len(base)
+            d = attr_of(op, "dim", default=0) % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
         case "slice":
-            # aten.slice(t, dim, start, end, step) — arg4 is the step
-            # (torch.export spells it positionally).  Ignoring it makes
-            # strided slices (x[..., ::2], RoPE) report the unsliced
-            # shape and poisons every downstream broadcast as _INVALID.
+            # aten.slice(t, dim, start, end, step) — step bounds the
+            # stride (torch.export spells it positionally).  Ignoring
+            # it makes strided slices (x[..., ::2], RoPE) report the
+            # unsliced shape and poisons every downstream broadcast as
+            # _INVALID.
             base = shapes[0]
             if not base:
                 return None
-            d = attr_of(op, "arg1", "dim", default=0) % len(base)
-            lo = op.attrs.get("arg2", 0) or 0
-            hi = op.attrs.get("arg3")
-            step = op.attrs.get("arg4", 1) or 1
+            d = attr_of(op, "dim", default=0) % len(base)
+            lo = op.attrs.get("start", 0) or 0
+            hi = op.attrs.get("end")
+            step = op.attrs.get("step", 1) or 1
             out = list(base)
             if isinstance(base[d], int):
                 n = (
@@ -343,8 +344,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if not base:
                 return None
-            d = attr_of(op, "dim", "arg1", default=0) % len(base)
-            idx = attr_of(op, "index", "arg2")
+            d = attr_of(op, "dim", default=0) % len(base)
+            idx = attr_of(op, "index")
             out = list(base)
             out[d] = (
                 len(idx) if isinstance(idx, (tuple, list)) else None
@@ -354,8 +355,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if not base:
                 return None
-            d0 = attr_of(op, "arg1", "start_dim", default=0)
-            d1 = attr_of(op, "arg2", "end_dim", default=-1)
+            d0 = attr_of(op, "start_dim", default=0)
+            d1 = attr_of(op, "end_dim", default=-1)
             d0, d1 = d0 % len(base), d1 % len(base)
             merged = _numel(base[d0 : d1 + 1])
             return (*tuple(base[:d0]), merged, *tuple(base[d1 + 1 :]))
@@ -415,7 +416,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if not a:
                 # () has no cat axis — carrier-internal operand.
                 return None
-            dim = attr_of(op, "dim", "arg1", default=0) % len(a)
+            dim = attr_of(op, "dim", default=0) % len(a)
             out = list(a)
             out[dim] = 0
             for s in shapes:
@@ -437,12 +438,10 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if not base:
                 return None
             dim = op.attrs.get("dim", -1) % len(base)
-            # Two attr spellings exist: pairing passes mint
-            # ``sizes=(...)``/``index=i``; exported graphs carry
-            # torch.split's ``arg1`` = per-section size (or a size
-            # list) and ``arg3``/``index`` = the section index.
-            sizes = attr_of(op, "sizes", "arg1")
-            idx = attr_of(op, "index", "arg3", default=0) or 0
+            # ``sizes`` is the per-section size (or a size list);
+            # ``index`` is the section index.
+            sizes = attr_of(op, "sizes")
+            idx = attr_of(op, "index", default=0) or 0
             out = list(base)
             if isinstance(sizes, (tuple, list)):
                 out[dim] = sizes[idx] if idx < len(sizes) else None
@@ -554,9 +553,8 @@ def _concrete(shape: Any) -> bool:
 
 def _stack_dim(attrs: dict) -> int:
     """The concatenation/stack axis from an op's attrs — the canonical
-    ``dim`` spelling or positional ``arg1``, defaulting to 0 on a
-    non-int value."""
-    d = attr_of(attrs, "dim", "arg1", default=0)
+    ``dim`` spelling, defaulting to 0 on a non-int value."""
+    d = attr_of(attrs, "dim", default=0)
     return d if isinstance(d, int) else 0
 
 

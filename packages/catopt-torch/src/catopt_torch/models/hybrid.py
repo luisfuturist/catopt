@@ -30,11 +30,10 @@ Design notes:
   ``masked_fill``/additive causal mask would.  Kept unmasked for the
   same reason: this module exists to expose the carrier, not to be a
   production attention.
-* ``torch.export`` emits ``cat`` with the axis positional
-  (``arg1=-2``), while every rule-produced concat uses ``dim=``.  The
-  om rule set speaks ``dim`` internally, so tests normalise the
-  exported spelling before saturating — see tests/test_hybrid.py for
-  the (honest) finding that the two spellings cannot recombine.
+* ``torch.export`` emits ``cat`` with the axis positional, but the
+  export boundary canonicalises it to ``dim`` (``ATTR_SCHEMA``), so
+  every exported and rule-produced concat speaks the same spelling —
+  see tests/test_hybrid.py.
 
 Everything is ``.double()``-compatible for fp64-exact verification.
 """

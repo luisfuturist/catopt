@@ -61,7 +61,7 @@ def _masked_dense_term(
     kcat = _nested_cat(ks, -2, attr_key)
     vcat = _nested_cat(vs, -2, attr_key)
     scores = Op.make(
-        "matmul", q, Op.make("transpose", kcat, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", kcat, dim0=-2, dim1=-1)
     )
     if style == "masked_fill":
         masked = Op.make("masked_fill", scores, m, NEG_INF)
@@ -73,7 +73,7 @@ def _masked_dense_term(
         masked = Op.make("where", m, scores, NEG_INF)
     else:
         raise ValueError(style)
-    return Op.make("matmul", Op.make("softmax", masked, arg1=-1), vcat)
+    return Op.make("matmul", Op.make("softmax", masked, dim=-1), vcat)
 
 
 def _masked_dense_ref(q, ks, vs, m, style="masked_fill"):

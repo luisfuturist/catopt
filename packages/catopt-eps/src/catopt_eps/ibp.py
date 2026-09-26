@@ -33,9 +33,9 @@ dimension).  A certificate bound ``b`` on a substituted tensor means
 every row of the error is within ``b`` (spectral: row ≤ σ_max;
 Frobenius: worst-case single row ≤ ‖·‖_F), and the output max-abs error
 is within the row bound.  For sites sitting in a *weight slot*
-(``arg1`` of ``linear``/``matmul``) the bound is carried as a spectral
-bound on ΔW instead — ``y = x·ΔWᵀ`` gives ``‖δy_row‖ ≤ ‖x_row‖·‖ΔW‖₂``
-directly, without paying a √m conversion.
+(the weight operand of ``linear``/``matmul``) the bound is carried as
+a spectral bound on ΔW instead — ``y = x·ΔWᵀ`` gives
+``‖δy_row‖ ≤ ‖x_row‖·‖ΔW‖₂`` directly, without paying a √m conversion.
 
 Soundness caveat (documented, not hidden): local constants are evaluated
 on activation boxes widened by the accumulated upstream perturbation
@@ -374,7 +374,7 @@ def _ibp_eval(
                 unsupported.append("linear:1d-weight")
                 box = _inf_box(t)
         elif op == "softmax":
-            dim = int(attr_of(attrs, "arg1", "dim", default=-1))
+            dim = int(attr_of(attrs, "dim", default=-1))
             box = _softmax(argboxes[0], dim)
         elif op in ("sum", "mean") and fn is not None:
             # reductions are monotone in every input
@@ -385,7 +385,7 @@ def _ibp_eval(
             # no torch binding for these names — apply amax/amin on the
             # declared dim (whole tensor when absent); monotone in input
             a = argboxes[0]
-            dim = attr_of(attrs, "dim", "arg1")
+            dim = attr_of(attrs, "dim")
             keep = bool(attrs.get("keepdim", False))
             f = torch.amax if op == "max" else torch.amin
             if dim is None:
@@ -737,7 +737,7 @@ def _unary_lip(op: str, b: Box, attrs: dict) -> float | None:
 def _softmax_lip(b: Box, attrs: dict) -> float:
     """‖J_softmax‖₂ ≤ max_i p_i (J = diag(p) − ppᵀ ≼ diag(p)); bounded
     by the interval softmax's upper corner."""
-    dim = int(attr_of(attrs, "arg1", "dim", default=-1))
+    dim = int(attr_of(attrs, "dim", default=-1))
     return float(_softmax(b, dim).hi.max())
 
 
@@ -806,12 +806,9 @@ def _hop(
 
     if op in ("transpose",):
         # preserving spectral norm only if swapping the last two dims.
-        # ``arg1``/``arg2`` are the canonical positional spelling for
-        # transpose today; accept ``dim0``/``dim1`` as fallback like
-        # other dual-spelling readers (torch_bridge, typing).
         nd = argb[0].lo.ndim
-        a1 = int(attr_of(node, "arg1", "dim0", default=-2))
-        a2 = int(attr_of(node, "arg2", "dim1", default=-1))
+        a1 = int(attr_of(node, "dim0", default=-2))
+        a2 = int(attr_of(node, "dim1", default=-1))
         a1, a2 = a1 % max(1, nd), a2 % max(1, nd)
         if {a1, a2} == {nd - 2, nd - 1}:
             return 1.0, kind
@@ -958,10 +955,11 @@ def _site_scalar(
 ) -> tuple[float, str] | None:
     """The perturbation scalar injected at the site: (r0, kind).
 
-    Weight-slot sites (site value feeds arg1 of linear/matmul) carry a
-    spectral bound on ΔW; everything else carries a per-row L2 bound on
-    the site value's perturbation.  ``actual`` selects the realized
-    difference over the certificate radius."""
+    Weight-slot sites (site value feeds the weight operand of
+    linear/matmul) carry a spectral bound on ΔW; everything else
+    carries a per-row L2 bound on the site value's perturbation.
+    ``actual`` selects the realized difference over the certificate
+    radius."""
     p = site["path"]
     b = site["bound"]
     norm = site.get("norm") or "frobenius"
@@ -1225,7 +1223,7 @@ def _prop_delta(
         except Exception:
             return None
     if op in ("concat", "cat"):
-        dim = int(attr_of(node, "dim", "arg1", default=0))
+        dim = int(attr_of(node, "dim", default=0))
         parts = []
         for j, b in enumerate(argb):
             parts.append(
@@ -1233,7 +1231,7 @@ def _prop_delta(
             )
         return torch.cat(parts, dim=dim), mag
     if op == "stack":
-        dim = int(attr_of(node, "dim", "arg1", default=0))
+        dim = int(attr_of(node, "dim", default=0))
         parts = [
             cur if j == i else torch.zeros_like(b.lo.double())
             for j, b in enumerate(argb)

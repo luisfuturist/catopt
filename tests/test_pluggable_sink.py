@@ -40,8 +40,8 @@ def _dim(kw, default=-1):
 
 
 def _transpose(x, **kw):
-    d0 = int(kw.get("dim0", kw.get("arg1", -2)))
-    d1 = int(kw.get("dim1", kw.get("arg2", -1)))
+    d0 = int(kw.get("dim0", -2))
+    d1 = int(kw.get("dim1", -1))
     return np.swapaxes(x, d0, d1)
 
 

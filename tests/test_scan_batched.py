@@ -70,7 +70,7 @@ def _balanced_scan_ir(model, x_var, ir, steps):
 
     def leaf(t):
         return Op.make(
-            "aff", p_a, Op.make("select", x_var, arg1=0, arg2=t)
+            "aff", p_a, Op.make("select", x_var, dim=0, index=t)
         )
 
     def tree(lo, hi):
@@ -282,8 +282,8 @@ def test_fallback_on_scan_ops_outside_apply():
     # module must fall back to serial tuple-passing eval.
     bare = Op.make(
         "aff_compose",
-        Op.make("aff", p_a, Op.make("select", xv, arg1=0, arg2=1)),
-        Op.make("aff", p_a, Op.make("select", xv, arg1=0, arg2=0)),
+        Op.make("aff", p_a, Op.make("select", xv, dim=0, index=1)),
+        Op.make("aff", p_a, Op.make("select", xv, dim=0, index=0)),
     )
     weird_ir = IR(
         root=bare,

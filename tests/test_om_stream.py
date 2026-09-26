@@ -47,7 +47,7 @@ def _dense_ref(q, ks, vs):
 
 
 def _qk_leaf(q, k, v):
-    s = Op.make("matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1))
+    s = Op.make("matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1))
     return Op.make("om_elem", s, v)
 
 
@@ -107,8 +107,8 @@ def _chunked_kv_ir(B, H, Tq, d, dv, Tkv, C):
     Vb = Var("V", TensorType((B, H, n * C, dv)))
 
     def leaf(i):
-        ki = Op.make("chunk", Kb, arg1=n, arg2=-2, index=i)
-        vi = Op.make("chunk", Vb, arg1=n, arg2=-2, index=i)
+        ki = Op.make("chunk", Kb, chunks=n, dim=-2, index=i)
+        vi = Op.make("chunk", Vb, chunks=n, dim=-2, index=i)
         return _qk_leaf(q, ki, vi)
 
     root = Op.make(

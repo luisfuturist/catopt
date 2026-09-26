@@ -111,7 +111,7 @@ def _cumsum_term(T: int, d: int):
     h0 = Param("h0", TensorType((d,)))
     h = h0
     for t in range(T):
-        h = Op.make("add", h, Op.make("select", x, arg1=0, arg2=t))
+        h = Op.make("add", h, Op.make("select", x, dim=0, index=t))
     return h, [x]
 
 
@@ -360,8 +360,8 @@ def test_unit_lift_ignores_add_of_increments():
     x = Var("x", TensorType((4, 4)))
     term = Op.make(
         "add",
-        Op.make("select", x, arg1=0, arg2=0),
-        Op.make("select", x, arg1=0, arg2=1),
+        Op.make("select", x, dim=0, index=0),
+        Op.make("select", x, dim=0, index=1),
     )
     eg = EGraph()
     root = eg.add_term(term)
@@ -370,7 +370,7 @@ def test_unit_lift_ignores_add_of_increments():
         assert eg.rule_fires.get(name, 0) == 0
 
     term2 = Op.make(
-        "add", Const(2.0), Op.make("select", x, arg1=0, arg2=0)
+        "add", Const(2.0), Op.make("select", x, dim=0, index=0)
     )
     eg2 = EGraph()
     r2 = eg2.add_term(term2)
@@ -385,7 +385,7 @@ def test_unit_lift_admits_leaf_state():
     no applyd precedes it)."""
     x = Var("x", TensorType((4, 4)))
     h0 = Param("h0", TensorType((4,)))
-    term = Op.make("add", h0, Op.make("select", x, arg1=0, arg2=0))
+    term = Op.make("add", h0, Op.make("select", x, dim=0, index=0))
 
     eg = EGraph()
     root = eg.add_term(term)

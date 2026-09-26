@@ -1424,15 +1424,15 @@ XC_TRANSPOSE_APPLY = R(
     Op.make(
         "transpose",
         Op.make("apply", Op.make("aff", "A", "b"), "h"),
-        arg1="D1",
-        arg2="D2",
+        dim0="D1",
+        dim1="D2",
     ),
     Op.make(
         "apply",
         Op.make(
             "aff",
-            Op.make("transpose", "A", arg1="DA1", arg2="DA2"),
-            Op.make("transpose", "b", arg1="DA1", arg2="DA2"),
+            Op.make("transpose", "A", dim0="DA1", dim1="DA2"),
+            Op.make("transpose", "b", dim0="DA1", dim1="DA2"),
         ),
         "h",
     ),
@@ -1477,15 +1477,15 @@ XC_TRANSPOSE_APPLYD = R(
     Op.make(
         "transpose",
         Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-        arg1="D1",
-        arg2="D2",
+        dim0="D1",
+        dim1="D2",
     ),
     Op.make(
         "applyd",
         Op.make(
             "aff_diag",
-            Op.make("transpose", "a", arg1="DA1", arg2="DA2"),
-            Op.make("transpose", "b", arg1="DA1", arg2="DA2"),
+            Op.make("transpose", "a", dim0="DA1", dim1="DA2"),
+            Op.make("transpose", "b", dim0="DA1", dim1="DA2"),
         ),
         "h",
     ),
@@ -1540,16 +1540,16 @@ XC_TRANSPOSE_APPLY_REV = R(
         "apply",
         Op.make(
             "aff",
-            Op.make("transpose", "A", arg1="P1", arg2="P2"),
-            Op.make("transpose", "b", arg1="Q1", arg2="Q2"),
+            Op.make("transpose", "A", dim0="P1", dim1="P2"),
+            Op.make("transpose", "b", dim0="Q1", dim1="Q2"),
         ),
         "h",
     ),
     Op.make(
         "transpose",
         Op.make("apply", Op.make("aff", "A", "b"), "h"),
-        arg1="RD1",
-        arg2="RD2",
+        dim0="RD1",
+        dim1="RD2",
     ),
     law="reverse of xc_transpose_apply — the pushed-through form "
     "re-fuses when both transposes agree on the same value axes.",
@@ -1592,16 +1592,16 @@ XC_TRANSPOSE_APPLYD_REV = R(
         "applyd",
         Op.make(
             "aff_diag",
-            Op.make("transpose", "a", arg1="P1", arg2="P2"),
-            Op.make("transpose", "b", arg1="Q1", arg2="Q2"),
+            Op.make("transpose", "a", dim0="P1", dim1="P2"),
+            Op.make("transpose", "b", dim0="Q1", dim1="Q2"),
         ),
         "h",
     ),
     Op.make(
         "transpose",
         Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"),
-        arg1="RD1",
-        arg2="RD2",
+        dim0="RD1",
+        dim1="RD2",
     ),
     law="reverse of xc_transpose_applyd — same feature-axis "
     "restriction: the stored dims must agree and stay off the "
@@ -1873,7 +1873,6 @@ def _omd_split(name, ak):
 
 
 XC_OMD_SPLIT = _omd_split("xc_omd_split", "dim")
-XC_OMD_SPLIT_ARG1 = _omd_split("xc_omd_split_arg1", "arg1")
 
 
 #: The whole cross-carrier law set.
@@ -1916,7 +1915,6 @@ XC_LAWS: list[Rewrite] = [
     XC_OMD_UNLIFT_DENSE,
     XC_OMD_PAIR_LIFT,
     XC_OMD_SPLIT,
-    XC_OMD_SPLIT_ARG1,
 ]
 
 

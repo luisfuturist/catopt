@@ -60,14 +60,14 @@ def _left_scaled_attention_seed():
     v = Var("v", _T(7, 6))
     m = Var("m", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     term = Op.make(
         "matmul",
         Op.make(
             "softmax",
             Op.make("add", Op.make("mul", Const(0.5), scores), m),
-            arg1=-1,
+            dim=-1,
         ),
         v,
     )
@@ -83,14 +83,14 @@ def _sub_mask_attention_seed():
     m1 = Var("m1", _T(5, 7))
     m2 = Var("m2", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     term = Op.make(
         "matmul",
         Op.make(
             "softmax",
             Op.make("add", scores, Op.make("sub", m1, m2)),
-            arg1=-1,
+            dim=-1,
         ),
         v,
     )
@@ -104,7 +104,7 @@ def _masked_fill_attention_seed():
     v = Var("v", _T(7, 6))
     mk = Var("mk", _T(5, 7))
     scores = Op.make(
-        "matmul", q, Op.make("transpose", k, arg1=-2, arg2=-1)
+        "matmul", q, Op.make("transpose", k, dim0=-2, dim1=-1)
     )
     term = Op.make(
         "matmul",
@@ -116,7 +116,7 @@ def _masked_fill_attention_seed():
                 mk,
                 Const(float("-inf")),
             ),
-            arg1=-1,
+            dim=-1,
         ),
         v,
     )
@@ -272,13 +272,13 @@ def test_masked_fill_sdpa_fold_emits_only_with_seed():
                     Op.make(
                         "matmul",
                         q,
-                        Op.make("transpose", k, arg1=-2, arg2=-1),
+                        Op.make("transpose", k, dim0=-2, dim1=-1),
                     ),
                 ),
                 mk,
                 f_var,
             ),
-            arg1=-1,
+            dim=-1,
         ),
         v,
     )
@@ -389,7 +389,7 @@ def test_bounded_instantiation_remains_fallback():
 
     s = Var("s", _T(4, 4))
     v = Var("v", _T(4, 6))
-    good = Op.make("matmul", Op.make("softmax", s, arg1=-1), v)
-    bad = Op.make("matmul", Op.make("softmax", s, arg1=0), v)
+    good = Op.make("matmul", Op.make("softmax", s, dim=-1), v)
+    bad = Op.make("matmul", Op.make("softmax", s, dim=0), v)
     assert meta.apply_rewrite_at(lemma, good, ()) is not None
     assert meta.apply_rewrite_at(lemma, bad, ()) is None

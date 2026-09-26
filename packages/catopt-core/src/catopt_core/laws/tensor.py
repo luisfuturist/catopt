@@ -532,7 +532,7 @@ LINEAR_ROW_SCALE_REV = R(
 def _head(t: str) -> Op:
     """The head-splitting view: view(t, S) then transpose(1, 2)."""
     return Op.make(
-        "transpose", Op.make("reshape", t, shape="S"), arg1=1, arg2=2
+        "transpose", Op.make("reshape", t, shape="S"), dim0=1, dim1=2
     )
 
 
@@ -623,8 +623,8 @@ def _head_v(t: Any, shape_var: str) -> Op:
     return Op.make(
         "transpose",
         Op.make("reshape", t, shape=shape_var),
-        arg1=1,
-        arg2=2,
+        dim0=1,
+        dim1=2,
     )
 
 
@@ -772,12 +772,12 @@ _REPEAT_KV = Op.make(
     Op.make(
         "reshape",
         Op.make(
-            "expand", Op.make("unsqueeze", "k", arg1="UDk"), shape="ESk"
+            "expand", Op.make("unsqueeze", "k", dim="UDk"), shape="ESk"
         ),
         shape="RSk",
     ),
-    arg1=1,
-    arg2=2,
+    dim0=1,
+    dim1=2,
 )
 
 _REPEAT_V = Op.make(
@@ -785,19 +785,19 @@ _REPEAT_V = Op.make(
     Op.make(
         "reshape",
         Op.make(
-            "expand", Op.make("unsqueeze", "v", arg1="UDv"), shape="ESv"
+            "expand", Op.make("unsqueeze", "v", dim="UDv"), shape="ESv"
         ),
         shape="RSv",
     ),
-    arg1=1,
-    arg2=2,
+    dim0=1,
+    dim1=2,
 )
 
 GQA_ABSORB = R(
     "gqa_absorb_repeat",
     Op.make(
         "sdpa",
-        Op.make("transpose", "q", arg1=1, arg2=2),
+        Op.make("transpose", "q", dim0=1, dim1=2),
         _REPEAT_KV,
         _REPEAT_V,
         arg4="D",
@@ -805,9 +805,9 @@ GQA_ABSORB = R(
     ),
     Op.make(
         "sdpa",
-        Op.make("transpose", "q", arg1=1, arg2=2),
-        Op.make("transpose", "k", arg1=1, arg2=2),
-        Op.make("transpose", "v", arg1=1, arg2=2),
+        Op.make("transpose", "q", dim0=1, dim1=2),
+        Op.make("transpose", "k", dim0=1, dim1=2),
+        Op.make("transpose", "v", dim0=1, dim1=2),
         arg4="D",
         arg5="C",
         arg7=True,
@@ -835,7 +835,7 @@ GQA_ABSORB = R(
 # ---------------------------------------------------------------------------
 
 _QK_SCORES = Op.make(
-    "matmul", "Q", Op.make("transpose", "K", arg1="TD1", arg2="TD2")
+    "matmul", "Q", Op.make("transpose", "K", dim0="TD1", dim1="TD2")
 )
 
 
@@ -935,13 +935,13 @@ def _make_sdpa_fold_rules() -> list:
         ("", lambda sm: sm),
         (
             "_drop",
-            lambda sm: Op.make("dropout", sm, arg1="DP", arg2="DT"),
+            lambda sm: Op.make("dropout", sm, p="DP", train="DT"),
         ),
     )
     for sname, scores, check_add, check_mf, derive in scaled:
         for wname, wrap in wraps:
             sm = lambda inner: wrap(  # noqa: E731, B023
-                Op.make("softmax", inner, arg1="SD")
+                Op.make("softmax", inner, dim="SD")
             )
             out.append(
                 R(

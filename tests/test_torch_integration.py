@@ -1432,27 +1432,20 @@ def test_linear_attention_reassociation():
     assert diff < 1e-8  # fp64: reassociation is exact up to rounding
 
 
-def test_index_bindings_accept_positional_spelling():
-    """chunk/split/unbind bindings honour the schema-declared
-    positional ``arg3``/``arg2`` index spellings — a minted
-    ``arg3=i`` term must slice the same part as ``index=i``."""
+def test_index_bindings_canonical_spelling():
+    """chunk/split/unbind bindings read the canonical
+    ``chunks``/``dim``/``index`` spellings."""
     x = torch.arange(24.0).reshape(2, 3, 4)
     from catopt.torch_bridge import _IR_TO_TORCH
 
     want = x.chunk(2, dim=1)[1]
-    for spelling in (dict(index=1), dict(arg3=1)):
-        got = _IR_TO_TORCH["chunk"](x, arg1=2, arg2=1, **spelling)
-        assert torch.equal(got, want)
+    got = _IR_TO_TORCH["chunk"](x, chunks=2, dim=1, index=1)
+    assert torch.equal(got, want)
     want = torch.split(x, (1, 2), dim=1)[1]
-    for spelling in (dict(index=1), dict(arg3=1)):
-        got = _IR_TO_TORCH["split"](
-            x, sizes=(1, 2), dim=1, **spelling
-        )
-        assert torch.equal(got, want)
+    got = _IR_TO_TORCH["split"](x, sizes=(1, 2), dim=1, index=1)
+    assert torch.equal(got, want)
     want = x.unbind(0)[1]
     got = _IR_TO_TORCH["unbind"](x, dim=0, index=1)
-    assert torch.equal(got, want)
-    got = _IR_TO_TORCH["unbind"](x, arg1=0, arg2=1)
     assert torch.equal(got, want)
 
 

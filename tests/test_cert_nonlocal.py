@@ -69,11 +69,11 @@ def _diag_term(T: int, d: int):
     h0 = Param("h0", TensorType((d,)))
     h = h0
     for t in range(T):
-        a_t = Op.make("select", a, arg1=0, arg2=t)
+        a_t = Op.make("select", a, dim=0, index=t)
         in_t = Op.make(
             "mul",
-            Op.make("select", b, arg1=0, arg2=t),
-            Op.make("select", x, arg1=0, arg2=t),
+            Op.make("select", b, dim=0, index=t),
+            Op.make("select", x, dim=0, index=t),
         )
         h = Op.make("add", Op.make("mul", a_t, h), in_t)
     return h, [x], {"pa": a, "pb": b, "h0": h0}

@@ -161,17 +161,17 @@ def test_scalar_operand_axis_ops_report_none():
     m44 = Param("m44", TensorType((4, 4)))
     # the ZeroDivisionError site: transpose on a ()-shaped operand
     assert (
-        _infer_op_shape(Op.make("transpose", scalar, arg1=0, arg2=1))
+        _infer_op_shape(Op.make("transpose", scalar, dim0=0, dim1=1))
         is None
     )
     # every other axis-indexing op takes the same policy
-    assert _infer_op_shape(Op.make("squeeze", scalar, arg1=0)) is None
+    assert _infer_op_shape(Op.make("squeeze", scalar, dim=0)) is None
     assert (
-        _infer_op_shape(Op.make("select", scalar, arg1=0, arg2=0))
+        _infer_op_shape(Op.make("select", scalar, dim=0, index=0))
         is None
     )
-    assert _infer_op_shape(Op.make("slice", scalar, arg1=0)) is None
-    assert _infer_op_shape(Op.make("unbind", scalar, arg1=0)) is None
+    assert _infer_op_shape(Op.make("slice", scalar, dim=0)) is None
+    assert _infer_op_shape(Op.make("unbind", scalar, dim=0)) is None
     assert (
         _infer_op_shape(Op.make("chunk", scalar, dim=0, chunks=2))
         is None

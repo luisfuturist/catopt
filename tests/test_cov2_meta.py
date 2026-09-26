@@ -94,15 +94,15 @@ def test_canonicalize_attrs_survive_rebuild():
     x = Var("x", _T())
     t = Op.make(
         "transpose",
-        Op.make("transpose", x, arg1=0, arg2=1),
-        arg1=-1,
-        arg2=-2,
+        Op.make("transpose", x, dim0=0, dim1=1),
+        dim0=-1,
+        dim1=-2,
     )
     canon = meta.canonicalize(t)
     # rebuilt through Op.make (hash-consed: identical structure → the
     # same interned object, attrs intact on both levels)
-    assert dict(canon.attrs) == {"arg1": -1, "arg2": -2}
-    assert dict(canon.args[0].attrs) == {"arg1": 0, "arg2": 1}
+    assert dict(canon.attrs) == {"dim0": -1, "dim1": -2}
+    assert dict(canon.args[0].attrs) == {"dim0": 0, "dim1": 1}
     assert meta.canonicalize(canon) == canon
 
 
@@ -233,13 +233,13 @@ def test_overlapping_positions():
 
 def test_has_attr_metavars():
     assert meta._has_attr_metavars(
-        Op.make("transpose", "t", arg1="D", arg2=-1)
+        Op.make("transpose", "t", dim0="D", dim1=-1)
     )
     assert meta._has_attr_metavars(
         Op.make(
             "add",
             "a",
-            Op.make("transpose", "t", arg1="D", arg2=-1),
+            Op.make("transpose", "t", dim0="D", dim1=-1),
         )
     )
     assert not meta._has_attr_metavars(Op.make("add", "a", "b"))
@@ -256,23 +256,23 @@ def test_synthesizable_rejects_unbound_metavars():
     # RHS attr metavar neither LHS-bound nor derivable → unusable
     unbound_attr = Rewrite(
         "t_ua",
-        Op.make("transpose", "a", arg1="D1", arg2=-1),
-        Op.make("transpose", "a", arg1="D1", arg2="D2"),
+        Op.make("transpose", "a", dim0="D1", dim1=-1),
+        Op.make("transpose", "a", dim0="D1", dim1="D2"),
     )
     assert not meta._synthesizable(unbound_attr)
     # …but a derive that can produce it makes the rule usable
     derivable = Rewrite(
         "t_d",
-        Op.make("transpose", "a", arg1="D1", arg2=-1),
-        Op.make("transpose", "a", arg1="D1", arg2="D2"),
+        Op.make("transpose", "a", dim0="D1", dim1=-1),
+        Op.make("transpose", "a", dim0="D1", dim1="D2"),
         derive=lambda b: {"$attr:D2": 0},
     )
     assert meta._synthesizable(derivable)
     # attr metavars bound by the LHS are always fine
     bound = Rewrite(
         "t_b",
-        Op.make("transpose", "a", arg1="D1", arg2="D2"),
-        Op.make("transpose", "a", arg1="D2", arg2="D1"),
+        Op.make("transpose", "a", dim0="D1", dim1="D2"),
+        Op.make("transpose", "a", dim0="D2", dim1="D1"),
     )
     assert meta._synthesizable(bound)
 
@@ -283,16 +283,16 @@ def test_synthesizable_rejects_unbound_metavars():
 
 
 def test_match_pattern_attr_rebinding_and_keysets():
-    pat = Op.make("transpose", "t", arg1="D", arg2="D")
+    pat = Op.make("transpose", "t", dim0="D", dim1="D")
     x = Var("x", _T())
-    ok = Op.make("transpose", x, arg1=0, arg2=0)
-    bad = Op.make("transpose", x, arg1=0, arg2=1)
+    ok = Op.make("transpose", x, dim0=0, dim1=0)
+    bad = Op.make("transpose", x, dim0=0, dim1=1)
     m = meta.match_pattern(pat, ok, {})
     assert m is not None and m["$attr:D"] == 0
     # second occurrence of the same attr metavar must agree
     assert meta.match_pattern(pat, bad, {}) is None
     # attr key-sets must match exactly
-    extra = Op.make("transpose", x, arg1=0, arg2=0, extra=1)
+    extra = Op.make("transpose", x, dim0=0, dim1=0, extra=1)
     assert meta.match_pattern(pat, extra, {}) is None
 
 
@@ -647,7 +647,7 @@ def test_eval_allclose_and_term_is_ground():
     assert not meta._term_is_ground("mv")
     assert not meta._term_is_ground(Op.make("add", "mv", x))
     assert not meta._term_is_ground(
-        Op.make("transpose", x, arg1="D", arg2=-1)
+        Op.make("transpose", x, dim0="D", dim1=-1)
     )
 
 
@@ -701,8 +701,8 @@ def test_validate_candidate_wellformedness():
     # RHS attr metavar neither bound nor derivable → ill-formed
     bad_attr = Rewrite(
         "c2",
-        Op.make("transpose", "x", arg1="D", arg2=-1),
-        Op.make("transpose", "x", arg1="D", arg2="E"),
+        Op.make("transpose", "x", dim0="D", dim1=-1),
+        Op.make("transpose", "x", dim0="D", dim1="E"),
     )
     assert not meta._validate_candidate(bad_attr, r1, r2, numeric=False)
 

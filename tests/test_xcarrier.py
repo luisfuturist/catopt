@@ -636,14 +636,6 @@ def test_omd_split():
         Op.make("concat", b1, b2, dim=-2),
     )
     _law(XC.XC_OMD_SPLIT, t0, env)
-    # arg1 spelling
-    t0 = Op.make(
-        "omd_elem",
-        Op.make("concat", s1, s2, arg1=-1),
-        Op.make("concat", a1, a2, arg1=-2),
-        Op.make("concat", b1, b2, arg1=-2),
-    )
-    _law(XC.XC_OMD_SPLIT_ARG1, t0, env)
 
 
 def test_omd_split_veto_wrong_axes():
