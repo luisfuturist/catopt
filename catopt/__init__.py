@@ -9,10 +9,10 @@ bridge, executors, models, reports), ``catopt-carriers`` (om/xcarrier/
 trace lifts + lowerers), ``catopt-eps`` (the opt-in approximation
 toolkit), ``catopt-optimize`` (the pipeline orchestrators).
 
-``sys.modules`` aliases below keep every historical ``catopt.X`` path
-resolving to its new home — ``from catopt.cost import flops_cost``,
-``import catopt.egraph.core``, ``from catopt.laws import all_rules``
-etc. all keep working unchanged.
+``sys.modules`` aliases below keep every still-used historical
+``catopt.X`` path resolving to its new home — ``from catopt.cost import
+flops_cost``, ``import catopt.egraph.terms``, ``from catopt.laws import
+all_rules`` etc. all keep working unchanged.
 """
 
 # -- compat: alias every historical module path BEFORE anything else --
@@ -27,21 +27,14 @@ _ALIAS = {
     "catopt.calibrate": "catopt_optimize.calibrate",
     "catopt.cost": "catopt_core.cost",
     "catopt.egraph": "catopt_core.egraph",
-    "catopt.egraph.certs": "catopt_core.egraph.certs",
-    "catopt.egraph.core": "catopt_core.egraph.core",
-    "catopt.egraph.extract": "catopt_core.egraph.extract",
-    "catopt.egraph.proof": "catopt_core.egraph.proof",
     "catopt.egraph.terms": "catopt_core.egraph.terms",
-    "catopt.egraph.types": "catopt_core.egraph.types",
     "catopt.eps": "catopt_eps.eps",
     "catopt.executors": "catopt_torch.executors",
-    "catopt.executors.base": "catopt_torch.executors.base",
     "catopt.ibp": "catopt_eps.ibp",
     "catopt.ir": "catopt_core.ir",
     "catopt.laws": "catopt_core.laws",
     "catopt.laws.base": "catopt_core.laws.base",
     "catopt.laws.pairing": "catopt_core.laws.pairing",
-    "catopt.laws.scan": "catopt_core.laws.scan",
     "catopt.laws.tensor": "catopt_core.laws.tensor",
     "catopt.meta": "catopt_core.meta",
     "catopt.models": "catopt_torch.models",
