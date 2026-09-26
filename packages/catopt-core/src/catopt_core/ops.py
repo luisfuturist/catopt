@@ -53,6 +53,14 @@ Carrier modules that opt in (and the ops they contribute):
 * :mod:`catopt_carriers.om` — ``cmask`` ``fill`` ``attnbias``
 * :mod:`catopt_eps.act_eps` — ``aquant`` ``adequant``
 
+That set is the built-in ``_CARRIER_MODULES`` tuple, in registration
+order.  A NEW carrier package does not edit core: it calls
+:func:`register_carrier` (from its package ``__init__`` or a plugin
+loader), and the module is appended to the composition in registration
+order — absent carriers are still skipped, and an import error inside
+an installed carrier still propagates (see
+:func:`_carrier_module_objects`).
+
 The aff/om/affd carrier PRIMITIVES (``aff`` ``apply`` ``om_elem`` ...)
 are core ops — they ship inside ``torch_bridge._CORE_TORCH_BINDINGS``.
 
@@ -92,6 +100,7 @@ __all__ = [
     "OpTable",
     "carrier_torch_bindings",
     "register_ambient_bindings",
+    "register_carrier",
     "register_core_bindings",
 ]
 
@@ -132,16 +141,45 @@ def register_ambient_bindings(table: dict[str, Binding]) -> None:
     _AMBIENT_BINDINGS = table
 
 
-#: Extension modules folded into :meth:`OpTable.full`, in
-#: registration order.  Each declares a module-level
-#: ``TORCH_BINDINGS: dict[str, Callable]`` (and may declare
-#: ``SHAPE_RULES`` / ``ATTR_SCHEMA`` fragments).
+#: Built-in carrier modules folded into :meth:`OpTable.full`, in
+#: registration order (later carriers win on a name collision).  Each
+#: declares a module-level ``TORCH_BINDINGS: dict[str, Callable]`` (and
+#: may declare ``SHAPE_RULES`` / ``ATTR_SCHEMA`` fragments).
+#:
+#: Extension point: a carrier OUTSIDE this built-in set joins ``full()``
+#: through :func:`register_carrier` — no edit to core.  (Entry-point
+#: discovery under a ``catopt.carriers`` group was considered and
+#: rejected: it would re-order the built-ins relative to this tuple and
+#: rescan every installed distribution on each ``full()`` call.)
 _CARRIER_MODULES: tuple[str, ...] = (
     "catopt_carriers.trace",
     "catopt_carriers.xcarrier",
     "catopt_carriers.om",
     "catopt_eps.act_eps",
 )
+
+#: Carrier modules registered at runtime via :func:`register_carrier`,
+#: appended after the built-ins in registration order.
+_registered_carriers: list[str] = []
+
+
+def register_carrier(module_name: str) -> None:
+    """Register an extra carrier module for :meth:`OpTable.full`.
+
+    The extension point — a carrier package outside the built-in set
+    (or a plugin loader acting for it) calls this and the module joins
+    ``full()``'s composition, with no edit to core.  Appended AFTER the
+    built-in carriers, in registration order (a later carrier still wins
+    on a name collision); idempotent per name.
+    """
+    if module_name not in _registered_carriers:
+        _registered_carriers.append(module_name)
+
+
+def _carrier_names() -> tuple[str, ...]:
+    """Every carrier module path :meth:`OpTable.full` composes, in
+    order: the built-ins, then runtime-registered carriers."""
+    return _CARRIER_MODULES + tuple(_registered_carriers)
 
 
 def _carrier_module_objects() -> list[ModuleType]:
@@ -156,7 +194,7 @@ def _carrier_module_objects() -> list[ModuleType]:
     dependency, ``e.name`` differing) still propagates.
     """
     mods: list[ModuleType] = []
-    for name in _CARRIER_MODULES:
+    for name in _carrier_names():
         try:
             mods.append(importlib.import_module(name))
         except ModuleNotFoundError as e:

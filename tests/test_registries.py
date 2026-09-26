@@ -158,6 +158,32 @@ class TestOpTableComposition:
         assert "omd_elem" in full.torch_bindings
 
 
+def test_register_carrier_extends_composition(monkeypatch):
+    """The extension point (Phase 3): a carrier module registered at
+    runtime joins ``full()``/``carrier_torch_bindings()`` without
+    editing core's built-in ``_CARRIER_MODULES`` tuple.  Appended in
+    registration order, idempotent, and the built-in order is kept."""
+    import sys
+    from types import SimpleNamespace
+
+    import catopt_core.ops as ops_mod
+
+    # isolate the registry — monkeypatch restores it afterwards
+    monkeypatch.setattr(ops_mod, "_registered_carriers", [])
+    fake = SimpleNamespace(
+        TORCH_BINDINGS={"mycarrier_op": lambda *a, **k: None}
+    )
+    monkeypatch.setitem(sys.modules, "my_carrier_pkg", fake)
+
+    ops_mod.register_carrier("my_carrier_pkg")
+    ops_mod.register_carrier("my_carrier_pkg")  # idempotent
+    names = ops_mod._carrier_names()
+    assert names[: len(ops_mod._CARRIER_MODULES)] == ops_mod._CARRIER_MODULES
+    assert names.count("my_carrier_pkg") == 1
+    # the registered module's bindings join the merged carrier table
+    assert "mycarrier_op" in ops_mod.carrier_torch_bindings()
+
+
 class TestCustomTableLowering:
     def test_minimal_table_lowers_carrier_term(self):
         """core + xcarrier lowers an omd carrier term — composed
