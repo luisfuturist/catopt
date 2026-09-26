@@ -180,6 +180,7 @@ project/         orphan branch: ADRs and retrospectives (worktree)
 ```bash
 python main.py                # demo: all transform families
 python bench_gpu.py           # GPU table (needs CUDA)
+python bench/fetch.py         # checkpoints → ~/.cache/catopt
 python bench/stories15m_bench.py --device cuda
 python -m pytest tests/ -q
 ```

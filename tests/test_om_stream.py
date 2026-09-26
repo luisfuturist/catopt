@@ -316,6 +316,7 @@ def test_streaming_block_working_set_is_bounded(monkeypatch):
     assert n_compose == n - 1              # left fold: one ⊕ per block
 
 
+@pytest.mark.requires_cuda
 def test_streaming_peak_memory_flat_in_Tkv():
     """Peak allocated bytes during the fold is ~independent of the
     number of blocks (and far below the batched executor, which stacks
@@ -349,7 +350,7 @@ def test_streaming_peak_memory_flat_in_Tkv():
     assert s1 * 4 < b1 and s2 * 4 < b2, (s1, b1, s2, b2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.requires_cuda
 def test_streaming_peak_cuda_where_dense_cannot():
     """The headline regime: T_kv where the full score matrix is ~GiB
     but streaming needs only ~block.  Batched/naive must OOM or blow
@@ -406,6 +407,7 @@ def test_incremental_step_equals_recompute():
         .abs().max().item() < 1e-12
 
 
+@pytest.mark.requires_cuda
 def test_incremental_growing_cache_matches_sdpa():
     """Decode regime: a fixed query streams over a cache that grows one
     block per step — each step O(block), output equals sdpa on the

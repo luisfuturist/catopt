@@ -802,6 +802,12 @@ class EGraph:
             self._inst_last_enode = enode
             return eid
         else:
+            # Register the concrete leaf BEFORE minting the enode: a
+            # leaf key that was never seen by ``add_term`` (a Const in
+            # a rule RHS, or a re-used repr name) would otherwise
+            # decode to a stale cross-call term — or to the raw key
+            # string, which poisons any extracted member it lands in.
+            _LeafRegistry.register(pattern)
             eid = self.add_leaf(repr(pattern))
             self._inst_last_enode = ENode("leaf", (),
                                           (("key", repr(pattern)),))

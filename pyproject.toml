@@ -22,3 +22,6 @@ include = ["catopt*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "requires_cuda: test allocates CUDA tensors; skipped at setup when CUDA is absent or OOMs on a probe allocation",
+]

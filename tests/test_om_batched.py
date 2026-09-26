@@ -467,7 +467,7 @@ def test_single_elem_apply_is_batched():
 #  CUDA graph replay (optional fast path)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.requires_cuda
 def test_cuda_graph_replay_matches_eager():
     """capture_cuda_graph replays the identical computation; changed
     inputs are picked up via the static input buffers; drop restores

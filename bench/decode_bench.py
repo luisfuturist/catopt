@@ -36,7 +36,7 @@ B=1 output is verified bitwise against the stock model at load time.
 
     python bench/decode_bench.py --device cuda --quick
     python bench/decode_bench.py --device cuda \
-        --ckpt /tmp/stories110M.bin
+        --ckpt ~/.cache/catopt/stories110M.bin
 """
 from __future__ import annotations
 
@@ -54,7 +54,8 @@ from torch.utils.benchmark import Timer
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from measure_weights import load_llama2c                      # noqa: E402
-from stories15m_bench import Block, Stories15M                # noqa: E402
+from stories15m_bench import (Block, Stories15M,              # noqa: E402
+                              resolve_ckpt)
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +208,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--device", default="cuda"
                     if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--ckpt", default="/tmp/stories15M.bin")
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint path — default resolves "
+                         "$XDG_CACHE_HOME/catopt/stories15M.bin then "
+                         "/tmp/stories15M.bin (see bench/fetch.py)")
     ap.add_argument("--quick", action="store_true",
                     help="B{1,4} x T{16,64}, min_run_time=0.5")
     ap.add_argument("--large", action="store_true",
@@ -215,6 +219,7 @@ def main():
     ap.add_argument("--min-run-time", type=float, default=None)
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
+    args.ckpt = resolve_ckpt(args.ckpt)
 
     if args.quick:
         batches, seqs = [1, 4], [16, 64]

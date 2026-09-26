@@ -200,6 +200,21 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                                 if known and base_n % known == 0 else None)
                     shape = tuple(inferred if d == -1 else d
                                   for d in shape)
+                # A reshape is a view: the declared shape MUST preserve
+                # the input numel.  Returning the attr verbatim lets an
+                # ill-typed member (e.g. one that halved the wrong axis)
+                # report its own wrong shape downstream — slipping past
+                # broadcast guards — and it is a free view, so extraction
+                # can even prefer it.  Flag the mismatch instead so the
+                # member costs _INVALID_COST and can never be picked.
+                base = shapes[0]
+                if (isinstance(base, tuple)
+                        and all(isinstance(d, int) and d >= 0
+                                for d in shape)
+                        and all(isinstance(d, int) and d >= 0
+                                for d in base)
+                        and _numel(shape) != _numel(base)):
+                    return _INVALID
                 return shape
             return shapes[0]
         case "unsqueeze":
@@ -405,10 +420,20 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             if not base:
                 return None
             dim = op.attrs.get("dim", -1) % len(base)
-            sizes = op.attrs.get("sizes", ())
-            idx = op.attrs.get("index", 0)
+            # Two attr spellings exist: pairing passes mint
+            # ``sizes=(...)``/``index=i``; exported graphs carry
+            # torch.split's ``arg1`` = per-section size (or a size
+            # list) and ``arg3``/``index`` = the section index.
+            sizes = op.attrs.get("sizes", op.attrs.get("arg1"))
+            idx = op.attrs.get("index", op.attrs.get("arg3", 0)) or 0
             out = list(base)
-            out[dim] = sizes[idx] if idx < len(sizes) else 0
+            if isinstance(sizes, (tuple, list)):
+                out[dim] = (sizes[idx] if idx < len(sizes)
+                            else None)
+            elif isinstance(sizes, int):
+                out[dim] = sizes          # equal-size sections
+            else:
+                out[dim] = None
             return tuple(out)
         case _:
             # Unknown ops pass through the first operand's shape; a ()

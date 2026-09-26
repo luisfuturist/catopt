@@ -1,9 +1,9 @@
 """Real-checkpoint benchmark: stories15M through catopt vs eager/Inductor.
 
-A real trained SLM (llama2.c checkpoint, /tmp/stories15M.bin) wrapped
-as an exportable nn.Module (sdpa attention, rmsnorm, swiglu), run
-through ``optimize_compositional``, verified bitwise, and timed with
-``torch.utils.benchmark``.
+A real trained SLM (llama2.c checkpoint — see ``bench/fetch.py``)
+wrapped as an exportable nn.Module (sdpa attention, rmsnorm, swiglu),
+run through ``optimize_compositional``, verified bitwise, and timed
+with ``torch.utils.benchmark``.
 
     python bench/stories15m_bench.py [--seq 128] [--device cuda]
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,32 @@ from torch.utils.benchmark import Timer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from measure_weights import load_llama2c                      # noqa: E402
+
+
+def cache_dir() -> Path:
+    """$XDG_CACHE_HOME/catopt, falling back to ~/.cache/catopt."""
+    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(root) / "catopt"
+
+
+def resolve_ckpt(arg: str | None, name: str = "stories15M.bin") -> str:
+    """Checkpoint resolution: explicit --ckpt → cache → /tmp → error."""
+    if arg:
+        p = Path(arg)
+        if p.is_file():
+            return str(p)
+        alt = cache_dir() / p.name            # same basename in cache
+        if alt.is_file():
+            return str(alt)
+        sys.exit(f"checkpoint not found: {arg}\n"
+                 f"run `python bench/fetch.py` to download the llama2.c "
+                 f"checkpoints into {cache_dir()}")
+    for p in (cache_dir() / name, Path("/tmp") / name):
+        if p.is_file():
+            return str(p)
+    sys.exit(f"checkpoint {name} not found — looked in "
+             f"{cache_dir() / name} and /tmp/{name}.\n"
+             f"run `python bench/fetch.py` to download it")
 
 
 class Block(nn.Module):
@@ -117,8 +144,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq", type=int, default=128)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--ckpt", default="/tmp/stories15M.bin")
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint path — default resolves "
+                         "$XDG_CACHE_HOME/catopt/stories15M.bin then "
+                         "/tmp/stories15M.bin (see bench/fetch.py)")
     args = ap.parse_args()
+    args.ckpt = resolve_ckpt(args.ckpt)
 
     w = load_llama2c(args.ckpt)
     # cfg from shapes + header (n_heads isn't inferable from shapes)

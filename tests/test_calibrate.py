@@ -4,7 +4,6 @@ profile-parameterised cost fns in catopt.cost."""
 import json
 
 import pytest
-import torch
 
 from catopt.calibrate import (
     TargetProfile,
@@ -160,7 +159,7 @@ def test_calibrate_cpu_sane():
     assert roofline_cost_for(p)(_mm_term()) > 0.0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+@pytest.mark.requires_cuda
 def test_calibrate_cuda_sane():
     p = calibrate(device="cuda", quick=True)
     assert p.device.startswith("cuda")

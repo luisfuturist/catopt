@@ -172,7 +172,7 @@ def test_diagonal_elementwise_ssm_does_not_lift():
     assert _opdepth(best, {}) == _opdepth(ir.root, {})
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.requires_cuda
 def test_selective_ssm_gpu_wallclock():
     """Sequential vs scan-extracted wall-clock on CUDA.
 
