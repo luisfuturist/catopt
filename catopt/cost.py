@@ -257,12 +257,12 @@ def flops_cost(term: Any, memo: dict | None = None) -> float:
     For matmul, uses the standard 2*M*N*K formula.
     For element-wise ops, uses 1 FLOP per output element.
 
-    ``memo`` (id-keyed) makes repeated calls over a shared-subterm DAG
+    ``memo`` (content-keyed) makes repeated calls over a shared-subterm DAG
     linear instead of exponential; callers doing many evaluations
     (e.g. extraction) should pass a shared dict.
     """
     memo = {} if memo is None else memo
-    key = id(term)
+    key = term  # content-keyed: interned terms hash by structure
     ck = ("c", key)
     if ck in memo:
         return memo[ck]
@@ -332,7 +332,7 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
         lowering folds them into a materialised parameter — so they are
         charged 0, matching extract_best's param-only discount.
         """
-        k = id(t)
+        k = t  # content-keyed
         if k in var_memo:
             return var_memo[k]
         if isinstance(t, Var):
@@ -346,9 +346,9 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
 
     def rec(t: Any) -> None:
         nonlocal total
-        if id(t) in seen:
+        if t in seen:
             return
-        seen.add(id(t))
+        seen.add(t)
         if isinstance(t, Op):
             if not has_var(t) and not bill_params:
                 return  # folds at compile time — free at runtime
@@ -372,7 +372,7 @@ def launch_aware_cost(term: Any, memo: dict | None = None) -> float:
     default extraction cost in :func:`catopt.optimize.optimize_model`.
     """
     memo = {} if memo is None else memo
-    ck = ("lc", id(term))
+    ck = ("lc", term)
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
@@ -395,7 +395,7 @@ def depth_cost(term: Any, memo: dict | None = None) -> float:
     this is the axis on which a sequential recurrence and its
     log-depth Blelloch form differ."""
     memo = {} if memo is None else memo
-    ck = ("dc", id(term))
+    ck = ("dc", term)
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
@@ -417,7 +417,7 @@ def depth_cost(term: Any, memo: dict | None = None) -> float:
 def count_cost(term: Any, memo: dict | None = None) -> float:
     """Cost = number of non-view operations in the term tree."""
     memo = {} if memo is None else memo
-    ck = ("cc", id(term))
+    ck = ("cc", term)
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
@@ -573,10 +573,10 @@ _FOLDABLE_ELEMWISE = frozenset(
 def _has_var_leaf(term: Any, memo: dict) -> bool:
     """True iff the subtree reads a data input (Var leaf).
 
-    Mirrors ``IRModule._uses_input``; id-keyed so the shared-subterm
+    Mirrors ``IRModule._uses_input``; content-keyed so the shared-subterm
     DAG stays a linear walk.
     """
-    k = ("hv", id(term))
+    k = ("hv", term)
     hit = memo.get(k)
     if hit is not None:
         return hit
@@ -618,7 +618,7 @@ def _folds_to_param(
     """
     if not isinstance(term, Op):
         return False
-    k = ("pf", id(term))
+    k = ("pf", term)
     hit = memo.get(k)
     if hit is not None:
         return hit
@@ -696,7 +696,7 @@ def _param_index(
       materialisation is billed at output size regardless of how the
       leaves underneath dedup.
     """
-    key = ("pbi", id(term))
+    key = ("pbi", term)
     hit = memo.get(key)
     if hit is not None:
         return hit
@@ -705,7 +705,7 @@ def _param_index(
     elif isinstance(term, Op):
         if _folds_to_param(term, source_tensors, memo):
             out = {
-                f"\x00fold:{id(term)}": _fold_numel(
+                ("\x00fold", term): _fold_numel(
                     term, source_tensors, memo, by_bytes
                 )
             }
@@ -820,7 +820,7 @@ def _roofline_cost(
     The memo key carries the constants so two profiles can share a memo
     dict (e.g. inside dag_cost) without colliding.
     """
-    ck = ("rc", peak_flops, peak_bw, launch_s, id(term))
+    ck = ("rc", peak_flops, peak_bw, launch_s, term)
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
@@ -925,7 +925,7 @@ def depth_cost_for(profile: Any = None):
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        ck = ("dc", pf, bw, ls, id(term))
+        ck = ("dc", pf, bw, ls, term)
         if ck in memo:
             return memo[ck]
         if isinstance(term, Op):

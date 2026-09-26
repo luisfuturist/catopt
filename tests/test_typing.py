@@ -306,10 +306,14 @@ def test_leaf_typing():
     assert _shape_of(v) == (None, 4)
 
 
-def test_memo_is_id_keyed_dag():
-    """Shared subterms resolve once through the memo (DAG, not tree)."""
+def test_memo_is_content_keyed_dag():
+    """Shared subterms resolve once through the memo (DAG, not tree).
+
+    Terms are interned and content-hashed — the memo keys on the term
+    object itself (no id(), no GC-reuse hazard).
+    """
     shared = Op.make("mul", x234, x234)
     term = Op.make("add", shared, shared)
     memo: dict = {}
     assert _shape_of(term, memo) == (2, 3, 4)
-    assert id(shared) in memo
+    assert shared in memo

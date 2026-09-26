@@ -33,22 +33,18 @@ def R(
     )
 
 
-#: id()-keyed shape memo for the check-hook path.  The bound terms it
-#: sees are ``EGraph.any_term`` resolutions — DAG-shared Op objects —
+#: Content-keyed shape memo for the check-hook path.  The bound terms
+#: it sees are ``EGraph.any_term`` resolutions — interned Op objects —
 #: and ``typing._shape_of`` is already memo-aware: threading one memo
-#: turns an exponential DAG re-walk into a linear one.  ``_SHAPE_KEEP``
-#: pins every term the memo covers so ids can never be recycled into a
-#: stale (id -> wrong shape) binding — soundness over memory (the set
-#: stays small: unique resolved terms, not per-subst copies).
+#: turns an exponential DAG re-walk into a linear one.  Term keys hold
+#: their objects alive, so no keepalive pins are needed.
 _SHAPE_MEMO: dict = {}
-_SHAPE_KEEP: dict[int, Any] = {}
 
 
 def _shape_of(t: Any):
     """Best-effort shape of a bound term (delegates to cost model)."""
     from catopt.typing import _shape_of as _so
 
-    _SHAPE_KEEP[id(t)] = t
     return _so(t, _SHAPE_MEMO)
 
 
@@ -1160,7 +1156,7 @@ def _pair_shared_input(
             node, cid, w = entry
             # ``_any_term_cached`` resolves to the class's minimum-size
             # member and returns a STABLE object across calls — the
-            # id()-keyed ``_SHAPE_MEMO`` in ``_so`` then dedupes shape
+            # content-keyed ``_SHAPE_MEMO`` in ``_so`` then dedupes shape
             # inference on repeated weights.
             wt = eg._any_term_cached(w)
             if wt is None:

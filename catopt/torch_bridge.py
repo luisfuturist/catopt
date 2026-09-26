@@ -714,7 +714,7 @@ class IRModule(torch.nn.Module):
         Memoised by id(): extracted terms are shared-subterm DAGs, and
         an unmemoised walk is exponential in DAG depth.
         """
-        key = id(term)
+        key = term
         if key in self._uses_memo:
             return self._uses_memo[key]
         if isinstance(term, Var):
@@ -743,9 +743,9 @@ class IRModule(torch.nn.Module):
         # term may share a subtree object between several parents (e.g.
         # one fused GEMM under two chunk projections).  Returning the
         # same folded object preserves that sharing for _eval.  Must
-        # capture id() before `term` is rebound to the rebuilt node.
-        orig_id = id(term)
-        memo_hit = self._fold_memo.get(orig_id)
+        # capture the key before `term` is rebound to the rebuilt node.
+        orig_key = term
+        memo_hit = self._fold_memo.get(orig_key)
         if memo_hit is not None:
             return memo_hit
 
@@ -779,7 +779,7 @@ class IRModule(torch.nn.Module):
                         result = _Param(
                             name=fused_name, typ=TensorType(shape)
                         )
-                        self._fold_memo[orig_id] = result
+                        self._fold_memo[orig_key] = result
                         return result
                 elif term.op in (
                     "add",
@@ -830,11 +830,11 @@ class IRModule(torch.nn.Module):
                                     name=fused_name,
                                     typ=TensorType(shape),
                                 )
-                                self._fold_memo[orig_id] = result
+                                self._fold_memo[orig_key] = result
                                 return result
                         except Exception:
                             pass
-        self._fold_memo[orig_id] = term
+        self._fold_memo[orig_key] = term
         return term
 
     def _build_params(self) -> None:
@@ -846,9 +846,9 @@ class IRModule(torch.nn.Module):
         seen: set[int] = set()
 
         def collect(t: Any) -> None:
-            if id(t) in seen:
+            if t in seen:
                 return
-            seen.add(id(t))
+            seen.add(t)
             if isinstance(t, _Param):
                 if (
                     t.name not in param_shapes
@@ -909,7 +909,7 @@ class IRModule(torch.nn.Module):
         if isinstance(term, Op):
             # Shared subtrees (e.g. one fused GEMM read by two chunk
             # projections) are the SAME object — compute once.
-            hit = memo.get(id(term))
+            hit = memo.get(term)
             if hit is not None:
                 return hit
             fn = _IR_TO_TORCH.get(term.op)
@@ -918,7 +918,7 @@ class IRModule(torch.nn.Module):
             args = [self._eval(a, env, x, memo) for a in term.args]
             kwargs = dict(term.attrs) if term.attrs else {}
             result = fn(*args, **kwargs)
-            memo[id(term)] = result
+            memo[term] = result
             return result
         raise TypeError(f"Cannot evaluate term: {term}")
 

@@ -12,8 +12,9 @@ label plus a list of child e-class IDs.  The e-graph itself (see
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from catopt.attrs import validate_attrs
 
@@ -94,13 +95,47 @@ class Param:
         return self.name
 
 
+def _hashable_attr(v: Any) -> Any:
+    """Hashable form of an attr value — strict: [3,5] != (3,5).
+
+    Unhashable values (lists, dicts) fall back to ``repr``.
+    """
+    try:
+        hash(v)
+    except TypeError:
+        return repr(v)
+    return v
+
+
+def _attr_key(attrs: dict[str, Any]) -> tuple:
+    return tuple(
+        sorted((k, _hashable_attr(v)) for k, v in attrs.items())
+    )
+
+
 @dataclass(frozen=True)
 class Op:
-    """An operation (an ENode in the e-graph)."""
+    """An operation (an ENode in the e-graph).
+
+    Terms are **hash-consed**: ``Op.make`` interns by structure, so
+    equal terms are the same object.  ``__hash__``/``__eq__`` are
+    content-based — term objects are safe dict/set keys, and the old
+    ``id(t)``-keyed memos can all key on ``t`` directly (no GC-reuse
+    hazard, no keepalive lists).
+    """
 
     op: str
     args: tuple[Any, ...]
     attrs: dict[str, Any] = field(default_factory=dict)
+    _h: int = field(init=False, repr=False, compare=False, hash=False)
+
+    _INTERN: ClassVar[Any] = None  # weakref table, created at import
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_h",
+            hash((self.op, self.args, _attr_key(self.attrs))),
+        )
 
     @staticmethod
     def make(op: str, *args, validate: bool = True, **attrs) -> Op:
@@ -114,10 +149,25 @@ class Op:
         hand-minted terms consume it); the positional spelling only
         merges — winning — when the canonical name is also supplied.
         ``validate=False`` escapes for deliberate non-canonical mints.
+
+        Interned: structurally identical makes return one object.
         """
-        return Op(
-            op, args, validate_attrs(op, attrs, validate=validate)
-        )
+        a = validate_attrs(op, attrs, validate=validate)
+        try:
+            key = (op, tuple(args), _attr_key(a))
+            existing = Op._INTERN.get(key)
+        except TypeError:
+            key = None
+            existing = None
+        if existing is not None:
+            return existing
+        t = Op(op, args, a)
+        if key is not None:
+            Op._INTERN[key] = t
+        return t
+
+    def __hash__(self) -> int:
+        return self._h
 
     def __repr__(self) -> str:
         parts = [op_repr(a) for a in self.args]
@@ -128,6 +178,9 @@ class Op:
             parts.append(attr_str)
         inside = ", ".join(parts)
         return f"{self.op}({inside})"
+
+
+Op._INTERN = weakref.WeakValueDictionary()
 
 
 def op_repr(term: Any) -> str:

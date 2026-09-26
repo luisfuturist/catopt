@@ -269,7 +269,7 @@ def _specialize_causal(
         memo = {}
     if not isinstance(term, Op):
         return term
-    key = id(term)
+    key = term  # content-keyed: interned terms hash by structure
     if key in memo:
         return memo[key]
     args = tuple(_specialize_causal(a, params, memo) for a in term.args)

@@ -77,7 +77,7 @@ def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
     results (``Const``, full-reduce ``sum``/``mean``, vector dot
     ``matmul``, scalar elementwise) still report ``()``.
     """
-    key = id(term)
+    key = term  # content-keyed: interned terms hash by structure
     if memo is not None and key in memo:
         return memo[key]
     if isinstance(term, (Var, Param)):

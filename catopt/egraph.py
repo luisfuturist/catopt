@@ -461,7 +461,7 @@ class EGraph:
     ) -> int:
         """Add a term (Var/Const/Param/Op) to the e-graph.
 
-        ``_memo`` is an ``id()``-keyed cache: exported IR terms are DAGs
+        ``_memo`` is a content-keyed cache: exported IR terms are DAGs
         with heavy sharing (residual streams, RoPE tables), and without
         memoisation the recursion re-walks shared subtrees
         exponentially.
@@ -471,7 +471,7 @@ class EGraph:
         and pass-introduced enodes in certificate generation.
         """
         memo = {} if _memo is None else _memo
-        key = id(term)
+        key = term
         if key in memo:
             return memo[key]
         if isinstance(term, Op):
@@ -983,7 +983,7 @@ class EGraph:
 
         The result is also stored in ``eclass.cache`` so the SAME term
         object survives across ``apply_rule`` calls and iterations —
-        the rules' id()-keyed ``_shape_of`` memo then hits for checks
+        the rules' content-keyed ``_shape_of`` memo then hits for checks
         re-evaluated on unchanged classes.
         """
         eid = self.find(eid)
@@ -1432,12 +1432,11 @@ class EGraph:
 
         # Shared cost/shape memo for the whole extraction: makes the
         # per-candidate cost_fn calls O(1) amortised over the DAG.
-        # keepalive retains every candidate term so id() keys in the
-        # memo cannot be recycled by the GC mid-extraction.
+        # Terms are content-hashed and interned — memos key on the term
+        # object directly and hold it alive; no keepalive needed.
         import inspect
 
         cost_memo: dict = {}
-        keepalive: list = []
         takes_memo = "memo" in inspect.signature(cost_fn).parameters
         # Storage-style cost models (param_bytes_cost) bill Param leaves
         # — folding does not shrink the weights file — so the param-only
@@ -1538,7 +1537,6 @@ class EGraph:
                 term = Op.make(
                     node.op, *child_terms, **dict(node.attrs)
                 )
-                keepalive.append(term)
                 local = cfn(term) - sum(cfn(c) for c in child_terms)
                 local = max(local, 0.0)
                 if param_only and not bill_params:
@@ -1731,8 +1729,6 @@ class EGraph:
             _cache_out=pass1_cache,
         )
 
-        keepalive: list = []
-
         def steered_score(node: Any) -> float:
             """local cost + children best totals (member-routed pass)."""
             child_terms = []
@@ -1744,7 +1740,6 @@ class EGraph:
                 child_terms.append(entry[1])
                 sub += entry[0]
             term = Op.make(node.op, *child_terms, **dict(node.attrs))
-            keepalive.append(term)  # id()-keyed memo: prevent GC reuse
             local = cfn(term) - sum(cfn(c) for c in child_terms)
             return max(local, 0.0) + sub
 
@@ -1776,14 +1771,15 @@ class EGraph:
     ) -> Any:
         """Canonical e-class id realising *term*, without mutating the graph.
 
-        ``_memo`` is ``id(term)``-keyed: ``any_term``/``_min_term``
-        resolutions are shared-DAG objects, and without the memo the
-        recursion re-walks shared subtrees exponentially (observed:
-        ~24M calls for one pairing witness on a 5-block stack).
+        ``_memo`` is content-keyed on the term (interned Op objects
+        hash by structure): ``any_term``/``_min_term`` resolutions are
+        shared-DAG objects, and without the memo the recursion re-walks
+        shared subtrees exponentially (observed: ~24M calls for one
+        pairing witness on a 5-block stack).
         """
         if _memo is None:
             _memo = {}
-        hit = _memo.get(id(term), False)
+        hit = _memo.get(term, False)
         if hit is not False:
             return hit
         if isinstance(term, Op):
@@ -1791,7 +1787,7 @@ class EGraph:
             for a in term.args:
                 c = self._class_of_term(a, _memo)
                 if c is None:
-                    _memo[id(term)] = None
+                    _memo[term] = None
                     return None
                 cids.append(c)
             en = ENode(term.op, tuple(cids), _pattern_attrs(term))
@@ -1799,7 +1795,7 @@ class EGraph:
             en = ENode("leaf", (), (("key", repr(term)),))
         eid = self._node_to_class.get(en)
         res = self.find(eid) if eid is not None else None
-        _memo[id(term)] = res
+        _memo[term] = res
         return res
 
     def _locate(self, term: Any, eid: int | None = None):
