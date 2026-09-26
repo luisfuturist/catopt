@@ -56,3 +56,4 @@ cov_ann/
 
 # Bench outputs
 bench/results/
+.chokkin/
