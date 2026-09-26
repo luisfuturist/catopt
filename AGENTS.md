@@ -67,6 +67,39 @@ configured in `pyproject.toml`):
   (see `catopt_core.ops` *Backend wiring*), never a puller: the adapter
   registers its tables into core, core never imports the adapter.
 
+## Differential oracle (opt-in, test-only)
+
+`tests/test_egglog_oracle.py` cross-checks catopt's hand-rolled
+equality-saturation search against the Rust **egglog** library on a
+small op/law subset.  It is an **opt-in, test-only oracle** — not a
+production dependency and not an engine swap: `catopt-core` stays
+pure-Python / zero-dependency, and nothing under `packages/` or
+`catopt/` imports `egglog`.  The ported prototype and its documented
+limitations (untyped-by-shape terms, unconditional `check` rewrites, no
+proof replay) live in `tests/egglog_oracle.py`.
+
+`egglog` is in a dedicated `oracle` dependency group — deliberately
+**not** the default `dev` group — so the repo stays light (egglog is a
+compiled Rust extension).  The test begins with
+`pytest.importorskip("egglog")`, so the whole file skips cleanly when
+the group is absent and the rest of the suite stays green.
+
+Run it explicitly:
+
+```sh
+uv sync --group oracle
+.venv/bin/python -m pytest tests/test_egglog_oracle.py
+```
+
+It runs catopt's `EGraph` and egglog on the *same* law subset and
+asserts they agree: the extracted lowest-FLOPs terms match up to
+commutative-operand *representative* choice, the folded (param-
+discounted) costs coincide, and the original plus both extracted terms
+are numerically equal (torch ground truth + NumPy evaluation).  It is
+fast (<~1 s) and needs no CUDA.  `egglog` ships wheels for CPython
+>=3.12 only, so the group entry carries a `python_version` marker while
+the workspace keeps `requires-python = ">=3.11"`.
+
 ## Ports (hexagonal boundary)
 
 `catopt_core.ports` names every adapter contract as a
