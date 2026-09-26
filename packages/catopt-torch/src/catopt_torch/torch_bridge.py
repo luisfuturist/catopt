@@ -812,7 +812,13 @@ def eval_term(
     every strict caller passes both defaults.
     """
 
-    def go(t: Any) -> Any:
+    def go(t: Any, rec: Callable[..., Any]) -> Any:
+        # Recursion goes through the explicit ``rec`` parameter, not
+        # the closure: a self-referencing ``go`` would sit in its own
+        # ``__closure__``, leaving a reference cycle that keeps this
+        # call's memo/env cells (every intermediate tensor) alive
+        # until cyclic GC — an OOM source inside CUDA timing windows.
+
         if isinstance(t, Var):
             v = (var_env or {}).get(t.name, var_default)
             if v is _MISS:
@@ -841,7 +847,7 @@ def eval_term(
                 if strict:
                     raise ValueError(f"No torch binding for op '{t.op}'")
                 return None
-            args = [go(a) for a in t.args]
+            args = [rec(a, rec) for a in t.args]
             if not strict and any(a is None for a in args):
                 return None
             if strict:
@@ -866,7 +872,7 @@ def eval_term(
             raise TypeError(f"Cannot evaluate term: {t}")
         return None
 
-    return go(term)
+    return go(term, go)
 
 
 class IRModule(torch.nn.Module):

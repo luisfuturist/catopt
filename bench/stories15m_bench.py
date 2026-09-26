@@ -11,6 +11,7 @@ with ``torch.utils.benchmark``.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
 import time
@@ -218,7 +219,7 @@ def main():
         )
 
     results = []
-    variants = [("eager", lambda: m(idx)), ("catopt", lambda: opt(idx))]
+    variants = [("eager", m), ("catopt", opt)]
     try:
         cmp_ = torch.compile(m)
         opt_cmp = torch.compile(opt)
@@ -226,13 +227,32 @@ def main():
             cmp_(idx)
             opt_cmp(idx)
         variants += [
-            ("inductor", lambda: cmp_(idx)),
-            ("catopt+inductor", lambda: opt_cmp(idx)),
+            ("inductor", cmp_),
+            ("catopt+inductor", opt_cmp),
         ]
     except Exception as e:
         print(f"inductor skipped: {e}")
-    for tag, fn in variants:
-        t = Timer("fn()", globals={"fn": fn})
+
+    # Timed callable contract — same as decode_bench.make_fn: one
+    # inference under no_grad, ending in cuda.synchronize on GPU so the
+    # measurement is execution time, not async launch-submission time.
+    cuda = args.device == "cuda"
+
+    def _timed(mod):
+        def fn():
+            with torch.no_grad():
+                mod(idx)
+            if cuda:
+                torch.cuda.synchronize()
+                # eval-term closure cycles pin GPU intermediates
+                # (see benchkit.Runner._wrap) — gen-0 collect them
+                # before they OOM a 4 GB card.
+                gc.collect(0)
+
+        return fn
+
+    for tag, mod in variants:
+        t = Timer("fn()", globals={"fn": _timed(mod)})
         r = t.blocked_autorange(min_run_time=1.0)
         r.description = tag
         results.append(r)

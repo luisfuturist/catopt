@@ -40,6 +40,7 @@ PNGs under ``/tmp/benchkit_smoke`` (or ``--out``):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import platform
@@ -107,7 +108,15 @@ class Runner:
     globals={...})`` — torch's Timer only accepts string statements.
     On CUDA devices each timed call is wrapped so it ends in
     ``torch.cuda.synchronize()``, i.e. the measured time includes the
-    GPU tail rather than just kernel-launch overhead.
+    GPU tail rather than just kernel-launch overhead.  The wrapper
+    also runs ``gc.collect(0)`` per call (~2 us): self-referential
+    closures in evaluators (or torch internals) can leave young
+    reference cycles pinning GPU tensors between steps — on a 4 GB
+    card cyclic garbage can outrun the allocator inside a single
+    ``blocked_autorange`` window and OOM.  A gen-0 collect reclaims
+    young cycles before they pile up; it is a no-op cost for variants
+    that don't leak and uniform across variants, so comparisons stay
+    fair.
     """
 
     def __init__(
@@ -122,6 +131,11 @@ class Runner:
         self.min_run_time = min_run_time
         self.num_threads = num_threads
 
+    @staticmethod
+    def _released() -> None:
+        """Dead stmt swapped in after timing — see ``run_case``."""
+        return None
+
     def _wrap(self, stmt: Callable[[], object]) -> Callable[[], object]:
         if self.device.type != "cuda":
             return stmt
@@ -129,6 +143,7 @@ class Runner:
         def synced() -> object:
             out = stmt()
             torch.cuda.synchronize()
+            gc.collect(0)
             return out
 
         return synced
@@ -149,6 +164,11 @@ class Runner:
             )
             medians[v.name] = meas.median
             iqrs[v.name] = meas.iqr
+            # Timed stmts close over the cell's model + input tensors;
+            # a Cell kept for the report would hold that GPU working
+            # set for the rest of the sweep.  Timing is the only
+            # consumer of ``stmt`` — drop the reference.
+            v.stmt = self._released
         return Cell(
             case=case, medians=medians, iqr=iqrs, aux=dict(case.aux)
         )

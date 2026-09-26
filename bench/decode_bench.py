@@ -192,6 +192,10 @@ def bench_cell(model, opt, idx, ref, device, min_run_time, warmup=3):
                 mod(idx)
             if cuda:
                 torch.cuda.synchronize()
+                # eval-term closure cycles pin GPU intermediates
+                # (see benchkit.Runner._wrap) — gen-0 collect them
+                # before they OOM a 4 GB card.
+                gc.collect(0)
 
         return f
 

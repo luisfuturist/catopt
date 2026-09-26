@@ -1454,3 +1454,29 @@ def test_index_bindings_accept_positional_spelling():
     assert torch.equal(got, want)
     got = _IR_TO_TORCH["unbind"](x, arg1=0, arg2=1)
     assert torch.equal(got, want)
+
+
+def test_eval_term_does_not_leak_env():
+    """eval_term's recursive closure used to keep its own cell alive —
+    a self-referencing cycle that pinned every env tensor until
+    cyclic GC (an OOM source inside CUDA benchmark windows).  The
+    fix (`del go`) makes the env die by refcount."""
+    import weakref
+
+    x = Var("x", TensorType((4,)))
+    t = Op.make("add", x, Const(1.0))
+    from catopt.torch_bridge import _IR_TO_TORCH, eval_term
+
+    def _run(data):
+        env = {"x": data}  # temp dict — only the closure outlives it
+        return (
+            eval_term(t, var_env=env, bindings=_IR_TO_TORCH) is not None
+        )
+
+    data = torch.zeros(4)
+    ref = weakref.ref(data)
+    assert _run(data)
+    del data
+    # env's dict is dead -> the closure's ref to `data` must be too;
+    # a surviving self-cycle would keep it alive here (no gc.collect).
+    assert ref() is None

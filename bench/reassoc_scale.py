@@ -48,6 +48,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import logging
@@ -771,7 +772,15 @@ def run_cell(
             },
         },
     )
-    ran = runner.run_case(case)
+    try:
+        ran = runner.run_case(case)
+    except torch.OutOfMemoryError as e:  # honest gap, not a crash
+        print(f"  timing OOM'd: {e}")
+        cell["error"] = f"timing OOM: {e}"
+        if dev.type == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
+        return cell, None
     ms = _variant_ms(ran)
     cell["eager_ms"] = ms["eager"]
     cell["inductor_ms"] = ms["inductor"]
@@ -1014,6 +1023,12 @@ def run_bench(args: argparse.Namespace) -> Report:
         results.append(c)
         if ran is not None:
             report_cells.append(ran)
+        # Per-cell modules, compiled graphs and dynamo state pile up
+        # fast on a 4 GB card (same rationale as decode_bench) — free
+        # them before the next cell.
+        if dev.type == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
 
     # -- clean table ----------------------------------------------------
     hdr = (
