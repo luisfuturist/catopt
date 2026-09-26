@@ -1,6 +1,6 @@
 # Plan 0001 — Refactor architecture, enforce quality gates
 
-Status: proposed
+Status: phases 0–3 complete (as of bc1ea0e)
 Date: 2026-09-25
 Branch: `project` (orphan — plans live here, not on main)
 
@@ -260,3 +260,28 @@ No step changes public API without a deprecation shim.
 - No API redesign of the user-facing entry points.
 - eps/ibp/act_eps modules get the same structural treatment but no
   feature work.
+
+
+---
+
+## Progress log (main branch)
+
+| Phase | Commit | Result |
+|---|---|---|
+| 0 tooling | `97b79d8` | uv venv (system-site torch), ruff config, coverage config, pre-commit; baseline 80% |
+| 1a typing split | `0cdab72` | `catopt/typing.py`; `register_shape_rule` protocol; cost.py 1509→990 |
+| 1b attr schemas | `709f2c0` | `catopt/attrs.py` ATTR_SCHEMA + mint-time validation; layer_norm eps bug found |
+| 1c contract tests | `0cdab72` | `test_contracts.py` found `max` unbound + rms_norm eps positional on first run |
+| 2a hash-consing | `2f2b809` | `Op.make` interns; ~20 id()-memos → content keys; keepalives deleted |
+| 2b egraph→pkg | `99143f1` | `catopt/egraph/` = types/certs/terms/extract/proof/core via mixins |
+| 2c registries | `3dce571` | `OpTable.core()/full()`; import side-effects removed |
+| 2d laws/ split | `5c4919a` | `rules.py` 2020→60-line shim; laws/{base,tensor,scan,pairing} |
+| lint cleanup | `adf030f` + sweep | ruff 876→0 repo-wide |
+| coverage | `5c4919a` | 80%→87.6%; ibp 45→94, optimize 75→92, executors ≥89; 6 real bugs found+fixed |
+| 3a/3b reports+verify | `90dca02`,`bc1ea0e` | `catopt/report.py` typed dataclasses + `verify_equiv`/`verify_module` gate |
+| 3c logging | `90dca02` | `logging.getLogger("catopt.*")`; no compat prints needed |
+| 3d resilience | `90dca02` | requires_cuda markers + OOM guard (`OptimizationResourceError`) — done pre-refactor |
+
+Real bugs the refactor surfaced (beyond the two it was designed around): `max` op unbound, rms_norm eps positional, layer_norm eps misread, ibp `_inf_box` sentinel crash, `xs[0]` IndexError on param-only plans ×3 modules, `_matmul` dtype promotion, `_select_index` getitem spelling, unbind default dim, omd batched-seed memo silently dead (id-keyed vs content-keyed), `eps_rtol` docstring overclaim.
+
+Current state (bc1ea0e): **1009 tests**, ruff 0 findings, coverage 87.77% (fail_under ratchet 87 → 100 target open).
