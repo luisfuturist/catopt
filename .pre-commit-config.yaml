@@ -20,3 +20,20 @@ repos:
         language: system
         types: [python]
         files: ^(catopt|packages)/.*\.py$
+      - id: import-linter
+        name: import-linter
+        # Whole-project (not per-file): the [tool.importlinter] contracts
+        # in pyproject.toml — core must not import the torch adapter or
+        # any tensor library.  Requires `uv sync` (dev group).
+        entry: .venv/bin/lint-imports
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: vulture
+        name: vulture
+        # Whole-project dead-code scan; paths + min-confidence come from
+        # [tool.vulture] in pyproject.toml.  Requires `uv sync`.
+        entry: .venv/bin/vulture
+        language: system
+        pass_filenames: false
+        always_run: true
