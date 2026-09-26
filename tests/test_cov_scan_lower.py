@@ -1,15 +1,13 @@
-# ruff: noqa: RUF002, RUF003
 """Coverage tests for catopt.scan_lower — nested-apply folding, the
 aff-tree/domain recognizers, leaf-shape and gather analyses, the
 diagonal carrier, the leaf-b gather fast path, and the shared-A (LTI)
 expand path.  CPU only; CUDA paths live in test_scan_batched.py."""
+# ruff: noqa: RUF059 — test-idiom unpacking
 
-import pytest
 import torch
 
 from catopt.ir import IR, Op, Param, TensorType, Var
 from catopt.scan_lower import (
-    BatchedScanModule,
     _fold_nested_apply,
     _is_aff_tree,
     _leaf_b_gather,

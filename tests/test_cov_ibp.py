@@ -1,4 +1,4 @@
-# ruff: noqa: RUF002, RUF003
+# ruff: noqa: RUF003
 """Coverage tests for catopt.ibp internals and tight_model_bound paths.
 
 test_ibp.py pins the headline behaviour (sound + tighter than spectral).
@@ -11,6 +11,7 @@ kind — weight slot, activation linear (spectral-unsafe), embedding
 matmul, activation matmul, unlocated — plus the fallback ladder
 (local walk → spectral contribution → global sensitivity → ∞).
 """
+# ruff: noqa: RUF059 — test-idiom unpacking
 
 import math
 
@@ -27,7 +28,6 @@ from catopt.eps import (
 )
 from catopt.ibp import (
     Box,
-    _add,
     _closest_to_zero,
     _collect_sites,
     _div,
@@ -37,10 +37,8 @@ from catopt.ibp import (
     _grid_lip,
     _hop,
     _inf_box,
-    _matmul,
     _maxrow_bound,
     _minabs,
-    _mul,
     _neg,
     _norm_input_box,
     _prop_delta,
@@ -49,7 +47,6 @@ from catopt.ibp import (
     _softmax_lip,
     _spec_bound,
     _spectral_path_ok,
-    _sub,
     _unary,
     _unary_lip,
     _walk_site,
@@ -540,7 +537,7 @@ def test_hop_mul_div_pow():
     assert _hop(div, 0, [ab, bz], ob, "row") == (None, "row")
 
     pw = Op.make("pow", _v("a", 3), _v("e", 3))
-    pt = _box(torch.ones(3), torch.ones(3))  # point exponent
+    _pt = _box(torch.ones(3), torch.ones(3))  # point exponent
     e2 = _box(torch.full((3,), 2.0), torch.full((3,), 2.0))
     assert _hop(pw, 1, [ab, e2], ob, "row") == (None, "row")
     assert _hop(pw, 0, [ab, e2], ob, "row") == (
@@ -1241,7 +1238,7 @@ def test_tmb_fallback_ladder_and_notes():
     spectral contribution; a spectral-unsafe site there drops to the
     global sensitivity (or ∞)."""
     torch.manual_seed(0)
-    x = _v("x", 4, 4)
+    _x = _v("x", 4, 4)
     q, k = _v("q", 4, 4), _v("k", 4, 4)
     member = Op.make("mul", _p("V", 4, 4), Const(1.0))
     site_p = _p("V", 4, 4)

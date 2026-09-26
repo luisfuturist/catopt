@@ -1,9 +1,9 @@
-# ruff: noqa: RUF002, RUF003
 """Coverage tests for catopt.omd_lower — projection/leaf recognizers,
 plan rejection paths (inside_map_leaf projections, domain mismatches,
 non-uniform signatures), the opaque-leaf path in _leaf_part, index
 gathers in _eval_leaf_parts, the serial compose fallback, and the
 runtime fallback counter.  CPU only."""
+# ruff: noqa: RUF059 — test-idiom unpacking
 
 import pytest
 import torch
@@ -137,7 +137,7 @@ def test_part_gather():
     g = _part_gather(leaves, 0)
     assert g is not None and g[0] is base and g[2] == [0, 1, 2]
     # non-leaf op in the leaf list → None
-    leaves_bad = leaves[:1] + [_v("z", 4)]
+    leaves_bad = [*leaves[:1], _v("z", 4)]
     assert _part_gather(leaves_bad, 0) is None
     # arg not a select → None
     leaves2 = [
@@ -321,7 +321,7 @@ def test_omd_module_runtime_fallback_counts():
     Mixed leaf dtypes are legal IR but torch.stack can't batch them —
     the batched path raises, the wrapper falls back to serial eval and
     counts the fall."""
-    Tq, Ts, d = 3, 4, 2
+    _Tq, _Ts, d = 3, 4, 2
     a, b = _p("a", d), _p("b", d)
     h = _v("h", d)
     mp = Op.make(
@@ -334,7 +334,10 @@ def test_omd_module_runtime_fallback_counts():
     # a MAP term sits in the s slot: legal IR (typing can't know it
     # evaluates to a pair).  The batched leaf pass calls omd_elem on
     # the tuple → raises inside the schedule → counted fallback; the
-    # serial evaluator then surfaces the same genuine error.
+    # serial evaluator then surfaces the same genuine error — the
+    # binding gets a tuple where a tensor is expected (AttributeError
+    # on .amax), not a RuntimeError: the contract is that the REAL
+    # error escapes and the batched attempt was counted as a fallback.
     bad_elem = Op.make("omd_elem", mp, amap, bmap)
     term = Op.make("omd_apply", Op.make("omd_compose", bad_elem, bad_elem), h)
     ir = IR(root=term, inputs=[h], params={})
@@ -344,7 +347,7 @@ def test_omd_module_runtime_fallback_counts():
     }
     mod = to_batched_omd_module(ir, param_values=pv)
     assert mod.is_batched
-    with pytest.raises(Exception):
+    with pytest.raises((AttributeError, TypeError, RuntimeError)):
         mod(_rand((d,), 4))
     assert mod.fallbacks == 1
 

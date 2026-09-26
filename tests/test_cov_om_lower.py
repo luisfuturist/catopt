@@ -1,16 +1,14 @@
-# ruff: noqa: RUF002, RUF003
 """Coverage tests for catopt.om_lower — the operand-gather recognizers,
 elem-group analysis modes, the batched module's runtime paths (serial
 leaves, DAG multiplicities, masked rows, cache), and the streaming
 schedule's incremental API.  All CPU; CUDA paths stay in
 test_om_batched.py."""
+# ruff: noqa: RUF059, E741 — test-idiom unpacking
 
-import pytest
 import torch
 
 from catopt.ir import IR, Op, Param, TensorType, Var
 from catopt.om_lower import (
-    BatchedOMModule,
     StreamingOMModule,
     _analyze_elem_group,
     _batched_compose,
@@ -108,9 +106,11 @@ def test_sliced_gather_select_and_chunk():
     assert _sliced_gather(parts_bad) is None
     # different bases → None
     base2 = _v("base2", 4, 8)
-    parts_mix = parts[:1] + [
-        _slice_index(Op.make("select", base2, arg1=0, arg2=1))
-    ] + parts[2:]
+    parts_mix = [
+        *parts[:1],
+        _slice_index(Op.make("select", base2, arg1=0, arg2=1)),
+        *parts[2:],
+    ]
     assert _sliced_gather(parts_mix) is None
     # mixed kinds → None
     parts_mix2 = parts[:1] + ch[1:]
@@ -281,7 +281,7 @@ def _qk_ir(B, T, d, dv, ksizes, leaf_fn=None):
         )
 
     root = Op.make(
-        "om_apply", tree([fn(q, k, v) for k, v in zip(ks, vs)])
+        "om_apply", tree([fn(q, k, v) for k, v in zip(ks, vs, strict=True)])
     )
     inputs = [q, *ks, *vs]
     return (

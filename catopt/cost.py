@@ -13,6 +13,7 @@ For the "killer experiment", the FLOPs-based model matters: it rewards
 the associativity / distributivity / naturality rewrites that produce
 fewer total floating-point operations.
 """
+# ruff: noqa: RUF002, RUF003 — math notation in comments
 
 from __future__ import annotations
 
@@ -31,7 +32,6 @@ from catopt.typing import (  # noqa: F401
     _numel,
     _shape_of,
 )
-
 
 # ---------------------------------------------------------------------------
 # Per-op FLOP weights

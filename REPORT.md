@@ -70,7 +70,7 @@ but weak (the earlier "4 terms" was the best-e1 split's rank — the
 storage-optimal split needs K~28, giving ~1.3× at 35% residual).
 Correction applied honestly.
 
-## 4. The ε axis (`catopt/eps.py`, `egraph.py`)
+## 4. The ε axis (`catopt/eps.py`, `catopt/egraph/`)
 
 > **Status: optional toolkit, not core.** The ε-passes are opt-in
 > (`optimize_model(eps_rtol=…)`, off by default) and ride on catopt

@@ -1,9 +1,9 @@
-# ruff: noqa: RUF002, RUF003
 """Coverage tests for catopt.rulecache — the JSON codec (attrs, terms,
 bindings, rule records incl. guarded re-expression), fingerprinting,
 the filesystem store/load contract, and the cached-synthesis key
 derivation.  Real codec paths only; the synthesis itself is stubbed
 where the cache mechanics are what's under test."""
+# ruff: noqa: E741 — test-idiom unpacking
 
 import functools
 import json
@@ -207,7 +207,7 @@ def test_ruleset_fingerprint_order_and_hooks():
     # changing a hook changes the fingerprint
     r0 = rules[0]
     r0p = _rw(r0.name + "_x", r0.lhs, r0.rhs)
-    fp3 = ruleset_fingerprint(rules[1:] + [r0p])
+    fp3 = ruleset_fingerprint([*rules[1:], r0p])
     assert fp3 != fp1
 
 
@@ -286,7 +286,7 @@ def test_store_load_roundtrip_and_misses(tmp_path):
     # missing file → miss
     assert RuleCache(str(tmp_path / "empty")).load(key) is None
     # corrupt file → clean miss
-    bad = tmp_path / f"rules-{key}-bad.json"
+    _bad = tmp_path / f"rules-{key}-bad.json"
     cache2 = RuleCache(str(tmp_path))
     key2 = "corrupt"
     cache2.path(key2).write_text("{nope")
@@ -351,7 +351,7 @@ def test_synthesize_rules_cached_hits_and_misses(
     assert calls["n"] == 1
     assert [r.name for r in d2] == [r.name for r in d1]
     # different fuel → miss → second synthesis
-    d3 = synthesize_rules_cached(
+    _d3 = synthesize_rules_cached(
         parents, seeds, fuel=128, cache_dir=str(tmp_path)
     )
     assert calls["n"] == 2

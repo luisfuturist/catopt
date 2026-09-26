@@ -1,15 +1,15 @@
-# ruff: noqa: RUF002, RUF003
 """Coverage tests for catopt.optimize — resource bounds, the OOM
 adapter, causal-mask specialization, discovery/eps entry points, the
 parameter-diff report, and the compositional driver."""
+# ruff: noqa: RUF059 — test-idiom unpacking
 
-import json
 import types
 
 import pytest
 import torch
 import torch.nn as nn
 
+from catopt.cost import flops_cost, launch_aware_cost
 from catopt.ir import Const, Op, Param, TensorType, Var
 from catopt.optimize import (
     OptimizationResourceError,
@@ -19,7 +19,6 @@ from catopt.optimize import (
     _is_causal_keep_mask,
     _looks_like_oom,
     _oom_to_resource_error,
-    _rel_diff,
     _select_blocks,
     _specialize_causal,
     discover_alternatives,
@@ -30,7 +29,6 @@ from catopt.optimize import (
     save_optimized_weights,
     term_cost,
 )
-from catopt.cost import flops_cost, launch_aware_cost
 
 
 def _T(*shape):
@@ -368,7 +366,7 @@ def test_optimize_compositional_sequential():
     pr = stats["param_report"]
     assert pr["original_params"] >= stats["n_optimized"]
     assert "blocks" in stats
-    for name, entry in stats["blocks"].items():
+    for _name, entry in stats["blocks"].items():
         assert entry["status"] in (
             "optimized",
             "failed",
