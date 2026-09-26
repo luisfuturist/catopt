@@ -172,7 +172,7 @@ catopt/          the engine: ir, egraph, rules, cost, optimize
   meta           coherence stratification + rule synthesis
   calibrate      per-device cost constants
 bench/           real-checkpoint benchmarks (stories15M/110M, decode sweep)
-tests/           572 tests
+tests/           578 tests
 REPORT.md        full measurements + the falsified directions
 project/         orphan branch: ADRs and retrospectives (worktree)
 ```
