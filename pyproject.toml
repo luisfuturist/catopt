@@ -42,14 +42,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["packages", "catopt"]
-extraPaths = [
-    "packages/catopt-core/src",
-    "packages/catopt-torch/src",
-    "packages/catopt-carriers/src",
-    "packages/catopt-eps/src",
-    "packages/catopt-optimize/src",
-]
+include = ["catopt"]
 exclude = ["packages*", "tests*", "bench*"]
 
 # --- uv workspace: the domain packages ---------------------------
