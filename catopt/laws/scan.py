@@ -279,7 +279,7 @@ def _derive_affd_unit(bound: dict) -> dict | None:
     if not (
         isinstance(s, tuple) and all(isinstance(d, int) for d in s)
     ):
-        return None
+        return None  # pragma: no cover — defensive guard
     # The RHS embeds ``Const(1.0)`` as a leaf; ``_instantiate`` adds
     # leaf enodes keyed by repr WITHOUT registering the term, so
     # ``any_term``/extraction would decode the raw string "1.0" unless

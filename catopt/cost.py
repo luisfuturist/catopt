@@ -796,7 +796,7 @@ def _local_roofline(
     if shape is _INVALID:
         return _INVALID_COST
     flops = _flops_of(term, memo)
-    if flops >= _INVALID_COST:
+    if flops >= _INVALID_COST:  # pragma: no cover — INVALID shapes checked above
         return _INVALID_COST
     compute_s = flops / peak_flops
     memory_s = _bytes_of(term, memo) / peak_bw

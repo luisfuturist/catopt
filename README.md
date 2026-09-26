@@ -181,7 +181,6 @@ catopt/          the engine: ir, egraph, laws, cost, ops, optimize
 bench/           real-checkpoint benchmarks: stories15M/110M, decode sweep,
                  e2e smoke, omd attention stack
 tests/           578 tests
-REPORT.md        full measurements + the falsified directions
 project/         orphan branch: ADRs and retrospectives (worktree)
 ```
 

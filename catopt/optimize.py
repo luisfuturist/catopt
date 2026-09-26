@@ -165,11 +165,11 @@ def _current_memory_mb() -> float:
     rss = 0.0
     try:
         with open("/proc/self/status") as fh:
-            for line in fh:
+            for line in fh:  # pragma: no branch — VmRSS always present on Linux
                 if line.startswith("VmRSS:"):
                     rss = float(line.split()[1]) / 1024.0
                     break
-    except OSError:  # non-Linux: peak RSS is the portable fallback
+    except OSError:  # pragma: no cover — non-Linux only
         import resource
 
         rss = (

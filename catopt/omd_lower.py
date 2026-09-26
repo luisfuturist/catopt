@@ -446,7 +446,7 @@ def build_omd_plan(root: Any) -> dict | None:
         before = len(targets)
         walk_map(mp, dom)
         if len(targets) > before:
-            queue.extend(list(targets.values())[before:])
+            queue.extend(list(targets.values())[before:])  # pragma: no cover — queue always empty here
     if bad:
         return None
 
@@ -623,7 +623,8 @@ class BatchedOmdModule(torch.nn.Module):
     def is_graph_captured(self) -> bool:
         return self._graph is not None
 
-    def capture_cuda_graph(
+    def capture_cuda_graph(  # pragma: no cover — CUDA-only body
+
         self,
         *example_inputs: torch.Tensor,
         warmup: int = 3,

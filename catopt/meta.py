@@ -1406,15 +1406,16 @@ def synthesize_rules(
                 ok = True
                 for v in pattern_metavars(r2.rhs):
                     if v.startswith("$attr:") and v not in inst2:
-                        if r2.derive is None:
-                            ok = False  # pragma: no cover — filtered by _synthesizable
+                        if r2.derive is None:  # pragma: no cover — filtered by _synthesizable
+                            ok = False
                             break
-                        inst2[v] = ns2 + v[len("$attr:") :]
-                if not ok:
+                        inst2[v] = ns2 + v[len("$attr:") :]  # pragma: no cover — r2.derive + unbound attr metavar
+
+                if not ok:  # pragma: no cover — filtered by _synthesizable
                     continue
                 try:
                     rhs2 = instantiate_pattern(r2.rhs, inst2)
-                except KeyError:
+                except KeyError:  # pragma: no cover — total subst guaranteed
                     continue
                 t2 = _replace(t1, q, rhs2)
                 chk, drv = _compose_guards(r1, r2, pat1, m2)

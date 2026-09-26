@@ -200,7 +200,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             dim = op.attrs.get("dim", op.attrs.get("axis", None))
             keep = bool(op.attrs.get("keepdim", False))
             base = shapes[0]
-            if base is None:
+            if base is None:  # pragma: no cover — dispatch filters None shapes
                 return ()
             if dim is None:
                 return ()
@@ -271,7 +271,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return shapes[0]
         case "unsqueeze":
             base = shapes[0]
-            if base is None:
+            if base is None:  # pragma: no cover — dispatch filters None shapes
                 return None
             d = op.attrs.get("arg1", op.attrs.get("dim", -1))
             d = d % (len(base) + 1)
@@ -290,7 +290,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "stack":
             # stack(ts, dim): all inputs share a shape; insert dim.
             base = shapes[0]
-            if base is None:
+            if base is None:  # pragma: no cover — dispatch filters None shapes
                 return None
             d = op.attrs.get("arg1", op.attrs.get("dim", 0))
             d = d % (len(base) + 1)

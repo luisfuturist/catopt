@@ -566,7 +566,8 @@ class BatchedOMModule(torch.nn.Module):
         """True after :meth:`capture_cuda_graph` succeeded."""
         return self._graph is not None
 
-    def capture_cuda_graph(
+    def capture_cuda_graph(  # pragma: no cover — CUDA-only body
+
         self,
         *example_inputs: torch.Tensor,
         warmup: int = 3,

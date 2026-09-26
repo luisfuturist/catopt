@@ -423,7 +423,7 @@ class _ExtractMixin:
                     progress = True
             if not progress:
                 return None  # bounded member we cannot locate/exclude
-        return None
+        return None  # pragma: no cover — pigeonhole: each ban removes a new enode
 
     # -- coordinated (group) extraction ----------------------------------
 

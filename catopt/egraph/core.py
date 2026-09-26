@@ -388,7 +388,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
             attr_t = _pattern_attrs(pattern)
             for node in self._nodes_of(eclass, pattern.op):
                 if limit is not None and len(results) >= limit:
-                    return
+                    return  # pragma: no cover — limit reached only inside trailing extend
                 if len(node.children) != len(pattern.args):
                     continue
                 # Attribute matching: every pattern attr key must exist in

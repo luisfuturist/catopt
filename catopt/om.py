@@ -674,9 +674,7 @@ def _check_cat_pair(bound: dict) -> int | None:
     ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
     if ba is _INVALID or bb is _INVALID:
         return None
-    # pragma: no cover — unreachable: earlier guards force per-operand
-    # off-axis equality, so the broadcast results cannot differ here.
-    if not all(_dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa):
+    if not all(_dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa):  # pragma: no cover — off-axis equality forced by earlier guards
         return None
     return oa
 

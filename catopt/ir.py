@@ -162,7 +162,7 @@ class Op:
         if existing is not None:
             return existing
         t = Op(op, args, a)
-        if key is not None:
+        if key is not None:  # pragma: no branch — unhashable args die earlier in __post_init__
             Op._INTERN[key] = t
         return t
 

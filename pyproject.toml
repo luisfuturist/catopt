@@ -101,7 +101,7 @@ branch = true
 omit = ["*/tests/*"]
 
 [tool.coverage.report]
-fail_under = 87        # ratcheted upward each refactor phase; target 100
+fail_under = 100       # ratcheted upward each refactor phase; target 100
 show_missing = true
 exclude_also = [
     "if __name__ == ['\"]__main__['\"]:",

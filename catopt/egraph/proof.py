@@ -501,7 +501,7 @@ class _ProofMixin:
                             sig = tuple(
                                 (s.rule, s.path) for s in nsteps
                             )
-                            if sig not in sigs:
+                            if sig not in sigs:  # pragma: no branch — full (rule,path) histories can't collide
                                 sigs.add(sig)
                                 paths.append(nsteps)
                         elif new_repr not in seen:

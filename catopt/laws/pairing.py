@@ -139,7 +139,7 @@ def _pair_shared_input(
                 continue  # fused weight must fold at compile time
             wts = [eg._any_term_cached(w) for w in weights]
             if any(t is None for t in wts):
-                continue
+                continue  # pragma: no cover — memoized _any_term_cached can't differ
             sizes: list[int] = []
             for t in wts:
                 s = _so(t)
