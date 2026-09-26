@@ -200,6 +200,20 @@ def test_verifier_wrong_signature_rejected():
     assert not signature_conforms(object(), Verifier)
 
 
+def test_verify_result_is_core_owned_and_satisfied_by_verify_report():
+    """Core's structural ``VerifyResult`` is what the ports return; the
+    torch adapter's ``VerifyReport`` satisfies it without core naming
+    that type (the decoupling Phase 1 pins)."""
+    from catopt.ports import VerifyResult
+
+    rep = VerifyReport(0.0, 0.0, True)
+    assert isinstance(rep, VerifyResult)
+    assert rep.passed
+    assert not isinstance(object(), VerifyResult)
+    # the returned report is the concrete torch dataclass
+    assert isinstance(verify_equiv(torch.ones(3), torch.ones(3)), VerifyResult)
+
+
 # ---------------------------------------------------------------------------
 #  Source / Sink — the whole-graph source/sink boundary
 # ---------------------------------------------------------------------------

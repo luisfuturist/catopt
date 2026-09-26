@@ -85,7 +85,7 @@ representative of the same critical pair.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Protocol
 
 import catopt_core.rules as R
 from catopt_core.egraph import EGraph, Rewrite
@@ -879,37 +879,64 @@ def _alpha_key(lhs: Any, rhs: Any) -> tuple[str, str]:
     return op_repr(norm(lhs, names)), op_repr(norm(rhs, names))
 
 
+class ConcreteEval(Protocol):
+    """Adapter-injected numeric evaluation for candidate validation.
+
+    ``synthesize_rules``' numeric check instantiates a candidate on
+    random fp64 tensors and compares both sides.  The tensor machinery
+    is backend-specific, so it is pushed in from an adapter
+    (``catopt_torch.meta_eval`` implements this and registers it via
+    :func:`register_concrete_eval`); core imports no tensor library.
+    """
+
+    def make_env(self, leaf_shapes: dict) -> dict:
+        """Build a ``{leaf: random fp64 value}`` env for the given
+        ``{leaf: shape}`` mapping (shapes are all-int)."""
+        ...
+
+    def eval_term(self, term: Any, env: dict) -> Any:
+        """Evaluate *term* against *env* through the backend's op
+        bindings; raise ``KeyError`` for an unbound op."""
+        ...
+
+    def allclose(self, a: Any, b: Any, tol: float) -> bool:
+        """Structural/tensor comparison of two (possibly nested-tuple)
+        values with tolerance *tol*."""
+        ...
+
+
+#: Injected concrete-evaluation backend — see
+#: :func:`register_concrete_eval`.  ``None`` until an adapter registers
+#: (a catopt-core-only environment), in which case the numeric check
+#: degrades to structural-only.
+_concrete_eval: ConcreteEval | None = None
+
+
+def register_concrete_eval(backend: ConcreteEval) -> None:
+    """Adapter hook: install the numeric-evaluation backend.
+
+    ``catopt_torch.meta_eval`` calls this at import time.  With no
+    backend registered the numeric candidate check is skipped — the
+    same path taken when an op has no lowering binding.
+    """
+    global _concrete_eval
+    _concrete_eval = backend
+
+
 def _eval_term(term: Any, env: dict) -> Any:
     """Evaluate a term with concrete leaves against ``env`` (leaf ->
-    tensor), using the torch_bridge op bindings.  Returns a tensor or a
-    nested tuple (aff/om carriers)."""
-    from catopt_torch.torch_bridge import _IR_TO_TORCH
-
-    if isinstance(term, Const):
-        import torch
-
-        return torch.tensor(term.value)
-    if isinstance(term, (Var, Param)):
-        return env[term]
-    if isinstance(term, Op):
-        fn = _IR_TO_TORCH.get(term.op)
-        if fn is None:
-            raise KeyError(term.op)
-        args = [_eval_term(a, env) for a in term.args]
-        return fn(*args, **dict(term.attrs))
-    raise TypeError(term)
+    value) through the injected backend.  Returns a value or a nested
+    tuple (aff/om carriers).  Raises ``RuntimeError`` when no backend is
+    registered — the caller treats that as "skip the numeric check"."""
+    if _concrete_eval is None:
+        raise RuntimeError("no concrete-eval backend registered")
+    return _concrete_eval.eval_term(term, env)
 
 
 def _eval_allclose(a: Any, b: Any, tol: float = 1e-6) -> bool:
-    import torch
-
-    if isinstance(a, tuple) and isinstance(b, tuple):
-        return len(a) == len(b) and all(
-            _eval_allclose(x, y, tol) for x, y in zip(a, b, strict=True)
-        )
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        return bool(torch.allclose(a, b, atol=tol, rtol=tol))
-    return False
+    if _concrete_eval is None:
+        return False
+    return _concrete_eval.allclose(a, b, tol)
 
 
 def _term_is_ground(t: Any) -> bool:
@@ -1018,18 +1045,20 @@ def _tensor_env(subst: dict) -> dict:
 
     Bound values may be whole subterms (witness bindings mined from
     seeds), so Var/Param leaves are collected recursively — a scalar or
-    tensor needed only deep inside a bound mask still gets an entry."""
-    import torch
-
-    env = {}
+    tensor needed only deep inside a bound mask still gets an entry.
+    Leaf/shape extraction is pure core; the tensors themselves are
+    built by the injected backend (``{}`` when none is registered)."""
+    if _concrete_eval is None:
+        return {}
+    leaf_shapes: dict[Any, tuple] = {}
     for v in subst.values():
         for leaf in _leaf_vars(v):
             shape = getattr(getattr(leaf, "typ", None), "shape", None)
             if shape is not None and all(
                 isinstance(d, int) for d in shape
             ):
-                env[leaf] = torch.randn(*shape, dtype=torch.float64)
-    return env
+                leaf_shapes[leaf] = tuple(shape)
+    return _concrete_eval.make_env(leaf_shapes)
 
 
 def _seed_witnesses(lhs: Any, seeds: Iterable[Any]):

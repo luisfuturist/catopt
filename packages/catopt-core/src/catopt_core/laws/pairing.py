@@ -20,6 +20,35 @@ from typing import Any
 
 from catopt_core.ir import Op
 
+
+def _is_tensor(x: Any) -> bool:
+    """Duck-typed "is a tensor" check.
+
+    The sharing passes are called with the backend's leaf values
+    (``source_tensors`` from ``export_to_ir``); core must not name the
+    tensor type, so a tensor is recognised structurally — ``shape`` /
+    ``dtype`` / ``dim`` (a ``str``/``dict``/``None`` entry, which a
+    caller may leave in the mapping, has none of these).
+    """
+    return (
+        hasattr(x, "shape")
+        and hasattr(x, "dtype")
+        and hasattr(x, "dim")
+    )
+
+
+def _exact_equal(a: Any, b: Any) -> bool:
+    """Exact value equality of two tensor-like leaves — ``torch.equal``
+    semantics without importing torch: same shape AND every element
+    equal, so ``NaN != NaN`` and ``-0.0 == +0.0`` (unlike a raw-bytes
+    comparison).  Uses the objects' own ``==`` / ``.all()``, keeping
+    core tensor-library-free.
+    """
+    if tuple(a.shape) != tuple(b.shape):
+        return False
+    return bool((a == b).all())
+
+
 # ---------------------------------------------------------------------------
 #  Diagram-level pairing pass — the product law in full generality.
 #
@@ -280,13 +309,11 @@ def share_duplicate_params(
     Each merge carries a pointwise witness, like the other non-local
     passes — certificates replay it as a rule step.
     """
-    import torch as _t
-
     from catopt_core.ir import Param, TensorType
 
     by_sig: dict[tuple, list[str]] = {}
     for name, t in source_tensors.items():
-        if not isinstance(t, _t.Tensor):
+        if not _is_tensor(t):
             continue
         key = (tuple(t.shape), str(t.dtype))
         by_sig.setdefault(key, []).append(name)
@@ -301,7 +328,7 @@ def share_duplicate_params(
         for name in names:
             placed = False
             for ci, rep in enumerate(reps):
-                if _t.equal(source_tensors[name], source_tensors[rep]):
+                if _exact_equal(source_tensors[name], source_tensors[rep]):
                     clusters[ci].append(name)
                     placed = True
                     break
@@ -398,14 +425,12 @@ def share_duplicate_param_slices(
     ``{param, heads, head_dim, unique, index_map, dedup_param,
       stored_before, stored_after, eid}``.
     """
-    import torch as _t
-
     from catopt_core.egraph import ENode
     from catopt_core.ir import Param, TensorType
 
     offers: list[dict] = []
     for name, t in list(source_tensors.items()):
-        if not isinstance(t, _t.Tensor) or t.dim() != 2:
+        if not _is_tensor(t) or t.dim() != 2:
             continue
         o, i = int(t.shape[0]), int(t.shape[1])
         leaf = ENode("leaf", (), (("key", name),))
@@ -455,13 +480,19 @@ def share_duplicate_param_slices(
         stored, h, d, imap, uniques = best
         k = len(uniques)
 
-        with _t.no_grad():
-            dedup = _t.stack(uniques, dim=0).detach().clone()
+        # Stack the unique head-blocks WITHOUT importing torch: a fresh
+        # zero tensor of the right shape (dtype/device inherited from the
+        # blocks via ``new_zeros``) filled in place, then detached — the
+        # duck-typed equivalent of ``torch.stack(uniques).detach()``.
+        dedup = uniques[0].new_zeros((k, d, i))
+        for j, u in enumerate(uniques):
+            dedup[j] = u
+        dedup = dedup.detach()
         dedup_name = f"{name}__heads{h}"
         # Fresh registration; reuse an identical prior entry on re-run.
         if not (
             dedup_name in source_tensors
-            and _t.equal(source_tensors[dedup_name], dedup)
+            and _exact_equal(source_tensors[dedup_name], dedup)
         ):
             base_name, n = dedup_name, 0
             while dedup_name in source_tensors:

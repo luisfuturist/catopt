@@ -13,7 +13,11 @@ from typing import Any
 import torch
 from catopt_core.attrs import ATTR_SCHEMA, attr_of
 from catopt_core.ir import IR, Const, Op, Param, TensorType, Var
-from catopt_core.ops import OpTable
+from catopt_core.ops import (
+    OpTable,
+    register_ambient_bindings,
+    register_core_bindings,
+)
 
 _ATEN_TO_IR: dict[str, str] = {
     "add": "add",
@@ -696,6 +700,16 @@ class _AmbientTorchBindings(dict):
 _IR_TO_TORCH: _AmbientTorchBindings = _AmbientTorchBindings(
     _CORE_TORCH_BINDINGS
 )
+
+# -- push the torch tables into core (core imports no adapter) --------
+# catopt-core owns ``OpTable.core()`` / ``OpTable.full()`` but never
+# names this module; the wiring is registered here, at adapter import
+# time.  ``_CORE_TORCH_BINDINGS`` becomes the base table ``core()``
+# folds in; ``_IR_TO_TORCH`` is the ambient dict ``full()`` seats its
+# bindings on (so post-hoc ``_IR_TO_TORCH[op] = fn`` overrides and lazy
+# carrier resolution keep reaching already-built evaluators).
+register_core_bindings(_CORE_TORCH_BINDINGS)
+register_ambient_bindings(_IR_TO_TORCH)
 
 
 def _om_elem(s: torch.Tensor, v: torch.Tensor):

@@ -30,7 +30,10 @@ The ports (this file)
 * :class:`Executor` / :class:`PlannedExecutor` /
   :class:`BatchedExecutor` — the lowered-module contract.
 * :class:`Verifier` — the semantic-equivalence gate,
-  ``(ref_out, out, rtol, atol) -> VerifyReport``.
+  ``(ref_out, out, rtol, atol) -> VerifyResult``.
+* :class:`VerifyResult` — the core-owned structural view of a verify
+  result (``max_abs`` / ``max_rel`` / ``passed``); the torch adapter's
+  ``report.VerifyReport`` satisfies it without core naming it.
 * :class:`Source` — the whole-graph source port,
   ``model -> (IR, leaves)``.
 * :class:`Sink` — the whole-graph sink port, ``IR -> runnable``, plus
@@ -103,9 +106,6 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    import torch
-    from catopt_torch.report import VerifyReport
-
     from catopt_core.ir import IR, Op
 
 __all__ = [
@@ -123,6 +123,7 @@ __all__ = [
     "Source",
     "TorchBinding",
     "Verifier",
+    "VerifyResult",
     "signature_conforms",
 ]
 
@@ -169,9 +170,12 @@ class Executor(Protocol):
     Members: ``IRModule`` (torch_bridge), ``BatchedScanModule``
     (scan_lower), ``BatchedOMModule`` / ``StreamingOMModule``
     (om_lower), ``BatchedOmdModule`` (omd_lower).
+
+    ``xs``/return are ``Any``: core is backend-neutral and names no
+    tensor library (the torch adapter's values are ``torch.Tensor``).
     """
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor: ...
+    def forward(self, *xs: Any) -> Any: ...
 
 
 @runtime_checkable
@@ -289,9 +293,30 @@ class CostFn(Protocol):
 
 
 @runtime_checkable
+class VerifyResult(Protocol):
+    """Core's structural view of an equivalence-check result.
+
+    Domain port — the return of :class:`Verifier` and
+    :meth:`Sink.verify`.  Core names no adapter type: the torch
+    adapter's ``report.VerifyReport`` (a frozen dataclass) structurally
+    satisfies it, and so does any backend's own result object.  The
+    three members are exactly the fields every call site reads:
+
+    * ``max_abs`` — ``max|ref - out|``;
+    * ``max_rel`` — the historical rel-diff metric
+      ``max|ref - out| / (max|ref| + 1e-8)``;
+    * ``passed`` — the gate outcome.
+    """
+
+    max_abs: float
+    max_rel: float
+    passed: bool
+
+
+@runtime_checkable
 class Verifier(Protocol):
     """The semantic-equivalence gate:
-    ``(ref_out, out, rtol, atol) -> VerifyReport``.
+    ``(ref_out, out, rtol, atol) -> VerifyResult``.
 
     Domain port — ``report.verify_equiv`` is the canonical
     implementation (the rel-diff metric every call site shares), with
@@ -302,11 +327,11 @@ class Verifier(Protocol):
 
     def __call__(
         self,
-        ref_out: torch.Tensor,
-        out: torch.Tensor,
+        ref_out: Any,
+        out: Any,
         rtol: float = 1e-4,
         atol: float | None = None,
-    ) -> VerifyReport: ...
+    ) -> VerifyResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +403,7 @@ class Sink(Protocol):
         *,
         rtol: float = 1e-4,
         atol: float | None = None,
-    ) -> VerifyReport: ...
+    ) -> VerifyResult: ...
 
 
 # ---------------------------------------------------------------------------

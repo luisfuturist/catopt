@@ -9,9 +9,10 @@ WHICH modules had happened to be imported — an invisible dependency.
 
 :class:`OpTable` replaces that with explicit composition:
 
-* :meth:`OpTable.core` — the base table: the core torch bindings plus
-  the ambient shape rules (``catopt_core.typing._SHAPE_RULES``) and the
-  attr schema (``catopt_core.attrs.ATTR_SCHEMA``).
+* :meth:`OpTable.core` — the base table: the registered core bindings
+  (see *Backend wiring* below) plus the ambient shape rules
+  (``catopt_core.typing._SHAPE_RULES``) and the attr schema
+  (``catopt_core.attrs.ATTR_SCHEMA``).
 * :meth:`OpTable.register` — folds one extension module's declared
   exports in: ``TORCH_BINDINGS`` / ``SHAPE_RULES`` / ``ATTR_SCHEMA``
   dicts the module publishes at top level (importing the module no
@@ -19,6 +20,28 @@ WHICH modules had happened to be imported — an invisible dependency.
 * :meth:`OpTable.full` — ``core()`` plus every carrier module that
   is installed — preserves today's ambient behavior and is the
   default ``IRModule``/``optimize_model`` dispatches through.
+
+Backend wiring (core stays torch-free)
+--------------------------------------
+``catopt-core`` imports no backend.  The torch lowering table
+(``catopt_torch.torch_bridge._CORE_TORCH_BINDINGS``) and the ambient
+dict (``_IR_TO_TORCH``) are *pushed into* core by the adapter at import
+time through two hooks:
+
+* :func:`register_core_bindings` — the adapter hands core its base
+  binding table; :meth:`OpTable.core` folds in every registered table.
+* :func:`register_ambient_bindings` — the adapter hands core the
+  ambient dict :meth:`OpTable.full` seats its bindings on (so post-hoc
+  ``_IR_TO_TORCH[op] = fn`` overrides and lazy carrier resolution keep
+  reaching already-built evaluators).
+
+Nothing in core names ``catopt_torch``.  With no adapter imported (a
+``pip install catopt-core``-only environment) the hooks are simply
+unfired: ``OpTable.core()`` yields the shape rules and attr schema with
+an empty ``torch_bindings`` (no backend can lower anything), and
+``OpTable.full()`` returns a private composed table instead of seating
+on an ambient dict.  A new backend (numpy/JAX) registers its own tables
+the same way.
 
 Carrier modules that opt in (and the ops they contribute):
 
@@ -65,7 +88,49 @@ from typing import Any
 
 from catopt_core.ports import Binding, ShapeRule
 
-__all__ = ["OpTable", "carrier_torch_bindings"]
+__all__ = [
+    "OpTable",
+    "carrier_torch_bindings",
+    "register_ambient_bindings",
+    "register_core_bindings",
+]
+
+#: Core lowering tables registered by adapters (see module docstring,
+#: *Backend wiring*).  ``catopt_torch.torch_bridge`` appends its
+#: ``_CORE_TORCH_BINDINGS`` here at import; core imports no adapter.
+_CORE_BINDING_TABLES: list[dict[str, Binding]] = []
+
+#: The ambient lowering dict registered by the backend (torch's
+#: ``_IR_TO_TORCH``).  :meth:`OpTable.full` seats its bindings on it so
+#: post-hoc overrides and lazy carrier resolution reach already-built
+#: evaluators.  ``None`` when no backend has registered (a
+#: catopt-core-only environment): ``full()`` then returns a private
+#: composed table.
+_AMBIENT_BINDINGS: dict[str, Binding] | None = None
+
+
+def register_core_bindings(table: dict[str, Binding]) -> None:
+    """Backend hook: register a core lowering table.
+
+    Called by an adapter at import time (``catopt_torch.torch_bridge``
+    passes ``_CORE_TORCH_BINDINGS``).  :meth:`OpTable.core` folds every
+    registered table into its ``torch_bindings``; core never imports the
+    adapter.  Idempotent per table *object* — a re-import or a double
+    call does not duplicate the table.
+    """
+    if not any(t is table for t in _CORE_BINDING_TABLES):
+        _CORE_BINDING_TABLES.append(table)
+
+
+def register_ambient_bindings(table: dict[str, Binding]) -> None:
+    """Backend hook: register the ambient lowering dict.
+
+    :meth:`OpTable.full` seats its composed bindings on the last
+    registered dict.  The torch adapter passes ``_IR_TO_TORCH``.
+    """
+    global _AMBIENT_BINDINGS
+    _AMBIENT_BINDINGS = table
+
 
 #: Extension modules folded into :meth:`OpTable.full`, in
 #: registration order.  Each declares a module-level
@@ -149,17 +214,23 @@ class OpTable:
 
     @classmethod
     def core(cls) -> OpTable:
-        """The base table: core torch bindings + shape rules + attr
-        schema.  No carrier ops — ``trace``/``omd_*``/``cmask``/
-        ``aquant`` are absent until a carrier module is
-        :meth:`register`\\ ed."""
-        from catopt_torch.torch_bridge import _CORE_TORCH_BINDINGS
+        """The base table: every registered core binding table + shape
+        rules + attr schema.  No carrier ops — ``trace``/``omd_*``/
+        ``cmask``/``aquant`` are absent until a carrier module is
+        :meth:`register`\\ ed.
 
+        With a backend adapter imported (``catopt_torch.torch_bridge``
+        registers its table at import) this is exactly the historical
+        core table.  In a catopt-core-only environment no table is
+        registered, so ``torch_bindings`` is empty while the shape rules
+        and attr schema still compose.
+        """
         from catopt_core.attrs import ATTR_SCHEMA
         from catopt_core.typing import _SHAPE_RULES
 
         t = cls()
-        t.torch_bindings.update(_CORE_TORCH_BINDINGS)
+        for table in _CORE_BINDING_TABLES:
+            t.torch_bindings.update(table)
         t.shape_rules.update(_SHAPE_RULES)
         t.attr_schemas.update(ATTR_SCHEMA)
         return t
@@ -175,17 +246,24 @@ class OpTable:
         yields a working table.
 
         The returned table's ``torch_bindings`` is the ambient
-        ``catopt_torch.torch_bridge._IR_TO_TORCH`` dict itself: post-hoc
-        overrides (``_IR_TO_TORCH[op] = fn``) and lazy carrier
-        resolution keep reaching the evaluators that dispatch through
-        this table — exactly what the old global registry did.
+        lowering dict the backend registered
+        (:func:`register_ambient_bindings` — torch's
+        ``catopt_torch.torch_bridge._IR_TO_TORCH``): post-hoc overrides
+        (``_IR_TO_TORCH[op] = fn``) and lazy carrier resolution keep
+        reaching the evaluators that dispatch through this table —
+        exactly what the old global registry did.  When no backend has
+        registered an ambient dict (catopt-core alone) a private
+        composed table is returned instead.
         """
-        import catopt_torch.torch_bridge as tb
-
         t = cls.core()
         for mod in _carrier_module_objects():
             t.register(mod)
-        ambient = tb._IR_TO_TORCH
+        ambient = _AMBIENT_BINDINGS
+        if ambient is None:
+            # No backend registered — nothing to seat on, and the lazy
+            # carrier resolver lives in the (absent) adapter.  Return
+            # the private composed table.
+            return t
         for name, fn in t.torch_bindings.items():
             # setdefault: a live user override already in the ambient
             # dict beats the canonical binding.

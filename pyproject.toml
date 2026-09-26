@@ -93,6 +93,9 @@ root_packages = [
     "catopt_optimize",
     "catopt",
 ]
+# Required so the "core imports no tensor library" contract can forbid
+# the external torch/numpy packages.
+include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "core is torch-free (and carrier-free)"
@@ -104,6 +107,12 @@ forbidden_modules = [
     "catopt_eps",
     "catopt_optimize",
 ]
+
+[[tool.importlinter.contracts]]
+name = "core imports no tensor library"
+type = "forbidden"
+source_modules = ["catopt_core"]
+forbidden_modules = ["torch", "numpy"]
 
 [tool.ruff]
 target-version = "py311"
