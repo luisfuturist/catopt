@@ -25,7 +25,6 @@ import os
 
 import pytest
 import torch
-
 from catopt.cost import flops_cost, param_bytes_cost_for
 from catopt.optimize import optimize_model, param_report
 
@@ -302,13 +301,14 @@ def test_real_stories15m_checkpoint_has_no_exact_duplicates():
     import numpy as np
 
     sys.path.insert(0, REPO)
-    from bench.llama2c import load_llama2c
     from catopt.egraph import EGraph
     from catopt.ir import Param, TensorType
     from catopt.rules import (
         share_duplicate_param_slices,
         share_duplicate_params,
     )
+
+    from bench.llama2c import load_llama2c
 
     w = load_llama2c(CKPT)
 

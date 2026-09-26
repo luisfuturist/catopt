@@ -1,27 +1,99 @@
+# ruff: noqa: E402 — the alias loop must precede the public imports
 """catopt — Categorical optimization of neural-network computation graphs.
 
-This package implements a prototype pipeline that:
+Façade + compatibility layer over the domain packages (plan 0003).
+The engine is split across distributions — ``catopt-core`` (the
+torch-free semantic engine: IR, attrs, typing, egraph, laws, cost,
+meta, rulecache, ports, ops), ``catopt-torch`` (the PyTorch adapter:
+bridge, executors, models, reports), ``catopt-carriers`` (om/xcarrier/
+trace lifts + lowerers), ``catopt-eps`` (the opt-in approximation
+toolkit), ``catopt-optimize`` (the pipeline orchestrators).
 
-1. Converts a PyTorch computation graph (via torch.export / ATen) into a
-   categorical / string-diagram IR.
-2. Performs equality saturation over an e-graph, applying rewrite rules
-   derived from categorical laws (associativity, symmetry/commutativity,
-   distributivity/naturality, etc.).
-3. Extracts the lowest-cost equivalent program according to a cost model.
-4. Lowers the result back to ATen/FX for TorchInductor compilation and
-   benchmarking against vanilla Inductor output.
+``sys.modules`` aliases below keep every historical ``catopt.X`` path
+resolving to its new home — ``from catopt.cost import flops_cost``,
+``import catopt.egraph.core``, ``from catopt.rules import all_rules``
+etc. all keep working unchanged.
 """
 
-# locked: IRModule(ir, param_values={...}) lowers right-assoc
-# matrix chains to ONE fused runtime matmul; catopt == Inductor both go
-# through torch.compile.  Measured on CPU: 1.6x wall-clock.
-from catopt.cost import (
+# -- compat: alias every historical module path BEFORE anything else --
+import sys as _sys
+from importlib import import_module as _imp
+
+_ALIAS = {
+    "catopt.act_eps": "catopt_eps.act_eps",
+    "catopt.attrs": "catopt_core.attrs",
+    "catopt.calibrate": "catopt_optimize.calibrate",
+    "catopt.cost": "catopt_core.cost",
+    "catopt.egraph": "catopt_core.egraph",
+    "catopt.egraph.certs": "catopt_core.egraph.certs",
+    "catopt.egraph.core": "catopt_core.egraph.core",
+    "catopt.egraph.extract": "catopt_core.egraph.extract",
+    "catopt.egraph.proof": "catopt_core.egraph.proof",
+    "catopt.egraph.terms": "catopt_core.egraph.terms",
+    "catopt.egraph.types": "catopt_core.egraph.types",
+    "catopt.eps": "catopt_eps.eps",
+    "catopt.executors": "catopt_torch.executors",
+    "catopt.executors.base": "catopt_torch.executors.base",
+    "catopt.ibp": "catopt_eps.ibp",
+    "catopt.ir": "catopt_core.ir",
+    "catopt.laws": "catopt_core.laws",
+    "catopt.laws.base": "catopt_core.laws.base",
+    "catopt.laws.pairing": "catopt_core.laws.pairing",
+    "catopt.laws.scan": "catopt_core.laws.scan",
+    "catopt.laws.tensor": "catopt_core.laws.tensor",
+    "catopt.meta": "catopt_core.meta",
+    "catopt.models": "catopt_torch.models",
+    "catopt.models.hybrid": "catopt_torch.models.hybrid",
+    "catopt.models.ssm": "catopt_torch.models.ssm",
+    "catopt.om": "catopt_carriers.om",
+    "catopt.om_lower": "catopt_carriers.om_lower",
+    "catopt.omd_lower": "catopt_carriers.omd_lower",
+    "catopt.ops": "catopt_core.ops",
+    "catopt.optimize": "catopt_optimize.optimize",
+    "catopt.ports": "catopt_core.ports",
+    "catopt.regime": "catopt_optimize.regime",
+    "catopt.report": "catopt_torch.report",
+    "catopt.rulecache": "catopt_core.rulecache",
+    "catopt.rules": "catopt_core.rules",
+    "catopt.scan_lower": "catopt_carriers.scan_lower",
+    "catopt.torch_bridge": "catopt_torch.torch_bridge",
+    "catopt.trace": "catopt_carriers.trace",
+    "catopt.trace_lift": "catopt_carriers.trace_lift",
+    "catopt.typing": "catopt_core.typing",
+    "catopt.xcarrier": "catopt_carriers.xcarrier",
+}
+
+for _old, _new in _ALIAS.items():
+    try:
+        _mod = _imp(_new)
+        _sys.modules.setdefault(_old, _mod)
+        # attribute access too — `catopt.egraph`/`catopt.optimize` as
+        # getattr targets (import machinery only sees sys.modules).
+        # Only direct children: `catopt.egraph.core` resolves via the
+        # real `catopt.egraph` package attr naturally.
+        if _old.count(".") == 1:
+            _sys.modules[__name__].__dict__.setdefault(
+                _old.split(".", 1)[1], _mod
+            )
+    except ModuleNotFoundError:  # pragma: no cover — only fires when a
+        pass  # domain package isn't installed (partial install)
+
+del _sys, _imp
+
+# -- public API ---------------------------------------------------------
+from catopt_carriers.omd_lower import (
+    BatchedOmdModule,
+    build_omd_plan,
+    is_omd_apply_term,
+    to_batched_omd_module,
+)
+from catopt_core.cost import (
     CostModel,
     count_cost,
     flops_cost,
 )
-from catopt.egraph import EGraph, ENode, Rewrite
-from catopt.ir import (
+from catopt_core.egraph import EGraph, ENode, Rewrite
+from catopt_core.ir import (
     IR,
     Const,
     Op,
@@ -29,25 +101,20 @@ from catopt.ir import (
     TensorType,
     Var,
 )
-from catopt.omd_lower import (
-    BatchedOmdModule,
-    build_omd_plan,
-    is_omd_apply_term,
-    to_batched_omd_module,
-)
-from catopt.optimize import optimize_model
-from catopt.rules import (
+from catopt_core.rules import (
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
     all_rules,
 )
-from catopt.torch_bridge import (
+from catopt_optimize.optimize import optimize_model
+from catopt_torch.torch_bridge import (
     IRModule,
     export_to_ir,
     ir_to_torch_module,
 )
 
 __version__ = "0.1.0dev"
+
 __all__ = [
     "CATEGORICAL_RULES",
     "IR",

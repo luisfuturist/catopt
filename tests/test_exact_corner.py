@@ -39,7 +39,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from catopt.cost import param_bytes_cost_for
 from catopt.optimize import optimize_model, param_report
 
@@ -323,13 +322,14 @@ def test_real_stories15m_checkpoint_offers_zero():
     import numpy as np
 
     sys.path.insert(0, REPO)
-    from bench.llama2c import load_llama2c
     from catopt.egraph import EGraph
     from catopt.ir import Param, TensorType
     from catopt.rules import (
         share_duplicate_param_slices,
         share_duplicate_params,
     )
+
+    from bench.llama2c import load_llama2c
 
     w = load_llama2c(CKPT)
     src = {}

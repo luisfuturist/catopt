@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catopt-torch"
+version = "0.1.0dev"
+description = "PyTorch adapters for catopt: torch.export bridge, executors, model zoo, reports."
+requires-python = ">=3.11"
+dependencies = ["catopt-core", "torch>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

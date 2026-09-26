@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catopt-core"
+version = "0.1.0dev"
+description = "The torch-free semantic engine for catopt: term IR, e-graph, laws, cost algebra."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

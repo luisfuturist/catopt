@@ -19,4 +19,4 @@ repos:
         entry: .venv/bin/pyright
         language: system
         types: [python]
-        files: ^catopt/.*\.py$
+        files: ^(catopt|packages)/.*\.py$

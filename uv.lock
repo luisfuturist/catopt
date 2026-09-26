@@ -6,11 +6,26 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+members = [
+    "catopt",
+    "catopt-carriers",
+    "catopt-core",
+    "catopt-eps",
+    "catopt-optimize",
+    "catopt-torch",
+]
+
 [[package]]
 name = "catopt"
 version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
+    { name = "catopt-carriers" },
+    { name = "catopt-core" },
+    { name = "catopt-eps" },
+    { name = "catopt-optimize" },
+    { name = "catopt-torch" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
@@ -40,6 +55,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "catopt-carriers", editable = "packages/catopt-carriers" },
+    { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-eps", editable = "packages/catopt-eps" },
+    { name = "catopt-optimize", editable = "packages/catopt-optimize" },
+    { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.0" },
@@ -61,6 +81,79 @@ dev = [
     { name = "pytest-cov", specifier = ">=5.0" },
     { name = "pytest-xdist", specifier = ">=3.0" },
     { name = "ruff", specifier = ">=0.6" },
+]
+
+[[package]]
+name = "catopt-carriers"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-carriers" }
+dependencies = [
+    { name = "catopt-core" },
+    { name = "catopt-torch" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-torch", editable = "packages/catopt-torch" },
+    { name = "torch", specifier = ">=2.0" },
+]
+
+[[package]]
+name = "catopt-core"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-core" }
+
+[[package]]
+name = "catopt-eps"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-eps" }
+dependencies = [
+    { name = "catopt-core" },
+    { name = "catopt-torch" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-torch", editable = "packages/catopt-torch" },
+    { name = "torch", specifier = ">=2.0" },
+]
+
+[[package]]
+name = "catopt-optimize"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-optimize" }
+dependencies = [
+    { name = "catopt-carriers" },
+    { name = "catopt-core" },
+    { name = "catopt-torch" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "catopt-carriers", editable = "packages/catopt-carriers" },
+    { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-torch", editable = "packages/catopt-torch" },
+    { name = "torch", specifier = ">=2.0" },
+]
+
+[[package]]
+name = "catopt-torch"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-torch" }
+dependencies = [
+    { name = "catopt-core" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "torch", specifier = ">=2.0" },
 ]
 
 [[package]]

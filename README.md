@@ -162,29 +162,42 @@ target — the same equivalence space, selected per backend.
 
 ## Layout
 
+The repo is a **uv workspace monorepo** — the engine is split into
+domain distributions so each carries only its own dependencies:
+
 ```
-catopt/          the engine: ir, egraph, laws, cost, ops, optimize
-  ports          protocol boundaries (CostFn, Executor, OpRegistry, ...)
-  egraph/        union-find, matching, saturation, extraction, proof
-  laws/          equational laws (tensor/scan) + non-local passes
-  typing         shape inference (register_shape_rule protocol)
-  attrs          per-op attribute schemas (mint-time validation)
-  ops            OpTable — explicit adapter registry (bindings/shapes/attrs)
-  report         typed OptReport/BlockReport + verify_equiv gate
-  torch_bridge   torch.export → IR → executable module (+weight folding)
-  om/om_lower    online-softmax monoid + chunked/streaming executors
-  scan_lower     level-batched parallel-scan executor
-  trace          traced-monoidal structure (fixpoints as rewrites)
-  xcarrier       cross-carrier laws + deferred omd carrier
-  meta           coherence stratification + rule synthesis
-  calibrate      per-device cost constants
-bench/           real-checkpoint benchmarks: stories15M/110M, decode sweep,
-                 e2e smoke, omd attention stack
-tests/           578 tests
-project/         orphan branch: ADRs and retrospectives (worktree)
+packages/catopt-core/       the torch-free semantic engine (zero deps)
+  ir, attrs, typing         term IR, attr schemas, shape inference
+  egraph/                   union-find, matching, saturation, proof
+  laws/                     equational laws + non-local pairing passes
+  cost, meta, rulecache     cost algebra, rule synthesis, law cache
+  ports, ops                protocol boundaries + OpTable registry
+packages/catopt-torch/      the PyTorch adapters (deps: core + torch)
+  torch_bridge              torch.export → IR → executable module
+  executors/                BatchedExecutorBase + level_schedule
+  models/, report           small model zoo; OptReport + verify gate
+packages/catopt-carriers/   semantic carriers (deps: core + torch)
+  om, xcarrier, trace       online-softmax / deferred / traced monoids
+  *_lower, trace_lift       lowerers + the non-local lift passes
+packages/catopt-eps/        opt-in certified-approximation toolkit
+  eps, act_eps, ibp         weight offers, site wraps, interval bounds
+packages/catopt-optimize/   pipeline orchestrators (deps: all above)
+  optimize, regime, calibrate
+catopt/                     façade — public API + compat aliases;
+                            every historical `catopt.X` path resolves
+                            to its new home via sys.modules
+bench/                      real-checkpoint benchmarks: stories15M/110M,
+                            decode sweep, e2e smoke, omd attention stack
+tests/                      1579 tests
+project/                    orphan branch: plans, ADRs, retrospectives
 ```
 
+`catopt-core` installs standalone — the IR, e-graph, laws, and cost
+algebra run with zero dependencies (no torch). Integrations plug in
+per-domain: `pip install -e packages/catopt-core` for just the engine.
+
 ```bash
+uv sync                       # installs all workspace members editable
 python main.py                # demo: all transform families
 python bench/fetch.py         # checkpoints → ~/.cache/catopt
 python bench/stories15m_bench.py --device cuda

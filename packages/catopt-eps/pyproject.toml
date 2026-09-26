@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catopt-eps"
+version = "0.1.0dev"
+description = "Certified-approximation toolkit for catopt (optional, opt-in via eps_rtol)."
+requires-python = ">=3.11"
+dependencies = ["catopt-core", "catopt-torch", "torch>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

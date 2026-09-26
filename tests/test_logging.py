@@ -21,32 +21,12 @@ from catopt.rules import ASSOC_LINEAR_BIAS
 _REPO = Path(__file__).resolve().parents[1]
 
 # Files owned by the phase-3c change (print -> logging).
-_OWNED = [
-    "catopt/egraph/core.py",
-    "catopt/egraph/extract.py",
-    "catopt/egraph/proof.py",
-    "catopt/xcarrier.py",
-    "catopt/om.py",
-    "catopt/om_lower.py",
-    "catopt/omd_lower.py",
-    "catopt/scan_lower.py",
-    "catopt/meta.py",
-    "catopt/regime.py",
-    "catopt/rulecache.py",
-    "catopt/ibp.py",
-    "catopt/eps.py",
-    "catopt/act_eps.py",
-    "catopt/trace.py",
-    "catopt/trace_lift.py",
-    "catopt/calibrate.py",
-]
-_OWNED += sorted(
+_OWNED = sorted(
     str(p.relative_to(_REPO))
-    for p in (_REPO / "catopt" / "laws").glob("*.py")
-)
-_OWNED += sorted(
-    str(p.relative_to(_REPO))
-    for p in (_REPO / "catopt" / "models").glob("*.py")
+    for p in (_REPO / "packages").rglob("*.py")
+    # the owned set is the phase-3c logging-migration files; optimize.py
+    # keeps its deliberate verbose-mode stdout prints
+    if "src" in p.parts and p.name != "optimize.py"
 )
 
 
@@ -91,7 +71,7 @@ def _small_graph() -> tuple[EGraph, int]:
 
 def test_saturation_logs_iteration(caplog):
     eg, eid = _small_graph()
-    with caplog.at_level(logging.INFO, logger="catopt"):
+    with caplog.at_level(logging.INFO):
         stats = eg.run(
             [ASSOC_LINEAR_BIAS], eid, max_iterations=8, max_nodes=2000
         )
@@ -108,7 +88,7 @@ def test_saturation_logs_iteration(caplog):
 
 def test_max_nodes_stop_logs_warning(caplog):
     eg, eid = _small_graph()
-    with caplog.at_level(logging.WARNING, logger="catopt"):
+    with caplog.at_level(logging.WARNING):
         eg.run([ASSOC_LINEAR_BIAS], eid, max_nodes=1)
     assert any(
         r.name.startswith("catopt")
@@ -119,10 +99,10 @@ def test_max_nodes_stop_logs_warning(caplog):
 
 
 def test_verbose_true_yields_debug(caplog):
-    with caplog.at_level(logging.DEBUG, logger="catopt"):
+    with caplog.at_level(logging.DEBUG):
         calibrate(device="cpu", quick=True, verbose=True)
     assert any(
-        r.name == "catopt.calibrate" and r.levelno == logging.DEBUG
+        r.name == "catopt_optimize.calibrate" and r.levelno == logging.DEBUG
         for r in caplog.records
     )
 
@@ -130,6 +110,6 @@ def test_verbose_true_yields_debug(caplog):
 def test_verbose_restores_logger_level(caplog):
     log = logging.getLogger("catopt.calibrate")
     prev = log.level
-    with caplog.at_level(logging.DEBUG, logger="catopt"):
+    with caplog.at_level(logging.DEBUG):
         calibrate(device="cpu", quick=True, verbose=True)
     assert log.level == prev

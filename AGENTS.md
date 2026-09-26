@@ -1,7 +1,13 @@
 # Agent guide — catopt
 
 Categorical optimization of neural-network computation graphs
-(Python 3.13, torch + numpy). Package source lives in `catopt/`; tests in
+(Python 3.13, torch + numpy). Monorepo layout: the domain packages
+live under `packages/` (`catopt-core` — the torch-free engine;
+`catopt-torch` — PyTorch adapters; `catopt-carriers` — carrier
+laws/executors; `catopt-eps` — opt-in approximation toolkit;
+`catopt-optimize` — pipeline orchestrators); `catopt/` is the façade
++ compat aliases (every historical `catopt.X` import path resolves to
+its new home via `sys.modules` aliases). Tests in
 `tests/`. The dev virtualenv is `.venv/` (uv-managed).
 
 ## Verification commands
@@ -13,23 +19,24 @@ uv run pytest                 # full test suite (pytest-xdist enabled)
 .venv/bin/pyright             # typecheck — 0 errors required (warnings OK)
 .venv/bin/ruff check          # lint
 .venv/bin/ruff format --check # formatting
-uv run pytest --cov=catopt --cov-report=term-missing   # coverage (fail_under=87)
+coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_eps,catopt_optimize,catopt -m pytest tests/ -q
+coverage report -m                                              # coverage (fail_under=100)
 ```
 
 Pre-commit (`pre-commit install`) runs ruff check/format and pyright on
-`catopt/**/*.py`.
+`packages/**/*.py` + `catopt/`.
 
 ## Typecheck ratchet
 
 - Checker: **pyright** (`[tool.pyright]` in `pyproject.toml`,
-  `typeCheckingMode = "standard"`, `include = ["catopt"]`).
+  `typeCheckingMode = "standard"`, `include = ["packages","catopt"]`, `extraPaths` per-package `src/`).
 - Installed in `.venv` via the `dev` dependency group
   (`pyright>=1.1.380`; currently 1.1.414).
 - `exclude` in `pyproject.toml` lists files that predate the ratchet —
   each entry documents its baseline error count. **Remove entries as
   files get annotated**; never add new ones. Excluded files are still
   analyzed when imported by checked files.
-- New modules under `catopt/` are checked automatically — keep them
+- New modules under `packages/*/src/` are checked automatically — keep them
   clean at `standard` strictness.
 - Baseline was green at 0 errors / 2 warnings (`calibrate.py`
   `reportUnusedExpression`); warnings must not regress to errors.

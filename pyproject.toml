@@ -5,10 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "catopt"
 version = "0.1.0dev"
-description = "Categorical optimization of neural-network computation graphs"
+description = "Categorical optimization of neural-network computation graphs — meta distribution (façade over the domain packages in packages/)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "catopt-core",
+    "catopt-torch",
+    "catopt-carriers",
+    "catopt-eps",
+    "catopt-optimize",
     "torch>=2.0",
     "numpy>=1.24",
 ]
@@ -37,7 +42,26 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["catopt*"]
+include = ["packages", "catopt"]
+extraPaths = [
+    "packages/catopt-core/src",
+    "packages/catopt-torch/src",
+    "packages/catopt-carriers/src",
+    "packages/catopt-eps/src",
+    "packages/catopt-optimize/src",
+]
+exclude = ["packages*", "tests*", "bench*"]
+
+# --- uv workspace: the domain packages ---------------------------
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+catopt-core = { workspace = true }
+catopt-torch = { workspace = true }
+catopt-carriers = { workspace = true }
+catopt-eps = { workspace = true }
+catopt-optimize = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -65,30 +89,37 @@ ignore = [
 # excluded files are still analyzed when imported by checked files.
 # Each entry: error count at baseline + dominant issue. Sorted by count.
 typeCheckingMode = "standard"
-include = ["catopt"]
+include = ["packages", "catopt"]
+extraPaths = [
+    "packages/catopt-core/src",
+    "packages/catopt-torch/src",
+    "packages/catopt-carriers/src",
+    "packages/catopt-eps/src",
+    "packages/catopt-optimize/src",
+]
 exclude = [
-    "catopt/xcarrier.py",        # 164 — Optional-subscript/operand on un-narrowed dict lookups
-    "catopt/om.py",              #  87 — same Optional-heavy rewriting internals
-    "catopt/egraph/proof.py",    #  36 — attribute access on untyped proof objects
-    "catopt/egraph/extract.py",  #  32 — attribute access on untyped extraction state
-    "catopt/om_lower.py",        #  22 — Optional subscripts + incompatible override
-    "catopt/typing.py",          #  18 — generic helpers; arg-type mismatches
-    "catopt/scan_lower.py",      #  11 — Optional subscripts; None in Tensor dicts
-    "catopt/cost.py",            #  10 — FunctionType attr assignment; object→float
-    "catopt/omd_lower.py",       #   9 — Optional subscripts; None in Tensor dicts
-    "catopt/eps.py",             #   8 — possibly-unbound vars; Optional args
-    "catopt/ibp.py",             #   7 — Optional member access on Box intervals
-    "catopt/laws/tensor.py",     #   7 — Op passed where str expected
-    "catopt/torch_bridge.py",    #   7 — Optional attrs; torch Module return types
-    "catopt/optimize.py",        #   6 — "IR not iterable"; arg-type mismatches
-    "catopt/report.py",          #   5 — Optional member access; None args
-    "catopt/meta.py",            #   3 — list↔dict assignment mismatches
-    "catopt/models/__init__.py", #   3 — nn.Module __getitem__; int→Tensor return
-    "catopt/models/ssm.py",      #   2 — Tensor|Module arithmetic operators
-    "catopt/regime.py",          #   2 — Tensor−object op; IR not iterable
-    "catopt/egraph/core.py",     #   1 — dict return-type mismatch
-    "catopt/ir.py",              #   1 — int * Optional[int]
-    "catopt/laws/pairing.py",    #   1 — tuple assigned to list[int]
+    "packages/catopt-carriers/src/catopt_carriers/xcarrier.py",        # 164 — Optional-subscript/operand on un-narrowed dict lookups
+    "packages/catopt-carriers/src/catopt_carriers/om.py",              #  87 — same Optional-heavy rewriting internals
+    "packages/catopt-core/src/catopt_core/egraph/proof.py",    #  36 — attribute access on untyped proof objects
+    "packages/catopt-core/src/catopt_core/egraph/extract.py",  #  32 — attribute access on untyped extraction state
+    "packages/catopt-carriers/src/catopt_carriers/om_lower.py",        #  22 — Optional subscripts + incompatible override
+    "packages/catopt-core/src/catopt_core/typing.py",          #  18 — generic helpers; arg-type mismatches
+    "packages/catopt-carriers/src/catopt_carriers/scan_lower.py",      #  11 — Optional subscripts; None in Tensor dicts
+    "packages/catopt-core/src/catopt_core/cost.py",            #  10 — FunctionType attr assignment; object→float
+    "packages/catopt-carriers/src/catopt_carriers/omd_lower.py",       #   9 — Optional subscripts; None in Tensor dicts
+    "packages/catopt-eps/src/catopt_eps/eps.py",             #   8 — possibly-unbound vars; Optional args
+    "packages/catopt-eps/src/catopt_eps/ibp.py",             #   7 — Optional member access on Box intervals
+    "packages/catopt-core/src/catopt_core/laws/tensor.py",     #   7 — Op passed where str expected
+    "packages/catopt-torch/src/catopt_torch/torch_bridge.py",    #   7 — Optional attrs; torch Module return types
+    "packages/catopt-optimize/src/catopt_optimize/optimize.py",        #   6 — "IR not iterable"; arg-type mismatches
+    "packages/catopt-torch/src/catopt_torch/report.py",          #   5 — Optional member access; None args
+    "packages/catopt-core/src/catopt_core/meta.py",            #   3 — list↔dict assignment mismatches
+    "packages/catopt-torch/src/catopt_torch/models/__init__.py", #   3 — nn.Module __getitem__; int→Tensor return
+    "packages/catopt-torch/src/catopt_torch/models/ssm.py",      #   2 — Tensor|Module arithmetic operators
+    "packages/catopt-optimize/src/catopt_optimize/regime.py",          #   2 — Tensor−object op; IR not iterable
+    "packages/catopt-core/src/catopt_core/egraph/core.py",     #   1 — dict return-type mismatch
+    "packages/catopt-core/src/catopt_core/ir.py",              #   1 — int * Optional[int]
+    "packages/catopt-core/src/catopt_core/laws/pairing.py",    #   1 — tuple assigned to list[int]
 ]
 pythonVersion = "3.13"
 # torch and numpy ship usable stubs; keep missing imports an error so a
@@ -96,7 +127,7 @@ pythonVersion = "3.13"
 reportMissingImports = "error"
 
 [tool.coverage.run]
-source = ["catopt"]
+source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_eps", "catopt_optimize", "catopt"]
 branch = true
 omit = ["*/tests/*"]
 
