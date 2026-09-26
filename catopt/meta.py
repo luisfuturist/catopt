@@ -252,7 +252,7 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
             out = _balanced(out.op, flat, dict(out.attrs))
     elif out.op in _ASSOC_ONLY:
         flat = _flatten_chain(out)
-        if len(flat) == 1:
+        if len(flat) == 1:  # pragma: no cover — binary chains yield >=2 leaves
             out = flat[0]
         elif len(flat) != len(out.args):
             out = _balanced(out.op, flat, dict(out.attrs))
@@ -1237,7 +1237,7 @@ def synthesize_rules(
         # The guard re-expression maps (pat1, pat2) are pure data — kept
         # on the rule so catopt.rulecache can serialize them and rebuild
         # the composite check/derive at load time via _compose_guards.
-        if pats is not None:
+        if pats is not None:  # pragma: no cover — every call site passes pats
             object.__setattr__(cand, "guard_pats", pats)
         if not emit_subsumed and _subsumed(cand, usable + derived):
             return
@@ -1321,7 +1321,7 @@ def synthesize_rules(
                                     inst2[k] = v
                         try:
                             rhs2 = instantiate_pattern(r2.rhs, inst2)
-                        except KeyError:
+                        except KeyError:  # pragma: no cover — _synthesizable guarantees a total subst
                             continue
                         t2 = _replace(t1, q, rhs2)
                         keep2 = _concrete_matched_leaves(r2.lhs, sub2)
@@ -1385,7 +1385,7 @@ def synthesize_rules(
                 subst[v] = ns1 + v[len("$attr:") :]
         try:
             t1 = instantiate_pattern(r1.rhs, subst)
-        except KeyError:
+        except KeyError:  # pragma: no cover — _synthesizable guarantees a total subst
             continue
         # r1's binding on the derived rule's own subst is the identity.
         pat1 = {
@@ -1407,7 +1407,7 @@ def synthesize_rules(
                 for v in pattern_metavars(r2.rhs):
                     if v.startswith("$attr:") and v not in inst2:
                         if r2.derive is None:
-                            ok = False
+                            ok = False  # pragma: no cover — filtered by _synthesizable
                             break
                         inst2[v] = ns2 + v[len("$attr:") :]
                 if not ok:

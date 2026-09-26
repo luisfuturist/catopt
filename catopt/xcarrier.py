@@ -1951,7 +1951,7 @@ def _offer_witness(
     member of the class, rhs the offered term; the merge replays as a
     named rule step in certificates."""
     src = eg._oldest_term(eg.find(cid))
-    if src is None:
+    if src is None:  # pragma: no cover — every e-class is born with an acyclic enode
         return None
     return Rewrite(
         name=f"{provenance}#{offered_eid}",
@@ -2004,7 +2004,7 @@ def _gather_stack(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:
+        if ec is None:  # pragma: no cover — c comes from _classes itself
             continue
         for node in list(ec.nodes):
             if node.op != "stack" or not node.children:
@@ -2056,7 +2056,7 @@ def _gather_stack(
                 for m in vs_map[1:]:
                     shared &= set(m)
                 for S in sorted(shared):
-                    if S[-1] != hs[0]:
+                    if S[-1] != hs[0]:  # pragma: no cover — both stack kinds force S[-1]==hs[0]
                         continue
                     d_norm = D % (len(S) + 1)
                     if d_norm >= len(S):
@@ -2250,7 +2250,7 @@ def omd_tree_lift(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:
+        if ec is None:  # pragma: no cover — c comes from _classes itself
             continue
         for node in list(ec.nodes):
             if node.op != "om_apply" or len(node.children) != 1:

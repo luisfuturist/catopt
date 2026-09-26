@@ -1570,7 +1570,7 @@ def tight_model_bound(
                 )
                 continue
             c0 = _site_scalar(s, term, boxes, src, values, actual=False)
-            if c0 is None:
+            if c0 is None:  # pragma: no cover — ibp_bound boxes every subterm; unreachable end-to-end
                 c0 = (s["bound"], "row")
             cc = _walk_site(term, s["path"], c0[0], c0[1], boxes, new_R)
             # artifact variant: propagate the realized lhs−rhs delta

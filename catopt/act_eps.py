@@ -199,7 +199,7 @@ def _activation_classes(eg: EGraph) -> dict[int, Any]:
     out: dict[int, object] = {}
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
-        if c in out:
+        if c in out:  # pragma: no cover — canonical-keys
             continue
         rep = eg._oldest_term(c) or eg.any_term(c)
         if (
@@ -235,7 +235,7 @@ def _wrap_sites(
     for cid in list(eg._classes.keys()):
         cc = eg.find(cid)
         ec = eg._classes.get(cc)
-        if ec is None:
+        if ec is None:  # pragma: no cover — canonical-keys
             continue
         for node in list(ec.nodes):
             if node.op == "leaf" or node.op in ACT_EPS_OPS:

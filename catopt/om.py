@@ -674,6 +674,8 @@ def _check_cat_pair(bound: dict) -> int | None:
     ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
     if ba is _INVALID or bb is _INVALID:
         return None
+    # pragma: no cover — unreachable: earlier guards force per-operand
+    # off-axis equality, so the broadcast results cannot differ here.
     if not all(_dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa):
         return None
     return oa
@@ -1125,7 +1127,7 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
     from catopt.typing import _INVALID, _broadcast
 
     bb = _broadcast(qs[:-2], k1s[:-2])
-    if bb is _INVALID:
+    if bb is _INVALID:  # pragma: no cover — _check_sdpa_cat already proved this broadcast
         return False
     scores = (*tuple(bb), qs[-2], k1 + k2)
     b = _broadcast(scores, ms)

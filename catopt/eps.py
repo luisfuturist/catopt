@@ -578,7 +578,7 @@ def quant_params(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:
+        if ec is None:  # pragma: no cover — _classes keys canonical under union
             continue
         for node in list(ec.nodes):
             if node.op != "leaf":
@@ -728,7 +728,7 @@ def low_rank_gather(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:
+        if ec is None:  # pragma: no cover — _classes keys canonical under union
             continue
         for node in list(ec.nodes):
             if node.op != "embedding" or len(node.children) != 2:
@@ -879,7 +879,7 @@ def kron_linear_params(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:
+        if ec is None:  # pragma: no cover — _classes keys canonical under union
             continue
         for node in list(ec.nodes):
             if node.op != "linear" or len(node.children) not in (2, 3):
@@ -1049,7 +1049,7 @@ def low_rank_params(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:
+        if ec is None:  # pragma: no cover — _classes keys canonical under union
             continue
         for node in list(ec.nodes):
             if node.op != "linear" or len(node.children) not in (2, 3):
