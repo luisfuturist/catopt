@@ -69,6 +69,10 @@ verification and automatic fallback.
 
 ## Mechanism
 
+**The claim**: e-graphs + semantic carriers discover transformations
+that conventional compiler IRs cannot express — not that another
+graph optimizer is faster.
+
 A program optimizer's reachable set is bounded by its semantic
 language, not its search strategy. Tensor IRs rewrite *ops*; catopt
 lifts programs into *carriers* — monoid objects where the same
