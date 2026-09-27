@@ -251,10 +251,13 @@ python -m pytest tests/ -q
   is this recurrence, derived rather than encoded.
 - Joyal, Street & Verity, *Traced Monoidal Categories* (1996) — the
   `trace` structure used for the closed-form resolvent.
-- Sun et al., *Retentive Network* (2023); Yang et al., *Gated Linear
-  Attention* (ICML 2024); Yang et al., *Parallelizing Linear
-  Transformers with the Delta Rule* (NeurIPS 2024); Gu & Dao, *Mamba*
-  (2023) — the linear-attention/SSM families the scan benchmarks
+- Sun et al., *Retentive Network: A Successor to Transformer for
+  Large Language Models* (arXiv 2023); Yang et al., *Gated Linear
+  Attention Transformers with Hardware-Efficient Training* (ICML
+  2024); Yang et al., *Parallelizing Linear Transformers with the
+  Delta Rule over Sequence Length* (NeurIPS 2024); Gu & Dao, *Mamba:
+  Linear-Time Sequence Modeling with Selective State Spaces* (arXiv
+  2023) — the linear-attention/SSM families the scan benchmarks
   instantiate.
 - Karpathy, *llama2.c* — the unmodified codebase the pairing rules
   rediscover vLLM/TensorRT-LLM-style merged projections on.
