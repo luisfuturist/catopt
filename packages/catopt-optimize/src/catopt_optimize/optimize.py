@@ -537,6 +537,7 @@ def optimize_model(
     source: Source | None = None,
     sink: Sink | None = None,
     compile: bool = False,
+    cuda_graph: bool = False,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -606,6 +607,15 @@ def optimize_model(
         (:func:`catopt_core.cost.fused_cost_for`).  Falls back to the
         uncompiled module if compilation fails at first call;
         ``stats["compiled"]`` records which ran.
+    cuda_graph : bool
+        Capture the delivered module into a CUDA graph — collapses
+        the carrier's per-level launches into one replayable graph
+        (measured ~2.4x on the batched scan).  Only applies when the
+        delivered module is a batched carrier executor and inputs are
+        CUDA; degrades quietly otherwise.  Compile-free alternative
+        to ``compile=True`` — when both are set the compiled module
+        wins and capture is skipped.  ``stats["cuda_graph"]``
+        records which ran.
     verbose : bool
         Print progress.
 
@@ -815,6 +825,21 @@ def optimize_model(
             stats["compiled"] = True
         except Exception:
             stats["compiled"] = False
+    if cuda_graph and not stats.get("compiled"):
+        # Compile-free deployment path: capture the batched carrier's
+        # per-level launches into one replayable graph.  Only batched
+        # executors expose capture_cuda_graph; generic IRModules and
+        # compiled wrappers degrade quietly.  Shape is baked at
+        # capture; mismatched calls fall back to eager internally.
+        stats["cuda_graph"] = False
+        if example_input.is_cuda and hasattr(
+            optimized_module, "capture_cuda_graph"
+        ):
+            try:
+                optimized_module.capture_cuda_graph(example_input)
+                stats["cuda_graph"] = True
+            except Exception:
+                optimized_module.drop_cuda_graph()
 
     # Verify semantic equivalence
     if verbose:

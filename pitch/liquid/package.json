@@ -1,0 +1,23 @@
+{
+  "name": "pitch-catopt-liquid",
+  "type": "module",
+  "private": true,
+  "description": "CatOpt × Liquid AI — automatically discovering faster implementations of neural blocks.",
+  "scripts": {
+    "dev": "slidev --open",
+    "build": "slidev build",
+    "export": "slidev export",
+    "export:pdf": "slidev export --format pdf --with-clicks",
+    "export:png": "slidev export --format png"
+  },
+  "dependencies": {
+    "@iconify-json/carbon": "^1.2.5",
+    "@iconify-json/logos": "^1.2.4",
+    "@slidev/cli": "^53.0.0",
+    "@slidev/theme-default": "^0.25.0",
+    "vue": "^3.5.22"
+  },
+  "devDependencies": {
+    "playwright-chromium": "^1.63.0"
+  }
+}

@@ -208,7 +208,9 @@ def test_capture_cpu_noop_then_cuda_guard(monkeypatch):
         with pytest.raises(ValueError, match="CUDA"):
             mod.capture_cuda_graph(*args)
         assert not mod.is_graph_captured
-        monkeypatch.undo()
+        # restore the forced-False flag for the next module — undo()
+        # would drop ALL patches, leaking the real flag on CUDA hosts
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
 class _FakeGraph:

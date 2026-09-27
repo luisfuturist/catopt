@@ -7,6 +7,7 @@ goes through ``sink.lower``.  The routing matters because term-level
 cost is blind to the lowering (``bench/cost_fidelity.py``).
 """
 
+import pytest
 import torch
 
 from catopt.cost import flops_cost
@@ -207,6 +208,37 @@ def test_carrier_upgrade_swaps_to_batched_member():
         assert torch.allclose(mod(x), ref, atol=1e-9)
 
 
+@pytest.mark.requires_cuda
+def test_optimize_model_delivered_module_captures_cuda_graph():
+    """End-to-end: the module ``optimize_model`` delivers for a
+    scan-shaped model takes the CUDA-graph path — capture replays the
+    identical computation, a changed input flows through the static
+    buffers, and ``drop_cuda_graph`` restores the eager path."""
+    from catopt.models import LinearRecurrence
+    from catopt.optimize import optimize_model
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double().cuda()
+    x = torch.rand(8, 4, dtype=torch.float64, device="cuda")
+    with torch.no_grad():
+        ref = m(x)
+        mod, stats = optimize_model(m, x, verbose=False)
+    assert stats["lowering"] == "batched"
+    assert getattr(mod, "is_batched", False)
+
+    mod.capture_cuda_graph(x)
+    assert mod.is_graph_captured
+    with torch.no_grad():
+        assert torch.allclose(mod(x).clone(), ref, atol=1e-9)
+        # new input is picked up via the static input buffers
+        x2 = torch.rand(8, 4, dtype=torch.float64, device="cuda")
+        assert torch.allclose(mod(x2).clone(), m(x2), atol=1e-9)
+
+        mod.drop_cuda_graph()
+        assert not mod.is_graph_captured
+        assert torch.allclose(mod(x2), m(x2), atol=1e-9)
+
+
 def test_lift_scan_to_applyd_offers_carrier_member():
     """The nonlocal lift seeds applyd members on recurrence classes
     without saturating the carrier laws."""
@@ -368,3 +400,35 @@ def test_batched_module_exposes_param_map():
     ir, h, env = _scan_ir()
     mod = _lower_extracted(ir.root, ir, env, TorchSink())
     assert mod._param_map is mod.eval_mod._param_map
+
+
+def test_cuda_graph_flag_noop_on_cpu():
+    """cuda_graph=True on a CPU input: stats records False, module
+    is unchanged — the flag is a no-op off-CUDA."""
+    from catopt.models import LinearRecurrence
+    from catopt.optimize import optimize_model
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    with torch.no_grad():
+        mod, stats = optimize_model(m, x, verbose=False,
+                                    cuda_graph=True)
+    assert stats.get("cuda_graph") is False
+    with torch.no_grad():
+        assert torch.allclose(mod(x), m(x))
+
+
+def test_cuda_graph_skipped_when_compiled():
+    """compile=True + cuda_graph=True: the compiled module wins —
+    capture is not attempted on it (no capture attr)."""
+    from catopt.models import LinearRecurrence
+    from catopt.optimize import optimize_model
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    with torch.no_grad():
+        mod, stats = optimize_model(
+            m, x, verbose=False, compile=True, cuda_graph=True
+        )
+    if stats.get("compiled"):
+        assert stats.get("cuda_graph") is None
