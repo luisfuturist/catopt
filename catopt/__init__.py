@@ -117,7 +117,18 @@ with _suppress(ModuleNotFoundError):  # partial install only
         to_batched_omd_module,
     )
 with _suppress(ModuleNotFoundError):  # partial install only
-    from catopt_optimize.criteria import criteria_cost
+    from catopt_optimize.criteria import (
+        Blend,
+        CompiledCriterion,
+        Criteria,
+        Criterion,
+        DepthCriterion,
+        FlopsCriterion,
+        LatencyCriterion,
+        MemoryCriterion,
+        criteria_cost,
+        peak_bytes_cost,
+    )
     from catopt_optimize.optimize import optimize_model
     from catopt_optimize.runners import (
         ChainedRunner,
@@ -146,15 +157,23 @@ __all__ = [
     "SIMPLIFICATION_RULES",
     "BatchedOmdModule",
     "Binding",
+    "Blend",
     "ChainedRunner",
+    "CompiledCriterion",
     "CompiledRunner",
     "Const",
     "CostModel",
+    "Criteria",
+    "Criterion",
     "CudaGraphRunner",
+    "DepthCriterion",
     "EGraph",
     "ENode",
+    "FlopsCriterion",
     "GenericRunner",
     "IRModule",
+    "LatencyCriterion",
+    "MemoryCriterion",
     "Op",
     "Param",
     "Rewrite",
@@ -175,6 +194,7 @@ __all__ = [
     "ir_to_torch_module",
     "is_omd_apply_term",
     "optimize_model",
+    "peak_bytes_cost",
     "runner_candidate",
     "to_batched_omd_module",
 ]

@@ -1640,6 +1640,27 @@ def _profile_dispatch_s(profile: Any) -> float:
     return float(us) * 1e-6
 
 
+def _profile_graph_overhead_s(profile: Any) -> float:
+    """Per-call overhead of a COMPILED graph in seconds.
+
+    ``calibrate`` measures it as ``graph_overhead_us`` — the
+    guards+graph-call boundary cost of an Inductor-compiled module,
+    minus the launch constants already billed per kernel.  The fused
+    price uses ``max(dispatch_s, this)`` for its one per-graph term —
+    the measured residual the per-kernel table cannot see.  Fallback
+    ``80us`` is conservative (measured ~6us CPU, ~50-150us with
+    guards on real graphs).
+    """
+    fallback = 80.0
+    if profile is None:
+        return fallback * 1e-6
+    if isinstance(profile, dict):
+        us = profile.get("graph_overhead_us", fallback)
+    else:
+        us = getattr(profile, "graph_overhead_us", fallback)
+    return float(us) * 1e-6
+
+
 def _profile_leaf_eval_s(profile: Any) -> float:
     """Per-leaf scan-eval machinery overhead in seconds.
 
@@ -2189,6 +2210,7 @@ def _fused_cost(
     launch_s: float,
     dispatch_s: float,
     kernel_ns=None,
+    graph_overhead_s: float = 0.0,
 ) -> float:
     """Inductor-approximation price of *term* (see fused_cost_for).
 
@@ -2255,7 +2277,11 @@ def _fused_cost(
             + launch_s * 1e9
             + (_SOLVER_FACTOR if solver else 0.0) * dispatch_s * 1e9
         )
-    total += dispatch_s * 1e9
+    # One per-graph charge — the bigger of the serial dispatch and the
+    # measured compiled-graph call overhead (guards + cudagraph-safe
+    # entry): the per-kernel table cannot see it, and calibration
+    # showed it dominates the compiled price's residual.
+    total += max(dispatch_s, graph_overhead_s) * 1e9
     return float(total)
 
 
@@ -2303,14 +2329,17 @@ def fused_cost_for(profile: Any = None) -> CostFn:
     """
     pf, bw, ls = _profile_constants(profile)
     dispatch_s = _profile_dispatch_s(profile)
+    goh = _profile_graph_overhead_s(profile)
     kns = _kernel_lookup(_profile_kernel_table(profile))
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        ck = ("fc", pf, bw, ls, dispatch_s, id(kns), term)
+        ck = ("fc", pf, bw, ls, dispatch_s, goh, id(kns), term)
         if ck in memo:
             return memo[ck]
-        out = _fused_cost(term, memo, pf, bw, ls, dispatch_s, kns)
+        out = _fused_cost(
+            term, memo, pf, bw, ls, dispatch_s, kns, goh
+        )
         memo[ck] = float(out)
         return out
 

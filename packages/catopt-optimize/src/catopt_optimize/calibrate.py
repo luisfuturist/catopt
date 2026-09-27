@@ -30,13 +30,15 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import platform
 import statistics
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -46,8 +48,12 @@ __all__ = [
     "calibrate",
     "list_profiles",
     "load_profile",
+    "measured_price_ns",
+    "profile_graph_overhead_us",
     "profiles_dir",
+    "record_measured",
     "save_profile",
+    "shape_bucket",
 ]
 
 #: Environment variable overriding the profile-store directory.
@@ -62,6 +68,13 @@ logger = logging.getLogger("catopt_optimize.calibrate")
 #: overhead rather than pretending it is free.
 _FALLBACK_DISPATCH_US = 5.0
 _FALLBACK_LEAF_EVAL_US = 15.0
+#: Compiled-call per-graph overhead when the probe cannot run — one
+#: ``torch.compile``d graph invocation pays guard evaluation +
+#: Inductor/cudagraph dispatch machinery even for a single kernel.
+#: Measured values run ~25 µs (small CPU graph) to ~150 µs; the
+#: fallback sits mid-range so a partially-calibrated profile never
+#: prices the compiled-call boundary as free.
+_FALLBACK_GRAPH_OVERHEAD_US = 80.0
 
 #: Chain length of the dispatch probe: long enough that per-forward
 #: fixed cost (``nn.Module.__call__``, env setup) amortises to noise,
@@ -122,12 +135,33 @@ class TargetProfile:
       launch, dispatch and kernel work all inside — which the cost
       model uses as a floor on its roofline estimate for ops whose
       shape signature lands near a measured bucket.
+    * ``graph_overhead_us`` — per-invocation overhead of one compiled
+      (``torch.compile``) graph call, in µs: guard evaluation plus
+      Inductor/cudagraph dispatch machinery, measured as the compiled
+      call's wall time minus a single launch.  The fused cost model's
+      per-graph term is ``max(dispatch_s, graph_overhead_s)`` — it
+      replaces the bare dispatch charge, it does not add to it.
+    * ``measured_ns`` — the measured-feedback map written by
+      ``optimize_model_autotuned`` (opt-in via its ``profile=``
+      argument): ``{candidate: {bucket: {"median_ns": float,
+      "model_ns": float}}}`` where ``candidate`` is a lowering-path
+      name (``"generic"``/``"batched"``/``"compiled"``/… or a custom
+      candidate name) and ``bucket`` a :func:`shape_bucket` key —
+      corrections are per-bucket, never global.  ``model_ns`` is the
+      cost model's price of the measured graph at recording time, so
+      consumers apply the *residual* (``median - model``) rather than
+      the absolute time; entries without ``model_ns`` (candidates the
+      model cannot price, e.g. ``"eager"``) substitute the measured
+      median directly.  See :func:`measured_price_ns` for the
+      consumption contract.
 
-    ``dispatch_us`` / ``leaf_eval_us`` default to conservative
-    fallbacks (``_FALLBACK_DISPATCH_US`` / ``_FALLBACK_LEAF_EVAL_US``),
-    and ``op_kernel_ns`` defaults to ``{}``, so profiles saved before
-    the probes existed — or built by hand — still price executor
-    overhead honestly and fall back to the pure roofline formula.
+    ``dispatch_us`` / ``leaf_eval_us`` / ``graph_overhead_us`` default
+    to conservative fallbacks (``_FALLBACK_DISPATCH_US`` /
+    ``_FALLBACK_LEAF_EVAL_US`` / ``_FALLBACK_GRAPH_OVERHEAD_US``), and
+    ``op_kernel_ns`` / ``measured_ns`` default to ``{}``, so profiles
+    saved before the probes existed — or built by hand — still price
+    executor overhead honestly and fall back to the pure roofline
+    formula.
 
     Feed it to ``catopt_core.cost.roofline_cost_for`` /
     ``depth_cost_for`` — both accept any object with ``tflops`` /
@@ -145,6 +179,8 @@ class TargetProfile:
     dispatch_us: float = _FALLBACK_DISPATCH_US
     leaf_eval_us: float = _FALLBACK_LEAF_EVAL_US
     op_kernel_ns: dict = field(default_factory=dict)
+    graph_overhead_us: float = _FALLBACK_GRAPH_OVERHEAD_US
+    measured_ns: dict = field(default_factory=dict)
 
     # -- serialisation ------------------------------------------------
     def to_json(self) -> str:
@@ -259,6 +295,171 @@ def list_profiles(dir: str | Path | None = None) -> list[str]:
             except (ValueError, TypeError):
                 continue
     return names
+
+
+# ---------------------------------------------------------------------------
+# Measured-feedback channel + compiled-graph overhead — profile consumers
+# ---------------------------------------------------------------------------
+#
+# ``optimize_model_autotuned`` measures real wall-clock latency per
+# lowering candidate and then throws the numbers away; these helpers
+# persist them on the profile and define how a consumer applies them.
+# The contract is deliberately small and duck-typed (dict profile or
+# any object with the field):
+#
+# * ``graph_overhead_us`` — a scalar constant: per-call overhead of one
+#   compiled graph invocation.  The fused cost model's per-graph term
+#   is ``max(dispatch_s, graph_overhead_s)``.
+# * ``measured_ns`` — ``{candidate: {bucket: record}}``: measured
+#   corrections keyed by (lowering-candidate, shape-bucket) — never
+#   global.  ``measured_price_ns`` applies them.
+
+
+def shape_bucket(example_input: Any) -> str:
+    """The shape bucket measured corrections key on: ``"<device>:2^e"``
+    where ``e`` is ``ceil(log2(total input numel))``.
+
+    Deliberately coarse — a correction measured on one graph transfers
+    to another graph only inside the same bucket, so an order-of-
+    magnitude bucket is the honest granularity.  The device prefix
+    keeps a CUDA measurement from correcting CPU prices (and vice
+    versa).  Tuple inputs sum their numels; a non-tensor input lands
+    in ``"cpu:2^0"``.
+    """
+    args = (
+        example_input
+        if isinstance(example_input, tuple)
+        else (example_input,)
+    )
+    numel = 0
+    device = None
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            numel += a.numel()
+            if device is None:
+                device = str(a.device)
+    e = math.ceil(math.log2(max(numel, 1)))
+    return f"{device or 'cpu'}:2^{e}"
+
+
+def profile_graph_overhead_us(profile: Any) -> float:
+    """Compiled per-graph call overhead (µs) carried by *profile*.
+
+    Reads ``graph_overhead_us`` (dict key or attribute); absent,
+    unreadable or non-positive yields ``_FALLBACK_GRAPH_OVERHEAD_US``
+    so the fused per-graph term errs toward over-pricing the compiled-
+    call boundary rather than pretending it is free.  Consumers charge
+    ``max(dispatch_s, graph_overhead_s)`` — the field REPLACES the bare
+    dispatch term when larger.
+    """
+    if profile is None:
+        return _FALLBACK_GRAPH_OVERHEAD_US
+    if isinstance(profile, dict):
+        us = profile.get(
+            "graph_overhead_us", _FALLBACK_GRAPH_OVERHEAD_US
+        )
+    else:
+        us = getattr(
+            profile, "graph_overhead_us", _FALLBACK_GRAPH_OVERHEAD_US
+        )
+    try:
+        us = float(us)
+    except (TypeError, ValueError):
+        return _FALLBACK_GRAPH_OVERHEAD_US
+    return us if us > 0 else _FALLBACK_GRAPH_OVERHEAD_US
+
+
+def _measured_table(profile: Any) -> dict | None:
+    """The ``measured_ns`` map off a dict or attribute profile."""
+    if profile is None:
+        return None
+    tab = (
+        profile.get("measured_ns")
+        if isinstance(profile, dict)
+        else getattr(profile, "measured_ns", None)
+    )
+    return tab if isinstance(tab, dict) else None
+
+
+def record_measured(
+    profile: Any,
+    candidate: str,
+    bucket: str,
+    median_ns: float,
+    model_ns: float | None = None,
+) -> Any:
+    """Write one measured-feedback entry into *profile*'s
+    ``measured_ns`` map; returns the updated profile.
+
+    ``candidate`` is a lowering-path name (``"generic"`` /
+    ``"batched"`` / ``"compiled"`` / a custom candidate name);
+    ``bucket`` a :func:`shape_bucket` key — entries are per
+    (candidate, bucket), never global.  ``median_ns`` is the measured
+    median wall time; ``model_ns`` the cost model's price of the
+    measured graph at recording time (omit when the model cannot price
+    the candidate — e.g. ``"eager"`` — and the entry substitutes the
+    measured median directly; see :func:`measured_price_ns`).
+
+    *dict* profiles are updated in place (and returned); a frozen
+    :class:`TargetProfile` — or any dataclass — yields a NEW instance
+    via ``dataclasses.replace``; any other object gets ``measured_ns``
+    set on it (objects that reject the attribute propagate the usual
+    error, e.g. ``AttributeError``/``TypeError``).
+    """
+    entry: dict[str, float] = {"median_ns": float(median_ns)}
+    if model_ns is not None:
+        entry["model_ns"] = float(model_ns)
+    if isinstance(profile, dict):
+        tab = profile.get("measured_ns")
+        if not isinstance(tab, dict):
+            tab = {}
+            profile["measured_ns"] = tab
+        tab.setdefault(candidate, {})[bucket] = entry
+        return profile
+    cur = _measured_table(profile)
+    tab = {c: dict(b) for c, b in cur.items()} if cur else {}
+    tab.setdefault(candidate, {})[bucket] = entry
+    if is_dataclass(profile) and not isinstance(profile, type):
+        return replace(profile, measured_ns=tab)
+    target: Any = profile
+    target.measured_ns = tab
+    return target
+
+
+def measured_price_ns(
+    profile: Any,
+    candidate: str,
+    bucket: str,
+    model_ns: float | None,
+) -> float | None:
+    """Delivered price (ns) of a ``(candidate, bucket)`` pair whose
+    uncorrected model estimate is *model_ns* — the measured-feedback
+    consumption contract.
+
+    * no ``measured_ns`` entry → *model_ns* unchanged (pure model);
+    * entry with ``model_ns`` recorded → ``model_ns + (median_ns -
+      recorded model_ns)``: the additive residual transfers the
+      systematic gap (e.g. unmodelled per-graph overhead) to the term
+      being priced — for the same graph the price IS the measurement;
+    * entry without a recorded ``model_ns``, or no model price
+      available now → the measured ``median_ns`` itself (the measured
+      latency is the best honest price);
+    * nothing anywhere → ``None`` (unpriced).
+    """
+    tab = _measured_table(profile)
+    cand = tab.get(candidate) if tab is not None else None
+    rec = cand.get(bucket) if isinstance(cand, dict) else None
+    if rec is None:
+        return model_ns
+    if isinstance(rec, dict):
+        med, ref = rec.get("median_ns"), rec.get("model_ns")
+    else:  # bare-number entries are allowed: absolute substitution
+        med, ref = rec, None
+    if med is None:
+        return model_ns
+    if ref is None or model_ns is None:
+        return float(med)
+    return float(model_ns) + (float(med) - float(ref))
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +675,37 @@ def _measure_leaf_eval(
     return max(t_mod - t_ref, 0.0) / iters
 
 
+def _measure_graph_overhead(
+    dev: torch.device,
+    dtype: torch.dtype,
+    reps: int,
+    iters: int,
+    warmup: int,
+    launch_s: float,
+) -> float:
+    """Per-invocation overhead of one compiled-graph call, seconds.
+
+    ``torch.compile`` of a trivial pointwise chain emits ONE fused
+    kernel whose work at this size is launch-bound, so the per-call
+    wall minus ``launch_s`` isolates what ``fused_cost_for``'s
+    per-graph term must carry but ``dispatch_us`` understates: dynamo
+    guard evaluation, compiled-module dispatch and cudagraph-tree
+    bookkeeping.  Best-effort like the other executor probes — a
+    toolchain without inductor raises into the caller's fallback.
+    """
+    x = torch.zeros(4096, device=dev, dtype=dtype)
+
+    def fwd(t: torch.Tensor) -> torch.Tensor:
+        return torch.relu(t) * 2.0 + 1.0
+
+    compiled = torch.compile(fwd)
+    for _ in range(warmup):  # first call compiles
+        compiled(x)
+    _sync(dev)
+    t_c = _timed_median(lambda: compiled(x), dev, reps, iters)
+    return max(t_c / iters - launch_s, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Per-op-class kernel probes — the shape-dependent kernel table
 # ---------------------------------------------------------------------------
@@ -665,6 +897,9 @@ def calibrate(
     * dispatch     — median-of-reps difference between an N-op IR chain
       and its inline-torch equivalent, per node;
     * leaf eval    — same protocol on a scan-leaf-shaped term, per leaf;
+    * graph overhead — per-call wall of a tiny ``torch.compile``d
+      pointwise graph minus one launch: the guards+dispatch boundary
+      the fused model's per-graph term charges;
     * op kernels   — timed torch kernels for the dominant op classes
       (matmul by (M,K,N); pointwise / reduce / concat / stack /
       index_select by element count), stored as ``op_kernel_ns``.
@@ -710,6 +945,10 @@ def calibrate(
     leaf_reps, leaf_iters, leaf_warmup = (
         (5, 150, 50) if quick else (7, 400, 100)
     )
+    # Compiled-overhead probe: warmup calls trigger the compile itself
+    # (seconds on a cold cache) — the timed block then measures
+    # steady-state per-call dispatch.
+    go_reps, go_iters, go_warmup = (3, 60, 4) if quick else (5, 150, 6)
 
     # Measure honest fp32: TF32 tensor cores would inflate the matmul
     # number past what fp32 elementwise consumers actually get.
@@ -768,6 +1007,19 @@ def calibrate(
         leaf_eval_us = _FALLBACK_LEAF_EVAL_US
     if leaf_eval_us <= 0:
         leaf_eval_us = _FALLBACK_LEAF_EVAL_US
+    # The compiled-call probe needs a working torch.compile backend;
+    # same fallback convention as the other executor overheads.
+    try:
+        graph_overhead_us = (
+            _measure_graph_overhead(
+                dev, dtype, go_reps, go_iters, go_warmup, launch
+            )
+            * 1e6
+        )
+    except Exception:
+        graph_overhead_us = _FALLBACK_GRAPH_OVERHEAD_US
+    if graph_overhead_us <= 0:
+        graph_overhead_us = _FALLBACK_GRAPH_OVERHEAD_US
 
     profile = TargetProfile(
         name=name or _default_name(dev),
@@ -786,11 +1038,13 @@ def calibrate(
         dispatch_us=dispatch_us,
         leaf_eval_us=leaf_eval_us,
         op_kernel_ns=op_kernels,
+        graph_overhead_us=graph_overhead_us,
     )
     with _verbose_ctx(logger, verbose):
         logger.info(
             "calibrated %s on %s: %.3f TFLOPS, %.1f GB/s, "
-            "%.2f µs launch, %.2f µs dispatch, %.2f µs leaf-eval",
+            "%.2f µs launch, %.2f µs dispatch, %.2f µs leaf-eval, "
+            "%.2f µs graph-overhead",
             profile.name,
             profile.device,
             profile.tflops,
@@ -798,15 +1052,18 @@ def calibrate(
             profile.launch_us,
             profile.dispatch_us,
             profile.leaf_eval_us,
+            profile.graph_overhead_us,
         )
         logger.debug(
             "calibration raw: flops=%g flop/s, bw=%g B/s, launch=%g s, "
-            "dispatch=%g s, leaf_eval=%g s, op-kernel classes=%s",
+            "dispatch=%g s, leaf_eval=%g s, graph_overhead=%g s, "
+            "op-kernel classes=%s",
             flops,
             bw,
             launch,
             dispatch_us * 1e-6,
             leaf_eval_us * 1e-6,
+            graph_overhead_us * 1e-6,
             sorted(profile.op_kernel_ns),
         )
     if save:

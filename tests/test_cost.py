@@ -547,21 +547,25 @@ def test_fused_cost_for_pointwise_region():
     # + one launch + one graph-level dispatch — well under the
     # per-op sum.  (No dispatch_us in the default profile → the
     # dispatch falls back to the launch constant.)
-    exp = _kernel_ns(3 * 512 * 512, el_b, el_b) + 2 * _LAUNCH_S * 1e9
+    exp = _kernel_ns(3 * 512 * 512, el_b, el_b) + _LAUNCH_S * 1e9 + 80_000.0
     assert fused == pytest.approx(exp)
-    assert fused < unfused / 2
+    # The per-graph overhead (~80us fallback) dominates at this size —
+    # a small fused graph is barely under the unfused price, which is
+    # the measured reality: Inductor's guard+call overhead means a
+    # tiny graph doesn't pay.
+    assert fused < unfused
     # A fusible diamond dedups its shared member in the region.
     dia = Op.make("add", mul, mul)
     fused_dia = fused_cost_for()(dia)
     assert fused_dia == pytest.approx(
-        _kernel_ns(2 * 512 * 512, el_b, el_b) + 2 * _LAUNCH_S * 1e9
+        _kernel_ns(2 * 512 * 512, el_b, el_b) + _LAUNCH_S * 1e9 + 80_000.0
     )
     # A non-fusible op keeps its own kernel: its flops dominate
     # the region traffic (reads x + W, writes the product).
     W = _p("W", 512, 512)
     mm = Op.make("matmul", x, W)
     assert fused_cost_for()(mm) == pytest.approx(
-        _kernel_ns(2 * 512**3, 2 * el_b, el_b) + 2 * _LAUNCH_S * 1e9
+        _kernel_ns(2 * 512**3, 2 * el_b, el_b) + _LAUNCH_S * 1e9 + 80_000.0
     )
     # Mixed term: the GEMM is its own kernel, the pointwise tail
     # fuses reading the GEMM's output once.
@@ -570,7 +574,8 @@ def test_fused_cost_for_pointwise_region():
     assert fmix == pytest.approx(
         _kernel_ns(2 * 512**3, 2 * el_b, el_b)
         + _kernel_ns(2 * 512 * 512, el_b, el_b)
-        + 3 * _LAUNCH_S * 1e9  # 2 launches + 1 graph dispatch
+        + 2 * _LAUNCH_S * 1e9
+        + 80_000.0  # per-graph: max(dispatch, measured overhead)
     )
     assert fmix < roofline_cost(mix)
     # Leaves emit no kernel; memo reuse hits the cache.
@@ -592,7 +597,7 @@ def test_fused_cost_region_traffic():
     add = Op.make("add", x, y)
     f_add = fused_cost_for()(add)
     assert f_add == pytest.approx(
-        _kernel_ns(512 * 512, 2 * el_b, el_b) + 2 * _LAUNCH_S * 1e9
+        _kernel_ns(512 * 512, 2 * el_b, el_b) + _LAUNCH_S * 1e9 + 80_000.0
     )
     # the same op reading ONE external twice dedups the read —
     # fewer bytes than the two-input form.
@@ -1311,14 +1316,44 @@ def test_fused_cost_region_measured_work_floor():
     f_table = fused_cost_for(prof)(pw)
     f_roof = fused_cost_for(bare)(pw)
     # kernel = sum(m_i - launch); +1 fused launch +1 graph dispatch.
-    exp = 3 * (400000.0 - 8700.0) + 8700.0 + 5000.0
+    exp = 3 * (400000.0 - 8700.0) + 8700.0 + 80_000.0
     assert f_table == pytest.approx(exp)
     assert f_table > f_roof
     # a singleton region of a measured class floors at its bucket
     mm = Op.make("matmul", _v("x", 512, 512), _p("W", 512, 512))
     assert fused_cost_for(prof)(mm) == pytest.approx(
-        5000000.0 - 8700.0 + 8700.0 + 5000.0
+        5000000.0 - 8700.0 + 8700.0 + 80_000.0
     )
     # a region whose members have no measured class is unchanged
     ct = Op.make("contiguous", _v("z", 8, 8))
     assert fused_cost_for(prof)(ct) == fused_cost_for(bare)(ct)
+
+
+def test_graph_overhead_profile_paths():
+    """_profile_graph_overhead_s: None / dict / object branches all
+    feed the fused per-graph charge — the inductor guard overhead."""
+    from catopt.cost import fused_cost_for
+
+    x = _v("x", 8, 8)
+    t = Op.make("neg", x)
+    # default fallback (no profile at all)
+    d = fused_cost_for()(t)
+    # dict profile with an explicit overhead
+    prof = dict(_PROF_KERNEL)
+    prof["graph_overhead_us"] = 200.0
+    hi = fused_cost_for(prof)(t)
+    assert hi > d  # 200us > 80us fallback
+    # object profile via a namespace
+    import types
+
+    obj = types.SimpleNamespace(
+        tflops=2.5,
+        gbps=89.0,
+        launch_us=8.7,
+        dispatch_us=5.0,
+        leaf_eval_us=20.0,
+        op_kernel_ns={},
+        graph_overhead_us=0.0,
+    )
+    lo = fused_cost_for(obj)(t)
+    assert lo < d  # 0us overhead < 80us fallback

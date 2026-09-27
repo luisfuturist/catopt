@@ -8,7 +8,18 @@ Pipeline entry points (:func:`optimize_model`,
 """
 
 from catopt_optimize.autotune import optimize_model_autotuned
-from catopt_optimize.criteria import criteria_cost
+from catopt_optimize.criteria import (
+    Blend,
+    CompiledCriterion,
+    Criteria,
+    Criterion,
+    DepthCriterion,
+    FlopsCriterion,
+    LatencyCriterion,
+    MemoryCriterion,
+    criteria_cost,
+    peak_bytes_cost,
+)
 from catopt_optimize.optimize import (
     OptimizationResourceError,
     optimize_compositional,
@@ -24,15 +35,24 @@ from catopt_optimize.runners import (
 )
 
 __all__ = [
+    "Blend",
     "ChainedRunner",
+    "CompiledCriterion",
     "CompiledRunner",
+    "Criteria",
+    "Criterion",
     "CudaGraphRunner",
+    "DepthCriterion",
+    "FlopsCriterion",
     "GenericRunner",
+    "LatencyCriterion",
+    "MemoryCriterion",
     "OptimizationResourceError",
     "Runner",
     "criteria_cost",
     "optimize_compositional",
     "optimize_model",
     "optimize_model_autotuned",
+    "peak_bytes_cost",
     "runner_candidate",
 ]

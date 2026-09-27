@@ -4,10 +4,16 @@ over the lowering paths."""
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
+import catopt_optimize.autotune as at_mod
+import catopt_optimize.calibrate as cal_mod
 import pytest
 import torch
 import torch.nn as nn
+from catopt.calibrate import TargetProfile, shape_bucket
+from catopt.cost import fused_cost_for
+from catopt.ir import Op, Param, TensorType, Var
 from catopt_optimize.autotune import (
     CandidateUnavailableError,
     optimize_model_autotuned,
@@ -335,3 +341,219 @@ def test_cuda_candidates():
         assert verify_module(m, mod, x).passed
     else:
         assert at["candidates"][at["winner"]]["verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# Measured feedback — profile channel, corrected pricing, graph overhead
+# ---------------------------------------------------------------------------
+
+
+def _term():
+    x = Var("x", TensorType((64,)))
+    w = Param("W", TensorType((64, 64)))
+    return Op.make("matmul", x, w)
+
+
+def test_measured_feedback_writes_profile_dict():
+    """profile= persists every timed candidate's median under
+    (candidate, shape_bucket) — the dict updates in place and rides
+    back out as stats["autotune"]["profile"]."""
+    m, x = _make()
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+    }
+    _mod, stats = _autotune(
+        m, x, candidates=("generic", "batched", "eager"), profile=prof
+    )
+    at = stats["autotune"]
+    bucket = at["shape_bucket"]
+    assert bucket == shape_bucket(x)
+    assert at["profile"] is prof
+    written = at["measured_ns"]
+    assert set(written) == {"generic", "batched", "eager"}
+    for name in ("generic", "batched", "eager"):
+        ent = prof["measured_ns"][name][bucket]
+        assert ent["median_ns"] == written[name]["median_ns"] > 0
+    # priced candidates record the model price + residual; eager has
+    # no priced lowering — its median substitutes outright.
+    assert written["generic"]["model_ns"] > 0
+    assert "residual_ns" in written["generic"]
+    assert "model_ns" not in written["eager"]
+    rec = at["candidates"]["generic"]
+    assert rec["model_ns"] > 0
+    # no prior entries → the corrected prediction IS the model price
+    assert rec["predicted_ns"] == rec["model_ns"]
+
+
+def test_measured_feedback_targetprofile_replaced():
+    """A frozen TargetProfile is NOT mutated — the updated profile
+    comes back under stats["autotune"]["profile"]."""
+    m, x = _make()
+    prof = TargetProfile("t", 2.5, 89.0, 8.7, "cpu", "t0")
+    _mod, stats = _autotune(m, x, candidates=("generic",), profile=prof)
+    at = stats["autotune"]
+    out = at["profile"]
+    assert out is not prof
+    assert prof.measured_ns == {}  # original untouched
+    ent = out.measured_ns["generic"][at["shape_bucket"]]
+    assert ent["median_ns"] > 0 and ent["model_ns"] > 0
+    assert out.graph_overhead_us == prof.graph_overhead_us
+
+
+def test_measured_entries_shift_candidate_order():
+    """A fake profile whose measured_ns says a custom candidate ran at
+    1 ns flips the ATTEMPT order — the correction is consumed before
+    any timing runs."""
+    m, x = _make()
+    bucket = shape_bucket(x)
+
+    def cheap(ctx):
+        return ctx.delivered
+
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "measured_ns": {"cheap": {bucket: {"median_ns": 1.0}}},
+    }
+    _mod, stats = _autotune(
+        m, x, candidates=("generic", ("cheap", cheap)), profile=prof
+    )
+    at = stats["autotune"]
+    # cheapest-predicted-first: the 1 ns entry leads the attempt order
+    assert next(iter(at["candidates"])) == "cheap"
+    assert at["predicted_winner"] == "cheap"
+    assert at["candidates"]["cheap"]["predicted_ns"] == 1.0
+
+
+def test_predicted_ns_without_profile_is_model_only():
+    """Without profile= nothing is persisted and nothing reorders —
+    but predicted prices are still recorded for fidelity."""
+    m, x = _make()
+    _mod, stats = _autotune(m, x, candidates=("generic", "eager"))
+    at = stats["autotune"]
+    c = at["candidates"]
+    assert c["generic"]["model_ns"] > 0
+    assert c["generic"]["predicted_ns"] == c["generic"]["model_ns"]
+    assert "model_ns" not in c["eager"]
+    assert "predicted_ns" not in c["eager"]
+    assert at["predicted_winner"] == "generic"
+    assert "measured_ns" not in at and "profile" not in at
+    # second call ordering is the declared order — verify via records
+    assert list(c)[:2] == ["generic", "eager"]
+
+
+def test_candidate_pricing_failure_is_soft(monkeypatch):
+    """A cost model that raises on a candidate must never break the
+    measurement run — the candidate simply goes unpriced."""
+    monkeypatch.setattr(
+        at_mod,
+        "executor_cost_for",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    m, x = _make()
+    _mod, stats = _autotune(m, x, candidates=("generic",))
+    rec = stats["autotune"]["candidates"]["generic"]
+    assert rec["status"] == "timed"
+    assert "model_ns" not in rec
+    assert stats["autotune"]["predicted_ns"] is None
+
+
+def test_compiled_price_charges_graph_overhead():
+    """``graph_overhead_us`` widens the fused per-graph term to
+    ``max(dispatch_us, graph_overhead_us)``: larger constants price
+    the same term higher; below dispatch it is a no-op."""
+    t = _term()
+    base = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+    }
+    raw = fused_cost_for(base)(t)  # per-graph term: dispatch only
+    low = at_mod._compiled_model_ns(
+        t, {**base, "graph_overhead_us": 0.5}
+    )
+    assert low == pytest.approx(raw)  # below the dispatch floor
+    high = at_mod._compiled_model_ns(
+        t, {**base, "graph_overhead_us": 200.0}
+    )
+    assert high == pytest.approx(raw + (200.0 - 1.0) * 1e3)
+    # absent → the calibrated fallback applies
+    fb = cal_mod._FALLBACK_GRAPH_OVERHEAD_US
+    none = at_mod._compiled_model_ns(t, dict(base))
+    assert none == pytest.approx(raw + (fb - 1.0) * 1e3)
+    # a TargetProfile consumes identically
+    tp = TargetProfile(
+        "t",
+        2.5,
+        89.0,
+        8.7,
+        "cpu",
+        "t0",
+        dispatch_us=1.0,
+        graph_overhead_us=150.0,
+    )
+    assert at_mod._compiled_model_ns(t, tp) == pytest.approx(
+        raw + (150.0 - 1.0) * 1e3
+    )
+
+
+def test_fused_charges_graph_overhead_detection(monkeypatch):
+    """When the installed fused model already consumes the field the
+    shim must not double-charge — detected behaviourally."""
+
+    def fake_fused(profile):
+        ov = (
+            profile.get("graph_overhead_us", 0.0)
+            if isinstance(profile, dict)
+            else 0.0
+        )
+
+        def cost(t, memo=None):
+            return 100.0 + ov * 1e3
+
+        return cost
+
+    monkeypatch.setattr(at_mod, "fused_cost_for", fake_fused)
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+        "graph_overhead_us": 50.0,
+    }
+    assert at_mod._fused_charges_graph_overhead(prof) is True
+    # native consumption detected → the price carries it, no surplus
+    assert at_mod._compiled_model_ns(_term(), prof) == pytest.approx(
+        100.0 + 50e3
+    )
+
+
+def test_graph_overhead_detection_exotic_profiles():
+    """Unpriceable / uncarryable profile types report not-native."""
+    # plain object() — clone accepts no attribute → None → False
+    assert at_mod._fused_charges_graph_overhead(object()) is False
+
+    @dataclass(frozen=True)
+    class Frozen:  # dataclass WITHOUT the field → replace() raises
+        x: int = 0
+
+    assert at_mod._fused_charges_graph_overhead(Frozen()) is False
+
+    class Bare:  # clones fine, but has no tflops — pricing raises
+        pass
+
+    assert at_mod._fused_charges_graph_overhead(Bare()) is False
+
+    class Obj:  # priceable attribute profile: probe runs, not native
+        tflops = 2.5
+        gbps = 89.0
+        launch_us = 8.7
+        dispatch_us = 1.0
+
+    assert at_mod._fused_charges_graph_overhead(Obj()) is False
+    assert at_mod._compiled_model_ns(_term(), Obj()) > 0.0

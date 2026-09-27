@@ -2,6 +2,7 @@
 profile-parameterised cost fns in catopt.cost."""
 
 import json
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -11,8 +12,12 @@ from catopt.calibrate import (
     calibrate,
     list_profiles,
     load_profile,
+    measured_price_ns,
+    profile_graph_overhead_us,
     profiles_dir,
+    record_measured,
     save_profile,
+    shape_bucket,
 )
 from catopt.cost import (
     dag_cost,
@@ -100,6 +105,216 @@ def test_profile_op_kernel_ns_defaults_and_roundtrip():
     )
     assert TargetProfile.from_json(p.to_json()) == p
     assert "op_kernel_ns" in p.to_json()
+
+
+def test_profile_graph_overhead_and_measured_defaults():
+    """``graph_overhead_us`` / ``measured_ns`` behave like the other
+    profile extras: conservative defaults on hand-built and legacy
+    profiles, clean serialisation round-trip."""
+    bare = TargetProfile("bare", 1.0, 2.0, 3.0, "cpu", "t")
+    assert bare.graph_overhead_us > 0  # fallback, never zero
+    assert bare.measured_ns == {}
+    legacy = json.loads(RTX2050.to_json())
+    del legacy["graph_overhead_us"], legacy["measured_ns"]
+    p = TargetProfile.from_json(legacy)
+    assert p.graph_overhead_us == bare.graph_overhead_us
+    assert p.measured_ns == {}
+    measured = {
+        "compiled": {"cpu:2^4": {"median_ns": 900.0, "model_ns": 300.0}}
+    }
+    q = TargetProfile(
+        "k",
+        1.0,
+        2.0,
+        3.0,
+        "cpu",
+        "t",
+        graph_overhead_us=42.0,
+        measured_ns=measured,
+    )
+    s = q.to_json()
+    assert "graph_overhead_us" in s and "measured_ns" in s
+    assert TargetProfile.from_json(s) == q
+
+
+# ---------------------------------------------------------------------------
+# Measured-feedback channel + graph overhead helpers
+# ---------------------------------------------------------------------------
+
+
+def test_shape_bucket():
+    """Buckets key on device + ceil(log2 numel) — never global."""
+    assert shape_bucket(torch.zeros(16)) == "cpu:2^4"
+    assert shape_bucket(torch.zeros(2, 8)) == "cpu:2^4"
+    # tuple inputs sum numels: 8 + 9 = 17 → ceil(log2) = 5
+    assert shape_bucket((torch.zeros(8), torch.zeros(9))) == "cpu:2^5"
+    # non-tensor / empty inputs land in the smallest bucket
+    assert shape_bucket(3) == "cpu:2^0"
+    assert shape_bucket(torch.zeros(0)) == "cpu:2^0"
+
+
+def test_profile_graph_overhead_us_reader():
+    """Absent / non-positive / unreadable values fall back; real ones
+    pass through — the fused per-graph term is never optimistic."""
+    fb = cal_mod._FALLBACK_GRAPH_OVERHEAD_US
+    assert profile_graph_overhead_us(None) == fb
+    assert profile_graph_overhead_us({}) == fb
+    assert profile_graph_overhead_us({"graph_overhead_us": 0.0}) == fb
+    assert (
+        profile_graph_overhead_us({"graph_overhead_us": "junk"}) == fb
+    )
+    assert (
+        profile_graph_overhead_us({"graph_overhead_us": 33.0}) == 33.0
+    )
+    # attribute profiles read the same way
+    assert (
+        profile_graph_overhead_us(RTX2050) == RTX2050.graph_overhead_us
+    )
+
+    class Obj:
+        graph_overhead_us = 12.5
+
+    assert profile_graph_overhead_us(Obj()) == 12.5
+
+
+def test_measured_price_ns_contract():
+    prof = {
+        "measured_ns": {
+            "compiled": {
+                "cpu:2^4": {"median_ns": 900.0, "model_ns": 300.0}
+            }
+        }
+    }
+    # residual transfer: model 500 + (measured 900 - recorded 300)
+    assert (
+        measured_price_ns(prof, "compiled", "cpu:2^4", 500.0) == 1100.0
+    )
+    # the recorded graph prices at its measurement exactly
+    assert (
+        measured_price_ns(prof, "compiled", "cpu:2^4", 300.0) == 900.0
+    )
+    # per-bucket, never global: other buckets / candidates keep the model
+    assert (
+        measured_price_ns(prof, "compiled", "cpu:2^9", 500.0) == 500.0
+    )
+    assert measured_price_ns(prof, "generic", "cpu:2^4", 500.0) == 500.0
+    # no model price available → measured median substitutes
+    assert measured_price_ns(prof, "compiled", "cpu:2^4", None) == 900.0
+    # nothing anywhere → unpriced
+    assert measured_price_ns({}, "x", "cpu:2^4", None) is None
+    # no profile at all → the model price passes through unchanged
+    assert measured_price_ns(None, "x", "cpu:2^4", 7.0) == 7.0
+    # entry without a recorded model → absolute substitution
+    bare = {"measured_ns": {"eager": {"cpu:2^4": {"median_ns": 42.0}}}}
+    assert measured_price_ns(bare, "eager", "cpu:2^4", 999.0) == 42.0
+    # bare-number entries are allowed too
+    num = {"measured_ns": {"eager": {"cpu:2^4": 123.0}}}
+    assert measured_price_ns(num, "eager", "cpu:2^4", 999.0) == 123.0
+    # a malformed entry (no median) leaves the model price alone
+    nomed = {"measured_ns": {"x": {"b": {"model_ns": 1.0}}}}
+    assert measured_price_ns(nomed, "x", "b", 7.0) == 7.0
+    # malformed candidate table → entry absent → model price
+    bad = {"measured_ns": {"x": 5}}
+    assert measured_price_ns(bad, "x", "b", 7.0) == 7.0
+    # attribute profiles read measured_ns the same way
+    tp = TargetProfile(
+        "k",
+        1.0,
+        2.0,
+        3.0,
+        "cpu",
+        "t",
+        measured_ns={
+            "compiled": {
+                "cpu:2^4": {"median_ns": 50.0, "model_ns": 10.0}
+            }
+        },
+    )
+    assert measured_price_ns(tp, "compiled", "cpu:2^4", 20.0) == 60.0
+
+    # a non-dict measured_ns on an attribute profile is ignored
+    class Weird:
+        measured_ns = "junk"
+
+    assert measured_price_ns(Weird(), "x", "b", 7.0) == 7.0
+
+
+def test_record_measured():
+    entry = {"median_ns": 100.0, "model_ns": 40.0}
+    # dict profiles update in place
+    d = {}
+    assert record_measured(d, "compiled", "cpu:2^4", 100.0, 40.0) is d
+    assert d["measured_ns"]["compiled"]["cpu:2^4"] == entry
+    # accumulating other buckets / candidates preserves earlier entries
+    record_measured(d, "compiled", "cpu:2^5", 200.0)
+    record_measured(d, "generic", "cpu:2^4", 50.0, 10.0)
+    assert set(d["measured_ns"]) == {"compiled", "generic"}
+    assert set(d["measured_ns"]["compiled"]) == {"cpu:2^4", "cpu:2^5"}
+    # an existing non-dict measured_ns is replaced, not crashed on
+    d2 = {"measured_ns": "junk"}
+    record_measured(d2, "g", "b", 1.0)
+    assert d2["measured_ns"]["g"]["b"] == {"median_ns": 1.0}
+    # frozen TargetProfile → a NEW object; the original is untouched
+    p = TargetProfile("k", 1.0, 2.0, 3.0, "cpu", "t")
+    p2 = record_measured(p, "generic", "cpu:2^4", 55.0, 20.0)
+    assert p2 is not p and p.measured_ns == {}
+    assert p2.measured_ns["generic"]["cpu:2^4"] == {
+        "median_ns": 55.0,
+        "model_ns": 20.0,
+    }
+    # a second write accumulates on the returned copy
+    p3 = record_measured(p2, "compiled", "cpu:2^4", 77.0)
+    assert set(p3.measured_ns) == {"generic", "compiled"}
+
+    # plain objects get the attribute set and keep prior entries
+    class Obj:
+        pass
+
+    obj = Obj()
+    out = record_measured(obj, "g", "b", 3.0)
+    assert out is obj
+    record_measured(obj, "h", "b", 4.0)
+    assert set(obj.measured_ns) == {"g", "h"}
+
+    # a frozen dataclass WITHOUT the field → replace() raises
+    @dataclass(frozen=True)
+    class Frozen:
+        x: int = 0
+
+    with pytest.raises(TypeError):
+        record_measured(Frozen(), "g", "b", 1.0)
+
+
+def test_measure_graph_overhead_direct(monkeypatch):
+    """The probe's timing path is exercised without needing a real
+    inductor: ``compile`` → identity keeps the residual ≥ 0."""
+    monkeypatch.setattr(torch, "compile", lambda f: f)
+    v = cal_mod._measure_graph_overhead(
+        torch.device("cpu"), torch.float32, 2, 10, 2, 3e-6
+    )
+    assert v >= 0.0
+
+
+def test_calibrate_graph_overhead_probe_failure_falls_back(monkeypatch):
+    """A toolchain without inductor (or a failing probe) must not
+    crash calibrate — the conservative fallback lands instead."""
+    monkeypatch.setattr(
+        cal_mod,
+        "_measure_graph_overhead",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    p = calibrate(device="cpu", quick=True)
+    assert p.graph_overhead_us == cal_mod._FALLBACK_GRAPH_OVERHEAD_US
+
+
+def test_calibrate_graph_overhead_nonpositive_falls_back(monkeypatch):
+    """A probe that returns zero — e.g. a clock coarser than the
+    launch constant — is clamped to the fallback, never free."""
+    monkeypatch.setattr(
+        cal_mod, "_measure_graph_overhead", lambda *a, **k: 0.0
+    )
+    p = calibrate(device="cpu", quick=True)
+    assert p.graph_overhead_us == cal_mod._FALLBACK_GRAPH_OVERHEAD_US
 
 
 def test_profile_save_load(tmp_path, monkeypatch):
@@ -219,6 +434,10 @@ def test_calibrate_cpu_sane():
     # positive fallback — either way never zero)
     assert 0.001 < p.dispatch_us < 1e4
     assert 0.001 < p.leaf_eval_us < 1e4
+    # compiled-call per-graph overhead: measured or fallback, > 0
+    assert 0.001 < p.graph_overhead_us < 1e5
+    # no autotune feedback until optimize_model_autotuned writes some
+    assert p.measured_ns == {}
     # and the measured profile yields a working cost fn
     assert roofline_cost_for(p)(_mm_term()) > 0.0
     # the op-kernel table measured every class at positive ns

@@ -70,7 +70,11 @@ from catopt_torch.report import (
     verify_module,
 )
 
-from catopt_optimize.criteria import criteria_cost
+from catopt_optimize.criteria import (
+    Criteria,
+    Criterion,
+    criteria_cost,
+)
 from catopt_optimize.runners import GenericRunner, Runner
 
 #: Rules whose saturation closure is combinatorially explosive on
@@ -542,7 +546,9 @@ def optimize_model(
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
     cost_fn: CostFn | None = None,
-    criteria: dict[str, float] | None = None,
+    criteria: (
+        dict[str, float] | Criteria | Criterion | list | tuple | None
+    ) = None,
     symmetry_budget: int | None = 2048,
     ops: OpTable | None = None,
     source: Source | None = None,
@@ -583,13 +589,18 @@ def optimize_model(
         level-batched executors at lowering time rather than priced
         in, because batched cost is non-additive over the spine and
         ``extract_best``'s local-cost decomposition can't see it.
-    criteria : dict[str, float], optional
-        Named cost axes blended into the extraction model — e.g.
-        ``{"latency": 1.0, "memory": 0.5}``; see
+    criteria : dict, Criterion, Criteria, or sequence, optional
+        Selection axes blended into the extraction model — a
+        ``{axis: weight}`` dict over the named axes
+        (:data:`~catopt_optimize.criteria.AXES`), a single
+        :class:`~catopt_optimize.criteria.Criterion`, a
+        ``Criteria``/``Blend`` composition (e.g.
+        ``LatencyCriterion() * 0.7 + MemoryCriterion("peak") * 0.3``),
+        or a list of criteria / ``(criterion, weight)`` pairs; see
         :func:`catopt_optimize.criteria.criteria_cost`.  Consulted only
         when ``cost_fn`` is ``None`` — precedence is explicit
         ``cost_fn`` > ``criteria`` > the default model.
-        ``stats["criteria"]`` records the normalised blend priced.
+        ``stats["criteria"]`` records the normalised axes priced.
     symmetry_budget : int, optional
         Per-rule enode budget for the expansive rules in
         ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
