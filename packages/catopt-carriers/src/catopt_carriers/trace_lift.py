@@ -92,7 +92,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from catopt_core.egraph import EGraph, Rewrite, _LeafRegistry
+from catopt_core.egraph import (
+    EClass,
+    EGraph,
+    ENode,
+    Rewrite,
+    _LeafRegistry,
+)
 from catopt_core.ir import Const, Op
 from catopt_core.typing import _shape_of
 
@@ -473,6 +479,16 @@ class _Emit:
         self.eg = eg
         self.prov = provenance
         self.broken = False
+        # ``ref`` memo: canonical id -> (eid, term).  ``any_term``
+        # re-walks a class on every call; on a length-T spine the same
+        # map/input classes are re-resolved T times per offer.  Must be
+        # dropped whenever a union lands mid-offer (``drop_term_cache``)
+        # — a merge can change which member ``any_term`` returns.
+        self._ref_memo: dict[int, tuple] = {}
+
+    def drop_term_cache(self) -> None:
+        """Invalidate ``_ref_memo`` after a union mutated classes."""
+        self._ref_memo.clear()
 
     def op(self, name: str, kids=(), attrs: dict | None = None):
         kids = list(kids)
@@ -485,13 +501,107 @@ class _Emit:
     def ref(self, eid: int):
         """An (eid, representative term) pair for an existing class."""
         eid = self.eg.find(eid)
+        hit = self._ref_memo.get(eid)
+        if hit is not None:
+            return hit
         t = self.eg.any_term(eid)
         if t is None:
+            # Not memoised: every broken ref must re-flag ``broken``
+            # like the unmemoised walk.
             self.broken = True
-        return (eid, t)
+            return (eid, t)
+        res = (eid, t)
+        self._ref_memo[eid] = res
+        return res
 
     def leaf(self, t: Any):
         return (self.eg.add_term(t, provenance=self.prov), t)
+
+
+def _add_enode_dedup(
+    eg: EGraph, enode: ENode, provenance: str, distinct
+) -> int:
+    """``EGraph._add_enode`` specialised for wide fan-in nodes.
+
+    The stock version visits every child slot twice — canonicalising
+    ``self.find(c)`` on entry and again registering the
+    child→parent edge — O(fan-in) Python-level work per node, which
+    the F block matrix amplifies to O(T²) (each of its ~T rows has
+    2T+1 slots).  Here the caller guarantees:
+
+    * ``enode.children`` already holds *canonical* e-class ids (the
+      ``find`` per slot is a no-op and is skipped), and
+    * ``distinct`` enumerates the deduplicated children — the only
+      effect the per-slot parent loop has on ``eg._parents`` anyway,
+      since it stores sets.
+
+    Everything else mirrors ``EGraph._add_enode`` verbatim (keep in
+    sync with catopt_core/egraph/core.py): union-find growth, class
+    creation, dirty/op-class bookkeeping, provenance records.
+    """
+    eid = eg._next_id
+    eg._next_id += 1
+    eg._uf.parent.append(eid)
+    eg._uf.rank.append(0)
+    ec = EClass(id=eid)
+    eg._classes[eid] = ec
+    eg._node_to_class[enode] = eid
+    ec.nodes.add(enode)
+    eg._dirty.add(eid)
+    eg._op_classes.setdefault(enode.op, set()).add(eid)
+    parents = eg._parents
+    find = eg.find
+    for c in distinct:
+        parents.setdefault(find(c), set()).add(eid)
+    if eg._track:
+        eg._enode_birth[enode] = eid
+        eg._enode_origin[enode] = (
+            eg._tag_rule or provenance or "external"
+        )
+        # ``_collect`` is only set while a rule instantiates its RHS —
+        # this pass mints enodes outside rule application, so the
+        # append is unreachable by construction.
+        if eg._collect is not None:  # pragma: no cover
+            eg._collect.append(enode)
+    return eid
+
+
+def _wide_concat(
+    em: _Emit,
+    ceids: list,
+    cterms: list,
+    dim: int,
+    distinct,
+) -> tuple:
+    """``em.op("concat", cols, {"dim": dim})`` for a wide fan-in node
+    whose children are already-canonical eids.
+
+    Identical output to :meth:`_Emit.op` — same enode, same term —
+    at O(fan-in) C-level work instead of O(fan-in) Python work:
+
+    * ``add_enode``'s per-slot ``find`` canonicalisation is skipped
+      (``ceids`` are canonical by construction — every emitter in
+      this module returns ``find``-resolved ids);
+    * the hash-cons lookup and, on miss, ``_add_enode_dedup`` visit
+      ``distinct`` rather than all slots;
+    * the term is minted as ``Op(...)`` directly — ``Op.make``'s
+      schema validation and intern-table key hash buy nothing here:
+      every F-row concat is structurally unique, so interning never
+      hits, and ``{"dim": …}`` is already canonical.
+
+    ``ceids``/``cterms`` are parallel slot lists (``ceids[i]`` is the
+    e-class of ``cterms[i]``); ``distinct`` must equal
+    ``set(ceids)`` — it feeds the child→parent bookkeeping.
+    """
+    attr_t = (("dim", dim),)
+    en = ENode("concat", tuple(ceids), attr_t)
+    eg = em.eg
+    eid = eg._node_to_class.get(en)
+    if eid is None:
+        eid = _add_enode_dedup(eg, en, em.prov, distinct)
+    else:
+        eid = eg.find(eid)
+    return (eid, Op("concat", tuple(cterms), {"dim": dim}))
 
 
 def _assemble_F(em: _Emit, maps: list, d: int):
@@ -501,29 +611,46 @@ def _assemble_F(em: _Emit, maps: list, d: int):
     (eid, term) pair of the ``(T·d + d) × (2·T·d + d)`` concat.
     """
     T = len(maps)
+    w = 2 * T + 1
     eye = em.op("eye", (), {"dim": d})
     zero = em.leaf(Const(0.0))
     Z = em.op("mul", (eye, zero))  # shared (d,d) zero block
+    # Canonical slot ids/terms for the wide-concat fast path: every
+    # emitter in this module returns ``find``-resolved eids, but rows
+    # can also be built from ``em.ref`` results captured before a
+    # union — canonicalise the distinct children once per row (the
+    # same canonicalisation ``add_enode`` applies per slot).
+    find = em.eg.find
+    Ze, Zt = find(Z[0]), Z[1]
+    ee, et = find(eye[0]), eye[1]
+    me = [find(m[0]) for m in maps]
+    mt = [m[1] for m in maps]
     rows = []
     for i in range(T):
         # u'_i = h_{i+1} = M_{i+1}·u_{i-1} + b_{i+1} (+ M_1·h0 for i=0)
         # Row = [S-part | R-part]: the S part is all-Z except S[i,i-1],
-        # the R part is all-Z except R[i,i] and R[0,T] — fill a shared
+        # the R part is all-Z except R[i,i] and R[0,T] — splat a shared
         # zero row in place rather than rebuilding two comprehensions.
-        cols = [Z] * (2 * T + 1)
+        ce = [Ze] * w
+        ct = [Zt] * w
         if i >= 1:
-            cols[i - 1] = maps[i]
-        cols[T + i] = eye
+            ce[i - 1] = me[i]
+            ct[i - 1] = mt[i]
+        ce[T + i] = ee
+        ct[T + i] = et
         if i == 0:
-            cols[2 * T] = maps[0]
-        rows.append(em.op("concat", cols, {"dim": -1}))
+            ce[w - 1] = me[0]
+            ct[w - 1] = mt[0]
+        # distinct children = {Z, eye, maps[i]} — for i=0 maps[0] sits
+        # at slot 2T, for i≥1 at slot i−1; either way the same trio.
+        rows.append(_wide_concat(em, ce, ct, -1, {Ze, ee, me[i]}))
     # y = h_T: Q selects the last u block; P = 0.
-    rows.append(
-        em.op(
-            "concat", [Z] * (T - 1) + [eye] + [Z] * (T + 1), {"dim": -1}
-        )
-    )
-    return em.op("concat", rows, {"dim": -2})
+    ce = [Ze] * (T - 1) + [ee] + [Ze] * (T + 1)
+    ct = [Zt] * (T - 1) + [et] + [Zt] * (T + 1)
+    rows.append(_wide_concat(em, ce, ct, -1, {Ze, ee}))
+    reids = [r[0] for r in rows]
+    rterms = [r[1] for r in rows]
+    return _wide_concat(em, reids, rterms, -2, set(reids))
 
 
 def _emit_head(em: _Emit, F, ins: list, h0, d: int, usize):
@@ -667,6 +794,11 @@ def _offer(
                 f"(T={T}, d={d}) → nilpotent block-shift fixpoint"
             ),
         )
+        # The union just merged the offer into the spine classes —
+        # ``any_term`` resolutions memoised in ``em.ref`` may now be
+        # stale (a merged class can yield a different representative),
+        # so the parl offer below must re-resolve.
+        em.drop_term_cache()
         lifts.append(
             TraceLift(
                 root_eid=cid,
@@ -711,6 +843,7 @@ def _offer(
                 f"diagonal recurrence → joint trace over parl"
             ),
         )
+        em.drop_term_cache()  # see note after the joint offer
         lifts.append(
             TraceLift(
                 root_eid=cid,
@@ -735,6 +868,7 @@ def lift_scan_to_trace(
     maximal_only: bool = True,
     provenance: str = "trace_lift",
     witness: bool = True,
+    max_trace_T: int | None = 4096,
 ) -> list:
     """Offer ``trace`` members for every unrolled recurrence in *eg*.
 
@@ -753,6 +887,23 @@ def lift_scan_to_trace(
     is sound but pointless).  ``maximal_only`` drops chains that are
     strict prefixes of a longer recognised chain.
 
+    ``max_trace_T`` bounds the horizon worth materialising F for —
+    plans longer than it are skipped (the offered member set then
+    differs: no trace member at huge T).  Emitting F is O(T²) work —
+    T row-concats of 2T+1 children — while the offered member can
+    never win extraction at that scale: ``flops_cost`` bills the
+    ``trace`` op alone 2·(T·d)³, and the executor-overhead model adds
+    a 10⁴× solver surcharge per ``trace``/``inv`` occurrence on top
+    of the un-deduplicated O(T²) concat nodes — orders of magnitude
+    beyond the ~O(T) unrolled spine at any T, let alone thousands.
+    The served regimes never select trace-rooted members either (the
+    trace executor degrades honestly to serial).  So a very long
+    spine's trace offer is pure O(T²) e-graph bloat whose only
+    consumer is the ``tr_*`` law family — itself producing only
+    solver-priced members.  The default 4096 keeps every
+    realistically-lifted horizon untouched; pass ``None`` to emit at
+    any T (previous behaviour) or a smaller bound to skip earlier.
+
     ``witness`` attaches a replayable certificate witness to every
     offered union (see :meth:`EGraph._offer_witness` and
     ``EGraph.union(..., witness=...)``): each offer's merge then shows
@@ -766,11 +917,11 @@ def lift_scan_to_trace(
     member — in class-iteration order.  Empty when nothing matches:
     the pass is a no-op on non-recurrence graphs.
     """
-    plans = _scan_plans(
-        eg, root_eid, min_steps, maximal_only
-    )
+    plans = _scan_plans(eg, root_eid, min_steps, maximal_only)
     lifts: list[TraceLift] = []
     for c, p in plans.items():
+        if max_trace_T is not None and max_trace_T < p.T:
+            continue
         lifts.extend(
             _offer(eg, c, p, channel_splits, provenance, witness)
         )
@@ -930,6 +1081,9 @@ def lift_scan_to_applyd(
                 f"(T={plan.T}, d={plan.d}) → carrier apply tree"
             ),
         )
+        # The union may change what ``any_term`` resolves for refs
+        # taken by later plans sharing this ``em``.
+        em.drop_term_cache()
         out.append(
             {
                 "root_eid": cid,
