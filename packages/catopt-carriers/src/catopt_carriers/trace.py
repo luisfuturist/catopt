@@ -741,7 +741,12 @@ def _cswap_torch(*a, **kw) -> torch.Tensor:
 
 def _eye_torch(*a, **kw) -> torch.Tensor:
     d = int(kw.get("dim", kw.get("d", 1)))
-    return torch.eye(d, dtype=torch.get_default_dtype())
+    m = kw.get("m")
+    return torch.eye(
+        d,
+        int(m) if m is not None else d,
+        dtype=torch.get_default_dtype(),
+    )
 
 
 #: Torch lowering bindings — an EXPORT, not an import-time mutation

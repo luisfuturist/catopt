@@ -151,9 +151,11 @@ def test_flops_default_weight_ops():
     for op, expected_shape in (
         ("rms_norm", (4, 8)),
         ("layer_norm", (4, 8)),
-        ("narrow", (4, 8)),  # default arm: first-operand shape
-        ("max", (4, 8)),
-        ("min", (4, 8)),
+        # Genuinely-unshaped ops keep the default arm: first-operand
+        # shape.
+        ("fft_fft", (4, 8)),
+        ("upsample_nearest2d", (4, 8)),
+        ("scatter_nd", (4, 8)),
     ):
         t = Op.make(op, x)
         assert _flops_of(t) == pytest.approx(1.0 * 4 * 8), op
@@ -230,9 +232,7 @@ def test_depth_cost_invalid_term_charges_launch_not_veto():
     # depth is structural: one launch, not the poison price.
     assert depth_cost(bad) == pytest.approx(_LAUNCH_S * 1e9)
     # …and the profile-calibrated closure uses its own launch constant.
-    df = depth_cost_for(
-        {"tflops": 2.5, "gbps": 89.0, "launch_us": 2.0}
-    )
+    df = depth_cost_for({"tflops": 2.5, "gbps": 89.0, "launch_us": 2.0})
     assert df(bad) == pytest.approx(2e-6 * 1e9)
     assert df.__name__ == "depth_cost_for"
     assert df.profile == {"tflops": 2.5, "gbps": 89.0, "launch_us": 2.0}
@@ -289,6 +289,7 @@ def test_param_numel_source_tensor_variants():
     t = Op.make("linear", x, W)
     # numpy arrays: .size is an int attribute (no .numel method).
     assert param_bytes_cost(t, {"W": np.zeros((3, 4))}) == 12.0
+
     # objects exposing numel() but no element_size(): by_bytes uses
     # the fp32 default of 4 bytes.
     class FakeTensor:
@@ -296,20 +297,26 @@ def test_param_numel_source_tensor_variants():
             return 10
 
     assert param_bytes_cost(t, {"W": FakeTensor()}) == 10.0
-    assert param_bytes_cost(
-        t, {"W": FakeTensor()}, by_bytes=True
-    ) == 40.0
+    assert (
+        param_bytes_cost(t, {"W": FakeTensor()}, by_bytes=True) == 40.0
+    )
     # A source object with neither a callable numel() nor a numeric
     # .size falls back to the declared TensorType.
     odd = types.SimpleNamespace(numel=None, size="not-a-number")
     assert param_bytes_cost(t, {"W": odd}) == 64.0
     # torch dtype widths under by_bytes.
-    assert param_bytes_cost(
-        t, {"W": torch.zeros(8, dtype=torch.float16)}, by_bytes=True
-    ) == 16.0
-    assert param_bytes_cost(
-        t, {"W": torch.zeros(8, dtype=torch.int8)}, by_bytes=True
-    ) == 8.0
+    assert (
+        param_bytes_cost(
+            t, {"W": torch.zeros(8, dtype=torch.float16)}, by_bytes=True
+        )
+        == 16.0
+    )
+    assert (
+        param_bytes_cost(
+            t, {"W": torch.zeros(8, dtype=torch.int8)}, by_bytes=True
+        )
+        == 8.0
+    )
 
 
 def test_folds_to_param_non_op_and_const_rules():
@@ -321,23 +328,34 @@ def test_folds_to_param_non_op_and_const_rules():
     assert _folds_to_param(Const(1.0), None, memo) is False
     # Elementwise ops accept Const operands; matmul/concat do not.
     P = _p("P", 4)
-    assert _folds_to_param(
-        Op.make("mul", P, Const(2.0)), None, memo
-    ) is True
-    assert _folds_to_param(
-        Op.make("matmul", _p("A", 4, 4), Const(2.0)), None, memo
-    ) is False
-    assert _folds_to_param(
-        Op.make("concat", P, Const(2.0), dim=0), None, memo
-    ) is False
+    assert (
+        _folds_to_param(Op.make("mul", P, Const(2.0)), None, memo)
+        is True
+    )
+    assert (
+        _folds_to_param(
+            Op.make("matmul", _p("A", 4, 4), Const(2.0)), None, memo
+        )
+        is False
+    )
+    assert (
+        _folds_to_param(
+            Op.make("concat", P, Const(2.0), dim=0), None, memo
+        )
+        is False
+    )
     # concat of two resolvable Params folds.
-    assert _folds_to_param(
-        Op.make("concat", P, _p("Q", 4), dim=0), None, memo
-    ) is True
+    assert (
+        _folds_to_param(
+            Op.make("concat", P, _p("Q", 4), dim=0), None, memo
+        )
+        is True
+    )
     # Non-foldable ops (reshape) never fold even param-only.
-    assert _folds_to_param(
-        Op.make("reshape", P, shape=(2, 2)), None, memo
-    ) is False
+    assert (
+        _folds_to_param(Op.make("reshape", P, shape=(2, 2)), None, memo)
+        is False
+    )
     # Bound source_tensors: a leaf absent from it cannot fold.
     # (Fresh memo per call — the cache keys on the term, not the
     # source dict.)
@@ -425,9 +443,10 @@ def test_param_bytes_fold_ewidth():
     # named ``itemsize``) defaults to the fp32 width — and that leaf
     # still resolves, so the subtree still folds.
     mul = Op.make("mul", P, Const(2.0))
-    assert param_bytes_cost(
-        mul, {"P": np.zeros(4)}, by_bytes=True
-    ) == 4.0 * 4.0
+    assert (
+        param_bytes_cost(mul, {"P": np.zeros(4)}, by_bytes=True)
+        == 4.0 * 4.0
+    )
 
 
 def test_param_bytes_for_closure_markers():
@@ -483,9 +502,7 @@ def test_dag_cost_dag_exact_partial_and_markers():
     t = Op.make("add", cat, cat)
     src = {"W": torch.zeros(4, 4)}
     bound = functools.partial(param_bytes_cost, source_tensors=src)
-    assert dag_cost(t, bound) == pytest.approx(
-        param_bytes_cost(t, src)
-    )
+    assert dag_cost(t, bound) == pytest.approx(param_bytes_cost(t, src))
     # charges_param_only via .func: a param-only subtree stays billed.
     only = Op.make("matmul", _p("A", 4, 4), _p("B", 4, 4))
     assert dag_cost(only, bound) == pytest.approx(
@@ -528,12 +545,8 @@ def test_is_strided_edges():
     assert _is_strided(_v("x", 4, 8)) is False
     x = _v("x", 4, 8)
     # chunk on the LAST dim yields strided consumers' views.
-    assert (
-        _is_strided(Op.make("chunk", x, chunks=2, dim=-1)) is True
-    )
-    assert (
-        _is_strided(Op.make("chunk", x, chunks=2, dim=0)) is False
-    )
+    assert _is_strided(Op.make("chunk", x, chunks=2, dim=-1)) is True
+    assert _is_strided(Op.make("chunk", x, chunks=2, dim=0)) is False
 
 
 # ---------------------------------------------------------------------------

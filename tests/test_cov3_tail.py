@@ -3,7 +3,6 @@ resource paths, _eval_const edges, intern TypeError, attrs helpers,
 rulecache env, ports signature internals, compositional e2e arms."""
 # ruff: noqa: RUF059
 
-
 import pytest
 import torch
 import torch.nn as nn
@@ -55,7 +54,9 @@ def test_compositional_verbose_and_e2e():
     torch.manual_seed(0)
     m = _TwoBlock()
     x = torch.randn(2, 8)
-    opt, rep = optimize_compositional(m, x, verbose=True, max_iterations=2)
+    opt, rep = optimize_compositional(
+        m, x, verbose=True, max_iterations=2
+    )
     assert rep["n_blocks"] == 2
     assert rep["end_to_end"] is not None
 
@@ -124,6 +125,7 @@ def test_signature_conforms_internals():
     # real fns bind the port's call
     assert signature_conforms(lambda t, memo=None: 1.0, CostFn)
     assert not signature_conforms(lambda a, b, c: 1.0, Verifier)
+
     # strict probe requires the full call to bind
     def partial_ok(ref, out):
         return None
@@ -186,7 +188,7 @@ def test_compositional_verbose_failed_block():
 
     class Weird(nn.Module):
         def forward(self, x):
-            return x.nonzero()  # unlowerable — optimize_model fails
+            return torch.fft.fft(x).real  # fft_fft: unlowerable
 
     class Wrap(nn.Module):
         def __init__(self):
@@ -336,7 +338,9 @@ def test_compositional_block_verify_failure(monkeypatch):
     monkeypatch.setattr("catopt.optimize.verify_module", fake_verify)
     torch.manual_seed(0)
     m = _TwoBlock()
-    _opt, rep = optimize_compositional(m, torch.randn(2, 8), max_iterations=1)
+    _opt, rep = optimize_compositional(
+        m, torch.randn(2, 8), max_iterations=1
+    )
     assert any(b["status"] == "failed" for b in rep["blocks"].values())
 
 

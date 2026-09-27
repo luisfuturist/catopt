@@ -44,10 +44,11 @@ own module.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Any
 
-from catopt_core.attrs import attr_of
+from catopt_core.attrs import attr_of, is_positional_attr
 from catopt_core.ir import Const, Op, Param, Var
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,41 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return _broadcast(
                 shapes[0], shapes[1] if len(shapes) > 1 else None
             )
+        case (
+            "maximum"
+            | "minimum"
+            | "fmax"
+            | "fmin"
+            | "fmod"
+            | "remainder"
+            | "xlogy"
+            | "atan2"
+            | "heaviside"
+            | "isclose"
+        ):
+            return _broadcast(
+                shapes[0], shapes[1] if len(shapes) > 1 else None
+            )
+        case "lerp" | "addcmul" | "addcdiv":
+            # Ternary broadcast (the scalar ``value``/``weight`` arg,
+            # when spelled as a Const operand, broadcasts as ()).
+            out = shapes[0]
+            for s in shapes[1:]:
+                out = _broadcast(out, s)
+                if out is _INVALID:
+                    return _INVALID
+            return out
         case "eq" | "ne" | "lt" | "le" | "gt" | "ge":
+            return _broadcast(
+                shapes[0], shapes[1] if len(shapes) > 1 else None
+            )
+        case (
+            "logical_and"
+            | "logical_or"
+            | "logical_xor"
+            | "bitwise_and"
+            | "bitwise_or"
+        ):
             return _broadcast(
                 shapes[0], shapes[1] if len(shapes) > 1 else None
             )
@@ -155,11 +190,93 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             | "gelu"
             | "rsqrt"
             | "exp"
+            | "exp2"
+            | "expm1"
             | "softmax"
+            | "log_softmax"
             | "masked_fill"
             | "logical_not"
+            | "relu"
+            | "leaky_relu"
+            | "elu"
+            | "celu"
+            | "softplus"
+            | "softsign"
+            | "hardswish"
+            | "hardsigmoid"
+            | "mish"
+            | "relu6"
+            | "prelu"
+            | "hardtanh"
+            | "abs"
+            | "sign"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "frac"
+            | "trunc"
+            | "log"
+            | "log2"
+            | "log10"
+            | "log1p"
+            | "erf"
+            | "erfc"
+            | "erfinv"
+            | "gammaln"
+            | "digamma"
+            | "i0"
+            | "sinc"
+            | "reciprocal"
+            | "nan_to_num"
+            | "isnan"
+            | "isinf"
+            | "isfinite"
+            | "isposinf"
+            | "isneginf"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "sinh"
+            | "cosh"
+            | "asinh"
+            | "acosh"
+            | "atanh"
+            | "detach"
+            | "detach_"
+            | "copy"
         ):
             return shapes[0]
+        # Axis-anchored ops that keep the input rank: a ()-shaped
+        # operand means a carrier member was read as a tensor — the
+        # axis doesn't exist, so unknown (None), never scalar.
+        case (
+            "cumsum"
+            | "cumprod"
+            | "logcumsumexp"
+            | "cummax"
+            | "cummin"
+            | "argsort"
+            | "flip"
+            | "roll"
+            | "triu"
+            | "tril"
+            | "scatter"
+            | "scatter_add"
+            | "scatter_reduce"
+            | "index_add"
+            | "index_put"
+            | "slice_scatter"
+            | "select_scatter"
+            | "batch_norm"
+            | "group_norm"
+            | "sort"
+            | "topk"
+            | "median"
+            | "kthvalue"
+            | "mode"
+            | "_assert_tensor_metadata"
+        ):
+            return shapes[0] or None
         case "pow":
             return shapes[0] if shapes and shapes[0] is not None else ()
         case "linear":
@@ -196,12 +313,34 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                         return out_b
                     return out
             return shapes[0] or None
-        case "sum" | "mean":
+        case (
+            "sum"
+            | "mean"
+            | "prod"
+            | "max"
+            | "min"
+            | "amax"
+            | "amin"
+            | "var_mean"
+            | "std_mean"
+            | "argmax"
+            | "argmin"
+            | "var"
+            | "std"
+            | "any"
+            | "all"
+            | "nansum"
+            | "nanmean"
+            | "count_nonzero"
+            | "linalg_vector_norm"
+        ):
             # Honor keepdim/dim when available, else reduce to scalar.
             dim = attr_of(op, "dim", "axis")
             keep = bool(op.attrs.get("keepdim", False))
             base = shapes[0]
-            if base is None:  # pragma: no cover — dispatch filters None shapes
+            if (
+                base is None
+            ):  # pragma: no cover — dispatch filters None shapes
                 return ()
             if dim is None:
                 return ()
@@ -272,7 +411,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return shapes[0]
         case "unsqueeze":
             base = shapes[0]
-            if base is None:  # pragma: no cover — dispatch filters None shapes
+            if (
+                base is None
+            ):  # pragma: no cover — dispatch filters None shapes
                 return None
             d = attr_of(op, "dim", default=-1)
             d = d % (len(base) + 1)
@@ -281,15 +422,67 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             base = shapes[0]
             if not base:
                 return None
-            d = attr_of(op, "dim", default=-1) % len(base)
+            d = attr_of(op, "dim")
+            if d is None:
+                # squeeze() with no dim drops every KNOWN size-1
+                # axis; unknown extents stay (they might be 1).
+                return tuple(x for x in base if x != 1)
+            d = d % len(base)
             return tuple(x for i, x in enumerate(base) if i != d)
-        case "expand":
+        case "expand" | "broadcast_to":
             s = op.attrs.get("shape")
             return tuple(s) if s is not None else shapes[0]
+        case "repeat":
+            # repeat(*sizes): leading dims are new, each covered dim
+            # multiplies its extent.  Not a view — materialises.
+            rep = attr_of(op, "shape", "repeats")
+            base = shapes[0]
+            if not isinstance(rep, (tuple, list)) or not rep:
+                return base
+            if len(rep) < len(base):
+                # torch requires len(reps) >= ndim — a malformed term;
+                # report the base rather than a fabricated shape.
+                return base
+            b_pad = (1,) * (len(rep) - len(base)) + tuple(base)
+            return tuple(
+                None if (b is None or r is None) else b * r
+                for b, r in zip(b_pad, rep, strict=True)
+            )
+        case "permute":
+            base = shapes[0]
+            if not base:
+                return None
+            dims = attr_of(op, "dim", "dims", "order")
+            if not isinstance(dims, (tuple, list)) or not dims:
+                # permute() with no dims reverses all axes.
+                return tuple(reversed(base))
+            n = len(base)
+            return tuple(base[int(d) % n] for d in dims)
+        case "movedim":
+            base = shapes[0]
+            if not base:
+                return None
+            src = _ax_tuple(attr_of(op, "source"))
+            dst = _ax_tuple(attr_of(op, "destination"))
+            if not src or not dst or len(src) != len(dst):
+                return base
+            n = len(base)
+            src_n = [s % n for s in src]
+            order = [i for i in range(n) if i not in set(src_n)]
+            for s, d in sorted(
+                zip(src_n, (d % n for d in dst), strict=True),
+                key=lambda p: p[1],
+            ):
+                order.insert(d, s)
+            return tuple(base[i] for i in order)
+        case "expand_as":
+            return shapes[1] if len(shapes) > 1 else shapes[0]
         case "stack":
             # stack(ts, dim): all inputs share a shape; insert dim.
             base = shapes[0]
-            if base is None:  # pragma: no cover — dispatch filters None shapes
+            if (
+                base is None
+            ):  # pragma: no cover — dispatch filters None shapes
                 return None
             d = attr_of(op, "dim", default=0)
             d = d % (len(base) + 1)
@@ -350,6 +543,231 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             out[d] = (
                 len(idx) if isinstance(idx, (tuple, list)) else None
             )
+            return tuple(out)
+        case "gather" | "take_along_dim" | "searchsorted":
+            # gather(t, dim, index) — the output IS the index shape.
+            # searchsorted(sorted, values) reports the values shape.
+            if len(shapes) < 2:
+                return shapes[0] or None
+            return shapes[1] or None
+        case "index":
+            return _index_shape(op, shapes)
+        case "unflatten":
+            # unflatten(t, dim, sizes): splice the size tuple in at dim.
+            base = shapes[0]
+            if not base:
+                return None
+            sizes = attr_of(op, "sizes")
+            if not isinstance(sizes, (tuple, list)) or not sizes:
+                return base
+            d = attr_of(op, "dim", default=0) % len(base)
+            sz = list(sizes)
+            if -1 in sz and isinstance(base[d], int):
+                known = 1
+                for s in sz:
+                    if s != -1:
+                        known *= (
+                            s if isinstance(s, int) and s > 0 else 1
+                        )
+                inf = (
+                    base[d] // known
+                    if known and base[d] % known == 0
+                    else None
+                )
+                sz = [inf if s == -1 else s for s in sz]
+            return (*tuple(base[:d]), *tuple(sz), *tuple(base[d + 1 :]))
+        case "narrow":
+            # narrow(t, dim, start, length) = a length-bounded slice.
+            base = shapes[0]
+            if not base:
+                return None
+            d = attr_of(op, "dim", default=0) % len(base)
+            out = list(base)
+            out[d] = attr_of(op, "length")
+            return tuple(out)
+        case "pad":
+            # F.pad constant: trailing dims get +left/+right extents.
+            base = shapes[0]
+            if not base:
+                return None
+            pads = attr_of(op, "pad")
+            if not isinstance(pads, (tuple, list)) or not pads:
+                return base
+            out = list(base)
+            for i in range(len(pads) // 2):
+                ax = len(out) - 1 - i
+                if ax < 0:
+                    break
+                lo, hi = pads[2 * i], pads[2 * i + 1]
+                if out[ax] is not None and all(
+                    isinstance(v, int) for v in (lo, hi)
+                ):
+                    out[ax] += lo + hi
+                else:
+                    out[ax] = None
+            return tuple(out)
+        case "glu":
+            base = shapes[0]
+            if not base:
+                return None
+            d = attr_of(op, "dim", default=-1) % len(base)
+            out = list(base)
+            out[d] = out[d] // 2 if isinstance(out[d], int) else None
+            return tuple(out)
+        case "nonzero":
+            # nonzero(t): (nnz, ndim) — nnz is data-dependent.
+            base = shapes[0]
+            return (None, len(base) if isinstance(base, tuple) else 0)
+        case "one_hot":
+            base = shapes[0]
+            if base is None:  # pragma: no cover — dispatch filters None
+                return None
+            nc = attr_of(op, "num_classes")
+            return (
+                *tuple(base),
+                nc if isinstance(nc, int) and nc > 0 else None,
+            )
+        case "outer":
+            # outer(u, v) — flatten each operand to 1-D, take products.
+            return (_numel(shapes[0]), _numel(shapes[1]))
+        case "diag_sum":
+            # torch.trace — scalar sum of the diagonal (aten `trace`
+            # maps here; the carrier ``trace`` is a different op).
+            return ()
+        case "item" | "numel":
+            return ()
+        case "einsum":
+            # The equation string is opaque to the structural
+            # walker — honest unknown rather than a wrong guess.
+            return None
+        case "addmm" | "addbmm" | "addbmm" | "baddbmm" | "addmv":
+            # bias + a @ b (addmv: bias + a @ v): the GEMM part
+            # shapes like matmul on args 1/2, then the bias broadcasts.
+            a, b = shapes[1], shapes[2]
+            if len(a) >= 2 and len(b) >= 2:
+                mm = (*tuple(a[:-1]), b[-1])
+            elif len(a) >= 2 and len(b) == 1:
+                mm = tuple(a[:-1])
+            else:
+                return shapes[0] or None
+            return _broadcast(mm, shapes[0])
+        case "conv1d":
+            # x (N,C,L) @ w (O,C,k) -> (N,O,L')
+            x, w = shapes[0], shapes[1]
+            if (
+                x is None
+                or w is None
+                or len(x) < 3
+                or len(w) < 3
+                or isinstance(op.attrs.get("padding"), str)
+            ):
+                return (
+                    (x[0], w[0], None)
+                    if (
+                        x is not None
+                        and w is not None
+                        and len(x) >= 1
+                        and len(w) >= 1
+                    )
+                    else (x or None)
+                )
+            st = op.attrs.get("stride", 1)
+            pd = op.attrs.get("padding", 0)
+            dl = op.attrs.get("dilation", 1)
+            st = st[0] if isinstance(st, (tuple, list)) else st
+            pd = pd[0] if isinstance(pd, (tuple, list)) else pd
+            dl = dl[0] if isinstance(dl, (tuple, list)) else dl
+            ol = None
+            if x[2] is not None and w[2] is not None:
+                ol = (x[2] + 2 * pd - dl * (w[2] - 1) - 1) // st + 1
+            return (x[0], w[0], ol)
+        case "tensor_split":
+            # Folded like split: ``sections`` is the count (or index
+            # list), ``index`` the folded section index.
+            base = shapes[0]
+            if not base:
+                return None
+            dim = attr_of(op, "dim", default=0) % len(base)
+            sec = attr_of(op, "sections")
+            idx = attr_of(op, "index", default=0) or 0
+            out = list(base)
+            if isinstance(sec, int):
+                out[dim] = (
+                    -(-base[dim] // sec)
+                    if isinstance(base[dim], int)
+                    else None
+                )
+            elif isinstance(sec, (tuple, list)) and isinstance(
+                base[dim], int
+            ):
+                bounds = [0] + [int(s) for s in sec] + [base[dim]]
+                out[dim] = (
+                    bounds[idx + 1] - bounds[idx]
+                    if idx + 1 < len(bounds)
+                    else None
+                )
+            else:
+                out[dim] = None
+            return tuple(out)
+        case "unfold":
+            # unfold(dim, size, step): dim shrinks to sliding windows
+            # and a new trailing axis of ``size`` appears.
+            base = shapes[0]
+            if not base:
+                return None
+            d = attr_of(op, "dim", default=0) % len(base)
+            size = attr_of(op, "size")
+            step = attr_of(op, "step", default=1) or 1
+            out = list(base)
+            if isinstance(out[d], int) and isinstance(size, int):
+                out[d] = max(0, (out[d] - size) // step + 1)
+            else:
+                out[d] = None
+            out.append(size if isinstance(size, int) else None)
+            return tuple(out)
+        case "pixel_shuffle":
+            # (N, C*r^2, H, W) -> (N, C, H*r, W*r)
+            base = shapes[0]
+            r = attr_of(op, "upscale_factor", default=1)
+            if len(base) < 4 or not isinstance(r, int):
+                return base
+            c = base[1]
+            return (
+                base[0],
+                c // (r * r) if isinstance(c, int) else None,
+                base[2] * r if isinstance(base[2], int) else None,
+                base[3] * r if isinstance(base[3], int) else None,
+            )
+        case "pixel_unshuffle":
+            # (N, C, H, W) -> (N, C*r^2, H/r, W/r)
+            base = shapes[0]
+            r = attr_of(op, "downscale_factor", default=1)
+            if len(base) < 4 or not isinstance(r, int):
+                return base
+            c = base[1]
+            return (
+                base[0],
+                c * r * r if isinstance(c, int) else None,
+                base[2] // r if isinstance(base[2], int) else None,
+                base[3] // r if isinstance(base[3], int) else None,
+            )
+        case "hstack" | "vstack":
+            a = shapes[0]
+            if not a:
+                return None
+            if op.op == "hstack":
+                dim = 0 if len(a) == 1 else 1
+            else:
+                # vstack promotes 1-D rows to (1, d) then cats dim 0.
+                if len(a) < 2:
+                    return (len(op.args), a[0] if a else None)
+                dim = 0
+            out = list(a)
+            out[dim] = 0
+            for s in shapes:
+                if not isinstance(s, tuple) or len(s) != len(a):
+                    return a
+                out[dim] += s[dim] or 0
             return tuple(out)
         case "flatten":
             base = shapes[0]
@@ -557,6 +975,73 @@ def _stack_dim(attrs: dict) -> int:
     return d if isinstance(d, int) else 0
 
 
+def _ax_tuple(v: Any) -> tuple | None:
+    """An axis attr spelled as an int, a list, or a tuple → tuple."""
+    if isinstance(v, int):
+        return (v,)
+    if isinstance(v, (list, tuple)):
+        return tuple(int(d) for d in v)
+    return None
+
+
+def _index_shape(op: Op, shapes: list) -> tuple | str | None:
+    """``index`` — numpy-style advanced indexing.
+
+    The term records a ``layout`` attr: one entry per key position —
+    ``True`` where an index operand sits, ``False`` for a full slice
+    (exported ``aten.index`` spells ``x[:, i]`` as ``[None, i]`` and
+    the Nones carry real semantic weight: without them the term
+    ``x[:, i]`` would lower as ``x[i]``).  Numpy semantics apply:
+
+    * indexed positions that are *contiguous* in the key splice the
+      broadcast index shape in where they stood;
+    * *separated* index positions move the broadcast index block to
+      the front and every preserved axis follows in order;
+    * axes beyond the key length pass through untouched.
+    """
+    base = shapes[0]
+    if not base:
+        return None
+    idx_shapes = [s for s in shapes[1:]]
+    ib: Any = idx_shapes[0] if idx_shapes else ()
+    for s in idx_shapes[1:]:
+        ib = _broadcast(ib, s)
+        if ib is _INVALID:
+            return _INVALID
+    layout = attr_of(op, "layout")
+    if not isinstance(layout, (tuple, list)) or not layout:
+        # A term minted without layout treats its operands as
+        # indexing the leading axes — the ``x[i]`` spelling.
+        layout = (True,) * len(idx_shapes)
+    consumed = min(len(layout), len(base))
+    kept_before: list = []
+    kept_after: list = []
+    idx_pos = [i for i, flag in enumerate(layout) if flag]
+    first_idx = idx_pos[0] if idx_pos else len(layout)
+    last_idx = idx_pos[-1] if idx_pos else -1
+    contiguous = idx_pos and last_idx - first_idx + 1 == len(idx_pos)
+    trailing = list(base[consumed:])
+    if contiguous:
+        for i, flag in enumerate(layout[:consumed]):
+            if flag:
+                continue
+            if i < first_idx:
+                kept_before.append(base[i])
+            else:
+                kept_after.append(base[i])
+        return (
+            *kept_before,
+            *(ib or ()),
+            *kept_after,
+            *trailing,
+        )
+    # Separated index positions: the index block moves to the front.
+    kept = [
+        base[i] for i, flag in enumerate(layout[:consumed]) if not flag
+    ]
+    return (*(ib or ()), *kept, *trailing)
+
+
 # ---------------------------------------------------------------------------
 # Per-op shape rules — the carrier ops' extensible dispatch
 # ---------------------------------------------------------------------------
@@ -685,6 +1170,60 @@ def _cswap_shape(op: Op, shapes: list) -> tuple | str | None:
         return (d1 + d2, d1 + d2)
     return None
 
+
+def _factory_shape(op: Op, shapes: list) -> tuple | str | None:
+    """Tensor creators — ``zeros``/``ones``/``empty``/``full``/
+    ``randn``/``rand``/``new_*``: the ``shape`` attr names the
+    output.  ``full``/``new_full`` carry a Const fill operand whose
+    shape is ignored."""
+    s = op.attrs.get("shape")
+    return tuple(s) if isinstance(s, (list, tuple)) else None
+
+
+def _arange_shape(op: Op, shapes: list) -> tuple | str | None:
+    """``arange`` — a 1-D extent from the bound args: Const operands
+    (minted spelling) or the exported ``arg0/arg1/arg2`` attrs.
+    ``arange(end)``, ``arange(start, end)``, ``arange(start, end,
+    step)`` share the one spelling."""
+    vals = [a.value for a in op.args if isinstance(a, Const)]
+    if not vals:
+        vals = [
+            op.attrs[k]
+            for k in sorted(
+                (k for k in op.attrs if is_positional_attr(k)),
+                key=lambda k: int(k[3:]),
+            )
+        ]
+    if not vals:
+        return (None,)
+    if len(vals) == 1:
+        start, end, step = 0, vals[0], 1
+    elif len(vals) == 2:
+        start, end, step = vals[0], vals[1], 1
+    else:
+        start, end, step = vals[0], vals[1], vals[2]
+    if (
+        not all(isinstance(v, (int, float)) for v in (start, end, step))
+        or step == 0
+    ):
+        return (None,)  # pragma: no cover — Const values are numeric
+    return (max(0, math.ceil((end - start) / step)),)
+
+
+for _n in (
+    "zeros",
+    "ones",
+    "empty",
+    "randn",
+    "rand",
+    "full",
+    "new_zeros",
+    "new_ones",
+    "new_empty",
+    "new_full",
+):
+    register_shape_rule(_n, _factory_shape)
+register_shape_rule("arange", _arange_shape)
 
 for _n in (
     "aff",

@@ -220,10 +220,10 @@ def test_compositional_fallback_keeps_original_block():
             self.f = nn.Linear(d, d)
 
         def forward(self, x):
-            # data-dependent op: exports but has no torch lowering —
+            # fft_fft exports but has no torch lowering —
             # the lowered candidate can't be verified → fallback.
-            idx = x.nonzero()
-            return self.f(x) + idx.sum() * 0 + self.f(x) * 0
+            y = torch.fft.fft(self.f(x))
+            return y.real + self.f(x) * 0
 
     class M(nn.Module):
         def __init__(self):

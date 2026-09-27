@@ -87,9 +87,94 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     "softmax": {1: "dim"},
     "select": {1: "dim", 2: "index"},
     "flatten": {1: "start_dim", 2: "end_dim"},
+    "unflatten": {1: "dim", 2: "sizes"},
     "index_select": {1: "dim", 2: "index"},
+    "take_along_dim": {1: "dim"},
     "gather": {1: "dim"},
+    # scatter(t, dim, index, src|value) — src/value stay operands;
+    # scatter_add/index_add same layout minus the value overload.
+    "scatter": {1: "dim"},
+    "scatter_add": {1: "dim"},
+    "scatter_reduce": {1: "dim", 4: "reduce"},
+    "index_add": {1: "dim"},
+    # index_put(t, [indices], values, accumulate) — indices land as
+    # operands with a ``layout`` attr (see export_to_ir).
+    "index_put": {3: "accumulate"},
+    # slice_scatter(t, src, dim, start, end, step) — the
+    # functionalized x[..., lo:hi] = y (KV-cache writes).
+    "slice_scatter": {2: "dim", 3: "start", 4: "end", 5: "step"},
+    "select_scatter": {2: "dim", 3: "index"},
     "narrow": {1: "dim", 2: "start", 3: "length"},
+    # movedim(t, source, destination) — either may be int or a list.
+    "movedim": {1: "source", 2: "destination"},
+    "roll": {1: "shifts", 2: "dims"},
+    "einsum": {0: "equation"},
+    # --- reductions -----------------------------------------------------
+    # argmax/prod/var/std/any/all share the (dim, keepdim) tail;
+    # var/std additionally carry the unbiased ``correction``.
+    "argmax": {1: "dim", 2: "keepdim"},
+    "argmin": {1: "dim", 2: "keepdim"},
+    # aten.max/.min carry the dim positionally too (values+indices
+    # pair); amax/amin are the values-only spellings.  var_mean and
+    # std_mean add the unbiased ``correction``.
+    "max": {1: "dim", 2: "keepdim"},
+    "min": {1: "dim", 2: "keepdim"},
+    "amax": {1: "dim", 2: "keepdim"},
+    "amin": {1: "dim", 2: "keepdim"},
+    "var_mean": {1: "dim", 2: "correction", 3: "keepdim"},
+    "std_mean": {1: "dim", 2: "correction", 3: "keepdim"},
+    "prod": {1: "dim", 2: "keepdim"},
+    "nansum": {1: "dim", 2: "keepdim"},
+    "nanmean": {1: "dim", 2: "keepdim"},
+    "var": {1: "dim", 2: "correction", 3: "keepdim"},
+    "std": {1: "dim", 2: "correction", 3: "keepdim"},
+    "any": {1: "dim", 2: "keepdim"},
+    "all": {1: "dim", 2: "keepdim"},
+    "count_nonzero": {1: "dim"},
+    "cumsum": {1: "dim"},
+    "cumprod": {1: "dim"},
+    "cummax": {1: "dim"},
+    "cummin": {1: "dim"},
+    "logcumsumexp": {1: "dim"},
+    "linalg_vector_norm": {1: "ord", 2: "dim", 3: "keepdim"},
+    "log_softmax": {1: "dim"},
+    "median": {1: "dim", 2: "keepdim"},
+    "kthvalue": {1: "k", 2: "dim", 3: "keepdim"},
+    "argsort": {1: "dim", 2: "descending"},
+    "topk": {1: "k", 2: "dim", 3: "largest", 4: "sorted"},
+    "sort": {1: "dim", 2: "descending"},
+    # clamp(t, min, max) — naming the bounds keeps the optional-None
+    # gap honest: clamp(x, None, hi) lands max=hi, not a Const operand
+    # the binding would misread as min.
+    "clamp": {1: "min", 2: "max"},
+    "clamp_min": {1: "min"},
+    "clamp_max": {1: "max"},
+    "hardtanh": {1: "min", 2: "max"},
+    "elu": {1: "alpha", 2: "scale", 3: "input_scale"},
+    "softplus": {1: "beta", 2: "threshold"},
+    "triu": {1: "diagonal"},
+    "tril": {1: "diagonal"},
+    "glu": {1: "dim"},
+    # isclose(x, y, rtol, atol, equal_nan) — the tolerances and the
+    # flag are semantic attrs the binding must see.
+    "isclose": {2: "rtol", 3: "atol", 4: "equal_nan"},
+    "searchsorted": {2: "out_int32", 3: "right"},
+    "one_hot": {1: "num_classes"},
+    "tensor_split": {1: "sections", 2: "dim"},
+    "unfold": {1: "dim", 2: "size", 3: "step"},
+    "pixel_shuffle": {1: "upscale_factor"},
+    "pixel_unshuffle": {1: "downscale_factor"},
+    # pad(t, pad_width_list, *, mode, value) — the width list lands
+    # under ``pad``; mode/value are kwargs.
+    "pad": {1: "pad", 2: "mode", 3: "value"},
+    "group_norm": {1: "num_groups", 4: "eps"},
+    # batch_norm(x, w, b, rm, rv, training, momentum, eps, cudnn).
+    "batch_norm": {
+        5: "training",
+        6: "momentum",
+        7: "eps",
+        8: "cudnn_enabled",
+    },
     # aten.slice(t, dim, start, end, step) — the trailing three are
     # the slice bounds/stride, read by typing/the binding.
     "slice": {1: "dim", 2: "start", 3: "end", 4: "step"},
@@ -116,6 +201,13 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     # aten.conv2d positional tails — also intercepted operand-side by
     # the exporter (list-valued stride/padding never reach ``argN``).
     "conv2d": {3: "stride", 4: "padding", 5: "dilation", 6: "groups"},
+    "conv1d": {3: "stride", 4: "padding", 5: "dilation", 6: "groups"},
+    # aten.mode is the median-style (values, indices) pair picked by
+    # a getitem consumer.
+    "mode": {1: "dim", 2: "keepdim"},
+    # aten.eye(n) / eye.m(n, m) — exported positional sizes name into
+    # the carrier binding's ``dim`` (``m`` for the rectangular one).
+    "eye": {0: "dim", 1: "m"},
 }
 
 #: Canonical names that must be present (either spelling) on a
@@ -136,9 +228,40 @@ ATTR_REQUIRED: dict[str, frozenset[str]] = {
     "squeeze": frozenset({"dim"}),
     "select": frozenset({"dim", "index"}),
     "flatten": frozenset({"start_dim"}),
+    "unflatten": frozenset({"dim", "sizes"}),
     "index_select": frozenset({"dim"}),
+    "take_along_dim": frozenset({"dim"}),
     "gather": frozenset({"dim"}),
+    "scatter": frozenset({"dim"}),
+    "scatter_add": frozenset({"dim"}),
+    "scatter_reduce": frozenset({"dim", "reduce"}),
+    "index_add": frozenset({"dim"}),
+    "slice_scatter": frozenset({"dim"}),
+    "select_scatter": frozenset({"dim", "index"}),
     "narrow": frozenset({"dim", "start", "length"}),
+    "movedim": frozenset({"source", "destination"}),
+    "roll": frozenset({"shifts"}),
+    "einsum": frozenset({"equation"}),
+    "cumsum": frozenset({"dim"}),
+    "cumprod": frozenset({"dim"}),
+    "cummax": frozenset({"dim"}),
+    "cummin": frozenset({"dim"}),
+    "logcumsumexp": frozenset({"dim"}),
+    "log_softmax": frozenset({"dim"}),
+    "median": frozenset({"dim"}),
+    "mode": frozenset({"dim"}),
+    "kthvalue": frozenset({"k"}),
+    "argsort": frozenset({"dim"}),
+    "topk": frozenset({"k"}),
+    "sort": frozenset({"dim"}),
+    "glu": frozenset({"dim"}),
+    "one_hot": frozenset({"num_classes"}),
+    "tensor_split": frozenset({"sections"}),
+    "unfold": frozenset({"dim", "size", "step"}),
+    "pixel_shuffle": frozenset({"upscale_factor"}),
+    "pixel_unshuffle": frozenset({"downscale_factor"}),
+    "pad": frozenset({"pad"}),
+    "group_norm": frozenset({"num_groups"}),
     "softmax": frozenset({"dim"}),
     "slice": frozenset({"dim"}),
     "rms_norm": frozenset({"dim"}),

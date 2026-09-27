@@ -61,7 +61,9 @@ SHAPE_CASES = [
     # --- mixed-shape early return -------------------------------------
     # A None operand under a shaped one: the first shape survives.
     pytest.param(
-        Op.make("add", x234, unknown), (2, 3, 4), id="mixed/first-shaped"
+        Op.make("add", x234, unknown),
+        (2, 3, 4),
+        id="mixed/first-shaped",
     ),
     pytest.param(
         Op.make("add", unknown, unknown), None, id="mixed/all-unknown"
@@ -70,7 +72,9 @@ SHAPE_CASES = [
     # Rank-0 weight: no in-features axis to consume — fall through to
     # the operand shape rather than fabricating one.
     pytest.param(
-        Op.make("linear", x48, scalar), (4, 8), id="linear/scalar-weight"
+        Op.make("linear", x48, scalar),
+        (4, 8),
+        id="linear/scalar-weight",
     ),
     # Column bias on a (B,o) output: the squeezed (B,) broadcast is
     # ill-typed, so the raw (B,1) broadcast must win — (B,o), not (B,B).
@@ -229,9 +233,7 @@ SHAPE_CASES = [
     ),
     # --- embedding ----------------------------------------------------
     pytest.param(
-        Op.make(
-            "embedding", _p("W", 16, 8, 4), _v("idx", 2, 3)
-        ),
+        Op.make("embedding", _p("W", 16, 8, 4), _v("idx", 2, 3)),
         None,
         id="embedding/rank3-weight",
     ),
@@ -284,9 +286,7 @@ SHAPE_CASES = [
     ),
     # Short-rank weight -> the (N, O, ?, ?) guess.
     pytest.param(
-        Op.make(
-            "conv2d", _v("x", 2, 3, 8, 8), _p("w", 4, 3, 3)
-        ),
+        Op.make("conv2d", _v("x", 2, 3, 8, 8), _p("w", 4, 3, 3)),
         (2, 4, None, None),
         id="conv2d/rank3-weight",
     ),
@@ -329,7 +329,9 @@ SHAPE_CASES = [
     # A non-matrix trace member: not len-2 -> unknown, not a fabricated
     # scalar.
     pytest.param(
-        Op.make("trace", scalar, usize=1), None, id="trace/scalar-member"
+        Op.make("trace", scalar, usize=1),
+        None,
+        id="trace/scalar-member",
     ),
     pytest.param(
         Op.make("trace", _v("v", 4, 5, 6), usize=1),
@@ -368,9 +370,7 @@ SHAPE_CASES = [
     ),
     # where(c, x, y) broadcasts all three against each other.
     pytest.param(
-        Op.make(
-            "where", _v("c", 4, 1), _v("x", 1, 8), _v("y", 4, 8)
-        ),
+        Op.make("where", _v("c", 4, 1), _v("x", 1, 8), _v("y", 4, 8)),
         (4, 8),
         id="where/three-way-broadcast",
     ),
@@ -383,9 +383,7 @@ SHAPE_CASES = [
         (4, 8),
         id="dropout/passthrough",
     ),
-    pytest.param(
-        Op.make("to", x48), (4, 8), id="to/passthrough"
-    ),
+    pytest.param(Op.make("to", x48), (4, 8), id="to/passthrough"),
     pytest.param(
         Op.make("type_as", x48, x234), (4, 8), id="type_as/passthrough"
     ),
@@ -397,8 +395,8 @@ SHAPE_CASES = [
     # --- default arm ----------------------------------------------------
     pytest.param(
         Op.make("narrow", x234, dim=1, start=0, length=2),
-        (2, 3, 4),
-        id="narrow/default-arm-first-operand",
+        (2, 2, 4),
+        id="narrow/dim-start-length",
     ),
     pytest.param(
         Op.make("some_unknown_op", scalar),

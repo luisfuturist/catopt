@@ -179,24 +179,22 @@ def test_export_lifted_constants_overrun_args_fallback():
 
     m = M().eval()
     ir, source = export_to_ir(m, (3, torch.randn(4)))
-    # Lifted constants are user inputs (Vars), not params.
-    assert ir.params == {}
+    # Lifted constants (non-param non-buffer module attrs) lift to
+    # Params just like buffers — constants, not user inputs.
+    assert set(ir.params) == {"c_c1", "c_c2"}
     shapes = {v.name: v.typ.shape for v in ir.inputs}
-    assert shapes["c_c1"] == (4,)
-    assert shapes["c_c2"] == (4,)
-    # n's placeholder has no meta val; by then inputs already overrun
-    # args, so it inherits args[0] = 3's (non-tensor) shape.
+    # The constants are gone from the input list; only the user
+    # inputs remain (n's placeholder has no meta val → unknown).
+    assert set(shapes) == {"n", "x"}
     assert shapes["n"] == (None,)
     assert shapes["x"] == (4,)
-    # The constants remain ordinary inputs at eval time — the env maps
-    # each forward arg positionally onto (c_c1, c_c2, n, x).
+    # Eval: (n, x) — n was specialised into the graph at export, so
+    # its Var is unused; the params carry c_c1/c_c2.
     lowered = ir_to_torch_module(ir, param_values=source)
     x = torch.randn(4)
     with torch.no_grad():
-        got = lowered(x, 2 * x, 0, x)
-    # root is add(add(c_c1, c_c2), mul(x, 3.0)) — the n arg was
-    # specialised into the graph, so the Var is unused.
-    assert torch.allclose(got, x + 2 * x + x * 3)
+        got = lowered(0, x)
+    assert torch.allclose(got, source["c_c1"] + source["c_c2"] + x * 3)
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +202,10 @@ def test_export_lifted_constants_overrun_args_fallback():
 # ---------------------------------------------------------------------------
 
 
-def test_export_scalar_positional_unschemed_op():
-    """Scalar positionals on ops outside _SCALAR_OPERAND_OPS and
-    ATTR_SCHEMA land as ``argN`` attrs; bools on non-reduction ops
-    do too."""
+def test_export_scalar_positional_schemed_op():
+    """Scalar positionals at ATTR_SCHEMA-declared slots land under
+    canonical names — ``tril``'s diagonal, ``argmax``'s (dim,
+    keepdim) tail."""
 
     class MTri(torch.nn.Module):
         def forward(self, x):
@@ -215,7 +213,8 @@ def test_export_scalar_positional_unschemed_op():
 
     ir, _ = export_to_ir(MTri().eval(), (torch.randn(4, 4),))
     tril = _find(ir.root, "tril")[0]
-    assert dict(tril.attrs) == {"arg1": 1}
+    # tril's diagonal is schema'd — canonical name, not argN.
+    assert dict(tril.attrs) == {"diagonal": 1}
 
     class MArg(torch.nn.Module):
         def forward(self, x):
@@ -223,13 +222,13 @@ def test_export_scalar_positional_unschemed_op():
 
     ir, _ = export_to_ir(MArg().eval(), (torch.randn(4, 8),))
     argmax = _find(ir.root, "argmax")[0]
-    assert argmax.attrs["arg1"] == 1
-    assert argmax.attrs["arg2"] is True
+    assert argmax.attrs["dim"] == 1
+    assert argmax.attrs["keepdim"] is True
 
 
-def test_export_string_arg_skipped():
-    """einsum's equation string is an arg that is not an operand —
-    it is skipped, leaving only the tensor operands."""
+def test_export_string_arg_named_not_skipped():
+    """einsum's equation is schema position 0 — a semantic attr the
+    binding needs, not a skipped operand."""
 
     class M(torch.nn.Module):
         def forward(self, a, b):
@@ -240,13 +239,9 @@ def test_export_string_arg_skipped():
     es = _find(ir.root, "einsum")
     assert len(es) == 1
     assert len(es[0].args) == 2
-    # A private table (copy) — adding the binding must not touch the
-    # ambient registry.
-    table = OpTable.full().copy()
-    table.torch_bindings["einsum"] = (
-        lambda x, y, *a, **kw: torch.einsum("ij,jk->ik", x, y)
-    )
-    lowered = ir_to_torch_module(ir, ops=table)
+    assert es[0].attrs["equation"] == "ij,jk->ik"
+    # The core binding lowers the term directly.
+    lowered = ir_to_torch_module(ir)
     with torch.no_grad():
         assert torch.allclose(
             lowered(a, b), torch.einsum("ij,jk->ik", a, b)
@@ -254,8 +249,8 @@ def test_export_string_arg_skipped():
 
 
 def test_export_index_list_with_none_element():
-    """Advanced indexing emits ``index(x, [None, idx])`` — list
-    elements without an env entry are skipped, the node operand
+    """Advanced indexing emits ``index(x, idx, layout=(False,True))``
+    — the None element is a slice slot in the layout, the node operand
     survives."""
 
     class M(torch.nn.Module):
@@ -263,10 +258,11 @@ def test_export_index_list_with_none_element():
             return x[:, torch.tensor([0, 2])]
 
     ir, _ = export_to_ir(M().eval(), (torch.randn(4, 4),))
-    idx_op = _find(ir.root, "index.Tensor")
+    idx_op = _find(ir.root, "index")
     assert len(idx_op) == 1
-    # The None element contributes nothing; the detached index tensor
-    # is the second operand.
+    # The None element is recorded in the layout as a full slice; the
+    # index tensor is the single operand after x.
+    assert dict(idx_op[0].attrs)["layout"] == (False, True)
     assert len(idx_op[0].args) == 2
 
 
@@ -406,10 +402,14 @@ def _lower_root(root, param_values=None, ops=None, inputs=None):
     ir = IR(
         root=root,
         inputs=inputs if inputs is not None else [x],
-        input_names={"x"} if inputs is None else {v.name for v in inputs},
+        input_names={"x"}
+        if inputs is None
+        else {v.name for v in inputs},
         params={},
     )
-    return ir_to_torch_module(ir, param_values=param_values or {}, ops=ops)
+    return ir_to_torch_module(
+        ir, param_values=param_values or {}, ops=ops
+    )
 
 
 def test_fold_param_only_concat_materialises():
@@ -425,7 +425,9 @@ def test_fold_param_only_concat_materialises():
     mod = _lower_root(root, {"W": wt, "Q": qt})
     fused = [n for n, _ in mod.named_parameters() if "fused" in n]
     assert len(fused) == 1
-    assert torch.equal(mod._param_map[fused[0]], torch.cat([wt, qt], dim=1))
+    assert torch.equal(
+        mod._param_map[fused[0]], torch.cat([wt, qt], dim=1)
+    )
     # The originals were consumed by the fold.
     assert "W" not in mod._param_map
     assert "Q" not in mod._param_map
@@ -454,7 +456,9 @@ def test_fold_memo_shared_subtree_single_materialisation():
     Q = Param("Q", TensorType((4, 4)))
     cat = Op.make("concat", W, Q, dim=0)  # interned: ONE object
     x = Var("x", TensorType((4, 4)))
-    root = Op.make("add", Op.make("mul", x, cat), Op.make("mul", x, cat))
+    root = Op.make(
+        "add", Op.make("mul", x, cat), Op.make("mul", x, cat)
+    )
     wt, qt = torch.randn(4, 4), torch.randn(4, 4)
     mod = _lower_root(root, {"W": wt, "Q": qt})
     fused = [n for n, _ in mod.named_parameters() if "fused" in n]
@@ -483,9 +487,7 @@ def test_fold_param_only_nonfoldable_op_stays():
     alone even though it has no Var leaves."""
     W = Param("W", TensorType((4, 4)))
     x = Var("x", TensorType((4, 4)))
-    root = Op.make(
-        "matmul", x, Op.make("reshape", W, shape=(4, 4))
-    )
+    root = Op.make("matmul", x, Op.make("batch_norm", W))
     mod = _lower_root(root, {"W": torch.randn(4, 4)})
     assert not [n for n, _ in mod.named_parameters() if "fused" in n]
     assert "W" in mod._param_map
@@ -499,7 +501,9 @@ def test_fold_elementwise_binding_raises_keeps_term():
     x = Var("x", TensorType((4, 4)))
     # add(W(2,3), Q(4,5)) broadcasts to nothing — torch.add raises.
     root = Op.make("matmul", x, Op.make("add", W, Q))
-    mod = _lower_root(root, {"W": torch.randn(2, 3), "Q": torch.randn(4, 5)})
+    mod = _lower_root(
+        root, {"W": torch.randn(2, 3), "Q": torch.randn(4, 5)}
+    )
     assert not [n for n, _ in mod.named_parameters() if "fused" in n]
     assert mod._root.args[1].op == "add"
 
@@ -539,9 +543,7 @@ def test_fold_nested_matmul_chains_fully():
     # baked into it, so one fused parameter stores P@(Q@R).
     assert len(fused) == 1
     expected = pt @ (qt @ rt)
-    assert torch.allclose(
-        mod._param_map[fused[0]], expected, atol=1e-6
-    )
+    assert torch.allclose(mod._param_map[fused[0]], expected, atol=1e-6)
 
 
 def test_uses_input_leaf_classification():
@@ -627,12 +629,11 @@ def test_param_requires_grad_by_dtype():
     W = Param("W", TensorType((4, 4)))
     x = Var("x", TensorType((4, 4)))
     mod = _lower_root(
-        Op.make("mul", x, W), {"W": torch.zeros(4, 4, dtype=torch.int64)}
+        Op.make("mul", x, W),
+        {"W": torch.zeros(4, 4, dtype=torch.int64)},
     )
     assert mod._param_map["W"].requires_grad is False
-    mod2 = _lower_root(
-        Op.make("mul", x, W), {"W": torch.randn(4, 4)}
-    )
+    mod2 = _lower_root(Op.make("mul", x, W), {"W": torch.randn(4, 4)})
     assert mod2._param_map["W"].requires_grad is True
 
 
@@ -676,8 +677,10 @@ def test_dim_args_helper():
     # axis is a synonym; list dims normalise to tuples; keepdim rides.
     assert _dim_args((), {"axis": [0, 2]}) == ((0, 2), False)
     assert _dim_args((), {"dim": -1, "keepdim": True}) == (-1, True)
-    # No attrs at all -> reduce the last axis, no keepdim.
-    assert _dim_args((), {}) == (-1, False)
+    # No attrs at all -> the dim-less aten spelling is a FULL reduce
+    # (``x.sum()``), not a last-axis one — matching typing's ()
+    # verdict for a dim-less reduction.
+    assert _dim_args((), {}) == ()
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +720,7 @@ def test_defensive_branch_inventory():
       making 382->385 (the non-None arc) dead.  Verified empirically:
       ``args: ((node,),)`` on every export in the suite.
     """
+
     # Evidence for the output-tuple claim — the invariant the whole
     # inventory rests on.
     class M(torch.nn.Module):
