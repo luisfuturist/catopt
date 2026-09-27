@@ -6,7 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from catopt_core.cost import _FOLDABLE_ELEMWISE, _memo_dispatch
+from catopt_core.cost import (
+    _FOLDABLE_ELEMWISE,
+    _SOLVER_FACTOR,
+    _SOLVER_OPS,
+    _local_roofline,
+    _memo_dispatch,
+    _profile_constants,
+)
 from catopt_core.egraph.types import (
     ENode,
     _LeafRegistry,
@@ -27,6 +34,27 @@ _FOLDABLE_OPS = _FOLDABLE_ELEMWISE | {"matmul", "concat"}
 
 
 class _ExtractMixin:
+    def _cost_memo_for(self, cost_fn) -> dict:
+        """Shared content-keyed cost memo for *cost_fn* on this e-graph.
+
+        Cost values are pure functions of ``(cost_fn, term)`` — terms
+        are interned — so one dict can serve every extraction pass
+        (greedy, forced/coordinated re-extractions, bounded rounds)
+        instead of repricing each distinct candidate term per call.
+        Entries are per cost_fn object: a different cost model gets a
+        fresh dict.  The stored pair pins the callable so an
+        ``id()``-recycled different function can never inherit a stale
+        memo.
+        """
+        memos = getattr(self, "_cost_memos", None)
+        if memos is None:
+            memos = self._cost_memos = {}
+        ent = memos.get(id(cost_fn))
+        if ent is None or ent[0] is not cost_fn:
+            ent = (cost_fn, {})
+            memos[id(cost_fn)] = ent
+        return ent[1]
+
     def extract_min_depth(self, eid: int) -> Any:
         """Extract the minimum critical-path-depth member.
 
@@ -192,16 +220,25 @@ class _ExtractMixin:
         Cyclic nodes (a class reachable from itself through rewrite-
         introduced unions) are skipped: they cannot be extracted.
         """
-        # eid -> (total_cost, term, used_eclass_ids, subtree_is_param_only, nops)
-        cache: dict[int, tuple[float, Any, frozenset, bool, int]] = {}
-        local_of: dict[int, float] = {}
-        param_only_of: dict[int, bool] = {}
+        # eid -> (total_cost, term, used_eclass_ids, subtree_is_param_only,
+        #         nops, cfn(term), eo_overhead, roofline_cost)
+        # The last three entries are sub-cost PROBES used to pre-seed the
+        # shared cost memo before pricing a parent candidate (see the
+        # seeding note below); ``None`` when the cost model did not
+        # produce the corresponding memo key for this class's term.
+        cache: dict[int, tuple] = {}
+        # eid -> billable local contribution of the class's chosen
+        # member: ``local`` unless the param-only discount applies.
+        # Replaces the separate local_of/param_only_of lookups so the
+        # shared-class billing below is a single dict probe per class.
+        adj_of: dict[int, float] = {}
         in_progress: set[int] = set()
 
-        # Shared cost/shape memo for the whole extraction: makes the
-        # per-candidate cost_fn calls O(1) amortised over the DAG.
-        # Terms are content-hashed and interned — memos key on the term
-        # object directly and hold it alive; no keepalive needed.
+        # Shared cost/shape memo — per cost_fn, across ALL extractions
+        # on this e-graph (``_cost_memo_for``): repeated passes price
+        # each distinct term once, total.  Terms are content-hashed and
+        # interned — memos key on the term object directly and hold it
+        # alive; no keepalive needed.
         # Storage-style cost models (param_bytes_cost) bill Param leaves
         # — folding does not shrink the weights file — so the param-only
         # discount does not apply.  getattr(..., "func", ...) unwraps
@@ -211,17 +248,58 @@ class _ExtractMixin:
             "charges_param_only",
             False,
         )
-        cfn = _memo_dispatch(cost_fn)
+        m = self._cost_memo_for(cost_fn)
+        cfn = _memo_dispatch(cost_fn, m)
 
-        def best(
-            eclass_id: int,
-        ) -> tuple[float, Any, frozenset, bool, int]:
+        # Memo pre-seeding for the two additive sub-models the executor
+        # cost family prices with: ``_generic_overhead`` counts op
+        # occurrences under ``("eo","generic",term)`` — additive by
+        # construction (eo = w(op) + Σ eo(children), integer-valued so
+        # order-exact) — but computes it by re-walking the whole
+        # subtree, ignoring the memo for children; ``_roofline_cost``
+        # under ``("rc",pf,bw,ls,term)`` recurses with the memo, one
+        # call per argument.  When every child's probe value is present
+        # (which happens exactly when the cost model prices through
+        # those keys — the check is self-gating: other cost fns simply
+        # leave the probes ``None`` and seeding never fires), the
+        # parent's entry is the child values summed under the same
+        # local term — turning each fresh ``cfn(term)`` into O(arity)
+        # memo hits instead of an O(subtree) re-walk.  Seeded values
+        # are identical: the eo count is integer-exact in any order,
+        # and rc replays ``local + Σchildren`` in the same order the
+        # model itself accumulates.
+        unwrapped = getattr(cost_fn, "func", cost_fn)
+        rc_enabled = hasattr(unwrapped, "profile")
+        if rc_enabled:
+            try:
+                rc_pf, rc_bw, rc_ls = _profile_constants(
+                    getattr(unwrapped, "profile", None)
+                )
+            except (AttributeError, TypeError, KeyError):
+                # A user cost_fn carrying an unrelated ``.profile``
+                # attribute — roofline seeding is self-gating anyway,
+                # so disabling it loses only the fast path.
+                rc_enabled = False
+                rc_pf = rc_bw = rc_ls = None
+        else:
+            rc_pf = rc_bw = rc_ls = None
+
+        def best(eclass_id: int) -> tuple:
             eclass_id = self.find(eclass_id)
             if eclass_id in cache:
                 return cache[eclass_id]
             if eclass_id in in_progress:
                 # Cycle back to an ancestor — not extractable.
-                return (float("inf"), None, frozenset(), False, 0)
+                return (
+                    float("inf"),
+                    None,
+                    frozenset(),
+                    False,
+                    0,
+                    0.0,
+                    None,
+                    None,
+                )
             in_progress.add(eclass_id)
             eclass = self._classes[eclass_id]
             override = overrides.get(eclass_id) if overrides else None
@@ -232,9 +310,13 @@ class _ExtractMixin:
             nodes = (
                 (override,)
                 if override is not None
-                else sorted(
-                    eclass.nodes,
-                    key=lambda n: (n.op, n.children, repr(n.attrs)),
+                else (
+                    sorted(
+                        eclass.nodes,
+                        key=lambda n: (n.op, n.children, repr(n.attrs)),
+                    )
+                    if len(eclass.nodes) > 1
+                    else tuple(eclass.nodes)
                 )
             )
             banned = bans.get(eclass_id) if bans else None
@@ -242,6 +324,7 @@ class _ExtractMixin:
             best_term: Any = None
             best_used: frozenset = frozenset({eclass_id})
             best_local = 0.0
+            best_ct = 0.0
             best_param_only = False
             best_nops = 0
             for node in nodes:
@@ -258,52 +341,108 @@ class _ExtractMixin:
                         best_term = term
                         best_used = frozenset({eclass_id})
                         best_local = total
+                        best_ct = total
                         best_param_only = not isinstance(term, _Var)
                         best_nops = 0
                     continue
 
                 child_terms: list[Any] = []
+                child_rcs: list[Any] = []
+                child_tc = 0.0
                 child_nops = 0
+                eo_sum = 0.0
+                eo_ok = True
+                rc_ok = rc_enabled
                 used: set[int] = {eclass_id}
                 sub_cost = 0.0
                 param_only = True
                 valid = True
                 for child_eid in node.children:
-                    canon_child = self.find(child_eid)
-                    if canon_child == eclass_id:
-                        valid = False  # direct self-reference
-                        break
-                    _ctotal, cterm, cused, cpo, cnops = best(
-                        canon_child
-                    )
+                    # Cached entries are keyed by canonical id, so a
+                    # hit means child_eid was already canonical — and
+                    # cannot be eclass_id itself (in-progress classes
+                    # are never cached).
+                    entry = cache.get(child_eid)
+                    if entry is None:
+                        canon_child = self.find(child_eid)
+                        if canon_child == eclass_id:
+                            valid = False  # direct self-reference
+                            break
+                        entry = best(canon_child)
+                    (
+                        _ctotal,
+                        cterm,
+                        cused,
+                        cpo,
+                        cnops,
+                        ctc,
+                        ceo,
+                        crc,
+                    ) = entry
                     if cterm is None:
                         valid = False
                         break
                     child_terms.append(cterm)
+                    if rc_enabled:
+                        child_rcs.append(crc)
+                    child_tc += ctc
                     child_nops += cnops
                     param_only = param_only and cpo
+                    eo_sum += ceo or 0.0
+                    eo_ok = eo_ok and ceo is not None
+                    rc_ok = rc_ok and crc is not None
                     # Charge each distinct e-class in the DAG once:
                     # a shared child contributes its subtree cost only
                     # for the classes not already accounted for.
                     # Compile-time (param-only) classes are free —
                     # unless the cost model prices storage, in which
-                    # case every class's local is billed.
-                    for u in cused - used:
-                        if bill_params or not param_only_of.get(
-                            u, False
-                        ):
-                            sub_cost += local_of.get(u, 0.0)
-                    used |= cused
+                    # case every class's local is billed.  adj_of is
+                    # that billable local — zeroed by the discount.
+                    new = cused - used
+                    if new:
+                        # Sequential += in diff-set order — identical
+                        # association to billing per element (adding
+                        # adj_of's 0.0s is an exact no-op).
+                        for u in new:
+                            sub_cost += adj_of.get(u, 0.0)
+                        used |= new
                 if not valid:
                     continue
                 term = Op.make(
                     node.op, *child_terms, **dict(node.attrs)
                 )
+                # Pre-seed the additive sub-model memo entries — see
+                # the note above.  Self-gating: fires only when the
+                # cost model produced the matching keys on children.
+                if eo_ok:
+                    ek = ("eo", "generic", term)
+                    if ek not in m:
+                        m[ek] = eo_sum + (
+                            _SOLVER_FACTOR
+                            if node.op in _SOLVER_OPS
+                            else 1.0
+                        )
+                if rc_ok:
+                    rk = ("rc", rc_pf, rc_bw, rc_ls, term)
+                    if rk not in m:
+                        rc = _local_roofline(
+                            term,
+                            m,
+                            peak_flops=rc_pf,
+                            peak_bw=rc_bw,
+                            launch_s=rc_ls,
+                        )
+                        # Same accumulation order as _roofline_cost:
+                        # local first, then children left-to-right.
+                        for c in child_rcs:
+                            rc += c
+                        m[rk] = rc
                 # …and this node's own op must be foldable — a
                 # param-only subtree over trace/inv still runs its
                 # solver call per eval, so it is billed.
                 param_only = param_only and node.op in _FOLDABLE_OPS
-                local = cfn(term) - sum(cfn(c) for c in child_terms)
+                ct = cfn(term)
+                local = ct - child_tc
                 local = max(local, 0.0)
                 if param_only and not bill_params:
                     local = 0.0  # whole subtree folds at compile time
@@ -322,23 +461,43 @@ class _ExtractMixin:
                     best_term = term
                     best_used = frozenset(used)
                     best_local = local
+                    best_ct = ct
                     best_param_only = param_only
                     best_nops = nops
             in_progress.discard(eclass_id)
             if best_term is None:
                 best_total = float("inf")
-            local_of[eclass_id] = best_local
-            param_only_of[eclass_id] = best_param_only
+            adj_of[eclass_id] = (
+                best_local
+                if (bill_params or not best_param_only)
+                else 0.0
+            )
+            # Sub-cost probes for memo pre-seeding (see the note above):
+            # read AFTER cfn(best_term) ran, so an eo/rc-pricing cost
+            # model has written the keys this reads back.
+            ceo = (
+                m.get(("eo", "generic", best_term))
+                if best_term is not None
+                else None
+            )
+            crc = (
+                m.get(("rc", rc_pf, rc_bw, rc_ls, best_term))
+                if (rc_enabled and best_term is not None)
+                else None
+            )
             cache[eclass_id] = (
                 best_total or 0.0,
                 best_term,
                 best_used,
                 best_param_only,
                 best_nops,
+                best_ct,
+                ceo,
+                crc,
             )
             return cache[eclass_id]
 
-        total, term, _, _, nops = best(eid)
+        total, term, _, _, nops, _, _, _ = best(eid)
         if term is None:
             logger.warning(
                 "extract_best: no extractable term in eclass %d",
@@ -489,7 +648,8 @@ class _ExtractMixin:
         # score steering candidates: picking member_reaching[0] can grab
         # an arbitrarily expensive alternative (e.g. a distributed form)
         # and inflate the forced term's true DAG cost.
-        cfn = _memo_dispatch(cost_fn)
+        cfn_memo = self._cost_memo_for(cost_fn)
+        cfn = _memo_dispatch(cost_fn, cfn_memo)
 
         pass1_cache: dict = {}
         self.extract_best(
@@ -503,14 +663,31 @@ class _ExtractMixin:
             """local cost + children best totals (member-routed pass)."""
             child_terms = []
             sub = 0.0
+            child_tc = 0.0
+            eo_sum = 0.0
+            eo_ok = True
             for ch in node.children:
                 entry = pass1_cache.get(self.find(ch))
                 if entry is None or entry[1] is None:
                     return float("inf")
                 child_terms.append(entry[1])
                 sub += entry[0]
+                child_tc += entry[5]  # cfn(child's chosen term)
+                ceo = entry[6]
+                eo_ok = eo_ok and ceo is not None
+                eo_sum += ceo or 0.0
             term = Op.make(node.op, *child_terms, **dict(node.attrs))
-            local = cfn(term) - sum(cfn(c) for c in child_terms)
+            # Same additive eo pre-seed as extract_best — keeps each
+            # steering probe an O(arity) evaluation.
+            if eo_ok:
+                ek = ("eo", "generic", term)
+                if ek not in cfn_memo:
+                    cfn_memo[ek] = eo_sum + (
+                        _SOLVER_FACTOR
+                        if node.op in _SOLVER_OPS
+                        else 1.0
+                    )
+            local = cfn(term) - child_tc
             return max(local, 0.0) + sub
 
         overrides: dict[int, Any] = dict(member_over)
