@@ -5,9 +5,10 @@ import types
 import pytest
 from catopt.cost import (
     _LAUNCH_S,
+    _PEAK_BW,
+    _PEAK_FLOPS,
     LOWERINGS,
     CostModel,
-    _local_roofline,
     count_cost,
     depth_cost_for,
     executor_cost_for,
@@ -355,6 +356,8 @@ def _balanced_tree(leaves: list[Op]) -> Op:
 
 
 def test_executor_overhead_generic_counts_ops():
+    from catopt.cost import _SOLVER_FACTOR
+
     x = _v("x", 4, 8)
     # hand-built chain: add(mul(x, 2), neg(x)) -> 3 dispatched ops
     t = Op.make("add", Op.make("mul", x, Const(2.0)), Op.make("neg", x))
@@ -370,6 +373,26 @@ def test_executor_overhead_generic_counts_ops():
     # leaves and Consts dispatch nothing
     assert executor_overhead(x, "generic") == 0.0
     assert executor_overhead(Const(1.0), "generic") == 0.0
+    # a param-only foldable subtree dispatches nothing — the lowerer
+    # materialises it to a bound parameter before the first forward
+    assert (
+        executor_overhead(
+            Op.make(
+                "add",
+                Op.make("mul", _p("P1", 8, 8), _p("P2", 8, 8)),
+                x,
+            ),
+            "generic",
+        )
+        == 1.0
+    )
+    # ...but a param-only op the fold can't touch still runs.
+    assert (
+        executor_overhead(
+            Op.make("trace", _p("M", 4, 4), usize=[4]), "generic"
+        )
+        == _SOLVER_FACTOR
+    )
     # memo reuse returns the cached count
     memo: dict = {}
     first = executor_overhead(tv, "generic", memo)
@@ -506,41 +529,48 @@ def test_executor_cost_for_adds_dispatch_overhead():
         executor_cost_for(prof, base="bogus")
 
 
+def _kernel_ns(flops: float, in_b: float, out_b: float) -> float:
+    """One region's kernel time, per fused_cost_for's documented
+    composition: max(Σ member FLOPs / peak, region traffic / bw)."""
+    return max(flops / _PEAK_FLOPS, (in_b + out_b) / _PEAK_BW) * 1e9
+
+
 def test_fused_cost_for_pointwise_region():
     x = _v("x", 512, 512)
+    el_b = 512 * 512 * 4  # one fp32 tensor's bytes
     mul = Op.make("mul", x, x)
     t = Op.make("add", mul, Op.make("neg", x))
     fused = fused_cost_for()(t)
     unfused = roofline_cost(t)
-    # The 3-op pointwise chain fuses to one kernel: the dominant
-    # member's roofline + one dispatch — well under the per-op sum.
-    dom = max(
-        _local_roofline(t),
-        _local_roofline(mul),
-        _local_roofline(t.args[1]),
-    )
-    assert fused == pytest.approx(dom + _LAUNCH_S * 1e9)
+    # The 3-op pointwise chain fuses to one kernel: Σ member flops
+    # vs deduplicated region traffic (x read ONCE + the root write),
+    # + one launch + one graph-level dispatch — well under the
+    # per-op sum.  (No dispatch_us in the default profile → the
+    # dispatch falls back to the launch constant.)
+    exp = _kernel_ns(3 * 512 * 512, el_b, el_b) + 2 * _LAUNCH_S * 1e9
+    assert fused == pytest.approx(exp)
     assert fused < unfused / 2
     # A fusible diamond dedups its shared member in the region.
     dia = Op.make("add", mul, mul)
     fused_dia = fused_cost_for()(dia)
     assert fused_dia == pytest.approx(
-        max(_local_roofline(dia), _local_roofline(mul))
-        + _LAUNCH_S * 1e9
+        _kernel_ns(2 * 512 * 512, el_b, el_b) + 2 * _LAUNCH_S * 1e9
     )
-    # A non-fusible op keeps its own kernel: local + one dispatch.
+    # A non-fusible op keeps its own kernel: its flops dominate
+    # the region traffic (reads x + W, writes the product).
     W = _p("W", 512, 512)
     mm = Op.make("matmul", x, W)
     assert fused_cost_for()(mm) == pytest.approx(
-        _local_roofline(mm) + _LAUNCH_S * 1e9
+        _kernel_ns(2 * 512**3, 2 * el_b, el_b) + 2 * _LAUNCH_S * 1e9
     )
-    # Mixed term: the GEMM prices normally, the pointwise tail fuses.
+    # Mixed term: the GEMM is its own kernel, the pointwise tail
+    # fuses reading the GEMM's output once.
     mix = Op.make("neg", Op.make("mul", mm, mm))
     fmix = fused_cost_for()(mix)
     assert fmix == pytest.approx(
-        _local_roofline(mm)
-        + max(_local_roofline(mix), _local_roofline(mix.args[0]))
-        + 2 * _LAUNCH_S * 1e9
+        _kernel_ns(2 * 512**3, 2 * el_b, el_b)
+        + _kernel_ns(2 * 512 * 512, el_b, el_b)
+        + 3 * _LAUNCH_S * 1e9  # 2 launches + 1 graph dispatch
     )
     assert fmix < roofline_cost(mix)
     # Leaves emit no kernel; memo reuse hits the cache.
@@ -548,6 +578,64 @@ def test_fused_cost_for_pointwise_region():
     memo: dict = {}
     f = fused_cost_for({"tflops": 2.5, "gbps": 89.0, "launch_us": 8.7})
     assert f(mix, memo) == f(mix, memo)
+
+
+def test_fused_cost_region_traffic():
+    """Region bytes, not dominant member: externals read + boundary
+    writes decide the fused kernel's time — two regions reading the
+    SAME big input and a small one differ from one reading two big
+    inputs, which dominant-member pricing could not see."""
+    x = _v("x", 512, 512)
+    y = _v("y", 512, 512)
+    el_b = 512 * 512 * 4
+    # one region {add}: reads x AND y (two externals), writes out.
+    add = Op.make("add", x, y)
+    f_add = fused_cost_for()(add)
+    assert f_add == pytest.approx(
+        _kernel_ns(512 * 512, 2 * el_b, el_b) + 2 * _LAUNCH_S * 1e9
+    )
+    # the same op reading ONE external twice dedups the read —
+    # fewer bytes than the two-input form.
+    add2 = Op.make("add", x, x)
+    assert fused_cost_for()(add2) < f_add
+    # Interior values stay in registers: add(mul, sigmoid) fuses the
+    # whole pointwise DAG — only x, y in and the root out cross
+    # memory.  Feeding the same subtrees to a concat boundary splits
+    # them into per-producer kernels that must WRITE their outputs —
+    # more launches AND more bytes, so strictly pricier.
+    pw = Op.make("add", Op.make("mul", x, y), Op.make("sigmoid", x))
+    cat = Op.make(
+        "concat", Op.make("mul", x, y), Op.make("sigmoid", x), dim=0
+    )
+    assert len(fusion_regions(pw)) == 1
+    assert len(fusion_regions(cat)) == 3
+    assert fused_cost_for()(cat) > fused_cost_for()(pw)
+    # ...and a transparent view does not hide the boundary: neg's
+    # value crosses the region through the transpose to reach `add`
+    # in another region, so it is billed as a write.
+    neg = Op.make("neg", x)
+    t = Op.make(
+        "add",
+        Op.make("matmul", x, _p("W", 512, 512)),
+        Op.make("transpose", neg, dim0=0, dim1=1),
+    )
+    member_regions = [
+        sorted(tt.op for tt in r) for r in fusion_regions(t)
+    ]
+    assert sorted(member_regions) == [["add", "neg"], ["matmul"]]
+    # Carrier packaging is transparent too: aff(neg, neg) forwards
+    # BOTH args through to `add`'s region — neg stays interior (its
+    # only opaque consumer is in-region), and the duplicated parent
+    # edge is dedup'd in the boundary walk.
+    neg2 = Op.make("neg", y)
+    t2 = Op.make(
+        "add",
+        Op.make("matmul", x, _p("U", 512, 512)),
+        Op.make("aff", neg2, neg2),
+    )
+    regions2 = [sorted(tt.op for tt in r) for r in fusion_regions(t2)]
+    assert sorted(regions2) == [["add", "neg"], ["matmul"]]
+    assert fused_cost_for()(t2) > 0
 
 
 def test_lowering_aware_cost_for_picks_per_term():
@@ -639,7 +727,9 @@ def test_fusion_regions_pointwise_chain_scales_sublinear():
         n_regions = len(fusion_regions(t))
         assert n_regions == 1
         assert n_regions <= math.ceil(math.log2(t_steps)) + 1
-    # the cost is T-independent: one kernel regardless of chain depth
+    # the cost is ~T-independent: one kernel regardless of chain
+    # depth — member flops/reads grow with T but stay far below the
+    # serial evaluator's O(T) dispatches.
     prof = {
         "tflops": 2.5,
         "gbps": 89.0,
@@ -647,7 +737,7 @@ def test_fusion_regions_pointwise_chain_scales_sublinear():
         "dispatch_us": 10.0,
     }
     f = fused_cost_for(prof)
-    assert f(_applyd_chain(4)) == pytest.approx(f(_applyd_chain(128)))
+    assert f(_applyd_chain(128)) < f(_applyd_chain(4)) * 2
 
 
 def test_fusion_regions_applyd_spine_is_one_region():
@@ -678,7 +768,186 @@ def test_fusion_regions_applyd_spine_is_one_region():
         batched = executor_cost_for(prof, lowering="batched_scan")(
             chain
         )
-        assert compiled < batched < generic
+        assert compiled < generic
+        assert compiled < batched
+        # With DISTINCT param leaves, no leaf fast path engages —
+        # the batched executor pays a per-leaf eval plus its level
+        # machinery, so on this profile it cannot beat the serial
+        # evaluator (the honest CPU negative of data-dependent
+        # leaves; the fast-path case is pinned below).
+        assert batched > generic
+
+
+def test_batched_scan_latency_fast_paths():
+    """Level-batched price beats generic only when leaf fast paths
+    engage — shared transition term + select-of-one-base inputs."""
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+        "leaf_eval_us": 5.0,
+    }
+    x = _v("x", 128, 8)
+    u = Op.make("matmul", x, _p("W", 8, 8))
+    gamma = _p("gamma", 8)
+    # LTI scan: every leaf is aff_diag(gamma, select(u, 0, i)) —
+    # leaf_a_shared + leaf_b_gather both engage.
+    leaves = [
+        Op.make(
+            "aff_diag",
+            gamma,
+            Op.make("select", u, dim=0, index=i),
+        )
+        for i in range(128)
+    ]
+    scan = Op.make("applyd", _balanced_tree(leaves), _v("h", 8))
+    generic = executor_cost_for(prof, lowering="generic")(scan)
+    batched = executor_cost_for(prof, lowering="batched_scan")(scan)
+    compiled = executor_cost_for(prof, lowering="compiled")(scan)
+    # ~7 batched levels + one base eval + one gather ≪ ~256 serial
+    # dispatches; the fused spine still beats everything.
+    assert compiled < batched < generic
+    # Same shape but data-dependent leaves (distinct transitions,
+    # non-select inputs): no fast path → batched cannot win at this
+    # size on this profile (the honest negative).
+    leaves2 = [
+        Op.make("aff_diag", _p(f"g{i}", 8), _p(f"b{i}", 8))
+        for i in range(128)
+    ]
+    scan2 = Op.make("applyd", _balanced_tree(leaves2), _v("h", 8))
+    assert executor_cost_for(prof, lowering="batched_scan")(
+        scan2
+    ) > executor_cost_for(prof, lowering="generic")(scan2)
+
+
+def _aff_tree(leaves: list[Op]) -> Op:
+    while len(leaves) > 1:
+        nxt = [
+            Op.make("aff_compose", a, b)
+            for a, b in zip(leaves[::2], leaves[1::2], strict=False)
+        ]
+        if len(leaves) % 2:
+            nxt.append(leaves[-1])
+        leaves = nxt
+    return leaves[0]
+
+
+def test_batched_scan_latency_dense_and_leaf_edges():
+    """The dense affine (``apply``) compose path and non pair-carrier
+    leaf shapes take their own priced branches."""
+    from catopt.cost import _leaf_gather_base, _leaf_shared_a
+
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+        "leaf_eval_us": 5.0,
+    }
+    f = executor_cost_for(prof, lowering="batched_scan")
+    # dense affine spine: apply over aff_compose of aff(A,b) leaves —
+    # the (d+1)x(d+1) bmm compose path (4 calls/level, s**1.5 flops).
+    d = 4
+    aff_leaves = [
+        Op.make("aff", _p(f"A{i}", d, d), _p(f"b{i}", d))
+        for i in range(8)
+    ]
+    dense_scan = Op.make("apply", _aff_tree(aff_leaves), _v("h", d))
+    b = f(dense_scan)
+    g = executor_cost_for(prof, lowering="generic")(dense_scan)
+    assert b > 0 and g > 0
+    # leaves with no pair structure (a bare Param leaf popped FIRST
+    # in the spine — aff_diag last arg — falls to the per-leaf-eval
+    # arm) — still a finite positive price.
+    spine = Op.make(
+        "affd_compose",
+        Op.make("aff_diag", _p("a", d), _p("bb", d)),
+        _p("M", d, d),
+    )
+    odd = Op.make("applyd", spine, _v("h2", d))
+    assert f(odd) > 0
+    # a spine with a shared compose subtree: the DAG walk dedups the
+    # revisit — same price structure, finite positive cost.
+    sc = Op.make(
+        "affd_compose",
+        Op.make("aff_diag", _p("g", d), _p("b", d)),
+        Op.make("aff_diag", _p("g", d), _p("b2", d)),
+    )
+    shared_spine = Op.make("affd_compose", sc, sc)
+    assert f(Op.make("applyd", shared_spine, _v("h3", d))) > 0
+    # helper edge cases — shared-a needs uniform first args.
+    diag = Op.make("aff_diag", _p("g", d), _p("b", d))
+    eye = Op.make("eye", dim=d)  # zero-arg leaf
+    assert not _leaf_shared_a([])
+    assert _leaf_shared_a([diag, diag])
+    assert not _leaf_shared_a(
+        [diag, Op.make("aff_diag", _p("g2", d), _p("b", d))]
+    )
+    # identically-NAMED Params count as one shared transition even
+    # when they are different objects (the LTI rule).
+    assert _leaf_shared_a(
+        [
+            Op.make("aff_diag", _p("g", 4), _p("b", d)),
+            Op.make("aff_diag", _p("g", 8), _p("b", d)),
+        ]
+    )
+    assert not _leaf_shared_a([diag, eye])
+    # gather needs every b = select(same base, same dim).
+    u = Op.make("matmul", _v("x", 8, d), _p("W", d, d))
+    g_leaves = [
+        Op.make(
+            "aff_diag", _p("g", d), Op.make("select", u, dim=0, index=i)
+        )
+        for i in range(4)
+    ]
+    assert _leaf_gather_base(g_leaves) is u
+    # non-select b / missing attrs / mismatched base → None.
+    assert _leaf_gather_base([diag, diag]) is None
+    bad_dim = Op.make(
+        "aff_diag",
+        _p("g", d),
+        Op.make("select", u, dim="x", index=0, validate=False),
+    )
+    assert _leaf_gather_base([g_leaves[0], bad_dim]) is None
+    other_base = Op.make(
+        "aff_diag",
+        _p("g", d),
+        Op.make("select", _v("z", 8, d), dim=0, index=0),
+    )
+    assert _leaf_gather_base([g_leaves[0], other_base]) is None
+    # a zero-arg leaf also breaks the pair check.
+    assert _leaf_gather_base([g_leaves[0], eye]) is None
+    # a leaf with <2 args breaks it too.
+    one_arg = Op.make("neg", _p("q", d))
+    assert _leaf_gather_base([g_leaves[0], one_arg]) is None
+
+
+def test_batched_scan_profile_fallbacks():
+    """None / dict-without-leaf_eval profiles use the conservative
+    4*dispatch leaf-eval fallback; a dict WITH leaf_eval_us uses it."""
+    scan = Op.make(
+        "applyd",
+        Op.make("affd_compose", _scan_leaf(0), _scan_leaf(1)),
+        _v("h", 4),
+    )
+    f_none = executor_cost_for(None, lowering="batched_scan")
+    f_dict = executor_cost_for(
+        {
+            "tflops": 2.5,
+            "gbps": 89.0,
+            "launch_us": 8.7,
+            "dispatch_us": 1.0,
+            "leaf_eval_us": 1000.0,
+        },
+        lowering="batched_scan",
+    )
+    # a huge leaf_eval_us must dominate the leaf materialisation
+    assert f_dict(scan) > f_none(scan)
+    # object profile missing leaf_eval_us → same fallback as dicts.
+    ns = types.SimpleNamespace(tflops=2.5, gbps=89.0, launch_us=8.7)
+    f_obj = executor_cost_for(ns, lowering="batched_scan")
+    assert f_obj(scan) > 0
 
 
 def test_fusion_regions_hard_boundaries():
@@ -746,6 +1015,9 @@ def test_fusion_regions_folded_params_are_free():
         "add", x, Op.make("mul", _p("P1", 64, 64), _p("P2", 64, 64))
     )
     assert fusion_regions(t) == (frozenset({t}),)
+    # the fold is billed as a kernel INPUT — read once by the add
+    # kernel — not as a kernel of its own.
+    assert fused_cost_for()(t) > 0
 
 
 def test_fusion_regions_solver_and_leaves():

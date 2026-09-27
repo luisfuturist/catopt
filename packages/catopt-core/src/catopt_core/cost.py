@@ -9,11 +9,14 @@ Models provided include:
 * param_bytes_cost - counts stored parameter values (the storage
   axis; what lets extraction prefer weight-sharing members).
 * executor_overhead / executor_cost_for - price the LOWERING:
-  dispatched-op counts per executor kind on top of a base model.
+  the serial evaluator's per-node dispatch+kernel time, the level-
+  batched executors' leaf-gather/level-compose schedule, the compiled
+  executor's fusion regions.
 * fusion_regions - partition a term's op-DAG into Inductor-style
   pointwise-fusion regions (one region = one compiled kernel).
 * fused_cost_for - the compiled lowering's price: each fusion region
-  costs one launch + dispatch at its dominant member's roofline.
+  costs one launch + the max of its summed member FLOPs vs its
+  external/boundary memory traffic; one dispatch per compiled graph.
 * lowering_aware_cost_for - min over lowerings: extraction picks the
   term whose best lowering is cheapest.
 
@@ -1259,6 +1262,13 @@ def _generic_overhead(term: Any, memo: dict) -> float:
     subtract and collapse locals to zero (non-additive cost fns are
     what made a ``trace`` resolvent term price like ~3 dispatches and
     win extraction — fidelity bench, ``cost_fidelity.py``).
+
+    A param-only subtree ``_folds_to_param`` materialises at lowering
+    contributes zero units — ``IRModule._fold_weight_chains`` rewrites
+    it to a bound parameter before the first forward, so there is no
+    runtime dispatch to price (a param-only subtree that does NOT fold
+    — e.g. a ``trace`` resolvent — still evaluates every call and is
+    counted).
     """
     ck = ("eo", "generic", term)
     if ck in memo:
@@ -1267,26 +1277,37 @@ def _generic_overhead(term: Any, memo: dict) -> float:
     stack = [term]
     while stack:
         t = stack.pop()
-        if isinstance(t, Op):
-            n += _SOLVER_FACTOR if t.op in _SOLVER_OPS else 1.0
-            stack.extend(t.args)
+        if not isinstance(t, Op):
+            continue
+        if _folds_to_param(t, None, memo):
+            continue  # folded to a parameter at lowering — no dispatch
+        n += _SOLVER_FACTOR if t.op in _SOLVER_OPS else 1.0
+        stack.extend(t.args)
     memo[ck] = n
     return n
 
 
-def _outside_overhead(term: Op, spine: Op) -> float:
+def _outside_overhead(term: Op, spine: Op, memo: dict) -> float:
     """Distinct op nodes of *term*'s DAG outside the ``spine`` subtree.
 
     The batched executor still runs everything around the compose
     spine generically — the apply root itself, the carried-state
-    argument, surrounding tensor terms.
+    argument, surrounding tensor terms.  Param-only foldable subtrees
+    materialise at lowering (``_generic_overhead`` convention) and are
+    not counted; nodes are deduplicated because the executor's eval
+    memoizes shared subtrees.
     """
     n = 0.0
     seen: set = set()
     stack = [term]
     while stack:
         t = stack.pop()
-        if not isinstance(t, Op) or t in seen or t == spine:
+        if (
+            not isinstance(t, Op)
+            or t in seen
+            or t == spine
+            or _folds_to_param(t, None, memo)
+        ):
             continue
         seen.add(t)
         n += 1.0
@@ -1321,7 +1342,7 @@ def _batched_scan_overhead(term: Op, memo: dict) -> float:
         else:
             leaves.append(t)
     levels = math.ceil(math.log2(max(1, len(leaves))))
-    total = float(levels) + _outside_overhead(term, spine)
+    total = float(levels) + _outside_overhead(term, spine, memo)
     # One batched leaf evaluation per leaf kind — the executor stacks
     # same-op leaves into a single gathered batch.
     for kind in {getattr(leaf, "op", "") for leaf in leaves}:
@@ -1413,6 +1434,251 @@ def _profile_dispatch_s(profile: Any) -> float:
     return float(us) * 1e-6
 
 
+def _profile_leaf_eval_s(profile: Any) -> float:
+    """Per-leaf scan-eval machinery overhead in seconds.
+
+    Reads ``leaf_eval_us`` — one ``apply``/``applyd`` leaf-operand eval
+    through the executor's ``eval_term`` machinery (gather/select plus
+    elementwise combine) on top of its kernels, as measured by
+    ``catopt_optimize.calibrate``.  Absent a measurement the fallback is
+    conservative — a leaf eval is a handful of dispatches, so it
+    prices at ``4 * dispatch_s``.
+    """
+    fallback = 4.0 * _profile_dispatch_s(profile)
+    if profile is None:
+        return fallback
+    if isinstance(profile, dict):
+        us = profile.get("leaf_eval_us", fallback * 1e6)
+    else:
+        us = getattr(profile, "leaf_eval_us", fallback * 1e6)
+    return float(us) * 1e-6
+
+
+def _generic_latency_ns(
+    term: Any,
+    memo: dict,
+    pf: float,
+    bw: float,
+    ls: float,
+    dsp: float,
+) -> float:
+    """Whole-subtree latency of the serial per-node evaluator, ns.
+
+    The ``executor_cost_for(lowering="generic")`` composition:
+    per-op roofline (kernel work + launch) plus one ``dispatch_s``
+    machinery overhead per dispatched op.  Used inside the batched
+    model for the pieces the level executors still run generically —
+    leaf operand evals and everything outside the compose spine.
+    """
+    return _roofline_cost(term, memo, pf, bw, ls) + (
+        _generic_overhead(term, memo) * dsp * 1e9
+    )
+
+
+def _leaf_shared_a(leaves: list) -> bool:
+    """``leaf_a_shared``: every leaf's first arg is the same term.
+
+    Mirrors ``catopt_carriers.scan_lower.build_scan_plan`` — same
+    object, or identically-named ``Param`` leaves (LTI recurrence):
+    the executor evaluates the transition once and ``expand``s a
+    stride-0 batch view instead of stacking T copies.
+    """
+    if not leaves or not getattr(leaves[0], "args", None):
+        return False
+    a0 = leaves[0].args[0]
+    for leaf in leaves[1:]:
+        if not getattr(leaf, "args", None) or not leaf.args:
+            return False
+        a = leaf.args[0]
+        if a is a0 or (
+            isinstance(a, Param)
+            and isinstance(a0, Param)
+            and a.name == a0.name
+        ):
+            continue
+        return False
+    return True
+
+
+def _leaf_gather_base(leaves: list) -> Any | None:
+    """``leaf_b_gather``'s shared base term, or ``None``.
+
+    Mirrors ``catopt_carriers.scan_lower._leaf_b_gather``: every
+    leaf's *second* argument is ``select(base, dim, index)`` over the
+    SAME base term and dim — one ``index_select`` (or the base itself
+    for contiguous indices) replaces n tiny indexing evals.
+    """
+    base = None
+    dim = None
+    for leaf in leaves:
+        args = getattr(leaf, "args", None)
+        if not args or len(args) < 2:
+            return None
+        b = args[1]
+        if not (isinstance(b, Op) and b.op == "select" and b.args):
+            return None
+        d = b.attrs.get("dim", 0)
+        i = b.attrs.get("index")
+        if not isinstance(d, int) or not isinstance(i, int):
+            return None
+        if base is None:
+            base, dim = b.args[0], d
+        elif b.args[0] is not base or d != dim:
+            return None
+    return base
+
+
+def _batched_scan_latency(
+    term: Op,
+    memo: dict,
+    pf: float,
+    bw: float,
+    ls: float,
+    dsp: float,
+    leaf_eval_s: float,
+) -> float:
+    """Whole-term nanoseconds under the level-batched carrier lowering.
+
+    The level executors (``BatchedScanModule`` and the om-family
+    variants) do NOT walk the term node-by-node — the compose spine
+    collapses to ~log₂(n) batched levels, so the price decomposes as
+    the executor's own work:
+
+    * **leaf materialisation** — ``leaf_a_shared`` (every leaf's
+      transition is the same term) evaluates the a-part ONCE;
+      ``leaf_b_gather`` (every leaf's input is ``base[i]``) evaluates
+      the base once and pays one ``index_select``.  Otherwise each
+      leaf operand evals through the eval machinery — ``leaf_eval_s``
+      per leaf plus the arg subtrees' kernel time — and one
+      ``torch.stack`` per side.
+    * **compose levels** — ``ceil(log2 n)`` levels; level *l* emits
+      ~``n/2^{l+1}`` carried elements.  The diagonal/elementwise path
+      costs ~9 dispatched calls per level (4 slot gathers, mul, mul+add,
+      2 cat); the dense affine path ~4 (2 gathers, bmm, cat).  Each
+      level also moves the running carried state: gather reads,
+      arithmetic writes, and the cat copies —
+      ``s·(4·m_l + done)·4`` bytes where ``s`` is the carried
+      element's scalar count.
+    * **outside the spine** — the apply root, the carried-state
+      argument and surrounding terms still evaluate generically:
+      per-node roofline + dispatch, deduplicated (the executor's eval
+      memoizes shared subtrees).
+
+    Whole-spine and non-additive — the same reporting/frontier caveat
+    as ``fused_cost_for`` (see :func:`fusion_regions`).  Callers
+    restrict it to ``_SCAN_ROOT_OPS`` terms; anything else keeps the
+    serial-fallback (generic) price.
+    """
+    spine = term.args[0]
+    seen: set = set()
+    leaves: list = []
+    stack = [spine]
+    while stack:
+        t = stack.pop()
+        if t in seen:
+            continue
+        seen.add(t)
+        if isinstance(t, Op) and t.op in _SCAN_COMPOSE_OPS:
+            stack.extend(t.args)
+        else:
+            leaves.append(t)
+    n = max(1, len(leaves))
+    dispatch_ns = dsp * 1e9
+    call_ns = (ls + dsp) * 1e9
+    total = 0.0
+
+    # ---- leaf materialisation -------------------------------------
+    # one leaf-operand eval = leaf_eval_s eval-machinery overhead +
+    # the arg subtree's kernel time (roofline only — dispatch is what
+    # leaf_eval_us measures, so charging it again would double-count).
+    def leaf_eval(subtree: Any) -> float:
+        return leaf_eval_s * 1e9 + _roofline_cost(
+            subtree, memo, pf, bw, ls
+        )
+
+    two_part = bool(leaves) and all(
+        isinstance(lf, Op) and len(lf.args) >= 2 for lf in leaves
+    )
+    stack_ns = call_ns  # one torch.stack per materialised side
+    if two_part and _leaf_shared_a(leaves):
+        # LTI: one eval + a stride-0 expand view (free).
+        total += leaf_eval(leaves[0].args[0])
+    elif two_part:
+        a_terms = list({lf.args[0] for lf in leaves})
+        total += n * leaf_eval_s * 1e9 + stack_ns
+        total += sum(
+            _roofline_cost(a, memo, pf, bw, ls) for a in a_terms
+        )
+    if two_part:
+        base = _leaf_gather_base(leaves)
+        if base is not None:
+            # One base eval + one index_select — not n indexing evals.
+            total += leaf_eval(base)
+            total += (
+                call_ns + _numel(_shape_of(base, memo)) * 4.0 / bw * 1e9
+            )
+        else:
+            b_terms = list({lf.args[1] for lf in leaves})
+            total += n * leaf_eval_s * 1e9 + stack_ns
+            total += sum(
+                _roofline_cost(b, memo, pf, bw, ls) for b in b_terms
+            )
+    else:
+        # Non pair-carriers (om triples and friends): per-leaf evals.
+        arg_terms = list(
+            {a for lf in leaves for a in getattr(lf, "args", ())}
+        )
+        total += n * leaf_eval_s * 1e9 + stack_ns
+        total += sum(
+            _roofline_cost(a, memo, pf, bw, ls) for a in arg_terms
+        )
+
+    # ---- compose levels ---------------------------------------------
+    # carried element scalars: the leaf packaging's summed arg numel.
+    s = 1.0
+    if leaves and isinstance(leaves[0], Op):
+        s = float(
+            sum(_numel(_shape_of(a, memo)) for a in leaves[0].args)
+        )
+        s = max(s, 1.0)
+    dense = term.op == "apply"  # dense affine: (d+1)x(d+1) bmm compose
+    calls = 4.0 if dense else 9.0
+    levels = math.ceil(math.log2(n))
+    done = float(n)
+    for lv in range(levels):
+        m_l = max(1.0, math.ceil(n / 2 ** (lv + 1)))
+        flops_lv = 2.0 * m_l * s**1.5 if dense else 3.0 * m_l * s
+        # 2·m_l·s gather reads + m_l·s arith writes + (done+m_l)·s cat
+        # copies of the running carried state.
+        bytes_lv = (4.0 * m_l + done) * s * 4.0
+        total += (
+            calls * call_ns + max(flops_lv / pf, bytes_lv / bw) * 1e9
+        )
+        done += m_l
+
+    # ---- outside the spine: generic eval, DAG-deduplicated ----------
+    seen2: set = set()
+    stack2 = [term]
+    while stack2:
+        t = stack2.pop()
+        if (
+            not isinstance(t, Op)
+            or t in seen2
+            or t == spine
+            or _folds_to_param(t, None, memo)
+        ):
+            continue
+        seen2.add(t)
+        total += (
+            _local_roofline(
+                t, memo, peak_flops=pf, peak_bw=bw, launch_s=ls
+            )
+            + dispatch_ns
+        )
+        stack2.extend(t.args)
+    return float(total)
+
+
 def executor_cost_for(
     profile: Any = None,
     *,
@@ -1443,7 +1709,13 @@ def executor_cost_for(
     ``lowering="compiled"`` ignores ``base`` and delegates to
     :func:`fused_cost_for` — the compiled executor's price is its
     fusion structure, not a per-node dispatch count
-    (``executor_overhead`` is 0 there).  The returned closure has the
+    (``executor_overhead`` is 0 there).  ``lowering="batched_scan"``
+    likewise ignores ``base`` on scan-apply roots: the level-batched
+    executors don't run the term's nodes at all — they run
+    :func:`_batched_scan_latency`'s leaf-gather / level-compose
+    schedule, whose work is priced directly (a whole-spine property,
+    so non-additive like ``fused_cost_for``; serial-fallback terms
+    keep the additive generic price).  The returned closure has the
     standard ``fn(term, memo=None)`` signature.
     """
     if lowering not in LOWERINGS:
@@ -1460,21 +1732,45 @@ def executor_cost_for(
         return fused_cost_for(profile)
     pf, bw, ls = _profile_constants(profile)
     dispatch_s = _profile_dispatch_s(profile)
+    leaf_eval_s = _profile_leaf_eval_s(profile)
     # ns for the roofline/depth bases; flop-equivalents for flops.
     per = dispatch_s * (1e9 if base != "flops" else 1e6)
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        ck = ("ec", lowering, base, pf, bw, ls, dispatch_s, term)
+        ck = (
+            "ec",
+            lowering,
+            base,
+            pf,
+            bw,
+            ls,
+            dispatch_s,
+            leaf_eval_s,
+            term,
+        )
         if ck in memo:
             return memo[ck]
-        if base == "roofline":
-            b = _roofline_cost(term, memo, pf, bw, ls)
-        elif base == "depth":
-            b = _depth_cost(term, memo, pf, bw, ls)
-        else:  # flops
-            b = flops_cost(term, memo)
-        out = b + executor_overhead(term, lowering, memo) * per
+        if (
+            lowering == "batched_scan"
+            and isinstance(term, Op)
+            and term.op in _SCAN_ROOT_OPS
+            and term.args
+        ):
+            out = _batched_scan_latency(
+                term, memo, pf, bw, ls, dispatch_s, leaf_eval_s
+            )
+        else:
+            if base == "roofline":
+                out = _generic_latency_ns(
+                    term, memo, pf, bw, ls, dispatch_s
+                )
+            else:
+                if base == "depth":
+                    b = _depth_cost(term, memo, pf, bw, ls)
+                else:  # flops
+                    b = flops_cost(term, memo)
+                out = b + executor_overhead(term, lowering, memo) * per
         memo[ck] = float(out)
         return out
 
@@ -1598,6 +1894,71 @@ def fusion_regions(
     return memo[ck]
 
 
+def _region_traffic(
+    region: frozenset,
+    parents: dict,
+    root: Op,
+    memo: dict,
+) -> tuple[float, float]:
+    """Bytes a fused kernel actually moves: (in, out).
+
+    *in* — every effective input of a member that is NOT itself a
+    member, deduplicated: leaves, other kernels' outputs, and
+    materialised param folds, each read once.  Transparent plumbing
+    forwards its own args, so a view never surfaces as an input
+    (Inductor folds its index arithmetic into the kernel).
+
+    *out* — every member value consumed by a non-member op (through
+    any number of transparent forwards) or returned as the term root:
+    the tensors the kernel must write.  Interior member→member values
+    stay in registers and move nothing — the structural fix over
+    dominant-member pricing, where a region whose members read
+    DIFFERENT large externals was billed only the largest op's
+    traffic.
+    """
+    in_b = 0.0
+    out_b = 0.0
+    ext: set = set()
+    for m in region:
+        # inputs: forward through transparent args until an opaque
+        # producer (member → interior; anything else → an external
+        # read).
+        pending = list(m.args)
+        while pending:
+            a = pending.pop()
+            if isinstance(a, Op) and a.op in _FUSION_TRANSPARENT_OPS:
+                pending.extend(a.args)
+                continue
+            if a in region or a in ext:
+                continue
+            ext.add(a)
+            in_b += _numel(_shape_of(a, memo)) * 4.0
+        # outputs: m crosses the region boundary if a consumer chain
+        # (forwarding through transparent parents) reaches an op
+        # outside the region — or m is the term root.
+        if m is root:
+            out_b += _numel(_shape_of(m, memo)) * 4.0
+            continue
+        reach = [m]
+        seen: set = {m}
+        boundary = False
+        while reach and not boundary:
+            u = reach.pop()
+            for p in parents.get(u, ()):
+                if p in region:
+                    continue
+                if p.op in _FUSION_TRANSPARENT_OPS:
+                    if p not in seen:
+                        seen.add(p)
+                        reach.append(p)
+                    continue
+                boundary = True
+                break
+        if boundary:
+            out_b += _numel(_shape_of(m, memo)) * 4.0
+    return in_b, out_b
+
+
 def _fused_cost(
     term: Any,
     memo: dict,
@@ -1608,33 +1969,55 @@ def _fused_cost(
 ) -> float:
     """Inductor-approximation price of *term* (see fused_cost_for).
 
-    One kernel per :func:`fusion_regions` entry: a region costs its
-    *dominant* member's local roofline plus one ``dispatch_s`` — the
-    fused kernel streams external inputs once and writes the output
-    once, so intermediates never touch memory and interior launches
-    vanish.  A region containing a solver op bills ``_SOLVER_FACTOR``
+    One kernel per :func:`fusion_regions` entry.  A region costs
+    ``max(total member FLOPs / peak, region traffic / bandwidth)`` +
+    one ``launch_s``: the fused kernel runs the SUM of its members'
+    arithmetic (fusion removes launches, not FLOPs) and streams
+    :func:`_region_traffic`'s external reads + boundary writes, so
+    intermediates never touch memory.  The whole graph pays a single
+    ``dispatch_s`` — compilation removes interior dispatch too; the
+    surviving boundary is the compiled module's own call.  A region
+    containing a solver op additionally bills ``_SOLVER_FACTOR``
     dispatches — the extern ``linalg.solve``/``inv`` call dominates
     any kernel math, the same floor the generic count carries.
     """
     if not isinstance(term, Op):
         return 0.0
-    dispatch_ns = dispatch_s * 1e9
+    regions = fusion_regions(term, memo)
+    if not regions:
+        return 0.0
+    # parent edges over the op-DAG (skipping folded param subtrees —
+    # they are kernel inputs, not consumers) — used to find each
+    # member's boundary-crossing outputs.
+    parents: dict = {}
+    seen_dag: set = set()
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        if not isinstance(t, Op) or t in seen_dag:
+            continue
+        seen_dag.add(t)
+        if _folds_to_param(t, None, memo):
+            continue
+        for a in t.args:
+            if isinstance(a, Op):
+                parents.setdefault(a, []).append(t)
+                stack.append(a)
     total = 0.0
-    for region in fusion_regions(term, memo):
-        dom = 0.0
+    for region in regions:
+        flops = 0.0
         solver = False
         for t in region:
-            local = _local_roofline(
-                t,
-                memo,
-                peak_flops=peak_flops,
-                peak_bw=peak_bw,
-                launch_s=launch_s,
-            )
-            if local > dom:
-                dom = local
+            flops += _flops_of(t, memo)
             solver = solver or t.op in _SOLVER_OPS
-        total += dom + (_SOLVER_FACTOR if solver else 1.0) * dispatch_ns
+        in_b, out_b = _region_traffic(region, parents, term, memo)
+        kernel_s = max(flops / peak_flops, (in_b + out_b) / peak_bw)
+        total += (
+            kernel_s * 1e9
+            + launch_s * 1e9
+            + (_SOLVER_FACTOR if solver else 0.0) * dispatch_s * 1e9
+        )
+    total += dispatch_s * 1e9
     return float(total)
 
 
@@ -1644,23 +2027,26 @@ def fused_cost_for(profile: Any = None) -> CostFn:
     One predicted kernel per :func:`fusion_regions` region: a maximal
     connected pointwise cluster (``_FUSION_POINTWISE_OPS`` — elementwise
     bindings plus the pointwise carrier bodies ``affd_compose``/
-    ``applyd``/``om[d]_compose``/``om[d]_apply``) priced at the
-    region's dominant member — ``max`` of the members' local
-    rooflines, not the sum: a fused kernel streams the external
-    inputs once and writes the output once, so intermediates never
-    touch memory and interior launches vanish.  Non-fusible ops
-    (matmul/conv/sdpa, reductions, materialising layout ops, the
-    solver ops ``trace``/``inv``, the contraction-bearing carrier ops)
-    are region singletons priced at their own local roofline; solver
-    singletons additionally bill ``_SOLVER_FACTOR`` dispatches (the
-    extern solve dwarfs launch overheads — the same floor the generic
-    count carries).  Transparent plumbing (views, carrier packaging)
-    emits no kernel; param-only folds are kernel inputs.  Every
-    surviving kernel additionally pays one ``dispatch_s`` (the
-    profile's ``dispatch_us``, else the launch constant): compilation
-    removes launches, not the dispatch boundary — without it a lone
-    GEMM would always look cheaper compiled than generic, and it
-    isn't; fusion cannot shrink one kernel.
+    ``applyd``/``om[d]_compose``/``om[d]_apply``) priced at
+    ``max(Σ member FLOPs / peak, region traffic / bandwidth)`` — the
+    kernel runs every member's arithmetic (fusion removes launches,
+    not FLOPs) and streams its external reads + boundary writes once,
+    so intermediates never touch memory and interior launches vanish
+    (:func:`_region_traffic` — the fix for dominant-member pricing
+    undercharging a region whose members read different externals).
+    Non-fusible ops (matmul/conv/sdpa, reductions, materialising
+    layout ops, the solver ops ``trace``/``inv``, the
+    contraction-bearing carrier ops) are region singletons priced the
+    same way; solver singletons additionally bill ``_SOLVER_FACTOR``
+    dispatches (the extern solve dwarfs launch overheads — the same
+    floor the generic count carries).  Transparent plumbing (views,
+    carrier packaging) emits no kernel; param-only folds are kernel
+    inputs.  Each region pays one ``launch_s`` and the whole graph one
+    ``dispatch_s`` (the profile's ``dispatch_us``, else the launch
+    constant): compilation removes launches and interior dispatch —
+    the surviving boundary is the compiled module's own call.  Without
+    that floor a lone GEMM would always look cheaper compiled than
+    generic, and it isn't; fusion cannot shrink one kernel.
 
     Non-additive: the region partition is a whole-DAG property (see
     :func:`fusion_regions`), so under ``extract_best``/``dag_cost``'s
@@ -1669,10 +2055,10 @@ def fused_cost_for(profile: Any = None) -> CostFn:
 
     Deliberately approximate: real fusion decisions are
     scheduler-dependent (rematerialise vs reuse, reduction splits,
-    layout constraints), and charging the dominant member underprices
-    a region whose members read *different* large externals.  That is
-    the honest part of the model — pointwise fusion is where the
-    measured win lives.
+    layout constraints), and a big fused kernel may also spill
+    intermediates the register file can't hold — the traffic model
+    bills boundary crossings only.  That is the honest part of the
+    model — pointwise fusion is where the measured win lives.
 
     Units are nanoseconds, matching :func:`roofline_cost`; the closure
     has the standard ``fn(term, memo=None)`` signature.
