@@ -102,3 +102,21 @@ Cells: matrix chain k∈{4,8,16} (win regime), retnet/gla T∈{128,512}
   gap the additive cost decomposition can't express.
 - Measured: retnet T=128 `optimize_model` → `lowering="batched"`,
   2.87x vs eager, fp64-exact.  LinearRecurrence likewise.
+
+## Scale findings (T=2048, measured on CPU)
+
+- retnet T=2048: `optimize_model` 215.8s pipeline → batched module,
+  fp64-exact, 1.04ms vs eager 7.03ms (6.8x).  Inductor compiled the
+  same shape in 45.4s → 0.256ms — still faster at runtime; CatOpt's
+  pipeline is slower than Inductor's compile where Inductor succeeds.
+- GLA T=2048: `optimize_model` 262.6s → batched, fp64-exact, runtime
+  parity with eager (10.47 vs 10.21ms).  Inductor does not compile
+  this shape at all (>60s wall) — the only schedule produced is
+  CatOpt's.
+- Composed path (`compile=True` on the delivered batched module):
+  retnet T=128 0.122ms vs eager 0.482ms — 3.9x, within ~2x of
+  Inductor-on-eager (0.056ms).
+- Honest framing: verified program reachability + certified
+  equivalence where the baseline can't produce code — not a
+  universal speedup claim.  Pipeline scalability (spine walk +
+  saturation at large T) is the open engineering cost.
