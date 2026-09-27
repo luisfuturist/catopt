@@ -561,14 +561,35 @@ def run_cell(
             h = fn(x32[t], h).clone()
         return torch.allclose(h, ref32, **gate_tol)
 
-    def _gate_chunk(fn) -> bool:
+    def _run_chunk(fn) -> torch.Tensor:
         h_c = h0_32
         for t0_ in range(0, N, C):
             out = fn(x32[t0_ : t0_ + C], h_c)
             # graph replay returns the static out buffer — clone
             # before it is overwritten by the next call.
             h_c = out.clone() if fn is g_chunk32 else out
-        return torch.allclose(h_c, ref32, **gate_tol)
+        return h_c
+
+    def _gate_chunk(fn) -> bool:
+        return torch.allclose(_run_chunk(fn), ref32, **gate_tol)
+
+    def _gate_chunk_carrier(fn) -> bool:
+        """Gate for reassociating carriers (batched compose trees).
+
+        The elementwise fp32-vs-eager32 gate demands two independent
+        ~1e-5-noise fp32 paths coincide — below the noise floor of
+        non-contracting recurrences (delta's ``I−βkkᵀ`` has
+        eigenvalue 1: injected rounding never contracts and
+        random-walks to ~1e-4 over a decode — measured).  Check the
+        carrier's fp32 error vs fp64 TRUTH is at parity with eager's
+        own fp32 error (×2 margin), which is the well-posed test of
+        "noise at the recurrence's intrinsic floor".
+        """
+        h_c = _run_chunk(fn)
+        ref64_32 = ref64.to(h_c.dtype)
+        eager_err = (ref32 - ref64_32).abs().max()
+        carrier_err = (h_c - ref64_32).abs().max()
+        return bool(carrier_err <= 2.0 * eager_err)
 
     dropped: dict[str, str] = {}
     with torch.no_grad():
@@ -580,7 +601,9 @@ def run_cell(
             cell["step_opt_error"] = f"fp32: {type(e).__name__}: {e}"
         try:
             if chunk_opt32 is not None:
-                checks["catopt_chunk"] = _gate_chunk(chunk_opt32)
+                checks["catopt_chunk"] = _gate_chunk_carrier(
+                    chunk_opt32
+                )
         except Exception as e:
             chunk_opt32 = None
             cell["chunk_opt_error"] = f"fp32: {type(e).__name__}: {e}"
@@ -592,7 +615,7 @@ def run_cell(
             ("inductor_ro", cstep_ro32, _gate_step_ro),
             ("catopt_step_ind", copt_step32, _gate_step),
             ("inductor_chunk", cchunk32, _gate_chunk),
-            ("catopt_chunk_ind", copt_chunk32, _gate_chunk),
+            ("catopt_chunk_ind", copt_chunk32, _gate_chunk_carrier),
         ):
             if fn is None:
                 continue
