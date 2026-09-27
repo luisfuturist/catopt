@@ -71,6 +71,7 @@ from catopt_torch.report import (
 )
 
 from catopt_optimize.criteria import criteria_cost
+from catopt_optimize.runners import GenericRunner, Runner
 
 #: Rules whose saturation closure is combinatorially explosive on
 #: stacked blocks: the pure-symmetry monoid laws enumerate every
@@ -546,8 +547,7 @@ def optimize_model(
     ops: OpTable | None = None,
     source: Source | None = None,
     sink: Sink | None = None,
-    compile: bool = False,
-    cuda_graph: bool = False,
+    runner: Runner | None = None,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -618,21 +618,21 @@ def optimize_model(
         (:func:`catopt_core.cost.backend_cost`), so the optimizer only
         commits to forms the sink can lower.  Takes precedence over
         ``ops``.
-    compile : bool
-        Wrap the lowered module in ``torch.compile`` — delivers the
-        fused executor the ``"compiled"`` lowering prices
-        (:func:`catopt_core.cost.fused_cost_for`).  Falls back to the
-        uncompiled module if compilation fails at first call;
-        ``stats["compiled"]`` records which ran.
-    cuda_graph : bool
-        Capture the delivered module into a CUDA graph — collapses
-        the carrier's per-level launches into one replayable graph
-        (measured ~2.4x on the batched scan).  Only applies when the
-        delivered module is a batched carrier executor and inputs are
-        CUDA; degrades quietly otherwise.  Compile-free alternative
-        to ``compile=True`` — when both are set the compiled module
-        wins and capture is skipped.  ``stats["cuda_graph"]``
-        records which ran.
+    runner : Runner, optional
+        Delivery-stage object deciding HOW the lowered executor is
+        executed — see :mod:`catopt_optimize.runners`
+        (:class:`GenericRunner` identity, :class:`CompiledRunner`
+        ``torch.compile``, :class:`CudaGraphRunner` CUDA-graph
+        capture, :class:`ChainedRunner` left-to-right composition —
+        e.g. ``ChainedRunner([CompiledRunner(), CudaGraphRunner()])``
+        compiles first, then defers capture to the compile's
+        outcome).  Applied once to the routed executor;
+        ``stats["runner"]`` records its name (a list of member names
+        for a chain) and the runner writes its own outcome keys
+        (``stats["compiled"]``, ``stats["cuda_graph"]``).  ``None``
+        delivers the module as lowered (:class:`GenericRunner`).
+        Duck-typed — any object with ``name`` and
+        ``apply(module, example_input, stats)`` conforms.
     verbose : bool
         Print progress.
 
@@ -669,6 +669,11 @@ def optimize_model(
     # Backend-relative pricing: members using an op the sink cannot
     # lower price at +inf, so extraction never commits to one.
     cost_fn = backend_cost(cost_fn, sink.supported_ops)
+
+    # Delivery runner — the only execution control: None ships the
+    # routed executor as lowered (GenericRunner).
+    if runner is None:
+        runner = GenericRunner()
 
     # Recursive walks (extraction, member resolution) descend the
     # e-class DAG, whose depth grows with the saturation closure —
@@ -806,7 +811,11 @@ def optimize_model(
     # Coordinated carrier selection: a batched-executor win is a
     # whole-spine property the additive extraction can't price.
     best_term = _carrier_upgrade(
-        eg, root_eid, best_term, cost_fn, compiled=compile
+        eg,
+        root_eid,
+        best_term,
+        cost_fn,
+        compiled=bool(getattr(runner, "delivers_compiled", False)),
     )
     # Causal specialization: a param-only attn_mask that evaluates to a
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
@@ -841,46 +850,20 @@ def optimize_model(
         if getattr(optimized_module, "is_batched", False)
         else "generic"
     )
-    if compile:
-        # Deliver the fused lowering: torch.compile wraps whichever
-        # executor routing produced (IRModule or a batched carrier).
-        # Compile failures surface at first call — verify once here
-        # and keep the uncompiled module on failure.
-        try:
-            compiled = torch.compile(optimized_module)
-            compiled(example_input)
-            optimized_module = compiled
-            stats["compiled"] = True
-        except Exception:
-            stats["compiled"] = False
-    if cuda_graph and not stats.get("compiled"):
-        # Compile-free deployment path: capture the batched carrier's
-        # per-level launches into one replayable graph.  Only batched
-        # executors expose capture_cuda_graph; generic IRModules and
-        # compiled wrappers degrade quietly.  Shape is baked at
-        # capture; mismatched calls fall back to eager internally.
-        stats["cuda_graph"] = False
-        ex = (
-            example_input[0]
-            if isinstance(example_input, (tuple, list))
-            else example_input
-        )
-        if (
-            isinstance(ex, torch.Tensor)
-            and ex.is_cuda
-            and hasattr(optimized_module, "capture_cuda_graph")
-        ):
-            try:  # pragma: no cover — CUDA-only body; the
-                # requires_cuda test exercises it on GPU.
-                xs = (
-                    tuple(example_input)
-                    if isinstance(example_input, (tuple, list))
-                    else (example_input,)
-                )
-                optimized_module.capture_cuda_graph(*xs)
-                stats["cuda_graph"] = True
-            except Exception:  # pragma: no cover — CUDA-only
-                optimized_module.drop_cuda_graph()
+    # Delivery: the runner decides how the routed executor ships —
+    # identity (generic), torch.compile, CUDA-graph capture, or a
+    # left-to-right composition.  stats["runner"] records the name
+    # (member-name list for a chain); runners write their own outcome
+    # keys (stats["compiled"], stats["cuda_graph"]).
+    runner_names = getattr(runner, "names", None)
+    stats["runner"] = (
+        list(runner_names)
+        if runner_names is not None
+        else getattr(runner, "name", type(runner).__name__)
+    )
+    optimized_module = runner.apply(
+        optimized_module, example_input, stats
+    )
 
     # Verify semantic equivalence
     if verbose:

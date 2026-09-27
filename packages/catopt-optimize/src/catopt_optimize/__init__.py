@@ -14,11 +14,25 @@ from catopt_optimize.optimize import (
     optimize_compositional,
     optimize_model,
 )
+from catopt_optimize.runners import (
+    ChainedRunner,
+    CompiledRunner,
+    CudaGraphRunner,
+    GenericRunner,
+    Runner,
+    runner_candidate,
+)
 
 __all__ = [
+    "ChainedRunner",
+    "CompiledRunner",
+    "CudaGraphRunner",
+    "GenericRunner",
     "OptimizationResourceError",
+    "Runner",
     "criteria_cost",
     "optimize_compositional",
     "optimize_model",
     "optimize_model_autotuned",
+    "runner_candidate",
 ]

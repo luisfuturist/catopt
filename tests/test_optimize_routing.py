@@ -14,6 +14,11 @@ from catopt.cost import flops_cost
 from catopt.ir import IR, Op, Param, TensorType, Var
 from catopt.torch_bridge import ir_to_torch_module
 from catopt_optimize.optimize import _lower_extracted
+from catopt_optimize.runners import (
+    ChainedRunner,
+    CompiledRunner,
+    CudaGraphRunner,
+)
 from catopt_torch.adapters import TorchSink
 
 
@@ -137,8 +142,8 @@ def test_plain_term_routes_to_sink_lower():
 
 
 def test_optimize_model_compile_delivers_fused_module():
-    """compile=True wraps the routed module in torch.compile and
-    verifies output; stats records what ran."""
+    """runner=CompiledRunner() wraps the routed module in
+    torch.compile and verifies output; stats records what ran."""
     from catopt.optimize import optimize_model
 
     torch.manual_seed(0)
@@ -148,7 +153,9 @@ def test_optimize_model_compile_delivers_fused_module():
     x = torch.rand(4, 8)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(m, x, verbose=False, compile=True)
+        mod, stats = optimize_model(
+            m, x, verbose=False, runner=CompiledRunner()
+        )
     assert stats["compiled"] is True
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
@@ -171,7 +178,9 @@ def test_optimize_model_compile_failure_falls_back(monkeypatch):
             raise RuntimeError("no compiler")
 
         monkeypatch.setattr(O.torch, "compile", boom)
-        mod, stats = O.optimize_model(m, x, verbose=False, compile=True)
+        mod, stats = O.optimize_model(
+            m, x, verbose=False, runner=CompiledRunner()
+        )
     assert stats["compiled"] is False
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
@@ -402,24 +411,25 @@ def test_batched_module_exposes_param_map():
     assert mod._param_map is mod.eval_mod._param_map
 
 
-def test_cuda_graph_flag_noop_on_cpu():
-    """cuda_graph=True on a CPU input: stats records False, module
-    is unchanged — the flag is a no-op off-CUDA."""
+def test_cuda_graph_runner_noop_on_cpu():
+    """runner=CudaGraphRunner() on a CPU input: stats records False,
+    module is unchanged — the runner is a no-op off-CUDA."""
     from catopt.models import LinearRecurrence
     from catopt.optimize import optimize_model
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
     x = torch.rand(8, 4, dtype=torch.float64)
     with torch.no_grad():
-        mod, stats = optimize_model(m, x, verbose=False,
-                                    cuda_graph=True)
+        mod, stats = optimize_model(
+            m, x, verbose=False, runner=CudaGraphRunner()
+        )
     assert stats.get("cuda_graph") is False
     with torch.no_grad():
         assert torch.allclose(mod(x), m(x))
 
 
 def test_cuda_graph_skipped_when_compiled():
-    """compile=True + cuda_graph=True: the compiled module wins —
+    """[CompiledRunner, CudaGraphRunner]: the compiled module wins —
     capture is not attempted on it (no capture attr)."""
     from catopt.models import LinearRecurrence
     from catopt.optimize import optimize_model
@@ -428,7 +438,10 @@ def test_cuda_graph_skipped_when_compiled():
     x = torch.rand(8, 4, dtype=torch.float64)
     with torch.no_grad():
         mod, stats = optimize_model(
-            m, x, verbose=False, compile=True, cuda_graph=True
+            m,
+            x,
+            verbose=False,
+            runner=ChainedRunner([CompiledRunner(), CudaGraphRunner()]),
         )
     if stats.get("compiled"):
         assert stats.get("cuda_graph") is None
@@ -445,13 +458,13 @@ def test_cuda_graph_tuple_input_noop_on_cpu():
     with torch.no_grad():
         # tuple input that isn't CUDA → no capture, no crash
         mod, stats = optimize_model(
-            m, (x,), verbose=False, cuda_graph=True
+            m, (x,), verbose=False, runner=CudaGraphRunner()
         )
     assert stats.get("cuda_graph") is False
 
 
 def test_delivered_cost_compiled_prices_fusion_regions():
-    """compile=True: every candidate prices under the fusion-region
+    """compiled=True: every candidate prices under the fusion-region
     model — a 128-leaf pointwise spine bills ~1 kernel, not per-node."""
     from catopt.cost import executor_cost_for
     from catopt_optimize.optimize import _delivered_cost

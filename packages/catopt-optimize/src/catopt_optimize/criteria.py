@@ -58,7 +58,7 @@ def _axis_fns(profile: Any) -> dict[str, CostFn]:
       latency; rewards parallel structure a sequential chain hides.
     * ``"compiled"`` — :func:`fused_cost_for`: Inductor-style
       fusion-region pricing — the axis that sees what
-      ``compile=True`` buys.
+      ``runner=CompiledRunner()`` buys.
     """
     return {
         "latency": executor_cost_for(profile, lowering="generic"),

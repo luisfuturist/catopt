@@ -32,16 +32,16 @@ Built-in candidate names (see :data:`CANDIDATE_BUILDERS`):
     The pipeline's executor routing — ``_lower_extracted``: the
     level-batched carrier executor when the extracted root plans
     one, a plain ``IRModule`` otherwise.  This is exactly what
-    ``optimize_model(compile=False)`` returns.
+    ``optimize_model()`` returns.
 ``compiled``
     ``torch.compile`` over the routed executor — what
-    ``optimize_model(compile=True)`` returns.
+    ``optimize_model(runner=CompiledRunner())`` returns.
 ``compiled_generic``
     ``torch.compile`` over the serial ``IRModule``.
 ``cuda_graph``
     A fresh routed executor captured into a CUDA graph — what
-    ``optimize_model(cuda_graph=True)`` delivers.  Needs a CUDA
-    example input and a capture-capable executor; otherwise the
+    ``optimize_model(runner=CudaGraphRunner())`` delivers.  Needs a
+    CUDA example input and a capture-capable executor; otherwise the
     candidate records ``status="unavailable"``.
 ``eager``
     The original model, unchanged.  Always verifies (it is the
@@ -149,7 +149,7 @@ def _build_batched(ctx: AutotuneContext) -> Any:
 
 def _build_compiled(ctx: AutotuneContext) -> Any:
     """``torch.compile`` over the routed executor — the
-    ``optimize_model(compile=True)`` delivery.
+    ``optimize_model(runner=CompiledRunner())`` delivery.
 
     Always a FRESH module: ``torch.compile`` rewrites the module's
     ``forward`` attribute (dynamo dispatch), so compiling
@@ -201,8 +201,9 @@ def _capture_routed(  # pragma: no cover — CUDA-only body
 
 
 def _build_cuda_graph(ctx: AutotuneContext) -> Any:
-    """``cuda_graph`` candidate — ``optimize_model(cuda_graph=True)``
-    semantics on a fresh module (see :func:`_capture_routed`)."""
+    """``cuda_graph`` candidate — ``optimize_model(runner=
+    CudaGraphRunner())`` semantics on a fresh module (see
+    :func:`_capture_routed`)."""
     if not _input_is_cuda(ctx.example_input):
         raise CandidateUnavailableError(
             "cuda_graph needs a CUDA example input"
@@ -385,9 +386,10 @@ def optimize_model_autotuned(
         Print progress.
     **optimize_kwargs
         Forwarded to :func:`optimize_model` (``ruleset``,
-        ``max_iterations``, ``ops``, …).  ``compile`` /
-        ``cuda_graph`` are popped — compilation and graph capture
-        are candidates here, not preset pipeline flags.
+        ``max_iterations``, ``ops``, ``runner``, …).  Compilation
+        and graph capture are candidates here, not presets — pass
+        ``runner`` only to decorate the pipeline's own delivered
+        module, not as a substitute candidate.
 
     Returns
     -------
@@ -401,8 +403,6 @@ def optimize_model_autotuned(
         ``error``), ``fallback``, ``search_s``, ``elapsed_s``.
     """
     t_start = time.monotonic()
-    optimize_kwargs.pop("compile", None)
-    optimize_kwargs.pop("cuda_graph", None)
     if sink is None:
         sink = cast(Sink, TorchSink(ops=optimize_kwargs.get("ops")))
 
@@ -412,8 +412,6 @@ def optimize_model_autotuned(
         example_input,
         source=source,
         sink=sink,
-        compile=False,
-        cuda_graph=False,
         verbose=verbose,
         **optimize_kwargs,
     )

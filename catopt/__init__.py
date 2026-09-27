@@ -48,6 +48,7 @@ _ALIAS = {
     "catopt.regime": "catopt_optimize.regime",
     "catopt.report": "catopt_torch.report",
     "catopt.rulecache": "catopt_core.rulecache",
+    "catopt.runners": "catopt_optimize.runners",
     "catopt.scan_lower": "catopt_carriers.scan_lower",
     "catopt.torch_bridge": "catopt_torch.torch_bridge",
     "catopt.trace": "catopt_carriers.trace",
@@ -117,6 +118,14 @@ with _suppress(ModuleNotFoundError):  # partial install only
 with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_optimize.criteria import criteria_cost
     from catopt_optimize.optimize import optimize_model
+    from catopt_optimize.runners import (
+        ChainedRunner,
+        CompiledRunner,
+        CudaGraphRunner,
+        GenericRunner,
+        Runner,
+        runner_candidate,
+    )
 with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_torch.adapters import TorchSink, TorchSource
 with _suppress(ModuleNotFoundError):  # partial install only
@@ -136,14 +145,19 @@ __all__ = [
     "SIMPLIFICATION_RULES",
     "BatchedOmdModule",
     "Binding",
+    "ChainedRunner",
+    "CompiledRunner",
     "Const",
     "CostModel",
+    "CudaGraphRunner",
     "EGraph",
     "ENode",
+    "GenericRunner",
     "IRModule",
     "Op",
     "Param",
     "Rewrite",
+    "Runner",
     "Sink",
     "Source",
     "TensorType",
@@ -160,5 +174,6 @@ __all__ = [
     "ir_to_torch_module",
     "is_omd_apply_term",
     "optimize_model",
+    "runner_candidate",
     "to_batched_omd_module",
 ]

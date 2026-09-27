@@ -28,16 +28,39 @@ from catopt.optimize import optimize_model
 opt, report = optimize_model(model, example_input)
 out = opt(x)          # equivalent to model(x), certificate-backed
 
-opt, report = optimize_model(model, example_input, compile=True)
+from catopt_optimize import (
+    CompiledRunner, CudaGraphRunner, ChainedRunner,
+)
+
+opt, report = optimize_model(
+    model, example_input, runner=CompiledRunner()
+)
 # ^ torch.compile wraps the delivered module; report["compiled"]
 
-opt, report = optimize_model(model, example_input, cuda_graph=True)
-# ^ capture the batched carrier as a CUDA graph; report["cuda_graph"]
+opt, report = optimize_model(
+    model, example_input, runner=CudaGraphRunner()
+)
+# ^ captures the delivered carrier into a CUDA graph;
+#   report["cuda_graph"] — compile-free, works without Inductor
+
+opt, report = optimize_model(
+    model, example_input,
+    runner=ChainedRunner([CompiledRunner(), CudaGraphRunner()]),
+)
+# ^ runners compose left-to-right; duck-typed Protocol so custom
+#   runners drop in. report["runner"] records what ran
 
 from catopt_optimize import optimize_model_autotuned
 opt, report = optimize_model_autotuned(model, example_input)
 # ^ builds verified candidates per lowering, times them on the real
 #   input, returns the measured winner — picks honest about losses
+
+opt, report = optimize_model(
+    model, example_input,
+    criteria={"latency": 1.0, "memory": 0.5},
+)
+# ^ extraction priced by a named-axis blend (criteria_cost) —
+#   report["criteria"] records the priced axes
 ```
 
 Deep stacks use `optimize_compositional`, which optimizes each block
@@ -90,7 +113,7 @@ All rows verified semantically equivalent (fp64 where stated); RTX
 | FLOP reduction (reassociation, weight merging, factorization) | DeepParallel b=4096 | 2.51× GPU / 3.02× CPU |
 | Asymptotic reassociation | `(QKᵀ)V → Q(KᵀV)`: O(T²d)→O(Td²) | 8.0× at T=2048 |
 | Weights-first fold (k-deep chain → 1 GEMM) | `x @ W₁@…@W₁₆` — Inductor's post-grad graph keeps all k `mm`s | 15.9× vs Inductor GPU, k=16 |
-| Scan lift on real blocks | RetNet/GLA/delta-rule — `optimize_model` selects + delivers the carrier | 3× vs eager CPU+GPU at T=128; 3.9× composed (`compile=True`); the only schedule produced at GLA T=2048 |
+| Scan lift on real blocks | RetNet/GLA/delta-rule — `optimize_model` selects + delivers the carrier | 3× vs eager CPU+GPU at T=128; 3.9× composed (`CompiledRunner`); the only schedule produced at GLA T=2048 |
 | Attention fold | `softmax(masked_fill(qkᵀ·s)) @ v` → `sdpa(is_causal)` | 4.6× vs eager, 2.5× under Inductor (nanoGPT, T=2048) |
 | Parallel-scan discovery | LTI recurrence → balanced Blelloch tree | 6.3× CUDA-graph, T=64 |
 | Diagonal-affine scan | `a⊙h + b⊙x` (Mamba-faithful) | 4.4× CUDA-graph, T=64 |
@@ -116,7 +139,7 @@ Measured, including the losses:
 | Conv pairing | Wins — Inductor never fuses cuDNN calls |
 | GEMM pairing on transformer blocks | Parity — ~40 non-GEMM kernels/layer dilute it |
 | Real trained checkpoints (stories15M/110M) | Parity — all blocks transform and verify, no win at these sizes |
-| Scan lift on linear-attention blocks | 3× vs eager delivered end-to-end; 3.9× composed with `compile=True`; loses to a compiled Inductor where it can compile |
+| Scan lift on linear-attention blocks | 3× vs eager delivered end-to-end; 3.9× composed with `CompiledRunner`; loses to a compiled Inductor where it can compile |
 | Inductor compile wall on unrolled recurrences | Inductor's compile grows superlinearly in T (54–85s at T=2048; GLA T=2048 exceeds 60s timeout). CatOpt produces a certified O(log T) schedule there — but its own pipeline is slower than Inductor's compile where Inductor succeeds (262s at T=2048) |
 | Launch-bound decode cells (B=1, T≤64) | Loses 4–15% — split-view copies cost more than saved launches |
 | Chunked decode on GPU (`decode_scan_bench`) | Carrier loses uncompiled (executor dispatch); **wins 1.65–2.8× CUDA-graphed** — the schedule amortizes to zero launches where Inductor's fused chunk still pays one per call |
