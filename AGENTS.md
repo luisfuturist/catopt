@@ -96,15 +96,11 @@ all `ALL_RULES` patterns.  The shared strategies live in
     tests/test_property_cost.py tests/test_property_laws.py
 ```
 
-One property is `xfail(strict=False)` because it documents a real
-limitation: `EGraph.rebuild` dedups enodes *within* a class but does not
-close congruence *across* classes that become identical after child
-canonicalisation (a full congruence closure is a core-engine change with
-broad blast radius; the graph is sound but incomplete, and re-adding the
-term closes it).  The other former xfail — asymmetric cost under
-operand swap with an unknown shape — is fixed.  Do not "fix" the
-remaining one by weakening the test; either implement congruence closure
-in `rebuild` or keep the documented xfail.
+No properties are xfailed: both former xfails are fixed.  The
+commutative unknown-shape cost fallback in `_infer_op_shape` is
+symmetric, and `EGraph.rebuild` now closes congruence across classes —
+enodes that become identical after child canonicalisation are unioned
+(see `_close_congruence`), to a fixed point.
 
 ## Static analysis & security
 

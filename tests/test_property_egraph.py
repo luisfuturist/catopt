@@ -10,7 +10,6 @@ from __future__ import annotations
 import math
 
 import hypothesis.strategies as st
-import pytest
 from catopt_core.cost import count_cost, flops_cost
 from catopt_core.egraph import EGraph
 from catopt_core.ir import Op, TensorType, Var, op_repr
@@ -106,14 +105,6 @@ def test_saturated_extraction_never_costs_more_than_input(t):
     assert count_cost(best) <= count_cost(t) + 1
 
 
-@pytest.mark.xfail(
-    reason=(
-        "EGraph.rebuild dedups enodes WITHIN a class but does not merge "
-        "two distinct classes that become structurally identical after "
-        "child canonicalisation (standard e-graph congruence closure)"
-    ),
-    strict=False,
-)
 def test_rebuild_merges_congruent_classes():
     x = Var("x", TensorType((2, 3)))
     y = Var("y", TensorType((2, 3)))

@@ -628,13 +628,17 @@ class EGraph(_ExtractMixin, _ProofMixin):
         the classes the dirty frontier just searched (plus the ones
         dirtied while searching).  An unrestricted pass is still
         available — and used once at the end of :meth:`run` — for
-        callers that mutate the graph outside the saturation loop.
+        callers that mutate the graph outside the saturation loop; it
+        also closes congruence (see :meth:`_close_congruence`).
         """
+        if classes is not None:
+            return self._canonicalise(classes)
+        changed = self._canonicalise(list(self._classes.keys()))
+        return self._close_congruence() or changed
+
+    def _canonicalise(self, ids: Any) -> bool:
+        """Re-canonicalize each class's enode children (one pass)."""
         changed = False
-        if classes is None:
-            ids: Any = list(self._classes.keys())
-        else:
-            ids = classes
         seen: set[int] = set()
         for eid0 in ids:
             eid = self.find(eid0)
@@ -681,6 +685,36 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 eclass.nodes = new_nodes
                 eclass.by_op = None
         return changed
+
+    def _close_congruence(self) -> bool:
+        """Union e-classes whose canonical enodes coincide.
+
+        Congruence: two enodes that are identical after child
+        canonicalisation must share a class.  ``union`` merges them and
+        can make further children canonical, so iterate to a fixed
+        point.  Only the unrestricted :meth:`rebuild` calls this; the
+        incremental (dirty-frontier) pass relies on the final
+        unrestricted rebuild to reach the fixed point.
+        """
+        changed = False
+        while True:
+            owner: dict[ENode, int] = {}
+            merge: tuple[int, int] | None = None
+            for eid in list(self._classes.keys()):
+                if self.find(eid) != eid:
+                    continue
+                for node in self._classes[eid].nodes:
+                    prev = owner.setdefault(node, eid)
+                    if self.find(prev) != self.find(eid):
+                        merge = (prev, eid)
+                        break
+                if merge is not None:
+                    break
+            if merge is None:
+                return changed
+            changed = True
+            self.union(*merge)
+            self._canonicalise(list(self._classes.keys()))
 
     # -- rule application --
 
