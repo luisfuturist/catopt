@@ -13,6 +13,7 @@ The main entry point is :func:`optimize_model`.
 from __future__ import annotations
 
 import copy
+import logging
 import sys
 import time
 from collections.abc import Callable
@@ -94,6 +95,8 @@ from catopt_optimize.runners import GenericRunner, Runner
 #: Measured on stacked ParallelBlocks (the model that motivated
 #: ``optimize_compositional``): identical extracted cost at every
 #: budget ≥ 512 while saturation drops from minutes to ~1s.
+logger = logging.getLogger("catopt_optimize.optimize")
+
 _EXPANSIVE_RULES = frozenset(
     {
         # monoid symmetries
@@ -1234,21 +1237,36 @@ def optimize_compositional(
         if isinstance(example_input, tuple)
         else (example_input,)
     )
-    try:
-        vr = verify_module(model, new_model, args)
+    if in_place:
+        # new_model IS the input model — a verify would be a
+        # self-comparison that always reports 0.0.  Record the
+        # degenerate case honestly instead of a false pass.
         report.end_to_end = {
-            "max_abs_diff": vr.max_abs,
-            "max_rel_diff": vr.max_rel,
+            "skipped": "in_place",
+            "reason": "deepcopy failed — returned model is the "
+            "input module, unmodified",
         }
-        if verbose:
-            print(
-                f"[Compositional] end-to-end rel diff: "
-                f"{report.end_to_end['max_rel_diff']:.3e}"
-            )
-    except Exception as e:
-        report.end_to_end = {"error": f"{type(e).__name__}: {e}"}
-        if verbose:
-            print(f"[Compositional] end-to-end check failed: {e}")
+        logger.warning(
+            "optimize_compositional: clone failed — returning the "
+            "input module unmodified (no blocks grafted; "
+            "report.in_place=True)"
+        )
+    else:
+        try:
+            vr = verify_module(model, new_model, args)
+            report.end_to_end = {
+                "max_abs_diff": vr.max_abs,
+                "max_rel_diff": vr.max_rel,
+            }
+            if verbose:
+                print(
+                    f"[Compositional] end-to-end rel diff: "
+                    f"{report.end_to_end['max_rel_diff']:.3e}"
+                )
+        except Exception as e:
+            report.end_to_end = {"error": f"{type(e).__name__}: {e}"}
+            if verbose:
+                print(f"[Compositional] end-to-end check failed: {e}")
 
     report.wall_time_s = time.time() - t_start
     return new_model, report.to_dict()

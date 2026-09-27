@@ -170,3 +170,25 @@ def test_compositional_fallback_keeps_original():
         d = (model(x.clone()) - opt(x.clone())).abs().max().item()
     assert d < 1e-4
     assert stats["end_to_end"]["max_rel_diff"] < 1e-4
+
+
+def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
+    """When deepcopy fails (e.g. OOM), the returned model is the INPUT
+    unmodified — the report must say so, not run a degenerate
+    self-comparison verify."""
+    import catopt_optimize.optimize as O
+    from catopt.optimize import optimize_compositional
+
+    torch.manual_seed(0)
+    model = MiniGPT(dim=32, n_heads=2, depth=1, hidden_mult=2).eval()
+    x = torch.randn(1, 8, 32)
+
+    def boom(_m):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(O.copy, "deepcopy", boom)
+    opt, stats = optimize_compositional(model, x, verbose=False)
+    assert opt is model  # same object — nothing grafted
+    assert stats["in_place"] is True
+    assert stats["n_optimized"] == 0
+    assert stats["end_to_end"]["skipped"] == "in_place"
