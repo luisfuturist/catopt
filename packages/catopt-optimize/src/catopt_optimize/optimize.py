@@ -70,6 +70,8 @@ from catopt_torch.report import (
     verify_module,
 )
 
+from catopt_optimize.criteria import criteria_cost
+
 #: Rules whose saturation closure is combinatorially explosive on
 #: stacked blocks: the pure-symmetry monoid laws enumerate every
 #: bracketing/ordering of a summation (Catalan-scale on the residual
@@ -539,6 +541,7 @@ def optimize_model(
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
     cost_fn: CostFn | None = None,
+    criteria: dict[str, float] | None = None,
     symmetry_budget: int | None = 2048,
     ops: OpTable | None = None,
     source: Source | None = None,
@@ -580,6 +583,13 @@ def optimize_model(
         level-batched executors at lowering time rather than priced
         in, because batched cost is non-additive over the spine and
         ``extract_best``'s local-cost decomposition can't see it.
+    criteria : dict[str, float], optional
+        Named cost axes blended into the extraction model — e.g.
+        ``{"latency": 1.0, "memory": 0.5}``; see
+        :func:`catopt_optimize.criteria.criteria_cost`.  Consulted only
+        when ``cost_fn`` is ``None`` — precedence is explicit
+        ``cost_fn`` > ``criteria`` > the default model.
+        ``stats["criteria"]`` records the normalised blend priced.
     symmetry_budget : int, optional
         Per-rule enode budget for the expansive rules in
         ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
@@ -647,7 +657,15 @@ def optimize_model(
     if sink is None:
         sink = TorchSink(ops=ops)
     if cost_fn is None:
-        cost_fn = _default_cost_fn()
+        cost_fn = (
+            criteria_cost(criteria)
+            if criteria is not None
+            else _default_cost_fn()
+        )
+    # Criteria-based selection reports the normalised blend actually
+    # priced (the marker criteria_cost sets) — read before the
+    # backend_cost wrap, which propagates only the billing markers.
+    criteria_used = getattr(cost_fn, "criteria", None)
     # Backend-relative pricing: members using an op the sink cannot
     # lower price at +inf, so extraction never commits to one.
     cost_fn = backend_cost(cost_fn, sink.supported_ops)
@@ -768,6 +786,7 @@ def optimize_model(
         _check_resources(eg, max_enodes, max_memory_mb)
 
     stats["rule_fires"] = dict(eg.rule_fires)
+    stats["criteria"] = criteria_used
     if verbose:
         print(f"  E-graph: {stats}")
 

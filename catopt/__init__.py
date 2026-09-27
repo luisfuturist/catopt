@@ -25,6 +25,7 @@ _ALIAS = {
     "catopt.attrs": "catopt_core.attrs",
     "catopt.calibrate": "catopt_optimize.calibrate",
     "catopt.cost": "catopt_core.cost",
+    "catopt.criteria": "catopt_optimize.criteria",
     "catopt.egraph": "catopt_core.egraph",
     "catopt.egraph.terms": "catopt_core.egraph.terms",
     "catopt.executors": "catopt_torch.executors",
@@ -114,6 +115,7 @@ with _suppress(ModuleNotFoundError):  # partial install only
         to_batched_omd_module,
     )
 with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_optimize.criteria import criteria_cost
     from catopt_optimize.optimize import optimize_model
 with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_torch.adapters import TorchSink, TorchSource
@@ -152,6 +154,7 @@ __all__ = [
     "backend_cost",
     "build_omd_plan",
     "count_cost",
+    "criteria_cost",
     "export_to_ir",
     "flops_cost",
     "ir_to_torch_module",
