@@ -7,9 +7,12 @@ catopt's roofline cost model prices each op as
 whose constants are only honest when measured on the deployment
 target.  ``calibrate()`` measures them where it runs — a timed matmul
 sweep for peak FLOPS, a timed copy/reduction sweep for memory
-bandwidth, a tiny-op loop for eager kernel-launch overhead, and two
+bandwidth, a tiny-op loop for eager kernel-launch overhead, two
 executor-overhead probes (generic-eval dispatch per IR node; per-leaf
-eval for batched-scan executors) — and returns a
+eval for batched-scan executors), and a per-op-class kernel sweep
+(timed torch kernels at representative shapes for the dominant op
+classes — matmul by (M,K,N), pointwise/reduction/concat/stack/
+index_select by element count) — and returns a
 :class:`TargetProfile`.
 
 Profiles round-trip through JSON and persist under
@@ -110,10 +113,21 @@ class TargetProfile:
       (gather/select + elementwise combine) through the executor's
       eval machinery, beyond its kernel time.
 
+    * ``op_kernel_ns`` — measured per-op-class kernel latencies (ns):
+      ``{op_class: {shape_key: measured_ns}}`` where ``op_class`` is
+      one of ``"matmul"`` (``"MxKxN"`` keys), ``"pointwise"``,
+      ``"reduce"``, ``"concat"``, ``"stack"``, ``"index_select"``
+      (element-count keys, decimal strings).  Each value is the
+      median wall time of one eager kernel call at that shape —
+      launch, dispatch and kernel work all inside — which the cost
+      model uses as a floor on its roofline estimate for ops whose
+      shape signature lands near a measured bucket.
+
     ``dispatch_us`` / ``leaf_eval_us`` default to conservative
     fallbacks (``_FALLBACK_DISPATCH_US`` / ``_FALLBACK_LEAF_EVAL_US``),
-    so profiles saved before the probes existed — or built by hand —
-    still price executor overhead honestly.
+    and ``op_kernel_ns`` defaults to ``{}``, so profiles saved before
+    the probes existed — or built by hand — still price executor
+    overhead honestly and fall back to the pure roofline formula.
 
     Feed it to ``catopt_core.cost.roofline_cost_for`` /
     ``depth_cost_for`` — both accept any object with ``tflops`` /
@@ -130,6 +144,7 @@ class TargetProfile:
     meta: dict = field(default_factory=dict)
     dispatch_us: float = _FALLBACK_DISPATCH_US
     leaf_eval_us: float = _FALLBACK_LEAF_EVAL_US
+    op_kernel_ns: dict = field(default_factory=dict)
 
     # -- serialisation ------------------------------------------------
     def to_json(self) -> str:
@@ -459,6 +474,167 @@ def _measure_leaf_eval(
     return max(t_mod - t_ref, 0.0) / iters
 
 
+# ---------------------------------------------------------------------------
+# Per-op-class kernel probes — the shape-dependent kernel table
+# ---------------------------------------------------------------------------
+#
+# The five constants above price an op as max(flops/peak, bytes/bw) +
+# launch — blind to how a real kernel's time actually scales with its
+# shape (BLAS efficiency curves, cache-resident bandwidth, gather
+# costs).  The probes below time the torch kernels themselves at a
+# handful of representative shapes, producing the ``op_kernel_ns``
+# table the cost model consults as a measured floor.
+
+#: Matmul probes as (M, K, N): square GEMMs for the compute-bound
+#: regime plus the skinny-K / wide-M rectangles lowered graphs emit
+#: (row-batched weight products, T-by-d attention shapes).
+_MM_PROBE_FULL = (
+    (128, 128, 128),
+    (512, 512, 512),
+    (1024, 1024, 1024),
+    (128, 64, 64),
+    (512, 64, 64),
+    (2048, 128, 128),
+    (4096, 64, 64),
+    (16384, 64, 64),
+)
+_MM_PROBE_QUICK = (
+    (128, 128, 128),
+    (512, 512, 512),
+    (128, 64, 64),
+    (512, 64, 64),
+    (2048, 128, 128),
+)
+
+#: Element-count probes for the traffic-priced classes.  The range
+#: spans L1-resident to DRAM-resident sizes so the nearest-bucket
+#: lookup sees both the launch floor and the bandwidth regime.
+_EW_PROBE_FULL = (4096, 65536, 262144, 1048576, 4194304, 16777216)
+_EW_PROBE_QUICK = (4096, 1048576, 4194304)
+_REDUCE_PROBE_FULL = (16384, 262144, 1048576, 4194304)
+_REDUCE_PROBE_QUICK = (16384, 1048576)
+_CAT_PROBE_FULL = (16384, 262144, 1048576, 4194304)
+_CAT_PROBE_QUICK = (16384, 1048576)
+_IX_PROBE_FULL = (4096, 16384, 65536, 262144, 1048576)
+_IX_PROBE_QUICK = (4096, 65536)
+
+#: Width of the index_select probe's gather: n indices over a (2n, W)
+#: base read n·W elements — the (T,d)-row gathers scan executors do.
+_IX_PROBE_WIDTH = 64
+
+
+def _kernel_probe(fn, dev: torch.device, quick: bool) -> float:
+    """Median wall-clock NANOSECONDS of one ``fn()`` kernel call.
+
+    Timed like :func:`_timed_median` — ``reps`` median-ed blocks of
+    ``iters`` back-to-back calls — but with the block length adapted
+    to the kernel: a ~ms-timescale op gets a handful of calls per
+    rep, a launch-bound tiny op hundreds, so every block lands in the
+    same few-ms timing window.
+    """
+    reps = 3 if quick else 5
+    for _ in range(2):
+        fn()
+    _sync(dev)
+    t0 = time.perf_counter()
+    fn()
+    _sync(dev)
+    est = time.perf_counter() - t0
+    iters = max(3, min(200, int(3e-3 / max(est, 1e-7))))
+    return _timed_median(fn, dev, reps, iters) * 1e9 / iters
+
+
+def _measure_op_kernels(
+    dev: torch.device, dtype: torch.dtype, quick: bool
+) -> dict:
+    """Measured kernel table: ``{op_class: {shape_key: ns}}``.
+
+    Each probe times the eager torch kernel the IR op lowers to —
+    ``a @ b``, ``x + y``, ``x.sum()``, ``cat``/``stack``,
+    ``index_select`` — so the values carry launch, dispatch and
+    kernel work together, matching what a lowered module actually
+    pays per op.  A failed probe (exotic device, OOM on the largest
+    point) drops its own entry; whatever measures survives — the
+    cost model falls back to the roofline for missing classes.
+
+    The sweep runs with ``torch.set_num_threads(1)``: per-call
+    latency through a serialized executor is what the table prices —
+    the standard timing harness (``torch.utils.benchmark.Timer``,
+    the fidelity bench's measurement) defaults to ``num_threads=1``,
+    and a multithreaded probe under-reports per-op latency by the
+    BLAS thread-scaling factor (~4x on a 12-core box).  The coarse
+    ``tflops``/``gbps`` sweeps keep their multithreaded peaks — those
+    are hardware-headline constants, not per-op latencies.  (The
+    thread pin is a no-op for the CUDA kernel work itself; it only
+    shapes the CPU-side dispatch the wall time includes.)
+    """
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return _op_kernel_sweep(dev, dtype, quick)
+    finally:
+        torch.set_num_threads(prev_threads)
+
+
+def _op_kernel_sweep(
+    dev: torch.device, dtype: torch.dtype, quick: bool
+) -> dict:
+    table: dict[str, dict[str, float]] = {}
+
+    def rec(cls: str, key: str, fn) -> None:
+        try:
+            table.setdefault(cls, {})[key] = _kernel_probe(
+                fn, dev, quick
+            )
+        except Exception:
+            logger.debug("op-kernel probe failed: %s[%s]", cls, key)
+
+    mm_shapes = _MM_PROBE_QUICK if quick else _MM_PROBE_FULL
+    for m, k, n in mm_shapes:
+        a = torch.randn(m, k, device=dev, dtype=dtype)
+        b = torch.randn(k, n, device=dev, dtype=dtype)
+        rec("matmul", f"{m}x{k}x{n}", lambda a=a, b=b: a @ b)
+        del a, b
+
+    ew_numels = _EW_PROBE_QUICK if quick else _EW_PROBE_FULL
+    for n in ew_numels:
+        x = torch.randn(n, device=dev, dtype=dtype)
+        y = torch.randn(n, device=dev, dtype=dtype)
+        rec("pointwise", str(n), lambda x=x, y=y: x + y)
+        del x, y
+
+    rd_numels = _REDUCE_PROBE_QUICK if quick else _REDUCE_PROBE_FULL
+    for n in rd_numels:
+        x = torch.randn(n, device=dev, dtype=dtype)
+        rec("reduce", str(n), lambda x=x: x.sum())
+        del x
+
+    cat_numels = _CAT_PROBE_QUICK if quick else _CAT_PROBE_FULL
+    for n in cat_numels:
+        a = torch.randn(n // 2, device=dev, dtype=dtype)
+        b = torch.randn(n - n // 2, device=dev, dtype=dtype)
+        rec("concat", str(n), lambda a=a, b=b: torch.cat([a, b]))
+        rec("stack", str(n), lambda a=a, b=b: torch.stack([a, b]))
+        del a, b
+
+    ix_numels = _IX_PROBE_QUICK if quick else _IX_PROBE_FULL
+    w = _IX_PROBE_WIDTH
+    for n in ix_numels:
+        n_idx = max(n // w, 1)
+        base = torch.randn(
+            max(2 * n_idx, w), w, device=dev, dtype=dtype
+        )
+        idx = torch.randperm(base.shape[0], device=dev)[:n_idx]
+        rec(
+            "index_select",
+            str(n_idx * w),
+            lambda base=base, idx=idx: base.index_select(0, idx),
+        )
+        del base, idx
+
+    return {cls: entries for cls, entries in table.items() if entries}
+
+
 def _default_name(dev: torch.device) -> str:
     if dev.type == "cuda":
         try:
@@ -481,14 +657,17 @@ def calibrate(
     """Measure the roofline constants of ``device`` (default: cuda if
     available, else cpu) and return a :class:`TargetProfile`.
 
-    Five micro-benchmarks, sized so the whole run takes a few seconds:
+    Six micro-benchmarks, sized so the whole run takes a few seconds:
 
     * peak FLOPS   — square-matmul sweep, best sustained rate;
     * bandwidth    — copy + reduction sweep, best bytes/s;
     * launch cost  — mean wall time of a back-to-back tiny-op loop;
     * dispatch     — median-of-reps difference between an N-op IR chain
       and its inline-torch equivalent, per node;
-    * leaf eval    — same protocol on a scan-leaf-shaped term, per leaf.
+    * leaf eval    — same protocol on a scan-leaf-shaped term, per leaf;
+    * op kernels   — timed torch kernels for the dominant op classes
+      (matmul by (M,K,N); pointwise / reduce / concat / stack /
+      index_select by element count), stored as ``op_kernel_ns``.
 
     ``quick=True`` shrinks the sweeps (for tests / smoke checks) at some
     accuracy cost.  ``save=True`` additionally persists the profile under
@@ -549,6 +728,10 @@ def calibrate(
         launch = _measure_launch(
             dev, dtype, launch_iters, launch_warmup
         )
+        try:
+            op_kernels = _measure_op_kernels(dev, dtype, quick)
+        except Exception:
+            op_kernels = {}
     finally:
         if prev_tf32 is not None:
             with contextlib.suppress(Exception):
@@ -602,6 +785,7 @@ def calibrate(
         },
         dispatch_us=dispatch_us,
         leaf_eval_us=leaf_eval_us,
+        op_kernel_ns=op_kernels,
     )
     with _verbose_ctx(logger, verbose):
         logger.info(
@@ -617,12 +801,13 @@ def calibrate(
         )
         logger.debug(
             "calibration raw: flops=%g flop/s, bw=%g B/s, launch=%g s, "
-            "dispatch=%g s, leaf_eval=%g s",
+            "dispatch=%g s, leaf_eval=%g s, op-kernel classes=%s",
             flops,
             bw,
             launch,
             dispatch_us * 1e-6,
             leaf_eval_us * 1e-6,
+            sorted(profile.op_kernel_ns),
         )
     if save:
         save_profile(profile)

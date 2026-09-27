@@ -4,7 +4,7 @@ profile-parameterised cost fns in catopt.cost."""
 import json
 
 import pytest
-
+import torch
 from catopt.calibrate import (
     PROFILE_DIR_ENV,
     TargetProfile,
@@ -21,6 +21,7 @@ from catopt.cost import (
     roofline_cost_for,
 )
 from catopt.ir import Op, Param, TensorType, Var
+from catopt_optimize import calibrate as cal_mod
 
 # The constants hardcoded in catopt.cost — the dev RTX 2050 profile.
 RTX2050 = TargetProfile(
@@ -79,6 +80,26 @@ def test_profile_json_ignores_unknown_fields():
     data = json.loads(RTX2050.to_json())
     data["future_field"] = 42
     assert TargetProfile.from_json(data) == RTX2050
+
+
+def test_profile_op_kernel_ns_defaults_and_roundtrip():
+    """The measured kernel table defaults to {} — legacy JSONs and
+    hand-built profiles get the empty (pure-roofline) table — and
+    serialises with the rest of the profile."""
+    bare = TargetProfile("bare", 1.0, 2.0, 3.0, "cpu", "t")
+    assert bare.op_kernel_ns == {}
+    legacy = json.loads(RTX2050.to_json())
+    del legacy["op_kernel_ns"]
+    assert TargetProfile.from_json(legacy).op_kernel_ns == {}
+    table = {
+        "matmul": {"128x128x128": 1.5e4},
+        "pointwise": {"1048576": 4.0e5},
+    }
+    p = TargetProfile(
+        "k", 1.0, 2.0, 3.0, "cpu", "t", op_kernel_ns=table
+    )
+    assert TargetProfile.from_json(p.to_json()) == p
+    assert "op_kernel_ns" in p.to_json()
 
 
 def test_profile_save_load(tmp_path, monkeypatch):
@@ -200,6 +221,71 @@ def test_calibrate_cpu_sane():
     assert 0.001 < p.leaf_eval_us < 1e4
     # and the measured profile yields a working cost fn
     assert roofline_cost_for(p)(_mm_term()) > 0.0
+    # the op-kernel table measured every class at positive ns
+    for cls in (
+        "matmul",
+        "pointwise",
+        "reduce",
+        "concat",
+        "stack",
+        "index_select",
+    ):
+        entries = p.op_kernel_ns.get(cls)
+        assert entries, f"missing kernel class {cls}"
+        assert all(v > 0.0 for v in entries.values())
+    # matmul keys are "MxKxN" signatures; the rest are numel strings
+    assert all(len(k.split("x")) == 3 for k in p.op_kernel_ns["matmul"])
+    assert all(k.isdigit() for k in p.op_kernel_ns["pointwise"])
+
+
+def test_measure_op_kernels_cpu_direct():
+    """The kernel sweep itself returns a positive-ns table covering
+    all six classes even outside calibrate() — and it restores the
+    torch thread count it pins for the serialized-latency probes."""
+    prev = torch.get_num_threads()
+    t = cal_mod._measure_op_kernels(
+        torch.device("cpu"), torch.float32, quick=True
+    )
+    assert torch.get_num_threads() == prev
+    assert set(t) >= {
+        "matmul",
+        "pointwise",
+        "reduce",
+        "concat",
+        "stack",
+        "index_select",
+    }
+    assert all(
+        v > 0.0 for entries in t.values() for v in entries.values()
+    )
+
+
+def test_measure_op_kernels_probe_failure_dropped(monkeypatch):
+    """A probe that cannot run drops only its own entries — here all
+    of them — leaving a usable (empty) table rather than a crash."""
+    monkeypatch.setattr(
+        cal_mod,
+        "_kernel_probe",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert (
+        cal_mod._measure_op_kernels(
+            torch.device("cpu"), torch.float32, quick=True
+        )
+        == {}
+    )
+
+
+def test_calibrate_op_kernel_sweep_failure_falls_back(monkeypatch):
+    """If the whole kernel sweep dies, calibrate still returns a
+    profile — with an empty table (pure-roofline pricing)."""
+    monkeypatch.setattr(
+        cal_mod,
+        "_measure_op_kernels",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    p = calibrate(device="cpu", quick=True)
+    assert p.op_kernel_ns == {}
 
 
 @pytest.mark.requires_cuda

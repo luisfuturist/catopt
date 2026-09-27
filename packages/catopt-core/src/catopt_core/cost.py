@@ -814,8 +814,15 @@ def _local_roofline(
     peak_flops: float = _PEAK_FLOPS,
     peak_bw: float = _PEAK_BW,
     launch_s: float = _LAUNCH_S,
+    kernel_ns=None,
 ) -> float:
-    """Estimated nanoseconds for one op: max(compute, memory) + launch."""
+    """Estimated nanoseconds for one op: max(compute, memory) + launch.
+
+    ``kernel_ns`` (a ``_kernel_lookup`` callable) floors the estimate
+    at the op's measured kernel time when the profile carries an
+    ``op_kernel_ns`` table — see the "measured per-op kernel table"
+    section above.
+    """
     shape = _infer_op_shape(term, memo)
     if shape is _INVALID:
         return _INVALID_COST
@@ -831,7 +838,12 @@ def _local_roofline(
     # read happens at the consumer, priced there via _STRIDE_PENALTY.
     if term.op in _VIEW_OPS:
         return 0.0
-    return (max(compute_s, memory_s) + launch) * 1e9
+    base = (max(compute_s, memory_s) + launch) * 1e9
+    if kernel_ns is not None:
+        measured = kernel_ns(term, memo)
+        if measured is not None:
+            base = max(base, measured)
+    return base
 
 
 def _roofline_cost(
@@ -840,13 +852,21 @@ def _roofline_cost(
     peak_flops: float,
     peak_bw: float,
     launch_s: float,
+    kernel_ns=None,
 ) -> float:
     """Shared traversal for roofline_cost and roofline_cost_for.
 
     The memo key carries the constants so two profiles can share a memo
-    dict (e.g. inside dag_cost) without colliding.
+    dict (e.g. inside dag_cost) without colliding.  When a measured
+    kernel table is bound, the callable's identity joins the key —
+    keeping the table-less ``("rc",pf,bw,ls,term)`` form intact for
+    the extraction fast-path's pre-seeded entries (egraph/extract.py).
     """
-    ck = ("rc", peak_flops, peak_bw, launch_s, term)
+    ck = (
+        ("rc", peak_flops, peak_bw, launch_s, term)
+        if kernel_ns is None
+        else ("rc", peak_flops, peak_bw, launch_s, id(kernel_ns), term)
+    )
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
@@ -856,10 +876,11 @@ def _roofline_cost(
             peak_flops=peak_flops,
             peak_bw=peak_bw,
             launch_s=launch_s,
+            kernel_ns=kernel_ns,
         )
         for arg in term.args:
             base += _roofline_cost(
-                arg, memo, peak_flops, peak_bw, launch_s
+                arg, memo, peak_flops, peak_bw, launch_s, kernel_ns
             )
         memo[ck] = float(base)
         return memo[ck]
@@ -904,6 +925,163 @@ def _profile_constants(profile: Any) -> tuple[float, float, float]:
     )
 
 
+# ---------------------------------------------------------------------------
+#  Measured per-op kernel table — the shape-dependent floor
+# ---------------------------------------------------------------------------
+#
+# The roofline prices an op as max(flops/peak, bytes/bw) + launch —
+# blind to how a real kernel's time scales with its shape (BLAS
+# efficiency curves, cache-resident bandwidth, gather costs).  A
+# calibrated profile carries ``op_kernel_ns``:
+# ``{op_class: {shape_key: measured_ns}}`` where each value is the
+# median wall time of one eager kernel call at that shape — launch,
+# dispatch and kernel work inside (``catopt_optimize.calibrate``).
+# A term whose op-class and shape signature lands near a measured
+# bucket prices at ``max(roofline_ns, measured_ns)``: the measurement
+# is a floor on the estimate — it can only raise the model toward the
+# observed latency, never undercut it (the fidelity sweep's failure
+# mode is under-prediction, so the asymmetric correction is the safe
+# direction).
+
+#: Reduction-style ops whose measured table class is ``"reduce"``,
+#: bucketed by input element count (the traffic the kernel streams).
+_MEASURED_REDUCE_OPS = frozenset(
+    {"sum", "mean", "max", "min", "prod", "softmax"}
+)
+
+#: Gather ops whose measured table class is ``"index_select"``,
+#: bucketed by output element count.
+_MEASURED_GATHER_OPS = frozenset({"index_select", "embedding"})
+
+
+def _mm_signature(
+    term: Op, out_shape: tuple, memo: dict
+) -> tuple[float, float, float] | None:
+    """(M, K, N) signature for a matmul/linear op, or ``None``.
+
+    ``M`` is the collapsed row count (``n_out / N`` — batch and row
+    dims together), ``N`` the output's last dim, ``K`` the reduction
+    dim of the weight argument (``w[-2]`` for matmul, ``w[-1]`` =
+    in-features for linear).  Anything unshapeable — a rank-1 result
+    (matvec/dot), a missing or dimensionless weight — yields ``None``
+    and the op stays on the roofline.
+    """
+    if len(out_shape) < 2 or len(term.args) < 2:
+        return None
+    n_dim = out_shape[-1]
+    w = _shape_of(term.args[1], memo)
+    if (
+        not isinstance(w, tuple)
+        or len(w) < 2
+        or not isinstance(n_dim, int)
+        or n_dim <= 0
+    ):
+        return None
+    k_dim = w[-1] if term.op == "linear" else w[-2]
+    if not isinstance(k_dim, int) or k_dim <= 0:
+        return None
+    n_out = float(_numel(out_shape))
+    return (n_out / n_dim, float(k_dim), float(n_dim))
+
+
+def _kernel_signature(
+    term: Op, memo: dict
+) -> tuple[str, tuple[float, ...]] | None:
+    """(op-class, shape signature) an ``op_kernel_ns`` bucket matches.
+
+    The mapping mirrors the classes ``calibrate._measure_op_kernels``
+    times: ``"matmul"`` (``"MxKxN"``) for matmul/linear, ``"reduce"``
+    (input numel) for reductions, ``"concat"`` / ``"stack"`` /
+    ``"index_select"`` and ``"pointwise"`` (output numel — for reduce,
+    the input numel is what streams).  Ops without a measured class
+    return ``None`` and keep the roofline price.
+    """
+    op = term.op
+    shape = _infer_op_shape(term, memo)
+    if shape is _INVALID or not isinstance(shape, tuple):
+        return None
+    n_out = float(_numel(shape))
+    if op in ("matmul", "linear"):
+        sig = _mm_signature(term, shape, memo)
+        return ("matmul", sig) if sig is not None else None
+    if op in _MEASURED_REDUCE_OPS:
+        # The streamed size is the reduction's INPUT (the output
+        # shrinks); _numel tolerates None/() arg shapes (→ 1).
+        return (
+            "reduce",
+            (float(_numel(_shape_of(term.args[0], memo))),),
+        )
+    if op == "concat":
+        return ("concat", (n_out,))
+    if op == "stack":
+        return ("stack", (n_out,))
+    if op in _MEASURED_GATHER_OPS:
+        return ("index_select", (n_out,))
+    if op in _FUSION_POINTWISE_OPS:
+        return ("pointwise", (n_out,))
+    return None
+
+
+def _profile_kernel_table(profile: Any) -> dict | None:
+    """The raw ``op_kernel_ns`` dict of a profile-like, or ``None``."""
+    if profile is None:
+        return None
+    if isinstance(profile, dict):
+        return profile.get("op_kernel_ns") or None
+    return getattr(profile, "op_kernel_ns", None) or None
+
+
+def _kernel_lookup(table: dict | None):
+    """Build ``kns(term, memo) -> measured ns | None`` from a table.
+
+    Parses the ``{op_class: {shape_key: ns}}`` profile dict once; the
+    returned callable maps a term to the measured wall time of the
+    NEAREST bucket in log-space — sum of ``|log2 ratio|`` over the
+    signature dims — so shapes between measured points price at their
+    closest probe.  ``None`` table (or one with no usable entries)
+    yields ``None``, i.e. the pure roofline path.
+    """
+    if not table:
+        return None
+    parsed: dict[str, list[tuple[tuple[float, ...], float]]] = {}
+    for cls, entries in table.items():
+        if not isinstance(entries, dict):
+            continue
+        pts: list[tuple[tuple[float, ...], float]] = []
+        for key, ns in entries.items():
+            try:
+                sig = tuple(float(v) for v in str(key).split("x"))
+                pts.append((sig, float(ns)))
+            except (TypeError, ValueError):
+                continue
+        if pts:
+            parsed[cls] = pts
+    if not parsed:
+        return None
+
+    def kns(term: Op, memo: dict | None) -> float | None:
+        sig = _kernel_signature(term, memo)
+        if sig is None:
+            return None
+        pts = parsed.get(sig[0])
+        if pts is None:
+            return None
+        dims = sig[1]
+        best_ns = None
+        best_d = float("inf")
+        for esig, ns in pts:
+            if len(esig) != len(dims):
+                continue
+            d = 0.0
+            for s, e in zip(dims, esig, strict=True):
+                d += abs(math.log2(max(s, 1.0) / max(e, 1.0)))
+            if d < best_d:
+                best_d, best_ns = d, ns
+        return best_ns
+
+    return kns
+
+
 def roofline_cost_for(
     profile: Any = None,
     *,
@@ -920,6 +1098,13 @@ def roofline_cost_for(
     and can be dropped into ``Regime(cost_fn=...)``,
     ``EGraph.extract_best``, or ``dag_cost``.
 
+    When the profile carries an ``op_kernel_ns`` table (measured
+    per-op-class kernel latencies — see
+    :func:`catopt_optimize.calibrate.calibrate`), each op's estimate
+    is floored at the measured time of its nearest shape bucket:
+    measurements can only raise the price toward observed latency,
+    never undercut the roofline.
+
     ``roofline_cost_for()`` (no args) is exactly ``roofline_cost``.
     """
     pf, bw, ls = _profile_constants(profile)
@@ -929,10 +1114,11 @@ def roofline_cost_for(
         bw = float(peak_bw)
     if launch_s is not None:
         ls = float(launch_s)
+    kns = _kernel_lookup(_profile_kernel_table(profile))
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        return _roofline_cost(term, memo, pf, bw, ls)
+        return _roofline_cost(term, memo, pf, bw, ls, kns)
 
     cost.__name__ = "roofline_cost_for"
     cost.profile = profile
@@ -945,12 +1131,17 @@ def _depth_cost(
     peak_flops: float,
     peak_bw: float,
     launch_s: float,
+    kernel_ns=None,
 ) -> float:
     """Shared critical-path traversal for depth_cost_for and the
     ``base="depth"`` arm of :func:`executor_cost_for`.  The memo key
     carries the constants so two profiles can share a memo dict
     without colliding (the ``_roofline_cost`` convention)."""
-    ck = ("dc", peak_flops, peak_bw, launch_s, term)
+    ck = (
+        ("dc", peak_flops, peak_bw, launch_s, term)
+        if kernel_ns is None
+        else ("dc", peak_flops, peak_bw, launch_s, id(kernel_ns), term)
+    )
     if ck in memo:
         return memo[ck]
     if isinstance(term, Op):
@@ -960,12 +1151,15 @@ def _depth_cost(
             peak_flops=peak_flops,
             peak_bw=peak_bw,
             launch_s=launch_s,
+            kernel_ns=kernel_ns,
         )
         if local >= _INVALID_COST:
             local = launch_s * 1e9
         child = max(
             (
-                _depth_cost(a, memo, peak_flops, peak_bw, launch_s)
+                _depth_cost(
+                    a, memo, peak_flops, peak_bw, launch_s, kernel_ns
+                )
                 for a in term.args
             ),
             default=0.0,
@@ -986,10 +1180,11 @@ def depth_cost_for(profile: Any = None):
     its log-depth scan differ.
     """
     pf, bw, ls = _profile_constants(profile)
+    kns = _kernel_lookup(_profile_kernel_table(profile))
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        return _depth_cost(term, memo, pf, bw, ls)
+        return _depth_cost(term, memo, pf, bw, ls, kns)
 
     cost.__name__ = "depth_cost_for"
     cost.profile = profile
@@ -1461,16 +1656,18 @@ def _generic_latency_ns(
     bw: float,
     ls: float,
     dsp: float,
+    kernel_ns=None,
 ) -> float:
     """Whole-subtree latency of the serial per-node evaluator, ns.
 
     The ``executor_cost_for(lowering="generic")`` composition:
-    per-op roofline (kernel work + launch) plus one ``dispatch_s``
+    per-op roofline (kernel work + launch, floored at measured kernel
+    times when ``kernel_ns`` is bound) plus one ``dispatch_s``
     machinery overhead per dispatched op.  Used inside the batched
     model for the pieces the level executors still run generically —
     leaf operand evals and everything outside the compose spine.
     """
-    return _roofline_cost(term, memo, pf, bw, ls) + (
+    return _roofline_cost(term, memo, pf, bw, ls, kernel_ns) + (
         _generic_overhead(term, memo) * dsp * 1e9
     )
 
@@ -1536,6 +1733,7 @@ def _batched_scan_latency(
     ls: float,
     dsp: float,
     leaf_eval_s: float,
+    kernel_ns=None,
 ) -> float:
     """Whole-term nanoseconds under the level-batched carrier lowering.
 
@@ -1593,7 +1791,7 @@ def _batched_scan_latency(
     # leaf_eval_us measures, so charging it again would double-count).
     def leaf_eval(subtree: Any) -> float:
         return leaf_eval_s * 1e9 + _roofline_cost(
-            subtree, memo, pf, bw, ls
+            subtree, memo, pf, bw, ls, kernel_ns
         )
 
     two_part = bool(leaves) and all(
@@ -1607,7 +1805,8 @@ def _batched_scan_latency(
         a_terms = list({lf.args[0] for lf in leaves})
         total += n * leaf_eval_s * 1e9 + stack_ns
         total += sum(
-            _roofline_cost(a, memo, pf, bw, ls) for a in a_terms
+            _roofline_cost(a, memo, pf, bw, ls, kernel_ns)
+            for a in a_terms
         )
     if two_part:
         base = _leaf_gather_base(leaves)
@@ -1621,7 +1820,8 @@ def _batched_scan_latency(
             b_terms = list({lf.args[1] for lf in leaves})
             total += n * leaf_eval_s * 1e9 + stack_ns
             total += sum(
-                _roofline_cost(b, memo, pf, bw, ls) for b in b_terms
+                _roofline_cost(b, memo, pf, bw, ls, kernel_ns)
+                for b in b_terms
             )
     else:
         # Non pair-carriers (om triples and friends): per-leaf evals.
@@ -1630,7 +1830,8 @@ def _batched_scan_latency(
         )
         total += n * leaf_eval_s * 1e9 + stack_ns
         total += sum(
-            _roofline_cost(a, memo, pf, bw, ls) for a in arg_terms
+            _roofline_cost(a, memo, pf, bw, ls, kernel_ns)
+            for a in arg_terms
         )
 
     # ---- compose levels ---------------------------------------------
@@ -1671,7 +1872,12 @@ def _batched_scan_latency(
         seen2.add(t)
         total += (
             _local_roofline(
-                t, memo, peak_flops=pf, peak_bw=bw, launch_s=ls
+                t,
+                memo,
+                peak_flops=pf,
+                peak_bw=bw,
+                launch_s=ls,
+                kernel_ns=kernel_ns,
             )
             + dispatch_ns
         )
@@ -1693,7 +1899,10 @@ def executor_cost_for(
     (:func:`flops_cost`).  On top the closure adds
     ``executor_overhead(term, lowering) * dispatch_s`` where
     ``dispatch_s`` is the profile's ``dispatch_us`` (seconds;
-    :func:`_profile_dispatch_s` fallback applies).
+    :func:`_profile_dispatch_s` fallback applies).  When the profile
+    carries an ``op_kernel_ns`` table, per-op kernel times inside the
+    roofline/depth/batched pieces floor at the measured values
+    (``_kernel_lookup`` — see ``roofline_cost_for``).
 
     Units follow the base model, matching this file's conventions:
     roofline and depth are nanoseconds (``_local_roofline`` returns
@@ -1733,6 +1942,7 @@ def executor_cost_for(
     pf, bw, ls = _profile_constants(profile)
     dispatch_s = _profile_dispatch_s(profile)
     leaf_eval_s = _profile_leaf_eval_s(profile)
+    kns = _kernel_lookup(_profile_kernel_table(profile))
     # ns for the roofline/depth bases; flop-equivalents for flops.
     per = dispatch_s * (1e9 if base != "flops" else 1e6)
 
@@ -1747,6 +1957,7 @@ def executor_cost_for(
             ls,
             dispatch_s,
             leaf_eval_s,
+            id(kns),
             term,
         )
         if ck in memo:
@@ -1758,16 +1969,16 @@ def executor_cost_for(
             and term.args
         ):
             out = _batched_scan_latency(
-                term, memo, pf, bw, ls, dispatch_s, leaf_eval_s
+                term, memo, pf, bw, ls, dispatch_s, leaf_eval_s, kns
             )
         else:
             if base == "roofline":
                 out = _generic_latency_ns(
-                    term, memo, pf, bw, ls, dispatch_s
+                    term, memo, pf, bw, ls, dispatch_s, kns
                 )
             else:
                 if base == "depth":
-                    b = _depth_cost(term, memo, pf, bw, ls)
+                    b = _depth_cost(term, memo, pf, bw, ls, kns)
                 else:  # flops
                     b = flops_cost(term, memo)
                 out = b + executor_overhead(term, lowering, memo) * per
@@ -1966,6 +2177,7 @@ def _fused_cost(
     peak_bw: float,
     launch_s: float,
     dispatch_s: float,
+    kernel_ns=None,
 ) -> float:
     """Inductor-approximation price of *term* (see fused_cost_for).
 
@@ -1974,7 +2186,11 @@ def _fused_cost(
     one ``launch_s``: the fused kernel runs the SUM of its members'
     arithmetic (fusion removes launches, not FLOPs) and streams
     :func:`_region_traffic`'s external reads + boundary writes, so
-    intermediates never touch memory.  The whole graph pays a single
+    intermediates never touch memory.  When the profile carries an
+    ``op_kernel_ns`` table, the region's kernel time is additionally
+    floored at the sum of its members' measured kernel work (each
+    member's measured wall minus its solo launch — the region
+    launches once).  The whole graph pays a single
     ``dispatch_s`` — compilation removes interior dispatch too; the
     surviving boundary is the compiled module's own call.  A region
     containing a solver op additionally bills ``_SOLVER_FACTOR``
@@ -2012,6 +2228,17 @@ def _fused_cost(
             solver = solver or t.op in _SOLVER_OPS
         in_b, out_b = _region_traffic(region, parents, term, memo)
         kernel_s = max(flops / peak_flops, (in_b + out_b) / peak_bw)
+        if kernel_ns is not None:
+            # Measured kernel times floor the region: the fused kernel
+            # cannot run faster than the sum of its members' measured
+            # kernel work (each member's measured wall stripped of its
+            # solo launch — the region launches once, priced below).
+            work_ns = 0.0
+            for t in region:
+                m = kernel_ns(t, memo)
+                if m is not None:
+                    work_ns += max(0.0, m - launch_s * 1e9)
+            kernel_s = max(kernel_s, work_ns / 1e9)
         total += (
             kernel_s * 1e9
             + launch_s * 1e9
@@ -2065,13 +2292,14 @@ def fused_cost_for(profile: Any = None) -> CostFn:
     """
     pf, bw, ls = _profile_constants(profile)
     dispatch_s = _profile_dispatch_s(profile)
+    kns = _kernel_lookup(_profile_kernel_table(profile))
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        ck = ("fc", pf, bw, ls, dispatch_s, term)
+        ck = ("fc", pf, bw, ls, dispatch_s, id(kns), term)
         if ck in memo:
             return memo[ck]
-        out = _fused_cost(term, memo, pf, bw, ls, dispatch_s)
+        out = _fused_cost(term, memo, pf, bw, ls, dispatch_s, kns)
         memo[ck] = float(out)
         return out
 
@@ -2122,10 +2350,21 @@ def lowering_aware_cost_for(
         raise ValueError("lowerings must be non-empty")
     pf, bw, ls = _profile_constants(profile)
     dsp = _profile_dispatch_s(profile)
+    kt = _profile_kernel_table(profile)
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        ck = ("lw", base, pf, bw, ls, dsp, tuple(lowerings), term)
+        ck = (
+            "lw",
+            base,
+            pf,
+            bw,
+            ls,
+            dsp,
+            id(kt),
+            tuple(lowerings),
+            term,
+        )
         if ck in memo:
             return memo[ck]
         out = min(f(term, memo) for f in fns.values())

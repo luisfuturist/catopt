@@ -1039,3 +1039,286 @@ def test_fusion_regions_solver_and_leaves():
     memo: dict = {}
     chain = _applyd_chain(4)
     assert fusion_regions(chain, memo) == fusion_regions(chain, memo)
+
+
+# ---------------------------------------------------------------------------
+#  Measured op_kernel_ns table — the shape-dependent kernel floor
+# ---------------------------------------------------------------------------
+
+#: A profile dict carrying measured kernel times far above the
+#: roofline estimate, so the floor is visible in the price.
+_PROF_KERNEL = {
+    "tflops": 2.5,
+    "gbps": 89.0,
+    "launch_us": 8.7,
+    "dispatch_us": 5.0,
+    "op_kernel_ns": {
+        "matmul": {"128x128x128": 200000.0, "512x512x512": 5000000.0},
+        "pointwise": {"4096": 5000.0, "1048576": 400000.0},
+        "reduce": {"1048576": 300000.0},
+        "concat": {"1048576": 250000.0},
+        "stack": {"1048576": 260000.0},
+        "index_select": {"65536": 20000.0},
+    },
+}
+
+
+def _bare(prof: dict) -> dict:
+    """The same profile without the kernel table."""
+    return {k: v for k, v in prof.items() if k != "op_kernel_ns"}
+
+
+def test_kernel_signature_op_classes():
+    from catopt.cost import _kernel_signature
+
+    x = _v("x", 64, 64)
+    assert _kernel_signature(
+        Op.make("matmul", x, _p("W", 64, 64)), {}
+    ) == (
+        "matmul",
+        (64.0, 64.0, 64.0),
+    )
+    # linear: (M,K,N) = (rows, in-features, out-features)
+    lin = Op.make("linear", _v("l", 8, 16), _p("LW", 32, 16))
+    assert _kernel_signature(lin, {}) == ("matmul", (8.0, 16.0, 32.0))
+    # reduce buckets the streamed INPUT numel, the rest output numel
+    assert _kernel_signature(Op.make("sum", x, dim=1), {}) == (
+        "reduce",
+        (4096.0,),
+    )
+    assert _kernel_signature(Op.make("concat", x, x, dim=0), {}) == (
+        "concat",
+        (8192.0,),
+    )
+    assert _kernel_signature(Op.make("stack", x, x, dim=0), {}) == (
+        "stack",
+        (8192.0,),
+    )
+    assert _kernel_signature(Op.make("add", x, x), {}) == (
+        "pointwise",
+        (4096.0,),
+    )
+    cls, sig = _kernel_signature(
+        Op.make("index_select", x, dim=0, index=(0, 1)), {}
+    )
+    assert cls == "index_select" and sig == (128.0,)
+
+
+def test_kernel_signature_fallbacks():
+    """Unshapeable / un-bucketed ops return None → roofline path."""
+    from catopt.cost import _kernel_signature
+
+    # ill-typed op: _INVALID output shape
+    bad = Op.make("add", _v("a", 2), _v("b", 3))
+    assert _kernel_signature(bad, {}) is None
+    # unknown (non-tuple) output shape
+    xs = Var("xs", TensorType(None))
+    assert _kernel_signature(Op.make("add", xs, xs), {}) is None
+    # rank-1 matmul result (matvec): no (M,K,N) bucket
+    mv = Op.make("matmul", _p("A", 4, 8), _v("v", 8))
+    assert _kernel_signature(mv, {}) is None
+    # batched matvec: matrix result but vector weight — K unreadable
+    bmv = Op.make("matmul", _p("B", 2, 8, 4), _v("v", 4))
+    assert _kernel_signature(bmv, {}) is None
+    # non-int output dim / non-int reduction dim / unknown weight
+    assert (
+        _kernel_signature(
+            Op.make("matmul", _v("x", 4, 8), _p("Wn", 8, None)), {}
+        )
+        is None
+    )
+    assert (
+        _kernel_signature(
+            Op.make("matmul", _v("x", 4, 8), _p("Wk", None, 8)), {}
+        )
+        is None
+    )
+    assert (
+        _kernel_signature(
+            Op.make(
+                "matmul", _v("x", 4, 8), Var("w", TensorType(None))
+            ),
+            {},
+        )
+        is None
+    )
+    # ops without a measured class keep the roofline price
+    assert (
+        _kernel_signature(Op.make("contiguous", _v("z", 8, 8)), {})
+        is None
+    )
+
+
+def test_kernel_lookup_parsing():
+    """Table parsing: nearest-bucket in log space; malformed entries
+    are skipped; empty/unusable tables disable the floor."""
+    from catopt.cost import _kernel_lookup
+
+    assert _kernel_lookup(None) is None
+    assert _kernel_lookup({}) is None
+    # non-dict class entries and unparseable keys are skipped — a
+    # table with nothing usable disables the lookup entirely.
+    assert _kernel_lookup({"matmul": 5}) is None
+    assert _kernel_lookup({"pointwise": {"bogus": 1.0}}) is None
+    kns = _kernel_lookup(
+        {
+            "matmul": {
+                "bad": 1.0,
+                "128x128x128": 100.0,
+                "512x512x512": 500.0,
+            },
+            "pointwise": {"4096": 10.0},
+            "junk": {"x": 1.0},
+            "nd": 42,
+        }
+    )
+    assert kns is not None
+    mm = Op.make("matmul", _v("x", 128, 128), _p("W", 128, 128))
+    assert kns(mm, {}) == 100.0
+    # 384³ is nearer (log-space) to 512³ than to 128³
+    mm2 = Op.make("matmul", _v("x", 384, 384), _p("W", 384, 384))
+    assert kns(mm2, {}) == 500.0
+    # a class absent from the table misses
+    assert kns(Op.make("sum", _v("x", 4, 4), dim=0), {}) is None
+    # as does an op with no signature at all
+    assert kns(Op.make("contiguous", _v("a", 4)), {}) is None
+    # bucket keys with a different signature arity never match
+    kns2 = _kernel_lookup({"pointwise": {"4x4": 10.0}})
+    assert kns2 is not None
+    assert (
+        kns2(Op.make("add", _v("a", 4, 4), _v("b", 4, 4)), {}) is None
+    )
+
+
+def test_roofline_measured_kernel_floor():
+    """A measured bucket above the roofline estimate floors the price;
+    one below it never undercuts."""
+    mm = Op.make("matmul", _v("x", 2048, 128), _p("W", 128, 128))
+    # sig (2048,128,128): nearer to 128³ (log-dist 4) than 512³ (6)
+    assert roofline_cost_for(_PROF_KERNEL)(mm) == pytest.approx(
+        200000.0
+    )
+    assert roofline_cost_for(_bare(_PROF_KERNEL))(mm) < 200000.0
+    # a measured value BELOW the roofline does not lower the price
+    small = dict(_PROF_KERNEL)
+    small["op_kernel_ns"] = {"matmul": {"128x128x128": 1.0}}
+    assert roofline_cost_for(small)(mm) == pytest.approx(
+        roofline_cost_for(_bare(_PROF_KERNEL))(mm)
+    )
+    # measured classes: reduce / concat / stack / index_select /
+    # pointwise all floor at their buckets when those exceed roofline
+    prof = dict(_PROF_KERNEL)
+    x1m = _v("big", 1024, 1024)
+    assert roofline_cost_for(prof)(
+        Op.make("sum", x1m, dim=1)
+    ) == pytest.approx(300000.0)
+    assert roofline_cost_for(prof)(
+        Op.make("concat", _v("c", 512, 1024), _v("d", 512, 1024), dim=0)
+    ) == pytest.approx(250000.0)
+    assert roofline_cost_for(prof)(
+        Op.make("stack", _v("c", 512, 1024), _v("d", 512, 1024), dim=0)
+    ) == pytest.approx(260000.0)
+    assert roofline_cost_for(prof)(
+        Op.make("index_select", _v("g", 256, 256), dim=0, index=(0, 1))
+    ) == pytest.approx(20000.0)
+    # pointwise add at 1M elems floors at the 1M bucket
+    assert roofline_cost_for(prof)(
+        Op.make("add", x1m, _v("b2", 1024, 1024))
+    ) == pytest.approx(400000.0)
+    # …while a small pointwise op keeps the launch-floor roofline
+    assert (
+        roofline_cost_for(prof)(Op.make("neg", _v("s", 8, 8)))
+        < 100000.0
+    )
+    # and an op with no measured class misses the table entirely
+    assert roofline_cost_for(prof)(
+        Op.make("contiguous", _v("z", 8, 8))
+    ) == pytest.approx(
+        roofline_cost_for(_bare(prof))(
+            Op.make("contiguous", _v("z", 8, 8))
+        )
+    )
+    # object profiles read the table off the attribute too
+    ns_prof = types.SimpleNamespace(
+        tflops=2.5,
+        gbps=89.0,
+        launch_us=8.7,
+        op_kernel_ns={"matmul": {"128x128x128": 200000.0}},
+    )
+    assert roofline_cost_for(ns_prof)(mm) == pytest.approx(200000.0)
+    # an empty table is no table
+    ns_empty = types.SimpleNamespace(
+        tflops=2.5, gbps=89.0, launch_us=8.7, op_kernel_ns={}
+    )
+    assert roofline_cost_for(ns_empty)(mm) == pytest.approx(
+        roofline_cost_for(_bare(_PROF_KERNEL))(mm)
+    )
+
+
+def test_measured_floor_through_executor_and_depth():
+    """The kernel table flows through executor_cost_for (generic,
+    batched_scan, depth base), fused_cost_for, depth_cost_for and
+    lowering_aware_cost_for."""
+    prof = dict(_PROF_KERNEL)
+    bare = _bare(prof)
+    mm = Op.make("matmul", _v("x", 2048, 128), _p("W", 128, 128))
+    # generic lowering: roofline arm + dispatch, both table-floored
+    assert executor_cost_for(prof, lowering="generic")(
+        mm
+    ) > executor_cost_for(bare, lowering="generic")(mm)
+    # depth base and fused/compiled lowering
+    assert executor_cost_for(prof, lowering="generic", base="depth")(
+        mm
+    ) > executor_cost_for(bare, lowering="generic", base="depth")(mm)
+    assert fused_cost_for(prof)(mm) > fused_cost_for(bare)(mm)
+    assert depth_cost_for(prof)(mm) > depth_cost_for(bare)(mm)
+    assert lowering_aware_cost_for(prof)(mm) == pytest.approx(
+        min(
+            executor_cost_for(prof, lowering=lw)(mm) for lw in LOWERINGS
+        )
+    )
+    # batched_scan on a scan term: leaf-operand evals price through
+    # the table (the gather base is a matmul here)
+    u = Op.make("matmul", _v("u", 128, 8), _p("W", 8, 8))
+    leaves = [
+        Op.make(
+            "aff_diag",
+            _p("g", 8),
+            Op.make("select", u, dim=0, index=i),
+        )
+        for i in range(8)
+    ]
+    scan = Op.make("applyd", _balanced_tree(leaves), _v("h", 8))
+    assert executor_cost_for(prof, lowering="batched_scan")(
+        scan
+    ) >= executor_cost_for(bare, lowering="batched_scan")(scan)
+    # flops base ignores the table (it is flop-denominated)
+    assert executor_cost_for(prof, lowering="generic", base="flops")(
+        scan
+    ) == executor_cost_for(bare, lowering="generic", base="flops")(scan)
+
+
+def test_fused_cost_region_measured_work_floor():
+    """In the fusion model each region floors at the sum of its
+    members' measured kernel work (solo launches stripped)."""
+    prof = dict(_PROF_KERNEL)
+    bare = _bare(prof)
+    # multi-member pointwise region: three 1M-numel members each
+    # floor at the 400µs bucket minus the launch — clearly above the
+    # traffic roofline of the fused kernel.
+    a, b = _v("a", 1024, 1024), _v("b", 1024, 1024)
+    pw = Op.make("add", Op.make("mul", a, b), Op.make("neg", a))
+    f_table = fused_cost_for(prof)(pw)
+    f_roof = fused_cost_for(bare)(pw)
+    # kernel = sum(m_i - launch); +1 fused launch +1 graph dispatch.
+    exp = 3 * (400000.0 - 8700.0) + 8700.0 + 5000.0
+    assert f_table == pytest.approx(exp)
+    assert f_table > f_roof
+    # a singleton region of a measured class floors at its bucket
+    mm = Op.make("matmul", _v("x", 512, 512), _p("W", 512, 512))
+    assert fused_cost_for(prof)(mm) == pytest.approx(
+        5000000.0 - 8700.0 + 8700.0 + 5000.0
+    )
+    # a region whose members have no measured class is unchanged
+    ct = Op.make("contiguous", _v("z", 8, 8))
+    assert fused_cost_for(prof)(ct) == fused_cost_for(bare)(ct)
