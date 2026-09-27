@@ -107,6 +107,8 @@ from catopt.egraph import EGraph
 from catopt.ir import IR, Op, op_repr
 from catopt.laws import SCAN_DIAG_LAWS, SCAN_LAWS
 from catopt.optimize import OptimizationResourceError, optimize_model
+from catopt_optimize.optimize import _lower_extracted
+from catopt_torch.adapters import TorchSink
 from catopt.scan_lower import (
     build_scan_plan,
     is_scan_apply_term,
@@ -955,10 +957,13 @@ def run_cell(
             for n, p in opt64._param_map.items():
                 if n not in fp32_src:
                     fp32_src[n] = p.detach().float()
+            # Rebuild the DELIVERED module — optimize_model routes
+            # carrier-apply roots to their batched executor, so
+            # timing c_opt through a plain IRModule would measure a
+            # module optimize_model never produced.
             opt32 = (
-                ir_to_torch_module(
-                    opt_ir,
-                    param_values=fp32_src,
+                _lower_extracted(
+                    opt_ir.root, opt_ir, fp32_src, TorchSink()
                 )
                 .to(dev)
                 .eval()

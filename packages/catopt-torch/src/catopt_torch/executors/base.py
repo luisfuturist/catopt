@@ -157,6 +157,21 @@ class BatchedExecutorBase:
         """True after :meth:`capture_cuda_graph` succeeded."""
         return self._graph is not None
 
+    @property
+    def _root(self) -> Any:
+        """The folded root term the executor lowers — delegates to the
+        wrapped ``IRModule`` so consumers inspecting the lowered term
+        (reports, benches) see the same root whichever executor
+        routing picked."""
+        return self.eval_mod._root
+
+    @property
+    def _param_map(self) -> Any:
+        """The materialised parameter map — delegates to the wrapped
+        ``IRModule`` (fused_* leaves live there whichever executor
+        routing picked)."""
+        return self.eval_mod._param_map
+
     def capture_cuda_graph(  # pragma: no cover — CUDA-only body
         self,
         *example_inputs: torch.Tensor,

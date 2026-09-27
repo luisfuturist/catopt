@@ -352,3 +352,19 @@ def test_carrier_upgrade_swaps_when_delivered_cheaper(monkeypatch):
     out = O._carrier_upgrade(eg, root, incumbent, flops_cost)
     assert out is not incumbent
     assert getattr(out, "op", None) == "applyd"
+
+
+def test_batched_module_exposes_root():
+    """Downstream consumers (benches, reports) read ``_root`` — the
+    batched modules delegate it to the wrapped IRModule."""
+    ir, h, env = _scan_ir()
+    mod = _lower_extracted(ir.root, ir, env, TorchSink())
+    assert mod._root is mod.eval_mod._root
+
+
+def test_batched_module_exposes_param_map():
+    """``_param_map`` (fused_* materialised params) delegates to the
+    wrapped IRModule — benches rebuild fp32 modules from it."""
+    ir, h, env = _scan_ir()
+    mod = _lower_extracted(ir.root, ir, env, TorchSink())
+    assert mod._param_map is mod.eval_mod._param_map
