@@ -9,6 +9,7 @@ cost is blind to the lowering (``bench/cost_fidelity.py``).
 
 import torch
 
+from catopt.cost import flops_cost
 from catopt.ir import IR, Op, Param, TensorType, Var
 from catopt.torch_bridge import ir_to_torch_module
 from catopt_optimize.optimize import _lower_extracted
@@ -173,3 +174,181 @@ def test_optimize_model_compile_failure_falls_back(monkeypatch):
     assert stats["compiled"] is False
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
+
+
+def test_delivered_cost_priced_by_executor():
+    """Carrier-rooted plannable terms price under the batched
+    lowering; non-carrier terms under generic."""
+    from catopt_optimize.optimize import _delivered_cost
+
+    ir, h, env = _scan_ir()
+    batched = _delivered_cost(ir.root)
+    generic = _delivered_cost(
+        Op.make("add", Var("x", _T((3,))), _P("p_w", (3,)))
+    )
+    assert batched > 0 and generic > 0
+
+
+def test_carrier_upgrade_swaps_to_batched_member():
+    """A cheaper batched applyd member replaces the additive winner."""
+    from catopt.egraph import EGraph
+    from catopt.optimize import optimize_model
+    from catopt.models import LinearRecurrence
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    with torch.no_grad():
+        ref = m(x)
+        mod, stats = optimize_model(m, x, verbose=False)
+    assert stats["lowering"] == "batched"
+    assert getattr(mod, "is_batched", False)
+    with torch.no_grad():
+        assert torch.allclose(mod(x), ref, atol=1e-9)
+
+
+def test_lift_scan_to_applyd_offers_carrier_member():
+    """The nonlocal lift seeds applyd members on recurrence classes
+    without saturating the carrier laws."""
+    from catopt.egraph import EGraph
+    from catopt.models import LinearRecurrence
+    from catopt.torch_bridge import export_to_ir
+    from catopt_carriers.trace_lift import lift_scan_to_applyd
+    from catopt.scan_lower import (
+        is_scan_apply_term,
+        to_batched_scan_module,
+    )
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    ir, src = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    lifts = lift_scan_to_applyd(eg)
+    assert lifts  # the recurrence spine was recognised
+    eg.rebuild()
+    root_cid = eg.find(root)
+    applyd_nodes = [
+        n
+        for n in eg._classes[root_cid].nodes
+        if n.op in ("apply", "applyd")  # dense -> apply, diag -> applyd
+    ]
+    assert applyd_nodes
+    term = eg.extract_best(
+        root, flops_cost, overrides={root_cid: applyd_nodes[0]}
+    )
+    assert is_scan_apply_term(term)
+    env = dict(src)
+    ref = ir_to_torch_module(ir, param_values=env)
+    batched = to_batched_scan_module(
+        IR(
+            root=term,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
+        param_values=env,
+    )
+    assert batched.is_batched
+    assert torch.allclose(batched(x), ref(x), atol=1e-9)
+
+
+def test_lift_scan_to_applyd_skips_existing_carrier():
+    """A second pass offers nothing — classes already carrying an
+    apply form are skipped."""
+    from catopt.egraph import EGraph
+    from catopt.models import LinearRecurrence
+    from catopt.torch_bridge import export_to_ir
+    from catopt_carriers.trace_lift import lift_scan_to_applyd
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    ir, _ = export_to_ir(m, x)
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    assert lift_scan_to_applyd(eg)
+    eg.rebuild()
+    assert lift_scan_to_applyd(eg) == []
+
+
+def test_delivered_cost_declines_non_plannable_carrier():
+    """A carrier-rooted term whose batched plan can't be built prices
+    as generic — the module would degrade to serial eval anyway."""
+    from catopt.cost import executor_cost_for
+    from catopt_optimize.optimize import _delivered_cost
+
+    h = Var("h", _T((2,)))
+    t = Op.make(
+        "applyd",
+        Op.make(
+            "affd_compose",
+            Op.make("aff_diag", _P("a2", (2,)), _P("b2", (2,))),
+            Op.make("aff_diag", _P("a4", (4,)), _P("b4", (4,))),
+        ),
+        h,
+    )
+    assert _delivered_cost(t) == executor_cost_for(
+        lowering="generic"
+    )(t)
+
+
+def test_carrier_upgrade_returns_incumbent_when_no_carriers():
+    """No carrier enodes at root -> incumbent returned unchanged."""
+    from catopt.egraph import EGraph
+    from catopt_optimize.optimize import _carrier_upgrade
+
+    x = Var("x", _T((3,)))
+    t = Op.make("add", x, _P("p_w", (3,)))
+    eg = EGraph()
+    root = eg.add_term(t)
+    assert _carrier_upgrade(eg, root, t, flops_cost) is t
+
+
+def test_carrier_upgrade_handles_failed_extraction(monkeypatch):
+    """An override extraction yielding None is skipped."""
+    import catopt_optimize.optimize as O
+    from catopt.egraph import EGraph
+
+    ir, h, env = _scan_ir()
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    monkeypatch.setattr(
+        O.EGraph, "extract_best", lambda self, eid, cf, **kw: None
+    )
+    incumbent = Op.make("add", h, _P("p0", (3,)))
+    assert (
+        O._carrier_upgrade(eg, root, incumbent, flops_cost)
+        is incumbent
+    )
+
+
+def test_carrier_upgrade_swaps_when_delivered_cheaper(monkeypatch):
+    """Carrier member wins when its delivered (batched) price beats
+    the incumbent's delivered price."""
+    import catopt_optimize.optimize as O
+    from catopt.egraph import EGraph
+
+    ir, h, env = _scan_ir()
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    cid = eg.find(root)
+    carrier_node = next(
+        n for n in eg._classes[cid].nodes if n.op == "applyd"
+    )
+    incumbent = Op.make("add", h, _P("p0", (3,)))
+    # force the incumbent to lose on delivered price
+    orig = O._delivered_cost
+    monkeypatch.setattr(
+        O,
+        "_delivered_cost",
+        lambda t, profile=None: (
+            1.0
+            if isinstance(t, Op) and t.op in O._CARRIER_PLANS
+            else 100.0
+        ),
+    )
+    out = O._carrier_upgrade(eg, root, incumbent, flops_cost)
+    assert out is not incumbent
+    assert getattr(out, "op", None) == "applyd"

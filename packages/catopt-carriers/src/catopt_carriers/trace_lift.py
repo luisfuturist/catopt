@@ -98,7 +98,7 @@ from catopt_core.typing import _shape_of
 
 from catopt_carriers.scan_lower import build_scan_plan
 
-__all__ = ["TraceLift", "lift_scan_to_trace"]
+__all__ = ["TraceLift", "lift_scan_to_applyd", "lift_scan_to_trace"]
 
 
 #: Ops preferred when picking a class representative for the carrier
@@ -271,10 +271,17 @@ class _Spine:
     e-nodes over e-class members, hence sound regardless of length.
     """
 
-    def __init__(self, eg: EGraph) -> None:
+    def __init__(self, eg: EGraph, allow_tied: bool = False) -> None:
         self.eg = eg
         self._memo: dict[int, Any] = {}
         self._active: set[int] = set()
+        # When False (default) equal-length ambiguous decompositions
+        # are vetoed — the trace lift wants one canonical reading.
+        # The carrier lift relaxes it: any successful decomposition is
+        # a sound sequential reading of the class's value, so the
+        # applyd member is emitted from the first (deterministically
+        # sorted) maximal plan.
+        self._allow_tied = allow_tied
 
     def plan(self, cid: int):
         res = self._walk(self.eg.find(cid))
@@ -361,7 +368,14 @@ class _Spine:
         try:
             best = None
             tied = False
-            for node in ec.nodes:
+            nodes = ec.nodes
+            if self._allow_tied:
+                # deterministic candidate order under ties
+                nodes = sorted(
+                    nodes,
+                    key=lambda n: (n.op, n.children, repr(n.attrs)),
+                )
+            for node in nodes:
                 if node.op != "add" or len(node.children) != 2:
                     continue
                 for cand in self._candidates(node):
@@ -384,7 +398,7 @@ class _Spine:
                             tied = True  # ambiguous: two equal-length
                             # decompositions — veto
             if best is not None:
-                res = None if tied else best
+                res = None if (tied and not self._allow_tied) else best
             elif any(n.op in _BASE_OPS for n in ec.nodes):
                 res = ([], cid)  # chain base: h0 / carried
             else:  #   scan segment
@@ -696,8 +710,32 @@ def lift_scan_to_trace(
     member — in class-iteration order.  Empty when nothing matches:
     the pass is a no-op on non-recurrence graphs.
     """
+    plans = _scan_plans(
+        eg, root_eid, min_steps, maximal_only
+    )
+    lifts: list[TraceLift] = []
+    for c, p in plans.items():
+        lifts.extend(
+            _offer(eg, c, p, channel_splits, provenance, witness)
+        )
+    return lifts
+
+
+def _scan_plans(
+    eg: EGraph,
+    root_eid: int | None,
+    min_steps: int,
+    maximal_only: bool,
+    allow_tied: bool = False,
+) -> dict[int, _Plan]:
+    """Recognised recurrence plans per e-class, prefixes dropped.
+
+    Shared plan discovery for the nonlocal lifts — the trace lift and
+    the carrier (applyd) lift recognise the same spines and emit
+    different forms of the same schedule.
+    """
     plans: dict[int, _Plan] = {}
-    spine = _Spine(eg)
+    spine = _Spine(eg, allow_tied=allow_tied)
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         if c in plans or eg._classes.get(c) is None:
@@ -710,47 +748,126 @@ def lift_scan_to_trace(
         if plan is not None and min_steps <= plan.T:
             plans[c] = plan
 
+    if not maximal_only:
+        return plans
     interior: set[int] = set()
-    if maximal_only:
-        for p in plans.values():
-            for st in p.step_states:
-                if st in plans and plans[st].T < p.T:
-                    interior.add(st)
-        # Carrier-path plans record no step_states (the carrier tree
-        # is a term, not an e-class chain), so the walk above misses
-        # every prefix class that only carries an apply/applyd
-        # member.  Detect them structurally: a plan is interior to a
-        # strictly longer plan when both share the same h0 e-class
-        # AND the shorter plan's chronological (maps, ins) eid
-        # sequence is a literal prefix of the longer's — same map and
-        # input e-classes over the same init compute the same
-        # intermediate value, so the shorter chain's class IS a state
-        # of the longer one.  Without this, every saturated prefix
-        # class mints its own block-matrix F (~2T offers instead of
-        # the ~2 for the whole horizon — the ~2T× storage blow-up).
-        items = list(plans.items())
-        for qc, q in items:
-            if qc in interior:
-                continue
-            qh0 = eg.find(q.h0)
-            qmaps = [eg.find(m) for m in q.maps]
-            qins = [eg.find(i) for i in q.ins]
-            for _pc, p in items:
-                if p.T <= q.T or p.kind != q.kind:
-                    continue
-                if eg.find(p.h0) != qh0:
-                    continue
-                if [eg.find(m) for m in p.maps[: q.T]] == qmaps and [
-                    eg.find(i) for i in p.ins[: q.T]
-                ] == qins:
-                    interior.add(qc)
-                    break
-
-    lifts: list[TraceLift] = []
-    for c, p in plans.items():
-        if c in interior:
+    for p in plans.values():
+        for st in p.step_states:
+            if st in plans and plans[st].T < p.T:
+                interior.add(st)
+    # Carrier-path plans record no step_states (the carrier tree
+    # is a term, not an e-class chain), so the walk above misses
+    # every prefix class that only carries an apply/applyd
+    # member.  Detect them structurally: a plan is interior to a
+    # strictly longer plan when both share the same h0 e-class
+    # AND the shorter plan's chronological (maps, ins) eid
+    # sequence is a literal prefix of the longer's — same map and
+    # input e-classes over the same init compute the same
+    # intermediate value, so the shorter chain's class IS a state
+    # of the longer one.  Without this, every saturated prefix
+    # class mints its own block-matrix F (~2T offers instead of
+    # the ~2 for the whole horizon — the ~2T× storage blow-up).
+    items = list(plans.items())
+    for qc, q in items:
+        if qc in interior:
             continue
-        lifts.extend(
-            _offer(eg, c, p, channel_splits, provenance, witness)
+        qh0 = eg.find(q.h0)
+        qmaps = [eg.find(m) for m in q.maps]
+        qins = [eg.find(i) for i in q.ins]
+        for _pc, p in items:
+            if p.T <= q.T or p.kind != q.kind:
+                continue
+            if eg.find(p.h0) != qh0:
+                continue
+            if [eg.find(m) for m in p.maps[: q.T]] == qmaps and [
+                eg.find(i) for i in q.ins[: q.T]
+            ] == qins:
+                interior.add(qc)
+                break
+    return {c: p for c, p in plans.items() if c not in interior}
+
+
+def lift_scan_to_applyd(
+    eg: EGraph,
+    root_eid: int | None = None,
+    *,
+    min_steps: int = 2,
+    maximal_only: bool = True,
+    provenance: str = "applyd_lift",
+    witness: bool = True,
+) -> list:
+    """Offer ``applyd``/``apply`` members for recognised recurrences.
+
+    Same spine discovery as :func:`lift_scan_to_trace`, but emits the
+    *carrier* form — a balanced compose tree over per-step affine
+    leaves applied to the shared init — rather than the resolvent
+    trace.  This is the member the level-batched executors lower to
+    an O(log T) schedule; the fold-by-laws path produces it only
+    through a full carrier-law saturation (combinatorially explosive
+    at long T), which this nonlocal pass replaces.
+
+    Skips classes that already carry an apply-tree member
+    (``_carrier_plan`` non-None — the form already exists there).
+    Returns one dict per offered member, matching the gather lifts'
+    record shape.  No-op on non-recurrence graphs.
+    """
+    # Post-saturation classes carry many equal add members — equal-
+    # length spine decompositions veto under the trace lift's strict
+    # reading; for the carrier form any successful decomposition is a
+    # sound reading, so ties are allowed (deterministically).
+    plans = _scan_plans(
+        eg, root_eid, min_steps, maximal_only, allow_tied=True
+    )
+    em = _Emit(eg, provenance)
+    out: list = []
+    for cid, plan in plans.items():
+        if _carrier_plan(eg, cid) is not None:
+            continue  # class already carries the apply form
+        leaf_op, comp_op, apply_op = (
+            ("aff_diag", "affd_compose", "applyd")
+            if plan.kind == "diag"
+            else ("aff", "aff_compose", "apply")
         )
-    return lifts
+        em.broken = False
+        leaves = [
+            em.op(leaf_op, (em.ref(m), em.ref(i)))
+            for m, i in zip(plan.maps, plan.ins, strict=True)
+        ]
+        if em.broken or not leaves:  # pragma: no cover — defensive
+            continue
+
+        def _tree(ls, _op=comp_op):
+            if len(ls) == 1:
+                return ls[0]
+            k = len(ls) // 2
+            # compose(f, g) applies g first — the early steps sit in
+            # the RIGHT subtree, so a balanced split is
+            # compose(right-half, left-half).
+            return em.op(_op, (_tree(ls[k:]), _tree(ls[:k])))
+
+        root = em.op(apply_op, (_tree(leaves), em.ref(plan.h0)))
+        if em.broken:  # pragma: no cover — defensive
+            continue
+        eg._offer_witness(
+            cid,
+            root[0],
+            rhs_term=root[1],
+            provenance=provenance,
+            law=_LIFT_LAW,
+            witness=witness,
+            note=(
+                f"applyd_lift: unrolled {plan.kind} recurrence "
+                f"(T={plan.T}, d={plan.d}) → carrier apply tree"
+            ),
+        )
+        out.append(
+            {
+                "root_eid": cid,
+                "out_eid": root[0],
+                "term": root[1],
+                "kind": plan.kind,
+                "T": plan.T,
+                "d": plan.d,
+            }
+        )
+    return out

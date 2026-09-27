@@ -20,18 +20,24 @@ from typing import Any
 
 import torch
 from catopt_carriers.om_lower import (
+    build_om_plan,
     is_om_apply_term,
     to_batched_om_module,
 )
 from catopt_carriers.omd_lower import (
+    build_omd_plan,
     is_omd_apply_term,
     to_batched_omd_module,
 )
 from catopt_carriers.scan_lower import (
+    build_scan_plan,
     is_scan_apply_term,
     to_batched_scan_module,
 )
-from catopt_carriers.trace_lift import lift_scan_to_trace
+from catopt_carriers.trace_lift import (
+    lift_scan_to_applyd,
+    lift_scan_to_trace,
+)
 from catopt_carriers.xcarrier import (
     gather_apply_stack,
     gather_applyd_stack,
@@ -324,6 +330,66 @@ def _default_cost_fn() -> CostFn:
     return executor_cost_for(lowering="generic")
 
 
+#: Carrier-apply root enode ops → (batched plan builder).  A term
+#: rooted at one of these lowers through the level-batched executor.
+_CARRIER_PLANS = {
+    "apply": build_scan_plan,
+    "applyd": build_scan_plan,
+    "om_apply": build_om_plan,
+    "omd_apply": build_omd_plan,
+    "omd_applym": build_omd_plan,
+}
+
+
+def _delivered_cost(term: Any, profile: Any = None) -> float:
+    """Price a term under the lowering it would actually get — the
+    batched carrier executor for plannable apply roots, generic eval
+    otherwise (solver ops surcharged)."""
+    if isinstance(term, Op) and term.op in _CARRIER_PLANS:
+        plan = _CARRIER_PLANS[term.op](term)
+        if plan is not None:
+            return executor_cost_for(profile, lowering="batched_scan")(
+                term
+            )
+    return executor_cost_for(profile, lowering="generic")(term)
+
+
+def _carrier_upgrade(
+    eg: Any,
+    root_eid: int,
+    best_term: Any,
+    cost_fn: CostFn,
+    profile: Any = None,
+) -> Any:
+    """Coordinated carrier selection.
+
+    ``extract_best``'s additive local-cost decomposition can't price
+    the batched-scan win (a whole-spine property: log(T) batched
+    levels vs T serial leaves), so apply-rooted members lose to terms
+    that merely count cheaper — even though they run ~6x faster when
+    lowered.  Re-examine the root eclass: force-extract each
+    carrier-apply enode and compare *delivered* prices — each term
+    billed under the executor it would route to.  Swap only when the
+    carrier member is cheaper AND its batched plan exists (else the
+    module degrades to serial eval and the price lied).
+    """
+    cid = eg.find(root_eid)
+    carriers = [
+        n for n in eg._classes[cid].nodes if n.op in _CARRIER_PLANS
+    ]
+    if not carriers:
+        return best_term
+    best_price = _delivered_cost(best_term, profile)
+    for node in carriers:
+        cand = eg.extract_best(root_eid, cost_fn, overrides={cid: node})
+        if cand is None:
+            continue
+        price = _delivered_cost(cand, profile)
+        if price < best_price:
+            best_term, best_price = cand, price
+    return best_term
+
+
 def _lower_extracted(
     best_term: Any,
     optimized_ir: Any,
@@ -420,13 +486,15 @@ def discover_alternatives(
         eg.run(
             rules, root_eid, max_iterations=5, rule_budgets=rule_budgets
         )
+
     # Non-local lifts: unrolled recurrences -> trace(F), stacks of
     # same-state carrier applications -> one application, whole om
     # trees over scanned values -> the deferred omd carrier, and exact
     # weight tying (duplicate Param leaves share one class).
     # All witnessed so certificates stay replayable.
     lifts = (
-        lift_scan_to_trace(eg)
+        lift_scan_to_applyd(eg)
+        + lift_scan_to_trace(eg)
         + gather_applyd_stack(eg)
         + gather_apply_stack(eg)
         + omd_tree_lift(eg)
@@ -661,7 +729,8 @@ def optimize_model(
     # weight tying (duplicate Param leaves share one class).
     # All witnessed so certificates stay replayable.
     lifts = (
-        lift_scan_to_trace(eg)
+        lift_scan_to_applyd(eg)
+        + lift_scan_to_trace(eg)
         + gather_applyd_stack(eg)
         + gather_apply_stack(eg)
         + omd_tree_lift(eg)
@@ -698,6 +767,9 @@ def optimize_model(
         ):
             best_term = forced
             stats["paired_extract"] = True
+    # Coordinated carrier selection: a batched-executor win is a
+    # whole-spine property the additive extraction can't price.
+    best_term = _carrier_upgrade(eg, root_eid, best_term, cost_fn)
     # Causal specialization: a param-only attn_mask that evaluates to a
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
     _cm: dict = {}

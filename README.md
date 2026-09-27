@@ -195,13 +195,18 @@ runtime guarantee — the correlation numbers above are the honest
 receipt.
 
 Post-fix re-run (CPU, retnet T=128): the pathological pick is gone —
-`optimize_model` selects the `add`-chain instead of the trace
-resolvent, and `lowering_min` correctly prices the canonical scan's
-batched advantage. The *residual* ρ (~0.3) is fusion: identical
-terms run 0.043ms under Inductor vs ~0.9ms under the generic
-evaluator — a 20× gap structural cost can't see without predicting
-kernel fusion. That remaining fidelity gap is pricing compiled
-lowerings by realized fusion regions, not terms — next work item.
+and more: `optimize_model` now *selects and delivers* the batched
+scan end-to-end (2.87× vs eager, fp64-exact). That required a new
+nonlocal lift — `lift_scan_to_applyd` builds the carrier tree
+directly from the recognized recurrence spine (carrier-law
+saturation is combinatorially explosive at long T) — plus
+`_carrier_upgrade`, which re-prices carrier members under the
+executor they'd actually get and swaps them in when cheaper. The
+*residual* ρ (~0.3) is fusion: identical terms run 0.043ms under
+Inductor vs ~0.9ms under the generic evaluator — a 20× gap
+structural cost can't see without predicting kernel fusion. That
+remaining fidelity gap is pricing compiled lowerings by realized
+fusion regions, not terms — next work item.
 
 **Controlled negative**: NormLinear loses slightly (0.98×) — Inductor
 already fuses `x·rms·wn` into the GEMM's input read, so restructuring
