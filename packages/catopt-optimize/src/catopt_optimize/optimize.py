@@ -802,10 +802,15 @@ def optimize_model(
         # enode AND steer consumers through the shared GEMM.  Compare
         # true DAG costs — forcing loses if a group is only partially
         # reachable or a bypassing alternative was already cheaper.
+        # One shared memo across both calls: a forced term shares most
+        # subterms with the best term, and the baseline price is
+        # computed once, not per candidate.
+        _dc_memo: dict = {}
+        _best_dag = dag_cost(best_term, cost_fn, memo=_dc_memo)
         forced = eg.extract_paired(root_eid, cost_fn, groups)
-        if forced is not None and dag_cost(forced, cost_fn) <= dag_cost(
-            best_term, cost_fn
-        ):
+        if forced is not None and dag_cost(
+            forced, cost_fn, memo=_dc_memo
+        ) <= _best_dag:
             best_term = forced
             stats["paired_extract"] = True
     # Coordinated carrier selection: a batched-executor win is a

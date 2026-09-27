@@ -1468,18 +1468,29 @@ def _generic_overhead(term: Any, memo: dict) -> float:
     ck = ("eo", "generic", term)
     if ck in memo:
         return memo[ck]
-    n = 0.0
-    stack = [term]
+    # eo(t) = w(t) + Σ eo(children) — memoised PER NODE so dag_cost's
+    # one-call-per-node pricing is linear in the DAG, not O(N²): the
+    # previous flat stack walk repriced every node's whole subtree.
+    # Iterative post-order — spine-depth chains blow the recursion
+    # limit (T=2048).
+    stack = [(term, 0)]
     while stack:
-        t = stack.pop()
-        if not isinstance(t, Op):
+        t, phase = stack.pop()
+        c2 = ("eo", "generic", t)
+        if c2 in memo:
             continue
-        if _folds_to_param(t, None, memo):
-            continue  # folded to a parameter at lowering — no dispatch
-        n += _SOLVER_FACTOR if t.op in _SOLVER_OPS else 1.0
-        stack.extend(t.args)
-    memo[ck] = n
-    return n
+        if phase == 0:
+            if not isinstance(t, Op) or _folds_to_param(t, None, memo):
+                memo[c2] = 0.0
+                continue
+            stack.append((t, 1))
+            for a in t.args:
+                stack.append((a, 0))
+        else:
+            memo[c2] = (
+                _SOLVER_FACTOR if t.op in _SOLVER_OPS else 1.0
+            ) + sum(memo[("eo", "generic", a)] for a in t.args)
+    return memo[ck]
 
 
 def _outside_overhead(term: Op, spine: Op, memo: dict) -> float:
