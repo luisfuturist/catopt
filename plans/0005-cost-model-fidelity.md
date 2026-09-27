@@ -1,7 +1,9 @@
 # Plan 0005 — Cost-model fidelity vs measured latency
 
-Status: fix landed (main `9b3577d`) — executor-aware pricing +
-lowering routing implemented; follow-up fidelity re-run in progress
+Status: fix landed (main `9b3577d` + `d7924bf`) — executor-aware
+pricing, lowering routing, and coordinated carrier selection
+implemented and verified end-to-end (retnet T=128 selects + delivers
+the batched scan: 2.87x vs eager, fp64-exact)
 
 ## Landed (main 9b3577d)
 
@@ -84,3 +86,19 @@ Cells: matrix chain k∈{4,8,16} (win regime), retnet/gla T∈{128,512}
 - A cost-model fix for any identified unmodeled term, then a re-run
   showing ρ improvement and selection changes.
 - README update with the fidelity numbers (honest either way).
+
+## Follow-up (main d7924bf)
+
+- `lift_scan_to_applyd`: nonlocal lift emitting the apply/applyd
+  carrier member directly from the recognized recurrence spine —
+  carrier-law saturation is combinatorially explosive (358k enodes
+  on retnet T=128 vs the 100k cap), so the fold is constructed
+  instead.  Shares `_Spine`/`_scan_plans` with the trace lift;
+  allows deterministic tie-tolerant decompositions (any valid
+  reading is sound — every offered member equals the class value).
+- `_carrier_upgrade`: post-extraction coordinated selection —
+  force-extracts root-class carrier enodes and compares *delivered*
+  prices (batched when a plan exists).  Closes the (term, lowering)
+  gap the additive cost decomposition can't express.
+- Measured: retnet T=128 `optimize_model` → `lowering="batched"`,
+  2.87x vs eager, fp64-exact.  LinearRecurrence likewise.
