@@ -259,7 +259,9 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
             out = _balanced(out.op, flat, dict(out.attrs))
     elif out.op in _ASSOC_ONLY:
         flat = _flatten_chain(out)
-        if len(flat) == 1:  # pragma: no cover — binary chains yield >=2 leaves
+        if (
+            len(flat) == 1
+        ):  # pragma: no cover — binary chains yield >=2 leaves
             out = flat[0]
         elif len(flat) != len(out.args):
             out = _balanced(out.op, flat, dict(out.attrs))
@@ -861,9 +863,9 @@ def _leaf_generalize(
 
 def _alpha_key(lhs: Any, rhs: Any) -> tuple[str, str]:
     """Metavariable-renaming-invariant key for a (lhs, rhs) pair."""
-    names: dict[str, str] = []
+    names: list[str] = []
 
-    def norm(t: Any, table: list) -> Any:
+    def norm(t: Any, table: list[str]) -> Any:
         if isinstance(t, str):
             for i, n in enumerate(table):
                 if n == t:
@@ -1147,6 +1149,9 @@ def _validate_candidate(
     if witness is not None:
         return attempt(dict(witness), fatal_replay=True) is True
 
+    # Materialise once: ``seeds`` is typed ``Iterable`` (a generator is
+    # always truthy), and the loop below may consult it twice.
+    seeds = tuple(seeds)
     # Guarded candidates prefer real seed witnesses; a vetoed match is
     # just an instance the side conditions exclude, a verified match is
     # proof on a binding that actually arises.
@@ -1295,7 +1300,9 @@ def synthesize_rules(
         # The guard re-expression maps (pat1, pat2) are pure data — kept
         # on the rule so catopt_core.rulecache can serialize them and rebuild
         # the composite check/derive at load time via _compose_guards.
-        if pats is not None:  # pragma: no cover — every call site passes pats
+        if (
+            pats is not None
+        ):  # pragma: no cover — every call site passes pats
             object.__setattr__(cand, "guard_pats", pats)
         if not emit_subsumed and _subsumed(cand, usable + derived):
             return
@@ -1443,7 +1450,9 @@ def synthesize_rules(
                 subst[v] = ns1 + v[len("$attr:") :]
         try:
             t1 = instantiate_pattern(r1.rhs, subst)
-        except KeyError:  # pragma: no cover — _synthesizable guarantees a total subst
+        except (
+            KeyError
+        ):  # pragma: no cover — _synthesizable guarantees a total subst
             continue
         # r1's binding on the derived rule's own subst is the identity.
         pat1 = {
@@ -1464,16 +1473,24 @@ def synthesize_rules(
                 ok = True
                 for v in pattern_metavars(r2.rhs):
                     if v.startswith("$attr:") and v not in inst2:
-                        if r2.derive is None:  # pragma: no cover — filtered by _synthesizable
+                        if (
+                            r2.derive is None
+                        ):  # pragma: no cover — filtered by _synthesizable
                             ok = False
                             break
-                        inst2[v] = ns2 + v[len("$attr:") :]  # pragma: no cover — r2.derive + unbound attr metavar
+                        inst2[v] = (
+                            ns2 + v[len("$attr:") :]
+                        )  # pragma: no cover — r2.derive + unbound attr metavar
 
-                if not ok:  # pragma: no cover — filtered by _synthesizable
+                if (
+                    not ok
+                ):  # pragma: no cover — filtered by _synthesizable
                     continue
                 try:
                     rhs2 = instantiate_pattern(r2.rhs, inst2)
-                except KeyError:  # pragma: no cover — total subst guaranteed
+                except (
+                    KeyError
+                ):  # pragma: no cover — total subst guaranteed
                     continue
                 t2 = _replace(t1, q, rhs2)
                 chk, drv = _compose_guards(r1, r2, pat1, m2)

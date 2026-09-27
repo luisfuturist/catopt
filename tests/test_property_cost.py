@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 
-import pytest
 from catopt_core.cost import (
     _shape_of,
     count_cost,
@@ -46,22 +45,16 @@ def test_flops_invariant_under_commutative_swap(a, b):
         )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "cost._infer_op_shape short-circuits when ANY operand shape is "
-        "unknown, returning shapes[0] (or None) instead of the "
-        "symmetric broadcast — so add(a, b) and add(b, a) price "
-        "differently when the FIRST operand's shape is unknown"
-    ),
-    strict=False,
-)
 def test_flops_invariant_under_commutative_swap_unknown_shape():
+    """With one operand's shape unknown, ``add``/``mul`` still price
+    symmetrically — the unknown-shape fallback is operand-agnostic."""
     known = Var("x", TensorType((2,)))
     unknown = Op.make("max", Const(0.0), Const(0.0))
     assert _shape_of(unknown) is None
-    assert flops_cost(Op.make("add", known, unknown)) == flops_cost(
-        Op.make("add", unknown, known)
-    )
+    for op in ("add", "mul"):
+        assert flops_cost(Op.make(op, known, unknown)) == flops_cost(
+            Op.make(op, unknown, known)
+        )
 
 
 @given(terms(max_leaves=6))

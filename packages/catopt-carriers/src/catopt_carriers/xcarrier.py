@@ -134,7 +134,7 @@ bindings lazily when a consumer actually reads them.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, TypeGuard, cast
 
 import torch
 from catopt_core.egraph import EGraph, Rewrite
@@ -171,7 +171,7 @@ def _bc(a, b):
     return None if r is _INVALID else r
 
 
-def _concrete(s) -> bool:
+def _concrete(s) -> TypeGuard[tuple[int, ...]]:
     """tuple-of-int shape predicate — single source is
     :func:`catopt_core.typing._concrete` (shared with the lowerers)."""
     from catopt_core.typing import _concrete as _tc
@@ -753,7 +753,11 @@ def _check_omd_split(bound: dict) -> bool:
     b1, b2 = _shape(bound.get("b1")), _shape(bound.get("b2"))
     if not all(_concrete(x) for x in (s1, s2, a1, a2, b1, b2)):
         return False
-    if not all(isinstance(d, int) for d in (sd, ad, bd)):
+    if not (
+        isinstance(sd, int)
+        and isinstance(ad, int)
+        and isinstance(bd, int)
+    ):
         return False
     if len(s1) != len(s2) or len(a1) != len(a2) or a1 != b1 or a2 != b2:
         return False
@@ -1005,6 +1009,7 @@ XC_LINEAR_APPLY_REV = R(
 def _scale_applyd(name, r_first):
     def mul(x, y):
         return Op.make("mul", x, y)
+
     lhs = (
         mul("r", Op.make("applyd", Op.make("aff_diag", "a", "b"), "h"))
         if r_first
@@ -1334,7 +1339,7 @@ def _derive_reshape_apply(bound: dict):
     S = bound.get("$attr:S")
     if A is None or _resolve_view_shape(S, _numel_of(A[:-1])) is None:
         return None
-    return {"$attr:SA": (*tuple(S), A[-1])}
+    return {"$attr:SA": (*cast("tuple[Any, ...]", S), A[-1])}
 
 
 def _check_transpose_apply(bound: dict) -> bool:
@@ -1512,7 +1517,12 @@ def _transpose_apply_rev_dims(bound: dict):
     n1, n = len(A), len(A) - 1
     p1, p2 = bound.get("$attr:P1"), bound.get("$attr:P2")
     q1, q2 = bound.get("$attr:Q1"), bound.get("$attr:Q2")
-    if not all(isinstance(d, int) for d in (p1, p2, q1, q2)):
+    if not (
+        isinstance(p1, int)
+        and isinstance(p2, int)
+        and isinstance(q1, int)
+        and isinstance(q2, int)
+    ):
         return None
     d1, d2 = p1 % n1, p2 % n1
     if d1 >= n or d2 >= n:  # permutes the map's input axis
@@ -1565,7 +1575,12 @@ def _transpose_applyd_rev_dims(bound: dict):
     n = len(a)
     p1, p2 = bound.get("$attr:P1"), bound.get("$attr:P2")
     q1, q2 = bound.get("$attr:Q1"), bound.get("$attr:Q2")
-    if not all(isinstance(d, int) for d in (p1, p2, q1, q2)):
+    if not (
+        isinstance(p1, int)
+        and isinstance(p2, int)
+        and isinstance(q1, int)
+        and isinstance(q2, int)
+    ):
         return None
     d1, d2 = p1 % n, p2 % n
     if {d1, d2} != {q1 % n, q2 % n}:
@@ -1850,7 +1865,7 @@ XC_OMD_PAIR_LIFT = R(
 )
 
 
-def _omd_split(name, ak):
+def _omd_split(name, ak: Literal["dim"]):
     return R(
         name,
         Op.make(
@@ -1989,7 +2004,9 @@ def _gather_stack(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:  # pragma: no cover — c comes from _classes itself
+        if (
+            ec is None
+        ):  # pragma: no cover — c comes from _classes itself
             continue
         for node in list(ec.nodes):
             if node.op != "stack" or not node.children:
@@ -2041,7 +2058,9 @@ def _gather_stack(
                 for m in vs_map[1:]:
                     shared &= set(m)
                 for S in sorted(shared):
-                    if S[-1] != hs[0]:  # pragma: no cover — both stack kinds force S[-1]==hs[0]
+                    if (
+                        S[-1] != hs[0]
+                    ):  # pragma: no cover — both stack kinds force S[-1]==hs[0]
                         continue
                     d_norm = D % (len(S) + 1)
                     if d_norm >= len(S):
@@ -2231,7 +2250,9 @@ def omd_tree_lift(
     for cid in list(eg._classes.keys()):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:  # pragma: no cover — c comes from _classes itself
+        if (
+            ec is None
+        ):  # pragma: no cover — c comes from _classes itself
             continue
         for node in list(ec.nodes):
             if node.op != "om_apply" or len(node.children) != 1:

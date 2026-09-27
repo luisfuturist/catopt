@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from catopt_core.cost import _FOLDABLE_ELEMWISE, _memo_dispatch
 from catopt_core.egraph.types import (
@@ -13,6 +13,10 @@ from catopt_core.egraph.types import (
     _pattern_attrs,
 )
 from catopt_core.ir import Op
+
+if TYPE_CHECKING:
+    from catopt_core.egraph.certs import Certificate
+    from catopt_core.egraph.types import EClass
 
 logger = logging.getLogger("catopt_core.egraph.extract")
 
@@ -27,6 +31,41 @@ _FOLDABLE_OPS = _FOLDABLE_ELEMWISE | {"matmul", "concat"}
 
 
 class _ExtractMixin:
+    if TYPE_CHECKING:
+        # Interface supplied by ``EGraph`` (and the proof mixin) once
+        # the mixins are combined — declared here so ``self``
+        # type-checks.  Runtime never executes this block.
+        _classes: dict[int, EClass]
+        _node_to_class: dict[ENode, int]
+
+        @property
+        def n_enodes(self) -> int: ...
+
+        def find(self, eid: int) -> int: ...
+
+        def any_term(
+            self,
+            eid: int,
+            _seen: frozenset = frozenset(),
+            _memo: dict | None = None,
+        ) -> Any: ...
+
+        def certificate(
+            self,
+            src_term: Any,
+            dst_term: Any = None,
+            *,
+            root_eid: int | None = None,
+            cost_fn: Any = None,
+        ) -> Certificate: ...
+
+        def _oldest_term(
+            self,
+            eid: int,
+            _stack: frozenset = frozenset(),
+            _memo: dict | None = None,
+        ) -> Any: ...
+
     def extract_min_depth(self, eid: int) -> Any:
         """Extract the minimum critical-path-depth member.
 
@@ -122,12 +161,12 @@ class _ExtractMixin:
         classes with >= 2 distinct member ops, each with a one-line
         sketch of every distinct member."""
 
-        out = []
+        out: list[dict[str, Any]] = []
         for eid, ec in self._classes.items():
             ops = {n.op for n in ec.nodes if n.op != "leaf"}
             if len(ops) < 2:
                 continue
-            sketches = []
+            sketches: list[str] = []
             seen_sketch = set()
             for n in ec.nodes:
                 if n.op == "leaf":

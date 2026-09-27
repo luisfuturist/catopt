@@ -23,7 +23,7 @@ Collections:
 # ruff: noqa: RUF001 RUF002 RUF003 -- the law strings and docstrings use
 # mathematical notation (σ, ⊗, ×) deliberately; ASCII would misstate it.
 
-from typing import Any
+from typing import Any, cast
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
@@ -752,7 +752,7 @@ def _check_gqa_absorb(bound: dict) -> bool:
             return False
     if bound["$attr:ESk"] != bound["$attr:ESv"]:
         return False
-    d = bound["$attr:UDk"] % (len(_so(bound["k"])) + 1)
+    d = bound["$attr:UDk"] % (len(cast("tuple", _so(bound["k"]))) + 1)
     r = bound["$attr:ESk"][d]
     qs, ks = _so(bound["q"]), _so(bound["k"])
     if not (

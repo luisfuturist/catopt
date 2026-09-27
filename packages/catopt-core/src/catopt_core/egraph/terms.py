@@ -1,4 +1,5 @@
 """Structural term utilities + certificate verification."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -219,4 +220,3 @@ def verify_certificate(
             f"certificate claims {op_repr(cert.dst)}"
         )
     return current
-

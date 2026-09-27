@@ -270,7 +270,9 @@ class ShapeRule(Protocol):
     ``Callable`` alias ``typing._ShapeRule`` structurally assignable.
     """
 
-    def __call__(self, op: Op, shapes: list, /) -> tuple | str | None: ...
+    def __call__(
+        self, op: Op, shapes: list, /
+    ) -> tuple | str | None: ...
 
 
 @runtime_checkable
@@ -289,7 +291,9 @@ class CostFn(Protocol):
     are per-model extras, not port members.
     """
 
-    def __call__(self, term: Any, memo: dict | None = None) -> float: ...
+    def __call__(
+        self, term: Any, memo: dict | None = None
+    ) -> float: ...
 
 
 @runtime_checkable
@@ -306,11 +310,20 @@ class VerifyResult(Protocol):
     * ``max_rel`` — the historical rel-diff metric
       ``max|ref - out| / (max|ref| + 1e-8)``;
     * ``passed`` — the gate outcome.
+
+    The members are declared read-only so a frozen dataclass (the torch
+    adapter's ``VerifyReport``) satisfies the port; a mutable object
+    satisfies it too (it only needs to be readable).
     """
 
-    max_abs: float
-    max_rel: float
-    passed: bool
+    @property
+    def max_abs(self) -> float: ...
+
+    @property
+    def max_rel(self) -> float: ...
+
+    @property
+    def passed(self) -> bool: ...
 
 
 @runtime_checkable

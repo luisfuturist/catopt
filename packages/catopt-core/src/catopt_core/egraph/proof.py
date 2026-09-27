@@ -1,7 +1,8 @@
 """Proof mixin: certificates, coherence, explanations."""
+
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from catopt_core.egraph.certs import (
     Certificate,
@@ -17,8 +18,47 @@ from catopt_core.egraph.terms import (
 from catopt_core.egraph.types import ENode, _LeafRegistry
 from catopt_core.ir import Op, op_repr
 
+if TYPE_CHECKING:
+    from catopt_core.egraph.certs import ProofEdge
+    from catopt_core.egraph.types import EClass, Rewrite
+
 
 class _ProofMixin:
+    if TYPE_CHECKING:
+        # Interface supplied by ``EGraph`` (and the extraction mixin)
+        # once the mixins are combined — declared here so ``self``
+        # type-checks.  Runtime never executes this block.
+        _classes: dict[int, EClass]
+        _node_to_class: dict[ENode, int]
+        _applications: list[dict]
+        _enode_app: dict[ENode, int]
+        _enode_birth: dict[ENode, int]
+        _enode_origin: dict[ENode, str]
+        _merge_log: list[ProofEdge]
+        _rule_objs: dict[str, Rewrite]
+        _track: bool
+        truncation_level: int
+        _CERT_MAX_DEPTH: int
+        _CERT_MAX_STEPS: int
+
+        def find(self, eid: int) -> int: ...
+
+        def _locate(
+            self, term: Any, eid: int | None = None
+        ) -> tuple[int | None, ENode | None]: ...
+
+        def _class_of_term(
+            self, term: Any, _memo: dict | None = None
+        ) -> Any: ...
+
+        def extract_best(
+            self,
+            eid: int,
+            cost_fn: Any,
+            overrides: dict[int, Any] | None = None,
+            bans: dict[int, set] | None = None,
+            _cache_out: dict | None = None,
+        ) -> Any: ...
 
     def _birth(self, enode: ENode) -> int:
         """Creation order of an enode (its birth eid); huge if unknown."""
@@ -177,6 +217,7 @@ class _ProofMixin:
                 else None
             )
             if bound is not None:
+                rule = cast("Rewrite", rule)
                 L = _term_instantiate(rule.lhs, bound)
                 R = _term_instantiate(rule.rhs, bound)
                 ok = self._connect(s, L, pos, steps, depth + 1)
@@ -202,7 +243,10 @@ class _ProofMixin:
         ):
             cs = [self._class_of_term(a) for a in s.args]
             ct = [self._class_of_term(a) for a in t.args]
-            if all(a is not None and a == b for a, b in zip(cs, ct, strict=True)):
+            if all(
+                a is not None and a == b
+                for a, b in zip(cs, ct, strict=True)
+            ):
                 ok = True
                 for i in range(len(s.args)):
                     if not self._connect(
@@ -254,6 +298,7 @@ class _ProofMixin:
             return []
         if _seen is None:
             _seen, _budget = set(), [512]
+        _budget = cast("list[int]", _budget)
         if depth > 16 or _budget[0] <= 0:
             return None
         _seen.add(op_repr(s))
@@ -501,7 +546,9 @@ class _ProofMixin:
                             sig = tuple(
                                 (s.rule, s.path) for s in nsteps
                             )
-                            if sig not in sigs:  # pragma: no branch — full (rule,path) histories can't collide
+                            if (
+                                sig not in sigs
+                            ):  # pragma: no branch — full (rule,path) histories can't collide
                                 sigs.add(sig)
                                 paths.append(nsteps)
                         elif new_repr not in seen:
@@ -560,5 +607,3 @@ class _ProofMixin:
             "paths": paths,
             "truncated": len(paths) >= max_paths,
         }
-
-

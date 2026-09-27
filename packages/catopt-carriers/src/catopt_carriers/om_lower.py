@@ -45,7 +45,7 @@ other IR falls back to the ordinary tuple-passing IRModule evaluation
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeGuard, cast
 
 import torch
 from catopt_core.ir import IR, Op, Param
@@ -111,7 +111,7 @@ def is_om_apply_term(root: Any) -> bool:
     )
 
 
-def _concrete(shape: Any) -> bool:
+def _concrete(shape: Any) -> TypeGuard[tuple[int, ...]]:
     return (
         isinstance(shape, tuple)
         and len(shape) > 0
@@ -394,7 +394,7 @@ def build_om_plan(root: Any) -> dict | None:
             )
         else:
             key = ("serial", leaf)
-        grp = by_key.get(key)
+        grp: dict[str, Any] | None = by_key.get(key)
         if grp is None:
             grp = {"key": key, "members": [], "mults": []}
             by_key[key] = grp
@@ -437,7 +437,7 @@ def build_om_plan(root: Any) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _stretch(t: torch.Tensor, tail: torch.Size) -> torch.Tensor:
+def _stretch(t: torch.Tensor, tail: tuple[int, ...]) -> torch.Tensor:
     """``t``: ``(n, *t_tail)`` → ``(n, *tail)`` broadcasting batch dims.
 
     Compose results broadcast like their operands; the stacked slot
@@ -546,7 +546,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         """Number of om carrier leaves (0 when not batched)."""
         return 0 if self._plan is None else len(self._plan["leaves"])
 
-    def compile(self, **kwargs) -> BatchedOMModule:
+    def compile(self, **kwargs) -> Any:
         """Compile the batched forward with ``torch.compile``.
 
         Inductor fuses the elem-level ``sub``/``exp``/``sum`` chain and
@@ -554,6 +554,10 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         bandwidth-bound shapes (measured on RTX 2050).  Returns
         ``self``; a no-op-ish pass-through when the module isn't
         batched (the fallback path delegates to the plain IRModule).
+
+        The return is annotated ``Any`` (not ``BatchedOMModule``): the
+        inherited ``nn.Module.compile`` is declared ``-> None``, so a
+        narrower self-return would be an LSP-incompatible override.
         """
         if self._plan is None:
             return self
@@ -577,7 +581,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
             for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
-            return self._graph_out
+            return cast(torch.Tensor, self._graph_out)
         if self._compiled is not None:
             return self._compiled(*xs)
         return self._forward_impl(*xs)
@@ -696,7 +700,9 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
                 l_parts.append(l_)
                 a_parts.append(a)
             else:
-                for leaf, c in zip(grp["members"], grp["mults"], strict=True):
+                for leaf, c in zip(
+                    grp["members"], grp["mults"], strict=True
+                ):
                     f = ev(leaf)  # (m, l, a) triple
                     for _ in range(c):
                         m_parts.append(f[0].unsqueeze(0))
@@ -934,26 +940,36 @@ class StreamingOMModule(torch.nn.Module):
         if self._plan is None:
             return self.eval_mod(*xs)
 
-        x = xs[0] if xs else None
+        x = cast(torch.Tensor, xs[0] if xs else None)
         env: dict[str, torch.Tensor] = {"self": x}
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x
 
         state: tuple | None = None
         for grp in self._plan["leaf_groups"]:
-            for leaf, c in zip(grp["members"], grp["mults"], strict=True):
+            for leaf, c in zip(
+                grp["members"], grp["mults"], strict=True
+            ):
                 # Fresh memo per leaf: score blocks / per-leaf
                 # intermediates are dropped with the dict at the next
                 # iteration — the bounded-working-set property.  Inputs
                 # (Var lookups) and params never enter the memo.
                 memo: dict[Any, Any] = {}
-                e = self.eval_mod._eval(leaf, env, x, memo)
+                # Each leaf is a carrier pack (an (m, l, a) triple) at
+                # runtime; ``_eval``'s declared ``Tensor`` return is the
+                # generic-eval shape, not this carrier's.
+                e = cast(
+                    tuple[Any, ...],
+                    self.eval_mod._eval(leaf, env, x, memo),
+                )
                 # A DAG-shared leaf contributes once per occurrence.
                 for _ in range(c):
                     state = (
                         e if state is None else _om_compose(state, e)
                     )
-        return state
+        return cast(
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor], state
+        )
 
 
 def to_streaming_om_module(

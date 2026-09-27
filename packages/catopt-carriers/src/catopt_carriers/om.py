@@ -56,12 +56,18 @@ MASKED ATTENTION
     masks the block's positional offset lives inside that slice.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from catopt_core.egraph import Rewrite, _LeafRegistry
 from catopt_core.ir import Const, Op, op_def
 from catopt_core.laws import R
+
+#: The canonical concat-axis attr KEY (see the module note on concat
+#: attrs).  Spelled as a ``Literal`` so that ``Op.make(..., **{key: v})``
+#: proves the keyword can never collide with ``Op.make``'s ``validate``
+#: flag — a plain ``str`` key would admit that ambiguity.
+_DimKey = Literal["dim"]
 
 
 def _vshape(t: Any):
@@ -127,7 +133,7 @@ def _check_om_lift(bound: dict) -> bool:
     return _dim_eq(ss[-1], vs[-2])
 
 
-def _om_lift(name: str, attr_key: str | None) -> Rewrite:
+def _om_lift(name: str, attr_key: _DimKey | None) -> Rewrite:
     sm = (
         Op.make("softmax", "s", **{attr_key: "SD"})
         if attr_key is not None
@@ -199,7 +205,7 @@ def _check_om_concat_dims(bound: dict) -> bool:
     return _chunks_compatible(s1, s2, v1, v2)
 
 
-def _om_split(name: str, attr_key: str) -> Rewrite:
+def _om_split(name: str, attr_key: _DimKey) -> Rewrite:
     return R(
         name,
         Op.make(
@@ -278,7 +284,7 @@ OM_ASSOC_REV = R(
 # ---------------------------------------------------------------------------
 
 
-def _concat_binarize(n: int, attr_key: str) -> Rewrite:
+def _concat_binarize(n: int, attr_key: _DimKey) -> Rewrite:
     xs = [f"x{i}" for i in range(n)]
     rhs = Op.make("concat", xs[0], xs[1], dim="D")
     for x in xs[2:]:
@@ -316,7 +322,11 @@ def _check_matmul_t_concat(bound: dict) -> bool:
     )
     k1, k2 = _vshape(bound.get("k1")), _vshape(bound.get("k2"))
     q = _vshape(bound.get("q"))
-    if not all(isinstance(x, int) for x in (kd, t1, t2)):
+    if not (
+        isinstance(kd, int)
+        and isinstance(t1, int)
+        and isinstance(t2, int)
+    ):
         return False
     if not all(isinstance(s, tuple) for s in (k1, k2, q)):
         return False
@@ -345,7 +355,7 @@ def _derive_score_concat_dim(bound: dict) -> dict | None:
     return {"$attr:SD": max(len(q), len(k1)) - 1}
 
 
-def _matmul_t_concat(name: str, attr_key: str) -> Rewrite:
+def _matmul_t_concat(name: str, attr_key: _DimKey) -> Rewrite:
     return R(
         name,
         Op.make(
@@ -540,7 +550,9 @@ def _mask_slice(key: str, i: int) -> Op:
     return Op.make("split", key, sizes="SZ", dim="MD", index=i)
 
 
-def _masked_fill_cat(name: str, attr_key: str, mode: str) -> Rewrite:
+def _masked_fill_cat(
+    name: str, attr_key: _DimKey, mode: str
+) -> Rewrite:
     """masked_fill(cat(s1,s2,D), m, v) → cat(masked_fill(s_i, m_i, v), D).
 
     ``m_i`` is the mask's slice on the cat axis (mode "slice") or the
@@ -571,7 +583,7 @@ def _masked_fill_cat(name: str, attr_key: str, mode: str) -> Rewrite:
 
 
 def _add_cat(
-    name: str, attr_key: str, mode: str, mask_first: bool
+    name: str, attr_key: _DimKey, mode: str, mask_first: bool
 ) -> Rewrite:
     """add(cat(s1,s2,D), m) / add(m, cat(s1,s2,D)) → cat of per-block
     adds — the additive-mask counterpart of masked_fill_cat.  add is
@@ -608,7 +620,7 @@ def _add_cat(
 
 
 def _where_cat(
-    name: str, attr_key: str, mode: str, cat_in_x: bool
+    name: str, attr_key: _DimKey, mode: str, cat_in_x: bool
 ) -> Rewrite:
     """where(m, cat(s1,s2,D), v) / where(m, v, cat(s1,s2,D)) → cat of
     per-block wheres — the torch.where masking idiom."""
@@ -666,7 +678,9 @@ def _check_cat_pair(bound: dict) -> int | None:
     ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
     if ba is _INVALID or bb is _INVALID:
         return None
-    if not all(_dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa):  # pragma: no cover — off-axis equality forced by earlier guards
+    if not all(
+        _dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa
+    ):  # pragma: no cover — off-axis equality forced by earlier guards
         return None
     return oa
 
@@ -680,7 +694,7 @@ def _cat_pair_derive(bound: dict) -> dict | None:
     return None if oa is None else {"$attr:DO": oa}
 
 
-def _cat_hom_add(name: str, attr_key: str) -> Rewrite:
+def _cat_hom_add(name: str, attr_key: _DimKey) -> Rewrite:
     """add(cat(a1,a2,D), cat(b1,b2,D)) = cat(add(a1,b1), add(a2,b2), D)
     — concat is a homomorphism for elementwise add.  This is the pure
     form of the additive-mask law when the mask is itself concat'd."""
@@ -704,7 +718,7 @@ def _cat_hom_add(name: str, attr_key: str) -> Rewrite:
     )
 
 
-def _cat_hom_masked_fill(name: str, attr_key: str) -> Rewrite:
+def _cat_hom_masked_fill(name: str, attr_key: _DimKey) -> Rewrite:
     """masked_fill(cat(s1,s2,D), cat(m1,m2,DM), v) → cat of per-block
     masked_fills — the mask arrives already concat'd (e.g. chunked
     masks); block i pairs s_i with m_i directly, no split needed."""
@@ -1044,7 +1058,7 @@ def _sdpa_cat_rhs(causal: bool) -> Op:
 
 
 def _sdpa_cat(
-    name: str, attr_key: str, sdpa_attrs: dict, causal: bool
+    name: str, attr_key: _DimKey, sdpa_attrs: dict, causal: bool
 ) -> Rewrite:
     return R(
         name,
@@ -1116,7 +1130,9 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
     from catopt_core.typing import _INVALID, _broadcast
 
     bb = _broadcast(qs[:-2], k1s[:-2])
-    if bb is _INVALID:  # pragma: no cover — _check_sdpa_cat already proved this broadcast
+    if (
+        bb is _INVALID
+    ):  # pragma: no cover — _check_sdpa_cat already proved this broadcast
         return False
     scores = (*tuple(bb), qs[-2], k1 + k2)
     b = _broadcast(scores, ms)
@@ -1154,7 +1170,7 @@ def _sdpa_cat_mask_rhs() -> Op:
 
 
 def _sdpa_cat_masked(
-    name: str, attr_key: str, sdpa_attrs: dict
+    name: str, attr_key: _DimKey, sdpa_attrs: dict
 ) -> Rewrite:
     return R(
         name,

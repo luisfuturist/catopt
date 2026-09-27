@@ -55,6 +55,8 @@ class SelectiveSSM(nn.Module):
         steps:   sequence length T — the loop is unrolled at export time.
     """
 
+    eye: torch.Tensor
+
     def __init__(
         self, d_inner: int = 16, d_in: int = 16, steps: int = 16
     ) -> None:
@@ -86,6 +88,8 @@ class DiagDenseSSM(nn.Module):
     affine lift matches.  A correctness reference point: the e-graph
     reaches the same balanced scan as for :class:`SelectiveSSM`.
     """
+
+    eye: torch.Tensor
 
     def __init__(
         self, d_inner: int = 16, d_in: int = 16, steps: int = 16

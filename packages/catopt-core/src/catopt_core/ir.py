@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from catopt_core.attrs import validate_attrs
 
@@ -46,9 +46,9 @@ class TensorType:
     def size(self) -> int | None:
         if any(d is None for d in self.shape):
             return None
-        result: int | None = 1
+        result = 1
         for d in self.shape:
-            result = result * d
+            result = result * cast("int", d)
         return result
 
     def __repr__(self) -> str:
@@ -133,7 +133,8 @@ class Op:
 
     def __post_init__(self) -> None:
         object.__setattr__(
-            self, "_h",
+            self,
+            "_h",
             hash((self.op, self.args, _attr_key(self.attrs))),
         )
 
@@ -162,7 +163,9 @@ class Op:
         if existing is not None:
             return existing
         t = Op(op, args, a)
-        if key is not None:  # pragma: no branch — unhashable args die earlier in __post_init__
+        if (
+            key is not None
+        ):  # pragma: no branch — unhashable args die earlier in __post_init__
             Op._INTERN[key] = t
         return t
 

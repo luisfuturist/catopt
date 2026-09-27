@@ -320,7 +320,9 @@ class OpTable:
         if isinstance(source, dict):
             return SimpleNamespace(TORCH_BINDINGS=source)
         if isinstance(source, str):
-            name = source if "." in source else f"catopt_carriers.{source}"
+            name = (
+                source if "." in source else f"catopt_carriers.{source}"
+            )
             return importlib.import_module(name)
         return source
 

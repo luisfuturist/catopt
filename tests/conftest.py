@@ -25,11 +25,11 @@ import torch
 # uv's PEP-660 editable install registers a single ``__editable__*``
 # MetaPathFinder mapping every workspace package back to the real
 # ``packages/*/src``.  It runs ahead of path-based resolution, so inside
-# mutmut's ``mutants/`` tree it would shadow the mutated copies and no
-# mutant would ever be imported (mutmut then reports "no test case for
-# any mutant").  When we are running from that sandbox, drop the finder
-# so pytest's ``pythonpath`` roots resolve to the mutated sources.  It
-# is a no-op for normal runs.
+# the flat sandbox mutmut builds (``.mutmut-sandbox/``, see
+# tools/mutmut.sh) it would shadow the mutated copies and no mutant
+# would ever be imported (mutmut then reports "no test case for any
+# mutant").  When running from that sandbox, drop the finder so the
+# ``mutants/`` copies win.  It is a no-op for normal runs.
 if Path.cwd().name == "mutants":
     sys.meta_path[:] = [
         f

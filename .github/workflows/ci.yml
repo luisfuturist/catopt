@@ -1,0 +1,106 @@
+# CI — runs EVERY gate, including the pre-commit `stages: [manual]` ones.
+#
+# The local pre-commit config already enforces most gates on staged
+# files, but three of them are marked `stages: [manual]` and therefore
+# never run automatically:
+#
+#   * typeguard runtime contracts (the curated catopt_core subset)
+#   * pip-audit                (needs network to reach the advisory DB)
+#   * semgrep registry rulesets (needs network to fetch p/* rulesets)
+#
+# This workflow runs all of them anyway, so CI cannot silently skip a
+# gate.  Every step is a hard failure.  The gate list mirrors
+# `.pre-commit-config.yaml` plus the coverage floor.
+#
+# Gate-by-gate rationale:
+#   * uv sync --group dev — the dev dependency group (ruff, ty, vulture,
+#     import-linter, bandit, pip-audit, radon, typeguard, semgrep, ...).
+#   * CPU torch — the lockfile resolves a CUDA wheel on Linux, but four
+#     tests assume a CPU build (and CUDA-graph capture is flaky on CI);
+#     force the CPU wheel before running anything.
+#   * ruff check packages catopt tools — lint (line length 72, etc.).
+#     Scoped to shipped source; tests/ + bench/ carry pre-existing
+#     isort drift under the pinned ruff.
+#   * ruff format --check packages catopt tools — formatting.
+#   * ty check — the typecheck ratchet ([tool.ty.src] include/exclude in
+#     pyproject.toml scope it to packages/ + catopt/).  0 errors.
+#   * vulture — dead-code scan ([tool.vulture] paths + min-confidence).
+#   * lint-imports — the hexagonal boundary contract: catopt_core must
+#     not import the adapters or torch/numpy.
+#   * bandit -c .bandit.yaml -r packages catopt — security SAST; the
+#     config carries the scoped excludes + justified rule skips.
+#   * semgrep --config .semgrep.yml --config p/python
+#     --config p/security-audit packages catopt — repo-local invariants
+#     plus the registry dataflow/security rulesets (network).
+#   * pip-audit — dependency-vulnerability audit (network).
+#   * python tools/radon_ratchet.py — cyclomatic-complexity ratchet:
+#     no function may exceed its pinned baseline, new ones stay <= C.
+#   * typeguard runtime contracts — runtime enforcement of annotations
+#     over the torch-free core (curated green subset).
+#   * coverage run + coverage report -m — the full suite under the
+#     pinned 100% coverage floor ([tool.coverage.report] fail_under).
+#
+# NOTE: `coverage` is invoked as `.venv/bin/coverage` because CI does
+# not activate the virtualenv between steps (uv sync only creates it).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: uv sync (dev group)
+        run: uv sync --group dev
+
+      - name: Force CPU torch build
+        # The lockfile resolves a CUDA wheel on Linux; four tests assume
+        # a CPU build, and CUDA-graph capture is flaky on CI runners.
+        run: uv pip install --torch-backend cpu --reinstall torch
+
+      - name: ruff check
+        run: .venv/bin/ruff check packages catopt tools
+
+      - name: ruff format --check
+        run: .venv/bin/ruff format --check packages catopt tools
+
+      - name: ty check
+        run: .venv/bin/ty check
+
+      - name: vulture
+        run: .venv/bin/vulture
+
+      - name: import-linter
+        run: .venv/bin/lint-imports
+
+      - name: bandit
+        run: .venv/bin/bandit -c .bandit.yaml -r packages catopt
+
+      - name: semgrep (local + registry rulesets)
+        run: >-
+          .venv/bin/semgrep --config .semgrep.yml --config p/python
+          --config p/security-audit packages catopt
+
+      - name: pip-audit
+        run: .venv/bin/pip-audit
+
+      - name: radon complexity ratchet
+        run: .venv/bin/python tools/radon_ratchet.py
+
+      - name: typeguard runtime contracts
+        run: sh tools/runtime_types.sh
+
+      - name: coverage run (full suite)
+        run: >-
+          .venv/bin/coverage run
+          --source=catopt_core,catopt_torch,catopt_carriers,catopt_optimize,catopt
+          -m pytest tests/ -q
+
+      - name: coverage report (fail_under=100)
+        run: .venv/bin/coverage report -m

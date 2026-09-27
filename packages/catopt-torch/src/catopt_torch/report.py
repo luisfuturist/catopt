@@ -193,7 +193,7 @@ class OptReport:
         on :class:`CompositionalReport`) are lifted to
         :class:`BlockReport`."""
         names = {f.name for f in dataclasses.fields(cls)} - {"extra"}
-        kwargs = {n: stats.get(n) for n in names}
+        kwargs: dict[str, Any] = {n: stats.get(n) for n in names}
         if kwargs.get("blocks") is not None:
             kwargs["blocks"] = {
                 n: BlockReport.from_dict(e, name=n)
@@ -256,7 +256,7 @@ class BlockReport:
             "name",
             "extra",
         }
-        kwargs = {n: entry.get(n) for n in names}
+        kwargs: dict[str, Any] = {n: entry.get(n) for n in names}
         if isinstance(kwargs.get("stats"), dict):
             kwargs["stats"] = OptReport.from_stats(kwargs["stats"])
         kwargs["extra"] = {

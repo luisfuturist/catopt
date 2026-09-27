@@ -329,7 +329,9 @@ def share_duplicate_params(
         for name in names:
             placed = False
             for ci, rep in enumerate(reps):
-                if _exact_equal(source_tensors[name], source_tensors[rep]):
+                if _exact_equal(
+                    source_tensors[name], source_tensors[rep]
+                ):
                     clusters[ci].append(name)
                     placed = True
                     break
@@ -458,22 +460,22 @@ def share_duplicate_param_slices(
                 for j in range(h)
             ]
             uniq: list[bytes] = []
-            imap: list[int] = []
+            imap_build: list[int] = []
             for s in sigs:
                 try:
-                    imap.append(uniq.index(s))
+                    imap_build.append(uniq.index(s))
                 except ValueError:
-                    imap.append(len(uniq))
+                    imap_build.append(len(uniq))
                     uniq.append(s)
             k = len(uniq)
             stored = k * d * i
             if k < h and (best is None or stored < best[0]):
-                first = [imap.index(u) for u in range(k)]
+                first = [imap_build.index(u) for u in range(k)]
                 best = (
                     stored,
                     h,
                     d,
-                    tuple(imap),
+                    tuple(imap_build),
                     [t[f * d : (f + 1) * d] for f in first],
                 )
         if best is None:

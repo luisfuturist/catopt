@@ -1,4 +1,5 @@
 """Core e-graph: union-find, matching, saturation."""
+
 from __future__ import annotations
 
 import logging
@@ -151,7 +152,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
         """
         attr_t = tuple(
             sorted(
-                (k, _norm_attr_value(v)) for k, v in (attrs or {}).items()
+                (k, _norm_attr_value(v))
+                for k, v in (attrs or {}).items()
             )
         )
         enode = ENode(op, tuple(self.find(c) for c in children), attr_t)
@@ -450,7 +452,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         union.  Returns :meth:`union`'s result.
         """
         if rhs_eid is None:
-            rhs_eid = self.add_term(rhs_term, provenance=term_provenance)
+            rhs_eid = self.add_term(
+                rhs_term, provenance=term_provenance
+            )
         wit = (
             self._pointwise_witness(
                 cid,
@@ -710,7 +714,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 tuple(self.find(c) for c in child_eids),
                 tuple(
                     sorted(
-                        (k, _norm_attr_value(v)) for k, v in attrs.items()
+                        (k, _norm_attr_value(v))
+                        for k, v in attrs.items()
                     )
                 ),
             )
@@ -1024,7 +1029,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         max_iterations: int = 100,
         max_nodes: int = 100_000,
         rule_budgets: dict[str, int] | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """Run equality saturation until a fixed point.
 
         Incremental: each iteration re-searches only the *dirty
@@ -1120,6 +1125,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         # unrestricted loop guaranteed (downstream passes and
         # extraction traverse it directly).
         self.rebuild()
+        # The payload mixes counts with the ``rule_budgets`` map and the
+        # ``budget_suspended`` list, so the return type is ``dict[str,
+        # Any]``.
         return {
             "iterations": iteration + 1,
             "n_enodes": self.n_enodes,
@@ -1133,4 +1141,3 @@ class EGraph(_ExtractMixin, _ProofMixin):
         }
 
     # -- extraction --
-

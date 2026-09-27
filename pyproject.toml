@@ -93,18 +93,6 @@ catopt-optimize = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The packages are editable-installed, but mutmut runs the suite inside
-# a copied ``mutants/`` tree with a per-package ``src/`` layout that is
-# *not* on ``sys.path``.  Declaring the source roots here makes pytest
-# put them first: harmless for normal runs (same files as the editable
-# install) and, under mutmut, it makes the *mutated* copies importable
-# so mutation→test correlation works.
-pythonpath = [
-    "packages/catopt-core/src",
-    "packages/catopt-torch/src",
-    "packages/catopt-carriers/src",
-    "packages/catopt-optimize/src",
-]
 markers = [
     "requires_cuda: test allocates CUDA tensors; skipped at setup when CUDA is absent or OOMs on a probe allocation",
 ]
@@ -190,16 +178,14 @@ ignore = [
 "tests/**" = ["D"]
 "bench/**" = ["D"]
 
-# --- typecheck ratchet (ty) ---------------------------------------
-# ty is Astral's type checker and replaces the earlier pyright ratchet.
-# `[tool.ty.src] include` scopes checking to the shipped packages (the
-# same scope pyright used — tests/ and bench/ are not type-checked);
-# `exclude` is the temporary opt-out list — remove entries as files get
-# annotated. Baseline (ty 0.0.84): 198 errors / 19 files. Excluded files
-# are not reported, but are still analyzed when imported by a checked
-# file. Each entry: ty-baseline error count + dominant issue, sorted by
-# count. New modules under packages/*/src/ are checked automatically —
-# keep them clean.
+# --- typecheck (ty) -----------------------------------------------
+# ty is Astral's type checker (it replaced the earlier pyright ratchet).
+# `[tool.ty.src] include` scopes checking to the shipped packages
+# (tests/ and bench/ are not type-checked).  The ratchet `exclude` list
+# is now EMPTY: every file that carried a baseline error count has been
+# annotated, so `ty check` is clean with no opt-outs.  Keep it that way
+# — add annotations, not exclude entries.  New modules under
+# packages/*/src/ are checked automatically.
 [tool.ty.environment]
 python-version = "3.13"
 extra-paths = [
@@ -211,31 +197,10 @@ extra-paths = [
 
 [tool.ty.src]
 include = ["packages", "catopt"]
-exclude = [
-    "packages/catopt-core/src/catopt_core/egraph/proof.py",      # 33 — unresolved-attribute on untyped proof objects
-    "packages/catopt-core/src/catopt_core/egraph/extract.py",    # 32 — unresolved-attribute on untyped extraction state
-    "packages/catopt-carriers/src/catopt_carriers/om.py",        # 19 — invalid-argument-type on Op.make **attrs
-    "packages/catopt-carriers/src/catopt_carriers/xcarrier.py",  # 18 — unsupported-operator / invalid-arg on Optional tensors
-    "packages/catopt-core/src/catopt_core/typing.py",            # 17 — invalid-argument-type / not-subscriptable generics
-    "packages/catopt-carriers/src/catopt_carriers/om_lower.py",  # 15 — invalid-arg/assign/return on Optional subscripts
-    "packages/catopt-core/src/catopt_core/cost.py",              # 12 — unresolved-attribute + invalid-return-type
-    "packages/catopt-carriers/src/catopt_carriers/scan_lower.py",#  8 — not-subscriptable / invalid-return-type
-    "packages/catopt-optimize/src/catopt_optimize/optimize.py",  #  8 — invalid-assignment + unresolved-attribute
-    "packages/catopt-core/src/catopt_core/laws/tensor.py",       #  7 — invalid-argument-type (Op vs str)
-    "packages/catopt-torch/src/catopt_torch/torch_bridge.py",    #  7 — invalid-arg/assign/method-override
-    "packages/catopt-carriers/src/catopt_carriers/omd_lower.py", #  5 — not-subscriptable / invalid-return-type
-    "packages/catopt-core/src/catopt_core/meta.py",              #  4 — invalid-argument-type / truthiness-test
-    "packages/catopt-torch/src/catopt_torch/report.py",          #  3 — invalid-argument-type / unresolved-attribute
-    "packages/catopt-torch/src/catopt_torch/models/__init__.py", #  2 — not-subscriptable (nn.Module __getitem__)
-    "packages/catopt-torch/src/catopt_torch/models/ssm.py",      #  2 — unsupported-operator (Tensor|Module)
-    "packages/catopt-core/src/catopt_core/egraph/core.py",       #  1 — invalid-return-type
-    "packages/catopt-core/src/catopt_core/laws/pairing.py",      #  1 — invalid-assignment
-    "packages/catopt-core/src/catopt_core/ir.py",                #  1 — unsupported-operator
-]
+exclude = []
 
 [tool.ty.terminal]
-# Ratchet semantics match the old pyright gate: errors are fatal,
-# warnings are not. Excluded files carry their baseline as errors.
+# Errors are fatal, warnings are not.
 error-on-warning = false
 
 [tool.coverage.run]
@@ -245,32 +210,17 @@ omit = ["*/tests/*"]
 
 # --- mutation testing (mutmut) -------------------------------------
 # Detects weak tests: a mutant that survives means the suite asserts
-# nothing about that line.  A *full* run is expensive (it re-runs the
-# suite once per mutant), so scope a fast loop with the `only_mutate`
-# glob, e.g. `only_mutate = ["packages/catopt-core/src/catopt_core/attrs.py"]`.
-#
-# STATUS: configured but NOT yet operational for this monorepo.  mutmut
-# 3.8 derives a mutant's key from its path relative to cwd
-# (`packages.catopt-core.src.catopt_core.attrs.x_foo`) and expects the
-# module to be importable under that dotted name, but a per-package
-# ``src/`` layout imports as `catopt_core.attrs`.  It also shadows the
-# `mutants/` copy via uv's editable-install finder.  Two shims are in
-# place for the parts that are fixable from our side (the `pythonpath`
-# roots in [tool.pytest.ini_options] and the editable-finder drop in
-# tests/conftest.py); the key derivation needs upstream support (or a
-# single-package flat checkout).  See AGENTS.md.
-[tool.mutmut]
-source_paths = [
-    "packages/catopt-core/src/catopt_core",
-    "packages/catopt-torch/src/catopt_torch",
-    "packages/catopt-carriers/src/catopt_carriers",
-    "packages/catopt-optimize/src/catopt_optimize",
-]
-pytest_add_cli_args = ["-p", "no:cacheprovider", "-q"]
-pytest_add_cli_args_test_selection = ["tests/"]
-# The tests import the `catopt` compat façade; it must be copied into the
-# sandbox too (mutmut's default also_copy only takes tests/ + lockfiles).
-also_copy = ["catopt/"]
+# nothing about that line.  Run it through the wrapper, which builds the
+# flat-layout sandbox mutmut needs (its keys are path-derived, but this
+# monorepo's per-package ``src/`` layout imports under a different dotted
+# name):
+#   MUTMUT_ONLY=catopt_core/ir.py MUTMUT_TESTS='tests/test_ir.py' \
+#       tools/mutmut.sh run
+#   tools/mutmut.sh results
+# There is intentionally no ``[tool.mutmut]`` table here: the wrapper
+# writes one into the sandbox, and a direct in-repo run would mis-key
+# every mutant.  Surviving mutants are weak-assertion findings, not
+# coverage gaps (the suite is pinned at 100%).
 
 [tool.coverage.report]
 fail_under = 100       # ratcheted upward each refactor phase; target 100

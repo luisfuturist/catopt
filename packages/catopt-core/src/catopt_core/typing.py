@@ -45,7 +45,7 @@ own module.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from catopt_core.attrs import attr_of
 from catopt_core.ir import Const, Op, Param, Var
@@ -55,7 +55,9 @@ from catopt_core.ir import Const, Op, Param, Var
 # ---------------------------------------------------------------------------
 
 
-def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
+def _shape_of(
+    term: Any, memo: dict | None = None
+) -> tuple | str | None:
     """Best-effort shape inference for a term.
 
     ``memo`` is an optional ``id()``-keyed dict shared across a whole
@@ -94,6 +96,11 @@ def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
     return out
 
 
+#: Ops whose result shape is invariant under operand swap — used to
+#: keep unknown-shape pricing symmetric for ``add``/``mul``/``eq``/``ne``.
+_COMMUTATIVE_BROADCAST = frozenset({"add", "mul", "eq", "ne"})
+
+
 def _infer_op_shape(op: Op, memo: dict | None = None):
     # Zero-argument ops with a registered rule (constant morphisms
     # like catopt_carriers.trace's ``eye``/``cswap``): their shapes are fully
@@ -108,12 +115,20 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
     if not shapes or any(s is None for s in shapes):
         if shapes and shapes[0] is not None:
             return shapes[0]
+        # Commutative element-wise ops are operand-symmetric: with the
+        # first shape unknown, fall back to whichever operand shape IS
+        # known, so add(a, b) and add(b, a) price identically.
+        if op.op in _COMMUTATIVE_BROADCAST:
+            for s in shapes:
+                if s is not None:
+                    return s
         return None
     if rule is not None:
         return rule(op, shapes)
     match op.op:
         case "matmul":
-            a, b = shapes[0], shapes[1]
+            a = cast("tuple", shapes[0])
+            b = cast("tuple", shapes[1])
             if len(a) >= 2 and len(b) >= 2:
                 return (*a[:-1], b[-1])
             # Rank-1 operands (torch.matmul semantics): matrix-vector
@@ -176,7 +191,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 if len(w) >= 1:
                     out = (*tuple(shapes[0][:-1]), w[0])
                     if len(shapes) >= 3:
-                        b = shapes[2]
+                        b = cast("tuple", shapes[2])
                         if len(b) >= 2 and b[-1] == 1:
                             # A column bias (o,1) is a rank-1 bias in
                             # disguise — prefer the squeezed (o,)
@@ -201,7 +216,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             dim = attr_of(op, "dim", "axis")
             keep = bool(op.attrs.get("keepdim", False))
             base = shapes[0]
-            if base is None:  # pragma: no cover — dispatch filters None shapes
+            if (
+                base is None
+            ):  # pragma: no cover — dispatch filters None shapes
                 return ()
             if dim is None:
                 return ()
@@ -272,7 +289,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return shapes[0]
         case "unsqueeze":
             base = shapes[0]
-            if base is None:  # pragma: no cover — dispatch filters None shapes
+            if (
+                base is None
+            ):  # pragma: no cover — dispatch filters None shapes
                 return None
             d = attr_of(op, "dim", default=-1)
             d = d % (len(base) + 1)
@@ -289,7 +308,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "stack":
             # stack(ts, dim): all inputs share a shape; insert dim.
             base = shapes[0]
-            if base is None:  # pragma: no cover — dispatch filters None shapes
+            if (
+                base is None
+            ):  # pragma: no cover — dispatch filters None shapes
                 return None
             d = attr_of(op, "dim", default=0)
             d = d % (len(base) + 1)
@@ -327,10 +348,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             hi = op.attrs.get("end")
             step = op.attrs.get("step", 1) or 1
             out = list(base)
-            if isinstance(base[d], int):
-                n = (
-                    min(hi, base[d]) if isinstance(hi, int) else base[d]
-                ) - lo
+            bd = base[d]
+            if isinstance(bd, int):
+                n = (min(hi, bd) if isinstance(hi, int) else bd) - lo
                 out[d] = max(0, -(-n // step))
             return tuple(out)
         case "embedding":
@@ -376,8 +396,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # x (N,C,H,W) @ w (O,C,kh,kw) -> (N,O,H',W')
             x, w = shapes[0], shapes[1]
             if (
-                x is None
-                or w is None
+                not isinstance(x, tuple)
+                or not isinstance(w, tuple)
                 or len(x) < 4
                 or len(w) < 4
                 or isinstance(op.attrs.get("padding"), str)
@@ -399,12 +419,14 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             pd = pd if isinstance(pd, (tuple, list)) else (pd, pd)
             dl = dl if isinstance(dl, (tuple, list)) else (dl, dl)
             oh = ow = None
-            if x[2] is not None and w[2] is not None:
-                oh = (x[2] + 2 * pd[0] - dl[0] * (w[2] - 1) - 1) // st[
+            xh, xw = x[2], x[3]
+            wh, ww = w[2], w[3]
+            if xh is not None and wh is not None:
+                oh = (xh + 2 * pd[0] - dl[0] * (wh - 1) - 1) // st[
                     0
                 ] + 1
-            if x[3] is not None and w[3] is not None:
-                ow = (x[3] + 2 * pd[1] - dl[1] * (w[3] - 1) - 1) // st[
+            if xw is not None and ww is not None:
+                ow = (xw + 2 * pd[1] - dl[1] * (ww - 1) - 1) // st[
                     1
                 ] + 1
             return (x[0], w[0], oh, ow)
@@ -461,7 +483,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
 #: Sentinel returned by shape inference when two shapes are PROVABLY
 #: incompatible (e.g. broadcasting (out,in) against (B,T,1)).  Distinct
 #: from ``None`` (merely unknown): ill-typed terms are poisonous — the
-#: cost model must never prefer them.
+#: cost model must never prefer them.  It is a ``str`` (a sentinel
+#: value), so shape results are typed ``tuple | str | None``.
 _INVALID = "__invalid_shape__"
 
 

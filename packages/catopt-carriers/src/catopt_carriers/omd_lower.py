@@ -51,7 +51,7 @@ bitwise — exactly the tolerance the carrier laws are verified at.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, TypeGuard, cast
 
 import torch
 from catopt_core.ir import IR, Op
@@ -118,7 +118,7 @@ def _select_index(term: Any):
     return (term.args[0], dim, idx)
 
 
-def _concrete(s) -> bool:
+def _concrete(s) -> TypeGuard[tuple[int, ...]]:
     return (
         isinstance(s, tuple)
         and len(s) > 0
@@ -290,7 +290,9 @@ def build_omd_plan(root: Any) -> dict | None:
     )
 
     # ---- scan leaf tensor args (and h) for map projections -----------
-    targets: dict[Any, tuple[Any, str]] = {}  # map term -> (term, domain)
+    targets: dict[
+        Any, tuple[Any, str]
+    ] = {}  # map term -> (term, domain)
     raw_proj: list[tuple[Op, int, Any]] = []  # (node, comp_idx, map)
     raw_stack: list[tuple[Op, int, str, list, int]] = []
     scanned: set[Any] = set()
@@ -390,10 +392,7 @@ def build_omd_plan(root: Any) -> dict | None:
                     for a in mp.args:
                         stack.append((a, dom, False))
                     continue
-                lv = (
-                    max(d["level_of"].get(a, 0) for a in mp.args)
-                    + 1
-                )
+                lv = max(d["level_of"].get(a, 0) for a in mp.args) + 1
                 d["level_of"][tid] = lv
                 while len(d["levels"]) < lv:
                     d["levels"].append([])
@@ -436,7 +435,9 @@ def build_omd_plan(root: Any) -> dict | None:
         before = len(targets)
         walk_map(mp, dom)
         if len(targets) > before:
-            queue.extend(list(targets.values())[before:])  # pragma: no cover — queue always empty here
+            queue.extend(
+                list(targets.values())[before:]
+            )  # pragma: no cover — queue always empty here
     if bad:
         return None
 
@@ -485,7 +486,8 @@ def build_omd_plan(root: Any) -> dict | None:
     if chain:
         dom = next(iter(tdoms))
         if any(
-            isinstance(lf, Op) and _LEAF_OP.get(lf.op) not in (None, dom)
+            isinstance(lf, Op)
+            and _LEAF_OP.get(lf.op) not in (None, dom)
             for lf in base
         ) or not _sig_uniform(base, dom):
             chain = False
@@ -621,7 +623,7 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
             for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
-            return self._graph_out
+            return cast(torch.Tensor, self._graph_out)
         return self._forward_impl(*xs)
 
     def _gidx(self, slots, like: torch.Tensor) -> torch.Tensor:

@@ -63,15 +63,10 @@ repos:
         always_run: true
       - id: runtime-types
         name: typeguard runtime contracts
-        # Runtime enforcement of annotations over the torch-free core.
-        # Curated green subset; see AGENTS.md for the annotation backlog
-        # that blocks whole-suite instrumentation.
-        entry: >-
-          .venv/bin/python -m pytest -q -p no:cacheprovider
-          --typeguard-packages=catopt_core
-          tests/test_ir.py tests/test_egraph.py
-          tests/test_laws_structure.py tests/test_cost.py
-          tests/test_interning.py tests/test_attrs.py
+        # Runtime enforcement of annotations over the torch-free core;
+        # the instrumented file list lives in tools/runtime_types.sh.
+        # Slow (~6 min), so it is a manual-stage gate (CI runs it).
+        entry: sh tools/runtime_types.sh
         language: system
         pass_filenames: false
         always_run: true

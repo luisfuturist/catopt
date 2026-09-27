@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 from catopt_core.attrs import ATTR_SCHEMA, attr_of
@@ -144,7 +144,9 @@ def _canon_aten_name(name: str) -> str:
     base = name.split(".")[0]
     if base in _ATEN_TO_IR:
         return _ATEN_TO_IR[base]
-    if base in _IR_TO_TORCH_EXTRA:  # pragma: no cover — every EXTRA key contains a dot
+    if (
+        base in _IR_TO_TORCH_EXTRA
+    ):  # pragma: no cover — every EXTRA key contains a dot
         return _IR_TO_TORCH_EXTRA[base]
     return base if base in _IR_TO_TORCH else stripped
 
@@ -262,7 +264,9 @@ def export_to_ir(
                 env[node.name] = var
                 inputs.append(var)
 
-        elif node.op == "get_attr":  # pragma: no cover — torch 2.14 export lifts everything to placeholders
+        elif (
+            node.op == "get_attr"
+        ):  # pragma: no cover — torch 2.14 export lifts everything to placeholders
             tensor = _resolve_attr(mod, node.target)
             shape = tuple(int(d) for d in tensor.shape)
             param = Param(name=node.name, typ=TensorType(shape))
@@ -273,7 +277,7 @@ def export_to_ir(
             op_name = _aten_name(node.target)
             ir_op = _ATEN_TO_IR.get(op_name, op_name)
             args = []
-            attrs = {}
+            attrs: dict[str, Any] = {}
             positional_attrs = ATTR_SCHEMA.get(ir_op, {})
             for i, arg_node in enumerate(node.args):
                 if (
@@ -322,7 +326,9 @@ def export_to_ir(
                     ):
                         attrs["shape"] = tuple(arg_node)
                     elif ir_op in ("split", "chunk"):
-                        attrs["sizes"] = tuple(arg_node)  # pragma: no cover — schema covers all real positions
+                        attrs["sizes"] = tuple(
+                            arg_node
+                        )  # pragma: no cover — schema covers all real positions
                     else:
                         attrs["dim"] = tuple(arg_node)
                 elif isinstance(arg_node, bool):
@@ -348,7 +354,12 @@ def export_to_ir(
                     )
                     if key in env:
                         args.append(env[key])
-            for k, v in node.kwargs.items():  # pragma: no cover — export normalises kwargs
+            for (
+                k,
+                v,
+            ) in (
+                node.kwargs.items()
+            ):  # pragma: no cover — export normalises kwargs
                 if k == "dim" and isinstance(v, (list, tuple)):
                     attrs[k] = tuple(v)
                 elif isinstance(v, (int, float, bool)):
@@ -382,13 +393,23 @@ def export_to_ir(
 
     # Find root
     root = None
-    for node in reversed(graph.nodes):  # pragma: no branch — output node is always last, first when reversed
-        if node.op == "output" and node.args:  # pragma: no branch — same invariant
+    for node in reversed(
+        graph.nodes
+    ):  # pragma: no branch — output node is always last, first when reversed
+        if (
+            node.op == "output" and node.args
+        ):  # pragma: no branch — same invariant
             arg = node.args[0]
-            if hasattr(arg, "name") and arg.name in env:  # pragma: no branch — tuples don't carry .name
-                root = env[arg.name]  # pragma: no cover — tuples don't carry .name
+            if (
+                hasattr(arg, "name") and arg.name in env
+            ):  # pragma: no branch — tuples don't carry .name
+                root = env[
+                    arg.name
+                ]  # pragma: no cover — tuples don't carry .name
             break  # pragma: no cover — same
-    if root is None and env:  # pragma: no branch — env is never empty when root missed
+    if (
+        root is None and env
+    ):  # pragma: no branch — env is never empty when root missed
         root = list(env.values())[-1]
 
     return IR(
@@ -400,7 +421,7 @@ def export_to_ir(
 
 
 def _resolve_attr(module: torch.nn.Module, target: str) -> torch.Tensor:
-    obj = module
+    obj: Any = module
     for part in target.split("."):
         obj = getattr(obj, part)
     return obj
@@ -673,7 +694,7 @@ class _AmbientTorchBindings(dict):
             raise KeyError(key)
         return fn
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def get(self, key: object, default: Any = None) -> Any:
         # ``dict.get`` never consults ``__missing__`` — route misses
         # through the carrier resolver so ``_IR_TO_TORCH.get`` sees the
         # same table ``[]`` does.
@@ -733,9 +754,9 @@ def _om_compose(f, g):
     fin1, fin2 = torch.isfinite(m1), torch.isfinite(m2)
     e1 = torch.where(fin1, torch.exp(m1 - mx), torch.zeros_like(mx))
     e2 = torch.where(fin2, torch.exp(m2 - mx), torch.zeros_like(mx))
-    lv = torch.where(
-        fin1, l1 * e1, torch.zeros_like(l1)
-    ) + torch.where(fin2, l2 * e2, torch.zeros_like(l2))
+    lv = torch.where(fin1, l1 * e1, torch.zeros_like(l1)) + torch.where(
+        fin2, l2 * e2, torch.zeros_like(l2)
+    )
     a = torch.where(fin1, a1 * e1, torch.zeros_like(a1)) + torch.where(
         fin2, a2 * e2, torch.zeros_like(a2)
     )
@@ -832,7 +853,9 @@ def eval_term(
         if isinstance(t, Var):
             v = (var_env or {}).get(t.name, var_default)
             if v is _MISS:
-                if strict:  # pragma: no cover — strict callers pass var_default
+                if (
+                    strict
+                ):  # pragma: no cover — strict callers pass var_default
                     raise KeyError(t.name)
                 return None
             return v
@@ -855,7 +878,9 @@ def eval_term(
             fn = (bindings or {}).get(t.op)
             if fn is None:
                 if strict:
-                    raise ValueError(f"No torch binding for op '{t.op}'")
+                    raise ValueError(
+                        f"No torch binding for op '{t.op}'"
+                    )
                 return None
             args = [rec(a, rec) for a in t.args]
             if not strict and any(a is None for a in args):
@@ -1025,7 +1050,8 @@ class IRModule(torch.nn.Module):
                     # would fold ops outside that list.
                     fused = None
                     if all(
-                        isinstance(a, (_Param, Const)) for a in term.args
+                        isinstance(a, (_Param, Const))
+                        for a in term.args
                     ):
                         fused = eval_term(
                             term,
@@ -1095,7 +1121,7 @@ class IRModule(torch.nn.Module):
             self._param_map[name] = p
 
     def forward(self, *xs: torch.Tensor) -> torch.Tensor:
-        x = xs[0] if xs else None
+        x = cast(torch.Tensor, xs[0] if xs else None)
         env: dict[str, torch.Tensor] = {"self": x}
         # Map input placeholders positionally to forward args
         for i, inp in enumerate(self._inputs):

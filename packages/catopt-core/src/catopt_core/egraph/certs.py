@@ -1,4 +1,5 @@
 """Proof-carrying certificate types."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -137,6 +138,3 @@ class Certificate:
         """True when no step carries an error bound — the derivation is
         an exact equivalence, not a certified approximation."""
         return self.error_bound == 0.0
-
-
-

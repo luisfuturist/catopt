@@ -1,4 +1,5 @@
 """E-graph node/class/union-find/rewrite data types."""
+
 # ruff: noqa: RUF003 — math notation in comments/docstrings
 from __future__ import annotations
 
@@ -113,7 +114,9 @@ def _norm_attr_value(v: Any) -> Any:
 def _pattern_attrs(op: Op) -> tuple[tuple[str, Any], ...]:
     return (
         tuple(
-            sorted((k, _norm_attr_value(v)) for k, v in op.attrs.items())
+            sorted(
+                (k, _norm_attr_value(v)) for k, v in op.attrs.items()
+            )
         )
         if op.attrs
         else ()
@@ -134,4 +137,3 @@ class _LeafRegistry:
     @classmethod
     def decode(cls, key: str) -> Any:
         return cls._key_to_term.get(key, key)
-

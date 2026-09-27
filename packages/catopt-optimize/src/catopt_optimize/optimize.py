@@ -629,7 +629,7 @@ def optimize_model(
     # ``None`` = unbounded: the run loop wants a concrete watermark.
     run_cap = max_enodes if max_enodes is not None else sys.maxsize
 
-    stats = eg.run(
+    stats: dict[str, Any] = eg.run(
         rules,
         root_eid,
         max_iterations=max_iterations,

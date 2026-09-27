@@ -60,3 +60,6 @@ bench/results/
 
 # mutmut working copy
 mutants/
+
+# mutmut flat-layout sandbox
+.mutmut-sandbox/

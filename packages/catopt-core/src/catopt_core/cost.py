@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from catopt_core.ir import Const, Op, Param
 
@@ -44,6 +44,25 @@ from catopt_core.typing import (  # noqa: F401
     _shape_of,
     has_var_leaf,
 )
+
+
+class _CostMarkers(Protocol):
+    """The dynamic per-model markers attached to a cost-fn object.
+
+    ``EGraph.extract_best`` / ``dag_cost`` read ``charges_param_only``
+    and ``dag_exact`` off the function via ``getattr``; the ``*_for``
+    factories also hang a ``profile`` (and sometimes ``lowering`` /
+    ``best_lowering``) off the closure for reporting.  These are extras
+    on the function object, not :class:`~catopt_core.ports.CostFn`
+    members, so the assignments below cast through this Protocol.
+    """
+
+    charges_param_only: bool
+    dag_exact: bool
+    profile: Any
+    lowering: Any
+    best_lowering: Any
+
 
 # ---------------------------------------------------------------------------
 # Per-op FLOP weights
@@ -165,7 +184,10 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
             and len(w) >= 4
             and all(isinstance(d, int) for d in w[1:4])
         ):
-            k = w[1] * w[2] * w[3]
+            w1 = cast("int", w[1])
+            w2 = cast("int", w[2])
+            w3 = cast("int", w[3])
+            k = w1 * w2 * w3
             g = term.attrs.get("groups", 1)
             if isinstance(g, int) and g > 1:
                 k //= g
@@ -518,8 +540,8 @@ def param_bytes_cost(
 # not fold away at compile time, so param-only subtrees stay billed;
 # and the leaf/fold index is already a true DAG cost, so dag_cost
 # must not apply its subtractive per-node decomposition.
-param_bytes_cost.charges_param_only = True
-param_bytes_cost.dag_exact = True
+cast(_CostMarkers, param_bytes_cost).charges_param_only = True
+cast(_CostMarkers, param_bytes_cost).dag_exact = True
 
 
 def param_bytes_cost_for(
@@ -539,8 +561,8 @@ def param_bytes_cost_for(
         return param_bytes_cost(term, source_tensors, memo, by_bytes)
 
     cost.__name__ = "param_bytes_cost_for"
-    cost.charges_param_only = True
-    cost.dag_exact = True
+    cast(_CostMarkers, cost).charges_param_only = True
+    cast(_CostMarkers, cost).dag_exact = True
     return cost
 
 
@@ -700,7 +722,7 @@ def _param_index(
     source_tensors: dict | None,
     memo: dict,
     by_bytes: bool = False,
-) -> dict[str, float]:
+) -> dict[Any, float]:
     """``{key: numel}`` for every *stored* parameter entry in a term DAG.
 
     Two kinds of entries, mirroring the lowered weights file:
@@ -930,7 +952,7 @@ def roofline_cost_for(
         return _roofline_cost(term, memo, pf, bw, ls)
 
     cost.__name__ = "roofline_cost_for"
-    cost.profile = profile
+    cast(_CostMarkers, cost).profile = profile
     return cost
 
 
@@ -987,7 +1009,7 @@ def depth_cost_for(profile: Any = None):
         return _depth_cost(term, memo, pf, bw, ls)
 
     cost.__name__ = "depth_cost_for"
-    cost.profile = profile
+    cast(_CostMarkers, cost).profile = profile
     return cost
 
 
@@ -1012,7 +1034,11 @@ class CostModel:
             if term.op == "matmul":
                 shapes = [_shape_of(a) for a in term.args]
                 if shapes and shapes[1] is not None:
-                    k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
+                    k_dim = (
+                        cast("int", shapes[1][-2])
+                        if len(shapes[1]) >= 2
+                        else 1
+                    )
                     base = 2 * n * k_dim
                 else:
                     base = coeff * n
@@ -1024,7 +1050,7 @@ class CostModel:
                     and shapes[0] is not None
                     and len(shapes[0]) >= 1
                 ):
-                    base = 2 * n * shapes[0][-1]
+                    base = 2 * n * cast("int", shapes[0][-1])
                 else:
                     base = 2 * n
             else:
@@ -1383,8 +1409,8 @@ def executor_cost_for(
         return out
 
     cost.__name__ = "executor_cost_for"
-    cost.profile = profile
-    cost.lowering = lowering
+    cast(_CostMarkers, cost).profile = profile
+    cast(_CostMarkers, cost).lowering = lowering
     return cost
 
 
@@ -1498,7 +1524,7 @@ def fused_cost_for(profile: Any = None) -> CostFn:
         return out
 
     cost.__name__ = "fused_cost_for"
-    cost.profile = profile
+    cast(_CostMarkers, cost).profile = profile
     return cost
 
 
@@ -1553,6 +1579,6 @@ def lowering_aware_cost_for(
         return min(fns, key=lambda lw: fns[lw](term, memo))
 
     cost.__name__ = "lowering_aware_cost_for"
-    cost.profile = profile
-    cost.best_lowering = best_lowering
+    cast(_CostMarkers, cost).profile = profile
+    cast(_CostMarkers, cost).best_lowering = best_lowering
     return cost

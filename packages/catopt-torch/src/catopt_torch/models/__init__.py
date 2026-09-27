@@ -478,6 +478,8 @@ class EagerAttention(nn.Module):
     discover the fused kernel form automatically.
     """
 
+    mask: torch.Tensor
+
     def __init__(
         self, dim: int = 128, n_heads: int = 4, block_size: int = 64
     ) -> None:
@@ -507,6 +509,8 @@ class EagerAttention(nn.Module):
 
 class AdditiveMaskAttention(nn.Module):
     """HF-style eager attention: softmax(qk^T * s + additive_mask) @ v."""
+
+    mask: torch.Tensor
 
     def __init__(
         self, dim: int = 128, n_heads: int = 4, block_size: int = 64

@@ -595,7 +595,9 @@ def _force_carrier(
     for cid in list(eg._classes):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:  # pragma: no cover — _classes self-consistent under find()
+        if (
+            ec is None
+        ):  # pragma: no cover — _classes self-consistent under find()
             continue
         inner = sorted(
             (n for n in ec.nodes if n.op in inner_ops), key=repr

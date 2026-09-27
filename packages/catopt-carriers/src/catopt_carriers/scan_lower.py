@@ -32,7 +32,7 @@ the ordinary tuple-passing IRModule evaluation.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from catopt_core.ir import IR, Op, Param
@@ -85,13 +85,18 @@ def _fold_nested_apply(term: Any) -> Any:
     return go(term)
 
 
-def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
+def _is_aff_tree(term: Any, memo: dict | None = None) -> str | None:
     """True if ``term`` is a pure map tree in ONE carrier domain.
 
     Dense: leaves ``aff(A, b)``, internal ``aff_compose``.  Diagonal:
     leaves ``aff_diag(a, b)``, internal ``affd_compose``.  Mixed or
     foreign nodes disqualify the subtree.  Memoised on id() because
     extracted terms are DAGs with shared subtrees.
+
+    Returns the shared carrier DOMAIN (``"aff"``/``"aff_diag"``) when
+    the tree is pure, ``None`` otherwise — the domain string doubles as
+    the truthy verdict, so the annotation is ``str | None``, not
+    ``bool``.
     """
     memo = {} if memo is None else memo
     key = id(term)
@@ -210,6 +215,7 @@ def _leaf_b_gather(leaves: list[Op]):
     parts = [_select_index(leaf.args[1]) for leaf in leaves]
     if any(p is None for p in parts):
         return None
+    parts = cast("list[tuple]", parts)
     base0, dim0 = parts[0][0], parts[0][1]
     if any(p[0] is not base0 or p[1] != dim0 for p in parts):
         return None
@@ -261,9 +267,7 @@ def build_scan_plan(root: Any) -> dict | None:
 
     # Slot assignment: leaves occupy 0..n-1, then each level appends its
     # outputs in order — so a level's operand slots are all < its own.
-    slot: dict[int, int] = {
-        id(lf): i for i, lf in enumerate(leaves)
-    }
+    slot: dict[int, int] = {id(lf): i for i, lf in enumerate(leaves)}
     level_gather = slot_gathers(
         levels, lambda t: t.args, slot, len(leaves), key=id
     )
@@ -360,7 +364,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
-            return self._graph_out
+            return cast(torch.Tensor, self._graph_out)
         return self._forward_impl(*xs)
 
     def _gather_idx(self, slots: list[int], like: torch.Tensor):

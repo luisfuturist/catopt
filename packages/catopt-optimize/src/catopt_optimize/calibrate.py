@@ -137,9 +137,7 @@ class TargetProfile:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
 
     @classmethod
-    def from_json(
-        cls, data: str | bytes | dict
-    ) -> TargetProfile:
+    def from_json(cls, data: str | bytes | dict) -> TargetProfile:
         """Rebuild from a JSON string/bytes or an already-parsed dict."""
         if isinstance(data, (str, bytes)):
             data = json.loads(data)
@@ -592,9 +590,7 @@ def calibrate(
         gbps=bw / 1e9,
         launch_us=launch * 1e6,
         device=str(dev),
-        measured_at=datetime.now(UTC).isoformat(
-            timespec="seconds"
-        ),
+        measured_at=datetime.now(UTC).isoformat(timespec="seconds"),
         meta={
             "dtype": str(dtype).replace("torch.", ""),
             "torch": torch.__version__,

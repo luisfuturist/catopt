@@ -33,9 +33,8 @@ Manual-stage gates (not run on every commit — network/slower):
 ```sh
 .venv/bin/pip-audit                                          # dependency CVEs (network)
 .venv/bin/semgrep --config p/python --config p/security-audit packages catopt  # registry rules (network)
-.venv/bin/python -m pytest -q --typeguard-packages=catopt_core \
-    tests/test_ir.py tests/test_egraph.py tests/test_laws_structure.py \
-    tests/test_cost.py tests/test_interning.py tests/test_attrs.py  # runtime contracts
+sh tools/runtime_types.sh                                    # typeguard runtime contracts
+MUTMUT_ONLY=catopt_core/ir.py MUTMUT_TESTS='tests/test_ir.py' tools/mutmut.sh run  # mutation testing
 ```
 
 Pre-commit (`pre-commit install`) runs ruff check/format, **ty**,
@@ -43,32 +42,27 @@ import-linter, vulture, bandit, semgrep and the radon ratchet.  The
 `manual`-stage hooks (typeguard, pip-audit, semgrep-registry) run with
 `pre-commit run --hook-stage manual --all-files`.
 
-Known drift: the installed ruff (0.16.9) flags pre-existing isort /
-format differences across `tests/` and `bench/` that predate any
-current change. `ruff check packages catopt` is the meaningful gate
-(0 errors); repo-wide `ruff check` and `ruff format --check` are not
-clean at `HEAD` under 0.16.9.
+Known drift: the installed ruff (0.16.9) still flags pre-existing
+isort / format differences across `tests/` and `bench/`, which are not
+format-checked.  The shipped source — `packages`, `catopt` and `tools` —
+is clean under both `ruff check` and `ruff format --check`.
 
-## Typecheck ratchet
+## Typecheck (ty)
 
 - Checker: **ty** (`[tool.ty]` in `pyproject.toml`) — Astral's type
   checker, replacing the earlier pyright ratchet.
   `[tool.ty.src] include = ["packages","catopt"]` scopes checking to the
   shipped packages (tests/ and bench/ are not type-checked);
   `[tool.ty.environment]` sets the 3.13 target and the per-package
-  `extra-paths`; `[tool.ty.terminal] error-on-warning = false` keeps the
-  gate "0 errors, warnings OK".
+  `extra-paths`; `[tool.ty.terminal] error-on-warning = false`.
 - Installed in `.venv` via the `dev` dependency group (`ty>=0.0.84`;
   currently 0.0.84).
-- `[tool.ty.src] exclude` lists files that predate the ratchet — each
-  entry documents its ty-baseline error count + dominant rule.
-  **Remove entries as files get annotated**; never add new ones.
-  Excluded files are not reported, but are still analyzed when imported
-  by a checked file.
-- New modules under `packages/*/src/` are checked automatically — keep
-  them clean.
-- Baseline at migration: 198 errors / 19 files (down from pyright's 442
-  / 22). `ty check` at `HEAD` is green (0 diagnostics).
+- **The ratchet `exclude` list is empty.** The migration baseline was
+  198 errors across 19 files (down from pyright's 442/22); every one of
+  those files has since been annotated, so `ty check` is clean with no
+  opt-outs.  Keep it that way — annotate; never add an exclude entry or
+  a `# ty: ignore`.
+- New modules under `packages/*/src/` are checked automatically.
 
 ## Dead-code + architecture linting
 
@@ -102,11 +96,15 @@ all `ALL_RULES` patterns.  The shared strategies live in
     tests/test_property_cost.py tests/test_property_laws.py
 ```
 
-Two properties are `xfail(strict=False)` because they document genuine
-open questions (asymmetric cost under operand swap when a shape is
-unknown; `rebuild` does not close congruence across classes) — see the
-test bodies.  Do not "fix" these by weakening the test; either resolve
-the behaviour or keep the xfail.
+One property is `xfail(strict=False)` because it documents a real
+limitation: `EGraph.rebuild` dedups enodes *within* a class but does not
+close congruence *across* classes that become identical after child
+canonicalisation (a full congruence closure is a core-engine change with
+broad blast radius; the graph is sound but incomplete, and re-adding the
+term closes it).  The other former xfail — asymmetric cost under
+operand swap with an unknown shape — is fixed.  Do not "fix" the
+remaining one by weakening the test; either implement congruence closure
+in `rebuild` or keep the documented xfail.
 
 ## Static analysis & security
 
@@ -149,28 +147,30 @@ shipped code only — `tests/**` and `bench/**` ignore `D`.
 
 ## Runtime contracts (typeguard)
 
-`typeguard` (dev dep) enforces annotations at runtime.  Whole-suite
-instrumentation is blocked by the ty annotation backlog (it surfaces
-`str`-sentinel-vs-`tuple | None` returns in `typing.py`, etc.), so the
-gate is a curated green subset run with `--typeguard-packages=catopt_core`
-over `test_ir/test_egraph/test_laws_structure/test_cost/test_interning/
-test_attrs` (manual stage).  It already caught two real bugs, now fixed:
-`laws/tensor._head` was annotated `str` but takes an `Op`, and
-`typing._infer_op_shape` passed a `tuple` to zero-arg shape rules typed
-`list`.  Grow the file list as annotations are cleaned up.
+`typeguard` (dev dep) enforces annotations at runtime.
+`tools/runtime_types.sh` instruments the whole torch-free core
+(`--typeguard-packages=catopt_core`) and runs the core-focused test
+files (464 tests) — a manual-stage gate that CI also runs.  It caught
+three real annotation bugs, all fixed: `laws/tensor._head` was annotated
+`str` but takes an `Op`; `typing._infer_op_shape` passed a `tuple` to
+zero-arg shape rules typed `list`; and `typing._shape_of` returned the
+`_INVALID` string sentinel under a `tuple | None` return type.  Grow the
+file list in the script as more tests become typeguard-clean (the
+torch-adapter suites are out of scope — they exercise eager/compile
+paths, not the core contracts).
 
 ## Mutation testing (mutmut)
 
-Configured in `[tool.mutmut]` but **not yet operational** for this
-monorepo.  mutmut 3.8 derives a mutant key from its path relative to
-cwd (`packages.catopt-core.src.catopt_core.attrs.x_foo`) and expects the
-module importable under that dotted name, but a per-package `src/`
-layout imports as `catopt_core.attrs`.  Two shims are in place for the
-fixable halves — the `pythonpath` roots in `[tool.pytest.ini_options]`
-and the editable-finder drop in `tests/conftest.py` (both no-ops for
-normal runs) — but the key derivation needs upstream support or a
-single-package flat checkout.  Until then, prefer coverage + the
-property tests for test-strength signal.
+`tools/mutmut.sh` runs mutmut against a flat-layout sandbox
+(`.mutmut-sandbox/`, gitignored): mutmut 3 derives mutant keys from
+paths, but a per-package `src/` layout imports under a different dotted
+name, so the wrapper symlinks each package at the sandbox top level
+(path == import name) plus `tests/`, `catopt/` and `uv.lock`, and writes
+the matching `[tool.mutmut]`.  Scope a fast loop with `MUTMUT_ONLY` /
+`MUTMUT_TESTS`; a surviving mutant is a weak-assertion finding (the
+suite is pinned at 100% coverage, so it is not a coverage gap).  The
+editable-finder drop in `tests/conftest.py` exists solely so the
+sandbox's mutated copies win over uv's editable install.
 
 ## Differential oracle (opt-in, test-only)
 
@@ -227,13 +227,18 @@ implements `Sink`; nothing in `catopt-core` changes.
   the suite is pinned at 100%; new branches need tests (or a
   justified `pragma: no cover`).
 - Tests allocating CUDA tensors use the `requires_cuda` marker
-  (auto-skipped when CUDA is absent).
-- Ratchets, not rewrites: the ty exclude list, the ruff `D` ignore
-  list, the radon baseline and the typeguard subset are all "pin the
-  current state, never regress" gates.  Tighten them as code improves;
-  never widen them to make a change pass.
-- The lockfile resolves a CUDA-enabled `torch` wheel on Linux.  Some
-  CUDA-graph tests (`test_cov2_models`, `test_executor_base`) assume a
-  CPU build (`torch.cuda.is_available() is False`); if your venv has
-  the CUDA wheel and a GPU, install the CPU build for the suite:
-  `uv pip install --torch-backend cpu --reinstall torch`.
+  (auto-skipped when CUDA is absent).  Tests that exercise the CPU
+  no-op path of `capture_cuda_graph` force `torch.cuda.is_available()`
+  off via `monkeypatch`, so they pass on a CUDA host too.
+- Ratchets, not rewrites: the ruff `D` ignore list, the radon baseline
+  and the typeguard file list are "pin the current state, never
+  regress" gates.  Tighten them as code improves; never widen them to
+  make a change pass.  The ty `exclude` list is empty — keep it so.
+- No new suppressions.  Do not add `# type: ignore` / `# ty: ignore` /
+  `# noqa` / `# nosec` / `# pragma: no cover` to make a gate pass; fix
+  the code or add a justified, documented config entry (as `.bandit.yaml`
+  does for the two `B112` `try/except/continue` sites).
+- The lockfile resolves a CUDA-enabled `torch` wheel on Linux.  CI
+  installs the CPU wheel (`uv pip install --torch-backend cpu
+  --reinstall torch`) for determinism; the CUDA-graph tests no longer
+  require it locally.
