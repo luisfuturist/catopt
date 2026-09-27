@@ -243,6 +243,20 @@ python -m pytest tests/ -q
 
 ## References
 
-E-graphs: Willsey et al., *egg*. Scans: Blelloch, *Prefix Sums and
-Their Applications*. FlashAttention: Dao et al. Traced categories:
-Joyal–Street–Verity. llama2.c: Karpathy.
+- Willsey et al., *egg: Fast and Extensible Equality Saturation*
+  (POPL 2021) — the e-graph / equality-saturation machinery.
+- Blelloch, *Prefix Sums and Their Applications* (1990) — the scan
+  structure the affine carrier reaches.
+- Dao et al., *FlashAttention* (NeurIPS 2022) — the om-monoid combine
+  is this recurrence, derived rather than encoded.
+- Joyal, Street & Verity, *Traced Monoidal Categories* (1996) — the
+  `trace` structure used for the closed-form resolvent.
+- Sun et al., *Retentive Network* (2023); Yang et al., *Gated Linear
+  Attention* (ICML 2024); Yang et al., *Parallelizing Linear
+  Transformers with the Delta Rule* (NeurIPS 2024); Gu & Dao, *Mamba*
+  (2023) — the linear-attention/SSM families the scan benchmarks
+  instantiate.
+- Karpathy, *llama2.c* — the unmodified codebase the pairing rules
+  rediscover vLLM/TensorRT-LLM-style merged projections on.
+- Paszke et al., *PyTorch*; `torch.compile`/Inductor — the shipped
+  `Source`/`Sink` pair and the benchmark baseline.
