@@ -489,7 +489,48 @@ class TestStorageBound:
 
 
 # ---------------------------------------------------------------------------
-#  (e) graceful no-op
+#  (e) scan cost stays linear in the horizon
+# ---------------------------------------------------------------------------
+
+
+class TestScanIsLinear:
+    def test_shape_resolution_is_memoised_per_class(self):
+        """Regression guard: plan discovery resolves each e-class's
+        shape once, not once per plan referencing it.
+
+        On a length-T spine ~T prefix classes each carry a plan, and
+        the old code called ``any_term`` for every map/input of every
+        plan — ~7·T² term walks here (measured ≈4900 calls at T=24).
+        With the per-scan memo the count stays O(T) (~1000 at T=24),
+        so ``optimize_model``'s two lift passes stop scaling
+        quadratically in the unrolled horizon.
+        """
+        T, d = 24, 4
+        term, _, _ = _diag_term(T, d)
+        eg = EGraph()
+        eg.add_term(term)
+        calls = 0
+        orig = EGraph.any_term
+
+        def counted(self, eid, _seen=frozenset(), _memo=None):
+            nonlocal calls
+            calls += 1
+            return orig(self, eid, _seen, _memo)
+
+        EGraph.any_term = counted
+        try:
+            la = TL.lift_scan_to_applyd(eg)
+            lt = TL.lift_scan_to_trace(eg)
+        finally:
+            EGraph.any_term = orig
+        assert la and lt  # the lifts still fire — a real scan ran
+        # ~42·T with the memo vs ~8·T² without — the bound sits
+        # well above the linear count and far below the quadratic one.
+        assert calls <= 60 * T
+
+
+# ---------------------------------------------------------------------------
+#  (f) graceful no-op
 # ---------------------------------------------------------------------------
 
 

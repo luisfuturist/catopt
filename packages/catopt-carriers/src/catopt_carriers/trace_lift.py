@@ -144,15 +144,40 @@ class _Plan:
     step_states: list = field(default_factory=list)
 
 
-def _term_of(eg: EGraph, eid: int) -> Any:
-    return eg.any_term(eg.find(eid))
+#: Sentinel for "not yet resolved" in a per-scan shape memo.
+_UNSET = object()
+
+
+def _shape_of_class(eg: EGraph, eid: int, memo: dict):
+    """``_shape_of(any_term(eid))``, memoised on the canonical id.
+
+    A scan resolves the shape of every map/input/h0 class once per
+    *plan* — O(T) resolutions per class on a length-T spine, O(T²)
+    ``any_term`` walks per pass.  ``add_term``/``add_enode`` never
+    union existing classes, so within one scan the canonical id and
+    the class's member set are stable and the memo is exact.
+    """
+    c = eg.find(eid)
+    s = memo.get(c, _UNSET)
+    if s is _UNSET:
+        t = eg.any_term(c)
+        s = _shape_of(t)
+        memo[c] = s
+    return s
 
 
 def _consistent_shapes(
-    eg: EGraph, kind: str, maps: list, ins: list, h0: int
+    eg: EGraph,
+    kind: str,
+    maps: list,
+    ins: list,
+    h0: int,
+    shapes: dict | None = None,
 ):
     """All steps must share one concrete vector width — returns d."""
-    hs = _shape_of(_term_of(eg, h0))
+    if shapes is None:
+        shapes = {}
+    hs = _shape_of_class(eg, h0, shapes)
     if not (
         isinstance(hs, tuple)
         and len(hs) == 1
@@ -163,10 +188,10 @@ def _consistent_shapes(
     d = hs[0]
     want_map = (d,) if kind == "diag" else (d, d)
     for e in maps:
-        if _shape_of(_term_of(eg, e)) != want_map:
+        if _shape_of_class(eg, e, shapes) != want_map:
             return None
     for e in ins:
-        if _shape_of(_term_of(eg, e)) != (d,):
+        if _shape_of_class(eg, e, shapes) != (d,):
             return None
     return d
 
@@ -224,7 +249,7 @@ def _prefer_term(
     return None
 
 
-def _carrier_plan(eg: EGraph, cid: int):
+def _carrier_plan(eg: EGraph, cid: int, shapes: dict | None = None):
     """Plan from an ``apply``/``applyd`` member of the class, if any."""
     ec = eg._classes.get(cid)
     if ec is None or not any(
@@ -248,7 +273,7 @@ def _carrier_plan(eg: EGraph, cid: int):
     maps = [eg.add_term(leaf.args[0]) for leaf in steps]
     ins = [eg.add_term(leaf.args[1]) for leaf in steps]
     h0 = eg.add_term(plan["h"])
-    d = _consistent_shapes(eg, kind, maps, ins, h0)
+    d = _consistent_shapes(eg, kind, maps, ins, h0, shapes)
     if d is None:
         return None
     return _Plan(kind, len(steps), d, maps, ins, h0)
@@ -257,24 +282,37 @@ def _carrier_plan(eg: EGraph, cid: int):
 # -- raw-spine path: add(mul|matmul) chains over e-classes ------------
 
 
+#: ``uniform_kind`` marker for a walk result whose steps mix the
+#: diagonal and dense readings — the plan declines those.
+_MIXED = object()
+
+
 class _Spine:
     """Walk ``add(mul(a_t, s), i_t)`` / ``add(matmul(A_t, s), i_t)``
     chains from e-class to e-class.
 
-    ``_walk(cid)`` returns ``(steps, base_eid)`` — the chronological
-    decomposition of the class's value — or ``None`` when the class is
-    neither a recognisable step nor a base.  Results are memoised on
-    canonical ids; the ``_active`` set cuts cycles (post-union classes
-    can be self-referential).  A memoised chain may be shorter than the
-    true longest when a cycle cut truncated a branch — a completeness
-    caveat only: every emitted chain is a real sequence of ``add``
-    e-nodes over e-class members, hence sound regardless of length.
+    ``_walk(cid)`` returns ``(steps, base_eid, uniform_kind)`` — the
+    chronological decomposition of the class's value plus ``"diag"``/
+    ``"dense"`` when every step reads the same carrier kind (``None``
+    for the empty base chain, ``_MIXED`` for a mixed spine) — or
+    ``None`` when the class is neither a recognisable step nor a base.
+    Results are memoised on canonical ids; the ``_active`` set cuts
+    cycles (post-union classes can be self-referential).  A memoised
+    chain may be shorter than the true longest when a cycle cut
+    truncated a branch — a completeness caveat only: every emitted
+    chain is a real sequence of ``add`` e-nodes over e-class members,
+    hence sound regardless of length.
     """
 
     def __init__(self, eg: EGraph, allow_tied: bool = False) -> None:
         self.eg = eg
         self._memo: dict[int, Any] = {}
         self._active: set[int] = set()
+        # Per-scan ``e-class -> shape`` memo (see _shape_of_class):
+        # canonical ids are union-stable while a scan runs, so each
+        # map/input/h0 class is resolved once rather than once per
+        # plan that references it.
+        self._shapes: dict[int, Any] = {}
         # When False (default) equal-length ambiguous decompositions
         # are vetoed — the trace lift wants one canonical reading.
         # The carrier lift relaxes it: any successful decomposition is
@@ -287,16 +325,22 @@ class _Spine:
         res = self._walk(self.eg.find(cid))
         if res is None:
             return None
-        steps, base = res
+        steps, base, ukind = res
         if not steps:
             return None
-        kinds = {s["kind"] for s in steps}
-        if len(kinds) != 1:
+        if not isinstance(ukind, str):
             return None  # mixed dense/diagonal spine — decline
-        kind = kinds.pop()
-        maps = [s["map"] for s in steps]
-        ins = [s["in"] for s in steps]
-        d = _consistent_shapes(self.eg, kind, maps, ins, base)
+        kind = ukind
+        maps = []
+        ins = []
+        states = []
+        for s in steps:
+            maps.append(s["map"])
+            ins.append(s["in"])
+            states.append(s["state"])
+        d = _consistent_shapes(
+            self.eg, kind, maps, ins, base, self._shapes
+        )
         if d is None:
             return None
         return _Plan(
@@ -306,7 +350,7 @@ class _Spine:
             maps,
             ins,
             base,
-            step_states=[s["state"] for s in steps],
+            step_states=states,
         )
 
     def _candidates(self, node) -> list:
@@ -382,7 +426,13 @@ class _Spine:
                     sub = self._walk(cand["state"])
                     if sub is None:
                         continue
-                    cur = (sub[0] + [cand], sub[1])
+                    sk = sub[2]
+                    uk = (
+                        cand["kind"]
+                        if sk is None or sk == cand["kind"]
+                        else _MIXED
+                    )
+                    cur = (sub[0] + [cand], sub[1], uk)
                     if best is None or len(cur[0]) > len(best[0]):
                         best, tied = cur, False
                     elif len(cur[0]) == len(best[0]):
@@ -400,7 +450,7 @@ class _Spine:
             if best is not None:
                 res = None if (tied and not self._allow_tied) else best
             elif any(n.op in _BASE_OPS for n in ec.nodes):
-                res = ([], cid)  # chain base: h0 / carried
+                res = ([], cid, None)  # chain base: h0 / carried
             else:  #   scan segment
                 res = None
             self._memo[cid] = res
@@ -457,10 +507,16 @@ def _assemble_F(em: _Emit, maps: list, d: int):
     rows = []
     for i in range(T):
         # u'_i = h_{i+1} = M_{i+1}·u_{i-1} + b_{i+1} (+ M_1·h0 for i=0)
-        s_cols = [maps[i] if j == i - 1 else Z for j in range(T)]
-        r_cols = [eye if j == i else Z for j in range(T)]
-        r_cols.append(maps[0] if i == 0 else Z)
-        rows.append(em.op("concat", s_cols + r_cols, {"dim": -1}))
+        # Row = [S-part | R-part]: the S part is all-Z except S[i,i-1],
+        # the R part is all-Z except R[i,i] and R[0,T] — fill a shared
+        # zero row in place rather than rebuilding two comprehensions.
+        cols = [Z] * (2 * T + 1)
+        if i >= 1:
+            cols[i - 1] = maps[i]
+        cols[T + i] = eye
+        if i == 0:
+            cols[2 * T] = maps[0]
+        rows.append(em.op("concat", cols, {"dim": -1}))
     # y = h_T: Q selects the last u block; P = 0.
     rows.append(
         em.op(
@@ -742,7 +798,7 @@ def _scan_plans(
             continue
         if root_eid is not None and c != eg.find(root_eid):
             continue
-        plan = _carrier_plan(eg, c)
+        plan = _carrier_plan(eg, c, spine._shapes)
         if plan is None:
             plan = spine.plan(c)
         if plan is not None and min_steps <= plan.T:
@@ -767,21 +823,35 @@ def _scan_plans(
     # of the longer one.  Without this, every saturated prefix
     # class mints its own block-matrix F (~2T offers instead of
     # the ~2 for the whole horizon — the ~2T× storage blow-up).
+    #
+    # Canonical (kind, h0, maps) signatures are resolved once per
+    # plan — re-running ``eg.find`` inside the pairwise loop made
+    # the check O(plans²·T) finds.  Plans are grouped by
+    # (kind, h0) so a plan only ever compares against the
+    # candidates that could actually subsume it.  (The old ``ins``
+    # comparison was vacuous — it tested ``q.ins`` against its own
+    # canonicalisation, always true; the (maps, h0) prefix check
+    # is the operative condition, unchanged here.)
     items = list(plans.items())
+    sigs: dict[int, tuple] = {}
+    groups: dict[tuple, list] = {}
+    for c, p in items:
+        sig = (
+            p.kind,
+            eg.find(p.h0),
+            tuple(eg.find(m) for m in p.maps),
+        )
+        sigs[c] = sig
+        groups.setdefault(sig[:2], []).append(c)
     for qc, q in items:
         if qc in interior:
             continue
-        qh0 = eg.find(q.h0)
-        qmaps = [eg.find(m) for m in q.maps]
-        qins = [eg.find(i) for i in q.ins]
-        for _pc, p in items:
-            if p.T <= q.T or p.kind != q.kind:
+        qmaps = sigs[qc][2]
+        for pc in groups[sigs[qc][:2]]:
+            p = plans[pc]
+            if p.T <= q.T:
                 continue
-            if eg.find(p.h0) != qh0:
-                continue
-            if [eg.find(m) for m in p.maps[: q.T]] == qmaps and [
-                eg.find(i) for i in q.ins[: q.T]
-            ] == qins:
+            if sigs[pc][2][: q.T] == qmaps:
                 interior.add(qc)
                 break
     return {c: p for c, p in plans.items() if c not in interior}
