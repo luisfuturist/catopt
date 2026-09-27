@@ -56,6 +56,7 @@ DEFAULT_SUITES = [
     "cost_fidelity",
     "killer_demo",
     "decode_scan_bench",
+    "real_win_hunt",
     "bench_e2e",
 ]
 

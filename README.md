@@ -126,6 +126,7 @@ All rows verified semantically equivalent (fp64 where stated); RTX
 | Diagonal absorption | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | 1.12× at T=512 |
 | **Chunked decode + CUDA graph** | retnet/gla/delta carriers, graph-captured | **1.65–2.8× vs best non-carrier** (GPU) |
 | **Autotuned selection** | `optimize_model_autotuned` — measures verified candidates per shape | retnet_stack 4.18× eager GPU; matrix_chain 2.24× CPU |
+| **Real-model wins** (`real_win_hunt`) | linattn / palm_stack / moe_sum / decode_retnet — realistic block topologies | **2.1× / 1.2× / 7–9.6× / 2.6–3.4× vs Inductor** (GPU) |
 
 On unmodified community code (Karpathy's `llama2.c`) it rediscovers
 `MergedColumnParallelLinear` and `QKVParallelLinear` — the transforms
@@ -143,6 +144,7 @@ Measured, including the losses:
 | Conv pairing | Wins — Inductor never fuses cuDNN calls |
 | GEMM pairing on transformer blocks | Parity — ~40 non-GEMM kernels/layer dilute it |
 | Real trained checkpoints (stories15M/110M) | Parity — all blocks transform and verify, no win at these sizes |
+| Realistic block topologies (`real_win_hunt`) | **Wins 1.2–9.6× vs Inductor** — unnormalized-attention reassoc + pairing; expert-sum weight folding; carrier+graph decode |
 | Scan lift on linear-attention blocks | 3× vs eager delivered end-to-end; 3.9× composed with `CompiledRunner`; loses to a compiled Inductor where it can compile |
 | Inductor compile wall on unrolled recurrences | Inductor's compile grows superlinearly in T (54–85s at T=2048; GLA T=2048 exceeds 60s timeout). CatOpt produces a certified O(log T) schedule there — but its own pipeline is slower than Inductor's compile where Inductor succeeds (262s at T=2048) |
 | Launch-bound decode cells (B=1, T≤64) | Loses 4–15% — split-view copies cost more than saved launches |
