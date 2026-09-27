@@ -851,9 +851,8 @@ def optimize_model(
             and ex.is_cuda
             and hasattr(optimized_module, "capture_cuda_graph")
         ):
-            # pragma: no cover — CUDA-only body (requires_cuda test
-            # exercises it on GPU; the CPU branch above is covered).
-            try:
+            try:  # pragma: no cover — CUDA-only body; the
+                # requires_cuda test exercises it on GPU.
                 xs = (
                     tuple(example_input)
                     if isinstance(example_input, (tuple, list))
@@ -861,7 +860,7 @@ def optimize_model(
                 )
                 optimized_module.capture_cuda_graph(*xs)
                 stats["cuda_graph"] = True
-            except Exception:
+            except Exception:  # pragma: no cover — CUDA-only
                 optimized_module.drop_cuda_graph()
 
     # Verify semantic equivalence
