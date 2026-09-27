@@ -132,3 +132,44 @@ def test_plain_term_routes_to_sink_lower():
     assert not getattr(mod, "is_batched", False)
     xin = torch.rand(3, dtype=torch.float64)
     assert torch.allclose(mod(xin), xin + env["p_w"], atol=1e-12)
+
+
+def test_optimize_model_compile_delivers_fused_module():
+    """compile=True wraps the routed module in torch.compile and
+    verifies output; stats records what ran."""
+    from catopt.optimize import optimize_model
+
+    torch.manual_seed(0)
+    m = torch.nn.Sequential(
+        torch.nn.Linear(8, 8), torch.nn.SiLU(), torch.nn.Linear(8, 8)
+    ).eval()
+    x = torch.rand(4, 8)
+    with torch.no_grad():
+        ref = m(x)
+        mod, stats = optimize_model(m, x, verbose=False, compile=True)
+    assert stats["compiled"] is True
+    with torch.no_grad():
+        assert torch.allclose(mod(x), ref, atol=1e-5)
+
+
+def test_optimize_model_compile_failure_falls_back(monkeypatch):
+    """A compile failure keeps the uncompiled module — the optimized
+    term still ships."""
+    import catopt_optimize.optimize as O
+
+    torch.manual_seed(0)
+    m = torch.nn.Sequential(
+        torch.nn.Linear(8, 8), torch.nn.SiLU(), torch.nn.Linear(8, 8)
+    ).eval()
+    x = torch.rand(4, 8)
+    with torch.no_grad():
+        ref = m(x)
+
+        def boom(mod):
+            raise RuntimeError("no compiler")
+
+        monkeypatch.setattr(O.torch, "compile", boom)
+        mod, stats = O.optimize_model(m, x, verbose=False, compile=True)
+    assert stats["compiled"] is False
+    with torch.no_grad():
+        assert torch.allclose(mod(x), ref, atol=1e-5)

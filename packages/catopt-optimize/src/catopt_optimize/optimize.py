@@ -468,6 +468,7 @@ def optimize_model(
     ops: OpTable | None = None,
     source: Source | None = None,
     sink: Sink | None = None,
+    compile: bool = False,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
@@ -531,6 +532,12 @@ def optimize_model(
         (:func:`catopt_core.cost.backend_cost`), so the optimizer only
         commits to forms the sink can lower.  Takes precedence over
         ``ops``.
+    compile : bool
+        Wrap the lowered module in ``torch.compile`` — delivers the
+        fused executor the ``"compiled"`` lowering prices
+        (:func:`catopt_core.cost.fused_cost_for`).  Falls back to the
+        uncompiled module if compilation fails at first call;
+        ``stats["compiled"]`` records which ran.
     verbose : bool
         Print progress.
 
@@ -724,6 +731,18 @@ def optimize_model(
         if getattr(optimized_module, "is_batched", False)
         else "generic"
     )
+    if compile:
+        # Deliver the fused lowering: torch.compile wraps whichever
+        # executor routing produced (IRModule or a batched carrier).
+        # Compile failures surface at first call — verify once here
+        # and keep the uncompiled module on failure.
+        try:
+            compiled = torch.compile(optimized_module)
+            compiled(example_input)
+            optimized_module = compiled
+            stats["compiled"] = True
+        except Exception:
+            stats["compiled"] = False
 
     # Verify semantic equivalence
     if verbose:
