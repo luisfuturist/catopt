@@ -61,6 +61,7 @@ DEFAULT_SUITES = [
     "bench_e2e",
     "model_bench",
     "e2e_model",
+    "e2e_llm",
 ]
 
 
