@@ -170,7 +170,6 @@ Measured, including the losses:
 | Inductor compile wall on unrolled recurrences | Inductor's compile grows superlinearly in T (54–85s at T=2048; GLA T=2048 exceeds 60s timeout). CatOpt produces a certified O(log T) schedule there — but its own pipeline is slower than Inductor's compile where Inductor succeeds (262s at T=2048) |
 | Launch-bound decode cells (B=1, T≤64) | Loses 4–15% — split-view copies cost more than saved launches |
 | Chunked decode on GPU (`decode_scan_bench`) | Carrier loses uncompiled (executor dispatch); **wins 1.65–2.8× CUDA-graphed** — the schedule amortizes to zero launches where Inductor's fused chunk still pays one per call |
-
 | Large cells (B≥8, T≥128, stories110M) | Parity — GEMM-shape efficiency washes out at ~1% |
 
 Real checkpoints (`bench/stories15m_bench.py`): stories15M and
