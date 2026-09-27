@@ -148,6 +148,7 @@ All rows verified semantically equivalent (fp64 where stated); RTX
 | **Autotuned selection** | `optimize_model_autotuned` — measures verified candidates per shape | retnet_stack 4.18× eager GPU; matrix_chain 2.24× CPU |
 | **Real-model wins** (`real_win_hunt`) | linattn / palm_stack / moe_sum / decode_retnet — realistic block topologies | **2.1× / 1.2× / 7–9.6× / 2.6–3.4× vs Inductor** (GPU) |
 | **Fused scan executor** | `to_batched_scan_module(fused=True)` + CUDA graph — canonical adjacent-pair compose, compile-friendly | **fused+graph beats Inductor 1.5–2.6× at T=128–512** (GPU) |
+| **End-to-end model** (`e2e_model`) | Llama-style decoder, 4 blocks GQA+SwiGLU — `optimize_compositional` → `torch.compile` | **~3.5–6% over plain Inductor** end-to-end (GPU) — pairing fires per block, verified fp64-exact |
 
 On unmodified community code (Karpathy's `llama2.c`) it rediscovers
 `MergedColumnParallelLinear` and `QKVParallelLinear` — the transforms

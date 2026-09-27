@@ -60,6 +60,7 @@ DEFAULT_SUITES = [
     "law_bench",
     "bench_e2e",
     "model_bench",
+    "e2e_model",
 ]
 
 
