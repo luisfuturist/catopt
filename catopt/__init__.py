@@ -50,6 +50,7 @@ _ALIAS = {
     "catopt.rulecache": "catopt_core.rulecache",
     "catopt.runners": "catopt_optimize.runners",
     "catopt.scan_lower": "catopt_carriers.scan_lower",
+    "catopt.scan_fused": "catopt_carriers.scan_fused",
     "catopt.torch_bridge": "catopt_torch.torch_bridge",
     "catopt.trace": "catopt_carriers.trace",
     "catopt.trace_lift": "catopt_carriers.trace_lift",

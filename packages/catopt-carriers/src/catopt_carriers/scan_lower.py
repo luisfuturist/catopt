@@ -28,6 +28,13 @@ Usage::
 ``to_batched_scan_module`` (and :class:`BatchedScanModule` itself)
 detects the ``apply(aff-tree, h)`` shape; any other IR falls back to
 the ordinary tuple-passing IRModule evaluation.
+
+``fused=True``/``"compile"`` selects the fused level-step from
+:mod:`~catopt_carriers.scan_fused`: the leaf product is *re-bracketed*
+into the canonical adjacent-pair reduction — the same composed map
+(the monoid product is association-invariant) — and the level loop
+runs through ``torch.compile`` so Inductor fuses it to a handful of
+kernels; ``fused="eager"`` runs the same schedule without compile.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from catopt_core.ir import IR, Op, Param
+from catopt_core.ir import IR, Op, Param, Var
 from catopt_core.typing import _shape_of
 from catopt_torch.executors import (
     BatchedExecutorBase,
@@ -43,6 +50,12 @@ from catopt_torch.executors import (
     slot_gathers,
 )
 from catopt_torch.torch_bridge import IRModule
+
+from catopt_carriers.scan_fused import (
+    fused_dense_levels,
+    fused_diag_levels,
+    occurrence_slots,
+)
 
 __all__ = [
     "BatchedScanModule",
@@ -323,6 +336,8 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         self,
         ir: IR,
         param_values: dict[str, torch.Tensor] | None = None,
+        *,
+        fused: bool | str = False,
     ) -> None:
         super().__init__()
         self._inputs = ir.inputs
@@ -332,6 +347,55 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         self._plan = build_scan_plan(self.eval_mod._root)
         self._const_cache: dict[tuple, torch.Tensor] = {}
         self._init_graph_state()
+        self._init_fused(fused)
+        gather = (
+            self._plan["leaf_b_gather"]
+            if self._plan is not None
+            else None
+        )
+        # ``indices == range(len)`` is a plan-time constant — caching it
+        # turns the per-forward contiguous check into a len compare.
+        self._b_identity = gather is not None and gather[2] == list(
+            range(len(gather[2]))
+        )
+
+    def _init_fused(self, fused: bool | str) -> None:
+        """Resolve the ``fused`` flag against the plan.
+
+        ``self._fused`` ends up ``None`` (standard level-gather
+        schedule), ``"eager"`` (canonical adjacent-pair reduction run
+        eagerly), or ``"compile"`` (the same body through
+        ``torch.compile(fullgraph=True)`` — requested by
+        ``fused=True``/``"compile"``).  The fused schedule
+        *re-brackets* the leaf sequence into adjacent pairs: the
+        monoid product is association-invariant, so the result is the
+        same composed map, but every level becomes a pure strided
+        pointwise/matmul step on a shrinking fresh tensor — no
+        gathers, no growing-buffer ``cat``, and Inductor fuses the
+        whole loop to a handful of kernels.
+
+        ``self._fused_occ`` holds the leaf-occurrence slots when the
+        extracted term is a DAG (shared leaves/subtrees) — ``None``
+        for the common tree case where occurrences are already in
+        order.  ``occurrence_slots`` declining (pathological sharing)
+        keeps the standard schedule.
+        """
+        self._fused: str | None = None
+        self._fused_occ: list[int] | None = None
+        self._fused_c: Any = None
+        self._fused_compile_failed = False
+        if not fused or self._plan is None:
+            return
+        if fused not in (True, "eager", "compile"):
+            raise ValueError(
+                f"fused must be True, 'eager', or 'compile'; got {fused!r}"
+            )
+        occ = occurrence_slots(self._plan["f"], self._plan["leaves"])
+        if occ is None:
+            return
+        if occ != list(range(len(occ))):
+            self._fused_occ = occ
+        self._fused = "eager" if fused == "eager" else "compile"
 
     @property
     def is_batched(self) -> bool:
@@ -382,6 +446,20 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
 
         ev = self.ev_factory(env, x, memo)
 
+        def evf(t: Any) -> torch.Tensor:
+            """Cheap ``Param``/``Var`` resolution for the plan's few
+            top-level leaf terms — full ``eval_term`` dispatch for
+            anything richer (select chains, fused subtrees, …)."""
+            if isinstance(t, Param):
+                v = self.eval_mod._param_map.get(t.name)
+                if v is not None:
+                    return v
+            elif isinstance(t, Var):
+                v = env.get(t.name)
+                if v is not None:
+                    return v
+            return ev(t)
+
         # ---- Level 0: aff(A_t, b_t) leaves → homogeneous (d+1)² -------
         leaves = self._plan["leaves"]
         n = len(leaves)
@@ -389,10 +467,10 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             # LTI recurrence: one shared transition matrix — expand is a
             # zero-copy stride-0 view that batched matmul reads directly,
             # avoiding both the per-leaf evals and the stack kernel.
-            A0 = ev(leaves[0].args[0])
+            A0 = evf(leaves[0].args[0])
             a_vals = A0.unsqueeze(0).expand(n, *A0.shape)
         else:
-            leaf_As = [ev(leaf.args[0]) for leaf in leaves]
+            leaf_As = [evf(leaf.args[0]) for leaf in leaves]
             if all(a is leaf_As[0] for a in leaf_As):
                 a_vals = (
                     leaf_As[0].unsqueeze(0).expand(n, *leaf_As[0].shape)
@@ -405,8 +483,8 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             # All leaf b-parts are base[i] slices of one tensor — a
             # single index_select replaces n tiny indexing calls.
             base_t, dim, indices = gather
-            base = ev(base_t)
-            if indices == list(range(base.shape[dim])):
+            base = evf(base_t)
+            if self._b_identity and base.shape[dim] == len(indices):
                 b_vals = base
             else:
                 b_vals = base.index_select(
@@ -415,7 +493,10 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             if dim != 0:
                 b_vals = b_vals.movedim(dim, 0)
         else:
-            b_vals = torch.stack([ev(leaf.args[1]) for leaf in leaves])
+            b_vals = torch.stack([evf(leaf.args[1]) for leaf in leaves])
+
+        if self._fused is not None:
+            return self._forward_fused(a_vals, b_vals, evf)
 
         if self._plan["diagonal"]:
             # Diagonal carrier: pairs (a, b) of (d,) vectors; compose is
@@ -436,15 +517,11 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
                 )
                 a_all = torch.cat([a_all, a_f * a_g])
                 b_all = torch.cat([b_all, a_f * b_g + b_f])
-            h = ev(self._plan["h"])
+            h = evf(self._plan["h"])
             r = self._plan["root_slot"]
             return a_all[r] * h + b_all[r]
 
-        # M_leaf = [[A, b], [0, …, 0, 1]]  (n, d+1, d+1)
-        d = a_vals.shape[-1]
-        top = torch.cat([a_vals, b_vals.reshape(n, d, 1)], dim=-1)
-        bottom = self._cached(("row", d + 1), a_vals, _make_bottom_row)
-        m_all = torch.cat([top, bottom.expand(n, 1, d + 1)], dim=-2)
+        m_all = self._leaf_homogeneous(a_vals, b_vals)
 
         # ---- Levels 1..L: batched aff_compose = M_f @ M_g -------------
         for f_idx, g_idx in self._plan["level_gather"]:
@@ -455,8 +532,89 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
 
         # ---- Root apply: f(h) = A·h + b --------------------------------
         m_root = m_all[self._plan["root_slot"]]
-        h = ev(self._plan["h"])
+        h = evf(self._plan["h"])
+        d = m_root.shape[-1] - 1
         return m_root[:d, :d] @ h + m_root[:d, d]
+
+    # -- fused schedule -------------------------------------------------
+
+    def _leaf_homogeneous(
+        self, a_vals: torch.Tensor, b_vals: torch.Tensor
+    ):
+        """Pack leaf ``(A, b)`` pairs into ``(n, d+1, d+1)`` mats.
+
+        ``M_leaf = [[A, b], [0, …, 0, 1]]`` — the homogeneous-matrix
+        trick that makes ``aff_compose`` literal matmul.
+        """
+        n, d = a_vals.shape[0], a_vals.shape[-1]
+        top = torch.cat([a_vals, b_vals.reshape(n, d, 1)], dim=-1)
+        bottom = self._cached(("row", d + 1), a_vals, _make_bottom_row)
+        return torch.cat([top, bottom.expand(n, 1, d + 1)], dim=-2)
+
+    def _occ_index(self, like: torch.Tensor):
+        """The occurrence-order gather indices, or ``None``.
+
+        Tree-structured terms keep ``_fused_occ is None`` — leaves are
+        already in product order; only DAG-shared terms pay the gather.
+        """
+        occ = self._fused_occ
+        if occ is None:
+            return None
+        return self._cached(
+            ("occ", tuple(occ)),
+            like,
+            lambda t: torch.tensor(
+                occ, dtype=torch.long, device=t.device
+            ),
+            dtype=torch.long,
+        )
+
+    def _fused_call(self, body, *args: torch.Tensor) -> torch.Tensor:
+        """Run ``body`` — compiled when the mode calls for it.
+
+        ``fused="eager"`` (or a failed compile) runs the plain
+        function; ``fused=True``/``"compile"`` wraps it in
+        ``torch.compile(fullgraph=True)`` on first use and permanently
+        falls back to the eager body if compilation or a compiled call
+        ever raises — the fused schedule stays correct either way.
+        """
+        if self._fused == "eager" or self._fused_compile_failed:
+            return body(*args)
+        if self._fused_c is None:
+            try:
+                self._fused_c = torch.compile(body, fullgraph=True)
+            except Exception:
+                self._fused_compile_failed = True
+                return body(*args)
+        try:
+            return self._fused_c(*args)
+        except Exception:
+            self._fused_compile_failed = True
+            self._fused_c = None
+            return body(*args)
+
+    def _forward_fused(self, a_vals, b_vals, ev) -> torch.Tensor:
+        """Canonical adjacent-pair reduction over the leaf product.
+
+        Re-brackets to a balanced power-of-two tree: every level is a
+        strided ``f = x[0::2], g = x[1::2]`` pair on a fresh tensor —
+        the same composed map (the monoid product is
+        association-invariant) in ~2 kernels per level eagerly, or a
+        handful of Inductor kernels total when compiled.
+        """
+        h = ev(self._plan["h"])
+        occ = self._occ_index(a_vals)
+        if self._plan["diagonal"]:
+            if occ is not None:
+                a_vals = a_vals.index_select(0, occ)
+                b_vals = b_vals.index_select(0, occ)
+            return self._fused_call(
+                fused_diag_levels, a_vals, b_vals, h
+            )
+        m_seq = self._leaf_homogeneous(a_vals, b_vals)
+        if occ is not None:
+            m_seq = m_seq.index_select(0, occ)
+        return self._fused_call(fused_dense_levels, m_seq, h)
 
 
 def _make_bottom_row(like: torch.Tensor) -> torch.Tensor:
@@ -470,6 +628,8 @@ def _make_bottom_row(like: torch.Tensor) -> torch.Tensor:
 def to_batched_scan_module(
     ir: IR,
     param_values: dict[str, torch.Tensor] | None = None,
+    *,
+    fused: bool | str = False,
 ) -> BatchedScanModule:
     """Lower ``ir`` to a module, level-batching any leading scan term.
 
@@ -477,5 +637,13 @@ def to_batched_scan_module(
     ``apply(aff-tree, h)`` the module transparently delegates to the
     serial IRModule evaluator (check ``mod.is_batched`` to tell which
     path was taken).
+
+    ``fused`` selects the level schedule on scan roots: ``False`` (the
+    default) uses the slot-gather schedule the plan describes;
+    ``True``/``"compile"`` runs the canonical fused reduction through
+    ``torch.compile`` (permanently falling back to the eager fused
+    body if compilation fails); ``"eager"`` runs the fused schedule
+    without compile.  ``is_batched``/``n_levels``/``_plan`` describe
+    the extracted term identically under either schedule.
     """
-    return BatchedScanModule(ir, param_values=param_values)
+    return BatchedScanModule(ir, param_values=param_values, fused=fused)

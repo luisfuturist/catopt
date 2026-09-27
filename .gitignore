@@ -57,3 +57,6 @@ cov_ann/
 # Bench outputs
 bench/results/
 .chokkin/
+
+# Pitch decks (standalone repos)
+pitch/
