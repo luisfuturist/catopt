@@ -10,8 +10,10 @@ Models provided include:
   axis; what lets extraction prefer weight-sharing members).
 * executor_overhead / executor_cost_for - price the LOWERING:
   dispatched-op counts per executor kind on top of a base model.
-* fused_cost_for - the compiled lowering's price (Inductor-style
-  pointwise-fusion regions).
+* fusion_regions - partition a term's op-DAG into Inductor-style
+  pointwise-fusion regions (one region = one compiled kernel).
+* fused_cost_for - the compiled lowering's price: each fusion region
+  costs one launch + dispatch at its dominant member's roofline.
 * lowering_aware_cost_for - min over lowerings: extraction picks the
   term whose best lowering is cheapest.
 
@@ -1136,11 +1138,100 @@ _SCAN_COMPOSE_OPS = frozenset(
     {"aff_compose", "affd_compose", "om_compose", "omd_compose"}
 )
 
-#: Ops a compiled lowering can fuse into one pointwise kernel:
-#: ``_VIEW_OPS`` (views emit no kernel of their own — their index
-#: arithmetic rides along in the consumer's) plus the elementwise set
-#: ``_FOLDABLE_ELEMWISE``.
-_FUSIBLE_OPS = _VIEW_OPS | _FOLDABLE_ELEMWISE
+#: Ops whose torch binding is pure POINTWISE tensor work — the unit a
+#: compiled lowering (torch.compile / Inductor) fuses into a single
+#: kernel.  The elementwise core set plus the rest of the pointwise
+#: bindings in the core table (casts, comparisons, where/clone, the
+#: cmask/fill/attnbias mask generators) and the carrier ops whose
+#: bodies are ordinary elementwise arithmetic on the carried
+#: components — ``applyd`` = f0⊙h + f1, ``affd_compose`` =
+#: (f0⊙g0, f0⊙g1 + f1), ``om_compose``/``omd_compose`` = maximum +
+#: where-rescaled mul-adds, ``om_apply`` = a/l, ``omd_apply`` =
+#: (fa⊙h + fb)/l (torch_bridge._CORE_TORCH_BINDINGS,
+#: catopt_carriers.xcarrier.TORCH_BINDINGS).  NOT here: the bindings
+#: hiding a contraction or reduction — ``apply``/``aff_compose``/
+#: ``omd_applym`` (matmul), ``om_elem``/``omd_elem``/``om_elem_aff``/
+#: ``om_elem_affd`` (amax + GEMM) — those stay fusion boundaries.
+_FUSION_POINTWISE_OPS: frozenset = _FOLDABLE_ELEMWISE | frozenset(
+    {
+        "relu",
+        "rsqrt",
+        "cos",
+        "sin",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "logical_not",
+        "where",
+        "masked_fill",
+        "clone",
+        "to",
+        "type_as",
+        "float",
+        "cmask",
+        "fill",
+        "attnbias",
+        "affd_compose",
+        "applyd",
+        "om_compose",
+        "om_apply",
+        "omd_compose",
+        "omd_apply",
+    }
+)
+
+#: Ops emitting NO kernel under a compiled lowering — fusion-
+#: TRANSPARENT plumbing.  Pure views (Inductor folds their index
+#: arithmetic into the consumer's kernel — the _VIEW_OPS convention;
+#: the set adds the aten spellings torch.export emits: unbind/getitem/
+#: select/slice/squeeze/unsqueeze/expand/flatten/alias/dropout) and
+#: carrier *packaging*: ``aff``/``aff_diag``/``om``/``omd`` assemble
+#: the carried pair/triple and ``affd_a``/``affd_b``/``aff_A``/``aff_b``
+#: project a component — under dynamo tracing they are Python-level
+#: plumbing that never reaches the graph.  A pointwise consumer unions
+#: with a transparent node's pointwise DESCENDANTS: the plumbing does
+#: not split the region.  Constant morphisms (``eye``/``cswap``)
+#: materialise at compile time — free, and they take no args so
+#: nothing forwards through them.
+_FUSION_TRANSPARENT_OPS: frozenset = frozenset(
+    {
+        "transpose",
+        "reshape",
+        "broadcast",
+        "chunk",
+        "split",
+        "unsqueeze",
+        "squeeze",
+        "select",
+        "slice",
+        "expand",
+        "flatten",
+        "getitem",
+        "unbind",
+        "alias",
+        "dropout",
+        "leaf",
+        "aff",
+        "aff_diag",
+        "om",
+        "omd",
+        "affd_a",
+        "affd_b",
+        "aff_A",
+        "aff_b",
+        "eye",
+        "cswap",
+    }
+)
+
+#: Everything that can ride inside a fused region — pointwise members
+#: plus transparent plumbing.  (Previously ``_VIEW_OPS |
+#: _FOLDABLE_ELEMWISE``; the compiled-lowering model now also knows
+#: the pointwise carrier bodies and the remaining aten views.)
+_FUSIBLE_OPS = _FUSION_POINTWISE_OPS | _FUSION_TRANSPARENT_OPS
 
 #: Ops whose binding hides a direct solver call (``linalg.solve`` /
 #: inverse) — measured orders of magnitude beyond a dispatch
@@ -1266,9 +1357,14 @@ def executor_overhead(
       compose levels + one evaluation per distinct compose-tree leaf;
       ops outside the spine dispatch generically.  Non-scan roots get
       the generic count — the modules' serial fallback.
-    * ``"compiled"`` — 0: per-node dispatch is the wrong axis for the
-      compiled lowering.  Its kernel count comes from fusion regions,
-      priced by :func:`fused_cost_for`, not by node count.
+    * ``"compiled"`` — ``len(fusion_regions(term))``: the compiled
+      executor's unit of work is the KERNEL, so the count is the
+      region count — a pointwise chain of any depth fuses to one
+      region, not O(nodes).  Priced by :func:`fused_cost_for`; the
+      count is a whole-DAG property (regions merge across siblings),
+      i.e. NON-additive — fine for overhead reporting/min-over-
+      lowerings, not for ``extract_best``'s subtractive local-cost
+      decomposition (see ``_generic_overhead``).
     """
     memo = {} if memo is None else memo
     ck = ("eo", lowering, term)
@@ -1276,7 +1372,7 @@ def executor_overhead(
     if hit is not None:
         return hit
     if lowering == "compiled":
-        out = 0.0
+        out = float(len(fusion_regions(term, memo)))
     elif lowering == "generic":
         out = _generic_overhead(term, memo)
     elif lowering == "batched_scan":
@@ -1388,6 +1484,120 @@ def executor_cost_for(
     return cost
 
 
+def fusion_regions(
+    term: Any, memo: dict | None = None
+) -> tuple[frozenset, ...]:
+    """Partition *term*'s op-DAG into Inductor-style fusion regions —
+    one entry per kernel the ``"compiled"`` lowering emits.
+
+    Each frozenset is one kernel's member ops:
+
+    * a maximal connected cluster of pointwise ops
+      (``_FUSION_POINTWISE_OPS``) — Inductor streams the whole cluster
+      in one kernel; or
+    * a singleton ``{op}`` for every fusion BOUNDARY: contractions
+      (``matmul``/``linear``/``conv2d``/``sdpa``), reductions
+      (``sum``/``mean``/``max``/``min``/``softmax``/``*_norm``),
+      materialising layout ops (``concat``/``stack``/``contiguous``,
+      gathers ``index_select``/``embedding``, ``bdiag``/``parl``),
+      solver ops (``trace``/``inv``), carrier ops whose binding hides
+      a contraction (``apply``/``aff_compose``/``omd_applym``/
+      ``om_elem``/``omd_elem``/``om_elem_aff*``) — and any unknown op,
+      conservatively.
+
+    ``_FUSION_TRANSPARENT_OPS`` plumbing (views and carrier packaging:
+    ``aff``/``aff_diag``/``om``/``omd``/``affd_a``/...) emits no kernel
+    and appears in no region — a pointwise consumer unions with a
+    transparent node's pointwise DESCENDANTS, so the tuple/view
+    plumbing does not split a region.  Param-only subtrees that
+    ``_folds_to_param`` materialises at lowering contribute nothing:
+    the compiled graph reads them as inputs (the same compile-time
+    fold the extract_best param-only discount prices at 0).  Leaves
+    are never members.
+
+    ``len(fusion_regions(t))`` is the predicted kernel count — what
+    :func:`executor_overhead` reports for ``lowering="compiled"``.
+    The partition is profile-independent (shapes don't enter) and a
+    WHOLE-DAG property, not additive per node: regions merge across
+    siblings at a shared pointwise parent and a shared subterm fuses
+    once.  Cost fns built on it (``fused_cost_for``) are therefore
+    reporting/frontier models — under ``extract_best``/``dag_cost``'s
+    subtractive ``local = c(t) − Σc(children)`` a sibling merge
+    clamps to 0 and the merge is billed nowhere; fine for
+    ``lowering_aware``/frontier comparisons, approximate inside
+    extraction (the ``_generic_overhead`` docstring has the
+    additivity contract).
+    """
+    memo = {} if memo is None else memo
+    ck = ("fr", term)
+    hit = memo.get(ck)
+    if hit is not None:
+        return hit
+    out: list[frozenset] = []
+    if isinstance(term, Op):
+        # Collect the DAG's op nodes once.  A param-only subtree the
+        # lowerer folds into a materialised Param is a kernel INPUT,
+        # not a kernel — skip it without descending.
+        nodes: list[Op] = []
+        seen: set = set()
+        stack = [term]
+        while stack:
+            t = stack.pop()
+            if not isinstance(t, Op) or t in seen:
+                continue
+            seen.add(t)
+            if _folds_to_param(t, None, memo):
+                continue
+            nodes.append(t)
+            stack.extend(t.args)
+        node_set = set(nodes)
+
+        # Union-find: one region per connected pointwise cluster.
+        rep = {t: t for t in nodes}
+
+        def find(t: Op) -> Op:
+            while rep[t] is not t:
+                rep[t] = rep[rep[t]]
+                t = rep[t]
+            return t
+
+        for t in nodes:
+            if t.op not in _FUSION_POINTWISE_OPS:
+                continue
+            # Transparent args forward their own args (transparent ops
+            # never fold, so every transparent arg was collected).
+            eff: list[Any] = list(t.args)
+            i = 0
+            while i < len(eff):
+                a = eff[i]
+                if (
+                    isinstance(a, Op)
+                    and a.op in _FUSION_TRANSPARENT_OPS
+                ):
+                    eff[i : i + 1] = a.args
+                else:
+                    i += 1
+            for a in eff:
+                if (
+                    isinstance(a, Op)
+                    and a.op in _FUSION_POINTWISE_OPS
+                    and a in node_set
+                ):
+                    ra, rb = find(t), find(a)
+                    if ra is not rb:
+                        rep[ra] = rb
+        grouped: dict[Op, set] = {}
+        for t in nodes:
+            if t.op in _FUSION_POINTWISE_OPS:
+                grouped.setdefault(find(t), set()).add(t)
+        out = [frozenset(m) for m in grouped.values()]
+        out += [
+            frozenset({t}) for t in nodes if t.op not in _FUSIBLE_OPS
+        ]
+    memo[ck] = tuple(out)
+    return memo[ck]
+
+
 def _fused_cost(
     term: Any,
     memo: dict,
@@ -1398,82 +1608,64 @@ def _fused_cost(
 ) -> float:
     """Inductor-approximation price of *term* (see fused_cost_for).
 
-    Collects the DAG's op nodes, unions fusible producer/consumer
-    pairs into kernel regions, then charges each maximal region its
-    *dominant* member's local roofline and each non-fusible op its own
-    local roofline — plus one ``dispatch_s`` per surviving kernel.
+    One kernel per :func:`fusion_regions` entry: a region costs its
+    *dominant* member's local roofline plus one ``dispatch_s`` — the
+    fused kernel streams external inputs once and writes the output
+    once, so intermediates never touch memory and interior launches
+    vanish.  A region containing a solver op bills ``_SOLVER_FACTOR``
+    dispatches — the extern ``linalg.solve``/``inv`` call dominates
+    any kernel math, the same floor the generic count carries.
     """
     if not isinstance(term, Op):
         return 0.0
-    nodes: list[Op] = []
-    seen: set = set()
-    stack = [term]
-    while stack:
-        t = stack.pop()
-        if not isinstance(t, Op) or t in seen:
-            continue
-        seen.add(t)
-        nodes.append(t)
-        stack.extend(t.args)
-    # Union-find over fusible parent<->child edges: one region per
-    # connected pointwise cluster.
-    rep = {t: t for t in nodes}
-
-    def find(t: Op) -> Op:
-        while rep[t] is not t:
-            rep[t] = rep[rep[t]]
-            t = rep[t]
-        return t
-
-    for t in nodes:
-        if t.op in _FUSIBLE_OPS:
-            for a in t.args:
-                if isinstance(a, Op) and a.op in _FUSIBLE_OPS:
-                    ra, rb = find(t), find(a)
-                    if ra is not rb:
-                        rep[ra] = rb
-    total = 0.0
-    dominant: dict[Op, float] = {}
     dispatch_ns = dispatch_s * 1e9
-    for t in nodes:
-        local = _local_roofline(
-            t,
-            memo,
-            peak_flops=peak_flops,
-            peak_bw=peak_bw,
-            launch_s=launch_s,
-        )
-        if t.op in _FUSIBLE_OPS:
-            r = find(t)
-            # Every region is one evaluation slot — a materialisation /
-            # dispatch boundary — even when its dominant member emits
-            # no kernel of its own (a view-only region still hands a
-            # buffer to its consumer).
-            if local > dominant.setdefault(r, 0.0):
-                dominant[r] = local
-        else:
-            total += local + dispatch_ns
-    return float(
-        total + sum(v + dispatch_ns for v in dominant.values())
-    )
+    total = 0.0
+    for region in fusion_regions(term, memo):
+        dom = 0.0
+        solver = False
+        for t in region:
+            local = _local_roofline(
+                t,
+                memo,
+                peak_flops=peak_flops,
+                peak_bw=peak_bw,
+                launch_s=launch_s,
+            )
+            if local > dom:
+                dom = local
+            solver = solver or t.op in _SOLVER_OPS
+        total += dom + (_SOLVER_FACTOR if solver else 1.0) * dispatch_ns
+    return float(total)
 
 
 def fused_cost_for(profile: Any = None) -> CostFn:
-    """Compiled-lowering cost — the Inductor-approximation model.
+    """Compiled-lowering cost — the fusion-region (Inductor) model.
 
-    A maximal connected region of pointwise-fusible ops
-    (``_FUSIBLE_OPS``: views + elementwise) lowers to ONE kernel,
-    priced at the region's dominant member — ``max`` of the members'
-    local rooflines, not the sum: a fused kernel streams the external
+    One predicted kernel per :func:`fusion_regions` region: a maximal
+    connected pointwise cluster (``_FUSION_POINTWISE_OPS`` — elementwise
+    bindings plus the pointwise carrier bodies ``affd_compose``/
+    ``applyd``/``om[d]_compose``/``om[d]_apply``) priced at the
+    region's dominant member — ``max`` of the members' local
+    rooflines, not the sum: a fused kernel streams the external
     inputs once and writes the output once, so intermediates never
     touch memory and interior launches vanish.  Non-fusible ops
-    (matmul, conv, sdpa, the carrier compose/apply ops) keep their own
-    kernels and price at full local roofline.  Every surviving kernel
-    — one per region, one per non-fusible op — additionally pays one
-    ``dispatch_s`` (the profile's ``dispatch_us``, else the launch
-    constant): compilation removes launches, not the dispatch
-    boundary.  Without it a lone GEMM would always look cheaper
-    compiled than generic — it isn't; fusion cannot shrink one kernel.
+    (matmul/conv/sdpa, reductions, materialising layout ops, the
+    solver ops ``trace``/``inv``, the contraction-bearing carrier ops)
+    are region singletons priced at their own local roofline; solver
+    singletons additionally bill ``_SOLVER_FACTOR`` dispatches (the
+    extern solve dwarfs launch overheads — the same floor the generic
+    count carries).  Transparent plumbing (views, carrier packaging)
+    emits no kernel; param-only folds are kernel inputs.  Every
+    surviving kernel additionally pays one ``dispatch_s`` (the
+    profile's ``dispatch_us``, else the launch constant): compilation
+    removes launches, not the dispatch boundary — without it a lone
+    GEMM would always look cheaper compiled than generic, and it
+    isn't; fusion cannot shrink one kernel.
+
+    Non-additive: the region partition is a whole-DAG property (see
+    :func:`fusion_regions`), so under ``extract_best``/``dag_cost``'s
+    subtractive local-cost decomposition the model is approximate —
+    prefer it for ``lowering_aware``/frontier reporting.
 
     Deliberately approximate: real fusion decisions are
     scheduler-dependent (rematerialise vs reuse, reduction splits,
@@ -1518,6 +1710,12 @@ def lowering_aware_cost_for(
     rather than pricing every term as if the generic per-node
     dispatcher would run it: a balanced carrier tree credits its
     level-batched plan, a pointwise chain credits fusion.
+
+    The ``"compiled"`` arm is non-additive (the region partition is a
+    whole-DAG property — see :func:`fusion_regions`), so the minimum
+    is too: as an ``extract_best`` cost_fn the model is approximate —
+    a sibling merge can hide inside a clamped local.  Reporting and
+    frontier comparison are its sound uses.
 
     The returned closure carries ``cost.best_lowering(term,
     memo=None) -> str`` — the argmin lowering (first in ``lowerings``

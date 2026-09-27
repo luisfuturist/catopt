@@ -7,6 +7,7 @@ Pipeline entry points (:func:`optimize_model`,
 (:mod:`~catopt_optimize.calibrate`).
 """
 
+from catopt_optimize.autotune import optimize_model_autotuned
 from catopt_optimize.optimize import (
     OptimizationResourceError,
     optimize_compositional,
@@ -17,4 +18,5 @@ __all__ = [
     "OptimizationResourceError",
     "optimize_compositional",
     "optimize_model",
+    "optimize_model_autotuned",
 ]

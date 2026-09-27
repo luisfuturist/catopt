@@ -29,7 +29,15 @@ opt, report = optimize_model(model, example_input)
 out = opt(x)          # equivalent to model(x), certificate-backed
 
 opt, report = optimize_model(model, example_input, compile=True)
-# ^ torch.compile is applied to the delivered module; report["compiled"]
+# ^ torch.compile wraps the delivered module; report["compiled"]
+
+opt, report = optimize_model(model, example_input, cuda_graph=True)
+# ^ capture the batched carrier as a CUDA graph; report["cuda_graph"]
+
+from catopt_optimize import optimize_model_autotuned
+opt, report = optimize_model_autotuned(model, example_input)
+# ^ builds verified candidates per lowering, times them on the real
+#   input, returns the measured winner — picks honest about losses
 ```
 
 Deep stacks use `optimize_compositional`, which optimizes each block
@@ -89,6 +97,8 @@ All rows verified semantically equivalent (fp64 where stated); RTX
 | Streaming attention | om monoid: O(1) state per KV block | 260× vs sdpa-recompute at 65k cache; 89 MiB flat at 2M keys |
 | Conv pairing | 4 parallel conv1×1 → 1 conv | 1.24–1.33×, all batch sizes |
 | Diagonal absorption | `repeat_kv` → SDPA `enable_gqa` (llama2.c) | 1.12× at T=512 |
+| **Chunked decode + CUDA graph** | retnet/gla/delta carriers, graph-captured | **1.65–2.8× vs best non-carrier** (GPU) |
+| **Autotuned selection** | `optimize_model_autotuned` — measures verified candidates per shape | retnet_stack 4.18× eager GPU; matrix_chain 2.24× CPU |
 
 On unmodified community code (Karpathy's `llama2.c`) it rediscovers
 `MergedColumnParallelLinear` and `QKVParallelLinear` — the transforms
@@ -109,6 +119,8 @@ Measured, including the losses:
 | Scan lift on linear-attention blocks | 3× vs eager delivered end-to-end; 3.9× composed with `compile=True`; loses to a compiled Inductor where it can compile |
 | Inductor compile wall on unrolled recurrences | Inductor's compile grows superlinearly in T (54–85s at T=2048; GLA T=2048 exceeds 60s timeout). CatOpt produces a certified O(log T) schedule there — but its own pipeline is slower than Inductor's compile where Inductor succeeds (262s at T=2048) |
 | Launch-bound decode cells (B=1, T≤64) | Loses 4–15% — split-view copies cost more than saved launches |
+| Chunked decode on GPU (`decode_scan_bench`) | Carrier loses uncompiled (executor dispatch); **wins 1.65–2.8× CUDA-graphed** — the schedule amortizes to zero launches where Inductor's fused chunk still pays one per call |
+
 | Large cells (B≥8, T≥128, stories110M) | Parity — GEMM-shape efficiency washes out at ~1% |
 
 Real checkpoints (`bench/stories15m_bench.py`): stories15M and
@@ -141,10 +153,13 @@ rank correlation. Findings and the fixes they drove:
   batched spine, so `_carrier_upgrade` force-extracts root-class
   carrier enodes and compares delivered prices — each term billed
   under the executor it would route to.
-- Residual gap: ρ ≈ 0.3 on scan blocks — identical terms run 0.043ms
-  Inductor vs ~0.9ms generic eval; structural cost can't predict
-  realized kernel fusion. Pricing compiled lowerings by fusion
-  regions is open work.
+- Fixed further: **`fusion_regions`** partitions a term's DAG into
+  predicted Inductor kernels (maximal pointwise clusters; matmul /
+  reduction / materializing-layout / solver ops are boundaries; views
+  and carrier packaging are transparent). The `compiled` lowering now
+  prices kernel count — the 128-leaf `applyd` spine bills ~1 kernel
+  (predicted 18.7µs ≈ measured) instead of ~256 phantom dispatches.
+  ρ moved: `lowering_min` 0.167→0.261, `exec_generic` 0.070→0.316.
 - Constraint: extraction requires additive cost functions —
   `min`-over-lowerings is non-additive and corrupts `extract_best`'s
   local-cost decomposition, so it serves reporting, not selection.
@@ -213,9 +228,12 @@ packages/catopt-optimize/   pipeline orchestrators (deps: all above)
   optimize, regime, calibrate
 catopt/                     façade — public API + compat aliases
 bench/                      benchmarks: stories15M/110M checkpoints,
-                            decode sweep, reassoc_scale,
+                            decode_bench (launch-bound sweep),
+                            decode_scan_bench (chunked decode, carriers
+                            + CUDA-graph), reassoc_scale,
                             real_linear_attn (scan lift, CPU+CUDA),
-                            cost_fidelity (predicted vs measured)
+                            cost_fidelity (predicted vs measured),
+                            killer_demo (autotuned e2e table)
 tests/                      test suite
 project/                    orphan branch: plans, ADRs, retrospectives
 ```
@@ -238,6 +256,8 @@ python bench/fetch.py         # checkpoints → ~/.cache/catopt
 python bench/stories15m_bench.py --device cuda
 python bench/decode_bench.py --device cuda --quick
 python bench/real_linear_attn.py --device cuda --quick
+python bench/decode_scan_bench.py --device cuda --quick
+python bench/killer_demo.py --device cpu --quick
 python -m pytest tests/ -q
 ```
 

@@ -375,7 +375,7 @@ def test_carrier_upgrade_swaps_when_delivered_cheaper(monkeypatch):
     monkeypatch.setattr(
         O,
         "_delivered_cost",
-        lambda t, profile=None: (
+        lambda t, profile=None, compiled=False: (
             1.0
             if isinstance(t, Op) and t.op in O._CARRIER_PLANS
             else 100.0
@@ -432,3 +432,31 @@ def test_cuda_graph_skipped_when_compiled():
         )
     if stats.get("compiled"):
         assert stats.get("cuda_graph") is None
+
+
+def test_cuda_graph_tuple_input_noop_on_cpu():
+    """Tuple/list example inputs don't crash the cuda_graph path —
+    non-tensor first elements degrade quietly to cuda_graph=False."""
+    from catopt.models import LinearRecurrence
+    from catopt.optimize import optimize_model
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    with torch.no_grad():
+        # tuple input that isn't CUDA → no capture, no crash
+        mod, stats = optimize_model(
+            m, (x,), verbose=False, cuda_graph=True
+        )
+    assert stats.get("cuda_graph") is False
+
+
+def test_delivered_cost_compiled_prices_fusion_regions():
+    """compile=True: every candidate prices under the fusion-region
+    model — a 128-leaf pointwise spine bills ~1 kernel, not per-node."""
+    from catopt.cost import executor_cost_for
+    from catopt_optimize.optimize import _delivered_cost
+
+    ir, h, env = _scan_ir()
+    assert _delivered_cost(
+        ir.root, compiled=True
+    ) == executor_cost_for(lowering="compiled")(ir.root)

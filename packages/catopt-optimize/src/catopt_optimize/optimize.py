@@ -341,10 +341,16 @@ _CARRIER_PLANS = {
 }
 
 
-def _delivered_cost(term: Any, profile: Any = None) -> float:
+def _delivered_cost(
+    term: Any, profile: Any = None, compiled: bool = False
+) -> float:
     """Price a term under the lowering it would actually get — the
     batched carrier executor for plannable apply roots, generic eval
-    otherwise (solver ops surcharged)."""
+    otherwise (solver ops surcharged).  With ``compiled=True`` the
+    delivered module is torch.compile-wrapped whichever route ran,
+    so the fusion-region model prices every term."""
+    if compiled:
+        return executor_cost_for(profile, lowering="compiled")(term)
     if isinstance(term, Op) and term.op in _CARRIER_PLANS:
         plan = _CARRIER_PLANS[term.op](term)
         if plan is not None:
@@ -360,6 +366,7 @@ def _carrier_upgrade(
     best_term: Any,
     cost_fn: CostFn,
     profile: Any = None,
+    compiled: bool = False,
 ) -> Any:
     """Coordinated carrier selection.
 
@@ -379,12 +386,12 @@ def _carrier_upgrade(
     ]
     if not carriers:
         return best_term
-    best_price = _delivered_cost(best_term, profile)
+    best_price = _delivered_cost(best_term, profile, compiled)
     for node in carriers:
         cand = eg.extract_best(root_eid, cost_fn, overrides={cid: node})
         if cand is None:
             continue
-        price = _delivered_cost(cand, profile)
+        price = _delivered_cost(cand, profile, compiled)
         if price < best_price:
             best_term, best_price = cand, price
     return best_term
@@ -779,7 +786,9 @@ def optimize_model(
             stats["paired_extract"] = True
     # Coordinated carrier selection: a batched-executor win is a
     # whole-spine property the additive extraction can't price.
-    best_term = _carrier_upgrade(eg, root_eid, best_term, cost_fn)
+    best_term = _carrier_upgrade(
+        eg, root_eid, best_term, cost_fn, compiled=compile
+    )
     # Causal specialization: a param-only attn_mask that evaluates to a
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
     _cm: dict = {}
@@ -832,11 +841,25 @@ def optimize_model(
         # compiled wrappers degrade quietly.  Shape is baked at
         # capture; mismatched calls fall back to eager internally.
         stats["cuda_graph"] = False
-        if example_input.is_cuda and hasattr(
-            optimized_module, "capture_cuda_graph"
+        ex = (
+            example_input[0]
+            if isinstance(example_input, (tuple, list))
+            else example_input
+        )
+        if (
+            isinstance(ex, torch.Tensor)
+            and ex.is_cuda
+            and hasattr(optimized_module, "capture_cuda_graph")
         ):
+            # pragma: no cover — CUDA-only body (requires_cuda test
+            # exercises it on GPU; the CPU branch above is covered).
             try:
-                optimized_module.capture_cuda_graph(example_input)
+                xs = (
+                    tuple(example_input)
+                    if isinstance(example_input, (tuple, list))
+                    else (example_input,)
+                )
+                optimized_module.capture_cuda_graph(*xs)
                 stats["cuda_graph"] = True
             except Exception:
                 optimized_module.drop_cuda_graph()

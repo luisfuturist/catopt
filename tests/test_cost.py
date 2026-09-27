@@ -14,6 +14,7 @@ from catopt.cost import (
     executor_overhead,
     flops_cost,
     fused_cost_for,
+    fusion_regions,
     lowering_aware_cost_for,
     param_bytes_cost,
     param_bytes_cost_for,
@@ -362,7 +363,7 @@ def test_executor_overhead_generic_counts_ops():
     tv = Op.make("transpose", t, dim0=0, dim1=1)
     assert executor_overhead(tv, "generic") == 4.0
     # per-occurrence, not DAG-dedup: extract_best recovers local cost
-    # as f(t) − Σf(children), exact only for additive fns — shared
+    # as f(t) - Σf(children), exact only for additive fns — shared
     # subtrees are already billed once at the e-class level
     m = Op.make("mul", x, _p("W", 8, 8))
     assert executor_overhead(Op.make("add", m, m), "generic") == 3.0
@@ -425,15 +426,25 @@ def test_executor_overhead_batched_scan_compose_tree():
 
 
 def test_executor_overhead_non_scan_and_compiled():
-    non = Op.make("neg", _v("x", 4))
+    x = _v("x", 4)
+    non = Op.make("neg", x)
     # Non-scan roots get the serial-fallback (generic) count.
     assert executor_overhead(non, "batched_scan") == executor_overhead(
         non, "generic"
     )
     # An apply op with no spine argument is not a scan term either.
     assert executor_overhead(Op.make("apply"), "batched_scan") == 1.0
-    # Compiled dispatch is counted via fusion regions, not nodes.
-    assert executor_overhead(non, "compiled") == 0.0
+    # Compiled dispatch counts fusion regions (kernels), not nodes:
+    # neg is pointwise — ONE fused region, not one per node.
+    assert executor_overhead(non, "compiled") == 1.0
+    assert executor_overhead(x, "compiled") == 0.0  # a leaf
+    assert (
+        executor_overhead(
+            Op.make("neg", Op.make("matmul", x, _p("W", 4, 4))),
+            "compiled",
+        )
+        == 2.0
+    )  # the GEMM boundary + the fused neg
     with pytest.raises(ValueError, match="unknown lowering"):
         executor_overhead(non, "nope")
 
@@ -562,14 +573,16 @@ def test_lowering_aware_cost_for_picks_per_term():
     mm = Op.make("matmul", x, _p("W", 512, 512))
     assert cost.best_lowering(mm) == "generic"
 
-    # An applyd compose tree: the batched scan's log-level dispatch
-    # count beats per-node dispatch (generic) and per-node kernels
-    # (compiled — the carrier ops are not pointwise-fusible).
+    # An applyd compose tree: the diagonal-carrier ops are pointwise
+    # under the hood, so the compiled lowering fuses the whole spine
+    # into one region — cheaper than the batched scan's log-level
+    # dispatch count AND the generic per-node dispatch.  (This is the
+    # measured-fidelity asymmetry the region model captures.)
     leaves = [_scan_leaf(i) for i in range(8)]
     scan = Op.make("applyd", _balanced_tree(leaves), _v("h", 4))
-    assert cost.best_lowering(scan) == "batched_scan"
+    assert cost.best_lowering(scan) == "compiled"
     assert cost(scan) == pytest.approx(
-        executor_cost_for(prof, lowering="batched_scan")(scan)
+        executor_cost_for(prof, lowering="compiled")(scan)
     )
 
     # Memo reuse + a restricted lowering set.
@@ -585,3 +598,172 @@ def test_lowering_aware_cost_for_picks_per_term():
 
 def test_lowering_aware_all_lowerings_constant():
     assert LOWERINGS == ("generic", "batched_scan", "compiled")
+
+
+# ---------------------------------------------------------------------------
+#  Fusion regions — the compiled lowering's kernel partition
+# ---------------------------------------------------------------------------
+
+
+def _applyd_chain(n: int, d: int = 4) -> Op:
+    """applyd over a balanced affd_compose tree of n aff_diag leaves."""
+    return Op.make(
+        "applyd",
+        _balanced_tree([_scan_leaf(i, d) for i in range(n)]),
+        _v("h", d),
+    )
+
+
+def _ops_of(regions) -> list[list[str]]:
+    return [sorted(t.op for t in r) for r in regions]
+
+
+def test_fusion_regions_pointwise_chain_scales_sublinear():
+    """A T-step pointwise chain prices at ≤ O(log T) regions — one.
+
+    The measured-fidelity fix: the compiled lowering fuses the whole
+    chain into ~one kernel (0.05ms measured on the applyd spine at
+    T=128), NOT the O(T) launches the generic evaluator pays (~0.9ms).
+    Region counting is global — a whole-DAG partition — so the model
+    is reporting/frontier-only (extract_best's subtractive local-cost
+    decomposition can hide a sibling merge in a clamped local; the
+    fusion_regions docstring carries the contract).
+    """
+    import math
+
+    for t_steps in (4, 8, 128):
+        # a left-leaning chain of unary pointwise ops
+        t = _v("x", 4, 4)
+        for _ in range(t_steps):
+            t = Op.make("neg", Op.make("sigmoid", t))
+        n_regions = len(fusion_regions(t))
+        assert n_regions == 1
+        assert n_regions <= math.ceil(math.log2(t_steps)) + 1
+    # the cost is T-independent: one kernel regardless of chain depth
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 10.0,
+    }
+    f = fused_cost_for(prof)
+    assert f(_applyd_chain(4)) == pytest.approx(f(_applyd_chain(128)))
+
+
+def test_fusion_regions_applyd_spine_is_one_region():
+    """The diagonal-carrier scan spine fuses whole under compiled.
+
+    affd_compose/applyd bindings are pure pointwise arithmetic on the
+    carried pair (f0⊙g0, f0⊙g1+f1 / f0⊙h+f1) and the aff_diag leaves
+    are tuple packaging — the whole spine is one pointwise region,
+    matching Inductor's single fused kernel.  Generic counts one
+    dispatch per NODE (2T); batched_scan counts O(log T) levels.
+    """
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 10.0,
+    }
+    for t_steps in (8, 128):
+        chain = _applyd_chain(t_steps)
+        regions = fusion_regions(chain)
+        assert len(regions) == 1
+        assert {t.op for t in regions[0]} == {"applyd", "affd_compose"}
+        # the overhead count IS the region count
+        assert executor_overhead(chain, "compiled") == 1.0
+        assert executor_overhead(chain, "generic") == 2 * t_steps
+        compiled = executor_cost_for(prof, lowering="compiled")(chain)
+        generic = executor_cost_for(prof, lowering="generic")(chain)
+        batched = executor_cost_for(prof, lowering="batched_scan")(
+            chain
+        )
+        assert compiled < batched < generic
+
+
+def test_fusion_regions_hard_boundaries():
+    """matmul / reductions / materialising layout ops split regions."""
+    x = _v("x", 64, 64)
+    # Two distinct GEMMs + a pointwise tail: 3 kernels — the fused
+    # {add, neg, sigmoid} plus one per matmul.
+    mm1 = Op.make("matmul", x, _p("W", 64, 64))
+    mm2 = Op.make("matmul", x, _p("U", 64, 64))
+    t = Op.make("add", Op.make("neg", mm1), Op.make("sigmoid", mm2))
+    regions = fusion_regions(t)
+    assert len(regions) == 3
+    assert frozenset({mm1}) in regions
+    assert frozenset({mm2}) in regions
+    assert frozenset({t, t.args[0], t.args[1]}) in regions
+    # A reduction is a boundary too: pointwise siblings still fuse.
+    red = Op.make("add", Op.make("sum", x, dim=1), Op.make("mul", x, x))
+    r_ops = _ops_of(fusion_regions(red))
+    assert sorted(r_ops) == [["add", "mul"], ["sum"]]
+    # Materialising layout ops bound regions; a gather does too.
+    cat = Op.make("concat", x, x, dim=0)
+    r_ops = _ops_of(fusion_regions(Op.make("neg", cat)))
+    assert sorted(r_ops) == [["concat"], ["neg"]]
+    gat = Op.make("index_select", x, dim=0, index=(0, 1))
+    r_ops = _ops_of(fusion_regions(Op.make("neg", gat)))
+    assert sorted(r_ops) == [["index_select"], ["neg"]]
+
+
+def test_fusion_regions_transparent_plumbing_bridges():
+    """Views + carrier packaging emit no kernel and don't split a
+    region — a pointwise consumer unions with their descendants."""
+    x = _v("x", 4, 4)
+    y = _v("y", 4, 4)
+    neg = Op.make("neg", x)
+    t = Op.make(
+        "add",
+        Op.make("transpose", neg, dim0=0, dim1=1),
+        y,
+    )
+    regions = fusion_regions(t)
+    assert len(regions) == 1
+    assert regions[0] == frozenset({t, neg})  # transpose is invisible
+    # A lone packaging op is no kernel at all — a tuple assembly.
+    assert (
+        fusion_regions(Op.make("aff_diag", _p("a", 4), _p("b", 4)))
+        == ()
+    )
+    assert fusion_regions(Op.make("transpose", x, dim0=0, dim1=1)) == ()
+    assert (
+        fused_cost_for()(Op.make("transpose", x, dim0=0, dim1=1)) == 0.0
+    )
+
+
+def test_fusion_regions_folded_params_are_free():
+    """Param-only subtrees the lowerer folds contribute no kernel —
+    the compiled graph reads them as materialised inputs."""
+    x = _v("x", 64, 64)
+    fold = Op.make("matmul", _p("W1", 64, 64), _p("W2", 64, 64))
+    assert fusion_regions(fold) == ()
+    assert fused_cost_for()(fold) == 0.0
+    # ...including when the fold feeds a pointwise region: the
+    # mul(P1,P2) subtree is an input, so only `add` is a region member
+    # (and it does not union with the folded mul).
+    t = Op.make(
+        "add", x, Op.make("mul", _p("P1", 64, 64), _p("P2", 64, 64))
+    )
+    assert fusion_regions(t) == (frozenset({t}),)
+
+
+def test_fusion_regions_solver_and_leaves():
+    """Solver ops are singleton regions billed _SOLVER_FACTOR
+    dispatches; leaves emit nothing."""
+    from catopt.cost import _SOLVER_FACTOR
+
+    inv = Op.make("inv", _p("M", 4, 4))
+    regions = fusion_regions(inv)
+    assert regions == (frozenset({inv}),)
+    # the extern solve dwarfs a dispatch — same floor the generic
+    # count carries
+    assert fused_cost_for()(inv) >= _SOLVER_FACTOR * _LAUNCH_S * 1e9
+    # leaves and non-Op terms partition to nothing
+    assert fusion_regions(_v("x", 4)) == ()
+    assert fusion_regions(Const(1.0)) == ()
+    assert fused_cost_for()(Const(1.0)) == 0.0
+    # memo reuse returns the cached partition
+    memo: dict = {}
+    chain = _applyd_chain(4)
+    assert fusion_regions(chain, memo) == fusion_regions(chain, memo)

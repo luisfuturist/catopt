@@ -42,6 +42,7 @@ _ALIAS = {
     "catopt.omd_lower": "catopt_carriers.omd_lower",
     "catopt.ops": "catopt_core.ops",
     "catopt.optimize": "catopt_optimize.optimize",
+    "catopt.autotune": "catopt_optimize.autotune",
     "catopt.ports": "catopt_core.ports",
     "catopt.regime": "catopt_optimize.regime",
     "catopt.report": "catopt_torch.report",

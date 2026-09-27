@@ -54,6 +54,8 @@ DEFAULT_SUITES = [
     "search_efficiency",
     "real_linear_attn",
     "cost_fidelity",
+    "killer_demo",
+    "decode_scan_bench",
     "bench_e2e",
 ]
 

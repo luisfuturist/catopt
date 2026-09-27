@@ -975,7 +975,11 @@ def run_cell(
             cell["opt32_error"] = f"{type(e).__name__}: {e}"
 
     # -- inductor baselines --------------------------------------------
-    cm32, status = try_compile(m32, x32, compile_timeout)
+    # torch.compile mutates module.forward — compile a deepcopy so
+    # the later eager timing on m32 stays honest.
+    cm32, status = try_compile(
+        copy.deepcopy(m32), x32, compile_timeout
+    )
     cell["inductor_status"] = status
     print(f"  inductor: {status}", flush=True)
     copt32, status = (

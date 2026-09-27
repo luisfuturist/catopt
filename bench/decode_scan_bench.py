@@ -1048,7 +1048,7 @@ def run_bench(args: argparse.Namespace) -> Report:
     print("\n" + "=" * 78)
     print(
         "  TIMING (median ms per FULL N-token decode) — the last two "
-        "cols are catopt_chunk's per-token cost"
+        "cols are the best carrier variant's per-token cost"
     )
     print("=" * 78)
     print(hdr)
@@ -1066,8 +1066,14 @@ def run_bench(args: argparse.Namespace) -> Report:
         def g(n, _ms=ms) -> str:
             return f"{_ms[n]:>7.3f}" if n in _ms else f"{'—':>7}"
 
-        cctok = c["us_per_token"].get("catopt_chunk")
-        cctps = c["tps"].get("catopt_chunk")
+        car = [n for n in _CARRIER_VARIANTS if n in c["us_per_token"]]
+        bc = (
+            min(car, key=lambda n: c["us_per_token"][n])
+            if car
+            else None
+        )
+        cctok = c["us_per_token"].get(bc) if bc else None
+        cctps = c["tps"].get(bc) if bc else None
         print(
             f"{c['mode']:<7} {c['N']:>4} {c['k']:>2} {c['C']:>3} | "
             f"{g('eager')} {g('inductor')} {g('catopt_step')} "
