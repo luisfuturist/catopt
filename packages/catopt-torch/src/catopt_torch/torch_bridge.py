@@ -1,7 +1,9 @@
 # ruff: noqa: RUF002, RUF003
-"""Fixed torch_bridge.py — uses exported._graph_signature.inputs_to_parameters
-to correctly map graph placeholder targets (p_w1, p_w2, ...) to actual
-model parameter names (W1, W2, ...) and retrieve their shapes.
+"""Fixed torch_bridge.py.
+
+Uses exported._graph_signature.inputs_to_parameters to correctly map
+graph placeholder targets (p_w1, p_w2, ...) to actual model parameter
+names (W1, W2, ...) and retrieve their shapes.
 """
 
 from __future__ import annotations
@@ -428,10 +430,13 @@ def _resolve_attr(module: torch.nn.Module, target: str) -> torch.Tensor:
 
 
 def _expand_torch(t: Any, *a: Any, **kw: Any) -> Any:
-    """``t.expand`` binding: the target shape arrives as ``shape`` /
-    ``dim`` attrs or positional args — a size sequence OR a bare int.
-    Splat sequences; pass a scalar through (``t.expand(*4)`` would be a
-    ``TypeError``, ``t.expand(4)``/``t.expand(-1)`` is legal)."""
+    """``t.expand`` binding: the target shape arrives as attrs or args.
+
+    ``shape`` / ``dim`` attrs or positional args — a size sequence OR a
+    bare int.  Splat sequences; pass a scalar through (``t.expand(*4)``
+    would be a ``TypeError``, ``t.expand(4)``/``t.expand(-1)`` is
+    legal).
+    """
     dim_v = kw.get("shape") or kw.get("dim") or a
     if isinstance(dim_v, (tuple, list)):
         return t.expand(*dim_v)
@@ -679,8 +684,10 @@ class _AmbientTorchBindings(dict):
     """
 
     def _resolve(self, key: str) -> Any:
-        """Pull ``key``'s binding from the carrier modules' exports,
-        caching the hit back into the dict.  ``None`` when unknown."""
+        """Pull ``key``'s binding from the carrier modules' exports.
+
+        Caches the hit back into the dict.  ``None`` when unknown.
+        """
         from catopt_core.ops import carrier_torch_bindings
 
         fn = carrier_torch_bindings().get(key)
@@ -731,8 +738,10 @@ register_ambient_bindings(_IR_TO_TORCH)
 
 
 def _om_elem(s: torch.Tensor, v: torch.Tensor):
-    """elem(s, v) = (rowmax s, Σ exp(s−m), exp(s−m) @ v) — the
-    online-softmax monoid element for one key block."""
+    """elem(s, v) = (rowmax s, Σ exp(s−m), exp(s−m) @ v).
+
+    The online-softmax monoid element for one key block.
+    """
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
     return (m, e.sum(dim=-1, keepdim=True), e @ v)
@@ -764,8 +773,10 @@ def _om_compose(f, g):
 
 
 def _split_sizes(sizes: Any, kw: dict):
-    """split(x, sizes_list) and split(x, int) both land under the
-    canonical ``sizes`` attr."""
+    """``split(x, sizes_list)`` and ``split(x, int)``.
+
+    Both land under the canonical ``sizes`` attr.
+    """
     sz = kw.get("sizes", sizes)
     if isinstance(sz, (list, tuple)) and sz:
         return list(sz)
@@ -792,8 +803,11 @@ _MISS: Any = object()
 
 
 def _randn_param(term: Param) -> torch.Tensor:
-    """``IRModule._eval``'s unregistered-Param fallback: a fresh randn
-    of the declared shape (``None`` dims materialise as extent 1)."""
+    """``IRModule._eval``'s unregistered-Param fallback.
+
+    A fresh randn of the declared shape (``None`` dims materialise as
+    extent 1).
+    """
     shape = tuple(d if d is not None else 1 for d in term.typ.shape)
     return torch.randn(*shape)
 
@@ -935,6 +949,7 @@ class IRModule(torch.nn.Module):
     is itself the ``eval_mod`` the planned wrappers embed (see
     :class:`catopt_core.ports.PlannedExecutor`); ``ops`` conforms to
     :class:`catopt_core.ports.OpRegistry`.
+
     """
 
     def __init__(
@@ -943,6 +958,7 @@ class IRModule(torch.nn.Module):
         param_values: dict[str, torch.Tensor] | None = None,
         ops: OpTable | None = None,
     ) -> None:
+        """Initialise the module, folding weight-only subtrees."""
         super().__init__()
         self._ops = ops if ops is not None else OpTable.full()
         self._torch_bindings = self._ops.torch_bindings
@@ -958,7 +974,7 @@ class IRModule(torch.nn.Module):
         self._build_params()
 
     def _uses_input(self, term: Any) -> bool:
-        """True if the term mentions any data-dependent leaf (Var input).
+        """Return True if the term mentions a data-dependent leaf.
 
         Delegates to :func:`catopt_core.typing.has_var_leaf` with the
         instance's content-keyed memo: extracted terms are
@@ -1121,6 +1137,7 @@ class IRModule(torch.nn.Module):
             self._param_map[name] = p
 
     def forward(self, *xs: torch.Tensor) -> Any:
+        """Run the module: bind inputs and evaluate the root."""
         x = cast(torch.Tensor, xs[0] if xs else None)
         env: dict[str, Any] = {"self": x}
         # Map input placeholders positionally to forward args

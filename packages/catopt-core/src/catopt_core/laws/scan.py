@@ -119,16 +119,19 @@ SCAN_LAWS: list[Rewrite] = [
 
 
 def _affd_state_like(bound: dict) -> bool:
-    """Side condition for the diagonal lifts: the ``h`` binding must be
-    state-shaped — a previous step's ``add``/``sub`` spine, an already
-    lifted application (``applyd``/``apply``), or a leaf (the h0 Param
-    or a free Var).  Per-step vectors (a_t, b_t, x_t — select/mul
-    terms) are NOT states.
+    """Side condition for the diagonal lifts.
+
+    The ``h`` binding must be state-shaped — a previous step's
+    ``add``/``sub`` spine, an already lifted application
+    (``applyd``/``apply``), or a leaf (the h0 Param or a free Var).
+    Per-step vectors (a_t, b_t, x_t — select/mul terms) are NOT
+    states.
 
     The check exists for e-graph economy, not soundness — the rewrite
     a⊙h + x ≡ applyd(aff_diag(a,x), h) is valid for ANY h.  Without it,
     the operand-position variants below would each fire a useless
-    sideways lift binding an input vector as "h"."""
+    sideways lift binding an input vector as "h".
+    """
     t = bound.get("h")
     if isinstance(t, Op):
         return t.op in ("add", "sub", "apply", "applyd")
@@ -257,12 +260,15 @@ AFFD_LIFT_STEP_POST_SWAP = R(
 
 
 def _affd_unit_state_like(bound: dict) -> bool:
-    """Side condition for the unit lifts: the ``h`` binding must be
-    state-shaped — a previous step's ``add``/``sub`` spine, an already
-    lifted application (``applyd``/``apply``), or a leaf (the h0 Param
-    or a free Var).  Same economy guard as ``_affd_state_like``, plus a
-    ``Const`` exclusion: a scalar offset is not an accumulating state.
-    Per-step increments (select/mul terms) are NOT states."""
+    """Side condition for the unit lifts.
+
+    The ``h`` binding must be state-shaped — a previous step's
+    ``add``/``sub`` spine, an already lifted application
+    (``applyd``/``apply``), or a leaf (the h0 Param or a free Var).
+    Same economy guard as ``_affd_state_like``, plus a ``Const``
+    exclusion: a scalar offset is not an accumulating state.  Per-step
+    increments (select/mul terms) are NOT states.
+    """
     t = bound.get("h")
     if isinstance(t, Op):
         return t.op in ("add", "sub", "apply", "applyd")
@@ -270,9 +276,12 @@ def _affd_unit_state_like(bound: dict) -> bool:
 
 
 def _derive_affd_unit(bound: dict) -> dict | None:
-    """``US`` := broadcast(shape(h), shape(x)) — the unit diagonal must
-    materialise at the add's output shape (all ones).  Vetoes the
-    firing when either bound term's shape is non-concrete."""
+    """Compute ``US`` := broadcast(shape(h), shape(x)).
+
+    The unit diagonal must materialise at the add's output shape (all
+    ones).  Vetoes the firing when either bound term's shape is
+    non-concrete.
+    """
     from catopt_core.typing import _broadcast
 
     s = _broadcast(_shape_of(bound.get("h")), _shape_of(bound.get("x")))

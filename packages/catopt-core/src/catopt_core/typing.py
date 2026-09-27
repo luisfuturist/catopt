@@ -533,7 +533,7 @@ def _numel(shape) -> int:
 
 
 def has_var_leaf(term: Any, memo: dict | None = None) -> bool:
-    """True iff the subtree mentions a :class:`Var` leaf (runtime data).
+    """Return True iff the subtree mentions a :class:`Var` leaf.
 
     Param-only subtrees fold at compile time — this predicate is the
     activation/weight distinction used by the cost model's DAG
@@ -565,7 +565,7 @@ def has_var_leaf(term: Any, memo: dict | None = None) -> bool:
 
 
 def _concrete(shape: Any) -> bool:
-    """True iff *shape* is a non-empty tuple of concrete int dims."""
+    """Return True iff *shape* is a tuple of concrete int dims."""
     return (
         isinstance(shape, tuple)
         and len(shape) > 0
@@ -574,8 +574,11 @@ def _concrete(shape: Any) -> bool:
 
 
 def _stack_dim(attrs: dict) -> int:
-    """The concatenation/stack axis from an op's attrs — the canonical
-    ``dim`` spelling, defaulting to 0 on a non-int value."""
+    """Return the concatenation/stack axis from an op's attrs.
+
+    Uses the canonical ``dim`` spelling, defaulting to 0 on a non-int
+    value.
+    """
     d = attr_of(attrs, "dim", default=0)
     return d if isinstance(d, int) else 0
 
@@ -641,16 +644,21 @@ def _apply_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _om_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``om`` — the carrier triple (m, l, a); its "shape" is the
-    accumulator's — what consumers' costs are priced from."""
+    """``om`` — the carrier triple (m, l, a).
+
+    Its "shape" is the accumulator's — what consumers' costs are priced
+    from.
+    """
     out = shapes[2] if len(shapes) > 2 else shapes[0]
     return out or None
 
 
 def _om_elem_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``om_elem`` — elem(s[...,K], v[...,K,d]) reports the applied
-    output shape (...,T,d) — like ``aff``, the carrier is priced as
-    the tensor it will become under om_apply."""
+    """``om_elem`` — elem(s[...,K], v[...,K,d]).
+
+    Reports the applied output shape (...,T,d) — like ``aff``, the
+    carrier is priced as the tensor it will become under om_apply.
+    """
     s, v = shapes[0], shapes[1]
     if (
         isinstance(s, tuple)
@@ -665,8 +673,11 @@ def _om_elem_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _trace_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``trace`` — Tr(f): drop the first ``usize`` rows/cols of the
-    block matrix f : U⊗X → U⊗Y, leaving the X → Y map."""
+    """``trace`` — Tr(f).
+
+    Drops the first ``usize`` rows/cols of the block matrix
+    f : U⊗X → U⊗Y, leaving the X → Y map.
+    """
     s = shapes[0]
     if not (isinstance(s, tuple) and len(s) == 2):
         return s or None
@@ -680,9 +691,11 @@ def _trace_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _bdiag_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``bdiag``/``parl`` — total-dims-preserving matrix juxtaposition:
+    """``bdiag``/``parl`` — total-dims-preserving matrix juxtaposition.
+
     bdiag is literal block-diagonal; parl re-lays the same blocks
-    keeping feedback wires first (see catopt_carriers.trace)."""
+    keeping feedback wires first (see catopt_carriers.trace).
+    """
     a, b = shapes[0], shapes[1]
     if (
         isinstance(a, tuple)

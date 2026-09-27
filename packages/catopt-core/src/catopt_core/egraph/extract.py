@@ -76,7 +76,6 @@ class _ExtractMixin:
         directly.  Deterministic: members are scanned in a canonical
         sorted order so ties resolve identically every run.
         """
-
         cache: dict[int, tuple[float, Any]] = {}
         in_prog: set[int] = set()
 
@@ -125,12 +124,14 @@ class _ExtractMixin:
     def extract_alternatives(
         self, eid: int, cost_fn, top_k: int = 8
     ) -> list[tuple[float, Any]]:
-        """Enumerate the root e-class frontier: for each non-leaf enode,
-        force extraction through it and record the resulting term's DAG
-        cost.  Returns the top-k cheapest *distinct* alternatives —
-        i.e. the cheapest members of the semantic equivalence class
-        [G], which is what a discovery engine inspects for unexpected
-        candidates."""
+        """Enumerate the root e-class frontier.
+
+        For each non-leaf enode, force extraction through it and record
+        the resulting term's DAG cost.  Returns the top-k cheapest
+        *distinct* alternatives — i.e. the cheapest members of the
+        semantic equivalence class [G], which is what a discovery
+        engine inspects for unexpected candidates.
+        """
         from catopt_core.cost import dag_cost
         from catopt_core.ir import op_repr
 
@@ -159,8 +160,8 @@ class _ExtractMixin:
         `matmul(softmax(mf))` and `sdpa` means the search found that
         two very different programs compute the same thing.  Returns
         classes with >= 2 distinct member ops, each with a one-line
-        sketch of every distinct member."""
-
+        sketch of every distinct member.
+        """
         out: list[dict[str, Any]] = []
         for eid, ec in self._classes.items():
             ops = {n.op for n in ec.nodes if n.op != "leaf"}
@@ -403,8 +404,7 @@ class _ExtractMixin:
         src_term: Any = None,
         _cache_out: dict | None = None,
     ) -> Any:
-        """Extract the minimum-cost member whose derivation certifies
-        within ``max_error``.
+        """Extract the minimum-cost member certifying within ``max_error``.
 
         A member's ε lives on its *derivation*, not on the member
         itself — the certificate is what knows which bound-carrying
@@ -539,7 +539,7 @@ class _ExtractMixin:
         )
 
         def steered_score(node: Any) -> float:
-            """local cost + children best totals (member-routed pass)."""
+            """Local cost + children best totals (member-routed pass)."""
             child_terms = []
             sub = 0.0
             for ch in node.children:

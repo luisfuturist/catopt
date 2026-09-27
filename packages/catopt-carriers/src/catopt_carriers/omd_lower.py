@@ -127,7 +127,7 @@ def _concrete(s) -> TypeGuard[tuple[int, ...]]:
 
 
 def _is_omd_tree(t: Any, memo: dict | None = None) -> bool:
-    """True if ``t`` is an ``omd_compose`` tree over omd leaves.
+    """Return True if ``t`` is an ``omd_compose`` tree over omd leaves.
 
     Leaves are ``omd_elem`` (deferred affine element) or the ``omd``
     tuple-packaging node; shared subtrees are memoised on the term
@@ -150,8 +150,10 @@ def _is_omd_tree(t: Any, memo: dict | None = None) -> bool:
 
 
 def is_omd_apply_term(root: Any) -> bool:
-    """True if ``root`` is ``omd_apply[m](<omd tree>, h)`` — deferred
-    affine attention applied to the shared initial state."""
+    """Return True for an ``omd_apply[m](<omd tree>, h)`` root.
+
+    Deferred affine attention applied to the shared initial state.
+    """
     return (
         isinstance(root, Op)
         and root.op in ("omd_apply", "omd_applym")
@@ -575,6 +577,7 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
     semantic member — see :class:`catopt_core.ports.PlannedExecutor` for why
     it is not the runtime-checked one).  ``map_mode`` / ``fallbacks`` /
     ``is_graph_captured`` stay class-level API, not port members.
+
     """
 
     def __init__(
@@ -582,6 +585,7 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
         ir: Any,
         param_values: dict[str, torch.Tensor] | None = None,
     ) -> None:
+        """Initialise the module, plan, and graph state."""
         super().__init__()
         if not isinstance(ir, IR):
             ir = IR(root=ir)
@@ -601,14 +605,17 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
 
     @property
     def map_mode(self) -> str | None:
-        """``"chain"`` / ``"forest"`` / ``None`` — how the coefficient
-        maps inside the leaves are evaluated (None when the leaves hold
-        no map projections or the term is not omd-shaped)."""
+        """Return how the leaves' coefficient maps are evaluated.
+
+        ``"chain"`` / ``"forest"`` / ``None`` (None when the leaves hold
+        no map projections or the term is not omd-shaped).
+        """
         return None if self._plan is None else self._plan["map_mode"]
 
     # -- execution ----------------------------------------------------
 
     def forward(self, *xs: torch.Tensor) -> Any:
+        """Run the batched (or serial-fallback) forward pass."""
         g = self._graph
         if (
             g is not None
@@ -637,9 +644,12 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
         )
 
     def _leaf_part(self, leaf: Any, i: int, ev) -> torch.Tensor:
-        """Part i of a map leaf's value — for ``aff``/``aff_diag`` the
-        arg directly; for opaque leaves ``v[i]`` mirrors the generic
-        ``f[0]``/``f[1]`` indexing exactly (tuple or tensor)."""
+        """Return part i of a map leaf's value.
+
+        For ``aff``/``aff_diag`` the arg directly; for opaque leaves
+        ``v[i]`` mirrors the generic ``f[0]``/``f[1]`` indexing exactly
+        (tuple or tensor).
+        """
         if (
             isinstance(leaf, Op)
             and leaf.op in _LEAF_OP
@@ -681,8 +691,11 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
 
     @staticmethod
     def _id_map(a_shape, b_shape, domain, like):
-        """The monoid identity map value: ``(1, 0)`` diag / ``(I, 0)``
-        dense — padding with it is exact (1·a = a, a·0 + b = b)."""
+        """Build the monoid identity map value.
+
+        ``(1, 0)`` diag / ``(I, 0)`` dense — padding with it is exact
+        (1·a = a, a·0 + b = b).
+        """
         if domain == "dense":
             i = a_shape[-1]
             eye = torch.eye(i, dtype=like.dtype, device=like.device)
@@ -924,7 +937,10 @@ def to_batched_omd_module(
     ir: Any,
     param_values: dict[str, torch.Tensor] | None = None,
 ) -> BatchedOmdModule:
-    """Lower ``ir`` (or a bare term) to a module, batching any leading
-    ``omd_apply[m]`` term.  Non-omd roots transparently delegate to the
-    serial IRModule evaluator (check ``mod.is_batched``)."""
+    """Lower ``ir`` (or a bare term) to a module.
+
+    Batches any leading ``omd_apply[m]`` term.  Non-omd roots
+    transparently delegate to the serial IRModule evaluator (check
+    ``mod.is_batched``).
+    """
     return BatchedOmdModule(ir, param_values=param_values)

@@ -77,7 +77,7 @@ __all__ = [
 
 
 def _is_om_tree(term: Any, memo: dict | None = None) -> bool:
-    """True if ``term`` is a pure om carrier tree.
+    """Return True if ``term`` is a pure om carrier tree.
 
     Leaves are ``om_elem(s, v)`` (score block, value block) or the raw
     packaging node ``om(m, l, a)``; internal nodes are binary
@@ -102,7 +102,7 @@ def _is_om_tree(term: Any, memo: dict | None = None) -> bool:
 
 
 def is_om_apply_term(root: Any) -> bool:
-    """True if ``root`` is ``om_apply(<om_elem/om/om_compose tree>)``."""
+    """Return True for an ``om_apply(<om tree>)`` root."""
     return (
         isinstance(root, Op)
         and root.op == "om_apply"
@@ -468,7 +468,7 @@ def _batched_elem(s: torch.Tensor, v: torch.Tensor):
 
 
 def _batched_compose(m1, l1, a1, m2, l2, a2):
-    """The FlashAttention combine, batched over a whole reduction level.
+    """Compute the FlashAttention combine over a whole reduction level.
 
     The operands' ``l``/``a`` parts are pre-sanitised (a non-finite
     running max implies zeroed l/a — see ``_forward_impl``), so the
@@ -514,6 +514,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
     semantic member — see :class:`catopt_core.ports.PlannedExecutor` for why
     it is not the runtime-checked one).  ``n_levels`` / ``n_blocks`` /
     ``is_graph_captured`` stay class-level API, not port members.
+
     """
 
     def __init__(
@@ -521,6 +522,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         ir: IR,
         param_values: dict[str, torch.Tensor] | None = None,
     ) -> None:
+        """Initialise the module, plan, and graph state."""
         super().__init__()
         self._inputs = ir.inputs
         self.eval_mod = IRModule(ir, param_values)
@@ -567,6 +569,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
     # -- execution ----------------------------------------------------
 
     def forward(self, *xs: torch.Tensor) -> Any:
+        """Run the batched (or serial-fallback) forward pass."""
         g = self._graph
         if (
             g is not None
@@ -587,8 +590,10 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         return self._forward_impl(*xs)
 
     def _repeat_idx(self, counts: list[int], like: torch.Tensor):
-        """``[0]*c0 + [1]*c1 + ...`` as a cached index tensor — expands a
-        group's stacked leaves to their DAG multiplicities."""
+        """Build ``[0]*c0 + [1]*c1 + ...`` as a cached index tensor.
+
+        Expands a group's stacked leaves to their DAG multiplicities.
+        """
         rep = [i for i, c in enumerate(counts) for _ in range(c)]
         return self._cached(
             ("rep", tuple(counts)),
@@ -807,7 +812,7 @@ def om_empty_state(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The ⊕-identity carrier ``(m, l, a) = (-inf, 0, 0)``.
+    """Build the ⊕-identity carrier ``(m, l, a) = (-inf, 0, 0)``.
 
     ``shape`` is the carrier's broadcast tail excluding the trailing
     component dim — e.g. ``(B, H, Tq)`` gives ``m, l: (B,H,Tq,1)`` and
@@ -851,7 +856,7 @@ def om_step_qk(
 
 
 def om_apply_state(state: tuple) -> torch.Tensor:
-    """The ``om_apply`` readout: ``a / l`` (unclamped — NaN kept)."""
+    """Return the ``om_apply`` readout ``a / l`` (unclamped — NaN kept)."""
     return state[2] / state[1]
 
 
@@ -894,6 +899,7 @@ class StreamingOMModule(torch.nn.Module):
         ir: IR,
         param_values: dict[str, torch.Tensor] | None = None,
     ) -> None:
+        """Initialise the module and its om_apply plan."""
         super().__init__()
         self._inputs = ir.inputs
         self.eval_mod = IRModule(ir, param_values)

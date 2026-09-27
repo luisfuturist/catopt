@@ -74,7 +74,7 @@ class _ProofMixin:
         _stack: frozenset = frozenset(),
         _memo: dict | None = None,
     ):
-        """The earliest-created representative term of an e-class.
+        """Return the earliest-created representative term of an e-class.
 
         Proof-time analogue of :meth:`any_term`: picking the minimum-
         birth enode at every level makes target-side expansion in
@@ -118,7 +118,7 @@ class _ProofMixin:
         return None
 
     def _app_for_member(self, term: Any):
-        """The rule application whose RHS root realises *term*'s root.
+        """Return the rule application whose RHS root realises *term*'s root.
 
         Returns ``(app, enode)`` — ``app`` is ``None`` when the member
         enode is not the RHS root of any recorded application (input
@@ -569,8 +569,9 @@ class _ProofMixin:
         max_steps: int = 8,
         fuel: int = 8192,
     ) -> dict:
-        """Coherence summary between two terms: how many distinct ways
-        does the rewrite space prove them equal?
+        """Summarise coherence between two terms.
+
+        Counts the distinct ways the rewrite space proves them equal.
 
         Thin wrapper over :meth:`all_proofs` (which requires
         ``truncation_level >= 2``).  Returns a dict with the resolved

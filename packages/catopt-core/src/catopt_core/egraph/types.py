@@ -34,22 +34,26 @@ class UnionFind:
     """Union-find (disjoint-set with path compression + union by rank)."""
 
     def __init__(self) -> None:
+        """Initialise the empty parent and rank lists."""
         self.parent: list[int] = []
         self.rank: list[int] = []
 
     def make(self) -> int:
+        """Add a new singleton set; return its index."""
         idx = len(self.parent)
         self.parent.append(idx)
         self.rank.append(0)
         return idx
 
     def find(self, x: int) -> int:
+        """Return the canonical root of ``x`` (path halving)."""
         while self.parent[x] != x:
             self.parent[x] = self.parent[self.parent[x]]  # path halving
             x = self.parent[x]
         return x
 
     def union(self, a: int, b: int) -> bool:
+        """Merge the sets of ``a`` and ``b``; True if they differed."""
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
             return False
@@ -99,15 +103,19 @@ class Rewrite:
     bound_norm: str = "spectral"
 
     def __repr__(self) -> str:
+        """Return a ``name: lhs -> rhs`` rendering."""
         return (
             f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
         )
 
 
 def _norm_attr_value(v: Any) -> Any:
-    """List-valued attrs are unhashable — enode attr keys carry
-    tuples instead (the export boundary already canonicalises
-    list→tuple; hand-minted terms get the same normalisation here)."""
+    """Return the hashable form of an attr value.
+
+    List-valued attrs are unhashable — enode attr keys carry tuples
+    instead (the export boundary already canonicalises list→tuple;
+    hand-minted terms get the same normalisation here).
+    """
     return tuple(v) if isinstance(v, list) else v
 
 

@@ -50,8 +50,11 @@ class VerifyReport:
 
 
 def rel_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    """The historical relative-diff metric, identical everywhere it was
-    inlined: ``max|a - b| / (max|a| + 1e-8)``."""
+    """Return the historical relative-diff metric.
+
+    Identical everywhere it was inlined:
+    ``max|a - b| / (max|a| + 1e-8)``.
+    """
     return (a - b).abs().max().item() / (
         a.abs().max().item() + _REL_FLOOR
     )
@@ -88,10 +91,13 @@ def verify_module(
     rtol: float = 1e-4,
     atol: float | None = None,
 ) -> VerifyReport:
-    """Run ``ref_mod`` and ``opt_mod`` on ``inputs`` (a tensor or an
-    args tuple) under ``no_grad`` and compare with
-    :func:`verify_equiv`.  Tensor inputs are cloned so a forward that
-    mutates its arguments cannot corrupt the comparison."""
+    """Run ``ref_mod`` and ``opt_mod`` on ``inputs`` and compare.
+
+    ``inputs`` is a tensor or an args tuple; the run is under
+    ``no_grad`` and the comparison goes through :func:`verify_equiv`.
+    Tensor inputs are cloned so a forward that mutates its arguments
+    cannot corrupt the comparison.
+    """
     args = inputs if isinstance(inputs, tuple) else (inputs,)
     ref_mod.eval()
     opt_mod.eval()
@@ -117,8 +123,11 @@ def verify_module(
 
 
 def _plain(v: Any) -> Any:
-    """Serialize a field value: typed reports back to dicts, anything
-    else (dicts, lists, offer objects) passes through untouched."""
+    """Serialize a field value.
+
+    Typed reports go back to dicts, anything else (dicts, lists, offer
+    objects) passes through untouched.
+    """
     if isinstance(v, (OptReport, BlockReport)):
         return v.to_dict()
     return v
@@ -126,10 +135,12 @@ def _plain(v: Any) -> Any:
 
 @dataclass
 class SaturationStats:
-    """The ``EGraph.run`` payload — always present on a stats dict that
-    came out of equality saturation.  Exposed on ``OptReport`` as the
-    ``saturation_stats`` view; stored flat so ``to_dict`` reproduces the
-    original keys exactly."""
+    """The ``EGraph.run`` payload.
+
+    Always present on a stats dict that came out of equality saturation.
+    Exposed on ``OptReport`` as the ``saturation_stats`` view; stored
+    flat so ``to_dict`` reproduces the original keys exactly.
+    """
 
     iterations: int | None = None
     n_enodes: int | None = None
@@ -188,10 +199,12 @@ class OptReport:
 
     @classmethod
     def from_stats(cls, stats: dict[str, Any]) -> OptReport:
-        """Build the typed report from a stats dict.  Field names equal
-        dict keys, so extraction is mechanical; ``blocks`` values (only
-        on :class:`CompositionalReport`) are lifted to
-        :class:`BlockReport`."""
+        """Build the typed report from a stats dict.
+
+        Field names equal dict keys, so extraction is mechanical;
+        ``blocks`` values (only on :class:`CompositionalReport`) are
+        lifted to :class:`BlockReport`.
+        """
         names = {f.name for f in dataclasses.fields(cls)} - {"extra"}
         kwargs: dict[str, Any] = {n: stats.get(n) for n in names}
         if kwargs.get("blocks") is not None:
@@ -205,9 +218,11 @@ class OptReport:
         return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize back to the loose stats dict.  ``None`` fields are
-        omitted, so the round-trip reproduces the input dict's exact
-        key set."""
+        """Serialize back to the loose stats dict.
+
+        ``None`` fields are omitted, so the round-trip reproduces the
+        input dict's exact key set.
+        """
         out = dict(self.extra)
         for f in dataclasses.fields(self):
             if f.name == "extra":
@@ -252,6 +267,7 @@ class BlockReport:
     def from_dict(
         cls, entry: dict[str, Any], name: str = ""
     ) -> BlockReport:
+        """Build a block report from a ``blocks`` entry dict."""
         names = {f.name for f in dataclasses.fields(cls)} - {
             "name",
             "extra",
@@ -265,6 +281,7 @@ class BlockReport:
         return cls(name=name, **kwargs)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the block report back to an entry dict."""
         out: dict[str, Any] = {"status": self.status}
         for f in dataclasses.fields(self):
             if f.name in ("name", "status", "extra"):
@@ -278,11 +295,13 @@ class BlockReport:
 
 @dataclass
 class CompositionalReport(OptReport):
-    """Typed view of the ``stats`` dict ``optimize_compositional``
-    returns — an ``OptReport`` extended with the driver keys.  The
-    saturation fields stay ``None`` at top level (per-block saturation
-    lives inside ``blocks[name].stats``) and are omitted on
-    ``to_dict``, so the round-trip is exact."""
+    """Typed view of the ``optimize_compositional`` stats dict.
+
+    An ``OptReport`` extended with the driver keys.  The saturation
+    fields stay ``None`` at top level (per-block saturation lives inside
+    ``blocks[name].stats``) and are omitted on ``to_dict``, so the
+    round-trip is exact.
+    """
 
     compositional: bool | None = None
     n_blocks: int | None = None

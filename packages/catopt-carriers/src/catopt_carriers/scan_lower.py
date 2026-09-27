@@ -53,8 +53,9 @@ __all__ = [
 
 
 def _fold_nested_apply(term: Any) -> Any:
-    """``apply(f, apply(g, h))`` → ``apply(aff_compose(f, g), h)``
-    (and the ``applyd``/``affd_compose`` diagonal pair).
+    """``apply(f, apply(g, h))`` → ``apply(aff_compose(f, g), h)``.
+
+    Also the ``applyd``/``affd_compose`` diagonal pair.
 
     Extracted terms are often hybrids — a compose spine with nested
     ``apply`` segments.  Folding them bottom-up turns the whole map
@@ -86,7 +87,7 @@ def _fold_nested_apply(term: Any) -> Any:
 
 
 def _is_aff_tree(term: Any, memo: dict | None = None) -> str | None:
-    """True if ``term`` is a pure map tree in ONE carrier domain.
+    """Return True if ``term`` is a pure map tree in ONE carrier domain.
 
     Dense: leaves ``aff(A, b)``, internal ``aff_compose``.  Diagonal:
     leaves ``aff_diag(a, b)``, internal ``affd_compose``.  Mixed or
@@ -122,9 +123,11 @@ def _is_aff_tree(term: Any, memo: dict | None = None) -> str | None:
 
 
 def is_scan_apply_term(root: Any) -> bool:
-    """True if ``root`` is ``apply[d](<map tree>, h)`` — dense or
-    diagonal affine scan application (nested ``apply`` segments are
-    first folded into the compose spine)."""
+    """Return True for an ``apply[d](<map tree>, h)`` root.
+
+    Dense or diagonal affine scan application (nested ``apply`` segments
+    are first folded into the compose spine).
+    """
     root = _fold_nested_apply(root)
     return (
         isinstance(root, Op)
@@ -321,6 +324,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
     semantic member — see :class:`catopt_core.ports.PlannedExecutor` for why
     it is not the runtime-checked one).  ``n_levels`` /
     ``is_graph_captured`` stay class-level API, not port members.
+
     """
 
     def __init__(
@@ -328,6 +332,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         ir: IR,
         param_values: dict[str, torch.Tensor] | None = None,
     ) -> None:
+        """Initialise the module, plan, and graph state."""
         super().__init__()
         self._inputs = ir.inputs
         self.eval_mod = IRModule(ir, param_values)
@@ -350,6 +355,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
     # -- execution ----------------------------------------------------
 
     def forward(self, *xs: torch.Tensor) -> Any:
+        """Run the batched (or serial-fallback) forward pass."""
         g = self._graph
         if (
             g is not None
@@ -464,7 +470,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
 
 
 def _make_bottom_row(like: torch.Tensor) -> torch.Tensor:
-    """The constant ``[0, …, 0, 1]`` row of a homogeneous affine matrix."""
+    """Return the ``[0, …, 0, 1]`` row of a homogeneous affine matrix."""
     d1 = like.shape[-1] + 1 if like.dim() >= 2 else like.shape[-1]
     row = like.new_zeros(1, 1, d1)
     row[..., -1] = 1.0

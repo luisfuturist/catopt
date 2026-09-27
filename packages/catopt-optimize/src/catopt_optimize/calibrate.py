@@ -163,7 +163,7 @@ class TargetProfile:
         return load_profile(name_or_path, dir)
 
     def cost_fn(self):
-        """The additive roofline cost fn for this target."""
+        """Return the additive roofline cost fn for this target."""
         from catopt_core.cost import roofline_cost_for
 
         return roofline_cost_for(self)
@@ -476,8 +476,10 @@ def calibrate(
     verbose: bool = False,
     save: bool = False,
 ) -> TargetProfile:
-    """Measure the roofline constants of ``device`` (default: cuda if
-    available, else cpu) and return a :class:`TargetProfile`.
+    """Measure the roofline constants of ``device``.
+
+    ``device`` defaults to cuda if available, else cpu.  Returns a
+    :class:`TargetProfile`.
 
     Five micro-benchmarks, sized so the whole run takes a few seconds:
 

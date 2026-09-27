@@ -149,8 +149,11 @@ _ARG_RE = re.compile(r"^arg(\d+)$")
 
 
 def attr_of(source: Any, *names: str, default: Any = None) -> Any:
-    """First present attr across names — the canonical + positional dual
-    spelling read.  `source` may be a term (reads .attrs) or a dict."""
+    """Return the first present attr across names.
+
+    The canonical + positional dual spelling read.  `source` may be a
+    term (reads .attrs) or a dict.
+    """
     attrs = (
         source
         if isinstance(source, Mapping)
@@ -165,7 +168,7 @@ def attr_of(source: Any, *names: str, default: Any = None) -> Any:
 
 
 def is_positional_attr(key: Any) -> bool:
-    """True for the ``argN`` positional-attr spelling."""
+    """Return True for the ``argN`` positional-attr spelling."""
     return isinstance(key, str) and _ARG_RE.match(key) is not None
 
 

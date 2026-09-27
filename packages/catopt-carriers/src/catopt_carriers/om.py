@@ -71,7 +71,7 @@ _DimKey = Literal["dim"]
 
 
 def _vshape(t: Any):
-    """The *value* shape of a bound term — carrier-aware.
+    """Return the *value* shape of a bound term — carrier-aware.
 
     Metavariable bindings resolve through ``EGraph``'s representative
     member (``_min_term``/``any_term``), which may be a CARRIER member:
@@ -115,10 +115,12 @@ def _broadcast_ok(a, b) -> bool:
 
 
 def _check_om_lift(bound: dict) -> bool:
-    """softmax must be over the scores' LAST dim (the key axis), and the
-    matmul must contract s[...,K] with v[...,K,d].  A softmax over any
-    other axis is well-typed but a *different* program — the check is
-    load-bearing."""
+    """Require softmax over the scores' LAST dim (the key axis).
+
+    The matmul must contract s[...,K] with v[...,K,d].  A softmax over
+    any other axis is well-typed but a *different* program — the check
+    is load-bearing.
+    """
     sd = bound.get("$attr:SD", -1)
     ss, vs = _vshape(bound.get("s")), _vshape(bound.get("v"))
     if not (
@@ -168,9 +170,11 @@ OM_UNLIFT = R(
 
 
 def _chunks_compatible(s1, s2, v1, v2) -> bool:
-    """Chunk pair i must contract s_i[...,K_i] with v_i[...,K_i,d]; the
-    two chunks must be cat-compatible off the concatenated axis, and
-    each chunk's batch dims must broadcast s_i against v_i."""
+    """Require chunk pair i to contract s_i[...,K_i] with v_i[...,K_i,d].
+
+    The two chunks must be cat-compatible off the concatenated axis, and
+    each chunk's batch dims must broadcast s_i against v_i.
+    """
     ns, nv = len(s1), len(v1)
     if ns < 2 or nv < 2 or len(s2) != ns or len(v2) != nv:
         return False
@@ -188,9 +192,11 @@ def _chunks_compatible(s1, s2, v1, v2) -> bool:
 
 
 def _check_om_concat_dims(bound: dict) -> bool:
-    """OM_SPLIT fires only when scores concat on the LAST dim (keys)
-    and values concat on dim -2 (the same key axis, pre-contraction).
-    A cat along any other axis is well-typed but WRONG."""
+    """OM_SPLIT fires only when scores concat on the LAST dim (keys).
+
+    Values must concat on dim -2 (the same key axis, pre-contraction).
+    A cat along any other axis is well-typed but WRONG.
+    """
     sd, vd = bound.get("$attr:SD"), bound.get("$attr:VD")
     s1, s2 = _vshape(bound.get("s1")), _vshape(bound.get("s2"))
     v1, v2 = _vshape(bound.get("v1")), _vshape(bound.get("v2"))
@@ -229,9 +235,11 @@ OM_SPLIT = _om_split("om_split", "dim")
 
 
 def _derive_om_concat_dims(bound: dict) -> dict | None:
-    """Concat dims for the merged element, computed from bound shapes:
-    scores join on their last dim, values on dim -2.  Vetoes (returns
-    None) when the two chunks cannot form a well-typed cat."""
+    """Compute concat dims for the merged element from bound shapes.
+
+    Scores join on their last dim, values on dim -2.  Vetoes (returns
+    None) when the two chunks cannot form a well-typed cat.
+    """
     s1, s2 = _vshape(bound.get("s1")), _vshape(bound.get("s2"))
     v1, v2 = _vshape(bound.get("v1")), _vshape(bound.get("v2"))
     if not all(isinstance(x, tuple) for x in (s1, s2, v1, v2)):
@@ -311,10 +319,12 @@ CONCAT_BINARIZE: list[Rewrite] = [
 
 
 def _check_matmul_t_concat(bound: dict) -> bool:
-    """q @ cat(k1,k2,dim).T splits only when the key concat is on the
-    SEQUENCE axis (dim -2 of k, i.e. keys) and the transpose is exactly
-    .T on the last two dims — so that after the transpose the concat
-    lands on the scores' last dim."""
+    """Q @ cat(k1,k2,dim).T splits only on a SEQUENCE-axis key concat.
+
+    The key concat must be on dim -2 of k (keys) and the transpose
+    exactly .T on the last two dims — so that after the transpose the
+    concat lands on the scores' last dim.
+    """
     kd, t1, t2 = (
         bound.get("$attr:KD"),
         bound.get("$attr:T1"),
@@ -346,9 +356,11 @@ def _check_matmul_t_concat(bound: dict) -> bool:
 
 
 def _derive_score_concat_dim(bound: dict) -> dict | None:
-    """The concat dim through the transpose: after .T the key axis is
-    last in k.T and lands on the scores' last dim, at index
-    rank(out)-1 = max(rank q, rank k) - 1."""
+    """Return the concat dim through the transpose.
+
+    After .T the key axis is last in k.T and lands on the scores' last
+    dim, at index rank(out)-1 = max(rank q, rank k) - 1.
+    """
     q, k1 = _vshape(bound.get("q")), _vshape(bound.get("k1"))
     if not (isinstance(q, tuple) and isinstance(k1, tuple)):
         return None
@@ -428,8 +440,7 @@ MATMUL_T_CONCAT = _matmul_t_concat("matmul_t_concat", "dim")
 def _cat_axis_plan(
     bound: dict, sliced_key: str, fixed_keys: tuple = ()
 ) -> dict | None:
-    """Plan how an elementwise op's operands distribute over
-    ``concat(s1, s2, dim=D)``.
+    """Plan operand distribution over ``concat(s1, s2, dim=D)``.
 
     The sliceable operand (``sliced_key`` — the mask/bias) is classified
     by its extent on the cat axis:
@@ -483,9 +494,11 @@ def _cat_axis_plan(
         out_rank = max(out_rank, len(sh))
 
     def _off_axis_ok(sh) -> bool:
-        """Every operand dim OFF the cat axis must broadcast against the
-        blocks (extra leading dims are fine — they rank up the output
-        identically on both sides)."""
+        """Require every off-axis operand dim to broadcast against blocks.
+
+        Extra leading dims are fine — they rank up the output
+        identically on both sides.
+        """
         for j, ext in enumerate(sh):
             dj = j + r - len(sh)  # operand dim → score dim
             if dj < 0 or dj == d:
@@ -544,9 +557,11 @@ def _derive_mask_cat(sliced_key: str, fixed_keys: tuple):
 
 
 def _mask_slice(key: str, i: int) -> Op:
-    """Block i's slice of a mask/bias along the cat axis — a projection
-    of the full mask, which is exactly where the positional offset of
-    block i lives (causal masks included)."""
+    """Build block i's slice of a mask/bias along the cat axis.
+
+    A projection of the full mask, which is exactly where the positional
+    offset of block i lives (causal masks included).
+    """
     return Op.make("split", key, sizes="SZ", dim="MD", index=i)
 
 
@@ -556,7 +571,8 @@ def _masked_fill_cat(
     """masked_fill(cat(s1,s2,D), m, v) → cat(masked_fill(s_i, m_i, v), D).
 
     ``m_i`` is the mask's slice on the cat axis (mode "slice") or the
-    mask itself when it broadcasts along that axis (mode "reuse")."""
+    mask itself when it broadcasts along that axis (mode "reuse").
+    """
     m1 = _mask_slice("m", 0) if mode == "slice" else "m"
     m2 = _mask_slice("m", 1) if mode == "slice" else "m"
     return R(
@@ -585,10 +601,12 @@ def _masked_fill_cat(
 def _add_cat(
     name: str, attr_key: _DimKey, mode: str, mask_first: bool
 ) -> Rewrite:
-    """add(cat(s1,s2,D), m) / add(m, cat(s1,s2,D)) → cat of per-block
-    adds — the additive-mask counterpart of masked_fill_cat.  add is
+    """add(cat(s1,s2,D), m) / add(m, cat(s1,s2,D)) → cat of per-block adds.
+
+    The additive-mask counterpart of masked_fill_cat.  add is
     commutative, but COMM_ADD is deliberately absent from OM_LAWS, so
-    both operand orders get a rule."""
+    both operand orders get a rule.
+    """
     m1 = _mask_slice("m", 0) if mode == "slice" else "m"
     m2 = _mask_slice("m", 1) if mode == "slice" else "m"
     cat = Op.make("concat", "s1", "s2", **{attr_key: "D"})
@@ -622,8 +640,10 @@ def _add_cat(
 def _where_cat(
     name: str, attr_key: _DimKey, mode: str, cat_in_x: bool
 ) -> Rewrite:
-    """where(m, cat(s1,s2,D), v) / where(m, v, cat(s1,s2,D)) → cat of
-    per-block wheres — the torch.where masking idiom."""
+    """where(m, cat(s1,s2,D), v) / where(m, v, cat(s1,s2,D)).
+
+    Splits to cat of per-block wheres — the torch.where masking idiom.
+    """
     m1 = _mask_slice("m", 0) if mode == "slice" else "m"
     m2 = _mask_slice("m", 1) if mode == "slice" else "m"
     cat = Op.make("concat", "s1", "s2", **{attr_key: "D"})
@@ -653,7 +673,8 @@ def _check_cat_pair(bound: dict) -> int | None:
     may differ — a lower-rank mask's cat axis is shifted), each operand
     pair must be cat-compatible on its own axis, and the per-block
     broadcast results must be cat-compatible on the shared axis.
-    Returns the result cat dim, or None to veto."""
+    Returns the result cat dim, or None to veto.
+    """
     a1, a2 = _vshape(bound.get("a1")), _vshape(bound.get("a2"))
     b1, b2 = _vshape(bound.get("b1")), _vshape(bound.get("b2"))
     DA, DB = bound.get("$attr:DA"), bound.get("$attr:DB")
@@ -695,9 +716,11 @@ def _cat_pair_derive(bound: dict) -> dict | None:
 
 
 def _cat_hom_add(name: str, attr_key: _DimKey) -> Rewrite:
-    """add(cat(a1,a2,D), cat(b1,b2,D)) = cat(add(a1,b1), add(a2,b2), D)
-    — concat is a homomorphism for elementwise add.  This is the pure
-    form of the additive-mask law when the mask is itself concat'd."""
+    """add(cat(a1,a2,D), cat(b1,b2,D)) = cat(add(a1,b1), add(a2,b2), D).
+
+    Concat is a homomorphism for elementwise add.  This is the pure form
+    of the additive-mask law when the mask is itself concat'd.
+    """
     return R(
         name,
         Op.make(
@@ -719,9 +742,11 @@ def _cat_hom_add(name: str, attr_key: _DimKey) -> Rewrite:
 
 
 def _cat_hom_masked_fill(name: str, attr_key: _DimKey) -> Rewrite:
-    """masked_fill(cat(s1,s2,D), cat(m1,m2,DM), v) → cat of per-block
-    masked_fills — the mask arrives already concat'd (e.g. chunked
-    masks); block i pairs s_i with m_i directly, no split needed."""
+    """masked_fill(cat(s1,s2,D), cat(m1,m2,DM), v) → per-block fills.
+
+    The mask arrives already concat'd (e.g. chunked masks); block i
+    pairs s_i with m_i directly, no split needed.
+    """
     return R(
         name,
         Op.make(
@@ -926,11 +951,13 @@ def _fill_torch(x: torch.Tensor, *a, **kw) -> torch.Tensor:
 
 
 def _attnbias_torch(m: torch.Tensor, *a, **kw) -> torch.Tensor:
-    """Torch's documented attn_mask coercion: float masks ARE the
-    additive bias; bool keep-masks become the 0/-inf bias (positions
-    with False are disallowed).  Shape-preserving and elementwise, so
-    slicing commutes with it — split(attnbias(m)) is the bias of the
-    slice."""
+    """Coerce an attn_mask the way Torch documents it.
+
+    Float masks ARE the additive bias; bool keep-masks become the 0/-inf
+    bias (positions with False are disallowed).  Shape-preserving and
+    elementwise, so slicing commutes with it — split(attnbias(m)) is the
+    bias of the slice.
+    """
     if m.dtype == torch.bool:
         return torch.where(
             m,
@@ -959,11 +986,14 @@ _LeafRegistry.register(_NEG_INF)
 
 
 def _check_sdpa_cat(bound: dict) -> bool:
-    """sdpa(q, cat(k1,k2,KD), cat(v1,v2,VD)) chunks only when both cats
-    are on the SEQUENCE axis (dim -2 of k and v — the key axis), the
-    blocks are cat-compatible, q's head dim contracts k's, each key
-    block pairs with its value block, batch dims broadcast per block,
-    and the sdpa flags are benign (dropout_p == 0, numeric scale)."""
+    """Check sdpa chunking over concatenated k/v blocks.
+
+    The chunks are only valid when both cats are on the SEQUENCE axis
+    (dim -2 of k and v — the key axis), the blocks are cat-compatible,
+    q's head dim contracts k's, each key block pairs with its value
+    block, batch dims broadcast per block, and the sdpa flags are benign
+    (dropout_p == 0, numeric scale).
+    """
     qs = _vshape(bound.get("q"))
     k1s, k2s = _vshape(bound.get("k1")), _vshape(bound.get("k2"))
     v1s, v2s = _vshape(bound.get("v1")), _vshape(bound.get("v2"))
@@ -1019,10 +1049,12 @@ def _check_sdpa_cat(bound: dict) -> bool:
 
 
 def _derive_sdpa_cat(bound: dict) -> dict | None:
-    """The kernel's softmax scale: the bound ``scale`` attr if given,
-    else the default 1/√E with E = q's head dim.  Lands in the RHS
-    ``fill(q, value=SC)`` — the only way a derived number reaches an
-    operand."""
+    """Return the kernel's softmax scale.
+
+    The bound ``scale`` attr if given, else the default 1/√E with
+    E = q's head dim.  Lands in the RHS ``fill(q, value=SC)`` — the only
+    way a derived number reaches an operand.
+    """
     sc = bound.get("$attr:SC")
     if sc is None:
         e = _vshape(bound.get("q"))
@@ -1033,10 +1065,12 @@ def _derive_sdpa_cat(bound: dict) -> dict | None:
 
 
 def _sdpa_cat_rhs(causal: bool) -> Op:
-    """om_apply(om_elem(masked score-concat, v-concat)) — the causal
-    variant masks the concatenated scores with a materialised
+    """om_apply(om_elem(masked score-concat, v-concat)).
+
+    The causal variant masks the concatenated scores with a materialised
     ``cmask``; the per-block chunking is left to OM_MASK_LAWS +
-    OM_SPLIT."""
+    OM_SPLIT.
+    """
     qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
     mm1 = Op.make(
         "matmul", qs, Op.make("transpose", "k1", dim0=-2, dim1=-1)
@@ -1110,13 +1144,16 @@ _SDPA_PLAIN_ATTRS: tuple[dict, ...] = (
 
 
 def _check_sdpa_mask_cat(bound: dict) -> bool:
-    """Everything ``_check_sdpa_cat`` requires (sequence-axis cats,
+    """Check sdpa chunking with an explicit attn_mask.
+
+    Everything ``_check_sdpa_cat`` requires (sequence-axis cats,
     per-block k_i/v_i pairing, batch broadcast, benign flags), plus:
     the explicit attn_mask must broadcast against the concatenated
     score matrix ``(…, Tq, K1+K2)`` with the key axis on its last dim —
     extent ``K1+K2`` (per-block slices) or 1 (broadcast reuse).  Any
     other extent, a broadcast-incompatible mask, or unknown key extents
-    vetoes the rewrite — the split sizes could not be derived."""
+    vetoes the rewrite — the split sizes could not be derived.
+    """
     if not _check_sdpa_cat(bound):
         return False
     ms = _vshape(bound.get("m"))
@@ -1151,7 +1188,8 @@ def _sdpa_cat_mask_rhs() -> Op:
     ``split(attnbias(m), (K1,K2), -1, i)`` is block i's mask columns.
     Chunking then proceeds exactly like the cmask path: OM_SPLIT splits
     the carrier and fully-masked blocks exercise om_compose's isfinite
-    guard."""
+    guard.
+    """
     qs = Op.make("mul", "q", Op.make("fill", "q", value="SC"))
     mm1 = Op.make(
         "matmul", qs, Op.make("transpose", "k1", dim0=-2, dim1=-1)

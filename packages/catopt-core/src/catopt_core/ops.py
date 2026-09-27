@@ -175,8 +175,10 @@ def register_carrier(module_name: str) -> None:
 
 
 def _carrier_names() -> tuple[str, ...]:
-    """Every carrier module path :meth:`OpTable.full` composes, in
-    order: the built-ins, then runtime-registered carriers."""
+    """Return every carrier module path :meth:`OpTable.full` composes.
+
+    In order: the built-ins, then runtime-registered carriers.
+    """
     return _CARRIER_MODULES + tuple(_registered_carriers)
 
 
@@ -239,9 +241,11 @@ class OpTable:
     attr_schemas : dict[str, dict[int, str]]
         ``op_name -> {position: canonical attr name}`` — mirrors
         ``catopt_core.attrs.ATTR_SCHEMA``.
+
     """
 
     def __init__(self) -> None:
+        """Initialise the empty binding/shape/attr tables."""
         self.torch_bindings: dict[str, Binding] = {}
         self.shape_rules: dict[str, ShapeRule] = {}
         self.attr_schemas: dict[str, dict[int, str]] = {}
@@ -250,10 +254,11 @@ class OpTable:
 
     @classmethod
     def core(cls) -> OpTable:
-        """The base table: every registered core binding table + shape
-        rules + attr schema.  No carrier ops — ``trace``/``omd_*``/
-        ``cmask`` are absent until a carrier module is
-        :meth:`register`\\ ed.
+        r"""Build the base table.
+
+        Every registered core binding table, shape rule, and attr schema.
+        No carrier ops — ``trace``/``omd_*``/``cmask`` are absent until a
+        carrier module is :meth:`register`\ ed.
 
         With a backend adapter imported (``catopt_torch.torch_bridge``
         registers its table at import) this is exactly the historical
@@ -273,8 +278,9 @@ class OpTable:
 
     @classmethod
     def full(cls) -> OpTable:
-        """``core()`` plus every carrier module that is installed —
-        today's ambient behavior, as an explicit object.
+        """Return ``core()`` plus every carrier module that is installed.
+
+        Today's ambient behavior, as an explicit object.
 
         Carrier packages absent from the environment are skipped:
         their terms cannot exist without the package anyway, so a
@@ -311,8 +317,10 @@ class OpTable:
 
     @staticmethod
     def _coerce_source(source: Any) -> Any:
-        """Normalize a ``register`` argument to an object exposing
-        ``TORCH_BINDINGS``/``SHAPE_RULES``/``ATTR_SCHEMA`` attributes.
+        """Normalize a ``register`` argument to a module-like object.
+
+        It must expose ``TORCH_BINDINGS``/``SHAPE_RULES``/``ATTR_SCHEMA``
+        attributes.
 
         Accepts a module object, a module name (``"catopt_carriers.trace"`` or
         the bare ``"trace"``), or a plain dict of torch bindings.
@@ -365,9 +373,12 @@ class OpTable:
         return self
 
     def copy(self) -> OpTable:
-        """A snapshot copy — private plain dicts, detached from the
-        ambient table.  Deleting a binding from the copy makes the op
-        fail loudly at eval; it cannot leak back into ``full()``."""
+        """Return a snapshot copy of the table.
+
+        Private plain dicts, detached from the ambient table.  Deleting a
+        binding from the copy makes the op fail loudly at eval; it cannot
+        leak back into ``full()``.
+        """
         t = OpTable()
         t.torch_bindings = dict(self.torch_bindings)
         t.shape_rules = dict(self.shape_rules)

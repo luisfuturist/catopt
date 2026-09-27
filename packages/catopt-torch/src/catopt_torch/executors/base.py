@@ -208,7 +208,7 @@ class BatchedExecutorBase:
     def _input_env(
         self, xs: tuple[torch.Tensor, ...]
     ) -> tuple[Any, dict[str, Any]]:
-        """The shared ``_forward_impl`` prologue: ``(x, env)``.
+        """Return the shared ``_forward_impl`` prologue: ``(x, env)``.
 
         ``x`` is the first positional arg (``None`` on zero args —
         the serial evaluator's "self" fallback); ``env`` maps
@@ -227,9 +227,11 @@ class BatchedExecutorBase:
         x: Any,
         memo_env: dict,
     ) -> Callable[[Any], Any]:
-        """The ``ev(t)`` leaf-evaluation closure ``_forward_impl``
-        uses: ``t → eval_mod._eval(t, env, x, memo_env)``, memoising
-        into the caller's ``memo_env``."""
+        """Build the ``ev(t)`` leaf-evaluation closure.
+
+        ``_forward_impl`` uses it as ``t → eval_mod._eval(t, env, x,
+        memo_env)``, memoising into the caller's ``memo_env``.
+        """
 
         def ev(t: Any) -> Any:
             return self.eval_mod._eval(t, env, x, memo_env)

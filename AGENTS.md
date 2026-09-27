@@ -133,13 +133,16 @@ regenerate with `--update` and review the diff.  Run
 
 ## Docstring quality (ruff `D`)
 
-The pydocstyle ruleset is enabled through ruff (`select = [..., "D"]`),
-which is the modern replacement for the standalone `pydocstyle`
-package.  The currently-violated rules (missing-docstring `D1xx`, and
-the `D202/D205/D209/D301/D400/D401/D403/D413` style backlog) are
-ratcheted off in `[tool.ruff.lint] ignore` with a comment; remove
-entries as docstrings are brought up to standard.  The gate applies to
-shipped code only — `tests/**` and `bench/**` ignore `D`.
+The pydocstyle ruleset is enabled through ruff (`select = [..., "D"]`).
+The `D` ignore list is now **empty**: the whole backlog (550 violations
+— missing docstrings, summary/blank-line style, imperative mood, …) has
+been cleared, so `ruff check packages catopt` enforces `D` in full.  The
+codebase adopts **D211** (blank line before a class docstring) and
+**D212** (multi-line summary on the first line) over the mutually
+exclusive D203/D213 — ruff prints its usual "incompatible" warning for
+those pairs; that is the expected signature of the choice, not an
+error.  The gate applies to shipped code only — `tests/**` and
+`bench/**` ignore `D`.
 
 ## Runtime contracts (typeguard)
 

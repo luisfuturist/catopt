@@ -46,7 +46,7 @@ def _shape_of(t: Any):
 
 
 def _is_scalar(t: Any) -> bool:
-    """True if the bound term is a scalar (shape ())."""
+    """Return True if the bound term is a scalar (shape ())."""
     s = _shape_of(t)
     return s == () or s == tuple()
 

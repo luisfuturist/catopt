@@ -22,9 +22,11 @@ __all__ = ["TorchConcreteEval"]
 
 
 def _eval_term(term: Any, env: dict) -> Any:
-    """Evaluate *term* against *env* (leaf -> tensor) through the
-    ``_IR_TO_TORCH`` bindings.  Returns a tensor or a nested tuple
-    (aff/om carriers)."""
+    """Evaluate *term* against *env* (leaf -> tensor).
+
+    Evaluation goes through the ``_IR_TO_TORCH`` bindings.  Returns a
+    tensor or a nested tuple (aff/om carriers).
+    """
     from catopt_torch.torch_bridge import _IR_TO_TORCH
 
     if isinstance(term, Const):
@@ -57,15 +59,18 @@ class TorchConcreteEval:
     """
 
     def make_env(self, leaf_shapes: dict) -> dict:
+        """Build a ``{leaf: random fp64 tensor}`` env."""
         return {
             leaf: torch.randn(*shape, dtype=torch.float64)
             for leaf, shape in leaf_shapes.items()
         }
 
     def eval_term(self, term: Any, env: dict) -> Any:
+        """Evaluate *term* against *env* through the torch bindings."""
         return _eval_term(term, env)
 
     def allclose(self, a: Any, b: Any, tol: float) -> bool:
+        """Compare two (possibly nested-tuple) values with tolerance *tol*."""
         return _eval_allclose(a, b, tol)
 
 

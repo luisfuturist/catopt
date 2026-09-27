@@ -258,8 +258,9 @@ def _carrier_plan(eg: EGraph, cid: int):
 
 
 class _Spine:
-    """Walk ``add(mul(a_t, s), i_t)`` / ``add(matmul(A_t, s), i_t)``
-    chains from e-class to e-class.
+    """Walk affine-step chains from e-class to e-class.
+
+    Recognises ``add(mul(a_t, s), i_t)`` / ``add(matmul(A_t, s), i_t)``.
 
     ``_walk(cid)`` returns ``(steps, base_eid)`` — the chronological
     decomposition of the class's value — or ``None`` when the class is
@@ -401,9 +402,12 @@ class _Spine:
 
 
 class _Emit:
-    """Builds every node twice: as an e-graph enode (eid, children are
-    e-class ids so later rewrites see through) and as a concrete Op
-    term (for the returned record / direct evaluation)."""
+    """Build every node twice.
+
+    As an e-graph enode (eid, children are e-class ids so later rewrites
+    see through) and as a concrete Op term (for the returned record /
+    direct evaluation).
+    """
 
     def __init__(self, eg: EGraph, provenance: str) -> None:
         self.eg = eg
@@ -419,7 +423,7 @@ class _Emit:
         return (eid, Op.make(name, *(k[1] for k in kids), **attrs))
 
     def ref(self, eid: int):
-        """An (eid, representative term) pair for an existing class."""
+        """Return an (eid, representative term) pair for a class."""
         eid = self.eg.find(eid)
         t = self.eg.any_term(eid)
         if t is None:
@@ -431,9 +435,10 @@ class _Emit:
 
 
 def _assemble_F(em: _Emit, maps: list, d: int):
-    """The time-extended feedback matrix F (feedback-first layout).
+    """Build the time-extended feedback matrix F.
 
-    ``maps[i]`` is the (d,d) transition block of step i+1.  Returns the
+    Feedback-first layout.  ``maps[i]`` is the (d,d) transition block of
+    step i+1.  Returns the
     (eid, term) pair of the ``(T·d + d) × (2·T·d + d)`` concat.
     """
     T = len(maps)
@@ -457,8 +462,10 @@ def _assemble_F(em: _Emit, maps: list, d: int):
 
 
 def _emit_head(em: _Emit, F, ins: list, h0, d: int, usize):
-    """``reshape(matmul(trace(F, usize), vec), (d,))`` — the member
-    offered to the recurrence's e-class."""
+    """``reshape(matmul(trace(F, usize), vec), (d,))``.
+
+    The member offered to the recurrence's e-class.
+    """
     vec = em.op("concat", [*list(ins), h0], {"dim": 0})
     vec2 = em.op("unsqueeze", (vec,), {"dim": 1})
     tr = em.op("trace", (F,), {"usize": usize})
@@ -468,8 +475,11 @@ def _emit_head(em: _Emit, F, ins: list, h0, d: int, usize):
 
 
 def _channel_F(em: _Emit, kind: str, maps: list, d: int):
-    """F for one channel block: diagonal maps are densified as
-    ``mul(eye(d), a_t)``; dense maps are used directly."""
+    """Build F for one channel block.
+
+    Diagonal maps are densified as ``mul(eye(d), a_t)``; dense maps are
+    used directly.
+    """
     if kind == "diag":
         eye = em.op("eye", (), {"dim": d})
         maps = [em.op("mul", (eye, m)) for m in maps]

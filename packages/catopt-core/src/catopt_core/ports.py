@@ -151,7 +151,9 @@ class Binding(Protocol):
     an alias of the same protocol.
     """
 
-    def __call__(self, *args: Any, **attrs: Any) -> Any: ...
+    def __call__(self, *args: Any, **attrs: Any) -> Any:
+        """Lower one op with its operand args and attrs."""
+        ...
 
 
 #: Historical alias of :class:`Binding` — the lowering port predates the
@@ -175,7 +177,9 @@ class Executor(Protocol):
     tensor library (the torch adapter's values are ``torch.Tensor``).
     """
 
-    def forward(self, *xs: Any) -> Any: ...
+    def forward(self, *xs: Any) -> Any:
+        """Run the lowered module on ``xs``."""
+        ...
 
 
 @runtime_checkable
@@ -217,7 +221,9 @@ class BatchedExecutor(PlannedExecutor, Protocol):
     """
 
     @property
-    def is_batched(self) -> bool: ...
+    def is_batched(self) -> bool:
+        """Whether the executor runs batched."""
+        ...
 
 
 @runtime_checkable
@@ -244,7 +250,9 @@ class OpRegistry(Protocol):
         torch_bindings: dict | None = None,
         shape_rules: dict | None = None,
         attr_schema: dict | None = None,
-    ) -> OpRegistry: ...
+    ) -> OpRegistry:
+        """Compose bindings and shape/attr fragments; return self."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +262,8 @@ class OpRegistry(Protocol):
 
 @runtime_checkable
 class ShapeRule(Protocol):
-    """The ``typing.register_shape_rule`` handler contract:
+    """The ``typing.register_shape_rule`` handler contract.
+
     ``fn(op, shapes) -> tuple | _INVALID | None``.
 
     Domain port — installed in ``catopt_core.typing._SHAPE_RULES`` and
@@ -270,9 +279,9 @@ class ShapeRule(Protocol):
     ``Callable`` alias ``typing._ShapeRule`` structurally assignable.
     """
 
-    def __call__(
-        self, op: Op, shapes: list, /
-    ) -> tuple | str | None: ...
+    def __call__(self, op: Op, shapes: list, /) -> tuple | str | None:
+        """Return the op's output shape, ``_INVALID``, or ``None``."""
+        ...
 
 
 @runtime_checkable
@@ -291,9 +300,9 @@ class CostFn(Protocol):
     are per-model extras, not port members.
     """
 
-    def __call__(
-        self, term: Any, memo: dict | None = None
-    ) -> float: ...
+    def __call__(self, term: Any, memo: dict | None = None) -> float:
+        """Price *term*, optionally threading *memo*."""
+        ...
 
 
 @runtime_checkable
@@ -317,18 +326,25 @@ class VerifyResult(Protocol):
     """
 
     @property
-    def max_abs(self) -> float: ...
+    def max_abs(self) -> float:
+        """Return ``max|ref - out|``."""
+        ...
 
     @property
-    def max_rel(self) -> float: ...
+    def max_rel(self) -> float:
+        """Return the historical rel-diff metric."""
+        ...
 
     @property
-    def passed(self) -> bool: ...
+    def passed(self) -> bool:
+        """Return the gate outcome."""
+        ...
 
 
 @runtime_checkable
 class Verifier(Protocol):
-    """The semantic-equivalence gate:
+    """The semantic-equivalence gate.
+
     ``(ref_out, out, rtol, atol) -> VerifyResult``.
 
     Domain port — ``report.verify_equiv`` is the canonical
@@ -344,7 +360,9 @@ class Verifier(Protocol):
         out: Any,
         rtol: float = 1e-4,
         atol: float | None = None,
-    ) -> VerifyResult: ...
+    ) -> VerifyResult:
+        """Compare ``ref_out`` and ``out`` under ``rtol``/``atol``."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +385,9 @@ class Source(Protocol):
 
     def to_ir(
         self, model: Any, example_inputs: Any
-    ) -> tuple[IR, dict[str, Any]]: ...
+    ) -> tuple[IR, dict[str, Any]]:
+        """Export ``model`` to IR plus its leaf values."""
+        ...
 
 
 @runtime_checkable
@@ -399,14 +419,20 @@ class Sink(Protocol):
     """
 
     @property
-    def supported_ops(self) -> frozenset[str]: ...
+    def supported_ops(self) -> frozenset[str]:
+        """Return the set of op names the backend can lower."""
+        ...
 
     @property
-    def ops(self) -> OpRegistry: ...
+    def ops(self) -> OpRegistry:
+        """Return the lowering registry."""
+        ...
 
     def lower(
         self, ir: IR, params: dict[str, Any] | None = None
-    ) -> Executor: ...
+    ) -> Executor:
+        """Materialise a runnable executor from ``ir`` and leaves."""
+        ...
 
     def verify(
         self,
@@ -416,7 +442,9 @@ class Sink(Protocol):
         *,
         rtol: float = 1e-4,
         atol: float | None = None,
-    ) -> VerifyResult: ...
+    ) -> VerifyResult:
+        """Run ``ref`` and ``opt`` on ``inputs``; return the report."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +454,9 @@ class Sink(Protocol):
 
 @runtime_checkable
 class RuleLike(Protocol):
-    """The rewrite-rule read surface — structural twin of
-    ``egraph.Rewrite``.
+    """The rewrite-rule read surface.
+
+    Structural twin of ``egraph.Rewrite``.
 
     Every member is read unconditionally somewhere in the e-graph:
     ``name`` (fire counts, budgets, ``_applied_rules``), ``lhs`` /
@@ -451,8 +480,9 @@ class RuleLike(Protocol):
 
 @runtime_checkable
 class LawSet(Protocol):
-    """An iterable of :class:`RuleLike` rewrites — the surface
-    ``EGraph.run(rules, ...)`` consumes.
+    """An iterable of :class:`RuleLike` rewrites.
+
+    The surface ``EGraph.run(rules, ...)`` consumes.
 
     ``list[Rewrite]`` collections conform: ``ALL_RULES`` /
     ``all_rules()``, ``SIMPLIFICATION_RULES``, ``CATEGORICAL_RULES``,
@@ -462,17 +492,23 @@ class LawSet(Protocol):
     static-typing half.)
     """
 
-    def __iter__(self) -> Iterator[RuleLike]: ...
+    def __iter__(self) -> Iterator[RuleLike]:
+        """Iterate over the rules in the set."""
+        ...
 
 
 @runtime_checkable
 class RuleProvider(Protocol):
-    """A zero-argument source of a :class:`LawSet` — the
-    ``all_rules()`` shape.  How a ruleset *name* maps to rules is a
-    pipeline detail (``optimize_model``'s ``ruleset`` dict), not part
-    of this port."""
+    """A zero-argument source of a :class:`LawSet`.
 
-    def __call__(self) -> LawSet: ...
+    This is the ``all_rules()`` shape.  How a ruleset *name* maps to
+    rules is a pipeline detail (``optimize_model``'s ``ruleset`` dict),
+    not part of this port.
+    """
+
+    def __call__(self) -> LawSet:
+        """Return the law set."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +519,7 @@ _PROBE = object()
 
 
 def _port_signature(proto: type) -> inspect.Signature | None:
-    """The signature of the port's ``__call__``, minus ``self``."""
+    """Return the port's ``__call__`` signature, minus ``self``."""
     for klass in getattr(proto, "__mro__", (proto,)):
         fn = klass.__dict__.get("__call__")
         if fn is None:

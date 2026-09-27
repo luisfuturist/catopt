@@ -69,8 +69,11 @@ CACHE_VERSION = 1
 
 
 def _enc_attr(v: Any) -> Any:
-    """JSON-safe encoding of an attribute value (or a ``$attr:`` binding
-    value — strings stay strings since they are metavar references)."""
+    """JSON-safe encoding of an attribute value.
+
+    Also handles a ``$attr:`` binding value — strings stay strings since
+    they are metavar references.
+    """
     if isinstance(v, tuple):
         return {"__tuple__": [_enc_attr(x) for x in v]}
     if isinstance(v, list):
@@ -130,9 +133,11 @@ def _dec_term(d: Any) -> Any:
 
 
 def _enc_binding(m: dict) -> list:
-    """Encode a substitution/re-expression map.  ``$attr:`` values are
-    attribute values (concrete constants or metavar-name strings);
-    every other key maps to a term/pattern."""
+    """Encode a substitution/re-expression map.
+
+    ``$attr:`` values are attribute values (concrete constants or
+    metavar-name strings); every other key maps to a term/pattern.
+    """
     out = []
     for k, v in m.items():
         if k.startswith("$attr:"):
@@ -158,9 +163,12 @@ def _dec_binding(pairs: list) -> dict:
 
 
 def _enc_rule(rule: Rewrite) -> dict:
-    """Serialize a synthesized rule: name, law, provenance, patterns,
-    and — when guarded — the (pat1, pat2) re-expression spec recorded on
-    ``rule.guard_pats``.  Callables are never serialized."""
+    """Serialize a synthesized rule.
+
+    Records name, law, provenance, patterns, and — when guarded — the
+    (pat1, pat2) re-expression spec recorded on ``rule.guard_pats``.
+    Callables are never serialized.
+    """
     spec = getattr(rule, "guard_pats", None)
     guarded = rule.check is not None or rule.derive is not None
     if guarded and spec is None:
@@ -191,10 +199,13 @@ def _enc_rule(rule: Rewrite) -> dict:
 def _dec_rule(
     rec: dict, parents_by_name: dict[str, Rewrite]
 ) -> Rewrite:
-    """Rebuild a rule.  Guarded rules re-run ``_compose_guards`` on the
-    stored re-expression maps — the parents must be present (by name)
-    in *parents_by_name*, or a ``KeyError`` propagates and the whole
-    load is treated as a miss."""
+    """Rebuild a rule.
+
+    Guarded rules re-run ``_compose_guards`` on the stored
+    re-expression maps — the parents must be present (by name) in
+    *parents_by_name*, or a ``KeyError`` propagates and the whole load
+    is treated as a miss.
+    """
     lhs = _dec_term(rec["lhs"])
     rhs = _dec_term(rec["rhs"])
     check = derive = None
@@ -245,9 +256,12 @@ def _sha(parts: Iterable[str]) -> str:
 
 
 def _hook_sig(fn) -> str:
-    """Stability signature for a check/derive callable: source text when
-    inspectable, else module+qualname.  An unstable signature only ever
-    causes a cache MISS, never a wrong hit — conservative by design."""
+    """Stability signature for a check/derive callable.
+
+    Source text when inspectable, else module+qualname.  An unstable
+    signature only ever causes a cache MISS, never a wrong hit —
+    conservative by design.
+    """
     if fn is None:
         return ""
     if isinstance(fn, functools.partial):
@@ -263,8 +277,11 @@ def _hook_sig(fn) -> str:
 
 
 def ruleset_fingerprint(rules: Iterable[Rewrite]) -> str:
-    """Hash of the parent ruleset: every rule's name, serialized lhs/rhs
-    patterns, and hook signatures — sorted so rule order doesn't matter."""
+    """Hash of the parent ruleset.
+
+    Covers every rule's name, serialized lhs/rhs patterns, and hook
+    signatures — sorted so rule order doesn't matter.
+    """
     entries = sorted(
         json.dumps(
             {
@@ -282,8 +299,10 @@ def ruleset_fingerprint(rules: Iterable[Rewrite]) -> str:
 
 
 def seed_fingerprint(seed_terms: Iterable[Any]) -> str:
-    """Hash of the serialized seed terms, in order (seed order affects
-    which derivations are explored and rule naming)."""
+    """Hash of the serialized seed terms, in order.
+
+    Seed order affects which derivations are explored and rule naming.
+    """
     return _sha(
         json.dumps(_enc_term(s), sort_keys=True) for s in seed_terms
     )
@@ -298,8 +317,11 @@ def cache_key(
     require_overlap: bool = True,
     emit_subsumed: bool = False,
 ) -> str:
-    """The cache key for one synthesis problem instance: ruleset
-    fingerprint + seed fingerprint + synthesis params + format version."""
+    """Return the cache key for one synthesis problem instance.
+
+    Combines the ruleset fingerprint, seed fingerprint, synthesis
+    params, and format version.
+    """
     rules = list(rules)
     payload = {
         "version": CACHE_VERSION,
@@ -331,15 +353,20 @@ class RuleCache:
     """Filesystem cache of synthesized rule sets, one JSON file per key."""
 
     def __init__(self, cache_dir: Any):
+        """Initialise the cache directory."""
         self.dir = Path(cache_dir)
 
     def path(self, key: str) -> Path:
+        """Return the cache file path for ``key``."""
         return self.dir / f"rules-{key}.json"
 
     def store(self, key: str, rules: Iterable[Rewrite]) -> Path:
-        """Persist *rules* under *key*.  Raises ``TypeError`` if a rule
-        carries hooks without a ``guard_pats`` spec (not synthesizable-
-        output), rather than silently dropping its side conditions."""
+        """Persist *rules* under *key*.
+
+        Raises ``TypeError`` if a rule carries hooks without a
+        ``guard_pats`` spec (not synthesizable-output), rather than
+        silently dropping its side conditions.
+        """
         self.dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": CACHE_VERSION,
@@ -359,7 +386,8 @@ class RuleCache:
         *rules* is the parent ruleset: guarded rules rebuild their
         composite check/derive from the parents' hooks, resolved by
         name.  A missing parent, a version/key mismatch, or a corrupt
-        file is a clean miss — never a partially-loaded set."""
+        file is a clean miss — never a partially-loaded set.
+        """
         p = self.path(key)
         if not p.exists():
             return None
@@ -386,15 +414,17 @@ def synthesize_rules_cached(
     emit_subsumed: bool = False,
     cache_dir: Any = None,
 ) -> list[Rewrite]:
-    """``meta.synthesize_rules`` with persistence: on a repeat call with
-    the same ruleset, seeds, and parameters the derived rules are loaded
-    from *cache_dir* (composite guards rebuilt from the parent hooks)
-    instead of re-derived.
+    """``meta.synthesize_rules`` with persistence.
+
+    On a repeat call with the same ruleset, seeds, and parameters the
+    derived rules are loaded from *cache_dir* (composite guards rebuilt
+    from the parent hooks) instead of re-derived.
 
     Loaded rules are ordinary ``Rewrite`` objects — they fire in
     e-graphs, carry ``.parents`` provenance, and re-register in
     ``meta.SYNTH_PARENTS``.  ``cache_dir`` defaults to
-    ``$CATOPT_RULECACHE_DIR`` or ``~/.cache/catopt/rulecache``."""
+    ``$CATOPT_RULECACHE_DIR`` or ``~/.cache/catopt/rulecache``.
+    """
     rules = list(rules)
     cache = RuleCache(cache_dir or _default_cache_dir())
     key = cache_key(

@@ -1,6 +1,5 @@
 # ruff: noqa: RUF001
-"""Cross-carrier laws — what can and cannot pass between the scan
-(``aff``/``aff_diag``) and online-softmax (``om``) monoid domains.
+"""Cross-carrier laws between the scan and online-softmax monoids.
 
 THE QUESTION
     Every existing carrier lives behind its own seam: an e-class never
@@ -172,15 +171,18 @@ def _bc(a, b):
 
 
 def _concrete(s) -> TypeGuard[tuple[int, ...]]:
-    """tuple-of-int shape predicate — single source is
-    :func:`catopt_core.typing._concrete` (shared with the lowerers)."""
+    """Return whether a shape is a tuple of concrete int dims.
+
+    Single source is :func:`catopt_core.typing._concrete` (shared with
+    the lowerers).
+    """
     from catopt_core.typing import _concrete as _tc
 
     return _tc(s)
 
 
 def _xshape(t: Any, _memo: dict | None = None):
-    """The TRUE value shape of a bound term — for the XC guards.
+    """Return the TRUE value shape of a bound term — for the XC guards.
 
     ``catopt_core.typing._shape_of`` prices the carriers by convention:
     ``apply``/``applyd`` report h's (state) shape, ``aff``/``aff_diag``
@@ -319,10 +321,12 @@ def _affd_b(f, *a, **kw):
 def _om_elem_affd(
     s: torch.Tensor, a: torch.Tensor, b: torch.Tensor, h: torch.Tensor
 ):
-    """om_elem whose value block is diagonal-affine in h:
+    """om_elem whose value block is diagonal-affine in h.
+
     elem(s, a⊙h+b) = (m, l, (e@a)⊙h + e@b).  Same triple as
     ``om_elem(s, applyd(aff_diag(a,b),h))`` — fp64-identical modulo
-    reassociation."""
+    reassociation.
+    """
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
     return m, e.sum(dim=-1, keepdim=True), (e @ a) * h + e @ b
@@ -331,11 +335,13 @@ def _om_elem_affd(
 def _om_elem_aff(
     s: torch.Tensor, A: torch.Tensor, b: torch.Tensor, h: torch.Tensor
 ):
-    """om_elem with dense-affine values: v = A@h + b with per-key
-    A : (…,K, d, i).  numerator = (e@A)@h + e@b where e@A contracts the
-    key axis — computed via reshape (the IR has no einsum).  Leading
-    axes of A (e.g. attention heads) are batch dims for the matmul and
-    are preserved through the flattening reshape."""
+    """om_elem with dense-affine values: v = A@h + b.
+
+    Per-key A : (…,K, d, i); numerator = (e@A)@h + e@b where e@A
+    contracts the key axis — computed via reshape (the IR has no
+    einsum).  Leading axes of A (e.g. attention heads) are batch dims
+    for the matmul and are preserved through the flattening reshape.
+    """
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
     d, i = A.shape[-2], A.shape[-1]
@@ -345,15 +351,17 @@ def _om_elem_aff(
 
 
 def _omd_elem(s: torch.Tensor, a: torch.Tensor, b: torch.Tensor):
-    """Deferred-affine om element: the om triple of (s, M(h)+b) with h
-    left symbolic — a 4-tuple (m, l, e@M, e@b) whose numerator is the
-    affine PAIR.
+    """Deferred-affine om element: the om triple of (s, M(h)+b).
+
+    h is left symbolic — a 4-tuple (m, l, e@M, e@b) whose numerator is
+    the affine PAIR.
 
     Diagonal fiber: a is (…,K,d) → e@a is the (…,Tq,d) diagonal
     coefficient (consumed by ``omd_apply``).  Dense fiber: a is
     (…,K,d,i) → e contracts the key axis via a (d·i)-flattened reshape
     (the IR has no einsum), giving the (…,Tq,d,i) dense coefficient
-    (consumed by ``omd_applym``)."""
+    (consumed by ``omd_applym``).
+    """
     m = s.amax(dim=-1, keepdim=True)
     e = torch.exp(s - m)
     l_ = e.sum(dim=-1, keepdim=True)
@@ -370,10 +378,13 @@ def _omd(m, l_, fa, fb, *a, **kw):
 
 
 def _omd_compose(f, g):
-    """Combine two deferred-affine triples.  The rescaling is linear in
-    each numerator component, so the pair stays a pair:
+    """Combine two deferred-affine triples.
+
+    The rescaling is linear in each numerator component, so the pair
+    stays a pair:
     e1·(fa1⊙h+fb1) + e2·(fa2⊙h+fb2) = (e1 fa1 + e2 fa2)⊙h
-                                    + (e1 fb1 + e2 fb2)."""
+                                    + (e1 fb1 + e2 fb2).
+    """
     m1, l1, fa1, fb1 = f
     m2, l2, fa2, fb2 = g
     mx = torch.maximum(m1, m2)
@@ -408,8 +419,11 @@ def _omd_apply(f, h, *a, **kw):
 
 
 def _omd_applym(f, h, *a, **kw):
-    """Apply a deferred-dense carrier: (fa@h + fb) / l.  fa's last dim
-    is the map's input axis — (…,Tq,o,i) @ (i,) → (…,Tq,o)."""
+    """Apply a deferred-dense carrier: (fa@h + fb) / l.
+
+    fa's last dim is the map's input axis — (…,Tq,o,i) @ (i,) →
+    (…,Tq,o).
+    """
     return (f[2] @ h + f[3]) / f[1]
 
 
@@ -437,9 +451,11 @@ TORCH_BINDINGS: dict[str, Any] = {
 
 
 def _check_matmul_applyd_vec(bound: dict) -> bool:
-    """matmul(W, applyd(aff_diag(a,b),h)) — W contracts the FEATURE
-    axis: a,b,h all (d,), W (o,d).  The dense promotion:
-    W·(a⊙h+b) = (W·diag a)h + Wb."""
+    """matmul(W, applyd(aff_diag(a,b),h)) — W contracts the FEATURE axis.
+
+    a,b,h all (d,), W (o,d).  The dense promotion:
+    W·(a⊙h+b) = (W·diag a)h + Wb.
+    """
     W, a, b, h = (_shape(bound.get(k)) for k in ("W", "a", "b", "h"))
     if not all(_concrete(s) for s in (W, a, b, h)):
         return False
@@ -449,9 +465,11 @@ def _check_matmul_applyd_vec(bound: dict) -> bool:
 
 
 def _check_matmul_apply(bound: dict) -> bool:
-    """matmul(W, apply(aff(A,c),h)) = apply(aff(WA,Wc),h) — post-compose
-    of a linear map with a dense affine map.  W (o,i), A (i,i),
-    c,h (i,)."""
+    """matmul(W, apply(aff(A,c),h)) = apply(aff(WA,Wc),h).
+
+    Post-compose of a linear map with a dense affine map.  W (o,i),
+    A (i,i), c,h (i,).
+    """
     W, A, c, h = (_shape(bound.get(k)) for k in ("W", "A", "c", "h"))
     if not all(_concrete(s) for s in (W, A, c, h)):
         return False
@@ -466,9 +484,11 @@ def _check_matmul_apply(bound: dict) -> bool:
 
 
 def _check_linear_applyd(bound: dict) -> bool:
-    """linear(applyd(aff_diag(a,b),h), W) — the diagonal→dense
-    promotion: W·diag(a_t) per row = mul(unsqueeze(a,-2), W).
-    a,b : (…,i) equal shapes, h : (i,), W : (o,i)."""
+    """linear(applyd(aff_diag(a,b),h), W) — diagonal→dense promotion.
+
+    W·diag(a_t) per row = mul(unsqueeze(a,-2), W).  a,b : (…,i) equal
+    shapes, h : (i,), W : (o,i).
+    """
     W, a, b, h = (_shape(bound.get(k)) for k in ("W", "a", "b", "h"))
     if not all(_concrete(s) for s in (W, a, b, h)):
         return False
@@ -482,8 +502,10 @@ def _check_linear_applyd(bound: dict) -> bool:
 
 
 def _check_linear_apply(bound: dict) -> bool:
-    """linear(apply(aff(A,c),h), W) = apply(aff(WA, linear(c,W)),h):
-    A (…,i,i), W (o,i), h (i,), c broadcastable to (…,i)."""
+    """linear(apply(aff(A,c),h), W) = apply(aff(WA, linear(c,W)),h).
+
+    A (…,i,i), W (o,i), h (i,), c broadcastable to (…,i).
+    """
     W, A, c, h = (_shape(bound.get(k)) for k in ("W", "A", "c", "h"))
     if not all(_concrete(s) for s in (W, A, c, h)):
         return False
@@ -509,9 +531,9 @@ def _scalar_or_broadcast(bound: dict, rkey: str, tshape) -> bool:
 
 
 def _named_scale(bound: dict, rkey: str) -> bool:
-    """The scale operand must resolve to a LEAF — a named scalar or
-    gain (Var/Param/Const), not a computed factor.
+    """Require the scale operand to resolve to a LEAF.
 
+    A named scalar or gain (Var/Param/Const), not a computed factor.
     A *computed* r (any Op term — e.g. the per-step decay a_t on a
     recurrence spine) makes this law replay the carrier's own step
     composition as a concrete map: the minted ``mul(f.a, r)`` factors
@@ -523,14 +545,17 @@ def _named_scale(bound: dict, rkey: str) -> bool:
     ``r ⊙ applyd(f, h)`` is already reachable through the carrier's
     own ``affd_compose``/``aff_compose`` machinery; the leaf case
     (readout scales like 1/√d, learned gains) is the one that needs a
-    concrete map."""
+    concrete map.
+    """
     return not isinstance(bound.get(rkey), Op)
 
 
 def _check_scale_applyd(bound: dict) -> bool:
-    """mul(applyd(aff_diag(a,b),h), r) = applyd((r⊙a, r⊙b),h): r must
-    be a leaf (named scalar/gain) broadcasting against the state shape
-    (scalar, (d,), or full shape)."""
+    """mul(applyd(aff_diag(a,b),h), r) = applyd((r⊙a, r⊙b),h).
+
+    r must be a leaf (named scalar/gain) broadcasting against the
+    state shape (scalar, (d,), or full shape).
+    """
     if not _named_scale(bound, "r"):
         return False
     a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
@@ -542,10 +567,12 @@ def _check_scale_applyd(bound: dict) -> bool:
 
 
 def _check_scale_apply(bound: dict) -> bool:
-    """mul(apply(aff(A,c),h), r) = apply(aff(rA, rc),h): r broadcasts
-    against the OUTPUT shape A[:-1] (scalar or row scale (…,1) also
-    fine since mul broadcasts).  Keep it strict: scalar or A[:-1] or
-    (…,1)-shaped broadcastable."""
+    """mul(apply(aff(A,c),h), r) = apply(aff(rA, rc),h).
+
+    r broadcasts against the OUTPUT shape A[:-1] (scalar or row scale
+    (…,1) also fine since mul broadcasts).  Keep it strict: scalar or
+    A[:-1] or (…,1)-shaped broadcastable.
+    """
     A, c, h = (_shape(bound.get(k)) for k in ("A", "c", "h"))
     if not all(_concrete(s) for s in (A, c, h)):
         return False
@@ -578,9 +605,12 @@ def _check_scale_apply(bound: dict) -> bool:
 
 
 def _check_add_applyd(bound: dict) -> bool:
-    """add(applyd(f,h), applyd(g,h)) with the SAME h: componentwise add
-    of the two maps.  f,g's shapes are their a-parts (cost convention);
-    require equal shapes and h a (d,) broadcast vector."""
+    """add(applyd(f,h), applyd(g,h)) with the SAME h.
+
+    Componentwise add of the two maps.  f,g's shapes are their a-parts
+    (cost convention); require equal shapes and h a (d,) broadcast
+    vector.
+    """
     f, g, h = (_shape(bound.get(k)) for k in ("f", "g", "h"))
     if not all(_concrete(s) for s in (f, g, h)):
         return False
@@ -588,8 +618,10 @@ def _check_add_applyd(bound: dict) -> bool:
 
 
 def _check_add_apply(bound: dict) -> bool:
-    """add(apply(f,h), apply(g,h)) — dense analog; f's shape is A's:
-    require equal (…,i,i) shapes and h (i,)."""
+    """add(apply(f,h), apply(g,h)) — dense analog; f's shape is A's.
+
+    Require equal (…,i,i) shapes and h (i,).
+    """
     f, g, h = (_shape(bound.get(k)) for k in ("f", "g", "h"))
     if not all(_concrete(s) for s in (f, g, h)):
         return False
@@ -603,8 +635,11 @@ def _check_add_apply(bound: dict) -> bool:
 
 
 def _check_chunk_applyd(bound: dict, split: bool = False) -> bool:
-    """chunk/split of applyd(aff_diag(a,b),h): the slice axis must not
-    be the FEATURE axis (h is not chunked), i.e. D % rank < rank-1."""
+    """chunk/split of applyd(aff_diag(a,b),h).
+
+    The slice axis must not be the FEATURE axis (h is not chunked),
+    i.e. D % rank < rank-1.
+    """
     a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
     D = bound.get("$attr:D")
     if not (
@@ -617,9 +652,12 @@ def _check_chunk_applyd(bound: dict, split: bool = False) -> bool:
 
 
 def _check_chunk_apply(bound: dict) -> tuple[bool, int | None]:
-    """chunk(apply(aff(A,c),h)): A = c's shape ++ (i,); the slice dim D
-    (in c's coords) maps to the same leading index of A (A's extra axis
-    is LAST).  Any axis of c is sound.  Returns (ok, DA)."""
+    """chunk(apply(aff(A,c),h)): A = c's shape ++ (i,).
+
+    The slice dim D (in c's coords) maps to the same leading index of
+    A (A's extra axis is LAST).  Any axis of c is sound.  Returns
+    (ok, DA).
+    """
     A, c, h = (_shape(bound.get(k)) for k in ("A", "c", "h"))
     D = bound.get("$attr:D")
     if not (
@@ -668,8 +706,10 @@ def _check_split_apply(bound: dict) -> bool:
 
 
 def _check_om_elem_affd(bound: dict) -> bool:
-    """om_elem(s, applyd(aff_diag(a,b),h)) — v = a⊙h+b must be a valid
-    value block: s (…,Tq,K), a,b (…,K,d) equal, s[-1]==a[-2], h (d,)."""
+    """om_elem(s, applyd(aff_diag(a,b),h)) — v = a⊙h+b must be valid.
+
+    s (…,Tq,K), a,b (…,K,d) equal, s[-1]==a[-2], h (d,).
+    """
     s, a, b, h = (_shape(bound.get(k)) for k in ("s", "a", "b", "h"))
     if not all(_concrete(x) for x in (s, a, b, h)):
         return False
@@ -681,11 +721,13 @@ def _check_om_elem_affd(bound: dict) -> bool:
 
 
 def _check_om_elem_aff(bound: dict) -> bool:
-    """om_elem(s, apply(aff(A,b),h)) — v = A@h+b, A (…,K,d,i) rank-≥3,
+    """om_elem(s, apply(aff(A,b),h)) — v = A@h+b, A (…,K,d,i) rank-≥3.
+
     b == A[:-1], h (i,), s (…,Tq,K).  Leading axes of A beyond
     (K,d,i) are BATCH dims — a per-head map (nh,K,d,i) is fine
     because the torch bindings matmul over them; they only have to
-    broadcast against s's leading dims."""
+    broadcast against s's leading dims.
+    """
     s, A, b, h = (_shape(bound.get(k)) for k in ("s", "A", "b", "h"))
     if not all(_concrete(x) for x in (s, A, b, h)):
         return False
@@ -702,8 +744,10 @@ def _check_om_elem_aff(bound: dict) -> bool:
 
 
 def _check_omd_lift(bound: dict) -> bool:
-    """Same shape requirements as om_elem_affd — plus h stays bound
-    through to the omd_apply."""
+    """Use the same shape requirements as om_elem_affd — plus bound h.
+
+    h stays bound through to the omd_apply.
+    """
     return _check_om_elem_affd(bound)
 
 
@@ -712,9 +756,11 @@ def _check_omd_lift_dense(bound: dict) -> bool:
 
 
 def _check_omd_pair(bound: dict) -> bool:
-    """Two om_elem-applyd leaves composed under om_apply — each leaf
-    must satisfy the elem-applyd shape relation and the two score
-    blocks must agree off the key axis."""
+    """Two om_elem-applyd leaves composed under om_apply.
+
+    Each leaf must satisfy the elem-applyd shape relation and the two
+    score blocks must agree off the key axis.
+    """
     ok1 = _check_om_elem_affd(
         {
             "s": bound.get("s1"),
@@ -741,8 +787,11 @@ def _check_omd_pair(bound: dict) -> bool:
 
 
 def _check_omd_split(bound: dict) -> bool:
-    """omd_elem(cat s, cat a, cat b) splits like om_elem: scores cat on
-    the LAST dim (keys), a/b cat on dim -2 (the same key axis)."""
+    """omd_elem(cat s, cat a, cat b) splits like om_elem.
+
+    Scores cat on the LAST dim (keys), a/b cat on dim -2 (the same key
+    axis).
+    """
     sd, ad, bd = (
         bound.get("$attr:SD"),
         bound.get("$attr:AD"),
@@ -787,7 +836,8 @@ def _matmul_applyd_rows_via_f(bound: dict) -> bool:
     contract: the value v = applyd(f,h) must be a rank-≥2 block whose
     second-to-last dim matches E[-1], and f's own shape (its a-part,
     by the cost model's convention) is v's shape, with h a vector
-    matching the last dim."""
+    matching the last dim.
+    """
     E, f, h = (_shape(bound.get(k)) for k in ("E", "f", "h"))
     if not all(_concrete(s) for s in (E, f, h)):
         return False
@@ -1172,10 +1222,12 @@ XC_SPLIT_APPLYD = _chunk_applyd(
 
 
 def _chunk_apply(name, op, check):
-    """chunk(apply(aff(A,c),h)) → apply(aff(chunk A, chunk c),h): the
-    slice axis lives in c's coordinates; A carries the same leading
+    """chunk(apply(aff(A,c),h)) → apply(aff(chunk A, chunk c),h).
+
+    The slice axis lives in c's coordinates; A carries the same leading
     axes plus one extra LAST (the map's input dim), so A's slice dim is
-    the same normalized index — derived as DA = D % rank(c)."""
+    the same normalized index — derived as DA = D % rank(c).
+    """
     base = Op.make("apply", Op.make("aff", "A", "c"), "h")
     if op == "chunk":
         lhs = Op.make("chunk", base, chunks="N", dim="D", index="I")
@@ -1259,12 +1311,13 @@ def _numel_of(s) -> int:
 
 
 def _resolve_view_shape(S, numel_in: int):
-    """Concrete resolution of a reshape ``shape`` attr against the
-    input's numel — the same convention ``typing._shape_of`` uses (one
-    literal -1 may appear in exported graphs and is inferred).
-    Returns the resolved tuple, or None when the shape is ill-formed
-    or numel-inconsistent (then the view — and the law — is not
-    well-typed)."""
+    """Resolve a reshape ``shape`` attr against the input's numel.
+
+    The same convention ``typing._shape_of`` uses (one literal -1 may
+    appear in exported graphs and is inferred).  Returns the resolved
+    tuple, or None when the shape is ill-formed or numel-inconsistent
+    (then the view — and the law — is not well-typed).
+    """
     if not isinstance(S, (tuple, list)) or len(S) == 0:
         return None
     if not all(isinstance(d, int) and (d == -1 or d > 0) for d in S):
@@ -1288,8 +1341,11 @@ def _resolve_view_shape(S, numel_in: int):
 
 
 def _view_dims(bound: dict, rank: int):
-    """The transpose's two dims normalised mod *rank* — the value's
-    rank, so the same numbers also index the map's leading axes."""
+    """Normalise the transpose's two dims mod *rank*.
+
+    *rank* is the value's rank, so the same numbers also index the
+    map's leading axes.
+    """
     d1, d2 = bound.get("$attr:D1"), bound.get("$attr:D2")
     if not (isinstance(d1, int) and isinstance(d2, int)):
         return None
@@ -1297,9 +1353,11 @@ def _view_dims(bound: dict, rank: int):
 
 
 def _apply_value_shapes(bound: dict):
-    """Shared contract for the dense view laws: A (…, value, i) with
-    b exactly value-shaped (b == A[:-1]) and h a matching (i,) vector.
-    Returns A's shape, or None."""
+    """Shared contract for the dense view laws.
+
+    A (…, value, i) with b exactly value-shaped (b == A[:-1]) and h a
+    matching (i,) vector.  Returns A's shape, or None.
+    """
     A, b, h = (_shape(bound.get(k)) for k in ("A", "b", "h"))
     if not all(_concrete(s) for s in (A, b, h)):
         return None
@@ -1311,8 +1369,10 @@ def _apply_value_shapes(bound: dict):
 
 
 def _applyd_value_shapes(bound: dict):
-    """Same for the diagonal carrier: a == b value-shaped, h (d,)
-    matching the feature (last) axis."""
+    """Apply the same contract to the diagonal carrier.
+
+    a == b value-shaped, h (d,) matching the feature (last) axis.
+    """
     a, b, h = (_shape(bound.get(k)) for k in ("a", "b", "h"))
     if not all(_concrete(s) for s in (a, b, h)):
         return None
@@ -1332,9 +1392,11 @@ def _check_reshape_apply(bound: dict) -> bool:
 
 
 def _derive_reshape_apply(bound: dict):
-    """The map's input axis stays LAST: A reshapes to S+(i,).  A -1 in
-    S is carried through verbatim — numel(A) = numel(v)·i so the
-    inferred dim resolves identically on the map."""
+    """Require the map's input axis to stay LAST: A reshapes to S+(i,).
+
+    A -1 in S is carried through verbatim — numel(A) = numel(v)·i so
+    the inferred dim resolves identically on the map.
+    """
     A = _apply_value_shapes(bound)
     S = bound.get("$attr:S")
     if A is None or _resolve_view_shape(S, _numel_of(A[:-1])) is None:
@@ -1350,9 +1412,11 @@ def _check_transpose_apply(bound: dict) -> bool:
 
 
 def _derive_transpose_apply(bound: dict):
-    """Transpose dims are bound on the VALUE (rank len(A)-1) but are
-    stored on the map (rank len(A)) — normalise mod the value rank so
-    the map's last (input) axis can never be permuted."""
+    """Bind transpose dims on the VALUE (rank len(A)-1), store on the map.
+
+    The map has rank len(A) — normalise mod the value rank so the
+    map's last (input) axis can never be permuted.
+    """
     A = _apply_value_shapes(bound)
     if A is None:
         return None
@@ -1363,10 +1427,12 @@ def _derive_transpose_apply(bound: dict):
 
 
 def _check_reshape_applyd(bound: dict) -> bool:
-    """Diagonal reshape: sound iff the resolved view keeps the LAST
-    axis at size d — numel preservation plus S[-1] == V[-1] means the
-    flat-order relabel never mixes a feature component into a leading
-    axis, so h still multiplies the right components."""
+    """Check the diagonal reshape keeps the LAST axis at size d.
+
+    Numel preservation plus S[-1] == V[-1] means the flat-order relabel
+    never mixes a feature component into a leading axis, so h still
+    multiplies the right components.
+    """
     V = _applyd_value_shapes(bound)
     if V is None:
         return False
@@ -1507,10 +1573,13 @@ XC_TRANSPOSE_APPLYD = R(
 
 
 def _transpose_apply_rev_dims(bound: dict):
-    """For the dense reverse: the dims stored on the map's transpose
-    (rank len(A)) and on b's transpose (rank len(b)) must agree as
-    VALUE axes — i.e. normalise to the same pair, never touching A's
-    last (input) axis.  Returns the value-rank dims, or None."""
+    """For the dense reverse: normalise the two transposes' dims.
+
+    The dims stored on the map's transpose (rank len(A)) and on b's
+    transpose (rank len(b)) must agree as VALUE axes — i.e. normalise
+    to the same pair, never touching A's last (input) axis.  Returns
+    the value-rank dims, or None.
+    """
     A = _apply_value_shapes(bound)
     if A is None:
         return None
@@ -1627,11 +1696,13 @@ XC_TRANSPOSE_APPLYD_REV = R(
 
 
 def _check_reshape_apply_rev(bound: dict) -> bool:
-    """apply(aff(reshape(A,SA), reshape(b,SB)), h) refolds to
-    reshape(apply(aff(A,b),h), SB) — requires SA == SB+(i,) literally
-    (the spelling the forward law mints; a semantically-equal but
-    differently-spelled SA is conservatively vetoed), plus the usual
-    map contract and a well-typed SB."""
+    """Refold apply(aff(reshape(A,SA), reshape(b,SB)), h).
+
+    Refolds to reshape(apply(aff(A,b),h), SB) — requires SA == SB+(i,)
+    literally (the spelling the forward law mints; a semantically-equal
+    but differently-spelled SA is conservatively vetoed), plus the
+    usual map contract and a well-typed SB.
+    """
     A = _apply_value_shapes(bound)
     if A is None:
         return False
@@ -1671,8 +1742,10 @@ XC_RESHAPE_APPLY_REV = R(
 
 
 def _check_reshape_applyd_rev(bound: dict) -> bool:
-    """Diagonal reverse: both coefficients must carry the same shape
-    attr, keeping the feature axis last."""
+    """Require both coefficients to carry the same shape attr.
+
+    The diagonal reverse keeps the feature axis last.
+    """
     a = _applyd_value_shapes(bound)
     if a is None:
         return False
@@ -1947,8 +2020,11 @@ XC_LAWS: list[Rewrite] = [
 
 
 def _stack_dim(attrs: dict) -> int:
-    """The stack/concat axis from an op's attrs — single source is
-    :func:`catopt_core.typing._stack_dim` (shared with the lowerers)."""
+    """Return the stack/concat axis from an op's attrs.
+
+    Single source is :func:`catopt_core.typing._stack_dim` (shared with
+    the lowerers).
+    """
     from catopt_core.typing import _stack_dim as _tsd
 
     return _tsd(attrs)
@@ -1969,7 +2045,8 @@ def _map_out_shape(f_shape, h_shape, kind: str):
     """Shape of ``apply_op(f, h)``'s VALUE given the map's shape.
 
     diag:  v = a⊙h+b  → broadcast(f_shape, h_shape)
-    dense: v = A@h+b  → A[:-1] (h contracts the last axis)."""
+    dense: v = A@h+b  → A[:-1] (h contracts the last axis).
+    """
     if kind == "diag":
         return _bc(f_shape, h_shape)
     if (
@@ -2114,9 +2191,12 @@ def gather_applyd_stack(
     witness: bool = True,
     provenance: str = "xc_stack_diag",
 ) -> list:
-    """Offer ``applyd(aff_diag(stack affd_a f_i, stack affd_b f_i), h)``
+    """Offer the stacked-map form for every qualifying ``stack`` enode.
+
+    Offers ``applyd(aff_diag(stack affd_a f_i, stack affd_b f_i), h)``
     for every ``stack`` enode whose children are applyd applications
-    over a shared initial state — the scan sequence as ONE map."""
+    over a shared initial state — the scan sequence as ONE map.
+    """
     return _gather_stack(
         eg,
         "applyd",
@@ -2161,8 +2241,11 @@ def gather_apply_stack(
 
 
 def _elem_affine_options(eg: EGraph, v_cid: int) -> dict[int, list]:
-    """For a value-block e-class: ``{h_eid: [(kind, a_eid, b_eid)]}`` —
-    every applyd/apply member whose map exposes aff_diag/aff parts."""
+    """Index a value-block e-class's map parts.
+
+    Returns ``{h_eid: [(kind, a_eid, b_eid)]}`` — every applyd/apply
+    member whose map exposes aff_diag/aff parts.
+    """
     out: dict[int, list] = {}
     for n in eg.get_class(v_cid).nodes:
         if n.op == "applyd" and len(n.children) == 2:
@@ -2197,7 +2280,8 @@ def _omd_convert(
     Tries each member: om_elem leaves convert when the value class has
     an affine member of ``kind`` over ``h_eid``; om_compose members
     convert when both sides do.  ``om`` packaging leaves (concrete
-    numerators) cannot convert."""
+    numerators) cannot convert.
+    """
     cid = eg.find(cid)
     key = (cid, h_eid, kind)
     if key in memo:
@@ -2237,8 +2321,7 @@ def _omd_convert(
 def omd_tree_lift(
     eg: EGraph, *, witness: bool = True, provenance: str = "omd_lift"
 ) -> list[dict]:
-    """Lift ``om_apply`` members whose carrier tree is entirely
-    scan-valued into the deferred ``omd`` carrier.
+    """Lift ``om_apply`` members with an entirely scan-valued carrier tree.
 
     For each ``om_apply`` enode, collect the h-options of every
     reachable ``om_elem`` leaf; for each candidate h and each fiber

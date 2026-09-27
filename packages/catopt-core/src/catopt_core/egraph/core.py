@@ -55,6 +55,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         track_proofs: bool | None = None,
         truncation_level: int = 2,
     ) -> None:
+        """Initialise the union-find, class maps, and saturation state."""
         if truncation_level not in (1, 2, 3):
             raise ValueError(
                 f"truncation_level must be 1, 2, or 3, "
@@ -118,16 +119,20 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     @property
     def n_classes(self) -> int:
+        """Return the number of e-classes."""
         return len(self._classes)
 
     @property
     def n_enodes(self) -> int:
+        """Return the number of enodes."""
         return len(self._node_to_class)
 
     def find(self, eid: int) -> int:
+        """Return the canonical e-class id of ``eid``."""
         return self._uf.find(eid)
 
     def get_class(self, eid: int) -> EClass:
+        """Return the e-class containing ``eid``."""
         return self._classes[self.find(eid)]
 
     def add_leaf(self, key: str, provenance: str | None = None) -> int:
@@ -344,6 +349,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     @property
     def n_proof_edges(self) -> int:
+        """Return the number of recorded proof edges."""
         return len(self._merge_log)
 
     @property
@@ -366,8 +372,10 @@ class EGraph(_ExtractMixin, _ProofMixin):
         error_bound: float | None = None,
         bound_norm: str = "spectral",
     ) -> Rewrite | None:
-        """Synthesise the pointwise :class:`Rewrite` certifying one
-        non-locally offered member — see :meth:`_offer_witness`.
+        """Synthesise the pointwise :class:`Rewrite` for an offered member.
+
+        Certifies one non-locally offered member — see
+        :meth:`_offer_witness`.
 
         ``lhs`` defaults to the *oldest* member of ``cid``'s class —
         the term the e-graph saw first — chosen so the certificate's
@@ -430,8 +438,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         bound_norm: str = "spectral",
         term_provenance: str = "input",
     ) -> bool:
-        """Offer a non-locally-computed member under a pointwise
-        witness — the canonical ritual behind every non-local pass.
+        """Offer a non-locally-computed member under a pointwise witness.
+
+        The canonical ritual behind every non-local pass.
 
         A non-local pass offers a member no LHS pattern could produce
         (it is computed from the whole e-graph, not from a matched
@@ -824,8 +833,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
     def _min_term(
         self, eid: int, memo: dict, _seen: frozenset = frozenset()
     ) -> tuple[Any, float]:
-        """Smallest (fewest ops) acyclic member of an e-class, as
-        ``(term, size)``.
+        """Return the smallest acyclic member of an e-class.
+
+        Returns ``(term, size)`` — fewest ops wins.
 
         Used to feed rewrite side conditions: every member of the class
         is an equally valid binding, but a compact representative makes
@@ -871,8 +881,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         return best
 
     def _any_term_cached(self, eid: int) -> Any:
-        """Member resolution for rewrite side conditions, memoised for
-        the duration of one ``apply_rule``.
+        """Resolve a member for rewrite side conditions.
+
+        Memoised for the duration of one ``apply_rule``.
 
         Resolves to the class's *minimum-size* member rather than an
         arbitrary one: ``check``/``derive`` contracts only require *a*

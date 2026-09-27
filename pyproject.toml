@@ -151,25 +151,6 @@ ignore = [
     "E501",     # line length — math/notation lines exceed 72 legitimately
     "B008",     # function-call in default arg — used for cost-fn defaults
     "SIM108",   # ternary suggestion — if/else often clearer here
-    # --- pydocstyle (D) ratchet -------------------------------------
-    # Docstring quality is enforced, but the currently-violated rules
-    # are ratcheted off as a backlog (see AGENTS.md). Remove entries
-    # from this list as docstrings are brought up to standard; never
-    # add new ones.
-    "D203",     # one-blank-line-before-class — conflicts with D211
-    "D213",     # multi-line-summary-second-line — conflicts with D212
-    "D102",     # missing docstring in public method
-    "D103",     # missing docstring in public function
-    "D105",     # missing docstring in magic method
-    "D107",     # missing docstring in __init__
-    "D202",     # no blank line after function docstring
-    "D205",     # missing blank line after summary
-    "D209",     # new line after last paragraph
-    "D301",     # backslash in docstring (use r"""...)
-    "D400",     # first line should end with a period
-    "D401",     # non-imperative mood
-    "D403",     # first word uncapitalized
-    "D413",     # missing blank line after last section
 ]
 
 # The docstring gate applies to shipped code only: tests and bench are

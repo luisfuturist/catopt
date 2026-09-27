@@ -1,6 +1,8 @@
 # ruff: noqa: RUF002
-"""Selective state-space model (SSM) blocks — Mamba/S4-style input-dependent
-dynamics, used as targets for the affine-map scan laws (``SCAN_LAWS``).
+"""Selective state-space model (SSM) blocks.
+
+Mamba/S4-style input-dependent dynamics, used as targets for the
+affine-map scan laws (``SCAN_LAWS``).
 
 Two recurrence forms live here:
 
@@ -53,6 +55,7 @@ class SelectiveSSM(nn.Module):
         d_inner: state dimension (16–32 keeps the e-graph small).
         d_in:    input feature dimension.
         steps:   sequence length T — the loop is unrolled at export time.
+
     """
 
     eye: torch.Tensor
@@ -60,6 +63,7 @@ class SelectiveSSM(nn.Module):
     def __init__(
         self, d_inner: int = 16, d_in: int = 16, steps: int = 16
     ) -> None:
+        """Initialise the transition, projections, and initial state."""
         super().__init__()
         self.A = nn.Parameter(torch.randn(d_inner, d_inner) * 0.05)
         self.delta_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -69,6 +73,7 @@ class SelectiveSSM(nn.Module):
         self.steps = steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Unroll the selective recurrence over ``steps``."""
         # x: (T, d_in)
         delta = torch.tanh(self.delta_proj(x))  # (T, d_inner), |Δ| < 1
         B = self.B_proj(x)  # (T, d_inner)
@@ -94,6 +99,7 @@ class DiagDenseSSM(nn.Module):
     def __init__(
         self, d_inner: int = 16, d_in: int = 16, steps: int = 16
     ) -> None:
+        """Initialise the decay projection and initial state."""
         super().__init__()
         self.decay_proj = nn.Linear(d_in, d_inner, bias=False)
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -102,6 +108,7 @@ class DiagDenseSSM(nn.Module):
         self.steps = steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Unroll the diagonal (dense-matmul) recurrence."""
         a = torch.sigmoid(self.decay_proj(x))  # (T, d_inner) in (0,1)
         B = self.B_proj(x)
         h = self.h0
@@ -112,8 +119,9 @@ class DiagDenseSSM(nn.Module):
 
 
 class DiagonalSSM(nn.Module):
-    """Mamba-faithful elementwise selective scan: ``h_t = a_t ⊙ h_{t-1}
-    + b_t ⊙ x_t``.
+    """Mamba-faithful elementwise selective scan.
+
+    Computes ``h_t = a_t ⊙ h_{t-1} + b_t ⊙ x_t``.
 
     Exported as ``add(mul(a_t, h), mul(b_t, x_t))`` — the affine step is
     present mathematically (a diagonal affine map) but ``SCAN_LAWS``
@@ -124,6 +132,7 @@ class DiagonalSSM(nn.Module):
     def __init__(
         self, d_inner: int = 16, d_in: int = 16, steps: int = 16
     ) -> None:
+        """Initialise the decay projection and initial state."""
         super().__init__()
         self.decay_proj = nn.Linear(d_in, d_inner, bias=False)
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -131,6 +140,7 @@ class DiagonalSSM(nn.Module):
         self.steps = steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Unroll the elementwise recurrence over ``steps``."""
         a = torch.sigmoid(self.decay_proj(x))
         b = self.B_proj(x)
         h = self.h0
