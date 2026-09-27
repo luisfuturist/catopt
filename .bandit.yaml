@@ -1,0 +1,27 @@
+# Bandit configuration for catopt.
+#
+# Run: .venv/bin/bandit -c .bandit.yaml -r packages catopt
+#
+# The scan is already scoped to shipped source by `-r packages catopt`;
+# `exclude_dirs` is stated explicitly so that a bare
+# `bandit -c .bandit.yaml -r .` stays equivalent.  tests/ and bench/ are
+# not production code and are intentionally out of scope.
+
+# Directories excluded from the scan (matched by path component).
+exclude_dirs:
+  - tests
+  - bench
+
+# Rule skips.  Every entry carries the reason it is safe in this codebase.
+skips:
+  # B112 try_except_continue ------------------------------------------------
+  # meta.py's equality-saturation rule matcher wraps each candidate
+  # rewrite's guard (`r2.check`) and `derive` in `try/except Exception:
+  # continue` (meta.py:1360-1372).  A rule whose guard or derivation
+  # raises simply does not apply to this candidate, so the loop must fall
+  # through to the next match; the exception is the *signal* to reject the
+  # candidate, not an error being masked.  The surrounding algorithm is
+  # total over candidates, so continuing is the correct control flow.
+  # This is a local, deliberate pattern — see the report for the inline
+  # `# nosec B112` alternative if a future edit wants per-site suppression.
+  - B112

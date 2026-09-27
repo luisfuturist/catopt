@@ -529,7 +529,7 @@ LINEAR_ROW_SCALE_REV = R(
 # ---------------------------------------------------------------------------
 
 
-def _head(t: str) -> Op:
+def _head(t: Op) -> Op:
     """The head-splitting view: view(t, S) then transpose(1, 2)."""
     return Op.make(
         "transpose", Op.make("reshape", t, shape="S"), dim0=1, dim1=2

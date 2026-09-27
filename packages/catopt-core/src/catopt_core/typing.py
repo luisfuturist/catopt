@@ -33,7 +33,7 @@ op-dispatch match runs — after ``_INVALID`` propagation and the
 unknown/empty early-returns — so a handler sees only non-``None``
 operand shapes and must still map a carrier-internal ``()`` operand to
 ``None``.  Zero-argument ops (``eye``/``cswap`` constant morphisms)
-have their handler called with ``shapes = ()`` — their shapes are
+have their handler called with ``shapes = []`` — their shapes are
 fully determined by attrs.
 
 The ``aff``/``apply``/``om``/``omd``/``trace``/``bdiag``/``parl``
@@ -101,7 +101,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
     # empty-shapes early return below.
     rule = _SHAPE_RULES.get(op.op)
     if rule is not None and not op.args:
-        return rule(op, ())
+        return rule(op, [])
     shapes = [_shape_of(a, memo) for a in op.args]
     if any(s is _INVALID for s in shapes):
         return _INVALID
@@ -574,7 +574,7 @@ _ShapeRule = Callable[[Op, list], tuple | str | None]
 
 #: ``{op_name: fn(op, shapes) -> shape}`` — consulted by
 #: ``_infer_op_shape`` after the ``_INVALID``/unknown early-returns
-#: (or immediately for zero-argument ops, which get ``shapes = ()``).
+#: (or immediately for zero-argument ops, which get ``shapes = []``).
 _SHAPE_RULES: dict[str, _ShapeRule] = {}
 
 
