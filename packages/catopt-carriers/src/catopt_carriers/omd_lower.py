@@ -68,6 +68,8 @@ from catopt_torch.torch_bridge import _IR_TO_TORCH, IRModule
 # resolve lazily through carrier_torch_bindings() (each module's
 # TORCH_BINDINGS export).
 import catopt_carriers.xcarrier  # noqa: F401
+from catopt_carriers.om_fused import fused_omd_levels, fused_omdm_levels
+from catopt_carriers.scan_fused import occurrence_slots
 
 __all__ = [
     "BatchedOmdModule",
@@ -290,7 +292,9 @@ def build_omd_plan(root: Any) -> dict | None:
     )
 
     # ---- scan leaf tensor args (and h) for map projections -----------
-    targets: dict[Any, tuple[Any, str]] = {}  # map term -> (term, domain)
+    targets: dict[
+        Any, tuple[Any, str]
+    ] = {}  # map term -> (term, domain)
     raw_proj: list[tuple[Op, int, Any]] = []  # (node, comp_idx, map)
     raw_stack: list[tuple[Op, int, str, list, int]] = []
     scanned: set[Any] = set()
@@ -390,10 +394,7 @@ def build_omd_plan(root: Any) -> dict | None:
                     for a in mp.args:
                         stack.append((a, dom, False))
                     continue
-                lv = (
-                    max(d["level_of"].get(a, 0) for a in mp.args)
-                    + 1
-                )
+                lv = max(d["level_of"].get(a, 0) for a in mp.args) + 1
                 d["level_of"][tid] = lv
                 while len(d["levels"]) < lv:
                     d["levels"].append([])
@@ -436,7 +437,9 @@ def build_omd_plan(root: Any) -> dict | None:
         before = len(targets)
         walk_map(mp, dom)
         if len(targets) > before:
-            queue.extend(list(targets.values())[before:])  # pragma: no cover — queue always empty here
+            queue.extend(
+                list(targets.values())[before:]
+            )  # pragma: no cover — queue always empty here
     if bad:
         return None
 
@@ -485,7 +488,8 @@ def build_omd_plan(root: Any) -> dict | None:
     if chain:
         dom = next(iter(tdoms))
         if any(
-            isinstance(lf, Op) and _LEAF_OP.get(lf.op) not in (None, dom)
+            isinstance(lf, Op)
+            and _LEAF_OP.get(lf.op) not in (None, dom)
             for lf in base
         ) or not _sig_uniform(base, dom):
             chain = False
@@ -579,6 +583,7 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
         self,
         ir: Any,
         param_values: dict[str, torch.Tensor] | None = None,
+        fused: bool | str = False,
     ) -> None:
         super().__init__()
         if not isinstance(ir, IR):
@@ -591,6 +596,54 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
         self._const_cache: dict[tuple, torch.Tensor] = {}
         self._init_graph_state()
         self.fallbacks = 0  # times the batched path declined at runtime
+        self._init_fused(fused)
+
+    def _init_fused(self, fused: bool | str) -> None:
+        """Resolve the ``fused`` flag — the canonical adjacent-pair
+        reduction (:func:`fused_omd_levels`/`fused_omdm_levels`).
+
+        The omd leaf stacks are NOT occurrence-expanded (DAG-shared
+        leaves appear once), so the fused path needs the product-order
+        slot list — ``self._fused_occ`` — via
+        :func:`occurrence_slots` over the compose tree.  ``None``
+        (pathological sharing, or no plan) declines the fused path at
+        runtime, counted in ``fallbacks``.
+        """
+        self._fused: str | None = None
+        self._fused_occ: list[int] | None = None
+        self._fused_c: Any = None
+        self._fused_compile_failed = False
+        if not fused or self._plan is None:
+            return
+        if fused not in (True, "eager", "compile"):
+            raise ValueError(
+                f"fused must be True, 'eager', or 'compile'; got {fused!r}"
+            )
+        root = self.eval_mod._root
+        self._fused_occ = (
+            occurrence_slots(root.args[0], self._plan["omd_leaves"])
+            if isinstance(root, Op) and root.args
+            else None
+        )
+        self._fused = "eager" if fused == "eager" else "compile"
+
+    def _fused_call(self, body, *args: torch.Tensor) -> torch.Tensor:
+        """Run ``body`` — compiled when the mode calls for it, with a
+        permanent eager fallback on compile or call failure."""
+        if self._fused == "eager" or self._fused_compile_failed:
+            return body(*args)
+        if self._fused_c is None:
+            try:
+                self._fused_c = torch.compile(body, fullgraph=True)
+            except Exception:
+                self._fused_compile_failed = True
+                return body(*args)
+        try:
+            return self._fused_c(*args)
+        except Exception:
+            self._fused_compile_failed = True
+            self._fused_c = None
+            return body(*args)
 
     @property
     def is_batched(self) -> bool:
@@ -842,6 +895,34 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
                 l_all = torch.stack([v[1] for v in vals])
                 fa_all = torch.stack([v[2] for v in vals])
                 fb_all = torch.stack([v[3] for v in vals])
+                if self._fused is not None:
+                    # Canonical adjacent-pair reduction over the
+                    # occurrence-expanded leaf stacks — shrinking
+                    # tensors, no per-level gathers/cats, and Inductor
+                    # fuses the whole loop under compile mode.
+                    occ = self._fused_occ
+                    if occ is None:
+                        self.fallbacks += 1
+                    else:
+                        if occ != list(range(len(occ))):
+                            ix = self._gidx(occ, m_all)
+                            m_all, l_all, fa_all, fb_all = (
+                                t.index_select(0, ix)
+                                for t in (m_all, l_all, fa_all, fb_all)
+                            )
+                        fn = (
+                            fused_omdm_levels
+                            if plan["apply_op"] == "omd_applym"
+                            else fused_omd_levels
+                        )
+                        return self._fused_call(
+                            fn,
+                            m_all,
+                            l_all,
+                            fa_all,
+                            fb_all,
+                            ev(plan["h"]),
+                        )
                 for f_idx, g_idx in plan["omd_gather"]:
                     ixf = self._gidx(f_idx, m_all)
                     ixg = self._gidx(g_idx, m_all)
@@ -921,8 +1002,13 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
 def to_batched_omd_module(
     ir: Any,
     param_values: dict[str, torch.Tensor] | None = None,
+    fused: bool | str = False,
 ) -> BatchedOmdModule:
     """Lower ``ir`` (or a bare term) to a module, batching any leading
     ``omd_apply[m]`` term.  Non-omd roots transparently delegate to the
-    serial IRModule evaluator (check ``mod.is_batched``)."""
-    return BatchedOmdModule(ir, param_values=param_values)
+    serial IRModule evaluator (check ``mod.is_batched``).  ``fused``
+    selects the canonical shrinking-tensor reduction
+    (:func:`fused_omd_levels`/`fused_omdm_levels`) — ``True``/
+    ``"compile"`` runs it under ``torch.compile`` with an eager
+    fallback."""
+    return BatchedOmdModule(ir, param_values=param_values, fused=fused)

@@ -17,7 +17,7 @@ from catopt.cost import flops_cost
 from catopt.egraph import EGraph
 from catopt.ir import IR, Op, Param, TensorType, Var
 from catopt.om import OM_LAWS
-from catopt.om_lower import build_om_plan
+from catopt.om_lower import build_om_plan, to_batched_om_module
 from catopt.omd_lower import build_omd_plan
 from catopt.torch_bridge import ir_to_torch_module
 from catopt_carriers.om_fused import (
@@ -537,3 +537,132 @@ def test_fused_om_single_leaf_direct():
     a = torch.randn(1, T, dv, dtype=torch.float64)
     out = fused_om_levels(m, l_, a)
     assert torch.allclose(out, a[0] / l_[0])
+
+
+# ---------------------------------------------------------------------------
+#  Module wiring — to_batched_om_module / to_batched_omd_module fused=
+# ---------------------------------------------------------------------------
+
+
+def _om_small():
+    """A small chunked-attention om IR + inputs."""
+    torch.manual_seed(0)
+    q = Var("q", _T(1, 2, 4, 8))
+    ks = [Var(f"k{i}", _T(1, 2, 8, 8)) for i in range(4)]
+    vs = [Var(f"v{i}", _T(1, 2, 8, 8)) for i in range(4)]
+    ir = _om_ir(q, ks, vs)
+    xs = [
+        torch.randn(*v.typ.shape, dtype=torch.float64)
+        for v in [q, *ks, *vs]
+    ]
+    return ir, xs
+
+
+def test_batched_om_module_fused_matches_serial():
+    """BatchedOMModule(fused=...) matches serial fp64-exactly in all
+    modes — the wiring path, not just the standalone function."""
+    ir, xs = _om_small()
+    serial = ir_to_torch_module(ir)
+    for fused in (False, "eager", True):
+        mod = to_batched_om_module(ir, fused=fused)
+        assert mod.is_batched
+        with torch.no_grad():
+            diff = (mod(*xs) - serial(*xs)).abs().max().item()
+        assert diff < 1e-12
+
+
+def test_batched_om_module_fused_validation_and_fallbacks():
+    ir, xs = _om_small()
+    # invalid fused value
+    with pytest.raises(ValueError, match="fused must be"):
+        to_batched_om_module(ir, fused="bogus")
+    # fused on a non-om root: identity — generic path, no fused state
+    plain = IR(
+        root=Op.make("neg", Var("z", _T(4))),
+        inputs=[Var("z", _T(4))],
+        input_names={"z"},
+        params={},
+    )
+    mod = to_batched_om_module(plain, fused=True)
+    assert not mod.is_batched and mod._fused is None
+    # compile-failure fallback: eager fused body still correct
+    mod2 = to_batched_om_module(ir, fused=True)
+    mod2._fused_c = lambda *a: (_ for _ in ()).throw(RuntimeError("x"))
+    with torch.no_grad():
+        assert torch.allclose(mod2(*xs), ir_to_torch_module(ir)(*xs))
+    assert mod2._fused_compile_failed
+
+
+def test_batched_omd_module_fused_matches_serial():
+    """BatchedOmdModule(fused=...) on both fibers, fp64-exact."""
+    from catopt_carriers.omd_lower import to_batched_omd_module
+
+    for dense in (False, True):
+        ir, ss, aa, bb, h = _omd_ir(4, Tq=4, K=3, d=6, dense=dense)
+        xs = [
+            torch.randn(*s.typ.shape, dtype=torch.float64) for s in ss
+        ]
+        pv = {
+            a.name: torch.randn(*a.typ.shape, dtype=torch.float64)
+            for a in aa
+        }
+        pv.update(
+            {
+                b.name: torch.randn(*b.typ.shape, dtype=torch.float64)
+                for b in bb
+            }
+        )
+        pv["h"] = torch.randn(*h.typ.shape, dtype=torch.float64)
+        serial = ir_to_torch_module(ir, param_values=pv)
+        for fused in (False, "eager", True):
+            mod = to_batched_omd_module(
+                ir, param_values=pv, fused=fused
+            )
+            assert mod.is_batched
+            with torch.no_grad():
+                diff = (mod(*xs) - serial(*xs)).abs().max().item()
+            assert diff < 1e-12
+
+
+def test_batched_omd_module_fused_edges():
+    """fused validation, non-plan decline, and the occ-decline
+    fallback path are all covered."""
+    from catopt_carriers.omd_lower import to_batched_omd_module
+
+    ir, ss, aa, bb, h = _omd_ir(4, Tq=4, K=3, d=6)
+    pv = {
+        a.name: torch.randn(*a.typ.shape, dtype=torch.float64)
+        for a in aa
+    }
+    pv.update(
+        {
+            b.name: torch.randn(*b.typ.shape, dtype=torch.float64)
+            for b in bb
+        }
+    )
+    pv["h"] = torch.randn(*h.typ.shape, dtype=torch.float64)
+    xs = [torch.randn(*s.typ.shape, dtype=torch.float64) for s in ss]
+    with pytest.raises(ValueError, match="fused must be"):
+        to_batched_omd_module(ir, param_values=pv, fused="bogus")
+    # fused on a non-omd root: no plan → fused stays off
+    plain = IR(
+        root=Op.make("neg", Var("z", _T(4))),
+        inputs=[Var("z", _T(4))],
+        input_names={"z"},
+        params={},
+    )
+    mod = to_batched_omd_module(plain, fused=True)
+    assert not mod.is_batched and mod._fused is None
+    # occ decline → the uniform path still runs correctly via the
+    # standard level schedule
+    mod2 = to_batched_omd_module(ir, param_values=pv, fused="eager")
+    mod2._fused_occ = None  # simulate occurrence_slots decline
+    with torch.no_grad():
+        diff = (
+            (mod2(*xs) - ir_to_torch_module(ir, param_values=pv)(*xs))
+            .abs()
+            .max()
+            .item()
+        )
+    assert diff < 1e-12
+    assert mod2.fallbacks == 1  # the occ decline counted it

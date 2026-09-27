@@ -57,6 +57,8 @@ from catopt_torch.executors import (
 )
 from catopt_torch.torch_bridge import IRModule, _om_compose, _om_elem
 
+from catopt_carriers.om_fused import fused_om_levels
+
 __all__ = [
     "BatchedOMModule",
     "StreamingOMModule",
@@ -520,6 +522,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         self,
         ir: IR,
         param_values: dict[str, torch.Tensor] | None = None,
+        fused: bool | str = False,
     ) -> None:
         super().__init__()
         self._inputs = ir.inputs
@@ -530,6 +533,46 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         self._const_cache: dict[tuple, torch.Tensor] = {}
         self._init_graph_state()
         self._compiled = None
+        self._init_fused(fused)
+
+    def _init_fused(self, fused: bool | str) -> None:
+        """Resolve the ``fused`` flag — same convention as
+        :class:`BatchedScanModule`: ``None``/``"eager"``/``"compile"``.
+
+        The fused schedule runs :func:`fused_om_levels`' canonical
+        adjacent-pair reduction on the leaf stacks — ⊕ commutes and
+        the stacks are already mults-expanded, so no occurrence walk
+        is needed.  ``torch.compile(fullgraph=True)`` failures fall
+        back to the eager fused body permanently.
+        """
+        self._fused: str | None = None
+        self._fused_c: Any = None
+        self._fused_compile_failed = False
+        if not fused or self._plan is None:
+            return
+        if fused not in (True, "eager", "compile"):
+            raise ValueError(
+                f"fused must be True, 'eager', or 'compile'; got {fused!r}"
+            )
+        self._fused = "eager" if fused == "eager" else "compile"
+
+    def _fused_call(self, body, *args: torch.Tensor) -> torch.Tensor:
+        """Run ``body`` — compiled when the mode calls for it, with a
+        permanent eager fallback on compile or call failure."""
+        if self._fused == "eager" or self._fused_compile_failed:
+            return body(*args)
+        if self._fused_c is None:
+            try:
+                self._fused_c = torch.compile(body, fullgraph=True)
+            except Exception:
+                self._fused_compile_failed = True
+                return body(*args)
+        try:
+            return self._fused_c(*args)
+        except Exception:
+            self._fused_compile_failed = True
+            self._fused_c = None
+            return body(*args)
 
     @property
     def is_batched(self) -> bool:
@@ -696,7 +739,9 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
                 l_parts.append(l_)
                 a_parts.append(a)
             else:
-                for leaf, c in zip(grp["members"], grp["mults"], strict=True):
+                for leaf, c in zip(
+                    grp["members"], grp["mults"], strict=True
+                ):
                     f = ev(leaf)  # (m, l, a) triple
                     for _ in range(c):
                         m_parts.append(f[0].unsqueeze(0))
@@ -736,6 +781,14 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         l_all = torch.where(fin, l_all, 0.0)
         a_all = torch.where(fin, a_all, 0.0)
 
+        if self._fused is not None:
+            # Canonical adjacent-pair reduction on shrinking tensors —
+            # the compile-fusable form (fused_om_levels sanitises the
+            # leaves internally; the hoist above is idempotent).
+            return self._fused_call(
+                fused_om_levels, m_all, l_all, a_all
+            )
+
         # ---- Levels 1..L: batched om_compose -------------------------
         # ⊕ is associative AND commutative, so the extracted bracketing
         # is one of many correct schedules.  We run the canonical
@@ -769,14 +822,18 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
 def to_batched_om_module(
     ir: IR,
     param_values: dict[str, torch.Tensor] | None = None,
+    fused: bool | str = False,
 ) -> BatchedOMModule:
     """Lower ``ir`` to a module, level-batching any leading om term.
 
     Always returns a :class:`BatchedOMModule`; when ``ir.root`` is not
     ``om_apply(<om tree>)`` the module transparently delegates to the
-    serial IRModule evaluator (check ``mod.is_batched``).
+    serial IRModule evaluator (check ``mod.is_batched``).  ``fused``
+    selects the canonical shrinking-tensor reduction
+    (:func:`fused_om_levels`) — ``True``/``"compile"`` additionally
+    runs it under ``torch.compile`` with an eager fallback.
     """
-    return BatchedOMModule(ir, param_values=param_values)
+    return BatchedOMModule(ir, param_values=param_values, fused=fused)
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +998,9 @@ class StreamingOMModule(torch.nn.Module):
 
         state: tuple | None = None
         for grp in self._plan["leaf_groups"]:
-            for leaf, c in zip(grp["members"], grp["mults"], strict=True):
+            for leaf, c in zip(
+                grp["members"], grp["mults"], strict=True
+            ):
                 # Fresh memo per leaf: score blocks / per-leaf
                 # intermediates are dropped with the dict at the next
                 # iteration — the bounded-working-set property.  Inputs
