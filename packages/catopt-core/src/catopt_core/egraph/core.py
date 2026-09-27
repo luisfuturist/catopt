@@ -476,7 +476,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     def matches(
         self, pattern: Any, eid: int, max_results: int | None = None
-    ) -> list[dict[str, int]]:
+    ) -> list[dict[str, Any]]:
         """Find all substitutions that match *pattern* at e-class *eid*.
 
         ``max_results`` bounds the enumeration: matching stops once
@@ -484,7 +484,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         first-found wins) and used by the saturation loop to enforce
         per-rule expansion budgets inside giant e-classes.
         """
-        results: list[dict[str, int]] = []
+        results: list[dict[str, Any]] = []
         self._match(pattern, eid, {}, results, max_results)
         return results
 
@@ -492,8 +492,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
         self,
         pattern: Any,
         eid: int,
-        subst: dict[str, int],
-        results: list[dict[str, int]],
+        subst: dict[str, Any],
+        results: list[dict[str, Any]],
         limit: int | None = None,
     ) -> None:
         if limit is not None and len(results) >= limit:
@@ -560,7 +560,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 child_substs: list[dict[str, Any]] = attr_substs
                 ok = True
                 for i, pat_arg in enumerate(pattern.args):
-                    new_substs: list[dict[str, int]] = []
+                    new_substs: list[dict[str, Any]] = []
                     for cs in child_substs:
                         if (
                             limit is not None
@@ -568,7 +568,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
                         ):
                             ok = False
                             break
-                        child_results: list[dict[str, int]] = []
+                        child_results: list[dict[str, Any]] = []
                         self._match(
                             pat_arg,
                             node.children[i],
@@ -721,7 +721,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     # -- rule application --
 
-    def _instantiate(self, pattern: Any, subst: dict[str, int]) -> int:
+    def _instantiate(self, pattern: Any, subst: dict[str, Any]) -> int:
         """Instantiate a pattern (RHS) with a substitution.
 
         When proof tracking is on, ``self._inst_last_enode`` records the

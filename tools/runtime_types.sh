@@ -74,4 +74,14 @@ exec .venv/bin/python -m pytest -q -p no:cacheprovider \
     tests/test_struct_real.py \
     tests/test_e2e_pipeline.py \
     tests/test_compositional.py \
-    tests/test_hybrid.py
+    tests/test_hybrid.py \
+    tests/test_om_causal.py \
+    tests/test_cov2_regime.py \
+    tests/test_regime.py \
+    tests/test_cov2_laws.py \
+    tests/test_mask_chunk.py \
+    tests/test_trace.py \
+    tests/test_trace_lift.py \
+    tests/test_trace_pipeline.py \
+    tests/test_xcarrier.py \
+    tests/test_xcarrier_mha.py

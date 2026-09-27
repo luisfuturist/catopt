@@ -146,19 +146,21 @@ shipped code only — `tests/**` and `bench/**` ignore `D`.
 `typeguard` (dev dep) enforces annotations at runtime.
 `tools/runtime_types.sh` instruments all four packages
 (`--typeguard-packages=catopt_core,catopt_torch,catopt_carriers,catopt_optimize`)
-and runs 58 test files (1147 tests) — a manual-stage gate that CI also
-runs (~9 min).  It caught several real annotation bugs, all fixed:
+and runs 68 test files (1372 tests) — a manual-stage gate that CI also
+runs (~11 min).  It caught several real annotation bugs, all fixed:
 `laws/tensor._head` was annotated `str` but takes an `Op`;
 `typing._infer_op_shape` passed a `tuple` to zero-arg shape rules typed
 `list`; `typing._shape_of` returned the `_INVALID` string sentinel under
-a `tuple | None` return type; and the adapter `eval_term` / `ev_factory`
-/ carrier-module `forward`s declared `-> torch.Tensor` returns that are
-really carrier tuples or `None` (widened to `Any`).  One parameter was
-renamed `memo` → `memo_env` to dodge a typeguard 4.6 shadowing bug.
-Files still left out (and why): heavy saturation tests that exceed
-~20 min under instrumentation, tests that deliberately pass
-wrong-typed values on an error path, and a few blocked on core
-`subst` / `_head` annotations.  Grow the list in the script.
+a `tuple | None` return type; `EGraph.matches`/`_match` substituted
+attribute metavariables (floats/strs) into `dict[str, int]`; and the
+adapter `eval_term` / `ev_factory` / carrier-module `forward`s declared
+`-> torch.Tensor` returns that are really carrier tuples or `None`
+(widened to `Any`).  One parameter was renamed `memo` → `memo_env` to
+dodge a typeguard 4.6 shadowing bug.  Files still left out (and why):
+heavy saturation tests that exceed ~20 min under instrumentation
+(`test_torch_integration`, `test_omd_lower`, `test_om_mha`), and a few
+error-path tests that deliberately pass wrong-typed values.  Grow the
+list in the script.
 
 ## Mutation testing (mutmut)
 

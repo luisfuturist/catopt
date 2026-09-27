@@ -529,7 +529,7 @@ LINEAR_ROW_SCALE_REV = R(
 # ---------------------------------------------------------------------------
 
 
-def _head(t: Op) -> Op:
+def _head(t: Any) -> Op:
     """The head-splitting view: view(t, S) then transpose(1, 2)."""
     return Op.make(
         "transpose", Op.make("reshape", t, shape="S"), dim0=1, dim1=2
@@ -618,7 +618,7 @@ QKV_FUSE = R(
 # ---------------------------------------------------------------------------
 
 
-def _head_v(t: Any, shape_var: str) -> Op:
+def _head_v(t: Any, shape_var: Any) -> Op:
     """Head view with a per-projection shape metavariable."""
     return Op.make(
         "transpose",
