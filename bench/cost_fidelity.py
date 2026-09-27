@@ -80,8 +80,10 @@ from catopt.cost import (
     dag_cost,
     depth_cost,
     depth_cost_for,
+    executor_cost_for,
     flops_cost,
     launch_aware_cost,
+    lowering_aware_cost_for,
     param_bytes_cost_for,
     roofline_cost,
     roofline_cost_for,
@@ -131,6 +133,8 @@ _COST_FN_NAMES = (
     "roofline_rtx",
     "roofline_cal",
     "depth_cal",
+    "exec_generic",
+    "lowering_min",
 )
 
 
@@ -147,6 +151,11 @@ def _cost_table(profile, source_tensors):
         "roofline_rtx": roofline_cost,
         "roofline_cal": roofline_cost_for(profile),
         "depth_cal": depth_cost_for(profile),
+        # Executor-aware: what optimize_model's default prices
+        # (additive generic-dispatch), and the min-over-lowerings
+        # frontier view (whole-term price, reporting-only).
+        "exec_generic": executor_cost_for(profile, lowering="generic"),
+        "lowering_min": lowering_aware_cost_for(profile),
     }
 
 
