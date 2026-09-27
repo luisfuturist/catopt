@@ -67,6 +67,26 @@ Deep stacks use `optimize_compositional`, which optimizes each block
 against its captured real input and recomposes with per-block
 verification and automatic fallback.
 
+## 60-second demo
+
+```bash
+python demo.py                 # CPU
+python demo.py --device cuda   # GPU (needs CUDA torch)
+python demo.py --quick         # shorter timing loop
+```
+
+One command runs the whole story on a gated projection block
+(PaLM-style gates + a 10-deep value chain, `y = Wo(σ(Wg·x) ⊙ σ(Wr·x)
+⊙ (Wv·x@W₁@…@W₁₀))`): equality-saturation search, the replayable
+certificate verified standalone, the extracted op tree, and a synced
+median benchmark vs eager and `torch.compile`. The script re-execs
+itself under `PYTHONHASHSEED=0` so the e-graph run — and the
+certificate — is bit-for-bit reproducible.
+
+On the dev box: **~2.1× vs eager and torch.compile** on CPU, ~2.6×
+on an RTX 2050 — from transforms Inductor structurally cannot do
+(projection concat + weight-first fold).
+
 ## Mechanism
 
 **The claim**: e-graphs + semantic carriers discover transformations
