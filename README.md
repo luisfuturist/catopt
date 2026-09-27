@@ -47,7 +47,7 @@ RTX 2050, synced timing.
 | **FLOP reduction** (reassociation, weight merging, factorization) | DeepParallel b=4096 | **2.51×** GPU / **3.02×** CPU |
 | **Asymptotic reassociation** | LinearAttention `(QKᵀ)V → Q(KᵀV)`: O(T²d)→O(Td²) | **8.0×** at T=2048 |
 | **Weights-first fold** (k-deep chain → 1 GEMM; Inductor's post-grad graph keeps all k left-assoc `mm`s — captured live) | `x @ W₁@…@W₁₆` | **15.9× vs Inductor** GPU at k=16 — a transform it structurally cannot reach |
-| **Scan lift on real blocks** | RetNet/GLA/delta-rule blocks (parallel-scan carrier, fp64-exact) | **2.1–21.7× vs eager** GPU at T≤2048 |
+| **Scan lift on real blocks** | RetNet/GLA/delta-rule blocks — `optimize_model` selects + delivers the carrier itself | **3× vs eager** CPU+GPU at T=128; **3.9×** composed (`compile=True`); certified where Inductor can't compile (GLA T=2048) |
 | **Attention fold** | `softmax(masked_fill(qkᵀ·s)) @ v` → `sdpa(is_causal)` | **4.6×** vs eager, **2.5×** under Inductor (nanoGPT, T=2048) |
 | **Parallel-scan discovery** | LTI recurrence → balanced Blelloch tree | **6.3×** CUDA-graph, T=64 |
 | **Diagonal-affine scan** | Mamba-faithful `a⊙h + b⊙x` | **4.4×** CUDA-graph, T=64 |
@@ -127,8 +127,8 @@ The honest regime map, all measured:
 | Conv pairing | **Wins** — Inductor never fuses cuDNN calls |
 | GEMM pairing on transformer blocks | **Parity** — ~40 non-GEMM kernels/layer dilute it |
 | Real trained checkpoints (stories15M/110M) | **Parity** — all blocks transform and verify, no win at these sizes |
-| Scan lift on real linear-attention blocks (GPU) | **Wins 2.1–21.7× vs eager**; **loses** to a *compiled* Inductor |
-| Inductor compile wall on unrolled recurrences | **Win by reachability** — Inductor's compile grows superlinearly in T (54–85s at T=2048, >60s timeout on GLA); CatOpt ships a certified O(log T) schedule in seconds |
+| Scan lift on real linear-attention blocks | **3× vs eager** delivered end-to-end (CPU+GPU); **3.9×** composed with `compile=True`; **loses** to a *compiled* Inductor where it can compile |
+| Inductor compile wall on unrolled recurrences | **Win by reachability** — Inductor's compile grows superlinearly in T (54–85s at T=2048, >60s timeout on GLA T=2048); CatOpt ships a certified O(log T) schedule where Inductor emits nothing. Caveat: CatOpt's own pipeline is slower than Inductor's compile where Inductor succeeds (262s at T=2048) — pipeline scalability is the open engineering cost |
 | Launch-bound decode cells (B=1, T≤64) | **Loses 4–15%** — split-view copies cost more than saved launches |
 | Large cells (B≥8, T≥128, stories110M) | **Parity** — GEMM-shape efficiency washes out at ~1% |
 
@@ -141,17 +141,21 @@ launch-bound hypothesis was falsified — on blocks, on whole models,
 and on the large-cell crossover sweep (`bench/decode_bench.py`).
 
 Real linear-attention blocks (`bench/real_linear_attn.py`, RetNet /
-GLA / delta-rule shapes, GPU): the scan-carrier lift produces a
-certified O(log T) schedule — fp64-exact through a saturated e-graph —
-beating eager 9.4–21.7× at T≤2048. The honest split: a *successfully
-compiled* Inductor is still faster (it fuses the unrolled pointwise
-chain into ~one kernel, 0.06–0.15ms), **but Inductor's compile time
-explodes with the unrolled horizon** — 54s at T=512, 85s at T=2048 on
-RetNet, and GLA T=2048 doesn't compile within the 60s timeout at all.
-At that horizon CatOpt's seconds-linear pipeline is the only path that
-produces an optimized schedule. Kernel-side, per-leaf eval cost is the
-gap to close — the schedule exists, the executor isn't yet as lean as
-Inductor's fused pointwise.
+GLA / delta-rule shapes, GPU): `optimize_model` now *selects and
+delivers* the batched-scan schedule itself — `root=applyd`,
+fp64-exact — 2.9× vs eager on CPU, 3.0× GPU (0.14/0.41ms). Composed
+(`compile=True`, batched + Inductor fusion): **0.122ms vs eager
+0.482** — 3.9×, within ~2× of Inductor-on-eager (0.056). The honest
+split: a *successfully compiled* Inductor is still faster when it can
+compile (it fuses the unrolled pointwise chain into ~one kernel), and
+Inductor's compile time explodes with the unrolled horizon — 54s at
+T=512, 85s at T=2048 on RetNet — but **GLA T=2048 doesn't compile
+within the 60s timeout at all**, where CatOpt delivers a certified
+schedule (262s pipeline, runtime parity with eager). Pipeline time
+itself is the honest limitation at large T — the spine walk +
+e-graph over thousands of steps is currently slower than Inductor's
+compile where Inductor succeeds, and CatOpt's is the only path left
+where it doesn't.
 
 **Cost-model fidelity** (`bench/cost_fidelity.py`, GPU): the parity
 map above is a *pricing* story more than a search story. Priced-vs-
