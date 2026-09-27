@@ -55,7 +55,7 @@ from catopt_core.laws import (
     share_duplicate_params,
 )
 from catopt_core.ops import OpTable
-from catopt_core.ports import CostFn, OpRegistry, Sink, Source
+from catopt_core.ports import CostFn, Executor, OpRegistry, Sink, Source
 from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.report import (
     BlockReport,
@@ -457,7 +457,7 @@ def discover_alternatives(
 @_oom_to_resource_error
 def optimize_model(
     model: torch.nn.Module,
-    example_input: torch.Tensor,
+    example_input: torch.Tensor | tuple[torch.Tensor, ...],
     *,
     ruleset: str = "all",
     max_iterations: int = 100,
@@ -470,7 +470,7 @@ def optimize_model(
     sink: Sink | None = None,
     compile: bool = False,
     verbose: bool = True,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
+) -> tuple[Executor, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
 
     Parameters

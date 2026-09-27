@@ -648,43 +648,48 @@ class EGraph(_ExtractMixin, _ProofMixin):
             eclass = self._classes[eid]
             new_nodes: set[ENode] = set()
             for node in eclass.nodes:
-                if node.children:
-                    canon = tuple(self.find(c) for c in node.children)
-                    if canon != node.children:
-                        changed = True
-                        # ``nn`` replaces ``node``: register the upward
-                        # edge for each canonical child so later changes
-                        # below propagate dirty to this class.  (``eid``
-                        # is already dirty — it is an ancestor of the
-                        # merge that forced the canonicalisation.)
-                        for c in canon:
-                            self._parents.setdefault(
-                                self.find(c), set()
-                            ).add(eid)
-                    nn = ENode(node.op, canon, node.attrs)
-                    new_nodes.add(nn)
-                    if self._track and nn != node:
-                        # The canonicalized enode inherits the original's
-                        # provenance — same term, fresh child ids.
-                        if node in self._enode_origin:
-                            self._enode_origin.setdefault(
-                                nn, self._enode_origin[node]
-                            )
-                        if node in self._enode_birth:
-                            self._enode_birth.setdefault(
-                                nn, self._enode_birth[node]
-                            )
-                        if node in self._enode_app:
-                            self._enode_app.setdefault(
-                                nn, self._enode_app[node]
-                            )
-                        self._node_to_class.setdefault(nn, eid)
-                else:
-                    new_nodes.add(node)
+                nn, node_changed = self._canonical_node(node, eid)
+                changed = changed or node_changed
+                new_nodes.add(nn)
             if new_nodes != eclass.nodes:
                 eclass.nodes = new_nodes
                 eclass.by_op = None
         return changed
+
+    def _canonical_node(
+        self, node: ENode, eid: int
+    ) -> tuple[ENode, bool]:
+        """Canonicalize one enode's children; return (enode, changed).
+
+        When children change, register the upward edge for each
+        canonical child so later changes propagate dirty to ``eid``
+        (already dirty — it is an ancestor of the merge that forced the
+        canonicalisation), and carry the original's provenance onto the
+        fresh enode (same term, new child ids).
+        """
+        if not node.children:
+            return node, False
+        canon = tuple(self.find(c) for c in node.children)
+        if canon == node.children:
+            return node, False
+        for c in canon:
+            self._parents.setdefault(self.find(c), set()).add(eid)
+        nn = ENode(node.op, canon, node.attrs)
+        if self._track:
+            self._inherit_provenance(node, nn, eid)
+        return nn, True
+
+    def _inherit_provenance(
+        self, node: ENode, nn: ENode, eid: int
+    ) -> None:
+        """Copy ``node``'s tracking metadata onto its canonical ``nn``."""
+        if node in self._enode_origin:
+            self._enode_origin.setdefault(nn, self._enode_origin[node])
+        if node in self._enode_birth:
+            self._enode_birth.setdefault(nn, self._enode_birth[node])
+        if node in self._enode_app:
+            self._enode_app.setdefault(nn, self._enode_app[node])
+        self._node_to_class.setdefault(nn, eid)
 
     def _close_congruence(self) -> bool:
         """Union e-classes whose canonical enodes coincide.
@@ -692,28 +697,26 @@ class EGraph(_ExtractMixin, _ProofMixin):
         Congruence: two enodes that are identical after child
         canonicalisation must share a class.  ``union`` merges them and
         can make further children canonical, so iterate to a fixed
-        point.  Only the unrestricted :meth:`rebuild` calls this; the
-        incremental (dirty-frontier) pass relies on the final
-        unrestricted rebuild to reach the fixed point.
+        point.  All duplicates found in a scan are merged in one round
+        (rather than one per round) — the merge cascade depth is small,
+        so this is O(rounds · enodes), not O(duplicates · enodes).  Only
+        the unrestricted :meth:`rebuild` calls this; the incremental
+        (dirty-frontier) pass relies on the final unrestricted rebuild.
         """
         changed = False
         while True:
             owner: dict[ENode, int] = {}
-            merge: tuple[int, int] | None = None
+            merges: list[tuple[int, int]] = []
             for eid in list(self._classes.keys()):
-                if self.find(eid) != eid:
-                    continue
                 for node in self._classes[eid].nodes:
                     prev = owner.setdefault(node, eid)
-                    if self.find(prev) != self.find(eid):
-                        merge = (prev, eid)
-                        break
-                if merge is not None:
-                    break
-            if merge is None:
+                    if prev != eid:
+                        merges.append((prev, eid))
+            if not merges:
                 return changed
             changed = True
-            self.union(*merge)
+            for a, b in merges:
+                self.union(a, b)
             self._canonicalise(list(self._classes.keys()))
 
     # -- rule application --

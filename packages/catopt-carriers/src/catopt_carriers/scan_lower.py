@@ -174,7 +174,7 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
     return True
 
 
-def _select_index(term: Op) -> tuple[Any, int, int] | None:
+def _select_index(term: Any) -> tuple[Any, int, int] | None:
     """Decompose ``select(base, dim, i)``/getitem-style leaf operands.
 
     Returns ``(base_term, dim, index)`` or ``None``.  Covers the
@@ -349,7 +349,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
 
     # -- execution ----------------------------------------------------
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> Any:
         g = self._graph
         if (
             g is not None
@@ -377,7 +377,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             dtype=torch.long,
         )
 
-    def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, *xs: torch.Tensor) -> Any:
         if self._plan is None:
             return self.eval_mod(*xs)
 

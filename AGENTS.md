@@ -144,16 +144,21 @@ shipped code only — `tests/**` and `bench/**` ignore `D`.
 ## Runtime contracts (typeguard)
 
 `typeguard` (dev dep) enforces annotations at runtime.
-`tools/runtime_types.sh` instruments the whole torch-free core
-(`--typeguard-packages=catopt_core`) and runs the core-focused test
-files (464 tests) — a manual-stage gate that CI also runs.  It caught
-three real annotation bugs, all fixed: `laws/tensor._head` was annotated
-`str` but takes an `Op`; `typing._infer_op_shape` passed a `tuple` to
-zero-arg shape rules typed `list`; and `typing._shape_of` returned the
-`_INVALID` string sentinel under a `tuple | None` return type.  Grow the
-file list in the script as more tests become typeguard-clean (the
-torch-adapter suites are out of scope — they exercise eager/compile
-paths, not the core contracts).
+`tools/runtime_types.sh` instruments all four packages
+(`--typeguard-packages=catopt_core,catopt_torch,catopt_carriers,catopt_optimize`)
+and runs 58 test files (1147 tests) — a manual-stage gate that CI also
+runs (~9 min).  It caught several real annotation bugs, all fixed:
+`laws/tensor._head` was annotated `str` but takes an `Op`;
+`typing._infer_op_shape` passed a `tuple` to zero-arg shape rules typed
+`list`; `typing._shape_of` returned the `_INVALID` string sentinel under
+a `tuple | None` return type; and the adapter `eval_term` / `ev_factory`
+/ carrier-module `forward`s declared `-> torch.Tensor` returns that are
+really carrier tuples or `None` (widened to `Any`).  One parameter was
+renamed `memo` → `memo_env` to dodge a typeguard 4.6 shadowing bug.
+Files still left out (and why): heavy saturation tests that exceed
+~20 min under instrumentation, tests that deliberately pass
+wrong-typed values on an error path, and a few blocked on core
+`subst` / `_head` annotations.  Grow the list in the script.
 
 ## Mutation testing (mutmut)
 

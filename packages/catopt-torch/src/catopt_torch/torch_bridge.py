@@ -804,7 +804,7 @@ def eval_term(
     var_env: dict | None = None,
     param_env: dict | None = None,
     bindings: Any = None,
-    memo: dict | None = None,
+    memo_env: dict | None = None,
     strict: bool = False,
     var_default: Any = _MISS,
     param_default: Callable[[Param], Any] | None = None,
@@ -826,7 +826,7 @@ def eval_term(
       :func:`_randn_param` — the unshaped-Param fallback), else
       failure.
     * ``Const`` → ``torch.tensor(value)``.
-    * ``Op``    → ``bindings[op](*args, **attrs)``; ``memo`` (when
+    * ``Op``    → ``bindings[op](*args, **attrs)``; ``memo_env`` (when
       given) dedups DAG-shared subtrees — interned terms are content
       keys.
 
@@ -871,8 +871,8 @@ def eval_term(
                 return None
             return v
         if isinstance(t, Op):
-            if memo is not None:
-                hit = memo.get(t)
+            if memo_env is not None:
+                hit = memo_env.get(t)
                 if hit is not None:
                     return hit
             fn = (bindings or {}).get(t.op)
@@ -900,8 +900,8 @@ def eval_term(
                         f"{type(out).__name__}, not a tensor"
                     )
                 return None
-            if memo is not None:
-                memo[t] = out
+            if memo_env is not None:
+                memo_env[t] = out
             return out
         if strict:
             raise TypeError(f"Cannot evaluate term: {t}")
@@ -1120,9 +1120,9 @@ class IRModule(torch.nn.Module):
             setattr(self, name, p)
             self._param_map[name] = p
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> Any:
         x = cast(torch.Tensor, xs[0] if xs else None)
-        env: dict[str, torch.Tensor] = {"self": x}
+        env: dict[str, Any] = {"self": x}
         # Map input placeholders positionally to forward args
         for i, inp in enumerate(self._inputs):
             env[inp.name] = xs[i] if i < len(xs) else x
@@ -1131,10 +1131,10 @@ class IRModule(torch.nn.Module):
     def _eval(
         self,
         term: Any,
-        env: dict[str, torch.Tensor],
-        x: torch.Tensor,
-        memo: dict[Any, torch.Tensor],
-    ) -> torch.Tensor:
+        env: dict[str, Any],
+        x: Any,
+        memo: dict[Any, Any],
+    ) -> Any:
         """Strict runtime evaluation — delegates to :func:`eval_term`.
 
         ``var_default=x`` is the single-input "self" fallback (``env``
@@ -1150,7 +1150,7 @@ class IRModule(torch.nn.Module):
             param_env=self._param_map,
             param_default=_randn_param,
             bindings=self._torch_bindings,
-            memo=memo,
+            memo_env=memo,
             strict=True,
         )
 

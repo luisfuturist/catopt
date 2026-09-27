@@ -225,14 +225,14 @@ class BatchedExecutorBase:
         self,
         env: dict[str, Any],
         x: Any,
-        memo: dict,
-    ) -> Callable[[Any], torch.Tensor]:
+        memo_env: dict,
+    ) -> Callable[[Any], Any]:
         """The ``ev(t)`` leaf-evaluation closure ``_forward_impl``
-        uses: ``t → eval_mod._eval(t, env, x, memo)``, memoising into
-        the caller's ``memo``."""
+        uses: ``t → eval_mod._eval(t, env, x, memo_env)``, memoising
+        into the caller's ``memo_env``."""
 
-        def ev(t: Any) -> torch.Tensor:
-            return self.eval_mod._eval(t, env, x, memo)
+        def ev(t: Any) -> Any:
+            return self.eval_mod._eval(t, env, x, memo_env)
 
         return ev
 

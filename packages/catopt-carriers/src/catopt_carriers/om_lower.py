@@ -566,7 +566,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
 
     # -- execution ----------------------------------------------------
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> Any:
         g = self._graph
         if (
             g is not None
@@ -671,7 +671,7 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
             [ev(leaf.args[1]) for leaf in grp["members"]]
         )
 
-    def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, *xs: torch.Tensor) -> Any:
         if self._plan is None:
             return self.eval_mod(*xs)
 
@@ -919,7 +919,7 @@ class StreamingOMModule(torch.nn.Module):
 
     # -- execution ----------------------------------------------------
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> Any:
         """Streaming fold → ``a / l`` (the om_apply readout)."""
         if self._plan is None:
             return self.eval_mod(*xs)
@@ -928,7 +928,7 @@ class StreamingOMModule(torch.nn.Module):
     def forward_state(
         self,
         *xs: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Any:
         """Streaming fold → the raw ``(m, l, a)`` carrier.
 
         This is the state a decode loop checkpoints: feed it to

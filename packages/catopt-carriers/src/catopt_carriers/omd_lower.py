@@ -608,7 +608,7 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
 
     # -- execution ----------------------------------------------------
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> Any:
         g = self._graph
         if (
             g is not None
@@ -752,7 +752,7 @@ class BatchedOmdModule(BatchedExecutorBase, torch.nn.Module):
             Pb.reshape(n, *shape_b)[:T],
         )
 
-    def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, *xs: torch.Tensor) -> Any:
         plan = self._plan
         if plan is None:
             return self.eval_mod(*xs)
