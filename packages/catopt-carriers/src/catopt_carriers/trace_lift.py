@@ -78,10 +78,20 @@ CAVEATS (when the pass declines):
     * T must be concrete — the spine length is the unrolled horizon;
       symbolic/dynamic loops have no finite F to build.
     * d must be concrete — ``usize`` and every block size are ints.
-    * states/inputs must be vectors ``(d,)``; dense maps ``(d,d)``;
-      diagonal maps ``(d,)``.
-    * the chain base must bottom out at a leaf (Param/Var/Const) or an
-      already-carried ``apply``/``applyd`` segment; a computed init
+    * the CARRIER lift accepts batched states: any concrete state
+      shape ``S`` works — diagonal maps/inputs need only broadcast
+      into ``S`` (a shared ``(d,)`` decay under ``(B,d)`` states), and
+      dense maps may be batched ``(*B,d,d)`` over column-vector states
+      ``(*B,d,1)`` — exactly the matmul signatures the ``aff``/
+      ``aff_compose`` bindings evaluate.  The TRACE offer still
+      requires the strict flat signature (vector states ``(d,)``,
+      dense maps ``(d,d)``, diagonal maps ``(d,)``): F's block layout
+      is built over a flat usize.
+    * the chain base must bottom out at a leaf (Param/Var/Const), an
+      already-carried ``apply``/``applyd`` segment, or a view thereof
+      (``reshape(h)``, ``x[i]``, ``h.contiguous()`` … — modules that
+      flatten a ``(B,d)`` init to ``(B·d,)`` place a reshape between
+      the input leaf and the flat recurrence state); a computed init
       state simply ends the walk (the segment above still lifts if it
       is ≥ ``min_steps``).
     * idempotent — re-running rebuilds the same hash-consed enodes.
@@ -100,7 +110,11 @@ from catopt_core.egraph import (
     _LeafRegistry,
 )
 from catopt_core.ir import Const, Op
-from catopt_core.typing import _shape_of
+from catopt_core.typing import (
+    _broadcast,
+    _matmul_shape,
+    _shape_of,
+)
 
 from catopt_carriers.scan_lower import build_scan_plan
 
@@ -125,6 +139,35 @@ _CARRIER_OPS = frozenset(
 #: trace simply consumes as its init).
 _BASE_OPS = frozenset({"leaf", "apply", "applyd"})
 
+#: Single-arg relayout ops the chain base may hide under: a module
+#: that carries a flattened or re-laid init (``h.reshape(B*d)``,
+#: ``x.transpose(0,1)``, dtype casts) puts these between the input
+#: leaf and the state the first step consumes — the class still IS
+#: the init value.  Indexing ops (select/getitem/slice/chunk/unbind)
+#: are deliberately absent: ``mul(a, x[t])`` in-terms would then read
+#: as phantom 1-step chains, tie-vetoing the real step-1 class.
+_BASE_VIEW_OPS = frozenset(
+    {
+        "reshape",
+        "view",
+        "flatten",
+        "unflatten",
+        "squeeze",
+        "unsqueeze",
+        "expand",
+        "broadcast_to",
+        "contiguous",
+        "clone",
+        "detach",
+        "to",
+        "alias",
+        "transpose",
+        "permute",
+        "movedim",
+        "t",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 #  Plans — a recognised recurrence spine, e-class ids throughout
@@ -148,6 +191,13 @@ class _Plan:
     ins: list
     h0: int
     step_states: list = field(default_factory=list)
+    #: The broadcast state shape — ``(d,)`` for the classic flat
+    #: signature, e.g. ``(B, d)`` for a batched diagonal state or
+    #: ``(B, d, 1)`` for a batched dense column-vector state.
+    shape: tuple = ()
+    #: ``shape == (d,)`` with the strict unbatched part signatures —
+    #: the only plans the trace offer's flat concat layout supports.
+    flat: bool = False
 
 
 #: Sentinel for "not yet resolved" in a per-scan shape memo.
@@ -172,6 +222,15 @@ def _shape_of_class(eg: EGraph, eid: int, memo: dict):
     return s
 
 
+def _concrete(shape) -> bool:
+    """All-int positive dims — the lift needs concrete sizes."""
+    return (
+        isinstance(shape, tuple)
+        and bool(shape)
+        and all(isinstance(x, int) and x > 0 for x in shape)
+    )
+
+
 def _consistent_shapes(
     eg: EGraph,
     kind: str,
@@ -179,27 +238,75 @@ def _consistent_shapes(
     ins: list,
     h0: int,
     shapes: dict | None = None,
-):
-    """All steps must share one concrete vector width — returns d."""
+) -> tuple | None:
+    """All steps must share one concrete state shape — ``(S, flat)``.
+
+    ``S`` is the broadcast state shape: the spine's per-step value
+    shape, inferred from h0, the maps, and the inputs together (a
+    sub-shaped init like a shared ``(d,)`` decay under ``(B,d)``
+    states is a real recurrence — broadcasting makes the monoid
+    algebra identical).  ``flat`` marks the strict flat-vector
+    signature the trace offer requires (h0 and every input exactly
+    ``(d,)``, diagonal maps ``(d,)`` / dense maps ``(d,d)``): the
+    concat-packed ``vec`` and F's block layout are written against
+    flat widths, not broadcasts.
+
+    Diagonal steps: every map and input need only broadcast INTO
+    ``S`` — ``affd_compose``/``applyd`` are pointwise, so the emitted
+    carrier is the same algebra over any leading batch dims.
+
+    Dense steps: maps must form ONE matmul family — all equal
+    ``(*P, d, d)`` — and the state shape must be closed under it:
+    ``M @ S == S`` (so ``f[0] @ g[0]``, ``f[0] @ g[1]``, and
+    ``f[0] @ h`` all evaluate under the bindings' literal ``@``).
+    That covers vector ``(d,)``, column-vector ``(*B,d,1)``, and
+    column-batched ``(d,*B)``-style states with shared ``(d,d)``
+    maps; each input must broadcast into S and stay so after the map.
+    """
     if shapes is None:
         shapes = {}
     hs = _shape_of_class(eg, h0, shapes)
-    if not (
-        isinstance(hs, tuple)
-        and len(hs) == 1
-        and isinstance(hs[0], int)
-        and hs[0] > 0
+    if not isinstance(hs, tuple) or not _concrete(hs):
+        return None
+    if kind == "diag":
+        S = hs
+        flat = len(hs) == 1
+        for e in (*maps, *ins):
+            s = _shape_of_class(eg, e, shapes)
+            if not _concrete(s):
+                return None
+            flat = flat and s == hs
+            S = _broadcast(S, s)
+            if not _concrete(S):
+                return None
+        return S, flat
+    # dense carrier
+    if not maps:
+        return None  # pragma: no cover — plans always have steps
+    M = _shape_of_class(eg, maps[0], shapes)
+    if not isinstance(M, tuple) or not (
+        _concrete(M) and len(M) >= 2 and _matmul_shape(M, M) == M
     ):
         return None
-    d = hs[0]
-    want_map = (d,) if kind == "diag" else (d, d)
-    for e in maps:
-        if _shape_of_class(eg, e, shapes) != want_map:
+    flat = len(hs) == 1 and (hs[0], hs[0]) == M
+    for e in maps[1:]:
+        if _shape_of_class(eg, e, shapes) != M:
             return None
+    S = hs
     for e in ins:
-        if _shape_of_class(eg, e, shapes) != (d,):
+        s = _shape_of_class(eg, e, shapes)
+        if not _concrete(s):
             return None
-    return d
+        flat = flat and s == hs
+        S = _broadcast(S, s)
+        if not _concrete(S):
+            return None
+        ms = _matmul_shape(M, s)
+        if ms is None or _broadcast(ms, S) != S:
+            return None
+    if _matmul_shape(M, S) != S:
+        return None
+    return S, flat
 
 
 # -- carrier path: apply/applyd members (reuses scan_lower's plan) ----
@@ -279,10 +386,20 @@ def _carrier_plan(eg: EGraph, cid: int, shapes: dict | None = None):
     maps = [eg.add_term(leaf.args[0]) for leaf in steps]
     ins = [eg.add_term(leaf.args[1]) for leaf in steps]
     h0 = eg.add_term(plan["h"])
-    d = _consistent_shapes(eg, kind, maps, ins, h0, shapes)
-    if d is None:
+    res = _consistent_shapes(eg, kind, maps, ins, h0, shapes)
+    if res is None:
         return None
-    return _Plan(kind, len(steps), d, maps, ins, h0)
+    S, flat = res
+    return _Plan(
+        kind,
+        len(steps),
+        S[-1],
+        maps,
+        ins,
+        h0,
+        shape=S,
+        flat=flat,
+    )
 
 
 # -- raw-spine path: add(mul|matmul) chains over e-classes ------------
@@ -326,6 +443,8 @@ class _Spine:
         # applyd member is emitted from the first (deterministically
         # sorted) maximal plan.
         self._allow_tied = allow_tied
+        # Per-scan chain-base verdicts (see _is_base).
+        self._base_memo: dict[int, bool] = {}
 
     def plan(self, cid: int):
         res = self._walk(self.eg.find(cid))
@@ -344,20 +463,55 @@ class _Spine:
             maps.append(s["map"])
             ins.append(s["in"])
             states.append(s["state"])
-        d = _consistent_shapes(
+        res = _consistent_shapes(
             self.eg, kind, maps, ins, base, self._shapes
         )
-        if d is None:
+        if res is None:
             return None
+        S, flat = res
         return _Plan(
             kind,
             len(steps),
-            d,
+            S[-1],
             maps,
             ins,
             base,
             step_states=states,
+            shape=S,
+            flat=flat,
         )
+
+    def _is_base(self, cid: int, _seen: frozenset = frozenset()):
+        """Is *cid* a usable chain base — a leaf, a carried segment,
+        or a value-level view of one?
+
+        Modules that carry a flattened or re-laid init put shape-only
+        wrappers between the input leaf and the state the first step
+        consumes (``decode_flat``-style ``h.reshape(B*d)``, transposed
+        layouts, dtype casts): the class still IS the init value, so
+        looking through ``_BASE_VIEW_OPS`` single-child nodes keeps
+        the walk honest without accepting a *computed* init — a view
+        of a non-base class (``reshape(sigmoid(x))``) still declines.
+        """
+        cid = self.eg.find(cid)
+        hit = self._base_memo.get(cid)
+        if hit is not None:
+            return hit
+        if cid in _seen:
+            return False
+        ec = self.eg._classes[cid]
+        seen = _seen | {cid}
+        res = any(
+            n.op in _BASE_OPS
+            or (
+                n.op in _BASE_VIEW_OPS
+                and len(n.children) == 1
+                and self._is_base(n.children[0], seen)
+            )
+            for n in ec.nodes
+        )
+        self._base_memo[cid] = res
+        return res
 
     def _candidates(self, node) -> list:
         """Decompositions of ``add(c0, c1)`` as map·state + input.
@@ -455,7 +609,7 @@ class _Spine:
                             # decompositions — veto
             if best is not None:
                 res = None if (tied and not self._allow_tied) else best
-            elif any(n.op in _BASE_OPS for n in ec.nodes):
+            elif self._is_base(cid):
                 res = ([], cid, None)  # chain base: h0 / carried
             else:  #   scan segment
                 res = None
@@ -920,6 +1074,11 @@ def lift_scan_to_trace(
     plans = _scan_plans(eg, root_eid, min_steps, maximal_only)
     lifts: list[TraceLift] = []
     for c, p in plans.items():
+        if not p.flat:
+            # Batched/broadcast state shapes lift through the carrier
+            # offer (lift_scan_to_applyd) — the trace offer's flat
+            # concat layout only exists for the strict (d,) signature.
+            continue
         if max_trace_T is not None and max_trace_T < p.T:
             continue
         lifts.extend(

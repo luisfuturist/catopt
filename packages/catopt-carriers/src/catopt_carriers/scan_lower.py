@@ -43,7 +43,12 @@ from typing import Any
 
 import torch
 from catopt_core.ir import IR, Op, Param, Var
-from catopt_core.typing import _shape_of
+from catopt_core.typing import (
+    _INVALID,
+    _broadcast,
+    _matmul_shape,
+    _shape_of,
+)
 from catopt_torch.executors import (
     BatchedExecutorBase,
     level_schedule,
@@ -63,6 +68,63 @@ __all__ = [
     "is_scan_apply_term",
     "to_batched_scan_module",
 ]
+
+
+#: Pure view/bookkeeping ops — single-arg terms that re-lay their
+#: input without computing on it (the same convention as
+#: ``cost._VIEW_OPS``, extended with the remaining single-arg aten
+#: spellings the exporter emits).  The scan plan is transparent to
+#: them on BOTH ends of the term: a chain's base may hide under one
+#: (``reshape(h0)`` inits — see ``trace_lift._Spine._is_base``), and
+#: the apply root may sit under them (``reshape(applyd(…), (B, d))``
+#: when the module reshapes its carried state on the way out) — the
+#: batched executor re-applies stripped output views verbatim through
+#: the ambient torch bindings, so the lowered value is unchanged.
+_VIEW_OPS = frozenset(
+    {
+        "reshape",
+        "view",
+        "flatten",
+        "unflatten",
+        "squeeze",
+        "unsqueeze",
+        "expand",
+        "broadcast_to",
+        "contiguous",
+        "clone",
+        "detach",
+        "to",
+        "alias",
+        "transpose",
+        "permute",
+        "movedim",
+        "t",
+        "select",
+        "getitem",
+        "slice",
+        "chunk",
+        "split",
+        "unbind",
+    }
+)
+
+
+def _strip_output_views(root: Any) -> tuple[Any, list]:
+    """Peel trailing ``_VIEW_OPS`` off a would-be scan root.
+
+    Returns ``(inner_root, post)`` where ``post`` lists the stripped
+    ``(op, attrs)`` wrappers OUTERMOST-first; re-applying them in
+    reverse order reproduces the original term's value exactly.
+    """
+    post: list = []
+    while (
+        isinstance(root, Op)
+        and root.op in _VIEW_OPS
+        and len(root.args) == 1
+    ):
+        post.append((root.op, dict(root.attrs)))
+        root = root.args[0]
+    return root, post
 
 
 def _fold_nested_apply(term: Any) -> Any:
@@ -132,8 +194,10 @@ def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
 def is_scan_apply_term(root: Any) -> bool:
     """True if ``root`` is ``apply[d](<map tree>, h)`` — dense or
     diagonal affine scan application (nested ``apply`` segments are
-    first folded into the compose spine)."""
+    first folded into the compose spine), possibly under trailing
+    view wrappers (``reshape(applyd(…), (B, d))``)."""
     root = _fold_nested_apply(root)
+    root, _post = _strip_output_views(root)
     return (
         isinstance(root, Op)
         and root.op in ("apply", "applyd")
@@ -144,33 +208,67 @@ def is_scan_apply_term(root: Any) -> bool:
     )
 
 
-def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
-    """Check every ``aff(A, b)`` leaf shares one (d, d) / (d,) signature.
+def _concrete_tuple(s) -> bool:
+    return isinstance(s, tuple) and all(
+        isinstance(d, int) and d > 0 for d in s
+    )
 
-    Batched stacking needs uniform shapes; if inference cannot prove
-    them uniform we decline the plan and the caller falls back to the
-    serial evaluator (which is correct for any shape).
+
+def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
+    """Check the ``aff``/``aff_diag`` leaves form one batched family.
+
+    Diagonal carrier: the (a, b) parts broadcast pointwise, so leaves
+    need only broadcast into ONE concrete per-slot shape — a shared
+    ``(d,)`` decay under ``(B, d)`` inputs is one family (the executor
+    normalises each part up to the join before stacking).
+
+    Dense carrier: the linear parts must share one map signature
+    ``A = (*P, d, d)`` and every b must be the vector ``A[:-1]`` or
+    the column ``(*P, d, 1)`` — exactly the shapes the homogeneous
+    ``[[A, b], [0, 1]]`` packing and the literal ``f[0] @ g[1]``
+    compose evaluate.  Matmul-shape checks (``A@A == A``,
+    ``A@B0 == B0``) keep the family closed under composition.
+
+    If inference cannot prove consistency we decline the plan and the
+    caller falls back to the serial evaluator (which is correct for
+    any shape).
     """
     if not leaves:
         return False
     a0 = _shape_of(leaves[0].args[0])
     b0 = _shape_of(leaves[0].args[1])
     if leaves[0].op == "aff_diag":
-        # Diagonal carrier: a and b are both (d,) vectors.
-        ok = (
-            isinstance(a0, tuple)
-            and isinstance(b0, tuple)
-            and a0 == b0
-            and all(isinstance(d, int) for d in a0)
+        if not (_concrete_tuple(a0) and _concrete_tuple(b0)):
+            return False
+        eff = _broadcast(a0, b0)
+        if eff is _INVALID:
+            return False
+        for leaf in leaves[1:]:
+            a = _shape_of(leaf.args[0])
+            b = _shape_of(leaf.args[1])
+            if not (_concrete_tuple(a) and _concrete_tuple(b)):
+                return False
+            eff = _broadcast(eff, a)
+            if eff is _INVALID:
+                return False
+            eff = _broadcast(eff, b)
+            if eff is _INVALID:
+                return False
+        return True
+    ok = (
+        _concrete_tuple(a0)
+        and _concrete_tuple(b0)
+        and len(a0) >= 2
+        and _matmul_shape(a0, a0) == a0
+        and _matmul_shape(a0, b0) == b0
+        # vector-b (*P, d) or column-b (…, d, 1) — the signatures
+        # _leaf_homogeneous packs and the level matmuls close over.
+        # A shared (d,d) map may broadcast into a batched (B,d,1) b.
+        and (
+            b0 == a0[:-1]
+            or (len(b0) >= 2 and b0[-1] == 1 and b0[-2] == a0[-2])
         )
-    else:
-        ok = (
-            isinstance(a0, tuple)
-            and len(a0) >= 2
-            and all(isinstance(d, int) for d in a0)
-            and isinstance(b0, tuple)
-            and b0 == a0[:-1]
-        )
+    )
     if not ok:
         return False
     for leaf in leaves[1:]:
@@ -251,9 +349,15 @@ def build_scan_plan(root: Any) -> dict | None:
     * ``"leaf_a_shared"`` — True when every leaf's linear part is the
       same term (LTI recurrence): evaluate once, expand as a stride-0
       batch view instead of stacking T copies.
+    * ``"post"`` — shape-only ``(op, attrs)`` wrappers stripped from
+      the root (outermost first); the executor re-applies them to the
+      scan result.  Empty for a bare apply/applyd root.
+    * ``"column_state"`` — dense plans whose b-part is the column
+      convention ``(*P, d, 1)`` (batched dense states).
     * ``"f"`` / ``"h"`` — the map term and the applied-to term.
     """
     root = _fold_nested_apply(root)
+    root, post = _strip_output_views(root)
     if not is_scan_apply_term(root):
         return None
     f_term, h_term = root.args
@@ -274,9 +378,7 @@ def build_scan_plan(root: Any) -> dict | None:
 
     # Slot assignment: leaves occupy 0..n-1, then each level appends its
     # outputs in order — so a level's operand slots are all < its own.
-    slot: dict[int, int] = {
-        id(lf): i for i, lf in enumerate(leaves)
-    }
+    slot: dict[int, int] = {id(lf): i for i, lf in enumerate(leaves)}
     level_gather = slot_gathers(
         levels, lambda t: t.args, slot, len(leaves), key=id
     )
@@ -291,6 +393,13 @@ def build_scan_plan(root: Any) -> dict | None:
         )
         for leaf in leaves
     )
+    b0s = _shape_of(leaves[0].args[1])
+    column_state = bool(
+        not diag
+        and isinstance(b0s, tuple)
+        and len(b0s) >= 2
+        and b0s[-1] == 1
+    )
     return {
         "leaves": leaves,
         "levels": levels,
@@ -299,6 +408,8 @@ def build_scan_plan(root: Any) -> dict | None:
         "leaf_b_gather": _leaf_b_gather(leaves),
         "leaf_a_shared": leaf_a_shared,
         "diagonal": diag,
+        "post": post,
+        "column_state": column_state,
         "f": f_term,
         "h": h_term,
     }
@@ -385,6 +496,12 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         self._fused_c: Any = None
         self._fused_compile_failed = False
         if not fused or self._plan is None:
+            return
+        if self._plan["column_state"]:
+            # fused_dense_levels' root slice is written for (d+1)²
+            # matrices only — column-state dense plans keep the
+            # standard schedule (fused_diag_levels already broadcasts
+            # batched (n, …, d) leaves).
             return
         if fused not in (True, "eager", "compile"):
             raise ValueError(
@@ -476,7 +593,13 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
                     leaf_As[0].unsqueeze(0).expand(n, *leaf_As[0].shape)
                 )
             else:
-                a_vals = torch.stack(leaf_As)
+                # Batched scans may mix broadcastable map shapes
+                # (a shared (d,) decay alongside (B, d) per-step
+                # gates) — expand to the join so the stack is uniform.
+                tgt = torch.broadcast_shapes(
+                    *[a.shape for a in leaf_As]
+                )
+                a_vals = torch.stack([a.expand(tgt) for a in leaf_As])
 
         gather = self._plan["leaf_b_gather"]
         if gather is not None:
@@ -493,14 +616,29 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             if dim != 0:
                 b_vals = b_vals.movedim(dim, 0)
         else:
-            b_vals = torch.stack([evf(leaf.args[1]) for leaf in leaves])
-
-        if self._fused is not None:
-            return self._forward_fused(a_vals, b_vals, evf)
+            leaf_bs = [evf(leaf.args[1]) for leaf in leaves]
+            tgt = torch.broadcast_shapes(*[b.shape for b in leaf_bs])
+            b_vals = torch.stack([b.expand(tgt) for b in leaf_bs])
 
         if self._plan["diagonal"]:
-            # Diagonal carrier: pairs (a, b) of (d,) vectors; compose is
-            # broadcasted elementwise — (a_f⊙a_g, a_f⊙b_g + b_f).
+            # Broadcast every leaf part up to the shared state shape —
+            # (d,) maps ride along with (B, d) states (the pointwise
+            # algebra is identical under the carrier bindings).
+            tgt = torch.broadcast_shapes(
+                a_vals.shape[1:], b_vals.shape[1:]
+            )
+            a_vals = _slot_expand(a_vals, tgt)
+            b_vals = _slot_expand(b_vals, tgt)
+
+        if self._fused is not None:
+            return self._apply_post(
+                self._forward_fused(a_vals, b_vals, evf)
+            )
+
+        if self._plan["diagonal"]:
+            # Diagonal carrier: pairs (a, b) of state-shaped tensors;
+            # compose is broadcasted elementwise —
+            # (a_f⊙a_g, a_f⊙b_g + b_f).
             a_all, b_all = a_vals, b_vals
             for f_idx, g_idx in self._plan["level_gather"]:
                 a_f = a_all.index_select(
@@ -519,7 +657,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
                 b_all = torch.cat([b_all, a_f * b_g + b_f])
             h = evf(self._plan["h"])
             r = self._plan["root_slot"]
-            return a_all[r] * h + b_all[r]
+            return self._apply_post(a_all[r] * h + b_all[r])
 
         m_all = self._leaf_homogeneous(a_vals, b_vals)
 
@@ -534,22 +672,57 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         m_root = m_all[self._plan["root_slot"]]
         h = evf(self._plan["h"])
         d = m_root.shape[-1] - 1
-        return m_root[:d, :d] @ h + m_root[:d, d]
+        a_r = m_root[..., :d, :d]
+        if h.dim() >= 2 and h.shape[-1] == 1:
+            # column-vector state (…, d, 1): the homogeneous b column
+            # stays a column — (…, d, d) @ (…, d, 1) + (…, d, 1).
+            out = a_r @ h + m_root[..., :d, d:]
+        else:
+            # vector state (d,) (or a broadcastable init — apply's own
+            # binding semantics), kept in the classic matvec spelling.
+            out = a_r @ h + m_root[..., :d, d]
+        return self._apply_post(out)
+
+    def _apply_post(self, out: torch.Tensor) -> torch.Tensor:
+        """Re-apply the output views stripped from the root term.
+
+        ``plan["post"]`` holds the ``(op, attrs)`` wrappers outermost
+        first — apply them innermost-first to reproduce the original
+        root's value.  The ambient torch bindings give each op its
+        exact semantics (``reshape(t, shape=…)`` etc.).
+        """
+        for op_name, attrs in reversed(self._plan["post"]):
+            out = self.eval_mod._torch_bindings[op_name](out, **attrs)
+        return out
 
     # -- fused schedule -------------------------------------------------
 
     def _leaf_homogeneous(
         self, a_vals: torch.Tensor, b_vals: torch.Tensor
     ):
-        """Pack leaf ``(A, b)`` pairs into ``(n, d+1, d+1)`` mats.
+        """Pack leaf ``(A, b)`` pairs into ``(n, *P, d+1, d+1)`` mats.
 
         ``M_leaf = [[A, b], [0, …, 0, 1]]`` — the homogeneous-matrix
-        trick that makes ``aff_compose`` literal matmul.
+        trick that makes ``aff_compose`` literal matmul.  ``b`` may be
+        a vector ``(*P, d)`` (unsqueezed to a column here) or already
+        a column ``(*P, d, 1)``; map and column batch dims broadcast
+        to a common ``P`` so shared ``(d, d)`` maps ride along with
+        batched ``(B, d, 1)`` states.
         """
-        n, d = a_vals.shape[0], a_vals.shape[-1]
-        top = torch.cat([a_vals, b_vals.reshape(n, d, 1)], dim=-1)
-        bottom = self._cached(("row", d + 1), a_vals, _make_bottom_row)
-        return torch.cat([top, bottom.expand(n, 1, d + 1)], dim=-2)
+        n = a_vals.shape[0]
+        if b_vals.dim() == a_vals.dim() - 1:
+            b_vals = b_vals.unsqueeze(-1)  # (*P, d) → (*P, d, 1)
+        pb = torch.broadcast_shapes(
+            a_vals.shape[1:-2], b_vals.shape[1:-2]
+        )
+        d = a_vals.shape[-1]
+        a_vals = _slot_expand(a_vals, (*pb, d, d))
+        b_vals = _slot_expand(b_vals, (*pb, d, 1))
+        top = torch.cat([a_vals, b_vals], dim=-1)
+        bottom = self._cached(
+            ("row", len(pb), d + 1), a_vals, _make_bottom_row
+        )
+        return torch.cat([top, bottom.expand(n, *pb, 1, d + 1)], dim=-2)
 
     def _occ_index(self, like: torch.Tensor):
         """The occurrence-order gather indices, or ``None``.
@@ -615,6 +788,25 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         if occ is not None:
             m_seq = m_seq.index_select(0, occ)
         return self._fused_call(fused_dense_levels, m_seq, h)
+
+
+def _slot_expand(
+    t: torch.Tensor, shape: tuple[int, ...]
+) -> torch.Tensor:
+    """``(n, *s) -> (n, *shape)``, broadcasting ``s`` right-aligned.
+
+    The leaf stack's dim 0 is the slot axis — the per-slot payload
+    right-aligns against the target like ordinary broadcasting, so a
+    ``(d,)`` map becomes ``(1, …, 1, d)`` before expanding to
+    ``(B, d)``-style state shapes.
+    """
+    s = t.shape[1:]
+    if tuple(s) == tuple(shape):
+        return t
+    pad = len(shape) - len(s)
+    if pad:
+        t = t.reshape(t.shape[0], *((1,) * pad), *s)
+    return t.expand(t.shape[0], *shape)
 
 
 def _make_bottom_row(like: torch.Tensor) -> torch.Tensor:

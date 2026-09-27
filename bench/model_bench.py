@@ -21,8 +21,8 @@ cleanly):
   UNBATCHED ``(T, d)`` scan form: block 1 emits a gated sequence,
   block 2 scans to a final state.  Mechanism: the affine-carrier
   scan lift → level-batched executor + weight-chain fold.  Known
-  caveats (real_linear_attn / decode_flat_b8): the diagonal carrier
-  does not lift batched/flattened states, and whole-graph saturation
+  caveat (whole-graph saturation on multi-block emitted-seq graphs is
+  the known cost cliff)
   on multi-block emitted-seq graphs is the known cost cliff — T is
   kept small and the search wall time recorded honestly, bounded by
   ``--max-enodes`` / ``--budget-s``.
@@ -306,9 +306,10 @@ def _cells(args) -> list[ModelCell]:
     )
 
     # -- 2-block gated linear-attention (retnet) stack ----------------
-    # Unbatched (T, d) input: the diagonal-affine carrier only lifts
-    # unbatched vector states (the decode_flat_b8 falsification — a
-    # batched/flattened state stays generic).  L=2 keeps the emitted-seq
+    # Unbatched (T, d) input — the canonical carrier form (batched
+    # states lift too since the batched-state lift landed; this bench
+    # keeps the unbatched shape for comparability).  L=2 keeps the
+    # emitted-seq
     # intermediate block whose whole-graph saturation is the known
     # cost cliff; T=32 stays well under it.
     ssm_t = int(getattr(args, "ssm_t", None) or 32)

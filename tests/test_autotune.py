@@ -473,7 +473,10 @@ def test_compiled_price_charges_graph_overhead():
         "launch_us": 8.7,
         "dispatch_us": 1.0,
     }
-    raw = fused_cost_for(base)(t)  # per-graph term: dispatch only
+    # fused_cost_for now consumes graph_overhead_us itself
+    # (per-graph term = max(dispatch, overhead)) — the baseline pins
+    # it to the dispatch floor so the deltas below are pure overhead.
+    raw = fused_cost_for({**base, "graph_overhead_us": 1.0})(t)
     low = at_mod._compiled_model_ns(
         t, {**base, "graph_overhead_us": 0.5}
     )
@@ -549,11 +552,13 @@ def test_graph_overhead_detection_exotic_profiles():
 
     assert at_mod._fused_charges_graph_overhead(Bare()) is False
 
-    class Obj:  # priceable attribute profile: probe runs, not native
+    class Obj:  # priceable attribute profile — and the installed
+        # fused model now natively consumes graph_overhead_us, so
+        # the behavioural probe reports True on it.
         tflops = 2.5
         gbps = 89.0
         launch_us = 8.7
         dispatch_us = 1.0
 
-    assert at_mod._fused_charges_graph_overhead(Obj()) is False
+    assert at_mod._fused_charges_graph_overhead(Obj()) is True
     assert at_mod._compiled_model_ns(_term(), Obj()) > 0.0

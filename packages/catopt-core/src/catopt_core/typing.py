@@ -913,6 +913,40 @@ def _broadcast(a, b):
     return tuple(out)
 
 
+def _dim_eq(x, y) -> bool:
+    """Dim equality for the matmul contraction check — a ``None``
+    (unknown) dim is a wildcard, matching ``_broadcast``'s convention."""
+    return x is None or y is None or x == y
+
+
+def _matmul_shape(a, b):
+    """``torch.matmul`` output shape for operand shapes ``a``, ``b``.
+
+    Full torch semantics: rank-1 promotion/demotion, batch-dim
+    broadcasting for rank ≥ 2 operands.  Returns ``None`` when the
+    contraction is invalid (inner-dim mismatch or a scalar operand)
+    and the result tuple otherwise (which may carry ``None`` dims).
+    """
+    if not (isinstance(a, tuple) and isinstance(b, tuple)):
+        return None
+    if not a or not b:
+        return None
+    if len(a) == 1 and len(b) == 1:
+        return () if _dim_eq(a[0], b[0]) else None
+    if len(b) == 1:
+        if len(a) < 2 or not _dim_eq(a[-1], b[0]):
+            return None
+        return tuple(a[:-1])
+    if len(a) == 1:
+        if not _dim_eq(a[0], b[-2]):
+            return None
+        return (*tuple(b[:-2]), b[-1])
+    batch = _broadcast(tuple(a[:-2]), tuple(b[:-2]))
+    if batch is _INVALID or not _dim_eq(a[-1], b[-2]):
+        return None
+    return (*batch, a[-2], b[-1])
+
+
 def _numel(shape) -> int:
     if shape is None:
         return 1

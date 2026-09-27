@@ -1241,14 +1241,24 @@ def test_lift_consistent_shapes_rejections():
     h0 = eg.add_term(_p("h0", d))
     m = eg.add_term(_p("m", d))
     i = eg.add_term(_p("i", d))
-    assert TL._consistent_shapes(eg, "diag", [m], [i], h0) == d
-    # h0 not 1-D → None
-    bad_h0 = eg.add_term(_p("h0b", d, d))
+    assert TL._consistent_shapes(eg, "diag", [m], [i], h0) == (
+        (d,),
+        True,
+    )
+    # batched h0 is fine now — (d,d) states with (d,) parts broadcast
+    # to a (d,d) state shape (non-flat: no trace offer, carrier only)
+    big_h0 = eg.add_term(_p("h0b", d, d))
+    assert TL._consistent_shapes(eg, "diag", [m], [i], big_h0) == (
+        (d, d),
+        False,
+    )
+    # h0 with an unbroadcastable width → None
+    bad_h0 = eg.add_term(_p("h0c", d + 1))
     assert TL._consistent_shapes(eg, "diag", [m], [i], bad_h0) is None
     # dense kind needs (d,d) maps — a (d,) map declines
     assert TL._consistent_shapes(eg, "dense", [m], [i], h0) is None
     # a wrong-shaped in declines
-    bad_i = eg.add_term(_p("ib", d, d))
+    bad_i = eg.add_term(_p("ib", d + 1))
     assert TL._consistent_shapes(eg, "diag", [m], [bad_i], h0) is None
 
 
@@ -1583,9 +1593,9 @@ def test_carrier_plan_success_via_lift():
     lifts = TL.lift_scan_to_trace(eg, min_steps=2, channel_splits=[])
     assert any(lf.T == 3 for lf in lifts)
 
-    # a carrier term whose h0 is the wrong rank declines AFTER the
-    # scan plan is built (consistent-shape check)
-    bad = eg.add_term(Op.make("applyd", tree, _p("h0b", d, d)))
+    # a carrier term whose h0 can't broadcast with the parts declines
+    # AFTER the scan plan is built (consistent-shape check)
+    bad = eg.add_term(Op.make("applyd", tree, _p("h0b", d + 1)))
     assert TL._carrier_plan(eg, eg.find(bad)) is None
 
 
