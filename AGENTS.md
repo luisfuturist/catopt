@@ -123,3 +123,31 @@ implements `Sink`; nothing in `catopt-core` changes.
   justified `pragma: no cover`).
 - Tests allocating CUDA tensors use the `requires_cuda` marker
   (auto-skipped when CUDA is absent).
+
+## Adding a rewrite law
+
+Laws live in `packages/catopt-core/src/catopt_core/laws/` — `tensor.py`
+(tensor algebra), `scan.py` (scan monoids).  Shape (via `laws.base.R`):
+`R(name, lhs, rhs, law=..., check=..., derive=...)` — lhs/rhs are
+`Op.make` pattern trees; bare `str` leaves are metavariables, `Const`
+leaves are literals, and `str` attr values are attr metavariables bound
+under `"$attr:"` keys.  `check(bound) -> bool` is the side-condition
+hook: `bound` maps each metavar to a resolved member term (use
+`laws.base._shape_of` for shape guards — the matcher cannot see types).
+`derive(bound) -> dict | None` computes RHS attrs absent from the LHS
+(`{"$attr:SZ": ...}`); `None` vetoes.  Every firing records a witness
+(proof edge + rule provenance) — no extra bookkeeping needed.  Register
+the rule in a group list at the bottom of its module
+(`SIMPLIFICATION_RULES`, `CATEGORICAL_RULES`, `SDPA_FOLD_RULES`,
+`SCAN_LAWS`, `SCAN_DIAG_LAWS`; `ALL_RULES`/`all_rules()` is the union).
+Expansive closure-generating rules also join
+`catopt_optimize.optimize._EXPANSIVE_RULES` (bounded-saturation budget).
+
+Measure it: `python bench/law_bench.py --laws <name[,name|group]>`
+`--sizes <d[,d]>` — per law: registered synthetic term → `eg.run` on
+that rule alone → extraction (pipeline cost model) → `_lower_extracted`
+→ `sink.verify` → timed before/after.  Table shows fired / rhs-member /
+picked / verified / cost & ms before→after; non-firing laws report
+honestly.  Add a builder in `LAW_CASES` keyed by rule name for new
+laws.  Gates: `uv run pytest`, `.venv/bin/pyright`,
+`.venv/bin/ruff check` (packages catopt), coverage stays 100.

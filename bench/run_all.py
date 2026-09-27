@@ -57,7 +57,9 @@ DEFAULT_SUITES = [
     "killer_demo",
     "decode_scan_bench",
     "real_win_hunt",
+    "law_bench",
     "bench_e2e",
+    "model_bench",
 ]
 
 
