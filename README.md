@@ -162,9 +162,37 @@ term, same predicted cost, 6–30× latency spread across lowerings —
 Inductor's fused kernel is rank-1 measured but priced like the
 generic per-leaf evaluator that runs 30× slower. The frontier
 contains the right programs; term-level cost can't see executor
-cost. (Also caught: trace-carrier members hiding a 14.5s
-`linalg.solve` under a normally-priced term.) Pricing the
-*lowering*, not just the term, is the named next step.
+cost.
+
+That measurement drove three fixes, now landed:
+
+* **Executor-aware pricing** — `executor_overhead` /
+  `executor_cost_for` / `lowering_aware_cost_for` price a term under
+  each available lowering (generic per-node dispatch, level-batched
+  carrier, compiled/fused), with `calibrate()`-measured
+  `dispatch_us`/`leaf_eval_us` constants. `optimize_model`'s default
+  selection runs the additive generic-dispatch model — batched cost
+  is a whole-spine property the additive extraction can't express,
+  so instead…
+* **Lowering routing** — an extracted carrier-apply term is lowered
+  through its level-batched executor (`stats["lowering"]`), falling
+  back to generic when no plan exists. The lowerer now produces the
+  executor the price assumed.
+* **Honest param-only discount** — a `trace` resolvent member hid a
+  14.5s `linalg.solve` inside a "compile-time-foldable" subtree:
+  `extract_best`/`dag_cost` billed param-only classes as free even
+  when the lowerer can't fold them. Now only genuinely foldable
+  subtrees (`_folds_to_param`) bill zero; solver ops additionally
+  carry a `_SOLVER_FACTOR` surcharge. Before the fix the optimizer
+  *picked* that member; after, it doesn't.
+
+Two cautions the fidelity sweep also pinned: cost fns must be
+**additive** for `extract_best`'s local-cost decomposition
+(`c(t) − Σc(children)`) to be meaningful — `min`-over-lowerings is
+not, so `lowering_aware_cost_for` serves reporting/discovery, not
+the selection default. And predicted cost is a model output, not a
+runtime guarantee — the correlation numbers above are the honest
+receipt.
 
 **Controlled negative**: NormLinear loses slightly (0.98×) — Inductor
 already fuses `x·rms·wn` into the GEMM's input read, so restructuring

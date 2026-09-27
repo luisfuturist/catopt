@@ -19,6 +19,18 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from catopt_carriers.om_lower import (
+    is_om_apply_term,
+    to_batched_om_module,
+)
+from catopt_carriers.omd_lower import (
+    is_omd_apply_term,
+    to_batched_omd_module,
+)
+from catopt_carriers.scan_lower import (
+    is_scan_apply_term,
+    to_batched_scan_module,
+)
 from catopt_carriers.trace_lift import lift_scan_to_trace
 from catopt_carriers.xcarrier import (
     gather_apply_stack,
@@ -28,8 +40,8 @@ from catopt_carriers.xcarrier import (
 from catopt_core.cost import (
     backend_cost,
     dag_cost,
+    executor_cost_for,
     flops_cost,
-    launch_aware_cost,
 )
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Op, op_repr
@@ -164,7 +176,9 @@ def _current_memory_mb() -> float:
     rss = 0.0
     try:
         with open("/proc/self/status") as fh:
-            for line in fh:  # pragma: no branch — VmRSS always present on Linux
+            for line in (
+                fh
+            ):  # pragma: no branch — VmRSS always present on Linux
                 if line.startswith("VmRSS:"):
                     rss = float(line.split()[1]) / 1024.0
                     break
@@ -293,6 +307,53 @@ def _specialize_causal(
     return out
 
 
+def _default_cost_fn() -> CostFn:
+    """The default extraction model.
+
+    Roofline pricing plus the executor overhead of the lowering this
+    pipeline delivers — ``"generic"`` per-node eval or
+    Roofline + the additive generic-dispatch overhead (solver ops
+    surcharged — the fidelity sweep caught a ``trace`` resolvent priced
+    ~free hiding a 14.5 s ``linalg.solve``).  The level-batched carrier
+    executors are *not* priced into selection: their cost is a
+    whole-spine property, which ``extract_best``'s additive local-cost
+    decomposition can't express — instead the lowering routes apply
+    roots to them after extraction (``stats["lowering"]``), so a
+    selected carrier member gets its fast executor for free.
+    """
+    return executor_cost_for(lowering="generic")
+
+
+def _lower_extracted(
+    best_term: Any,
+    optimized_ir: Any,
+    source_tensors: dict | None,
+    sink: Any,
+) -> Any:
+    """Route the extracted term to the executor that runs it best.
+
+    Executor routing: term-level cost is blind to the lowering — a
+    carrier-apply term evaluated by the generic IRModule runs its
+    leaves one-by-one (~6-30x slower than the level-batched schedule
+    it was priced for).  Route apply roots to their batched executor;
+    non-matching roots delegate to IRModule inside each builder, so a
+    declined plan degrades to the generic path rather than failing.
+    """
+    if is_scan_apply_term(best_term):
+        return to_batched_scan_module(
+            optimized_ir, param_values=source_tensors
+        )
+    if is_om_apply_term(best_term):
+        return to_batched_om_module(
+            optimized_ir, param_values=source_tensors
+        )
+    if is_omd_apply_term(best_term):
+        return to_batched_omd_module(
+            optimized_ir, param_values=source_tensors
+        )
+    return sink.lower(optimized_ir, source_tensors)
+
+
 def discover_alternatives(
     model: torch.nn.Module,
     example_input: torch.Tensor,
@@ -325,7 +386,7 @@ def discover_alternatives(
     if sink is None:
         sink = TorchSink()
     if cost_fn is None:
-        cost_fn = launch_aware_cost
+        cost_fn = _default_cost_fn()
     cost_fn = backend_cost(cost_fn, sink.supported_ops)
     ir, source_tensors = source.to_ir(model, example_input)
     eg = EGraph()
@@ -436,8 +497,12 @@ def optimize_model(
     cost_fn : CostFn | None
         Cost function for term extraction — the
         :class:`catopt_core.ports.CostFn` port.  Defaults to
-        :func:`launch_aware_cost` (FLOPs + a small per-kernel penalty so
-        that forms with identical FLOPs but fewer launches win).
+        :func:`executor_cost_for` with ``lowering="generic"`` —
+        roofline plus per-node dispatch overhead (solver ops
+        surcharged).  Carrier-apply selections are routed to their
+        level-batched executors at lowering time rather than priced
+        in, because batched cost is non-additive over the spine and
+        ``extract_best``'s local-cost decomposition can't see it.
     symmetry_budget : int, optional
         Per-rule enode budget for the expansive rules in
         ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
@@ -490,7 +555,7 @@ def optimize_model(
     if sink is None:
         sink = TorchSink(ops=ops)
     if cost_fn is None:
-        cost_fn = launch_aware_cost
+        cost_fn = _default_cost_fn()
     # Backend-relative pricing: members using an op the sink cannot
     # lower price at +inf, so extraction never commits to one.
     cost_fn = backend_cost(cost_fn, sink.supported_ops)
@@ -651,7 +716,14 @@ def optimize_model(
         input_names=ir.input_names,
         params=ir.params,
     )
-    optimized_module = sink.lower(optimized_ir, source_tensors)
+    optimized_module = _lower_extracted(
+        best_term, optimized_ir, source_tensors, sink
+    )
+    stats["lowering"] = (
+        "batched"
+        if getattr(optimized_module, "is_batched", False)
+        else "generic"
+    )
 
     # Verify semantic equivalence
     if verbose:
@@ -876,7 +948,7 @@ def optimize_compositional(
     """
     t_start = time.time()
     if cost_fn is None:
-        cost_fn = launch_aware_cost
+        cost_fn = _default_cost_fn()
 
     blocks = _select_blocks(model, block_pred)
     if verbose:

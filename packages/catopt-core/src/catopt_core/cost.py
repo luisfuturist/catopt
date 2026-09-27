@@ -8,6 +8,12 @@ Models provided include:
 * flops_cost - estimates FLOPs using shape information.
 * param_bytes_cost - counts stored parameter values (the storage
   axis; what lets extraction prefer weight-sharing members).
+* executor_overhead / executor_cost_for - price the LOWERING:
+  dispatched-op counts per executor kind on top of a base model.
+* fused_cost_for - the compiled lowering's price (Inductor-style
+  pointwise-fusion regions).
+* lowering_aware_cost_for - min over lowerings: extraction picks the
+  term whose best lowering is cheapest.
 
 For the "killer experiment", the FLOPs-based model matters: it rewards
 the associativity / distributivity / naturality rewrites that produce
@@ -17,6 +23,7 @@ fewer total floating-point operations.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
 
@@ -357,14 +364,22 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
         """
         return has_var_leaf(t, var_memo)
 
+    fold_memo: dict = {}
+
     def rec(t: Any) -> None:
         nonlocal total
         if t in seen:
             return
         seen.add(t)
         if isinstance(t, Op):
-            if not has_var(t) and not bill_params:
+            if (
+                not has_var(t)
+                and not bill_params
+                and _folds_to_param(t, None, fold_memo)
+            ):
                 return  # folds at compile time — free at runtime
+            # Param-only but NOT foldable (e.g. a ``trace`` resolvent's
+            # hidden linalg.solve) still runs every call — bill it.
             for a in t.args:
                 rec(a)
             local = c(t) - sum(c(a) for a in t.args)
@@ -800,7 +815,9 @@ def _local_roofline(
     if shape is _INVALID:
         return _INVALID_COST
     flops = _flops_of(term, memo)
-    if flops >= _INVALID_COST:  # pragma: no cover — INVALID shapes checked above
+    if (
+        flops >= _INVALID_COST
+    ):  # pragma: no cover — INVALID shapes checked above
         return _INVALID_COST
     compute_s = flops / peak_flops
     memory_s = _bytes_of(term, memo) / peak_bw
@@ -917,6 +934,44 @@ def roofline_cost_for(
     return cost
 
 
+def _depth_cost(
+    term: Any,
+    memo: dict,
+    peak_flops: float,
+    peak_bw: float,
+    launch_s: float,
+) -> float:
+    """Shared critical-path traversal for depth_cost_for and the
+    ``base="depth"`` arm of :func:`executor_cost_for`.  The memo key
+    carries the constants so two profiles can share a memo dict
+    without colliding (the ``_roofline_cost`` convention)."""
+    ck = ("dc", peak_flops, peak_bw, launch_s, term)
+    if ck in memo:
+        return memo[ck]
+    if isinstance(term, Op):
+        local = _local_roofline(
+            term,
+            memo,
+            peak_flops=peak_flops,
+            peak_bw=peak_bw,
+            launch_s=launch_s,
+        )
+        if local >= _INVALID_COST:
+            local = launch_s * 1e9
+        child = max(
+            (
+                _depth_cost(a, memo, peak_flops, peak_bw, launch_s)
+                for a in term.args
+            ),
+            default=0.0,
+        )
+        out = local + child
+        memo[ck] = float(out)
+        return out
+    memo[ck] = 0.0
+    return 0.0
+
+
 def depth_cost_for(profile: Any = None):
     """Return a critical-path cost fn calibrated to a target profile.
 
@@ -929,21 +984,7 @@ def depth_cost_for(profile: Any = None):
 
     def cost(term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo
-        ck = ("dc", pf, bw, ls, term)
-        if ck in memo:
-            return memo[ck]
-        if isinstance(term, Op):
-            local = _local_roofline(
-                term, memo, peak_flops=pf, peak_bw=bw, launch_s=ls
-            )
-            if local >= _INVALID_COST:
-                local = ls * 1e9
-            child = max((cost(a, memo) for a in term.args), default=0.0)
-            out = local + child
-            memo[ck] = float(out)
-            return out
-        memo[ck] = 0.0
-        return 0.0
+        return _depth_cost(term, memo, pf, bw, ls)
 
     cost.__name__ = "depth_cost_for"
     cost.profile = profile
@@ -1058,3 +1099,460 @@ def backend_cost(
         if hasattr(cost_fn, marker):
             setattr(priced, marker, getattr(cost_fn, marker))
     return priced
+
+
+# ---------------------------------------------------------------------------
+#  Lowering-aware pricing — price the lowering, not just the term
+# ---------------------------------------------------------------------------
+#
+# The fidelity study (bench/cost_fidelity.py) showed term-level cost is
+# blind to the lowering: the same term prices identically whether the
+# generic IRModule dispatches it node-by-node, a batched carrier
+# executor level-schedules it, or a compiled kernel fuses it — while
+# measured latency differs 6-30x.  The models below put the executor
+# in the price: executor_overhead counts the dispatched units a
+# lowering performs, executor_cost_for charges them at the profile's
+# dispatch rate on top of a base model, fused_cost_for approximates
+# Inductor-style pointwise fusion, and lowering_aware_cost_for prices
+# each term at its cheapest lowering — extraction then picks the term
+# whose best lowering is cheapest.
+
+#: Executor kinds a term can be lowered through.
+LOWERINGS: tuple = ("generic", "batched_scan", "compiled")
+
+#: Root ops whose first argument is a carrier map tree the
+#: level-batched executors lower as a scan plan: ``scan_lower``'s
+#: ``apply``/``applyd``, ``om_lower``'s ``om_apply``, ``omd_lower``'s
+#: ``omd_apply``/``omd_applym``.  Anything else falls back to the
+#: serial per-node evaluator inside those modules too.
+_SCAN_ROOT_OPS = frozenset(
+    {"apply", "applyd", "om_apply", "omd_apply", "omd_applym"}
+)
+
+#: Carrier compose ops forming the balanced tree the batched
+#: executors level-schedule — one batched op per tree *level* rather
+#: than one dispatch per node.
+_SCAN_COMPOSE_OPS = frozenset(
+    {"aff_compose", "affd_compose", "om_compose", "omd_compose"}
+)
+
+#: Ops a compiled lowering can fuse into one pointwise kernel:
+#: ``_VIEW_OPS`` (views emit no kernel of their own — their index
+#: arithmetic rides along in the consumer's) plus the elementwise set
+#: ``_FOLDABLE_ELEMWISE``.
+_FUSIBLE_OPS = _VIEW_OPS | _FOLDABLE_ELEMWISE
+
+#: Ops whose binding hides a direct solver call (``linalg.solve`` /
+#: inverse) — measured orders of magnitude beyond a dispatch
+#: (the fidelity sweep caught a ``trace`` term priced like ~3
+#: dispatches that measured 14.5 s: the resolvent's solve, not the
+#: graph).  FLOP models already bill ``2·du³``; this surcharge carries
+#: the dispatch-side constant until a measured ``solve_us`` profile
+#: field lands.
+_SOLVER_OPS = frozenset({"trace", "inv"})
+
+#: A solver call ≈ this many generic dispatches — a conservative
+#: floor (a 128×128 solve measures ~ms vs ~µs per dispatch).
+_SOLVER_FACTOR = 10_000.0
+
+
+def _generic_overhead(term: Any, memo: dict) -> float:
+    """Per-node dispatch count the generic evaluator performs for
+    *term* — one unit per op occurrence (+``_SOLVER_FACTOR`` for
+    solver ops).
+
+    Deliberately NOT DAG-deduplicated: ``EGraph.extract_best`` recovers
+    a node's local cost as ``f(t) − Σf(children)``, which is exact
+    only for additive functions — a shared child is already billed
+    once at the e-class level, so deduplicating here would double-
+    subtract and collapse locals to zero (non-additive cost fns are
+    what made a ``trace`` resolvent term price like ~3 dispatches and
+    win extraction — fidelity bench, ``cost_fidelity.py``).
+    """
+    ck = ("eo", "generic", term)
+    if ck in memo:
+        return memo[ck]
+    n = 0.0
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        if isinstance(t, Op):
+            n += _SOLVER_FACTOR if t.op in _SOLVER_OPS else 1.0
+            stack.extend(t.args)
+    memo[ck] = n
+    return n
+
+
+def _outside_overhead(term: Op, spine: Op) -> float:
+    """Distinct op nodes of *term*'s DAG outside the ``spine`` subtree.
+
+    The batched executor still runs everything around the compose
+    spine generically — the apply root itself, the carried-state
+    argument, surrounding tensor terms.
+    """
+    n = 0.0
+    seen: set = set()
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        if not isinstance(t, Op) or t in seen or t == spine:
+            continue
+        seen.add(t)
+        n += 1.0
+        stack.extend(t.args)
+    return n
+
+
+def _batched_scan_overhead(term: Op, memo: dict) -> float:
+    """Dispatched units under the level-batched carrier lowering.
+
+    The compose spine under an apply-family root collapses to one
+    batched op per balanced-tree *level* — ``ceil(log2 n_leaves)``
+    dispatches — plus the leaf materialisation: the executors stack
+    uniform leaves into ONE batched evaluation per leaf *kind*
+    (``leaf_a_shared``/``leaf_b_gather`` — a (T,·) gather, not T
+    sequential evals), so distinct leaf op-families bill once each,
+    weighted by their generic size.  Ops outside the spine — the
+    apply root, the state argument — still dispatch generically and
+    are counted as such.
+    """
+    spine = term.args[0]
+    seen: set = set()
+    leaves: list = []
+    stack = [spine]
+    while stack:
+        t = stack.pop()
+        if t in seen:
+            continue
+        seen.add(t)
+        if isinstance(t, Op) and t.op in _SCAN_COMPOSE_OPS:
+            stack.extend(t.args)
+        else:
+            leaves.append(t)
+    levels = math.ceil(math.log2(max(1, len(leaves))))
+    total = float(levels) + _outside_overhead(term, spine)
+    # One batched leaf evaluation per leaf kind — the executor stacks
+    # same-op leaves into a single gathered batch.
+    for kind in {getattr(leaf, "op", "") for leaf in leaves}:
+        rep = next(
+            leaf for leaf in leaves if getattr(leaf, "op", "") == kind
+        )
+        total += max(1.0, _generic_overhead(rep, memo))
+    return total
+
+
+def executor_overhead(
+    term: Any, lowering: str, memo: dict | None = None
+) -> float:
+    """Structural count of the executor work a *lowering* performs.
+
+    Counts, not seconds — multiply by a per-dispatch cost (as
+    :func:`executor_cost_for` does) to price it.  ``lowering`` is one
+    of :data:`LOWERINGS`:
+
+    * ``"generic"`` — the per-node IRModule dispatcher: every op
+      occurrence is one dispatched evaluation (counted per-node, not
+      deduplicated — additive, which ``extract_best``'s local-cost
+      decomposition requires).  View ops count too — the generic
+      evaluator still dispatches them even though they launch no
+      kernel.  Solver ops (``trace``/``inv``) bill
+      ``_SOLVER_FACTOR`` each.  Param-folded subtrees simply contain
+      no ops to count: their params are bound at lowering, not
+      evaluated.
+    * ``"batched_scan"`` — the level-batched carrier executors
+      (``BatchedScanModule`` / ``BatchedOMModule`` /
+      ``BatchedOmdModule``): for an ``apply``/``applyd``/``om_apply``/
+      ``omd_apply[m]``-rooted term, ``ceil(log2 n_leaves)`` batched
+      compose levels + one evaluation per distinct compose-tree leaf;
+      ops outside the spine dispatch generically.  Non-scan roots get
+      the generic count — the modules' serial fallback.
+    * ``"compiled"`` — 0: per-node dispatch is the wrong axis for the
+      compiled lowering.  Its kernel count comes from fusion regions,
+      priced by :func:`fused_cost_for`, not by node count.
+    """
+    memo = {} if memo is None else memo
+    ck = ("eo", lowering, term)
+    hit = memo.get(ck)
+    if hit is not None:
+        return hit
+    if lowering == "compiled":
+        out = 0.0
+    elif lowering == "generic":
+        out = _generic_overhead(term, memo)
+    elif lowering == "batched_scan":
+        if (
+            isinstance(term, Op)
+            and term.op in _SCAN_ROOT_OPS
+            and term.args
+        ):
+            out = _batched_scan_overhead(term, memo)
+        else:
+            # Not a scan shape — the batched modules run their serial
+            # fallback, i.e. generic dispatch.
+            out = _generic_overhead(term, memo)
+    else:
+        raise ValueError(
+            f"unknown lowering {lowering!r} — "
+            f"expected one of {LOWERINGS}"
+        )
+    memo[ck] = float(out)
+    return memo[ck]
+
+
+def _profile_dispatch_s(profile: Any) -> float:
+    """Per-dispatch executor overhead in seconds, from a profile-like.
+
+    Reads ``dispatch_us`` (attribute or dict key) — per-call
+    dispatcher overhead *on top of* the kernel launch the roofline
+    model already prices, e.g. Python-side op dispatch in the generic
+    evaluator.  Absent a measurement it falls back to the built-in
+    launch constant: dispatch ≈ launch.
+    """
+    if profile is None:
+        return _LAUNCH_S
+    if isinstance(profile, dict):
+        us = profile.get("dispatch_us", _LAUNCH_S * 1e6)
+    else:
+        us = getattr(profile, "dispatch_us", _LAUNCH_S * 1e6)
+    return float(us) * 1e-6
+
+
+def executor_cost_for(
+    profile: Any = None,
+    *,
+    lowering: str = "generic",
+    base: str = "roofline",
+) -> CostFn:
+    """Cost fn = a base model's term cost + per-dispatch overhead.
+
+    ``base`` picks the underlying term price — ``"roofline"`` (per-op
+    roofline sum, like :func:`roofline_cost`), ``"depth"``
+    (critical-path roofline, like :func:`depth_cost`), or ``"flops"``
+    (:func:`flops_cost`).  On top the closure adds
+    ``executor_overhead(term, lowering) * dispatch_s`` where
+    ``dispatch_s`` is the profile's ``dispatch_us`` (seconds;
+    :func:`_profile_dispatch_s` fallback applies).
+
+    Units follow the base model, matching this file's conventions:
+    roofline and depth are nanoseconds (``_local_roofline`` returns
+    ns), so the overhead term is ``overhead * dispatch_s * 1e9``.
+    For ``"flops"`` each dispatched unit is billed ``dispatch_us``
+    flop-equivalents — the ``launch_aware_cost`` convention scaled to
+    microseconds.  That is an approximation, documented as such: a
+    dispatch is time, not arithmetic; the honest conversion would be
+    ``dispatch_s * peak_flops``, which swamps every real term.
+    µs-as-flops keeps the penalty commensurate with the model's
+    magnitudes.
+
+    ``lowering="compiled"`` ignores ``base`` and delegates to
+    :func:`fused_cost_for` — the compiled executor's price is its
+    fusion structure, not a per-node dispatch count
+    (``executor_overhead`` is 0 there).  The returned closure has the
+    standard ``fn(term, memo=None)`` signature.
+    """
+    if lowering not in LOWERINGS:
+        raise ValueError(
+            f"unknown lowering {lowering!r} — "
+            f"expected one of {LOWERINGS}"
+        )
+    if base not in ("roofline", "depth", "flops"):
+        raise ValueError(
+            f"unknown base {base!r} — "
+            "expected 'roofline', 'depth' or 'flops'"
+        )
+    if lowering == "compiled":
+        return fused_cost_for(profile)
+    pf, bw, ls = _profile_constants(profile)
+    dispatch_s = _profile_dispatch_s(profile)
+    # ns for the roofline/depth bases; flop-equivalents for flops.
+    per = dispatch_s * (1e9 if base != "flops" else 1e6)
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        memo = {} if memo is None else memo
+        ck = ("ec", lowering, base, pf, bw, ls, dispatch_s, term)
+        if ck in memo:
+            return memo[ck]
+        if base == "roofline":
+            b = _roofline_cost(term, memo, pf, bw, ls)
+        elif base == "depth":
+            b = _depth_cost(term, memo, pf, bw, ls)
+        else:  # flops
+            b = flops_cost(term, memo)
+        out = b + executor_overhead(term, lowering, memo) * per
+        memo[ck] = float(out)
+        return out
+
+    cost.__name__ = "executor_cost_for"
+    cost.profile = profile
+    cost.lowering = lowering
+    return cost
+
+
+def _fused_cost(
+    term: Any,
+    memo: dict,
+    peak_flops: float,
+    peak_bw: float,
+    launch_s: float,
+    dispatch_s: float,
+) -> float:
+    """Inductor-approximation price of *term* (see fused_cost_for).
+
+    Collects the DAG's op nodes, unions fusible producer/consumer
+    pairs into kernel regions, then charges each maximal region its
+    *dominant* member's local roofline and each non-fusible op its own
+    local roofline — plus one ``dispatch_s`` per surviving kernel.
+    """
+    if not isinstance(term, Op):
+        return 0.0
+    nodes: list[Op] = []
+    seen: set = set()
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        if not isinstance(t, Op) or t in seen:
+            continue
+        seen.add(t)
+        nodes.append(t)
+        stack.extend(t.args)
+    # Union-find over fusible parent<->child edges: one region per
+    # connected pointwise cluster.
+    rep = {t: t for t in nodes}
+
+    def find(t: Op) -> Op:
+        while rep[t] is not t:
+            rep[t] = rep[rep[t]]
+            t = rep[t]
+        return t
+
+    for t in nodes:
+        if t.op in _FUSIBLE_OPS:
+            for a in t.args:
+                if isinstance(a, Op) and a.op in _FUSIBLE_OPS:
+                    ra, rb = find(t), find(a)
+                    if ra is not rb:
+                        rep[ra] = rb
+    total = 0.0
+    dominant: dict[Op, float] = {}
+    dispatch_ns = dispatch_s * 1e9
+    for t in nodes:
+        local = _local_roofline(
+            t,
+            memo,
+            peak_flops=peak_flops,
+            peak_bw=peak_bw,
+            launch_s=launch_s,
+        )
+        if t.op in _FUSIBLE_OPS:
+            r = find(t)
+            # Every region is one evaluation slot — a materialisation /
+            # dispatch boundary — even when its dominant member emits
+            # no kernel of its own (a view-only region still hands a
+            # buffer to its consumer).
+            if local > dominant.setdefault(r, 0.0):
+                dominant[r] = local
+        else:
+            total += local + dispatch_ns
+    return float(
+        total + sum(v + dispatch_ns for v in dominant.values())
+    )
+
+
+def fused_cost_for(profile: Any = None) -> CostFn:
+    """Compiled-lowering cost — the Inductor-approximation model.
+
+    A maximal connected region of pointwise-fusible ops
+    (``_FUSIBLE_OPS``: views + elementwise) lowers to ONE kernel,
+    priced at the region's dominant member — ``max`` of the members'
+    local rooflines, not the sum: a fused kernel streams the external
+    inputs once and writes the output once, so intermediates never
+    touch memory and interior launches vanish.  Non-fusible ops
+    (matmul, conv, sdpa, the carrier compose/apply ops) keep their own
+    kernels and price at full local roofline.  Every surviving kernel
+    — one per region, one per non-fusible op — additionally pays one
+    ``dispatch_s`` (the profile's ``dispatch_us``, else the launch
+    constant): compilation removes launches, not the dispatch
+    boundary.  Without it a lone GEMM would always look cheaper
+    compiled than generic — it isn't; fusion cannot shrink one kernel.
+
+    Deliberately approximate: real fusion decisions are
+    scheduler-dependent (rematerialise vs reuse, reduction splits,
+    layout constraints), and charging the dominant member underprices
+    a region whose members read *different* large externals.  That is
+    the honest part of the model — pointwise fusion is where the
+    measured win lives.
+
+    Units are nanoseconds, matching :func:`roofline_cost`; the closure
+    has the standard ``fn(term, memo=None)`` signature.
+    """
+    pf, bw, ls = _profile_constants(profile)
+    dispatch_s = _profile_dispatch_s(profile)
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        memo = {} if memo is None else memo
+        ck = ("fc", pf, bw, ls, dispatch_s, term)
+        if ck in memo:
+            return memo[ck]
+        out = _fused_cost(term, memo, pf, bw, ls, dispatch_s)
+        memo[ck] = float(out)
+        return out
+
+    cost.__name__ = "fused_cost_for"
+    cost.profile = profile
+    return cost
+
+
+def lowering_aware_cost_for(
+    profile: Any = None,
+    *,
+    lowerings: tuple = LOWERINGS,
+    base: str = "roofline",
+) -> CostFn:
+    """Min-over-lowerings cost: price each term at its cheapest executor.
+
+    For each ``l`` in ``lowerings`` the term is priced by
+    :func:`executor_cost_for` ``(lowering=l, base=base)`` —
+    ``"compiled"`` routes to :func:`fused_cost_for` instead — and the
+    term's cost is the minimum.  Extraction under this model
+    implicitly picks the term whose *best* lowering is cheapest,
+    rather than pricing every term as if the generic per-node
+    dispatcher would run it: a balanced carrier tree credits its
+    level-batched plan, a pointwise chain credits fusion.
+
+    The returned closure carries ``cost.best_lowering(term,
+    memo=None) -> str`` — the argmin lowering (first in ``lowerings``
+    order on ties), for reporting which executor the price
+    corresponds to.
+    """
+    fns: dict[str, CostFn] = {}
+    for lw in lowerings:
+        if lw == "compiled":
+            fns[lw] = fused_cost_for(profile)
+        elif lw in LOWERINGS:
+            fns[lw] = executor_cost_for(profile, lowering=lw, base=base)
+        else:
+            raise ValueError(
+                f"unknown lowering {lw!r} — expected one of {LOWERINGS}"
+            )
+    if not fns:
+        raise ValueError("lowerings must be non-empty")
+    pf, bw, ls = _profile_constants(profile)
+    dsp = _profile_dispatch_s(profile)
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        memo = {} if memo is None else memo
+        ck = ("lw", base, pf, bw, ls, dsp, tuple(lowerings), term)
+        if ck in memo:
+            return memo[ck]
+        out = min(f(term, memo) for f in fns.values())
+        memo[ck] = float(out)
+        return out
+
+    def best_lowering(term: Any, memo: dict | None = None) -> str:
+        memo = {} if memo is None else memo
+        return min(fns, key=lambda lw: fns[lw](term, memo))
+
+    cost.__name__ = "lowering_aware_cost_for"
+    cost.profile = profile
+    cost.best_lowering = best_lowering
+    return cost

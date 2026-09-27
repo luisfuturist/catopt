@@ -377,8 +377,38 @@ class TestSeededTracePipeline:
                 saw["split"] = True
             else:
                 saw["joint"] = True
-        # across regimes both architectures surfaced
-        assert saw["joint"] and saw["split"]
+        # Honest solver pricing (param-only subtrees are billed when
+        # they don't actually fold) makes the channel-split member win
+        # every regime — the joint solve is genuinely the pricier
+        # architecture.  Both still exist in the e-graph: force-extract
+        # the joint trace enode (trace over a ``parl`` state, in the
+        # scanned-state class) and verify it fp64 as well.
+        assert saw["split"]
+        joint = None
+        for cid, cls in eg._classes.items():
+            for n in cls.nodes:
+                if n.op != "trace":
+                    continue
+                cand = eg.extract_best(
+                    root, flops_cost, overrides={cid: n}
+                )
+                rep = op_repr(cand)
+                if "trace" in rep and "bdiag" not in rep:
+                    joint = cand
+                    break
+            if joint is not None:
+                break
+        assert joint is not None, "joint trace member lost"
+        joint_mod = ir_to_torch_module(
+            IR(
+                root=joint,
+                inputs=ir.inputs,
+                input_names=ir.input_names,
+                params=ir.params,
+            ),
+            param_values=env,
+        )
+        assert (joint_mod(x) - ref).abs().max().item() < 1e-12
 
     def test_channel_split_member_is_fp64_exact(self):
         """Extract the bdiag-of-traces member explicitly (pin the root

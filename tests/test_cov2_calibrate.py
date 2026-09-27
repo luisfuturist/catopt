@@ -15,8 +15,11 @@ Beyond the behavioural tests (test_calibrate.py) this file covers:
   frozen ``perf_counter``);
 * ``_default_name``'s CUDA branch (device-name query + fallback);
 * ``calibrate(device="cuda")`` — sweep sizing, tf32 save/restore —
-  with the three measurement probes monkeypatched, so the CUDA-only
+  with the five measurement probes monkeypatched, so the CUDA-only
   code runs on a CPU-only box;
+* the executor-overhead probes themselves (frozen-clock floor, real
+  CPU runs) and their calibrate() fallbacks — a raising probe and a
+  non-positive reading both land on the ``_FALLBACK_*`` constants;
 * ``_verbose_ctx`` level restore (both directions);
 * real CPU ``calibrate(quick=True)`` plausibility: finite, positive
   constants, parseable ``measured_at``, populated ``meta``.
@@ -198,12 +201,34 @@ def test_measure_guards_on_zero_dt(monkeypatch):
     dev = torch.device("cpu")
     assert C._measure_flops(dev, torch.float32, (8,), 2, 1) == 0.0
     assert C._measure_bandwidth(dev, torch.float32, (1,), 2, 1) == 0.0
+    # the executor probes clamp their median diff at zero — a frozen
+    # clock exercises exactly that ``max(..., 0.0)`` floor
+    assert C._measure_dispatch(dev, torch.float32, 2, 3, 1, 8) == 0.0
+    assert C._measure_leaf_eval(dev, torch.float32, 2, 3, 1) == 0.0
 
 
 def test_measure_launch_returns_per_op_time():
     # unpatched clock: a tiny real measurement is finite and positive
     dt = C._measure_launch(torch.device("cpu"), torch.float32, 50, 10)
     assert math.isfinite(dt) and dt > 0
+
+
+def test_measure_dispatch_returns_per_node_overhead():
+    """Real CPU run of the dispatch probe: a lowered 32-op add/mul
+    chain vs the inline-torch equivalent — finite and non-negative."""
+    dt = C._measure_dispatch(
+        torch.device("cpu"), torch.float32, 3, 5, 2, 32
+    )
+    assert math.isfinite(dt) and dt >= 0
+
+
+def test_measure_leaf_eval_returns_per_leaf_overhead():
+    """Real CPU run of the leaf probe: a select+mul+add leaf-shaped
+    term through ``ir_to_torch_module`` — finite and non-negative."""
+    dt = C._measure_leaf_eval(
+        torch.device("cpu"), torch.float32, 3, 50, 10
+    )
+    assert math.isfinite(dt) and dt >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +273,9 @@ def test_calibrate_cpu_quick_plausibility():
     assert math.isfinite(p.tflops) and p.tflops > 0
     assert math.isfinite(p.gbps) and p.gbps > 0
     assert math.isfinite(p.launch_us) and p.launch_us > 0
+    # executor-overhead constants measured on this CPU
+    assert math.isfinite(p.dispatch_us) and p.dispatch_us > 0
+    assert math.isfinite(p.leaf_eval_us) and p.leaf_eval_us > 0
     assert p.meta["dtype"] == "float32"
     assert p.meta["torch"] == torch.__version__
     assert "platform" in p.meta
@@ -265,10 +293,12 @@ def test_calibrate_cpu_named_and_saved(tmp_path, monkeypatch):
 
 def test_calibrate_cuda_branch_monkeypatched(monkeypatch, caplog):
     """Run the CUDA sweep-sizing + tf32 save/restore code on a CPU box
-    by stubbing the three measurement probes (and the device name)."""
+    by stubbing the five measurement probes (and the device name)."""
     monkeypatch.setattr(C, "_measure_flops", lambda *a: 2.0e12)
     monkeypatch.setattr(C, "_measure_bandwidth", lambda *a: 9.0e11)
     monkeypatch.setattr(C, "_measure_launch", lambda *a: 4.0e-6)
+    monkeypatch.setattr(C, "_measure_dispatch", lambda *a: 2.0e-6)
+    monkeypatch.setattr(C, "_measure_leaf_eval", lambda *a: 7.5e-6)
     monkeypatch.setattr(
         torch.cuda, "get_device_name", lambda dev=None: "Fake GPU"
     )
@@ -282,6 +312,8 @@ def test_calibrate_cuda_branch_monkeypatched(monkeypatch, caplog):
         assert p.tflops == pytest.approx(2.0)
         assert p.gbps == pytest.approx(900.0)
         assert p.launch_us == pytest.approx(4.0)
+        assert p.dispatch_us == pytest.approx(2.0)
+        assert p.leaf_eval_us == pytest.approx(7.5)
         # tf32 was disabled during measurement and restored after
         assert torch.backends.cuda.matmul.allow_tf32 is True
         assert "calibrated" in caplog.text
@@ -296,10 +328,59 @@ def test_calibrate_cuda_tf32_access_failure(monkeypatch):
     monkeypatch.setattr(C, "_measure_flops", lambda *a: 1.0e12)
     monkeypatch.setattr(C, "_measure_bandwidth", lambda *a: 1.0e11)
     monkeypatch.setattr(C, "_measure_launch", lambda *a: 1.0e-6)
+    monkeypatch.setattr(C, "_measure_dispatch", lambda *a: 1.0e-6)
+    monkeypatch.setattr(C, "_measure_leaf_eval", lambda *a: 1.0e-6)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "G")
     monkeypatch.setattr(torch.backends.cuda, "matmul", None)
     p = calibrate(device="cuda", quick=True)
     assert p.device == "cuda" and p.name == "G"
+
+
+# ---------------------------------------------------------------------------
+# executor-overhead probe fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_calibrate_dispatch_probe_failure_falls_back(monkeypatch):
+    """A raising dispatch probe keeps ``_FALLBACK_DISPATCH_US``; a
+    non-positive leaf reading falls back through the ``<= 0`` guard —
+    and neither poisons the other constant."""
+    monkeypatch.setattr(
+        C,
+        "_measure_dispatch",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("no adapter")),
+    )
+    monkeypatch.setattr(C, "_measure_leaf_eval", lambda *a: 0.0)
+    p = calibrate(device="cpu", quick=True)
+    assert p.dispatch_us == C._FALLBACK_DISPATCH_US
+    assert p.leaf_eval_us == C._FALLBACK_LEAF_EVAL_US
+    # the other constants still measured
+    assert p.tflops > 0 and p.launch_us > 0
+
+
+def test_calibrate_leaf_probe_failure_falls_back(monkeypatch):
+    """Symmetric: dispatch measures but reads non-positive → fallback;
+    a raising leaf probe → leaf fallback while dispatch keeps its
+    fallback (0 measured is not a constant)."""
+    monkeypatch.setattr(C, "_measure_dispatch", lambda *a: 0.0)
+    monkeypatch.setattr(
+        C,
+        "_measure_leaf_eval",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("no adapter")),
+    )
+    p = calibrate(device="cpu", quick=True)
+    assert p.dispatch_us == C._FALLBACK_DISPATCH_US
+    assert p.leaf_eval_us == C._FALLBACK_LEAF_EVAL_US
+
+
+def test_calibrate_dispatch_probe_real_value(monkeypatch):
+    """A synthetic per-node time lands in the profile as µs —
+    the measurement path through to the field, unpatched."""
+    monkeypatch.setattr(C, "_measure_dispatch", lambda *a: 3.25e-6)
+    monkeypatch.setattr(C, "_measure_leaf_eval", lambda *a: 9.5e-6)
+    p = calibrate(device="cpu", quick=True)
+    assert p.dispatch_us == pytest.approx(3.25)
+    assert p.leaf_eval_us == pytest.approx(9.5)
 
 
 @pytest.mark.requires_cuda

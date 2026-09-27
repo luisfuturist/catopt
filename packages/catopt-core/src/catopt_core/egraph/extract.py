@@ -1,11 +1,12 @@
 """Extraction mixin: cost-based + paired extraction."""
+
 # ruff: noqa: RUF002 — math notation in comments
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from catopt_core.cost import _memo_dispatch
+from catopt_core.cost import _FOLDABLE_ELEMWISE, _memo_dispatch
 from catopt_core.egraph.types import (
     ENode,
     _LeafRegistry,
@@ -15,9 +16,17 @@ from catopt_core.ir import Op
 
 logger = logging.getLogger("catopt_core.egraph.extract")
 
+#: Ops ``IRModule._fold_weight_chains`` actually folds into a
+#: materialised parameter (mirrors ``cost._folds_to_param``).  The
+#: param-only discount applies only to classes whose extracted subtree
+#: is built from these — a param-only ``trace``/``inv`` subtree is NOT
+#: foldable: it evaluates a solver call at runtime, so it must be
+#: billed.  (The e-class level check approximates the per-arg Const
+#: rules — see the function for the exact contract.)
+_FOLDABLE_OPS = _FOLDABLE_ELEMWISE | {"matmul", "concat"}
+
 
 class _ExtractMixin:
-
     def extract_min_depth(self, eid: int) -> Any:
         """Extract the minimum critical-path-depth member.
 
@@ -264,7 +273,9 @@ class _ExtractMixin:
                     if canon_child == eclass_id:
                         valid = False  # direct self-reference
                         break
-                    _ctotal, cterm, cused, cpo, cnops = best(canon_child)
+                    _ctotal, cterm, cused, cpo, cnops = best(
+                        canon_child
+                    )
                     if cterm is None:
                         valid = False
                         break
@@ -288,6 +299,10 @@ class _ExtractMixin:
                 term = Op.make(
                     node.op, *child_terms, **dict(node.attrs)
                 )
+                # …and this node's own op must be foldable — a
+                # param-only subtree over trace/inv still runs its
+                # solver call per eval, so it is billed.
+                param_only = param_only and node.op in _FOLDABLE_OPS
                 local = cfn(term) - sum(cfn(c) for c in child_terms)
                 local = max(local, 0.0)
                 if param_only and not bill_params:
@@ -590,4 +605,3 @@ class _ExtractMixin:
             ):
                 return eid, n
         return eid, None
-

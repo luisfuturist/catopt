@@ -59,6 +59,20 @@ def test_profile_json_roundtrip():
     # bytes and pre-parsed dicts work too
     assert TargetProfile.from_json(s.encode()) == RTX2050
     assert TargetProfile.from_json(json.loads(s)) == RTX2050
+    # executor-overhead fields serialise with the rest
+    assert "dispatch_us" in s and "leaf_eval_us" in s
+
+
+def test_profile_executor_overhead_defaults():
+    """Profiles built without the new constants — or loaded from a
+    pre-probe JSON — get the conservative fallbacks, not zeros."""
+    bare = TargetProfile("bare", 1.0, 2.0, 3.0, "cpu", "t")
+    assert bare.dispatch_us > 0 and bare.leaf_eval_us > 0
+    legacy = json.loads(RTX2050.to_json())
+    del legacy["dispatch_us"], legacy["leaf_eval_us"]
+    p = TargetProfile.from_json(legacy)
+    assert p.dispatch_us == bare.dispatch_us
+    assert p.leaf_eval_us == bare.leaf_eval_us
 
 
 def test_profile_json_ignores_unknown_fields():
@@ -180,6 +194,10 @@ def test_calibrate_cpu_sane():
     assert 0.1 < p.gbps < 1e5
     # 10 ns .. 10 ms per launch
     assert 0.01 < p.launch_us < 1e4
+    # executor-overhead constants: measured positive on CPU (or a
+    # positive fallback — either way never zero)
+    assert 0.001 < p.dispatch_us < 1e4
+    assert 0.001 < p.leaf_eval_us < 1e4
     # and the measured profile yields a working cost fn
     assert roofline_cost_for(p)(_mm_term()) > 0.0
 
@@ -193,6 +211,7 @@ def test_calibrate_cuda_sane():
     # 1 GB/s .. 100 TB/s
     assert 1.0 < p.gbps < 1e5
     assert 0.01 < p.launch_us < 1e4
+    assert p.dispatch_us > 0 and p.leaf_eval_us > 0
     assert roofline_cost_for(p)(_mm_term()) > 0.0
 
 
