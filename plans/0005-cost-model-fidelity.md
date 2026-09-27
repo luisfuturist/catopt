@@ -1,6 +1,25 @@
 # Plan 0005 — Cost-model fidelity vs measured latency
 
-Status: measured (bench landed) — fix identified, not yet implemented
+Status: fix landed (main `9b3577d`) — executor-aware pricing +
+lowering routing implemented; follow-up fidelity re-run in progress
+
+## Landed (main 9b3577d)
+
+- `catopt_core.cost`: `executor_overhead` / `executor_cost_for` /
+  `fused_cost_for` / `lowering_aware_cost_for` — per-node additive
+  generic dispatch, level-batched carrier pricing (levels + one
+  batched eval per leaf kind), fused-region pricing. Solver ops
+  (`trace`/`inv`) carry `_SOLVER_FACTOR`.
+- `calibrate()`: `dispatch_us` / `leaf_eval_us` measured.
+- `optimize_model` routes extracted carrier-apply terms to their
+  batched executors (`stats["lowering"]`); generic fallback.
+- `extract_best`/`dag_cost`: param-only discount restricted to
+  subtrees that actually fold — the un-foldable `trace` subtree
+  billed 0 was what let the resolvent member win extraction.
+- Constraint discovered: cost fns driving `extract_best` must be
+  additive (`c(t) − Σc(children)` local recovery); min-over-lowerings
+  is not, so `lowering_aware_cost_for` is reporting-only and the
+  selection default is `executor_cost_for(lowering="generic")`.
 
 ## Measured (RTX 2050 + CPU)
 
