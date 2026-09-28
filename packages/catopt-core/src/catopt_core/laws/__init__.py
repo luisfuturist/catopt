@@ -8,6 +8,10 @@
   ``ALL_RULES`` / ``all_rules()``.
 * :mod:`catopt_core.laws.scan` — the scan-monoid law sets: ``SCAN_LAWS``
   (dense affine carrier) and ``SCAN_DIAG_LAWS`` (diagonal-affine).
+* :mod:`catopt_core.laws.layout` — the transpose/layout laws:
+  ``LAYOUT_RULES`` (pointwise commutation, involution, the
+  product-transpose law, and the ``linear``/NT-GEMM bridge), folded
+  into ``ALL_RULES``.
 * :mod:`catopt_core.laws.pairing` — the non-local passes over the whole
   e-graph (pairing, weight sharing).  These are diagram-level passes,
   not equational laws.
@@ -28,6 +32,22 @@ from catopt_core.laws.base import (  # noqa: F401
     _is_row_scale,
     _is_scalar,
     _shape_of,
+)
+from catopt_core.laws.layout import (  # noqa: F401
+    LAYOUT_RULES,
+    LINEAR_FROM_MM_T,
+    LINEAR_FROM_MM_T_BARE,
+    LINEAR_TO_MM_T,
+    _bound_axes,
+    _check_commute_binary,
+    _check_commute_unary,
+    _check_involution,
+    _check_linear_is_mm_t,
+    _check_mm_t_is_linear,
+    _check_mm_transposes,
+    _check_transpose_matmul,
+    _is_swap,
+    _linear_shapes_ok,
 )
 from catopt_core.laws.pairing import (  # noqa: F401
     _CONV_ATTR_KEYS,
@@ -177,10 +197,14 @@ __all__ = [
     "GQA_ABSORB",
     "ID_ADD",
     "ID_MUL",
+    "LAYOUT_RULES",
     "LINEAR_CHANNEL_SCALE",
     "LINEAR_CHANNEL_SCALE_REV",
+    "LINEAR_FROM_MM_T",
+    "LINEAR_FROM_MM_T_BARE",
     "LINEAR_ROW_SCALE",
     "LINEAR_ROW_SCALE_REV",
+    "LINEAR_TO_MM_T",
     "NATURALITY_SCALAR",
     "NATURALITY_SCALAR_REV",
     "PARALLEL_MUL_FUSE",

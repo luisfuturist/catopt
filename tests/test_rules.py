@@ -26,8 +26,10 @@ def test_rules_have_correct_names():
 
 
 def test_all_rules_contains_all():
-    """ALL_RULES should be the union of simplification and categorical rules."""
-    combined = SIMPLIFICATION_RULES + CATEGORICAL_RULES
+    """ALL_RULES: simplification + categorical + layout rules."""
+    from catopt_core.laws import LAYOUT_RULES
+
+    combined = SIMPLIFICATION_RULES + CATEGORICAL_RULES + LAYOUT_RULES
     assert len(all_rules()) == len(combined)
 
 

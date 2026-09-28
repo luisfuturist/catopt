@@ -34,6 +34,7 @@ from catopt_core.laws.base import (
     _is_scalar,
     _shape_of,
 )
+from catopt_core.laws.layout import LAYOUT_RULES
 
 # ---------------------------------------------------------------------------
 #  Monoid laws: commutativity & associativity
@@ -1080,8 +1081,11 @@ CATEGORICAL_RULES: list[Rewrite] = [
     # Softmax-attention fold (flash-attention transform)
     *SDPA_FOLD_RULES,
 ]
-#: All rules combined.
-ALL_RULES: list[Rewrite] = SIMPLIFICATION_RULES + CATEGORICAL_RULES
+#: All rules combined — the tensor algebra plus the layout laws
+#: (:mod:`catopt_core.laws.layout`, transpose/pointwise/GEMM relayout).
+ALL_RULES: list[Rewrite] = (
+    SIMPLIFICATION_RULES + CATEGORICAL_RULES + LAYOUT_RULES
+)
 
 
 def all_rules() -> list[Rewrite]:

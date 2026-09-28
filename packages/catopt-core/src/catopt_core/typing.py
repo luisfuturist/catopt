@@ -1041,6 +1041,26 @@ def _ax_tuple(v: Any) -> tuple | None:
     return None
 
 
+def _axis_pair(d0: Any, d1: Any, rank: int) -> tuple[int, int] | None:
+    """Normalise a two-axis ``transpose`` pair against ``rank``.
+
+    Returns ``(d0 % rank, d1 % rank)`` when both dims are ints in
+    ``[-rank, rank)`` — the canonical per-operand form the axis readers
+    above use.  ``None`` for a rank-0 operand (no axes to swap), a
+    non-int dim, or a dim outside torch's accepted range.  Law
+    check-hooks (:mod:`catopt_core.laws.layout`) use it to decide
+    whether a bound ``transpose`` applies the axis swap their rewrite
+    assumes.
+    """
+    if rank < 1:
+        return None
+    if not (isinstance(d0, int) and isinstance(d1, int)):
+        return None
+    if not (-rank <= d0 < rank and -rank <= d1 < rank):
+        return None
+    return (d0 % rank, d1 % rank)
+
+
 def _index_shape(op: Op, shapes: list) -> tuple | str | None:
     """``index`` — numpy-style advanced indexing.
 

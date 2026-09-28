@@ -20,6 +20,7 @@ import re
 import sys
 
 import catopt_core.laws as laws
+import catopt_core.laws.layout
 import catopt_core.laws.pairing
 import catopt_core.laws.scan
 import catopt_core.laws.tensor
@@ -104,6 +105,7 @@ PUBLIC_NAMES = [
     "CATEGORICAL_RULES",
     "SCAN_LAWS",
     "SCAN_DIAG_LAWS",
+    "LAYOUT_RULES",
     "ALL_RULES",
     "all_rules",
     # non-local passes
@@ -178,15 +180,17 @@ def test_laws_exports_every_rewrite():
 
     found = _iter_module_rules(laws)
     assert all(isinstance(r, Rewrite) for r in found)
-    # 50 tensor + 6 dense-scan + 16 diagonal-scan rewrites.
-    assert len(found) == 72
+    # 50 tensor + 6 dense-scan + 16 diagonal-scan + 77 layout rewrites.
+    assert len(found) == 149
 
 
 def test_all_rules_count_unchanged():
-    assert len(laws.all_rules()) == 50
+    assert len(laws.all_rules()) == 127
     assert laws.all_rules() == laws.ALL_RULES
     assert len(laws.ALL_RULES) == (
-        len(laws.SIMPLIFICATION_RULES) + len(laws.CATEGORICAL_RULES)
+        len(laws.SIMPLIFICATION_RULES)
+        + len(laws.CATEGORICAL_RULES)
+        + len(laws.LAYOUT_RULES)
     )
     # each call returns a fresh list, not the shared ALL_RULES object
     assert laws.all_rules() is not laws.ALL_RULES
@@ -197,6 +201,10 @@ def test_collections_split_by_domain():
     assert len(laws.CATEGORICAL_RULES) == 37
     assert len(laws.SCAN_LAWS) == 6
     assert len(laws.SCAN_DIAG_LAWS) == 16
+    # layout: 12 unary + 4 binary pointwise commutations x 2 spellings
+    # x 2 directions, 4 involution spellings, 6 product-transpose,
+    # 3 linear/NT bridge
+    assert len(laws.LAYOUT_RULES) == 77
 
 
 def test_pairing_passes_resolve_from_both_paths():
@@ -217,6 +225,7 @@ def test_laws_modules_are_self_contained():
         catopt_core.laws.base,
         catopt_core.laws.tensor,
         catopt_core.laws.scan,
+        catopt_core.laws.layout,
         catopt_core.laws.pairing,
     ):
         with open(mod.__file__) as f:
@@ -235,10 +244,13 @@ def test_laws_modules_import_cleanly():
             "all_rules",
         ],
         "catopt_core.laws.scan": ["SCAN_LAWS", "SCAN_DIAG_LAWS"],
+        "catopt_core.laws.layout": ["LAYOUT_RULES"],
         "catopt_core.laws.pairing": PAIRING_PASSES,
     }
     for modname, names in expected.items():
-        mod = sys.modules.get(modname) or importlib.import_module(modname)
+        mod = sys.modules.get(modname) or importlib.import_module(
+            modname
+        )
         for n in names:
             assert hasattr(mod, n), f"{modname}.{n}"
     # package-level re-export matches the submodules' surface
