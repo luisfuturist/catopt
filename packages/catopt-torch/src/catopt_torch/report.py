@@ -310,6 +310,10 @@ class CompositionalReport(OptReport):
     n_skipped: int | None = None
     blocks: dict[str, BlockReport] | None = None
     in_place: bool | None = None
+    #: True when the recomposed module shares the input's tensor
+    #: storage (the param-sharing clone — the normal path); False when
+    #: ``in_place`` fell back to returning the caller's module.
+    shared_params: bool | None = None
     param_report: dict | None = None
     end_to_end: dict | None = None
     wall_time_s: float | None = None

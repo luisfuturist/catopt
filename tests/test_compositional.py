@@ -10,9 +10,9 @@ and grafts the lowered IRModules back into a clone of the model.
 
 import time
 
+import pytest
 import torch
 import torch.nn as nn
-
 from catopt.models import DeepParallel, ParallelBlock, ParallelLinear
 from catopt.optimize import optimize_compositional
 
@@ -68,6 +68,13 @@ def test_compositional_parallel_block_stack():
     assert any("fused" in n for n in pr["derived"])
     assert all(n.startswith("blocks.") for n in pr["eliminated"])
 
+    # The recomposed model is a real clone sharing tensor storage —
+    # and the caller's model was never mutated.
+    assert stats["shared_params"] is True
+    assert stats["in_place"] is False
+    assert opt is not model
+    assert all(isinstance(b, ParallelBlock) for b in model.blocks)
+
     # End-to-end equivalence (fp32).
     assert stats["end_to_end"]["max_rel_diff"] < 1e-4
     model.eval()
@@ -97,6 +104,7 @@ def test_compositional_sequential_stack_fp64():
 
     opt, stats = optimize_compositional(model, x, verbose=False)
     assert stats["n_optimized"] == 4
+    assert stats["shared_params"] is True
     for i in range(4):
         assert stats["blocks"][f"net.{i}"]["status"] == "optimized"
     with torch.no_grad():
@@ -147,10 +155,15 @@ def test_compositional_fallback_keeps_original():
     bad = stats["blocks"]["blocks.1"]
     assert bad["status"] == "failed"
     assert "error" in bad
-    # The original (unmodified) block object was kept.
+    # The original (unmodified) block object was kept — a fresh module
+    # shell sharing the caller's parameter storage (param-sharing
+    # clone: no second copy of the weights).
+    assert stats["shared_params"] is True
+    assert stats["in_place"] is False
     assert opt.blocks[1] is not None
     assert isinstance(opt.blocks[1], _DataDependentBlock)
     assert opt.blocks[1] is not model.blocks[1]  # clone, same weights
+    assert opt.blocks[1].lin.weight is model.blocks[1].lin.weight
     assert torch.equal(
         opt.blocks[1].lin.weight, model.blocks[1].lin.weight
     )
@@ -173,9 +186,9 @@ def test_compositional_fallback_keeps_original():
 
 
 def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
-    """When deepcopy fails (e.g. OOM), the returned model is the INPUT
-    unmodified — the report must say so, not run a degenerate
-    self-comparison verify."""
+    """When the recompose clone fails (e.g. an unpicklable non-tensor
+    attr), the returned model is the INPUT unmodified — the report must
+    say so, not run a degenerate self-comparison verify."""
     import catopt_optimize.optimize as O
     from catopt.optimize import optimize_compositional
 
@@ -183,12 +196,121 @@ def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
     model = MiniGPT(dim=32, n_heads=2, depth=1, hidden_mult=2).eval()
     x = torch.randn(1, 8, 32)
 
-    def boom(_m):
-        raise RuntimeError("CUDA out of memory")
+    def boom(*_a, **_k):
+        raise RuntimeError("cannot pickle this attribute")
 
     monkeypatch.setattr(O.copy, "deepcopy", boom)
     opt, stats = optimize_compositional(model, x, verbose=False)
     assert opt is model  # same object — nothing grafted
     assert stats["in_place"] is True
+    assert stats["shared_params"] is False
     assert stats["n_optimized"] == 0
     assert stats["end_to_end"]["skipped"] == "in_place"
+
+
+class _RootParam(nn.Module):
+    """Stack plus weights OUTSIDE any selected block: a Parameter and a
+    buffer on the root, and an unregistered tensor attribute — the
+    three tensor categories the sharing clone must alias."""
+
+    def __init__(self, dim: int = 32, depth: int = 2) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            ParallelLinear(dim, n_experts=2) for _ in range(depth)
+        )
+        self.root_w = nn.Parameter(torch.randn(dim, dim))
+        self.register_buffer("root_buf", torch.randn(dim))
+        self.plain_tensor = torch.randn(dim)  # __dict__, unregistered
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for b in self.blocks:
+            x = b(x)
+        return x @ self.root_w + self.root_buf + self.plain_tensor
+
+
+def test_compositional_recompose_shares_tensor_storage():
+    """The recompose clone copies module STRUCTURE but aliases every
+    tensor — parameter, buffer, and unregistered __dict__ attr — so
+    recomposing costs no second copy of the weights, and the caller's
+    model is never mutated."""
+    torch.manual_seed(0)
+    model = _RootParam(dim=32, depth=2).eval()
+    x = torch.randn(8, 32)
+
+    opt, stats = optimize_compositional(model, x, verbose=False)
+
+    assert stats["n_optimized"] == 2
+    assert stats["in_place"] is False
+    assert stats["shared_params"] is True
+    assert opt is not model
+
+    # Fresh shells, shared tensors — same objects, same storage.  The
+    # blocks were replaced by IRModules (their params are new fused
+    # weights); the weights outside every selected block alias.
+    assert opt.blocks is not model.blocks
+    assert opt.root_w is model.root_w
+    assert opt.root_buf is model.root_buf
+    assert opt.plain_tensor is model.plain_tensor
+    assert opt.root_w.data_ptr() == model.root_w.data_ptr()
+
+    # Grafting rebound only the clone's _modules — the caller's model
+    # still holds its original blocks and forwards unchanged.
+    assert all(isinstance(b, ParallelLinear) for b in model.blocks)
+    assert stats["end_to_end"]["max_rel_diff"] < 1e-4
+
+
+def test_shared_param_clone_preserves_structure_and_training():
+    """Unit-level check of the clone helper: every module shell and
+    dict is fresh, every tensor is aliased, non-tensor attrs copy."""
+    import catopt_optimize.optimize as O
+
+    torch.manual_seed(0)
+    model = MiniGPT(dim=32, n_heads=2, depth=2, hidden_mult=2)
+    model.plain_buf = torch.randn(4)
+    model.tag = [1, 2, 3]  # non-tensor attr — must copy, not share
+    model.train()
+
+    clone = O._shared_param_clone(model)
+
+    assert clone is not model
+    assert clone.blocks is not model.blocks
+    assert clone.blocks[0] is not model.blocks[0]
+    # Structure copies; tensors share.
+    assert clone.tag == model.tag and clone.tag is not model.tag
+    assert clone.training is True
+    assert clone.plain_buf is model.plain_buf
+    for p_orig, p_new in zip(
+        model.parameters(), clone.parameters(), strict=True
+    ):
+        assert p_new is p_orig
+        assert p_new.data_ptr() == p_orig.data_ptr()
+    # Rebinding on the clone leaves the original's _modules intact.
+    O._replace_submodule(clone, "blocks.0", nn.Identity())
+    assert isinstance(clone.blocks[0], nn.Identity)
+    assert isinstance(model.blocks[0], ParallelBlock)
+
+
+@pytest.mark.requires_cuda
+def test_shared_param_clone_cuda_no_param_copy():
+    """On GPU the clone allocates no second copy of the weights: device
+    memory grows only by the (host-side) module shells."""
+    import catopt_optimize.optimize as O
+
+    torch.manual_seed(0)
+    model = MiniGPT(dim=512, n_heads=8, depth=4, hidden_mult=4)
+    model = model.half().cuda().eval()
+    param_bytes = sum(
+        p.numel() * p.element_size() for p in model.parameters()
+    )
+    before = torch.cuda.memory_allocated()
+
+    clone = O._shared_param_clone(model)
+
+    grown = torch.cuda.memory_allocated() - before
+    assert grown < param_bytes // 10, (
+        f"clone allocated {grown} B for {param_bytes} B of params"
+    )
+    for p_orig, p_new in zip(
+        model.parameters(), clone.parameters(), strict=True
+    ):
+        assert p_new.data_ptr() == p_orig.data_ptr()

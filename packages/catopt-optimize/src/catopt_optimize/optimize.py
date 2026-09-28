@@ -1095,6 +1095,45 @@ def _replace_submodule(
         setattr(parent, child_name, new_mod)
 
 
+def _shared_param_clone(model: torch.nn.Module) -> torch.nn.Module:
+    """Deepcopy ``model``'s module structure without copying tensors.
+
+    A plain ``copy.deepcopy`` of an ``nn.Module`` clones every parameter
+    and buffer — at ~0.5B fp16 params that doubles device memory before
+    a single optimized block is grafted, which is what OOMed
+    compositional recompose on small GPUs.  Recomposing only ever
+    *replaces* submodules (``_replace_submodule`` rebinds entries in the
+    clone's ``_modules`` dicts); it never mutates a tensor in place, so
+    the clone can share the original's tensor storage safely.
+
+    The mechanism is deepcopy's own memo: ``copy.deepcopy`` checks
+    ``memo[id(obj)]`` before dispatching to ``__deepcopy__``, so
+    pre-seeding every reachable tensor's id makes the clone reuse those
+    objects while the module ``__dict__``s, ``_modules`` /
+    ``_parameters`` / ``_buffers`` dicts, and plain attributes still
+    copy normally — the result is a real clone (``training`` flag,
+    hooks, structure) whose weights alias the original's.  Grafting
+    into it cannot touch the caller's model.
+
+    Seeding covers registered ``parameters()``/``buffers()`` plus
+    *unregistered* tensor attributes — ``mod.foo = tensor`` lands in
+    ``__dict__`` (only Parameters go to ``_parameters`` and only
+    registered buffers to ``_buffers``), which the default deepcopy
+    walk traverses by id, so the memo shares them too.  Tensors nested
+    inside non-tensor container/attribute objects (e.g.
+    ``self.cache = {"k": t}``) are not memo-hit and still clone; if
+    even that fails, the caller's in-place fallback applies.
+    """
+    memo: dict[int, Any] = {}
+    for t in list(model.parameters()) + list(model.buffers()):
+        memo[id(t)] = t
+    for mod in model.modules():
+        for v in vars(mod).values():
+            if isinstance(v, torch.Tensor):
+                memo[id(v)] = v
+    return copy.deepcopy(model, memo)
+
+
 def optimize_compositional(
     model: torch.nn.Module,
     example_input: torch.Tensor | tuple,
@@ -1127,15 +1166,21 @@ def optimize_compositional(
        original implementation; a block that crosses a resource bound
        (``max_enodes``, ``max_memory_mb``, or a caught OOM) fails with
        ``reason == "resource_limit"``,
-    4. clones the model and grafts the optimized ``IRModule`` back in
-       place, preserving the original forward structure, then verifies
+    4. clones the model — structure deep-copied, parameter/buffer
+       tensors *shared* with the original (``_shared_param_clone``; no
+       second copy of the weights, so recompose does not double device
+       memory) — and grafts the optimized ``IRModule`` back in place,
+       preserving the original forward structure, then verifies
        end-to-end equivalence on ``example_input``.
 
     Returns ``(recomposed_module, stats)`` where ``stats["blocks"]`` maps
     each block's dotted name to ``{"status", "stats", "param_report",
     "time_s", ...}`` and ``stats["param_report"]`` aggregates the
     per-block parameter diffs (eliminated/derived names are prefixed by
-    block name for auditability).
+    block name for auditability).  ``stats["shared_params"]`` is True
+    when the recomposed module shares the original's tensor storage
+    (the normal path); ``stats["in_place"]`` True means cloning failed
+    and the input module was returned unmodified.
     """
     t_start = time.time()
     if cost_fn is None:
@@ -1226,9 +1271,13 @@ def optimize_compositional(
         rep.time_s = time.time() - t0
 
     # -- Recompose -------------------------------------------------------
+    # The clone grafts submodules, never tensors, so it shares the
+    # original's parameter/buffer storage — recomposing costs no extra
+    # weight bytes (the old plain deepcopy doubled the footprint and
+    # OOMed at ~0.5B fp16 on small GPUs).
     in_place = False
     try:
-        new_model = copy.deepcopy(model)
+        new_model = _shared_param_clone(model)
     except Exception:
         # Never graft into the caller's live model: the replacements
         # carry shape-specialized attrs baked by torch.export for the
@@ -1255,6 +1304,7 @@ def optimize_compositional(
         ),
         blocks=block_reports,
         in_place=in_place,
+        shared_params=not in_place,
     )
     agg["bytes_saved"] = agg["original_bytes"] - agg["optimized_bytes"]
     agg["ratio"] = (
@@ -1275,8 +1325,8 @@ def optimize_compositional(
         # degenerate case honestly instead of a false pass.
         report.end_to_end = {
             "skipped": "in_place",
-            "reason": "deepcopy failed — returned model is the "
-            "input module, unmodified",
+            "reason": "param-sharing clone failed — returned model "
+            "is the input module, unmodified",
         }
         logger.warning(
             "optimize_compositional: clone failed — returning the "
