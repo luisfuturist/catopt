@@ -68,6 +68,7 @@ from typing import (
 
 import torch
 import torch.nn as nn
+from catopt_carriers.decode_laws import DECODE_LAWS
 from catopt_carriers.om import OM_LAWS
 from catopt_carriers.om_lower import (
     build_om_plan,
@@ -1179,7 +1180,9 @@ class RegimeDispatch(nn.Module):
 #: bounded second tier (see its ``xc`` flag): the set is mostly
 #: bidirectional pairs minting fresh enodes, so it gets its own
 #: iteration budget after the carriers are established.
-CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS
+CARRIER_LAWS = (
+    SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS + DECODE_LAWS
+)
 
 
 def default_rules() -> list:
