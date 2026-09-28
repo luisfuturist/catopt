@@ -451,7 +451,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # repeat(*sizes): leading dims are new, each covered dim
             # multiplies its extent.  Not a view — materialises.
             rep = attr_of(op, "shape", "repeats")
-            base = shapes[0]
+            base = cast("tuple", shapes[0])
             if not isinstance(rep, (tuple, list)) or not rep:
                 return base
             if len(rep) < len(base):
@@ -568,7 +568,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return _index_shape(op, shapes)
         case "unflatten":
             # unflatten(t, dim, sizes): splice the size tuple in at dim.
-            base = shapes[0]
+            base = cast("tuple", shapes[0])
             if not base:
                 return None
             sizes = attr_of(op, "sizes")
@@ -657,7 +657,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "addmm" | "addbmm" | "addbmm" | "baddbmm" | "addmv":
             # bias + a @ b (addmv: bias + a @ v): the GEMM part
             # shapes like matmul on args 1/2, then the bias broadcasts.
-            a, b = shapes[1], shapes[2]
+            a, b = cast("tuple", shapes[1]), cast("tuple", shapes[2])
             if len(a) >= 2 and len(b) >= 2:
                 mm = (*tuple(a[:-1]), b[-1])
             elif len(a) >= 2 and len(b) == 1:
@@ -667,7 +667,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return _broadcast(mm, shapes[0])
         case "conv1d":
             # x (N,C,L) @ w (O,C,k) -> (N,O,L')
-            x, w = shapes[0], shapes[1]
+            x, w = cast("tuple", shapes[0]), cast("tuple", shapes[1])
             if (
                 x is None
                 or w is None
@@ -698,7 +698,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         case "tensor_split":
             # Folded like split: ``sections`` is the count (or index
             # list), ``index`` the folded section index.
-            base = shapes[0]
+            base = cast("tuple", shapes[0])
             if not base:
                 return None
             dim = attr_of(op, "dim", default=0) % len(base)
@@ -741,7 +741,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             return tuple(out)
         case "pixel_shuffle":
             # (N, C*r^2, H, W) -> (N, C, H*r, W*r)
-            base = shapes[0]
+            base = cast("tuple", shapes[0])
             r = attr_of(op, "upscale_factor", default=1)
             if len(base) < 4 or not isinstance(r, int):
                 return base
@@ -754,7 +754,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             )
         case "pixel_unshuffle":
             # (N, C, H, W) -> (N, C*r^2, H/r, W/r)
-            base = shapes[0]
+            base = cast("tuple", shapes[0])
             r = attr_of(op, "downscale_factor", default=1)
             if len(base) < 4 or not isinstance(r, int):
                 return base
@@ -766,7 +766,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 base[3] // r if isinstance(base[3], int) else None,
             )
         case "hstack" | "vstack":
-            a = shapes[0]
+            a = cast("tuple", shapes[0])
             if not a:
                 return None
             if op.op == "hstack":
@@ -931,8 +931,11 @@ def _broadcast(a, b):
 
 
 def _dim_eq(x, y) -> bool:
-    """Dim equality for the matmul contraction check — a ``None``
-    (unknown) dim is a wildcard, matching ``_broadcast``'s convention."""
+    """Check dim equality for the matmul contraction check.
+
+    A ``None`` (unknown) dim is a wildcard, matching
+    ``_broadcast``'s convention.
+    """
     return x is None or y is None or x == y
 
 
@@ -1030,7 +1033,7 @@ def _stack_dim(attrs: dict) -> int:
 
 
 def _ax_tuple(v: Any) -> tuple | None:
-    """An axis attr spelled as an int, a list, or a tuple → tuple."""
+    """Return an axis attr — an int, list, or tuple — as a tuple."""
     if isinstance(v, int):
         return (v,)
     if isinstance(v, (list, tuple)):
@@ -1236,19 +1239,23 @@ def _cswap_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _factory_shape(op: Op, shapes: list) -> tuple | str | None:
-    """Tensor creators — ``zeros``/``ones``/``empty``/``full``/
-    ``randn``/``rand``/``new_*``: the ``shape`` attr names the
-    output.  ``full``/``new_full`` carry a Const fill operand whose
-    shape is ignored."""
+    """Infer the output shape of a tensor creator.
+
+    ``zeros``/``ones``/``empty``/``full``/``randn``/``rand``/
+    ``new_*``: the ``shape`` attr names the output.  ``full``/
+    ``new_full`` carry a Const fill operand whose shape is ignored.
+    """
     s = op.attrs.get("shape")
     return tuple(s) if isinstance(s, (list, tuple)) else None
 
 
 def _arange_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``arange`` — a 1-D extent from the bound args: Const operands
-    (minted spelling) or the exported ``arg0/arg1/arg2`` attrs.
-    ``arange(end)``, ``arange(start, end)``, ``arange(start, end,
-    step)`` share the one spelling."""
+    """``arange`` — a 1-D extent from the bound args.
+
+    Const operands (minted spelling) or the exported
+    ``arg0/arg1/arg2`` attrs.  ``arange(end)``, ``arange(start,
+    end)``, ``arange(start, end, step)`` share the one spelling.
+    """
     vals = [a.value for a in op.args if isinstance(a, Const)]
     if not vals:
         vals = [

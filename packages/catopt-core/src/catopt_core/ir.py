@@ -79,9 +79,12 @@ class Var:
 
 @dataclass(frozen=True)
 class Const:
-    """A literal constant scalar.  Int values are preserved (not
-    coerced to float): ``x % 2`` must eval to an int64 operand or
-    weak-type promotion goes wrong downstream."""
+    """A literal constant scalar.
+
+    Int values are preserved (not coerced to float): ``x % 2`` must
+    eval to an int64 operand or weak-type promotion goes wrong
+    downstream.
+    """
 
     value: int | float
 

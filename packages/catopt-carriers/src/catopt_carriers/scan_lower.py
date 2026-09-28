@@ -243,8 +243,8 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
     """
     if not leaves:
         return False
-    a0 = _shape_of(leaves[0].args[0])
-    b0 = _shape_of(leaves[0].args[1])
+    a0 = cast("tuple", _shape_of(leaves[0].args[0]))
+    b0 = cast("tuple", _shape_of(leaves[0].args[1]))
     if leaves[0].op == "aff_diag":
         if not (_concrete_tuple(a0) and _concrete_tuple(b0)):
             return False
@@ -576,9 +576,11 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         ev = self.ev_factory(env, x, memo)
 
         def evf(t: Any) -> torch.Tensor:
-            """Cheap ``Param``/``Var`` resolution for the plan's few
-            top-level leaf terms — full ``eval_term`` dispatch for
-            anything richer (select chains, fused subtrees, …)."""
+            """Resolve a leaf term, cheaply for ``Param``/``Var``.
+
+            Full ``eval_term`` dispatch for anything richer (select
+            chains, fused subtrees, …).
+            """
             if isinstance(t, Param):
                 v = self.eval_mod._param_map.get(t.name)
                 if v is not None:
@@ -703,7 +705,9 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         root's value.  The ambient torch bindings give each op its
         exact semantics (``reshape(t, shape=…)`` etc.).
         """
-        for op_name, attrs in reversed(self._plan["post"]):
+        for op_name, attrs in reversed(
+            cast("dict", self._plan)["post"]
+        ):
             out = self.eval_mod._torch_bindings[op_name](out, **attrs)
         return out
 
@@ -737,7 +741,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         return torch.cat([top, bottom.expand(n, *pb, 1, d + 1)], dim=-2)
 
     def _occ_index(self, like: torch.Tensor):
-        """The occurrence-order gather indices, or ``None``.
+        """Return the occurrence-order gather indices, or ``None``.
 
         Tree-structured terms keep ``_fused_occ is None`` — leaves are
         already in product order; only DAG-shared terms pay the gather.
@@ -787,9 +791,10 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         association-invariant) in ~2 kernels per level eagerly, or a
         handful of Inductor kernels total when compiled.
         """
-        h = ev(self._plan["h"])
+        plan = cast("dict", self._plan)
+        h = ev(plan["h"])
         occ = self._occ_index(a_vals)
-        if self._plan["diagonal"]:
+        if plan["diagonal"]:
             if occ is not None:
                 a_vals = a_vals.index_select(0, occ)
                 b_vals = b_vals.index_select(0, occ)

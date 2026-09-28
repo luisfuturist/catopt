@@ -640,17 +640,23 @@ def _expand_torch(t: Any, *a: Any, **kw: Any) -> Any:
 
 
 def _scalar_value(v: Any) -> Any:
-    """A Const-evaluated scalar arrives as a 0-dim tensor — unwrap it
-    to the Python number the aten call expects."""
+    """Unwrap a Const-evaluated scalar to a Python number.
+
+    A Const-evaluated scalar arrives as a 0-dim tensor — unwrap it
+    to the Python number the aten call expects.
+    """
     if torch.is_tensor(v):
         return v.item() if v.dim() == 0 else v
     return v
 
 
 def _scatter_torch(t: Any, idx: Any, v: Any = None, **kw: Any) -> Any:
-    """``scatter`` covers both aten spellings: ``scatter.src`` (src
-    operand) and ``scatter.value`` (Const operand that evals to a
-    0-dim tensor — unwrap it to the Number the value overload wants)."""
+    """``scatter`` covers both aten spellings.
+
+    ``scatter.src`` (src operand) and ``scatter.value`` (Const
+    operand that evals to a 0-dim tensor — unwrap it to the Number
+    the value overload wants).
+    """
     dim = int(attr_of(kw, "dim", default=0))
     if torch.is_tensor(v) and v.dim() == 0:
         v = v.item()
@@ -660,9 +666,12 @@ def _scatter_torch(t: Any, idx: Any, v: Any = None, **kw: Any) -> Any:
 
 
 def _index_torch(t: Any, *idxs: Any, **kw: Any) -> Any:
-    """``index`` — numpy-style advanced indexing.  ``layout`` marks the
-    key positions that carry an index operand (True) vs a full slice
-    (False); minted terms without it index the leading axes."""
+    """``index`` — numpy-style advanced indexing.
+
+    ``layout`` marks the key positions that carry an index operand
+    (True) vs a full slice (False); minted terms without it index
+    the leading axes.
+    """
     layout = attr_of(kw, "layout", default=None) or (True,) * len(idxs)
     it = iter(idxs)
     key = tuple(
@@ -672,9 +681,11 @@ def _index_torch(t: Any, *idxs: Any, **kw: Any) -> Any:
 
 
 def _index_put_torch(t: Any, *a: Any, **kw: Any) -> Any:
-    """``index_put`` — the functional ``x[key] = v``.  The index
-    operands come first (counted by ``layout``'s True entries),
-    the values operand last; ``accumulate`` is an attr."""
+    """``index_put`` — the functional ``x[key] = v``.
+
+    The index operands come first (counted by ``layout``'s True
+    entries), the values operand last; ``accumulate`` is an attr.
+    """
     layout = attr_of(kw, "layout", default=None) or ()
     n_idx = sum(1 for flag in layout if flag)
     if layout:
@@ -689,12 +700,17 @@ def _index_put_torch(t: Any, *a: Any, **kw: Any) -> Any:
         key = tuple(a[:-1])
         value = a[-1] if a else None
     acc = bool(attr_of(kw, "accumulate", default=False))
-    return torch.index_put(t, key, value, accumulate=acc)
+    return torch.index_put(
+        t, cast(Any, key), cast(Any, value), accumulate=acc
+    )
 
 
 def _arange_torch(*a: Any, **kw: Any) -> Any:
-    """``arange`` — the bounds arrive as Const operands (``arange`` is
-    in ``_SCALAR_OPERAND_OPS``), evaluated to 0-dim tensors."""
+    """``arange`` — the bounds arrive as Const operands.
+
+    ``arange`` is in ``_SCALAR_OPERAND_OPS``; operands are
+    evaluated to 0-dim tensors.
+    """
     vals = [_scalar_value(v) for v in a]
     if not vals:
         vals = [
@@ -708,10 +724,14 @@ def _arange_torch(*a: Any, **kw: Any) -> Any:
 
 
 def _batch_norm_torch(x: Any, *a: Any, **kw: Any) -> Any:
-    """``aten.batch_norm(x, w, b, rm, rv, ...)`` → F.batch_norm's
-    (x, rm, rv, w, b, ...) operand order.  None weight/bias are
-    dropped at export, so the affine pair is whatever sits between
-    x and the running stats (a lone mid operand reads as weight)."""
+    """``aten.batch_norm`` → F.batch_norm's operand order.
+
+    ``aten.batch_norm(x, w, b, rm, rv, ...)`` →
+    F.batch_norm's (x, rm, rv, w, b, ...) operand order.  None
+    weight/bias are dropped at export, so the affine pair is
+    whatever sits between x and the running stats (a lone mid
+    operand reads as weight).
+    """
     rm, rv = a[-2], a[-1]
     mid = a[:-2]
     w = mid[0] if len(mid) >= 1 else None
@@ -1531,7 +1551,8 @@ def _dim_args(args: tuple, kwargs: dict) -> tuple:
 
     No dim attr → ``()``: aten's dim-less spelling (``x.sum()``,
     ``x.mean()``) is a FULL reduce, not a last-axis one — the
-    typing layer agrees (``sum`` with no dim reports ``()``)."""
+    typing layer agrees (``sum`` with no dim reports ``()``).
+    """
     if args:
         return tuple(args)
     dim = attr_of(kwargs, "dim", "axis")
@@ -2042,7 +2063,7 @@ class IRModule(torch.nn.Module):
             setattr(self, name, p)
             self._param_map[name] = p
 
-    def forward(self, *xs: torch.Tensor) -> Any:
+    def forward(self, *xs: Any) -> Any:
         """Run the module: bind inputs and evaluate the root."""
         x = cast(torch.Tensor, xs[0] if xs else None)
         env: dict[str, Any] = {"self": x}

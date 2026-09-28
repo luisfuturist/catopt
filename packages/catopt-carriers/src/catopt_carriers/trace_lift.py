@@ -483,8 +483,10 @@ class _Spine:
         )
 
     def _is_base(self, cid: int, _seen: frozenset = frozenset()):
-        """Is *cid* a usable chain base — a leaf, a carried segment,
-        or a value-level view of one?
+        """Check whether *cid* is a usable chain base.
+
+        A chain base is a leaf, a carried segment, or a value-level
+        view of one.
 
         Modules that carry a flattened or re-laid init put shape-only
         wrappers between the input leaf and the state the first step
@@ -731,8 +733,9 @@ def _wide_concat(
     dim: int,
     distinct,
 ) -> tuple:
-    """``em.op("concat", cols, {"dim": dim})`` for a wide fan-in node
-    whose children are already-canonical eids.
+    """``em.op("concat", cols, {"dim": dim})`` for a wide fan-in node.
+
+    The children are already-canonical eids.
 
     Identical output to :meth:`_Emit.op` — same enode, same term —
     at O(fan-in) C-level work instead of O(fan-in) Python work:

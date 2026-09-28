@@ -666,3 +666,122 @@ def test_batched_omd_module_fused_edges():
         )
     assert diff < 1e-12
     assert mod2.fallbacks == 1  # the occ decline counted it
+
+
+def test_batched_om_module_compile_wrap_failure_falls_back(monkeypatch):
+    """``torch.compile`` raising at wrap time permanently selects eager."""
+    ir, xs = _om_small()
+    mod = to_batched_om_module(ir, fused=True)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("compile failed")
+
+    monkeypatch.setattr(torch, "compile", _boom)
+    with torch.no_grad():
+        out = mod(*xs)
+        ref = ir_to_torch_module(ir)(*xs)
+    assert torch.allclose(out, ref)
+    assert mod._fused_compile_failed
+
+
+def test_batched_omd_module_compile_wrap_failure_falls_back(monkeypatch):
+    """``torch.compile`` raising at wrap time permanently selects eager."""
+    from catopt_carriers.omd_lower import to_batched_omd_module
+
+    ir, ss, aa, bb, h = _omd_ir(4, Tq=4, K=3, d=6)
+    pv = {
+        a.name: torch.randn(*a.typ.shape, dtype=torch.float64)
+        for a in aa
+    }
+    pv.update(
+        {
+            b.name: torch.randn(*b.typ.shape, dtype=torch.float64)
+            for b in bb
+        }
+    )
+    pv["h"] = torch.randn(*h.typ.shape, dtype=torch.float64)
+    xs = [torch.randn(*s.typ.shape, dtype=torch.float64) for s in ss]
+    mod = to_batched_omd_module(ir, param_values=pv, fused=True)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("compile failed")
+
+    monkeypatch.setattr(torch, "compile", _boom)
+    with torch.no_grad():
+        out = mod(*xs)
+        ref = ir_to_torch_module(ir, param_values=pv)(*xs)
+    assert torch.allclose(out, ref)
+    assert mod._fused_compile_failed
+
+
+def test_batched_omd_module_fused_reuse_and_call_failure():
+    """The compiled fn is reused on later calls; a call failure falls
+    back to eager permanently."""
+    from catopt_carriers.omd_lower import to_batched_omd_module
+
+    ir, ss, aa, bb, h = _omd_ir(4, Tq=4, K=3, d=6)
+    pv = {
+        a.name: torch.randn(*a.typ.shape, dtype=torch.float64)
+        for a in aa
+    }
+    pv.update(
+        {
+            b.name: torch.randn(*b.typ.shape, dtype=torch.float64)
+            for b in bb
+        }
+    )
+    pv["h"] = torch.randn(*h.typ.shape, dtype=torch.float64)
+    xs = [torch.randn(*s.typ.shape, dtype=torch.float64) for s in ss]
+    mod = to_batched_omd_module(ir, param_values=pv, fused=True)
+    serial = ir_to_torch_module(ir, param_values=pv)
+    with torch.no_grad():
+        first = mod(*xs)
+        second = mod(*xs)  # reuses the cached compiled fn
+        assert torch.allclose(first, serial(*xs))
+        assert torch.allclose(second, serial(*xs))
+        # a failing compiled call falls back to eager permanently
+        mod._fused_c = lambda *_a: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        third = mod(*xs)
+    assert mod._fused_compile_failed and mod._fused_c is None
+    assert torch.allclose(third, serial(*xs))
+
+
+def test_batched_omd_module_fused_shared_leaf_gathers():
+    """A DAG-shared leaf yields a non-identity occurrence permutation —
+    the gather path — and the fused run stays fp64-exact."""
+    from catopt_carriers.omd_lower import to_batched_omd_module
+
+    n, Tq, K, d = 2, 4, 3, 6
+    ss = [_v(f"s{i}", Tq, K) for i in range(n)]
+    aa = [_p(f"a{i}", K, d) for i in range(n)]
+    bb = [_p(f"b{i}", K, d) for i in range(n)]
+    h = _p("h", d)
+    l0 = Op.make("omd_elem", ss[0], aa[0], bb[0])
+    l1 = Op.make("omd_elem", ss[1], aa[1], bb[1])
+    root = Op.make("omd_apply", _compose("omd_compose", [l0, l0, l1]), h)
+    ir = IR(
+        root=root,
+        inputs=ss,
+        input_names={v.name for v in ss},
+        params={},
+    )
+    pv = {
+        a.name: torch.randn(*a.typ.shape, dtype=torch.float64)
+        for a in aa
+    }
+    pv.update(
+        {
+            b.name: torch.randn(*b.typ.shape, dtype=torch.float64)
+            for b in bb
+        }
+    )
+    pv["h"] = torch.randn(*h.typ.shape, dtype=torch.float64)
+    xs = [torch.randn(*s.typ.shape, dtype=torch.float64) for s in ss]
+    mod = to_batched_omd_module(ir, param_values=pv, fused=True)
+    assert mod._fused_occ != list(range(len(mod._fused_occ)))
+    with torch.no_grad():
+        out = mod(*xs)
+        ref = ir_to_torch_module(ir, param_values=pv)(*xs)
+    assert torch.allclose(out, ref)

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from catopt_core.cost import (
     _FOLDABLE_ELEMWISE,
@@ -468,9 +468,9 @@ class _ExtractMixin:
                         rc = _local_roofline(
                             term,
                             m,
-                            peak_flops=rc_pf,
-                            peak_bw=rc_bw,
-                            launch_s=rc_ls,
+                            peak_flops=cast("float", rc_pf),
+                            peak_bw=cast("float", rc_bw),
+                            launch_s=cast("float", rc_ls),
                         )
                         # Same accumulation order as _roofline_cost:
                         # local first, then children left-to-right.

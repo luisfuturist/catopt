@@ -117,15 +117,19 @@ __all__ = [
 
 
 class CandidateUnavailableError(RuntimeError):
-    """A candidate legitimately cannot run here (e.g. ``cuda_graph``
-    on a CPU input) — recorded as ``status="unavailable"``, which is
-    not a failure."""
+    """A candidate legitimately cannot run here.
+
+    E.g. ``cuda_graph`` on a CPU input — recorded as
+    ``status="unavailable"``, which is not a failure.
+    """
 
 
 @dataclass
 class AutotuneContext:
-    """What a candidate builder sees: the extracted program, its
-    materialised parameters, and the pipeline's own output.
+    """What a candidate builder sees.
+
+    The extracted program, its materialised parameters, and the
+    pipeline's own output.
 
     ``ir`` is the *delivered* IR — ``term`` (``ir.root``) is the
     extracted term after ``IRModule``'s weight-chain folding, so
@@ -166,16 +170,21 @@ def _require_ir(ctx: AutotuneContext) -> IR:
 
 
 def _build_generic(ctx: AutotuneContext) -> Any:
-    """Serial ``IRModule`` via ``sink.lower`` — reuse ``delivered``
-    when the pipeline itself routed to the generic executor."""
+    """Build the serial ``IRModule`` via ``sink.lower``.
+
+    Reuse ``delivered`` when the pipeline itself routed to the
+    generic executor.
+    """
     if ctx.lowering == "generic":
         return ctx.delivered
     return ctx.sink.lower(_require_ir(ctx), ctx.param_values)
 
 
 def _build_batched(ctx: AutotuneContext) -> Any:
-    """``_lower_extracted`` carrier routing — reuse ``delivered``
-    when it already is the routed executor."""
+    """Build ``_lower_extracted`` carrier routing.
+
+    Reuse ``delivered`` when it already is the routed executor.
+    """
     if ctx.lowering == "batched":
         return ctx.delivered
     return _lower_extracted(
@@ -184,8 +193,9 @@ def _build_batched(ctx: AutotuneContext) -> Any:
 
 
 def _build_compiled(ctx: AutotuneContext) -> Any:
-    """``torch.compile`` over the routed executor — the
-    ``optimize_model(runner=CompiledRunner())`` delivery.
+    """``torch.compile`` over the routed executor.
+
+    The ``optimize_model(runner=CompiledRunner())`` delivery.
 
     Always a FRESH module: ``torch.compile`` rewrites the module's
     ``forward`` attribute (dynamo dispatch), so compiling
@@ -200,8 +210,10 @@ def _build_compiled(ctx: AutotuneContext) -> Any:
 
 
 def _build_compiled_generic(ctx: AutotuneContext) -> Any:
-    """``torch.compile`` over a FRESH serial ``IRModule`` (fresh for
-    the same ``forward``-mutation reason as ``compiled``)."""
+    """``torch.compile`` over a FRESH serial ``IRModule``.
+
+    Fresh for the same ``forward``-mutation reason as ``compiled``.
+    """
     return torch.compile(
         cast(
             Any,
@@ -237,9 +249,11 @@ def _capture_routed(  # pragma: no cover — CUDA-only body
 
 
 def _build_cuda_graph(ctx: AutotuneContext) -> Any:
-    """``cuda_graph`` candidate — ``optimize_model(runner=
-    CudaGraphRunner())`` semantics on a fresh module (see
-    :func:`_capture_routed`)."""
+    """Build the ``cuda_graph`` candidate.
+
+    ``optimize_model(runner=CudaGraphRunner())`` semantics on a
+    fresh module (see :func:`_capture_routed`).
+    """
     if not _input_is_cuda(ctx.example_input):
         raise CandidateUnavailableError(
             "cuda_graph needs a CUDA example input"
@@ -248,7 +262,7 @@ def _build_cuda_graph(ctx: AutotuneContext) -> Any:
 
 
 def _build_eager(ctx: AutotuneContext) -> Any:
-    """The original model — the reference, always verified."""
+    """Return the original model — the reference, always verified."""
     return ctx.model
 
 
@@ -274,8 +288,11 @@ def _input_is_cuda(example_input: Any) -> bool:
 
 
 def _term_params(term: Any) -> dict[str, Param]:
-    """Collect the ``Param`` leaves of a term (interned terms are
-    content-hashed, so a set dedupes shared subtrees)."""
+    """Collect the ``Param`` leaves of a term.
+
+    Interned terms are content-hashed, so a set dedupes shared
+    subtrees.
+    """
     out: dict[str, Param] = {}
     seen: set[Any] = set()
 
@@ -296,10 +313,11 @@ def _term_params(term: Any) -> dict[str, Param]:
 def _recover_ir(
     delivered: torch.nn.Module,
 ) -> tuple[IR, dict[str, torch.Tensor]]:
-    """Reconstruct ``(IR, param_values)`` from the module
-    ``optimize_model`` delivered, so the SAME extracted term can be
-    re-lowered through another executor without re-running the
-    search.
+    """Reconstruct ``(IR, param_values)`` from a delivered module.
+
+    Recover from the module ``optimize_model`` delivered, so the
+    SAME extracted term can be re-lowered through another executor
+    without re-running the search.
 
     Every lowering path exposes ``_root`` (the folded extracted
     term), ``_inputs`` and ``_param_map`` — a plain ``IRModule``
@@ -395,8 +413,11 @@ _PROBE_OVERHEAD_US = 1e6
 
 
 def _with_graph_overhead(profile: Any, us: float) -> Any | None:
-    """*profile* with ``graph_overhead_us`` set to *us* — ``None`` for
-    ``None`` or profile types that cannot carry the field."""
+    """Return *profile* with ``graph_overhead_us`` set to *us*.
+
+    ``None`` for ``None`` or profile types that cannot carry the
+    field.
+    """
     if profile is None:
         return None
     if isinstance(profile, dict):
@@ -415,7 +436,9 @@ def _with_graph_overhead(profile: Any, us: float) -> Any | None:
 
 
 def _fused_charges_graph_overhead(profile: Any) -> bool:
-    """True when the installed :func:`fused_cost_for` already consumes
+    """Check whether :func:`fused_cost_for` consumes the field.
+
+    True when the installed :func:`fused_cost_for` already consumes
     ``graph_overhead_us`` in its per-graph term.
 
     Behavioural probe — price a one-op term with the profile's
@@ -439,8 +462,9 @@ def _fused_charges_graph_overhead(profile: Any) -> bool:
 
 
 def _compiled_model_ns(term: Any, profile: Any) -> float:
-    """Fusion-region price of *term* in ns plus the compiled
-    per-graph call overhead.
+    """Fusion-region price of *term* in ns plus call overhead.
+
+    The compiled per-graph call overhead.
 
     ``fused_cost_for`` charges ``dispatch_us`` once per graph; the
     profile's ``graph_overhead_us`` (measured guards + inductor
@@ -465,9 +489,11 @@ def _compiled_model_ns(term: Any, profile: Any) -> float:
 def _candidate_model_ns(
     name: str, ctx: AutotuneContext, profile: Any
 ) -> float | None:
-    """The cost model's uncorrected delivered price (ns) for one
-    candidate — ``None`` when the term was not recovered or the
-    candidate has no priced lowering (``"eager"``, custom names).
+    """Return the cost model's uncorrected delivered price (ns).
+
+    Prices one candidate; ``None`` when the term was not recovered
+    or the candidate has no priced lowering (``"eager"``, custom
+    names).
 
     ``"batched"`` prices under the executor the pipeline actually
     routed to; ``"cuda_graph"`` shares the fused model — its real
@@ -532,6 +558,11 @@ def optimize_model_autotuned(
 
     Parameters
     ----------
+    model
+        The model to optimize, then autotune the lowerings of.
+    example_input
+        A representative input — a tensor or a positional-args
+        tuple.
     candidates
         Names into :data:`CANDIDATE_BUILDERS` and/or
         ``(name, builder)`` tuples.
@@ -588,6 +619,7 @@ def optimize_model_autotuned(
         ``shape_bucket``, ``predicted_ns``/``predicted_winner``,
         ``measured_ns``/``profile`` (only with ``profile=``),
         ``search_s``, ``elapsed_s``.
+
     """
     t_start = time.monotonic()
     if sink is None:

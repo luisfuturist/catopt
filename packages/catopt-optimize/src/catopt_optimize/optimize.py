@@ -369,11 +369,13 @@ _CARRIER_PLANS = {
 def _delivered_cost(
     term: Any, profile: Any = None, compiled: bool = False
 ) -> float:
-    """Price a term under the lowering it would actually get — the
-    batched carrier executor for plannable apply roots, generic eval
-    otherwise (solver ops surcharged).  With ``compiled=True`` the
-    delivered module is torch.compile-wrapped whichever route ran,
-    so the fusion-region model prices every term."""
+    """Price a term under the lowering it would actually get.
+
+    The batched carrier executor for plannable apply roots, generic
+    eval otherwise (solver ops surcharged).  With ``compiled=True``
+    the delivered module is torch.compile-wrapped whichever route
+    ran, so the fusion-region model prices every term.
+    """
     if compiled:
         return executor_cost_for(profile, lowering="compiled")(term)
     if isinstance(term, Op) and term.op in _CARRIER_PLANS:
@@ -838,9 +840,10 @@ def optimize_model(
         _dc_memo: dict = {}
         _best_dag = dag_cost(best_term, cost_fn, memo=_dc_memo)
         forced = eg.extract_paired(root_eid, cost_fn, groups)
-        if forced is not None and dag_cost(
-            forced, cost_fn, memo=_dc_memo
-        ) <= _best_dag:
+        if (
+            forced is not None
+            and dag_cost(forced, cost_fn, memo=_dc_memo) <= _best_dag
+        ):
             best_term = forced
             stats["paired_extract"] = True
     # Coordinated carrier selection: a batched-executor win is a

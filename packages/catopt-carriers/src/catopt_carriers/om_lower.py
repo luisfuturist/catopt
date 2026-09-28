@@ -538,8 +538,10 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         self._init_fused(fused)
 
     def _init_fused(self, fused: bool | str) -> None:
-        """Resolve the ``fused`` flag — same convention as
-        :class:`BatchedScanModule`: ``None``/``"eager"``/``"compile"``.
+        """Resolve the ``fused`` flag to the fused-schedule mode.
+
+        Same convention as :class:`BatchedScanModule`:
+        ``None``/``"eager"``/``"compile"``.
 
         The fused schedule runs :func:`fused_om_levels`' canonical
         adjacent-pair reduction on the leaf stacks — ⊕ commutes and
@@ -559,8 +561,10 @@ class BatchedOMModule(BatchedExecutorBase, torch.nn.Module):
         self._fused = "eager" if fused == "eager" else "compile"
 
     def _fused_call(self, body, *args: torch.Tensor) -> torch.Tensor:
-        """Run ``body`` — compiled when the mode calls for it, with a
-        permanent eager fallback on compile or call failure."""
+        """Run ``body``, compiled when the mode calls for it.
+
+        A permanent eager fallback on compile or call failure.
+        """
         if self._fused == "eager" or self._fused_compile_failed:
             return body(*args)
         if self._fused_c is None:

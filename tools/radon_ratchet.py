@@ -52,6 +52,7 @@ def scan() -> dict[str, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the ratchet check (or ``--update`` the baseline)."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--update",

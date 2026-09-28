@@ -314,8 +314,10 @@ def list_profiles(dir: str | Path | None = None) -> list[str]:
 
 
 def shape_bucket(example_input: Any) -> str:
-    """The shape bucket measured corrections key on: ``"<device>:2^e"``
-    where ``e`` is ``ceil(log2(total input numel))``.
+    """Return the shape bucket measured corrections key on.
+
+    ``"<device>:2^e"`` where ``e`` is
+    ``ceil(log2(total input numel))``.
 
     Deliberately coarse — a correction measured on one graph transfers
     to another graph only inside the same bucket, so an order-of-
@@ -368,7 +370,7 @@ def profile_graph_overhead_us(profile: Any) -> float:
 
 
 def _measured_table(profile: Any) -> dict | None:
-    """The ``measured_ns`` map off a dict or attribute profile."""
+    """Return the ``measured_ns`` map off a dict or attribute profile."""
     if profile is None:
         return None
     tab = (
@@ -386,8 +388,9 @@ def record_measured(
     median_ns: float,
     model_ns: float | None = None,
 ) -> Any:
-    """Write one measured-feedback entry into *profile*'s
-    ``measured_ns`` map; returns the updated profile.
+    """Write one measured-feedback entry into *profile*.
+
+    Updates ``measured_ns`` and returns the updated profile.
 
     ``candidate`` is a lowering-path name (``"generic"`` /
     ``"batched"`` / ``"compiled"`` / a custom candidate name);
@@ -430,9 +433,10 @@ def measured_price_ns(
     bucket: str,
     model_ns: float | None,
 ) -> float | None:
-    """Delivered price (ns) of a ``(candidate, bucket)`` pair whose
-    uncorrected model estimate is *model_ns* — the measured-feedback
-    consumption contract.
+    """Delivered price (ns) of a ``(candidate, bucket)`` pair.
+
+    The uncorrected model estimate is *model_ns* — the
+    measured-feedback consumption contract.
 
     * no ``measured_ns`` entry → *model_ns* unchanged (pure model);
     * entry with ``model_ns`` recorded → ``model_ns + (median_ns -

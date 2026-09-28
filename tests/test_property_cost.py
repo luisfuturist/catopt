@@ -49,7 +49,7 @@ def test_flops_invariant_under_commutative_swap_unknown_shape():
     """With one operand's shape unknown, ``add``/``mul`` still price
     symmetrically — the unknown-shape fallback is operand-agnostic."""
     known = Var("x", TensorType((2,)))
-    unknown = Op.make("max", Const(0.0), Const(0.0))
+    unknown = Op.make("mystery_op", Const(0.0))
     assert _shape_of(unknown) is None
     for op in ("add", "mul"):
         assert flops_cost(Op.make(op, known, unknown)) == flops_cost(

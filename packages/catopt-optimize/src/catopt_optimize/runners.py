@@ -66,7 +66,9 @@ class Runner(Protocol):
         module: torch.nn.Module,
         example_input: Any,
         stats: dict[str, Any],
-    ) -> torch.nn.Module: ...
+    ) -> torch.nn.Module:
+        """Return the module to deliver, recording into *stats*."""
+        ...
 
 
 class GenericRunner:
@@ -80,6 +82,7 @@ class GenericRunner:
         example_input: Any,
         stats: dict[str, Any],
     ) -> torch.nn.Module:
+        """Return *module* unchanged — the executor as lowered."""
         return module
 
 
@@ -99,6 +102,7 @@ class CompiledRunner:
     delivers_compiled = True
 
     def __init__(self, **compile_kwargs: Any) -> None:
+        """Record the ``torch.compile`` keyword arguments."""
         self.compile_kwargs = dict(compile_kwargs)
 
     def apply(
@@ -107,11 +111,12 @@ class CompiledRunner:
         example_input: Any,
         stats: dict[str, Any],
     ) -> torch.nn.Module:
+        """Wrap *module* in ``torch.compile``, recording the outcome."""
         try:
             compiled = torch.compile(module, **self.compile_kwargs)
             compiled(example_input)
             stats["compiled"] = True
-            return compiled  # type: ignore[no-any-return]
+            return cast(torch.nn.Module, compiled)
         except Exception:
             stats["compiled"] = False
             return module
@@ -140,6 +145,7 @@ class CudaGraphRunner:
         example_input: Any,
         stats: dict[str, Any],
     ) -> torch.nn.Module:
+        """Capture *module* into a CUDA graph when the input is CUDA."""
         if stats.get("compiled"):
             return module
         stats["cuda_graph"] = False
@@ -181,20 +187,25 @@ class ChainedRunner:
     """
 
     def __init__(self, runners: Iterable[Runner]) -> None:
+        """Store the ordered *runners*."""
         self.runners = list(runners)
 
     @property
     def name(self) -> str:
+        """The ``+``-joined member names."""
         return "+".join(r.name for r in self.runners) or "identity"
 
     @property
     def names(self) -> list[str]:
+        """The ordered member names."""
         return [r.name for r in self.runners]
 
     @property
     def delivers_compiled(self) -> bool:
-        """True when any member marks a compiled delivery — the
-        fusion-region pricing propagates through the chain."""
+        """True when any member marks a compiled delivery.
+
+        The fusion-region pricing propagates through the chain.
+        """
         return any(
             getattr(r, "delivers_compiled", False) for r in self.runners
         )
@@ -205,6 +216,7 @@ class ChainedRunner:
         example_input: Any,
         stats: dict[str, Any],
     ) -> torch.nn.Module:
+        """Apply each member runner in order."""
         for r in self.runners:
             module = r.apply(module, example_input, stats)
         return module

@@ -982,7 +982,7 @@ _MEASURED_GATHER_OPS = frozenset({"index_select", "embedding"})
 
 
 def _mm_signature(
-    term: Op, out_shape: tuple, memo: dict
+    term: Op, out_shape: tuple, memo: dict | None
 ) -> tuple[float, float, float] | None:
     """(M, K, N) signature for a matmul/linear op, or ``None``.
 
@@ -1012,7 +1012,7 @@ def _mm_signature(
 
 
 def _kernel_signature(
-    term: Op, memo: dict
+    term: Op, memo: dict | None
 ) -> tuple[str, tuple[float, ...]] | None:
     """(op-class, shape signature) an ``op_kernel_ns`` bucket matches.
 
@@ -1050,7 +1050,7 @@ def _kernel_signature(
 
 
 def _profile_kernel_table(profile: Any) -> dict | None:
-    """The raw ``op_kernel_ns`` dict of a profile-like, or ``None``."""
+    """Return the raw ``op_kernel_ns`` dict of a profile-like."""
     if profile is None:
         return None
     if isinstance(profile, dict):
@@ -2066,8 +2066,9 @@ def executor_cost_for(
 def fusion_regions(
     term: Any, memo: dict | None = None
 ) -> tuple[frozenset, ...]:
-    """Partition *term*'s op-DAG into Inductor-style fusion regions —
-    one entry per kernel the ``"compiled"`` lowering emits.
+    """Partition *term*'s op-DAG into Inductor-style fusion regions.
+
+    One entry per kernel the ``"compiled"`` lowering emits.
 
     Each frozenset is one kernel's member ops:
 
@@ -2377,9 +2378,7 @@ def fused_cost_for(profile: Any = None) -> CostFn:
         ck = ("fc", pf, bw, ls, dispatch_s, goh, id(kns), term)
         if ck in memo:
             return memo[ck]
-        out = _fused_cost(
-            term, memo, pf, bw, ls, dispatch_s, kns, goh
-        )
+        out = _fused_cost(term, memo, pf, bw, ls, dispatch_s, kns, goh)
         memo[ck] = float(out)
         return out
 

@@ -89,9 +89,13 @@ class Criterion(Protocol):
     """
 
     @property
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """The axis label recorded into ``stats["criteria"]``."""
+        ...
 
-    def cost_fn(self, profile: Any = None) -> CostFn: ...
+    def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the axis's pricing callable for *profile*."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -105,15 +109,21 @@ def _looks_like_criterion(x: Any) -> bool:
 
 
 def _crit_name(crit: Any) -> str:
-    """The axis label — ``crit.name`` when it is a string, else the
-    class name (a nameless duck-typed criterion still records)."""
+    """Return the axis label for a criterion.
+
+    ``crit.name`` when it is a string, else the class name (a
+    nameless duck-typed criterion still records).
+    """
     n = getattr(crit, "name", None)
     return n if isinstance(n, str) else type(crit).__name__
 
 
 def _check_weight(label: str, w: Any) -> float:
-    """A finite, non-negative blend weight — one validation shared
-    by dict specs, ``(criterion, weight)`` members and ``crit * w``."""
+    """Validate and return a finite, non-negative blend weight.
+
+    One validation shared by dict specs, ``(criterion, weight)``
+    members and ``crit * w``.
+    """
     if not isinstance(w, (int, float)) or not math.isfinite(w) or w < 0:
         raise ValueError(
             f"criteria[{label!r}] must be a finite, "
@@ -123,9 +133,11 @@ def _check_weight(label: str, w: Any) -> float:
 
 
 def _member_term(m: Any) -> tuple[Any, float]:
-    """Normalise one container member: a criterion → ``(crit, 1.0)``;
-    a ``(criterion, weight)`` pair → the pair, weight validated.
-    Anything else is a spec error."""
+    """Normalise one container member to ``(crit, weight)``.
+
+    A criterion → ``(crit, 1.0)``; a ``(criterion, weight)`` pair →
+    the pair, weight validated.  Anything else is a spec error.
+    """
     if isinstance(m, (tuple, list)):
         if len(m) != 2:
             raise TypeError(
@@ -145,9 +157,11 @@ def _member_term(m: Any) -> tuple[Any, float]:
 
 
 def _flatten(crit: Any, w: float, out: list[tuple[Any, float]]) -> None:
-    """Append a member's leaf terms — a nested container distributes
-    its weight over its own members (blending is linear, so
-    flattening preserves the priced sum)."""
+    """Append a member's leaf terms to *out*.
+
+    A nested container distributes its weight over its own members
+    (blending is linear, so flattening preserves the priced sum).
+    """
     if isinstance(crit, Criteria):
         for c2, w2 in crit.terms:
             _flatten(c2, w * w2, out)
@@ -156,10 +170,12 @@ def _flatten(crit: Any, w: float, out: list[tuple[Any, float]]) -> None:
 
 
 def _accepts_memo(fn: Any) -> bool:
-    """True when *fn* declares a ``memo`` parameter — the blend
-    threads the shared extraction memo only into members that take
-    it (the ``_memo_dispatch`` convention); a bare ``fn(term)``
-    works too."""
+    """Check whether *fn* declares a ``memo`` parameter.
+
+    The blend threads the shared extraction memo only into members
+    that take it (the ``_memo_dispatch`` convention); a bare
+    ``fn(term)`` works too.
+    """
     try:
         return "memo" in inspect.signature(fn).parameters
     except (TypeError, ValueError):
@@ -199,15 +215,19 @@ class _Composable:
 
 
 class LatencyCriterion(_Composable):
-    """Delivered latency — the generic executor's per-op roofline +
-    per-node dispatch overhead, nanoseconds
+    """Delivered latency — per-op roofline + dispatch, ns.
+
+    The generic executor's per-op roofline plus per-node dispatch
+    overhead, nanoseconds
     (``executor_cost_for(lowering="generic")`` — the shipped default
-    extraction model).  Profile-calibrated."""
+    extraction model).  Profile-calibrated.
+    """
 
     name = "latency"
     charges_shape = True
 
     def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the delivered-latency cost model."""
         return executor_cost_for(profile, lowering="generic")
 
 
@@ -218,32 +238,40 @@ class FlopsCriterion(_Composable):
     charges_shape = True
 
     def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the profile-free FLOP cost model."""
         return flops_cost
 
 
 class DepthCriterion(_Composable):
-    """Critical-path roofline latency (:func:`depth_cost_for`) — the
-    axis that rewards parallel structure a sequential chain hides.
-    Max-composed, so inside extraction its contribution is the same
-    clamped non-additive approximation ``compiled`` carries."""
+    """Critical-path roofline latency (:func:`depth_cost_for`).
+
+    The axis that rewards parallel structure a sequential chain
+    hides.  Max-composed, so inside extraction its contribution is
+    the same clamped non-additive approximation ``compiled``
+    carries.
+    """
 
     name = "depth"
     charges_shape = True
 
     def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the critical-path depth cost model."""
         return depth_cost_for(profile)
 
 
 class CompiledCriterion(_Composable):
-    """Inductor-style fusion-region pricing (:func:`fused_cost_for`)
-    — the axis that sees what ``runner=CompiledRunner()`` buys.  A
+    """Inductor-style fusion-region pricing (:func:`fused_cost_for`).
+
+    The axis that sees what ``runner=CompiledRunner()`` buys.  A
     whole-DAG region partition: non-additive inside extraction;
-    prefer it for frontier reporting or small blend weights."""
+    prefer it for frontier reporting or small blend weights.
+    """
 
     name = "compiled"
     charges_shape = True
 
     def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the fusion-region cost model."""
         return fused_cost_for(profile)
 
 
@@ -291,10 +319,12 @@ class _PeakBytesCost:
 
     @staticmethod
     def _bytes(v: Any, memo: dict) -> float:
-        """Bytes of one live allocation — fp32 numel, or the
-        near-infinite poison price when the value is provably
-        ill-typed (the ``_INVALID_COST`` convention: such a member
-        must never win extraction)."""
+        """Bytes of one live allocation, fp32 or poison.
+
+        fp32 numel, or the near-infinite poison price when the value
+        is provably ill-typed (the ``_INVALID_COST`` convention:
+        such a member must never win extraction).
+        """
         if _shape_of(v, memo) is _INVALID:
             return _INVALID_COST
         return float(_numel(_shape_of(v, memo))) * 4.0
@@ -336,8 +366,11 @@ class _PeakBytesCost:
         n = len(order)
 
         def resolve(t: Any) -> Any:
-            """The allocation a value lives in — view ops alias their
-            input's storage, so forward through view chains."""
+            """Return the allocation a value lives in.
+
+            View ops alias their input's storage, so forward through
+            view chains.
+            """
             while isinstance(t, Op) and t.op in _VIEW_OPS and t.args:
                 t = t.args[0]
             return t
@@ -382,11 +415,13 @@ peak_bytes_cost = _PeakBytesCost()
 
 
 class _CombinedMemoryCost:
-    """``weights + peak`` — resident parameter storage plus the
-    transient-activation liveness peak, in one number.  Both
-    components are already whole-DAG prices at the root
-    (``dag_exact``); ``charges_param_only`` comes from the weights
-    component — storage survives compile-time folding."""
+    """``weights + peak`` — the whole memory footprint in one number.
+
+    Resident parameter storage plus the transient-activation
+    liveness peak.  Both components are already whole-DAG prices at
+    the root (``dag_exact``); ``charges_param_only`` comes from the
+    weights component — storage survives compile-time folding.
+    """
 
     __name__ = "combined_memory_cost"
     charges_param_only = True
@@ -425,6 +460,7 @@ class MemoryCriterion(_Composable):
     """
 
     def __init__(self, mode: str = "weights") -> None:
+        """Initialise the axis in one of ``MEMORY_MODES``."""
         if mode not in MEMORY_MODES:
             raise ValueError(
                 f"unknown memory mode {mode!r} — "
@@ -434,9 +470,12 @@ class MemoryCriterion(_Composable):
 
     @property
     def name(self) -> str:
-        """``"memory"`` for the back-compat weights mode —
+        """``"memory"``, or the mode-qualified label otherwise.
+
+        ``"memory"`` for the back-compat weights mode —
         mode-qualified otherwise, so a blend over two modes records
-        both members."""
+        both members.
+        """
         return (
             "memory"
             if self.mode == "weights"
@@ -445,13 +484,16 @@ class MemoryCriterion(_Composable):
 
     @property
     def charges_param_only(self) -> bool:
+        """True when the mode bills folded subtrees."""
         return self.mode in ("weights", "combined")
 
     @property
     def charges_shape(self) -> bool:
+        """True — every memory mode reads shapes."""
         return True
 
     def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the cost model for the selected mode."""
         if self.mode == "weights":
             return param_bytes_cost_for()
         if self.mode == "peak":
@@ -465,12 +507,12 @@ class MemoryCriterion(_Composable):
 
 
 class Criteria(_Composable):
-    """An ordered, weighted container of criteria — itself a
-    :class:`Criterion`.
+    """An ordered, weighted container of criteria.
 
-    Members are criterion objects (weight 1.0) or ``(criterion,
-    weight)`` pairs; nested containers flatten — blending is linear,
-    so a weighted sub-blend distributes onto its own members::
+    A container that is itself a :class:`Criterion`.  Members are
+    criterion objects (weight 1.0) or ``(criterion, weight)`` pairs;
+    nested containers flatten — blending is linear, so a weighted
+    sub-blend distributes onto its own members::
 
         Criteria(LatencyCriterion(), (MemoryCriterion("peak"), 0.5))
 
@@ -482,6 +524,7 @@ class Criteria(_Composable):
     name = "criteria"
 
     def __init__(self, *members: Any) -> None:
+        """Flatten *members* into ``(criterion, weight)`` terms."""
         flat: list[tuple[Any, float]] = []
         for m in members:
             crit, w = _member_term(m)
@@ -494,9 +537,11 @@ class Criteria(_Composable):
         return self._terms
 
     def __iter__(self):
+        """Iterate the flattened terms."""
         return iter(self._terms)
 
     def __len__(self) -> int:
+        """Return the number of flattened terms."""
         return len(self._terms)
 
     def blend(self, profile: Any = None) -> CostFn:
@@ -504,13 +549,14 @@ class Criteria(_Composable):
         return _build_blend(self._terms, profile)
 
     def cost_fn(self, profile: Any = None) -> CostFn:
-        """The :class:`Criterion` port member — ``self.blend``."""
+        """Build the blend — the :class:`Criterion` port member."""
         return self.blend(profile)
 
 
 class Blend(Criteria):
-    """The ``criterion * weight`` / ``a + b`` composition result — a
-    weighted sum of criteria that IS a :class:`Criterion` (and a
+    """The ``criterion * weight`` / ``a + b`` composition result.
+
+    A weighted sum of criteria that IS a :class:`Criterion` (and a
     :class:`Criteria` container).
 
     ``LatencyCriterion() * 0.7 + MemoryCriterion("peak") * 0.3``
@@ -522,6 +568,7 @@ class Blend(Criteria):
     name = "blend"
 
     def __init__(self, terms: Iterable[Any] = ()) -> None:
+        """Build a blend from ``(criterion, weight)`` *terms*."""
         super().__init__(*terms)
 
 
@@ -531,8 +578,9 @@ class Blend(Criteria):
 
 
 class _CriteriaBlend:
-    """A normalised weighted blend of per-criterion cost models —
-    the callable :func:`criteria_cost` / ``Criteria.blend`` return.
+    """A normalised weighted blend of per-criterion cost models.
+
+    The callable :func:`criteria_cost` / ``Criteria.blend`` return.
 
     Conforms to the :class:`~catopt_core.ports.CostFn` port through
     ``__call__(term, memo=None)`` — a class rather than a closure so
