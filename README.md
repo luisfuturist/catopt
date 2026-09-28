@@ -151,8 +151,9 @@ Everything below is importable from `catopt_optimize` (or
 | Name | Signature / role |
 |---|---|
 | `optimize_model` | `(model, example_input, *, ruleset="all", cost_fn=None, criteria=None, runner=None, source=None, sink=None, max_enodes=100_000, verbose=True)` → `(module, stats)` |
-| `optimize_compositional` | `(model, example_input, *, block_pred=None, verify_tol=1e-4, …)` → `(module, stats)` — block-wise path for deep stacks |
-| `optimize_model_autotuned` | `(model, example_input, *, candidates=("generic","batched","compiled"), budget_s=None, …)` → `(module, stats)` |
+| `optimize_compositional` | `(model, example_input, *, block_pred=None, verify_tol=1e-4, max_cross_pairs=8, …)` → `(module, stats)` — block-wise path for deep stacks; `max_cross_pairs` also re-judges adjacent block pairs jointly |
+| `optimize_model_autotuned` | `(model, example_input, *, candidates=("generic","batched","compiled"), budget_s=None, profile=None, …)` → `(module, stats)` — `profile=` persists measured corrections across runs |
+| `export_optimized` / `load_optimized` | `(model, opt, path, fmt="module"|"safetensors"|"state_dict"|"torchscript", …)` — `.pt2` roundtrips run standalone, no catopt at inference |
 | Criteria | `LatencyCriterion`, `FlopsCriterion`, `DepthCriterion`, `MemoryCriterion("weights"|"peak"|"combined")`, `CompiledCriterion` — compose with `*` / `+`, or pass `{"axis": weight}` dicts |
 | Runners | `GenericRunner` (default), `CompiledRunner(**compile_kwargs)`, `CudaGraphRunner()`, `ChainedRunner([...])` — duck-typed `Runner` protocol |
 | Ports | `Source` / `Sink` (defaults `TorchSource` / `TorchSink`) — a new backend implements `Sink`; the engine never imports it |
@@ -195,9 +196,6 @@ pip install -e packages/catopt-core      # engine only, zero deps
 
 ## Depth
 
-- [`REPORT.md`](../project/REPORT.md) — the research report on the
-  `project` branch (weight-as-program search, falsification results,
-  carrier theory).
 - `bench/README.md` — per-suite protocols and expected verdicts.
 - `AGENTS.md` — repo layout, verification commands, the port
   contracts.
