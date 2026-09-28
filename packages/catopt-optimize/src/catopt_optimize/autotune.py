@@ -62,12 +62,17 @@ and two things happen:
 
 * candidates are *attempted* cheapest-predicted-first, where the
   prediction is the cost model's delivered price corrected by the
-  profile's ``measured_ns`` entries for this input's
-  :func:`~catopt_optimize.calibrate.shape_bucket` (residual transfer —
-  see :func:`~catopt_optimize.calibrate.measured_price_ns`); and
+  profile's learned ``corrections`` factors (once a
+  (candidate, bucket) pair has enough observations) and
+  ``measured_ns`` residuals for this input's
+  :func:`~catopt_optimize.calibrate.shape_bucket`
+  (see :func:`~catopt_optimize.calibrate.corrected_price_ns`); and
 * this run's measurements are written back into the profile's
-  ``measured_ns`` map, so the NEXT call — or any other consumer of the
-  profile — prices those lowerings closer to measured.
+  ``measured_ns`` map AND folded into its ``corrections`` table
+  (a running geometric mean of ``median/model`` ratios per
+  (candidate, bucket)), so the NEXT call — or any other consumer of
+  the profile — prices those lowerings closer to measured, and the
+  model's per-bucket bias is learned across runs.
 
 Corrections are keyed per (candidate, shape-bucket) — never global:
 a measurement on one input size only ever corrects prices in its own
@@ -98,7 +103,7 @@ from catopt_core.ports import Sink, Source
 from catopt_torch.adapters import TorchSink
 
 from catopt_optimize.calibrate import (
-    measured_price_ns,
+    corrected_price_ns,
     profile_graph_overhead_us,
     record_measured,
     shape_bucket,
@@ -489,11 +494,18 @@ def _compiled_model_ns(term: Any, profile: Any) -> float:
 def _candidate_model_ns(
     name: str, ctx: AutotuneContext, profile: Any
 ) -> float | None:
-    """Return the cost model's uncorrected delivered price (ns).
+    """Return the cost model's UNCORRECTED delivered price (ns).
 
     Prices one candidate; ``None`` when the term was not recovered
     or the candidate has no priced lowering (``"eager"``, custom
     names).
+
+    The learned ``corrections`` factors are deliberately applied one
+    layer up, where the attempt-order price map is built
+    (:func:`~catopt_optimize.calibrate.corrected_price_ns`) — the
+    ``model_ns`` recorded in stats and paired with each write-back
+    must stay the honest raw model estimate, since it is the
+    denominator of the ratios the correction table learns.
 
     ``"batched"`` prices under the executor the pipeline actually
     routed to; ``"cuda_graph"`` shares the fused model — its real
@@ -584,8 +596,8 @@ def optimize_model_autotuned(
         :class:`~catopt_optimize.calibrate.TargetProfile`, a dict, or
         any object with a ``measured_ns`` mapping.  When given,
         candidates are attempted cheapest-predicted-first — the model
-        price corrected by the profile's ``measured_ns`` residuals for
-        this input's
+        price corrected by the profile's learned ``corrections``
+        factors and ``measured_ns`` residuals for this input's
         :func:`~catopt_optimize.calibrate.shape_bucket` — and this
         run's timings are written back into the profile
         (:func:`~catopt_optimize.calibrate.record_measured`), so the
@@ -683,9 +695,10 @@ def optimize_model_autotuned(
 
     # -- measured feedback: price every candidate ----------------------
     # model_ns  — the cost model's uncorrected delivered price;
-    # price_map — corrected by the profile's measured_ns residuals for
-    # THIS input's shape bucket (never global).  Either may be absent
-    # for unpriceable candidates (eager, custom names, unrecovered IR).
+    # price_map — corrected by the profile's learned corrections
+    # factors and measured_ns residuals for THIS input's shape bucket
+    # (never global).  Either may be absent for unpriceable candidates
+    # (eager, custom names, unrecovered IR).
     bucket = shape_bucket(example_input)
     model_ns: dict[str, float] = {}
     for name, _builder in entries:
@@ -694,7 +707,9 @@ def optimize_model_autotuned(
             model_ns[name] = m
     price_map: dict[str, float] = {}
     for name, _builder in entries:
-        p = measured_price_ns(profile, name, bucket, model_ns.get(name))
+        p = corrected_price_ns(
+            profile, name, bucket, model_ns.get(name)
+        )
         if p is not None:
             price_map[name] = p
     # A profile opt-in sorts the attempt order cheapest-predicted-first:

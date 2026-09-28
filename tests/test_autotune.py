@@ -386,6 +386,18 @@ def test_measured_feedback_writes_profile_dict():
     assert rec["model_ns"] > 0
     # no prior entries → the corrected prediction IS the model price
     assert rec["predicted_ns"] == rec["model_ns"]
+    # write-back also learned corrections: priced candidates got a
+    # first ratio observation; unpriced eager learned nothing
+    for name in ("generic", "batched"):
+        ent = prof["corrections"][name][bucket]
+        meas = prof["measured_ns"][name][bucket]
+        ratio = meas["median_ns"] / meas["model_ns"]
+        assert ent["n"] == 1
+        # factor = the observed ratio, clamped to the sane range
+        assert ent["factor"] == pytest.approx(
+            min(max(ratio, 0.1), 10.0)
+        )
+    assert "eager" not in prof["corrections"]
 
 
 def test_measured_feedback_targetprofile_replaced():
@@ -398,9 +410,14 @@ def test_measured_feedback_targetprofile_replaced():
     out = at["profile"]
     assert out is not prof
     assert prof.measured_ns == {}  # original untouched
+    assert prof.corrections == {}
     ent = out.measured_ns["generic"][at["shape_bucket"]]
     assert ent["median_ns"] > 0 and ent["model_ns"] > 0
+    corr = out.corrections["generic"][at["shape_bucket"]]
+    assert corr["n"] == 1 and 0.1 <= corr["factor"] <= 10.0
     assert out.graph_overhead_us == prof.graph_overhead_us
+    # the learned table serialises with the profile
+    assert TargetProfile.from_json(out.to_json()) == out
 
 
 def test_measured_entries_shift_candidate_order():
@@ -427,6 +444,107 @@ def test_measured_entries_shift_candidate_order():
     assert next(iter(at["candidates"])) == "cheap"
     assert at["predicted_winner"] == "cheap"
     assert at["candidates"]["cheap"]["predicted_ns"] == 1.0
+
+
+def test_learned_corrections_shift_candidate_order():
+    """A learned ``corrections`` factor is consumed by the attempt
+    ordering: the corrected ``predicted_ns`` is ``model * factor``,
+    and this run's timing grows the table's ``n``."""
+    m, x = _make()
+    bucket = shape_bucket(x)
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+        # learned on a previous run: generic is a 10th of its model
+        "corrections": {"generic": {bucket: {"factor": 0.1, "n": 3}}},
+    }
+    _mod, stats = _autotune(
+        m, x, candidates=("batched", "generic"), profile=prof
+    )
+    at = stats["autotune"]
+    g = at["candidates"]["generic"]
+    assert g["predicted_ns"] == pytest.approx(g["model_ns"] * 0.1)
+    # cheapest-predicted-first: the corrected generic leads the
+    # attempt order despite being declared second
+    assert next(iter(at["candidates"])) == "generic"
+    assert at["predicted_winner"] == "generic"
+    # this run's measurement folded into the learned entry (n: 3 → 4)
+    ent = prof["corrections"]["generic"][bucket]
+    assert ent["n"] == 4
+    assert 0.1 <= ent["factor"] <= 10.0
+
+
+def test_below_min_samples_falls_back_to_residual():
+    """One observation is a measured_ns residual, not a learned
+    factor — the delivered prediction is the measurement itself, and
+    ``model_ns`` stays the raw model price."""
+    m, x = _make()
+    bucket = shape_bucket(x)
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+        # n=1 < min_samples → the factor does NOT apply; the direct
+        # measurement (median 1 ns) transfers instead
+        "corrections": {"generic": {bucket: {"factor": 9.9, "n": 1}}},
+        "measured_ns": {
+            "generic": {bucket: {"median_ns": 1.0, "model_ns": 5.0}}
+        },
+    }
+    _mod, stats = _autotune(
+        m, x, candidates=("batched", "generic"), profile=prof
+    )
+    g = stats["autotune"]["candidates"]["generic"]
+    assert g["model_ns"] > 0
+    # residual transfer, not model * 9.9
+    assert g["predicted_ns"] == pytest.approx(
+        g["model_ns"] + (1.0 - 5.0)
+    )
+
+
+def test_ordering_uses_measured_truth_after_one_run():
+    """One run's write-back reaches the next run's ordering: a
+    5 ms custom candidate goes from unpriced to last-predicted."""
+    m, x = _make()
+
+    def slow(ctx):
+        inner = ctx.delivered
+
+        class S(nn.Module):
+            def forward(self, x):
+                deadline = time.perf_counter() + 0.005
+                while time.perf_counter() < deadline:
+                    pass
+                return inner(x)
+
+        return S()
+
+    prof = {
+        "tflops": 2.5,
+        "gbps": 89.0,
+        "launch_us": 8.7,
+        "dispatch_us": 1.0,
+    }
+    _autotune(
+        m, x, candidates=("generic", ("slow", slow)), profile=prof
+    )
+    bucket = shape_bucket(x)
+    assert prof["measured_ns"]["slow"][bucket]["median_ns"] > 1e6
+    _mod, stats = _autotune(
+        m, x, candidates=("generic", ("slow", slow)), profile=prof
+    )
+    at = stats["autotune"]
+    # slow has no model price but its measured median prices it —
+    # predicted ordering now matches the measured truth
+    assert at["predicted_winner"] == "generic"
+    assert (
+        at["candidates"]["slow"]["predicted_ns"]
+        > at["candidates"]["generic"]["predicted_ns"]
+    )
+    assert next(iter(at["candidates"])) == "generic"
 
 
 def test_predicted_ns_without_profile_is_model_only():

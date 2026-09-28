@@ -2,7 +2,8 @@
 profile-parameterised cost fns in catopt.cost."""
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from catopt.calibrate import (
     PROFILE_DIR_ENV,
     TargetProfile,
     calibrate,
+    corrected_price_ns,
     list_profiles,
     load_profile,
     measured_price_ns,
@@ -283,6 +285,400 @@ def test_record_measured():
 
     with pytest.raises(TypeError):
         record_measured(Frozen(), "g", "b", 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Learned correction table — record → learn → correct
+# ---------------------------------------------------------------------------
+
+
+def test_record_measured_learns_corrections():
+    """Each priced record folds ``median/model`` into the (candidate,
+    bucket) correction: a running geometric mean with a growing n."""
+    d: dict = {}
+    record_measured(d, "compiled", "cpu:2^4", 200.0, 100.0)
+    assert d["corrections"]["compiled"]["cpu:2^4"] == {
+        "factor": 2.0,
+        "n": 1,
+    }
+    # second observation: geomean(2.0, 8.0) = 4.0
+    record_measured(d, "compiled", "cpu:2^4", 800.0, 100.0)
+    ent = d["corrections"]["compiled"]["cpu:2^4"]
+    assert ent["n"] == 2 and ent["factor"] == pytest.approx(4.0)
+    # corrections stay per (candidate, bucket) — never global
+    record_measured(d, "generic", "cpu:2^4", 50.0, 10.0)
+    record_measured(d, "compiled", "cpu:2^9", 30.0, 10.0)
+    assert d["corrections"]["generic"]["cpu:2^4"]["factor"] == 5.0
+    assert d["corrections"]["compiled"]["cpu:2^9"]["factor"] == 3.0
+    # a measurement without a model price records but does not learn
+    record_measured(d, "eager", "cpu:2^4", 42.0)
+    assert "eager" not in d["corrections"]
+    assert d["measured_ns"]["eager"]["cpu:2^4"] == {"median_ns": 42.0}
+
+
+def test_record_measured_corrections_robust_inputs():
+    """Unusable ratios leave the table unchanged; extreme ratios are
+    clamped into the sane factor range before folding in."""
+    d: dict = {}
+    record_measured(d, "c", "b", 10.0, 0.0)  # division by zero
+    record_measured(d, "c", "b", -5.0, 10.0)  # negative median
+    record_measured(d, "c", "b", 10.0, -10.0)  # negative ratio
+    record_measured(d, "c", "b", 10.0, float("inf"))  # ratio == 0
+    record_measured(d, "c", "b", float("inf"), 10.0)  # non-finite
+    record_measured(d, "c", "b", 10.0, float("nan"))
+    assert d["corrections"] == {}
+    # an extreme ratio is clamped to [_CORRECTION_LO, _CORRECTION_HI]
+    record_measured(d, "c", "b", 1e6, 10.0)  # ratio 1e5 → 10.0
+    assert d["corrections"]["c"]["b"] == {"factor": 10.0, "n": 1}
+    record_measured(d, "c", "b", 1e-6, 10.0)  # ratio 1e-7 → 0.1
+    assert d["corrections"]["c"]["b"]["factor"] == pytest.approx(1.0)
+
+
+def test_learned_corrections_windowed_geometric_mean():
+    """Once n passes the window, the factor is a bounded-memory
+    average — a persistent regime shift still re-learns it."""
+    d: dict = {}
+    for _ in range(40):  # > _CORRECTION_WINDOW of ratio 2.0
+        record_measured(d, "c", "b", 20.0, 10.0)
+    ent = d["corrections"]["c"]["b"]
+    assert ent["n"] == 40
+    assert ent["factor"] == pytest.approx(2.0)
+    # a new regime (ratio 8) pulls the saturated estimate toward it
+    record_measured(d, "c", "b", 80.0, 10.0)
+    f = d["corrections"]["c"]["b"]["factor"]
+    assert 2.0 < f < 8.0
+    for _ in range(200):
+        record_measured(d, "c", "b", 80.0, 10.0)
+    assert d["corrections"]["c"]["b"]["factor"] == pytest.approx(
+        8.0, rel=0.05
+    )
+
+
+def test_learned_corrections_private_edge_cases():
+    """Direct coverage for the paths ``record_measured``'s float()
+    casts reject earlier, and malformed stored tables."""
+    # non-numeric observation inputs → table unchanged
+    assert cal_mod._learned_corrections(None, "c", "b", "x", 1.0) == {}
+    assert cal_mod._learned_corrections(None, "c", "b", 1.0, "x") == {}
+    # a non-dict stored table is rebuilt, not crashed on
+    assert cal_mod._learned_corrections("junk", "c", "b", 2.0, 1.0) == {
+        "c": {"b": {"factor": 2.0, "n": 1}}
+    }
+    # non-dict candidate values are dropped; a malformed entry for the
+    # updated bucket re-learns from scratch (n restarts at 1)
+    tab = cal_mod._learned_corrections(
+        {"bad": 5, "ok": {"b": {"factor": "x", "n": 9}}},
+        "ok",
+        "b",
+        20.0,
+        10.0,
+    )
+    assert "bad" not in tab
+    assert tab["ok"]["b"] == {"factor": 2.0, "n": 1}
+    # an entry with n <= 0 also re-learns fresh
+    tab = cal_mod._learned_corrections(
+        {"c": {"b": {"factor": 9.0, "n": 0}}}, "c", "b", 30.0, 10.0
+    )
+    assert tab["c"]["b"] == {"factor": 3.0, "n": 1}
+    # model_ns=None → table passed through untouched
+    src = {"c": {"b": {"factor": 2.0, "n": 3}}}
+    assert cal_mod._learned_corrections(src, "c", "b", 9.0, None) == src
+
+
+def test_record_measured_corrections_profile_shapes():
+    """Frozen profiles return new objects carrying corrections; dict
+    candidates that aren't tables are rebuilt; exotic objects degrade
+    gracefully."""
+    # frozen TargetProfile → a NEW object; the original is untouched
+    p = TargetProfile("k", 1.0, 2.0, 3.0, "cpu", "t")
+    p2 = record_measured(p, "generic", "cpu:2^4", 55.0, 20.0)
+    assert p2 is not p and p.corrections == {}
+    ent = p2.corrections["generic"]["cpu:2^4"]
+    assert ent["n"] == 1 and ent["factor"] == pytest.approx(2.75)
+    # a second write accumulates on the returned copy
+    p3 = record_measured(p2, "generic", "cpu:2^4", 82.5, 20.0)
+    ent = p3.corrections["generic"]["cpu:2^4"]
+    assert ent["n"] == 2
+    assert ent["factor"] == pytest.approx(math.sqrt(2.75 * 4.125))
+
+    # dict profile with a non-dict candidate table → rebuilt
+    d = {"measured_ns": {"c": 5}, "corrections": {"c": 9}}
+    record_measured(d, "c", "b", 10.0, 5.0)
+    assert d["measured_ns"]["c"]["b"]["median_ns"] == 10.0
+    assert d["corrections"]["c"]["b"] == {"factor": 2.0, "n": 1}
+
+    # attribute profile whose measured_ns holds non-dict values →
+    # they are dropped from the copy, not crashed on
+    class Obj:
+        pass
+
+    obj = Obj()
+    obj.measured_ns = {"x": 5}
+    obj.corrections = "junk"
+    out = record_measured(obj, "g", "b", 3.0, 1.0)
+    assert out is obj
+    assert obj.measured_ns["g"]["b"]["median_ns"] == 3.0
+    assert "x" not in obj.measured_ns
+    assert obj.corrections["g"]["b"] == {"factor": 3.0, "n": 1}
+
+    # an object whose slots reject the corrections attribute still
+    # records measured_ns — the learned table is best-effort
+    class Slotted:
+        __slots__ = ("measured_ns",)
+
+    s = Slotted()
+    record_measured(s, "g", "b", 3.0, 1.0)
+    assert s.measured_ns["g"]["b"]["median_ns"] == 3.0
+    assert not hasattr(s, "corrections")
+
+    # a frozen dataclass with measured_ns but no corrections field:
+    # the measured entry lands, learning is skipped
+    @dataclass(frozen=True)
+    class FrozenM:
+        measured_ns: dict = field(default_factory=dict)
+
+    fm = record_measured(FrozenM(), "g", "b", 3.0, 1.0)
+    assert fm.measured_ns["g"]["b"]["median_ns"] == 3.0
+    assert not hasattr(fm, "corrections")
+
+
+def test_corrected_price_ns_contract():
+    """Learned factors apply once ``n >= min_samples``; the measured_ns
+    contract is the fallback ladder below that."""
+    prof = {
+        "corrections": {
+            "compiled": {"cpu:2^4": {"factor": 2.0, "n": 5}}
+        }
+    }
+    assert (
+        corrected_price_ns(prof, "compiled", "cpu:2^4", 100.0) == 200.0
+    )
+    # below min_samples the factor is ignored → model unchanged
+    prof1 = {
+        "corrections": {
+            "compiled": {"cpu:2^4": {"factor": 2.0, "n": 1}}
+        }
+    }
+    assert (
+        corrected_price_ns(prof1, "compiled", "cpu:2^4", 100.0) == 100.0
+    )
+    # ... but min_samples is a knob
+    assert (
+        corrected_price_ns(
+            prof1, "compiled", "cpu:2^4", 100.0, min_samples=1
+        )
+        == 200.0
+    )
+    # a direct measured_ns entry is the fallback when n < min_samples
+    both = {
+        "corrections": {
+            "compiled": {"cpu:2^4": {"factor": 2.0, "n": 1}}
+        },
+        "measured_ns": {
+            "compiled": {
+                "cpu:2^4": {"median_ns": 90.0, "model_ns": 300.0}
+            }
+        },
+    }
+    assert (
+        corrected_price_ns(both, "compiled", "cpu:2^4", 300.0) == 90.0
+    )
+    # once learned, the factor takes precedence over the residual
+    both["corrections"]["compiled"]["cpu:2^4"]["n"] = 3
+    assert (
+        corrected_price_ns(both, "compiled", "cpu:2^4", 300.0) == 600.0
+    )
+    # unpriceable candidates cannot take a factor → measured path
+    assert corrected_price_ns(prof, "compiled", "cpu:2^4", None) is None
+    assert corrected_price_ns(both, "compiled", "cpu:2^4", None) == 90.0
+    # stored factors are clamped into the sane range at consumption
+    wild = {"corrections": {"c": {"b": {"factor": 500.0, "n": 9}}}}
+    assert corrected_price_ns(wild, "c", "b", 100.0) == 1000.0
+    low = {"corrections": {"c": {"b": {"factor": 0.001, "n": 9}}}}
+    assert corrected_price_ns(low, "c", "b", 100.0) == 10.0
+    # malformed tables / entries are ignored entirely
+    for bad in (
+        {"corrections": "junk"},
+        {"corrections": {"c": 5}},
+        {"corrections": {"c": {"b": 5}}},
+        {"corrections": {"c": {"b": {"factor": "x", "n": 9}}}},
+        {"corrections": {"c": {"b": {"factor": 2.0}}}},  # missing n
+        {"corrections": {"c": {"b": {"factor": float("nan"), "n": 9}}}},
+        {"corrections": {"c": {"b": {"factor": -2.0, "n": 9}}}},
+    ):
+        assert corrected_price_ns(bad, "c", "b", 100.0) == 100.0
+    # no profile → model passes through; nothing anywhere → None
+    assert corrected_price_ns(None, "c", "b", 7.0) == 7.0
+    assert corrected_price_ns(None, "c", "b", None) is None
+    # attribute profiles read corrections the same way
+    tp = TargetProfile(
+        "k",
+        1.0,
+        2.0,
+        3.0,
+        "cpu",
+        "t",
+        corrections={"c": {"b": {"factor": 3.0, "n": 4}}},
+    )
+    assert corrected_price_ns(tp, "c", "b", 100.0) == 300.0
+
+    class Weird:
+        corrections = "junk"
+
+    assert corrected_price_ns(Weird(), "c", "b", 7.0) == 7.0
+
+
+def test_corrected_price_ns_nearest_bucket():
+    """No exact-bucket correction → the nearest same-device bucket's
+    factor applies dampened toward 1.0 by ``0.5 ** |Δexponent|``."""
+    prof = {
+        "corrections": {
+            "compiled": {
+                "cpu:2^8": {"factor": 4.0, "n": 5},
+                "cuda:0:2^9": {"factor": 9.0, "n": 5},
+            }
+        }
+    }
+    # exact hit — full strength
+    assert (
+        corrected_price_ns(prof, "compiled", "cpu:2^8", 100.0) == 400.0
+    )
+    # one bucket away: 4 ** 0.5 = 2; two away: 4 ** 0.25
+    assert corrected_price_ns(
+        prof, "compiled", "cpu:2^9", 100.0
+    ) == pytest.approx(200.0)
+    assert corrected_price_ns(
+        prof, "compiled", "cpu:2^10", 100.0
+    ) == pytest.approx(100.0 * 4.0**0.25)
+    # other candidates / other devices never interpolate
+    assert (
+        corrected_price_ns(prof, "generic", "cpu:2^9", 100.0) == 100.0
+    )
+    assert (
+        corrected_price_ns(prof, "compiled", "cuda:1:2^8", 100.0)
+        == 100.0
+    )
+    # cuda:0's own factor is exact and undampened — device prefix
+    # parsing survives embedded colons
+    assert (
+        corrected_price_ns(prof, "compiled", "cuda:0:2^9", 100.0)
+        == 900.0
+    )
+    # a nearer LOW-CONFIDENCE entry does not shadow the farther
+    # learned one: n=1 is skipped, the 2^4 factor applies at dist 4
+    mixed = {
+        "corrections": {
+            "c": {
+                "cpu:2^9": {"factor": 8.0, "n": 1},
+                "cpu:2^4": {"factor": 8.0, "n": 3},
+            }
+        }
+    }
+    assert corrected_price_ns(
+        mixed, "c", "cpu:2^8", 10.0
+    ) == pytest.approx(10.0 * 8.0**0.0625)
+    # malformed entries are skipped during the nearest scan
+    messy = {
+        "corrections": {
+            "c": {
+                "cpu:2^5": "junk",
+                "cpu:2^4": {"factor": 3.0, "n": 2},
+            }
+        }
+    }
+    assert corrected_price_ns(
+        messy, "c", "cpu:2^6", 10.0
+    ) == pytest.approx(10.0 * 3.0**0.25)
+    # keys that don't parse exact-match but never interpolate
+    weird = {"corrections": {"c": {"odd-key": {"factor": 3.0, "n": 5}}}}
+    assert corrected_price_ns(weird, "c", "odd-key", 10.0) == 30.0
+    assert corrected_price_ns(weird, "c", "cpu:2^4", 10.0) == 10.0
+    # malformed query bucket: exact match only, no interpolation
+    qc = {"corrections": {"c": {"x": {"factor": 2.0, "n": 2}}}}
+    assert corrected_price_ns(qc, "c", "x", 10.0) == 20.0
+    assert corrected_price_ns(qc, "c", "y", 10.0) == 10.0
+    # entries whose own key doesn't parse are skipped, not crashed on
+    bad_key = {
+        "corrections": {"c": {"cpu:2^x": {"factor": 2.0, "n": 2}}}
+    }
+    assert corrected_price_ns(bad_key, "c", "cpu:2^4", 10.0) == 10.0
+    # the NEAREST bucket wins: a farther entry seen later does not
+    # displace it (cpu:2^5 is distance 1, cpu:2^2 distance 4)
+    multi = {
+        "corrections": {
+            "c": {
+                "cpu:2^5": {"factor": 4.0, "n": 3},
+                "cpu:2^2": {"factor": 8.0, "n": 3},
+            }
+        }
+    }
+    assert corrected_price_ns(
+        multi, "c", "cpu:2^6", 10.0
+    ) == pytest.approx(10.0 * 4.0**0.5)
+
+
+def test_bucket_coord_parsing():
+    """The nearest-bucket lookup keys on (device, exponent); the
+    parser rejects anything outside the ``<device>:2^e`` shape."""
+    bc = cal_mod._bucket_coord
+    assert bc("cpu:2^4") == ("cpu", 4)
+    assert bc("cuda:0:2^10") == ("cuda:0", 10)  # colons in device
+    assert bc("x") is None
+    assert bc(5) is None
+    assert bc(None) is None
+    assert bc(":2^3") is None  # empty device
+    assert bc("cpu:2^x") is None  # non-integer exponent
+
+
+def test_correction_loop_flips_ordering_to_measured():
+    """The closed loop on a toy profile: the model mis-ranks two
+    candidates, one recorded measurement flips the delivered ordering
+    to the measured truth, and the learned factor keeps it there."""
+    prof: dict = {}
+    model = {"generic": 100.0, "compiled": 300.0}
+    bucket = "cpu:2^4"
+    # before any measurement the (wrong) model ordering stands
+    assert corrected_price_ns(
+        prof, "compiled", bucket, model["compiled"]
+    ) > corrected_price_ns(prof, "generic", bucket, model["generic"])
+    # measured truth: compiled is CHEAPER — one record and the direct
+    # residual already delivers the measurement exactly
+    record_measured(prof, "compiled", bucket, 90.0, model["compiled"])
+    assert (
+        corrected_price_ns(prof, "compiled", bucket, model["compiled"])
+        == 90.0
+    )
+    assert corrected_price_ns(
+        prof, "compiled", bucket, model["compiled"]
+    ) < corrected_price_ns(prof, "generic", bucket, model["generic"])
+    # a second record reaches min_samples: the learned factor 0.3 now
+    # drives the correction — same ordering, from the table
+    record_measured(prof, "compiled", bucket, 90.0, model["compiled"])
+    ent = prof["corrections"]["compiled"][bucket]
+    assert ent["n"] == 2 and ent["factor"] == pytest.approx(0.3)
+    assert corrected_price_ns(
+        prof, "compiled", bucket, model["compiled"]
+    ) == pytest.approx(90.0)
+    # the learned ratio transfers to DIFFERENT model prices in the
+    # same bucket — a changed graph keeps the correction
+    assert corrected_price_ns(
+        prof, "compiled", bucket, 500.0
+    ) == pytest.approx(150.0)
+
+
+def test_corrections_serialize_roundtrip():
+    """``corrections`` rides the JSON schema like the other maps —
+    clean round-trip, empty default on legacy profiles."""
+    bare = TargetProfile("bare", 1.0, 2.0, 3.0, "cpu", "t")
+    assert bare.corrections == {}
+    legacy = json.loads(RTX2050.to_json())
+    del legacy["corrections"]
+    assert TargetProfile.from_json(legacy).corrections == {}
+    corr = {"compiled": {"cpu:2^4": {"factor": 0.3, "n": 7}}}
+    q = TargetProfile("k", 1.0, 2.0, 3.0, "cpu", "t", corrections=corr)
+    s = q.to_json()
+    assert '"corrections"' in s
+    assert TargetProfile.from_json(s) == q
 
 
 def test_measure_graph_overhead_direct(monkeypatch):

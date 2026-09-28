@@ -46,6 +46,7 @@ __all__ = [
     "PROFILE_DIR_ENV",
     "TargetProfile",
     "calibrate",
+    "corrected_price_ns",
     "list_profiles",
     "load_profile",
     "measured_price_ns",
@@ -154,11 +155,23 @@ class TargetProfile:
       model cannot price, e.g. ``"eager"``) substitute the measured
       median directly.  See :func:`measured_price_ns` for the
       consumption contract.
+    * ``corrections`` — the learned correction table
+      ``record_measured`` maintains alongside ``measured_ns``:
+      ``{candidate: {bucket: {"factor": float, "n": int}}}`` where
+      ``factor`` is the running geometric mean of the observed
+      ``median_ns / model_ns`` ratios (clamped to
+      ``[_CORRECTION_LO, _CORRECTION_HI]``) and ``n`` the observation
+      count.  Once a (candidate, bucket) pair reaches
+      ``_CORRECTION_MIN_SAMPLES`` observations,
+      :func:`corrected_price_ns` multiplies model prices by the
+      learned factor — the closed-loop correction of the cost MODEL,
+      versus the per-entry residuals of ``measured_ns``.
 
     ``dispatch_us`` / ``leaf_eval_us`` / ``graph_overhead_us`` default
     to conservative fallbacks (``_FALLBACK_DISPATCH_US`` /
     ``_FALLBACK_LEAF_EVAL_US`` / ``_FALLBACK_GRAPH_OVERHEAD_US``), and
-    ``op_kernel_ns`` / ``measured_ns`` default to ``{}``, so profiles
+    ``op_kernel_ns`` / ``measured_ns`` / ``corrections`` default to
+    ``{}``, so profiles
     saved before the probes existed — or built by hand — still price
     executor overhead honestly and fall back to the pure roofline
     formula.
@@ -181,6 +194,7 @@ class TargetProfile:
     op_kernel_ns: dict = field(default_factory=dict)
     graph_overhead_us: float = _FALLBACK_GRAPH_OVERHEAD_US
     measured_ns: dict = field(default_factory=dict)
+    corrections: dict = field(default_factory=dict)
 
     # -- serialisation ------------------------------------------------
     def to_json(self) -> str:
@@ -311,6 +325,11 @@ def list_profiles(dir: str | Path | None = None) -> list[str]:
 # * ``measured_ns`` — ``{candidate: {bucket: record}}``: measured
 #   corrections keyed by (lowering-candidate, shape-bucket) — never
 #   global.  ``measured_price_ns`` applies them.
+# * ``corrections`` — ``{candidate: {bucket: {"factor", "n"}}}``: the
+#   learned correction table ``record_measured`` folds every priced
+#   measurement into.  ``corrected_price_ns`` multiplies model prices
+#   by the factor once enough observations landed — closing the loop
+#   from "remember the last measurement" to "learn the model's bias".
 
 
 def shape_bucket(example_input: Any) -> str:
@@ -381,6 +400,107 @@ def _measured_table(profile: Any) -> dict | None:
     return tab if isinstance(tab, dict) else None
 
 
+def _corrections_table(profile: Any) -> dict | None:
+    """Return the ``corrections`` map off a dict or attribute profile."""
+    if profile is None:
+        return None
+    tab = (
+        profile.get("corrections")
+        if isinstance(profile, dict)
+        else getattr(profile, "corrections", None)
+    )
+    return tab if isinstance(tab, dict) else None
+
+
+#: Minimum ratio observations before a learned correction applies —
+#: a single measurement still transfers through ``measured_ns``'s
+#: residual path.
+_CORRECTION_MIN_SAMPLES = 2
+#: Learned multiplicative corrections live inside this range: a stale
+#: or outlier-driven factor can misprice a candidate by at most 10x.
+_CORRECTION_LO = 0.1
+_CORRECTION_HI = 10.0
+#: Effective memory of the running geometric mean — once ``n`` exceeds
+#: this, a new ratio moves the factor by ~``1/(W+1)`` in log space, so
+#: the table still adapts when a device/driver change shifts the true
+#: ratio instead of freezing at its full history.
+_CORRECTION_WINDOW = 32
+
+
+def _correction_of(rec: Any) -> tuple[float, int] | None:
+    """Validate one ``{"factor", "n"}`` corrections entry.
+
+    Returns ``(factor, n)`` with the factor clamped to
+    ``[_CORRECTION_LO, _CORRECTION_HI]`` — hand-edited profiles and
+    stale tables get sane bounds at consumption — or ``None`` for
+    malformed entries.
+    """
+    if not isinstance(rec, dict):
+        return None
+    try:
+        f = float(rec["factor"])
+        n = int(rec["n"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0.0:
+        return None
+    return min(max(f, _CORRECTION_LO), _CORRECTION_HI), max(n, 0)
+
+
+def _learned_corrections(
+    corr: dict | None,
+    candidate: str,
+    bucket: str,
+    median_ns: float,
+    model_ns: float | None,
+) -> dict:
+    """Return the ``corrections`` table updated by one observation.
+
+    Learning rule: ``factor`` is a running GEOMETRIC MEAN of the
+    observed ``median_ns / model_ns`` ratios — in log space each new
+    measurement moves the estimate by at most ``1/(min(n, W)+1)``:
+    bounded, monotone-ish (a single wild ratio shifts the factor by a
+    bounded step, never replaces it), and still adaptive after the
+    window saturates.  Ratios are clamped to
+    ``[_CORRECTION_LO, _CORRECTION_HI]`` before folding in, so the
+    stored factor can never leave the sane range; ``n`` counts the
+    observations.
+
+    Observations without a usable ratio leave the table unchanged: no
+    ``model_ns`` (the model cannot price the candidate — its
+    ``measured_ns`` entry substitutes the median outright), a zero
+    ``model_ns``, or a non-positive/non-finite ratio.
+    """
+    tab: dict = (
+        {c: dict(b) for c, b in corr.items() if isinstance(b, dict)}
+        if isinstance(corr, dict)
+        else {}
+    )
+    if model_ns is None:
+        return tab
+    try:
+        ratio = float(median_ns) / float(model_ns)
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return tab
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        return tab
+    r = min(max(ratio, _CORRECTION_LO), _CORRECTION_HI)
+    cand = tab.setdefault(candidate, {})
+    cur = _correction_of(cand.get(bucket))
+    if cur is None or cur[1] <= 0:
+        cand[bucket] = {"factor": r, "n": 1}
+    else:
+        f_old, n_old = cur
+        w = min(n_old, _CORRECTION_WINDOW)
+        cand[bucket] = {
+            "factor": math.exp(
+                (w * math.log(f_old) + math.log(r)) / (w + 1.0)
+            ),
+            "n": n_old + 1,
+        }
+    return tab
+
+
 def record_measured(
     profile: Any,
     candidate: str,
@@ -390,7 +510,8 @@ def record_measured(
 ) -> Any:
     """Write one measured-feedback entry into *profile*.
 
-    Updates ``measured_ns`` and returns the updated profile.
+    Updates ``measured_ns`` — and folds the observation into the
+    learned ``corrections`` table — and returns the updated profile.
 
     ``candidate`` is a lowering-path name (``"generic"`` /
     ``"batched"`` / ``"compiled"`` / a custom candidate name);
@@ -399,13 +520,18 @@ def record_measured(
     median wall time; ``model_ns`` the cost model's price of the
     measured graph at recording time (omit when the model cannot price
     the candidate — e.g. ``"eager"`` — and the entry substitutes the
-    measured median directly; see :func:`measured_price_ns`).
+    measured median directly; see :func:`measured_price_ns`).  When
+    both are usable the ratio ``median_ns / model_ns`` feeds the
+    running geometric mean in ``corrections[candidate][bucket]``
+    (:func:`_learned_corrections`), which :func:`corrected_price_ns`
+    consumes.
 
     *dict* profiles are updated in place (and returned); a frozen
     :class:`TargetProfile` — or any dataclass — yields a NEW instance
     via ``dataclasses.replace``; any other object gets ``measured_ns``
-    set on it (objects that reject the attribute propagate the usual
-    error, e.g. ``AttributeError``/``TypeError``).
+    (and, when settable, ``corrections``) set on it — objects that
+    reject ``measured_ns`` propagate the usual error, while a
+    ``corrections`` attribute that cannot be set is skipped silently.
     """
     entry: dict[str, float] = {"median_ns": float(median_ns)}
     if model_ns is not None:
@@ -415,15 +541,44 @@ def record_measured(
         if not isinstance(tab, dict):
             tab = {}
             profile["measured_ns"] = tab
-        tab.setdefault(candidate, {})[bucket] = entry
+        cand = tab.get(candidate)
+        if not isinstance(cand, dict):
+            cand = tab[candidate] = {}
+        cand[bucket] = entry
+        profile["corrections"] = _learned_corrections(
+            profile.get("corrections"),
+            candidate,
+            bucket,
+            median_ns,
+            model_ns,
+        )
         return profile
     cur = _measured_table(profile)
-    tab = {c: dict(b) for c, b in cur.items()} if cur else {}
-    tab.setdefault(candidate, {})[bucket] = entry
+    tab = (
+        {c: dict(b) for c, b in cur.items() if isinstance(b, dict)}
+        if cur
+        else {}
+    )
+    cand = tab.get(candidate)
+    if not isinstance(cand, dict):
+        cand = tab[candidate] = {}
+    cand[bucket] = entry
+    ctab = _learned_corrections(
+        _corrections_table(profile),
+        candidate,
+        bucket,
+        median_ns,
+        model_ns,
+    )
     if is_dataclass(profile) and not isinstance(profile, type):
+        if "corrections" in profile.__dataclass_fields__:
+            return replace(profile, measured_ns=tab, corrections=ctab)
+        # dataclass predating the field: measured_ns still lands
         return replace(profile, measured_ns=tab)
     target: Any = profile
     target.measured_ns = tab
+    with contextlib.suppress(Exception):
+        target.corrections = ctab
     return target
 
 
@@ -462,6 +617,98 @@ def measured_price_ns(
     if ref is None or model_ns is None:
         return float(med)
     return float(model_ns) + (float(med) - float(ref))
+
+
+def _bucket_coord(bucket: Any) -> tuple[str, int] | None:
+    """Parse a :func:`shape_bucket` key into ``(device, exponent)``.
+
+    Keys are ``"<device>:2^e"``; device strings may themselves carry
+    colons (``"cuda:0:2^10"``), so the split is from the right.
+    ``None`` for keys that do not parse — they can still exact-match,
+    never interpolate.
+    """
+    if not isinstance(bucket, str):
+        return None
+    dev, sep, e = bucket.rpartition(":2^")
+    if not sep or not dev:
+        return None
+    try:
+        return dev, int(e)
+    except ValueError:
+        return None
+
+
+def _correction_factor(
+    profile: Any,
+    candidate: str,
+    bucket: str,
+    min_samples: int,
+) -> float | None:
+    """Look up the learned multiplicative correction for ``(candidate, bucket)``.
+
+    Exact-bucket hit → its (clamped) factor.  Else the NEAREST
+    same-device bucket's factor, dampened toward 1.0 by
+    ``0.5 ** |Δexponent|`` — a correction measured one bucket away
+    applies at half its log-space strength, two away at a quarter, so
+    a neighbouring estimate nudges the price without pretending to be
+    a local measurement.  Entries with ``n < min_samples`` and
+    malformed entries are skipped; cross-device buckets never
+    interpolate.  ``None`` when nothing applies.
+    """
+    tab = _corrections_table(profile)
+    cand = tab.get(candidate) if tab is not None else None
+    if not isinstance(cand, dict):
+        return None
+    key = _bucket_coord(bucket)
+    best: tuple[int, float] | None = None
+    for b, rec in cand.items():
+        fn = _correction_of(rec)
+        if fn is None or fn[1] < min_samples:
+            continue
+        if b == bucket:
+            return fn[0]
+        if key is None:
+            continue
+        k2 = _bucket_coord(b)
+        if k2 is None or k2[0] != key[0]:
+            continue
+        dist = abs(k2[1] - key[1])
+        if best is None or dist < best[0]:
+            best = (dist, fn[0])
+    if best is None:
+        return None
+    return best[1] ** (0.5 ** best[0])
+
+
+def corrected_price_ns(
+    profile: Any,
+    candidate: str,
+    bucket: str,
+    model_ns: float | None,
+    *,
+    min_samples: int = _CORRECTION_MIN_SAMPLES,
+) -> float | None:
+    """Delivered price (ns) with the LEARNED correction applied.
+
+    The closed-loop counterpart of :func:`measured_price_ns`:
+
+    * a learned ``corrections`` factor for ``(candidate, bucket)`` —
+      the exact bucket's own factor, else the nearest same-device
+      bucket's dampened factor — with ``n >= min_samples``
+      observations returns ``model_ns * factor``: the aggregated
+      history's multiplicative correction of the model itself;
+    * else the :func:`measured_price_ns` contract — residual transfer
+      on a direct ``measured_ns`` entry, the measured median when no
+      model price exists now or was recorded, ``model_ns`` unchanged
+      when nothing is recorded;
+    * ``model_ns=None`` cannot take a multiplicative factor — the
+      measured path handles it (median substitution or ``None``).
+    """
+    if model_ns is not None:
+        f = _correction_factor(profile, candidate, bucket, min_samples)
+        if f is not None:
+            return float(model_ns) * f
+    return measured_price_ns(profile, candidate, bucket, model_ns)
 
 
 # ---------------------------------------------------------------------------
