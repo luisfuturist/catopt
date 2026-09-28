@@ -1,4 +1,5 @@
 """Proof-carrying certificate types."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -99,10 +100,12 @@ class Certificate:
 
     @property
     def n_steps(self) -> int:
+        """Return the number of derivation steps."""
         return len(self.steps)
 
     @property
     def n_egraph_dependent(self) -> int:
+        """Return the count of e-graph-dependent steps."""
         return sum(1 for s in self.steps if s.egraph_dependent)
 
     @property
@@ -112,19 +115,22 @@ class Certificate:
 
     @property
     def rules_used(self) -> list[str]:
+        """Return the rules used by replayable steps."""
         return sorted(
             {s.rule for s in self.steps if not s.egraph_dependent}
         )
 
     @property
     def error_bound(self) -> float:
-        """Conservative accumulated error bound: the triangle-inequality
-        sum of every step's ``Rewrite.error_bound`` (steps lacking a
-        bound contribute 0 — they are exact).  The bound is in whatever
-        norm the contributing rules declared; today that is the
-        spectral norm on the substituted subterm.  Propagating
-        site-local bounds to the model output requires per-op Lipschitz
-        constants — not yet computed."""
+        """Return the conservative accumulated error bound.
+
+        The triangle-inequality sum of every step's
+        ``Rewrite.error_bound`` (steps lacking a bound contribute 0 —
+        they are exact).  The bound is in whatever norm the contributing
+        rules declared; today that is the spectral norm on the
+        substituted subterm.  Propagating site-local bounds to the model
+        output requires per-op Lipschitz constants — not yet computed.
+        """
         total = 0.0
         for s in self.steps:
             r = self.rules.get(s.rule)
@@ -134,9 +140,9 @@ class Certificate:
 
     @property
     def exact(self) -> bool:
-        """True when no step carries an error bound — the derivation is
-        an exact equivalence, not a certified approximation."""
+        """Return True when no step carries an error bound.
+
+        The derivation is then an exact equivalence, not a certified
+        approximation.
+        """
         return self.error_bound == 0.0
-
-
-

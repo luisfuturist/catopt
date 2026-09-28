@@ -15,8 +15,27 @@ fills up *between* tests still skips rather than flakes.  Probing is a
 ~32 MiB alloc + a kernel launch + sync — milliseconds.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+# --- mutmut sandbox ------------------------------------------------
+# uv's PEP-660 editable install registers a single ``__editable__*``
+# MetaPathFinder mapping every workspace package back to the real
+# ``packages/*/src``.  It runs ahead of path-based resolution, so inside
+# the flat sandbox mutmut builds (``.mutmut-sandbox/``, see
+# tools/mutmut.sh) it would shadow the mutated copies and no mutant
+# would ever be imported (mutmut then reports "no test case for any
+# mutant").  When running from that sandbox, drop the finder so the
+# ``mutants/`` copies win.  It is a no-op for normal runs.
+if Path.cwd().name == "mutants":
+    sys.meta_path[:] = [
+        f
+        for f in sys.meta_path
+        if "editable" not in getattr(f, "__module__", "")
+    ]
 
 _PROBE_NUMEL = 8 * 1024 * 1024  # float32 zeros → 32 MiB
 

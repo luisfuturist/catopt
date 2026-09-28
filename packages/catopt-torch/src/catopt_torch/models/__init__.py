@@ -23,6 +23,7 @@ class SwiGLU(nn.Module):
     """SwiGLU activation: ``x * silu(gate) * up``."""
 
     def __init__(self, dim: int, hidden_mult: int = 4) -> None:
+        """Initialise the gate/up/down projections."""
         super().__init__()
         h = dim * hidden_mult
         self.gate = nn.Linear(dim, h, bias=False)
@@ -30,6 +31,7 @@ class SwiGLU(nn.Module):
         self.down = nn.Linear(h, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the SwiGLU activation and output projection."""
         g = self.gate(x)
         u = self.up(x)
         h = F.silu(g) * u
@@ -40,11 +42,13 @@ class RMSNorm(nn.Module):
     """Root-Mean-Square Normalization."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        """Initialise the eps and the per-channel gain."""
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalise ``x`` by its per-token RMS and scale."""
         # Per-token RMS normalization
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x * rms * self.weight
@@ -58,6 +62,7 @@ class AttentionBlock(nn.Module):
     """
 
     def __init__(self, dim: int, n_heads: int = 8) -> None:
+        """Initialise the Q/K/V/output projections and the scale."""
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -69,6 +74,7 @@ class AttentionBlock(nn.Module):
         self.scale = self.head_dim**-0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run multi-head SDPA attention over ``x``."""
         B, T, C = x.shape
         q = (
             self.q_proj(x)
@@ -98,6 +104,7 @@ class ResidualMLP(nn.Module):
     """
 
     def __init__(self, dim: int, hidden_mult: int = 4) -> None:
+        """Initialise the two linears and the input LayerNorm."""
         super().__init__()
         h = dim * hidden_mult
         self.fc1 = nn.Linear(dim, h)
@@ -105,6 +112,7 @@ class ResidualMLP(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the residual MLP on ``x``."""
         # y = fc2(silu(fc1(norm(x)))) + x   — the residual is an 'add'
         h = self.norm(x)
         h = F.silu(self.fc1(h))
@@ -135,6 +143,7 @@ class ParallelLinear(nn.Module):
         n_experts: int = 2,
         expert_dim: int | None = None,
     ) -> None:
+        """Initialise ``n_experts`` parallel projections."""
         super().__init__()
         out = expert_dim or dim
         self.linears = nn.ModuleList(
@@ -142,6 +151,7 @@ class ParallelLinear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the parallel projections of ``x``."""
         # Sum of parallel projections — NOT a stack, so it cannot be
         # reduced by trivially concatenating weights without summing them.
         out = self.linears[0](x)
@@ -170,12 +180,14 @@ class DeepParallel(nn.Module):
     """
 
     def __init__(self, dim: int, mid: int, out: int) -> None:
+        """Initialise the two parallel projections and the output."""
         super().__init__()
         self.W1 = nn.Linear(dim, mid, bias=False)
         self.W2 = nn.Linear(dim, mid, bias=False)
         self.W3 = nn.Linear(mid, out, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project through W3 after summing the W1/W2 branches."""
         return self.W3(self.W1(x) + self.W2(x))
 
 
@@ -190,12 +202,14 @@ class NormLinear(nn.Module):
     def __init__(
         self, dim: int, out: int | None = None, eps: float = 1e-6
     ) -> None:
+        """Initialise eps, the norm gain, and the projection."""
         super().__init__()
         self.eps = eps
         self.norm_weight = nn.Parameter(torch.ones(dim) * 0.5 + 1.0)
         self.proj = nn.Linear(dim, out or dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the RMS norm and the projection."""
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return self.proj(x * rms * self.norm_weight)
 
@@ -221,6 +235,7 @@ class TransformerBlock(nn.Module):
         hidden_mult: int = 4,
         eps: float = 1e-6,
     ) -> None:
+        """Initialise both norms, attention, and the SwiGLU MLP."""
         super().__init__()
         self.eps = eps
         self.norm1_w = nn.Parameter(torch.ones(dim))
@@ -236,6 +251,7 @@ class TransformerBlock(nn.Module):
         return t * rms * w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the pre-norm attention and SwiGLU blocks."""
         x = x + self.attn(self._rms(x, self.norm1_w))
         n = self._rms(x, self.norm2_w)
         x = x + self.down(F.silu(self.gate(n)) * self.up(n))
@@ -260,6 +276,7 @@ class ParallelBlock(nn.Module):
         hidden_mult: int = 4,
         eps: float = 1e-6,
     ) -> None:
+        """Initialise the norm, attention, and the SwiGLU MLP."""
         super().__init__()
         self.eps = eps
         self.norm_w = nn.Parameter(torch.ones(dim))
@@ -270,6 +287,7 @@ class ParallelBlock(nn.Module):
         self.down = nn.Linear(h, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the parallel attention + MLP block."""
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         n = x * rms * self.norm_w
         return (
@@ -291,6 +309,7 @@ class GQAAttention(nn.Module):
     def __init__(
         self, dim: int, n_heads: int = 8, n_kv_heads: int = 2
     ) -> None:
+        """Initialise the asymmetric Q/K/V projections and scale."""
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -309,6 +328,7 @@ class GQAAttention(nn.Module):
         self.scale = self.head_dim**-0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run grouped-query SDPA attention over ``x``."""
         B, T, _ = x.shape
         q = (
             self.q_proj(x)
@@ -352,6 +372,7 @@ class MatrixChain(nn.Module):
     """
 
     def __init__(self, d0: int, d1: int, d2: int, d3: int) -> None:
+        """Initialise the three weight matrices."""
         super().__init__()
         self.W1 = nn.Parameter(torch.randn(d0, d1) * 0.02)
         self.W2 = nn.Parameter(torch.randn(d1, d2) * 0.02)
@@ -359,6 +380,7 @@ class MatrixChain(nn.Module):
         self.dims = (d0, d1, d2, d3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate the left-associative matrix chain."""
         # Left-associative: ((x @ W1) @ W2) @ W3
         h1 = torch.matmul(x, self.W1)
         h2 = torch.matmul(h1, self.W2)
@@ -384,10 +406,9 @@ class MatrixChain(nn.Module):
 
 
 class ParallelConv(nn.Module):
-    """Parallel conv2d branches on one input — the product law beyond
-    ``linear``.
+    """Parallel conv2d branches on one input.
 
-    ``n`` same-geometry convolutions (e.g. ResNet bottleneck 1x1 heads,
+    The product law beyond ``linear``: ``n`` same-geometry convolutions (e.g. ResNet bottleneck 1x1 heads,
     multi-branch stems) read the SAME feature map.  The pairing pass
     fuses them into ONE conv whose weight is the out-channel concat,
     with per-branch ``split`` views on the channel dim.  Unlike linear
@@ -403,6 +424,7 @@ class ParallelConv(nn.Module):
         branches: int = 4,
         kernel: int = 1,
     ) -> None:
+        """Initialise ``branches`` same-geometry convolutions."""
         super().__init__()
         self.convs = nn.ModuleList(
             [
@@ -412,6 +434,7 @@ class ParallelConv(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the parallel convolutions of ``x``."""
         return sum(c(x) for c in self.convs)
 
 
@@ -431,6 +454,7 @@ class LinearAttention(nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
+        """Evaluate unnormalised attention ``(Q K^T) V``."""
         return torch.matmul(torch.matmul(q, k.transpose(-2, -1)), v)
 
 
@@ -445,13 +469,17 @@ def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class RepeatKVAttention(nn.Module):
-    """GQA attention with materialised ``repeat_kv`` — the llama2.c
-    pattern.  ``enable_gqa`` inside SDPA computes the same broadcast for
-    free; the absorb rule pushes the copy map into the kernel."""
+    """GQA attention with materialised ``repeat_kv``.
+
+    The llama2.c pattern: ``enable_gqa`` inside SDPA computes the same
+    broadcast for free; the absorb rule pushes the copy map into the
+    kernel.
+    """
 
     def __init__(
         self, dim: int = 128, n_heads: int = 8, n_kv_heads: int = 2
     ) -> None:
+        """Initialise head counts and the Q/K/V projections."""
         super().__init__()
         self.h, self.hk = n_heads, n_kv_heads
         self.dh = dim // n_heads
@@ -461,6 +489,7 @@ class RepeatKVAttention(nn.Module):
         self.wv = nn.Linear(dim, n_kv_heads * self.dh, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run GQA attention with materialised ``repeat_kv``."""
         b, t, _ = x.shape
         q = self.wq(x).view(b, t, self.h, self.dh).transpose(1, 2)
         k = self.wk(x).view(b, t, self.hk, self.dh)
@@ -478,9 +507,12 @@ class EagerAttention(nn.Module):
     discover the fused kernel form automatically.
     """
 
+    mask: torch.Tensor
+
     def __init__(
         self, dim: int = 128, n_heads: int = 4, block_size: int = 64
     ) -> None:
+        """Initialise the fused QKV projection and the causal mask."""
         super().__init__()
         self.h = n_heads
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
@@ -492,6 +524,7 @@ class EagerAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run nanoGPT-style masked-fill causal attention."""
         b, t, c = x.shape
         q, k, v = self.c_attn(x).split(c, dim=2)
         q = q.view(b, t, self.h, c // self.h).transpose(1, 2)
@@ -508,9 +541,12 @@ class EagerAttention(nn.Module):
 class AdditiveMaskAttention(nn.Module):
     """HF-style eager attention: softmax(qk^T * s + additive_mask) @ v."""
 
+    mask: torch.Tensor
+
     def __init__(
         self, dim: int = 128, n_heads: int = 4, block_size: int = 64
     ) -> None:
+        """Initialise the fused QKV projection and additive mask."""
         super().__init__()
         self.h = n_heads
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
@@ -523,6 +559,7 @@ class AdditiveMaskAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run HF-style additive-mask attention."""
         b, t, c = x.shape
         q, k, v = self.c_attn(x).split(c, dim=2)
         q = q.view(b, t, self.h, c // self.h).transpose(1, 2)
@@ -547,12 +584,14 @@ class LinearRecurrence(nn.Module):
     """
 
     def __init__(self, dim: int = 32, steps: int = 6) -> None:
+        """Initialise the state matrix, initial state, and step count."""
         super().__init__()
         self.A = nn.Parameter(torch.randn(dim, dim) * 0.1)
         self.h0 = nn.Parameter(torch.zeros(dim))
         self.steps = steps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fold the LTI recurrence over the input steps."""
         h = self.h0
         for t in range(self.steps):
             h = self.A @ h + x[t]

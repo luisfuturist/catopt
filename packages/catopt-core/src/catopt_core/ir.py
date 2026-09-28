@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from catopt_core.attrs import validate_attrs
 
@@ -44,14 +44,16 @@ class TensorType:
 
     @property
     def size(self) -> int | None:
+        """Return the element count, or None if a dim is unknown."""
         if any(d is None for d in self.shape):
             return None
-        result: int | None = 1
+        result = 1
         for d in self.shape:
-            result = result * d
+            result = result * cast("int", d)
         return result
 
     def __repr__(self) -> str:
+        """Return a debug rendering of the tensor type."""
         inner = ", ".join(
             "?" if d is None else str(d) for d in self.shape
         )
@@ -71,6 +73,7 @@ class Var:
     typ: TensorType
 
     def __repr__(self) -> str:
+        """Return the variable's name."""
         return self.name
 
 
@@ -83,6 +86,7 @@ class Const:
     value: int | float
 
     def __repr__(self) -> str:
+        """Return the constant's value as text."""
         return str(self.value)
 
 
@@ -94,6 +98,7 @@ class Param:
     typ: TensorType
 
     def __repr__(self) -> str:
+        """Return the parameter's name."""
         return self.name
 
 
@@ -134,6 +139,7 @@ class Op:
     _INTERN: ClassVar[Any] = None  # weakref table, created at import
 
     def __post_init__(self) -> None:
+        """Cache the content hash of the term."""
         object.__setattr__(
             self,
             "_h",
@@ -172,9 +178,11 @@ class Op:
         return t
 
     def __hash__(self) -> int:
+        """Return the cached content hash."""
         return self._h
 
     def __repr__(self) -> str:
+        """Return an S-expression rendering of the term."""
         parts = [op_repr(a) for a in self.args]
         if self.attrs:
             attr_str = ", ".join(
@@ -429,4 +437,5 @@ class IR:
     params: dict[str, Param] = field(default_factory=dict)
 
     def __repr__(self) -> str:
+        """Return an S-expression rendering of the root term."""
         return op_repr(self.root)

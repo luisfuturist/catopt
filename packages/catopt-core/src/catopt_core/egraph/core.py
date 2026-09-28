@@ -1,4 +1,5 @@
 """Core e-graph: union-find, matching, saturation."""
+
 from __future__ import annotations
 
 import logging
@@ -54,6 +55,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         track_proofs: bool | None = None,
         truncation_level: int = 2,
     ) -> None:
+        """Initialise the union-find, class maps, and saturation state."""
         if truncation_level not in (1, 2, 3):
             raise ValueError(
                 f"truncation_level must be 1, 2, or 3, "
@@ -117,16 +119,20 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     @property
     def n_classes(self) -> int:
+        """Return the number of e-classes."""
         return len(self._classes)
 
     @property
     def n_enodes(self) -> int:
+        """Return the number of enodes."""
         return len(self._node_to_class)
 
     def find(self, eid: int) -> int:
+        """Return the canonical e-class id of ``eid``."""
         return self._uf.find(eid)
 
     def get_class(self, eid: int) -> EClass:
+        """Return the e-class containing ``eid``."""
         return self._classes[self.find(eid)]
 
     def add_leaf(self, key: str, provenance: str | None = None) -> int:
@@ -151,7 +157,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
         """
         attr_t = tuple(
             sorted(
-                (k, _norm_attr_value(v)) for k, v in (attrs or {}).items()
+                (k, _norm_attr_value(v))
+                for k, v in (attrs or {}).items()
             )
         )
         enode = ENode(op, tuple(self.find(c) for c in children), attr_t)
@@ -342,6 +349,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     @property
     def n_proof_edges(self) -> int:
+        """Return the number of recorded proof edges."""
         return len(self._merge_log)
 
     @property
@@ -364,8 +372,10 @@ class EGraph(_ExtractMixin, _ProofMixin):
         error_bound: float | None = None,
         bound_norm: str = "spectral",
     ) -> Rewrite | None:
-        """Synthesise the pointwise :class:`Rewrite` certifying one
-        non-locally offered member — see :meth:`_offer_witness`.
+        """Synthesise the pointwise :class:`Rewrite` for an offered member.
+
+        Certifies one non-locally offered member — see
+        :meth:`_offer_witness`.
 
         ``lhs`` defaults to the *oldest* member of ``cid``'s class —
         the term the e-graph saw first — chosen so the certificate's
@@ -428,8 +438,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         bound_norm: str = "spectral",
         term_provenance: str = "input",
     ) -> bool:
-        """Offer a non-locally-computed member under a pointwise
-        witness — the canonical ritual behind every non-local pass.
+        """Offer a non-locally-computed member under a pointwise witness.
+
+        The canonical ritual behind every non-local pass.
 
         A non-local pass offers a member no LHS pattern could produce
         (it is computed from the whole e-graph, not from a matched
@@ -450,7 +461,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         union.  Returns :meth:`union`'s result.
         """
         if rhs_eid is None:
-            rhs_eid = self.add_term(rhs_term, provenance=term_provenance)
+            rhs_eid = self.add_term(
+                rhs_term, provenance=term_provenance
+            )
         wit = (
             self._pointwise_witness(
                 cid,
@@ -472,7 +485,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     def matches(
         self, pattern: Any, eid: int, max_results: int | None = None
-    ) -> list[dict[str, int]]:
+    ) -> list[dict[str, Any]]:
         """Find all substitutions that match *pattern* at e-class *eid*.
 
         ``max_results`` bounds the enumeration: matching stops once
@@ -480,7 +493,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         first-found wins) and used by the saturation loop to enforce
         per-rule expansion budgets inside giant e-classes.
         """
-        results: list[dict[str, int]] = []
+        results: list[dict[str, Any]] = []
         self._match(pattern, eid, {}, results, max_results)
         return results
 
@@ -488,8 +501,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
         self,
         pattern: Any,
         eid: int,
-        subst: dict[str, int],
-        results: list[dict[str, int]],
+        subst: dict[str, Any],
+        results: list[dict[str, Any]],
         limit: int | None = None,
     ) -> None:
         if limit is not None and len(results) >= limit:
@@ -556,7 +569,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 child_substs: list[dict[str, Any]] = attr_substs
                 ok = True
                 for i, pat_arg in enumerate(pattern.args):
-                    new_substs: list[dict[str, int]] = []
+                    new_substs: list[dict[str, Any]] = []
                     for cs in child_substs:
                         if (
                             limit is not None
@@ -564,7 +577,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
                         ):
                             ok = False
                             break
-                        child_results: list[dict[str, int]] = []
+                        child_results: list[dict[str, Any]] = []
                         self._match(
                             pat_arg,
                             node.children[i],
@@ -624,13 +637,17 @@ class EGraph(_ExtractMixin, _ProofMixin):
         the classes the dirty frontier just searched (plus the ones
         dirtied while searching).  An unrestricted pass is still
         available — and used once at the end of :meth:`run` — for
-        callers that mutate the graph outside the saturation loop.
+        callers that mutate the graph outside the saturation loop; it
+        also closes congruence (see :meth:`_close_congruence`).
         """
+        if classes is not None:
+            return self._canonicalise(classes)
+        changed = self._canonicalise(list(self._classes.keys()))
+        return self._close_congruence() or changed
+
+    def _canonicalise(self, ids: Any) -> bool:
+        """Re-canonicalize each class's enode children (one pass)."""
         changed = False
-        if classes is None:
-            ids: Any = list(self._classes.keys())
-        else:
-            ids = classes
         seen: set[int] = set()
         for eid0 in ids:
             eid = self.find(eid0)
@@ -640,47 +657,80 @@ class EGraph(_ExtractMixin, _ProofMixin):
             eclass = self._classes[eid]
             new_nodes: set[ENode] = set()
             for node in eclass.nodes:
-                if node.children:
-                    canon = tuple(self.find(c) for c in node.children)
-                    if canon != node.children:
-                        changed = True
-                        # ``nn`` replaces ``node``: register the upward
-                        # edge for each canonical child so later changes
-                        # below propagate dirty to this class.  (``eid``
-                        # is already dirty — it is an ancestor of the
-                        # merge that forced the canonicalisation.)
-                        for c in canon:
-                            self._parents.setdefault(
-                                self.find(c), set()
-                            ).add(eid)
-                    nn = ENode(node.op, canon, node.attrs)
-                    new_nodes.add(nn)
-                    if self._track and nn != node:
-                        # The canonicalized enode inherits the original's
-                        # provenance — same term, fresh child ids.
-                        if node in self._enode_origin:
-                            self._enode_origin.setdefault(
-                                nn, self._enode_origin[node]
-                            )
-                        if node in self._enode_birth:
-                            self._enode_birth.setdefault(
-                                nn, self._enode_birth[node]
-                            )
-                        if node in self._enode_app:
-                            self._enode_app.setdefault(
-                                nn, self._enode_app[node]
-                            )
-                        self._node_to_class.setdefault(nn, eid)
-                else:
-                    new_nodes.add(node)
+                nn, node_changed = self._canonical_node(node, eid)
+                changed = changed or node_changed
+                new_nodes.add(nn)
             if new_nodes != eclass.nodes:
                 eclass.nodes = new_nodes
                 eclass.by_op = None
         return changed
 
+    def _canonical_node(
+        self, node: ENode, eid: int
+    ) -> tuple[ENode, bool]:
+        """Canonicalize one enode's children; return (enode, changed).
+
+        When children change, register the upward edge for each
+        canonical child so later changes propagate dirty to ``eid``
+        (already dirty — it is an ancestor of the merge that forced the
+        canonicalisation), and carry the original's provenance onto the
+        fresh enode (same term, new child ids).
+        """
+        if not node.children:
+            return node, False
+        canon = tuple(self.find(c) for c in node.children)
+        if canon == node.children:
+            return node, False
+        for c in canon:
+            self._parents.setdefault(self.find(c), set()).add(eid)
+        nn = ENode(node.op, canon, node.attrs)
+        if self._track:
+            self._inherit_provenance(node, nn, eid)
+        return nn, True
+
+    def _inherit_provenance(
+        self, node: ENode, nn: ENode, eid: int
+    ) -> None:
+        """Copy ``node``'s tracking metadata onto its canonical ``nn``."""
+        if node in self._enode_origin:
+            self._enode_origin.setdefault(nn, self._enode_origin[node])
+        if node in self._enode_birth:
+            self._enode_birth.setdefault(nn, self._enode_birth[node])
+        if node in self._enode_app:
+            self._enode_app.setdefault(nn, self._enode_app[node])
+        self._node_to_class.setdefault(nn, eid)
+
+    def _close_congruence(self) -> bool:
+        """Union e-classes whose canonical enodes coincide.
+
+        Congruence: two enodes that are identical after child
+        canonicalisation must share a class.  ``union`` merges them and
+        can make further children canonical, so iterate to a fixed
+        point.  All duplicates found in a scan are merged in one round
+        (rather than one per round) — the merge cascade depth is small,
+        so this is O(rounds · enodes), not O(duplicates · enodes).  Only
+        the unrestricted :meth:`rebuild` calls this; the incremental
+        (dirty-frontier) pass relies on the final unrestricted rebuild.
+        """
+        changed = False
+        while True:
+            owner: dict[ENode, int] = {}
+            merges: list[tuple[int, int]] = []
+            for eid in list(self._classes.keys()):
+                for node in self._classes[eid].nodes:
+                    prev = owner.setdefault(node, eid)
+                    if prev != eid:
+                        merges.append((prev, eid))
+            if not merges:
+                return changed
+            changed = True
+            for a, b in merges:
+                self.union(a, b)
+            self._canonicalise(list(self._classes.keys()))
+
     # -- rule application --
 
-    def _instantiate(self, pattern: Any, subst: dict[str, int]) -> int:
+    def _instantiate(self, pattern: Any, subst: dict[str, Any]) -> int:
         """Instantiate a pattern (RHS) with a substitution.
 
         When proof tracking is on, ``self._inst_last_enode`` records the
@@ -710,7 +760,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 tuple(self.find(c) for c in child_eids),
                 tuple(
                     sorted(
-                        (k, _norm_attr_value(v)) for k, v in attrs.items()
+                        (k, _norm_attr_value(v))
+                        for k, v in attrs.items()
                     )
                 ),
             )
@@ -782,8 +833,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
     def _min_term(
         self, eid: int, memo: dict, _seen: frozenset = frozenset()
     ) -> tuple[Any, float]:
-        """Smallest (fewest ops) acyclic member of an e-class, as
-        ``(term, size)``.
+        """Return the smallest acyclic member of an e-class.
+
+        Returns ``(term, size)`` — fewest ops wins.
 
         Used to feed rewrite side conditions: every member of the class
         is an equally valid binding, but a compact representative makes
@@ -829,8 +881,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         return best
 
     def _any_term_cached(self, eid: int) -> Any:
-        """Member resolution for rewrite side conditions, memoised for
-        the duration of one ``apply_rule``.
+        """Resolve a member for rewrite side conditions.
+
+        Memoised for the duration of one ``apply_rule``.
 
         Resolves to the class's *minimum-size* member rather than an
         arbitrary one: ``check``/``derive`` contracts only require *a*
@@ -1024,7 +1077,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         max_iterations: int = 100,
         max_nodes: int = 100_000,
         rule_budgets: dict[str, int] | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """Run equality saturation until a fixed point.
 
         Incremental: each iteration re-searches only the *dirty
@@ -1120,6 +1173,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         # unrestricted loop guaranteed (downstream passes and
         # extraction traverse it directly).
         self.rebuild()
+        # The payload mixes counts with the ``rule_budgets`` map and the
+        # ``budget_suspended`` list, so the return type is ``dict[str,
+        # Any]``.
         return {
             "iterations": iteration + 1,
             "n_enodes": self.n_enodes,
@@ -1133,4 +1189,3 @@ class EGraph(_ExtractMixin, _ProofMixin):
         }
 
     # -- extraction --
-

@@ -1,6 +1,8 @@
 # ruff: noqa: RUF002
-"""Jamba-style hybrid blocks — a diagonal SSM and chunked attention in
-one module, so the e-graph sees BOTH monoid carriers simultaneously.
+"""Jamba-style hybrid blocks.
+
+A diagonal SSM and chunked attention in one module, so the e-graph sees
+BOTH monoid carriers simultaneously.
 
 Two carriers live side by side here:
 
@@ -62,6 +64,7 @@ class HybridBlock(nn.Module):
         d_attn:   attention inner dimension.
         steps:    sequence length T — the loop is unrolled at export.
         n_chunks: number of key/value blocks the concat is built from.
+
     """
 
     def __init__(
@@ -72,6 +75,7 @@ class HybridBlock(nn.Module):
         steps: int = 16,
         n_chunks: int = 2,
     ) -> None:
+        """Initialise the SSM, attention, and output projections."""
         super().__init__()
         self.decay_proj = nn.Linear(d_in, d_inner, bias=False)
         self.B_proj = nn.Linear(d_in, d_inner, bias=False)
@@ -85,6 +89,7 @@ class HybridBlock(nn.Module):
         self.scale = d_attn**-0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the SSM → chunked-attention block."""
         # x: (T, d_in)
         a = torch.sigmoid(self.decay_proj(x))  # (T, d_inner) in (0,1)
         b = self.B_proj(x)  # (T, d_inner)
@@ -106,7 +111,7 @@ class HybridBlock(nn.Module):
 
 
 class TwoLayerHybrid(nn.Module):
-    """SSM → attention → SSM: does the search compose across layers?
+    """SSM → attention → SSM: test whether the search composes across layers.
 
     Same carriers as :class:`HybridBlock`, stacked so that the second
     recurrence's inputs ``y2[t]`` are themselves reads of the attention
@@ -123,6 +128,7 @@ class TwoLayerHybrid(nn.Module):
         steps: int = 8,
         n_chunks: int = 2,
     ) -> None:
+        """Initialise both SSMs and the chunked attention layer."""
         super().__init__()
         # Layer 1: diagonal SSM
         self.decay_proj1 = nn.Linear(d_in, d_inner, bias=False)
@@ -158,6 +164,7 @@ class TwoLayerHybrid(nn.Module):
         return torch.stack(ys, dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the SSM → attention → SSM stack."""
         # x: (T, d_in)
         y1 = self._ssm(x, self.decay_proj1, self.B_proj1, self.h0_1)
 

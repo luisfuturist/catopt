@@ -60,3 +60,9 @@ bench/results/
 
 # Pitch decks (standalone repos)
 pitch/
+
+# mutmut working copy
+mutants/
+
+# mutmut flat-layout sandbox
+.mutmut-sandbox/

@@ -11,15 +11,15 @@ repos:
         entry: .venv/bin/ruff format
         language: system
         types: [python]
-      - id: pyright
-        name: pyright
-        # Per-file invocation: files passed explicitly still honor the
-        # `exclude` list in pyproject.toml, so excluded modules stay green
-        # while every checked module is verified. Config: [tool.pyright].
-        entry: .venv/bin/pyright
+      - id: ty
+        name: ty
+        # Whole-project typecheck: [tool.ty.src] include/exclude in
+        # pyproject.toml scope it to packages/ + catopt/ and pin the
+        # ratchet baseline.  ty is fast (Rust), so this is whole-tree.
+        entry: .venv/bin/ty check
         language: system
-        types: [python]
-        files: ^(catopt|packages)/.*\.py$
+        pass_filenames: false
+        always_run: true
       - id: import-linter
         name: import-linter
         # Whole-project (not per-file): the [tool.importlinter] contracts
@@ -37,3 +37,57 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: bandit
+        name: bandit
+        # Security SAST; excludes + justified skips in .bandit.yaml.
+        entry: .venv/bin/bandit -c .bandit.yaml -r packages catopt
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: semgrep
+        name: semgrep
+        # Offline, deterministic ruleset from .semgrep.yml.  For the
+        # deeper registry scan run (network) see AGENTS.md:
+        #   .venv/bin/semgrep --config p/python --config p/security-audit
+        entry: .venv/bin/semgrep --config .semgrep.yml packages catopt
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: radon-ratchet
+        name: radon complexity ratchet
+        # No function may exceed its baseline in
+        # tools/complexity_baseline.json; new functions must stay <= C.
+        entry: .venv/bin/python tools/radon_ratchet.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: runtime-types
+        name: typeguard runtime contracts
+        # Runtime enforcement of annotations over the torch-free core;
+        # the instrumented file list lives in tools/runtime_types.sh.
+        # Slow (~6 min), so it is a manual-stage gate (CI runs it).
+        entry: sh tools/runtime_types.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+      - id: pip-audit
+        name: pip-audit
+        # Dependency-vulnerability audit of the installed environment.
+        # Needs network access, so it is a manual-stage gate.
+        entry: .venv/bin/pip-audit
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+      - id: semgrep-registry
+        name: semgrep (registry rulesets)
+        # Deeper dataflow/security scan; downloads the p/python +
+        # p/security-audit rulesets, so it is a manual-stage gate.
+        entry: >-
+          .venv/bin/semgrep --config .semgrep.yml --config p/python
+          --config p/security-audit packages catopt
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]

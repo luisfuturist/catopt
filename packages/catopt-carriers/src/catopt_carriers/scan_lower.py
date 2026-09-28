@@ -39,7 +39,7 @@ kernels; ``fused="eager"`` runs the same schedule without compile.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from catopt_core.ir import IR, Op, Param, Var
@@ -128,8 +128,9 @@ def _strip_output_views(root: Any) -> tuple[Any, list]:
 
 
 def _fold_nested_apply(term: Any) -> Any:
-    """``apply(f, apply(g, h))`` → ``apply(aff_compose(f, g), h)``
-    (and the ``applyd``/``affd_compose`` diagonal pair).
+    """``apply(f, apply(g, h))`` → ``apply(aff_compose(f, g), h)``.
+
+    Also the ``applyd``/``affd_compose`` diagonal pair.
 
     Extracted terms are often hybrids — a compose spine with nested
     ``apply`` segments.  Folding them bottom-up turns the whole map
@@ -160,13 +161,18 @@ def _fold_nested_apply(term: Any) -> Any:
     return go(term)
 
 
-def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
-    """True if ``term`` is a pure map tree in ONE carrier domain.
+def _is_aff_tree(term: Any, memo: dict | None = None) -> str | None:
+    """Return True if ``term`` is a pure map tree in ONE carrier domain.
 
     Dense: leaves ``aff(A, b)``, internal ``aff_compose``.  Diagonal:
     leaves ``aff_diag(a, b)``, internal ``affd_compose``.  Mixed or
     foreign nodes disqualify the subtree.  Memoised on id() because
     extracted terms are DAGs with shared subtrees.
+
+    Returns the shared carrier DOMAIN (``"aff"``/``"aff_diag"``) when
+    the tree is pure, ``None`` otherwise — the domain string doubles as
+    the truthy verdict, so the annotation is ``str | None``, not
+    ``bool``.
     """
     memo = {} if memo is None else memo
     key = id(term)
@@ -192,10 +198,12 @@ def _is_aff_tree(term: Any, memo: dict | None = None) -> bool:
 
 
 def is_scan_apply_term(root: Any) -> bool:
-    """True if ``root`` is ``apply[d](<map tree>, h)`` — dense or
-    diagonal affine scan application (nested ``apply`` segments are
-    first folded into the compose spine), possibly under trailing
-    view wrappers (``reshape(applyd(…), (B, d))``)."""
+    """Return True for an ``apply[d](<map tree>, h)`` root.
+
+    Dense or diagonal affine scan application (nested ``apply`` segments
+    are first folded into the compose spine), possibly under trailing
+    view wrappers (``reshape(applyd(…), (B, d))``).
+    """
     root = _fold_nested_apply(root)
     root, _post = _strip_output_views(root)
     return (
@@ -280,7 +288,7 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
     return True
 
 
-def _select_index(term: Op) -> tuple[Any, int, int] | None:
+def _select_index(term: Any) -> tuple[Any, int, int] | None:
     """Decompose ``select(base, dim, i)``/getitem-style leaf operands.
 
     Returns ``(base_term, dim, index)`` or ``None``.  Covers the
@@ -321,6 +329,7 @@ def _leaf_b_gather(leaves: list[Op]):
     parts = [_select_index(leaf.args[1]) for leaf in leaves]
     if any(p is None for p in parts):
         return None
+    parts = cast("list[tuple]", parts)
     base0, dim0 = parts[0][0], parts[0][1]
     if any(p[0] is not base0 or p[1] != dim0 for p in parts):
         return None
@@ -441,6 +450,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
     semantic member — see :class:`catopt_core.ports.PlannedExecutor` for why
     it is not the runtime-checked one).  ``n_levels`` /
     ``is_graph_captured`` stay class-level API, not port members.
+
     """
 
     def __init__(
@@ -450,6 +460,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
         *,
         fused: bool | str = False,
     ) -> None:
+        """Initialise the module, plan, and graph state."""
         super().__init__()
         self._inputs = ir.inputs
         self.eval_mod = IRModule(ir, param_values)
@@ -526,7 +537,8 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
 
     # -- execution ----------------------------------------------------
 
-    def forward(self, *xs: torch.Tensor) -> torch.Tensor:
+    def forward(self, *xs: torch.Tensor) -> Any:
+        """Run the batched (or serial-fallback) forward pass."""
         g = self._graph
         if (
             g is not None
@@ -541,7 +553,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             for buf, t in zip(self._graph_inputs, xs, strict=True):
                 buf.copy_(t, non_blocking=True)
             g.replay()
-            return self._graph_out
+            return cast(torch.Tensor, self._graph_out)
         return self._forward_impl(*xs)
 
     def _gather_idx(self, slots: list[int], like: torch.Tensor):
@@ -554,7 +566,7 @@ class BatchedScanModule(BatchedExecutorBase, torch.nn.Module):
             dtype=torch.long,
         )
 
-    def _forward_impl(self, *xs: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, *xs: torch.Tensor) -> Any:
         if self._plan is None:
             return self.eval_mod(*xs)
 
@@ -810,7 +822,7 @@ def _slot_expand(
 
 
 def _make_bottom_row(like: torch.Tensor) -> torch.Tensor:
-    """The constant ``[0, …, 0, 1]`` row of a homogeneous affine matrix."""
+    """Return the ``[0, …, 0, 1]`` row of a homogeneous affine matrix."""
     d1 = like.shape[-1] + 1 if like.dim() >= 2 else like.shape[-1]
     row = like.new_zeros(1, 1, d1)
     row[..., -1] = 1.0

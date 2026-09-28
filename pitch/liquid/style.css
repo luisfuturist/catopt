@@ -1,594 +1,267 @@
 /* ------------------------------------------------------------------
-   CatOpt × Liquid AI — custom dark theme
+   Deck-specific composition. Everything here builds on the LFDS theme
+   (slidev-theme-lfds); it only adds shapes the theme doesn't ship.
    ------------------------------------------------------------------ */
 
-:root {
-  --c-bg: #05070d;
-  --c-bg-2: #0a1020;
-  --c-fg: #e8eef8;
-  --c-muted: #93a1b8;
-  --c-faint: #5b6a83;
-  --c-line: #1a2437;
-  --c-cyan: #22d3ee;
-  --c-sky: #38bdf8;
-  --c-violet: #a78bfa;
-  --c-pink: #f472b6;
-  --c-green: #4ade80;
-  --grad: linear-gradient(90deg, #22d3ee 0%, #38bdf8 40%, #a78bfa 100%);
-  --grad-2: linear-gradient(120deg, #38bdf8 0%, #a78bfa 55%, #f472b6 100%);
-
-  --slidev-theme-primary: #38bdf8;
-}
-
-/* base ------------------------------------------------------------ */
-html.dark,
-.dark .slidev-layout,
-.slidev-layout {
-  background: var(--c-bg);
-  color: var(--c-fg);
-}
-
-.slidev-layout {
+/* ----- the observation: reachable-set field ----------------------- */
+.slidev-layout .reach {
   position: relative;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
-  font-size: 1.02rem;
-  line-height: 1.5;
-  padding: 2rem 3.2rem;
+  min-height: 150px;
+  padding: 1.1rem 1.3rem;
+  border: 1px dashed var(--muted);
+  margin: 1.2rem 0 1.4rem;
   overflow: hidden;
 }
 
-/* ambient background: grid + glow */
-.slidev-layout::before {
+.slidev-layout .reach-space {
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(var(--edge-soft) 1.2px, transparent 1.2px);
+  background-size: 18px 18px;
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.slidev-layout .reach > .footnote {
+  position: relative;
+}
+
+.slidev-layout .reach-inner {
+  position: absolute;
+  left: 1.6rem;
+  bottom: 1.4rem;
+  width: 44%;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--foreground);
+  background: var(--background-secondary);
+}
+
+.slidev-layout .reach-inner::before {
   content: '';
   position: absolute;
   inset: 0;
-  background-image:
-    linear-gradient(rgba(56, 189, 248, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(56, 189, 248, 0.055) 1px, transparent 1px);
-  background-size: 46px 46px;
-  -webkit-mask-image: radial-gradient(120% 90% at 50% 0%, #000 30%, transparent 78%);
-  mask-image: radial-gradient(120% 90% at 50% 0%, #000 30%, transparent 78%);
+  background-image: radial-gradient(var(--foreground) 1px, transparent 1px);
+  background-size: 30px 30px;
+  background-position: 0.55rem 0.55rem;
+  opacity: 0.16;
   pointer-events: none;
-  z-index: 0;
 }
 
-.slidev-layout::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background:
-    radial-gradient(60% 45% at 82% -8%, rgba(167, 139, 250, 0.16), transparent 70%),
-    radial-gradient(55% 45% at 12% 108%, rgba(34, 211, 238, 0.14), transparent 70%);
-  pointer-events: none;
-  z-index: 0;
-}
-
-.slidev-layout > * {
+.slidev-layout .reach-inner > * {
   position: relative;
-  z-index: 1;
 }
 
-/* typography ------------------------------------------------------ */
-.slidev-layout h1 {
-  font-weight: 800;
-  letter-spacing: -0.025em;
-  line-height: 1.08;
-  font-size: 2.35rem;
-  margin-bottom: 0.5em;
-  background: var(--grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.slidev-layout h2,
-.slidev-layout h3 {
-  font-weight: 700;
-  letter-spacing: -0.015em;
-}
-
-.slidev-layout h3 {
-  color: #cdd9ec;
-  font-size: 1.15rem;
-  text-transform: none;
-  opacity: 0.95;
-  border: 0;
-  padding: 0;
-}
-
-.slidev-layout h4 {
-  font-weight: 700;
-  font-size: 1.02rem;
-  margin: 0 0 0.15rem;
-}
-
-.slidev-layout a {
-  color: var(--c-sky);
-  text-decoration: none;
-  border-bottom: 1px solid rgba(56, 189, 248, 0.4);
-}
-
-.slidev-layout strong {
-  color: #fff;
-  font-weight: 700;
-}
-
-.slidev-layout em {
-  color: #cbd5e1;
-}
-
-.slidev-layout code {
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
-  font-size: 0.86em;
-  background: rgba(56, 189, 248, 0.1);
-  color: #a5e8ff;
-  border: 1px solid rgba(56, 189, 248, 0.18);
-  border-radius: 6px;
-  padding: 0.08em 0.36em;
-}
-
-.slidev-layout .slidev-code,
-.slidev-layout pre {
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
-}
-
-/* code blocks get a subtle frame */
-.slidev-layout pre.slidev-code,
-.slidev-layout .slidev-code-wrapper pre {
-  background: #080d17 !important;
-  border: 1px solid var(--c-line);
-  border-radius: 12px;
-  box-shadow: 0 10px 30px -18px rgba(0, 0, 0, 0.9);
-}
-
-.slidev-layout :not(pre) > code {
-  white-space: nowrap;
-}
-
-/* lists ----------------------------------------------------------- */
-.slidev-layout ul {
-  list-style: none;
-  padding-left: 0;
-  margin: 0.35rem 0;
-}
-
-.slidev-layout ul li {
-  position: relative;
-  padding-left: 1.4rem;
-  margin: 0.34rem 0;
-}
-
-.slidev-layout ul li::before {
-  content: '';
-  position: absolute;
-  left: 0.1rem;
-  top: 0.62em;
-  width: 7px;
-  height: 7px;
-  border-radius: 2px;
-  background: var(--grad);
-  transform: rotate(45deg);
-}
-
-.slidev-layout ol {
-  padding-left: 1.2rem;
-}
-
-.slidev-layout ol li {
-  margin: 0.34rem 0;
-}
-
-/* blockquote / callout ------------------------------------------- */
-.slidev-layout blockquote {
-  border-left: 3px solid transparent;
-  border-image: var(--grad) 1;
-  background: rgba(56, 189, 248, 0.06);
-  border-radius: 0 12px 12px 0;
-  padding: 0.7rem 1.1rem;
-  margin: 0.6rem 0;
-  color: #d7e3f4;
-  font-style: normal;
-}
-
-/* table ----------------------------------------------------------- */
-.slidev-layout table {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: 0.95rem;
-  overflow: hidden;
-  border: 1px solid var(--c-line);
-  border-radius: 14px;
-}
-
-.slidev-layout th,
-.slidev-layout td {
-  padding: 0.6rem 0.9rem;
-  border: 0;
-  border-bottom: 1px solid var(--c-line);
-  text-align: left;
-}
-
-.slidev-layout thead th {
-  background: rgba(56, 189, 248, 0.09);
-  font-weight: 700;
-  color: #eaf3ff;
-  font-size: 0.98rem;
-}
-
-.slidev-layout tbody tr:last-child td {
-  border-bottom: 0;
-}
-
-.slidev-layout tbody tr:nth-child(even) {
-  background: rgba(255, 255, 255, 0.018);
-}
-
-/* cover ----------------------------------------------------------- */
-.cover-hero .slidev-layout {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.hero {
-  text-align: center;
-  max-width: 60rem;
-  margin: 0 auto;
-}
-
-.kicker {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.82rem;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: #9fe9ff;
-  border: 1px solid rgba(56, 189, 248, 0.35);
-  background: rgba(56, 189, 248, 0.07);
-  border-radius: 999px;
-  padding: 0.32rem 0.9rem;
-  margin-bottom: 1.6rem;
-}
-
-.kicker .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--c-cyan);
-  box-shadow: 0 0 12px 2px rgba(34, 211, 238, 0.8);
-}
-
-.hero h1 {
-  font-size: 3.6rem;
-  line-height: 1.05;
-  margin: 0 0 1rem;
-  background: var(--grad-2);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.hero-sub {
-  font-size: 1.25rem;
-  color: #b9c6da;
-  font-weight: 400;
-  margin-bottom: 2.4rem;
-}
-
-.hero-meta {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.85rem;
-  color: var(--c-faint);
-  letter-spacing: 0.04em;
-}
-
-.hero-meta .muted {
-  color: var(--c-sky);
-}
-
-/* generic layout helpers ----------------------------------------- */
-.cols {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1.4rem;
-  margin-top: 0.6rem;
-}
-
-.panel {
-  background: rgba(255, 255, 255, 0.025);
-  border: 1px solid var(--c-line);
-  border-radius: 16px;
-  padding: 1rem 1.2rem;
-}
-
-.panel.accent {
-  border-color: rgba(167, 139, 250, 0.35);
-  background: rgba(167, 139, 250, 0.06);
-}
-
-.question {
-  margin-top: 1.5rem;
-  text-align: center;
-  font-size: 1.35rem;
-  font-weight: 600;
-  color: #eaf3ff;
-}
-
-.question span,
-.question .q {
-  background: var(--grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.tag {
-  display: inline-block;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.68rem;
-  letter-spacing: 0.06em;
-  color: #a5e8ff;
-  border: 1px solid rgba(56, 189, 248, 0.3);
-  background: rgba(56, 189, 248, 0.08);
-  border-radius: 6px;
-  padding: 0.05rem 0.4rem;
-  vertical-align: middle;
-}
-
-/* step cards (what catopt does) ---------------------------------- */
-.steps {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1rem;
-  margin-top: 0.4rem;
-}
-
-.step {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.008));
-  border: 1px solid var(--c-line);
-  border-radius: 16px;
-  padding: 1rem 1.05rem;
-  display: flex;
-  gap: 0.85rem;
-  align-items: flex-start;
-}
-
-.step .n {
-  flex: none;
-  width: 2rem;
-  height: 2rem;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  font-family: 'JetBrains Mono', monospace;
-  font-weight: 700;
-  color: #041018;
-  background: var(--grad);
-}
-
-.step h4 {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  color: #fff;
-}
-
-.step p,
-.step .desc {
-  font-size: 0.9rem;
-  color: var(--c-muted);
-  margin: 0.15rem 0 0;
-}
-
-.step .icon {
-  color: var(--c-sky);
-}
-
-/* chips ----------------------------------------------------------- */
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-top: 1rem;
-}
-
-.chips > * {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.82rem;
-  color: #d9e7f7;
-  border: 1px solid var(--c-line);
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 999px;
-  padding: 0.32rem 0.8rem;
-}
-
-.chips > * .icon {
-  color: var(--c-cyan);
-}
-
-/* callout --------------------------------------------------------- */
-.callout {
-  margin-top: 1.2rem;
-  border: 1px solid rgba(74, 222, 128, 0.28);
-  background: rgba(74, 222, 128, 0.06);
-  border-radius: 16px;
-  padding: 0.9rem 1.2rem;
-}
-
-.callout h4 {
-  color: var(--c-green);
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  font-size: 0.75rem;
-  margin-bottom: 0.3rem;
-}
-
-.callout blockquote {
-  margin: 0;
-  border: 0;
-  background: transparent;
-  padding: 0;
-  font-size: 1.08rem;
-  color: #eafff2;
-}
-
-/* experiment timeline -------------------------------------------- */
-.exp {
-  display: grid;
-  gap: 0.7rem;
-  margin-top: 0.8rem;
-}
-
-.exp .row {
-  display: grid;
-  grid-template-columns: 3.2rem 1fr;
-  gap: 1rem;
-  align-items: center;
-  background: rgba(255, 255, 255, 0.025);
-  border: 1px solid var(--c-line);
-  border-left: 3px solid rgba(56, 189, 248, 0.6);
-  border-radius: 12px;
-  padding: 0.7rem 1rem;
-}
-
-.exp .num {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 1.4rem;
-  font-weight: 700;
-  background: var(--grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.exp .label {
-  font-weight: 700;
-  color: #fff;
-}
-
-.exp .desc {
-  color: var(--c-muted);
-  font-size: 0.92rem;
-}
-
-/* thesis ---------------------------------------------------------- */
-.thesis {
-  font-size: 2.5rem;
-  line-height: 1.35;
-  font-weight: 800;
-  letter-spacing: -0.02em;
-}
-
-.thesis .a {
-  background: linear-gradient(90deg, #7dd3fc, #38bdf8);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.thesis .b {
-  background: var(--grad-2);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.thesis-foot {
-  margin-top: 2rem;
-  color: var(--c-muted);
-  font-size: 1.15rem;
-  font-weight: 400;
-}
-
-/* closing --------------------------------------------------------- */
-.ask {
-  text-align: center;
-  max-width: 46rem;
-  margin: 0 auto;
-}
-
-.ask .big {
-  font-size: 2.6rem;
-  font-weight: 800;
-  line-height: 1.2;
-  background: var(--grad-2);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.ask .sub {
-  margin-top: 1rem;
-  font-size: 1.15rem;
-  color: #b9c6da;
-}
-
-.ask .contact {
-  margin-top: 2.2rem;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.85rem;
-  color: var(--c-faint);
-}
-
-/* section / center layout tweaks --------------------------------- */
-.slidev-layout.section,
-.slidev-layout.center {
+/* ----- the core idea: equivalence class --------------------------- */
+.slidev-layout .equiv {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  margin-top: 0.5rem;
 }
 
-/* badges on backup slides ---------------------------------------- */
-.badge-backup {
+.slidev-layout .equiv-label {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.slidev-layout .equiv-stem {
+  width: 1px;
+  height: 1.3rem;
+  background: var(--muted);
+}
+
+.slidev-layout .equiv-row {
+  position: relative;
+  display: flex;
+  gap: 3.5rem;
+  padding-top: 1.1rem;
+}
+
+.slidev-layout .equiv-row::before {
+  content: '';
   position: absolute;
-  top: 1.1rem;
-  right: 1.3rem;
-  z-index: 2;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.66rem;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--muted);
+}
+
+.slidev-layout .equiv-node {
+  position: relative;
+  padding: 0.5rem 1.1rem;
+  border: 1px solid var(--foreground);
+  background: var(--background-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--foreground);
+}
+
+.slidev-layout .equiv-node::before {
+  content: '';
+  position: absolute;
+  top: -1.1rem;
+  left: 50%;
+  width: 1px;
+  height: 1.1rem;
+  background: var(--muted);
+}
+
+.slidev-layout .equiv-node.cheap {
+  background: var(--foreground);
+  color: var(--background);
+}
+
+/* ----- a transformation: before / after --------------------------- */
+.slidev-layout .xf {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.4rem;
+}
+
+.slidev-layout .xf-row {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr auto;
+  gap: 1.2rem;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--edge-soft);
+  background: var(--background-secondary);
+}
+
+.slidev-layout .xf-row.after {
+  border-color: var(--foreground);
+}
+
+.slidev-layout .xf-tag {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.slidev-layout .xf-expr {
+  font-family: var(--font-mono);
+  font-size: 1.15rem;
+  color: var(--foreground);
+}
+
+.slidev-layout .xf-note {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--muted);
+  text-align: right;
+}
+
+.slidev-layout .xf-mid {
+  align-self: center;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: var(--c-muted);
-  border: 1px dashed var(--c-line);
-  border-radius: 999px;
-  padding: 0.2rem 0.6rem;
+  color: var(--foreground);
 }
 
-/* table column tint for the two search spaces -------------------- */
-.spaces th.liquid {
-  color: #bfe9ff;
+/* ----- backup: e-graph -------------------------------------------- */
+.slidev-layout .egraph {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin: 1.1rem 0 0.6rem;
 }
 
-.spaces th.catopt {
-  color: #d9c9ff;
+.slidev-layout .eg-class {
+  position: relative;
+  flex: 1 1 0;
+  padding: 0.7rem 0.9rem 0.8rem;
+  border: 1px solid var(--foreground);
+  background: var(--background-secondary);
 }
 
-.spaces td:first-child {
-  color: #cfe9ff;
+.slidev-layout .eg-class.sub {
+  border-style: dashed;
+  border-color: var(--muted);
+  flex: 0 0 34%;
 }
 
-.spaces td:last-child {
-  color: #e4d9ff;
+.slidev-layout .eg-id {
+  display: block;
+  margin-bottom: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
-/* mermaid --------------------------------------------------------- */
-.mermaid {
-  background: transparent !important;
+.slidev-layout .eg-nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
 }
 
-/* katex sizing ---------------------------------------------------- */
-.katex-display {
-  margin: 0.6rem 0 !important;
+.slidev-layout .eg-node {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--foreground);
+  border: 1px solid var(--edge-soft);
+  padding: 0.16rem 0.5rem;
 }
 
-/* progress bar ---------------------------------------------------- */
-#slidev-progress {
-  background: var(--grad) !important;
+.slidev-layout .eg-node.same {
+  border-color: var(--foreground);
+}
+
+.slidev-layout .eg-link {
+  flex: none;
+  width: 1.6rem;
+  height: 1px;
+  background: var(--muted);
+  position: relative;
+}
+
+.slidev-layout .eg-link::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-top: 1px solid var(--muted);
+  border-right: 1px solid var(--muted);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+/* ----- backup: derivation ----------------------------------------- */
+.slidev-layout .derive {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.slidev-layout .derive-step {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--foreground);
+  border: 1px solid var(--edge-soft);
+  padding: 0.25rem 0.6rem;
+}
+
+.slidev-layout .derive-step.done {
+  border-color: var(--foreground);
+  background: var(--foreground);
+  color: var(--background);
+}
+
+.slidev-layout .derive-sep {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
 }

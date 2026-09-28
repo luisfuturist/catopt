@@ -1,0 +1,54 @@
+# Repo-local Semgrep rules for catopt.
+#
+# Used together with the registry ruleset:
+#   .venv/bin/semgrep --config .semgrep.yml --config p/python packages catopt
+#
+# These rules pin a few project-specific security invariants that the
+# generic registry rulesets do not cover.  They currently produce zero
+# findings on the tree; keep them here so regressions are caught.
+
+rules:
+  - id: catopt-no-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Builtin eval()/exec() on a computed value enables arbitrary code
+      execution.  catopt never needs dynamic code evaluation; use an
+      explicit dispatch table instead.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-95: Improper Neutralization of Directives in Dynamically
+          Evaluated Code ('Eval Injection')"
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: catopt-no-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      subprocess with shell=True allows shell-injection when any part of
+      the command is attacker-influenced.  Pass an argument list instead.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-78: Improper Neutralization of Special Elements used in an
+          OS Command ('OS Command Injection')"
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: catopt-no-unsafe-yaml-load
+    languages: [python]
+    severity: ERROR
+    message: >-
+      yaml.load() without an explicit SafeLoader can construct arbitrary
+      Python objects.  Use yaml.safe_load() or pass Loader=SafeLoader.
+    metadata:
+      category: security
+      cwe:
+        - "CWE-502: Deserialization of Untrusted Data"
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=..., ...)
+      - pattern-not: yaml.load(..., Loader=$L, ...)

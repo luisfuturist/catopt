@@ -624,8 +624,10 @@ TR_EXPAND = R(
 
 
 def _check_collapse(bound: dict) -> bool:
-    """The four block projections must come from one f with matching
-    usize: RS = (du, dy), CS = (du, dx), eye dim = du."""
+    """Require the four block projections from one f with matching usize.
+
+    RS = (du, dy), CS = (du, dx), eye dim = du.
+    """
     du = bound.get("$attr:DU")
     rs, cs = bound.get("$attr:RS"), bound.get("$attr:CS")
     if not (isinstance(du, int) and du > 0):
@@ -703,7 +705,7 @@ def _trace_torch(f: torch.Tensor, *a, **kw) -> torch.Tensor:
 def _parl_torch(
     f: torch.Tensor, g: torch.Tensor, *a, **kw
 ) -> torch.Tensor:
-    """f ⊗ g re-laid to keep BOTH feedback wires first.
+    """F ⊗ g re-laid to keep BOTH feedback wires first.
 
     Input  [u_f(u1); u_g(u2); x_f; x_g]
     Output [u'_f;      u'_g;      y_f; y_g]

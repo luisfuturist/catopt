@@ -44,6 +44,7 @@ class TorchSource:
     def to_ir(
         self, model: Any, example_inputs: Any
     ) -> tuple[IR, dict[str, Any]]:
+        """Export ``model`` to IR plus its leaf values."""
         return export_to_ir(model, example_inputs)
 
 
@@ -60,9 +61,11 @@ class TorchSink:
         absent from it both drops out of :attr:`supported_ops` (so
         extraction never selects a form using it) and fails loudly at
         eval.
+
     """
 
     def __init__(self, ops: OpTable | None = None) -> None:
+        """Initialise the sink's op table."""
         self._ops = ops if ops is not None else OpTable.full()
 
     @property
@@ -78,8 +81,10 @@ class TorchSink:
     def lower(
         self, ir: IR, params: dict[str, Any] | None = None
     ) -> Executor:
-        """Materialise ``ir`` as an :class:`IRModule` (the concrete
-        :class:`catopt_core.ports.Executor`)."""
+        """Materialise ``ir`` as an :class:`IRModule`.
+
+        The concrete :class:`catopt_core.ports.Executor`.
+        """
         return ir_to_torch_module(
             ir, param_values=params, ops=self._ops
         )
@@ -93,6 +98,8 @@ class TorchSink:
         rtol: float = 1e-4,
         atol: float | None = None,
     ) -> VerifyReport:
-        """Run ``ref`` and ``opt`` on ``inputs`` under ``no_grad`` and
-        compare — delegates to ``report.verify_module``."""
+        """Run ``ref`` and ``opt`` on ``inputs`` under ``no_grad``.
+
+        Compares the results — delegates to ``report.verify_module``.
+        """
         return verify_module(ref, opt, inputs, rtol=rtol, atol=atol)

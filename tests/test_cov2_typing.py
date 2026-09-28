@@ -469,8 +469,9 @@ def test_invalid_operand_poisons_before_rule():
 
 
 def test_zero_arg_rule_gets_empty_shapes():
-    """A registered zero-arg op's rule is invoked with ``shapes = ()``
-    before the empty-shapes early return."""
+    """A registered zero-arg op's rule is invoked with ``shapes = []``
+    before the empty-shapes early return (the ``ShapeRule`` port types
+    ``shapes`` as a list, matching the non-zero-arg path)."""
     seen = []
     try:
         register_shape_rule(
@@ -478,7 +479,7 @@ def test_zero_arg_rule_gets_empty_shapes():
             lambda op, shapes: seen.append(shapes) or (9, 9),
         )
         assert _shape_of(Op.make("zz_const")) == (9, 9)
-        assert seen == [()]
+        assert seen == [[]]
     finally:
         _SHAPE_RULES.pop("zz_const", None)
 

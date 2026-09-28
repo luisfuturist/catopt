@@ -188,9 +188,7 @@ class TargetProfile:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
 
     @classmethod
-    def from_json(
-        cls, data: str | bytes | dict
-    ) -> TargetProfile:
+    def from_json(cls, data: str | bytes | dict) -> TargetProfile:
         """Rebuild from a JSON string/bytes or an already-parsed dict."""
         if isinstance(data, (str, bytes)):
             data = json.loads(data)
@@ -216,7 +214,7 @@ class TargetProfile:
         return load_profile(name_or_path, dir)
 
     def cost_fn(self):
-        """The additive roofline cost fn for this target."""
+        """Return the additive roofline cost fn for this target."""
         from catopt_core.cost import roofline_cost_for
 
         return roofline_cost_for(self)
@@ -886,8 +884,10 @@ def calibrate(
     verbose: bool = False,
     save: bool = False,
 ) -> TargetProfile:
-    """Measure the roofline constants of ``device`` (default: cuda if
-    available, else cpu) and return a :class:`TargetProfile`.
+    """Measure the roofline constants of ``device``.
+
+    ``device`` defaults to cuda if available, else cpu.  Returns a
+    :class:`TargetProfile`.
 
     Six micro-benchmarks, sized so the whole run takes a few seconds:
 
@@ -1027,9 +1027,7 @@ def calibrate(
         gbps=bw / 1e9,
         launch_us=launch * 1e6,
         device=str(dev),
-        measured_at=datetime.now(UTC).isoformat(
-            timespec="seconds"
-        ),
+        measured_at=datetime.now(UTC).isoformat(timespec="seconds"),
         meta={
             "dtype": str(dtype).replace("torch.", ""),
             "torch": torch.__version__,

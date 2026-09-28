@@ -62,7 +62,7 @@ from catopt_core.laws import (
     share_duplicate_params,
 )
 from catopt_core.ops import OpTable
-from catopt_core.ports import CostFn, OpRegistry, Sink, Source
+from catopt_core.ports import CostFn, Executor, OpRegistry, Sink, Source
 from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.report import (
     BlockReport,
@@ -144,14 +144,18 @@ class OptimizationResourceError(RuntimeError):
     ``optimize_compositional`` records these as ordinary per-block
     failures with ``reason == "resource_limit"``; a standalone
     :func:`optimize_model` caller gets this dedicated type instead of a
-    raw OOM."""
+    raw OOM.
+    """
 
 
 def _looks_like_oom(exc: BaseException) -> bool:
-    """True for host ``MemoryError``, ``torch.cuda.OutOfMemoryError`` and
-    the ``RuntimeError`` variants allocator failures surface as on older
+    """Return True for allocator-failure exceptions.
+
+    Host ``MemoryError``, ``torch.cuda.OutOfMemoryError`` and the
+    ``RuntimeError`` variants allocator failures surface as on older
     torch / host-side paths ("CUDA out of memory", DefaultCPUAllocator's
-    "can't allocate memory")."""
+    "can't allocate memory").
+    """
     if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
         return True
     if isinstance(exc, RuntimeError):
@@ -165,9 +169,11 @@ def _looks_like_oom(exc: BaseException) -> bool:
 
 
 def _oom_to_resource_error(fn):
-    """Wrap an optimizer entry point so allocator failures surface as
-    :class:`OptimizationResourceError` instead of a raw OOM.
-    ``functools.wraps`` keeps the public signature and docstring."""
+    """Wrap an optimizer entry point against allocator failures.
+
+    They surface as :class:`OptimizationResourceError` instead of a raw
+    OOM.  ``functools.wraps`` keeps the public signature and docstring.
+    """
     import functools
 
     @functools.wraps(fn)
@@ -187,8 +193,11 @@ def _oom_to_resource_error(fn):
 
 
 def _current_memory_mb() -> float:
-    """Current process memory footprint in MiB: host RSS plus
-    CUDA-allocated bytes (device memory lives outside RSS)."""
+    """Return the current process memory footprint in MiB.
+
+    Host RSS plus CUDA-allocated bytes (device memory lives outside
+    RSS).
+    """
     rss = 0.0
     try:
         with open("/proc/self/status") as fh:
@@ -221,7 +230,8 @@ def _check_resources(eg, max_enodes, max_memory_mb) -> None:
     run truncated against the cap: fail fast rather than spending
     extraction/lowering effort on an over-budget graph.  The memory
     check catches tensor pressure an e-node count cannot see
-    (materialised weight folds, lowered parameters)."""
+    (materialised weight folds, lowered parameters).
+    """
     if (
         max_enodes is not None
         and eg is not None
@@ -263,9 +273,11 @@ def _eval_const(
 
 
 def _is_causal_keep_mask(mask_val: torch.Tensor, q_shape) -> bool:
-    """mask (…, T, T) keeps exactly the lower triangle and T matches
-    q's sequence dim — i.e. the mask IS is_causal."""
+    """Return True when a mask is exactly the causal lower triangle.
 
+    ``(…, T, T)`` keeps the lower triangle and T matches q's sequence
+    dim — i.e. the mask IS is_causal.
+    """
     if not isinstance(q_shape, tuple) or len(q_shape) < 2:
         return False
     if (
@@ -296,9 +308,12 @@ def _specialize_causal(
     memo: dict | None = None,
     ops: OpRegistry | None = None,
 ) -> Any:
-    """sdpa(q,k,v, mask) where mask is parameter-only and evaluates to
-    a causal keep-mask → sdpa(q,k,v, is_causal=True).  Dropping the
-    materialised mask unlocks the fused flash/mem-efficient kernels."""
+    """sdpa(q,k,v, mask) → sdpa(q,k,v, is_causal=True).
+
+    Applies when mask is parameter-only and evaluates to a causal
+    keep-mask.  Dropping the materialised mask unlocks the fused
+    flash/mem-efficient kernels.
+    """
     from catopt_core.typing import _shape_of as _so
 
     if memo is None:
@@ -324,7 +339,7 @@ def _specialize_causal(
 
 
 def _default_cost_fn() -> CostFn:
-    """The default extraction model.
+    """Return the default extraction model.
 
     Roofline pricing plus the executor overhead of the lowering this
     pipeline delivers — ``"generic"`` per-node eval or
@@ -448,15 +463,15 @@ def discover_alternatives(
     source: Source | None = None,
     sink: Sink | None = None,
 ) -> dict:
-    """Enumerate the cheapest distinct members of the semantic
-    equivalence class [G] — the discovery-engine view.
+    """Enumerate the cheapest distinct members of class [G].
 
-    Runs the same export → e-graph → saturation → pairing pipeline as
-    optimize_model, but instead of committing to the single best term
-    it returns the top-k alternatives under the cost model, plus the
-    rule-fire provenance (which generic laws actually fired).  Human
-    inspection of this frontier is how level-3 candidates — emergent
-    compositions of known laws — are found.
+    The discovery-engine view.  Runs the same export → e-graph →
+    saturation → pairing pipeline as optimize_model, but instead of
+    committing to the single best term it returns the top-k alternatives
+    under the cost model, plus the rule-fire provenance (which generic
+    laws actually fired).  Human inspection of this frontier is how
+    level-3 candidates — emergent compositions of known laws — are
+    found.
 
     ``source`` / ``sink`` select the graph source and the (backend-
     relative) sink, defaulting to :class:`TorchSource` /
@@ -542,7 +557,7 @@ def discover_alternatives(
 @_oom_to_resource_error
 def optimize_model(
     model: torch.nn.Module,
-    example_input: torch.Tensor,
+    example_input: torch.Tensor | tuple[torch.Tensor, ...],
     *,
     ruleset: str = "all",
     max_iterations: int = 100,
@@ -558,7 +573,7 @@ def optimize_model(
     sink: Sink | None = None,
     runner: Runner | None = None,
     verbose: bool = True,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
+) -> tuple[Executor, dict[str, Any]]:
     """End-to-end categorical optimization of a PyTorch model.
 
     Parameters
@@ -665,6 +680,7 @@ def optimize_model(
         pipeline.  ``optimize_compositional`` treats this as a normal
         per-block fallback (status ``"failed"``,
         ``reason == "resource_limit"``).
+
     """
     if source is None:
         source = TorchSource()
@@ -751,7 +767,7 @@ def optimize_model(
     # ``None`` = unbounded: the run loop wants a concrete watermark.
     run_cap = max_enodes if max_enodes is not None else sys.maxsize
 
-    stats = eg.run(
+    stats: dict[str, Any] = eg.run(
         rules,
         root_eid,
         max_iterations=max_iterations,
@@ -903,9 +919,11 @@ def optimize_model(
 def param_report(
     model: torch.nn.Module, optimized_module: torch.nn.Module
 ) -> dict:
-    """Joint graph+parameter view: which original parameters survive in
-    the optimized realization, which were eliminated, and which were
-    derived (folded) — the 'optimized weights file' diff.
+    """Joint graph+parameter view of the optimized weights file.
+
+    Which original parameters survive in the optimized realization,
+    which were eliminated, and which were derived (folded) — the
+    'optimized weights file' diff.
 
     The optimized module's state_dict IS the smaller weights file:
     ``_fold_weight_chains`` materialises derived tensors (``fused_*``)
@@ -938,8 +956,11 @@ def param_report(
 def save_optimized_weights(
     optimized_module: torch.nn.Module, path: str
 ) -> None:
-    """Emit the optimized weights file — only the parameters the
-    certified form actually needs (folded derived tensors included)."""
+    """Emit the optimized weights file.
+
+    Only the parameters the certified form actually needs (folded
+    derived tensors included).
+    """
     torch.save(optimized_module.state_dict(), path)
 
 
@@ -963,8 +984,11 @@ def term_cost(term: Any, cost_fn: CostFn | None = None) -> float:
 def _default_block_pred(
     parent: torch.nn.Module, name: str, module: torch.nn.Module
 ) -> bool:
-    """Default block selector: direct children of ``nn.ModuleList`` /
-    ``nn.Sequential`` — the standard 'stacked blocks' structure."""
+    """Select direct children of ``nn.ModuleList`` / ``nn.Sequential``.
+
+    The default block selector for the standard 'stacked blocks'
+    structure.
+    """
     return isinstance(
         parent, (torch.nn.ModuleList, torch.nn.Sequential)
     )
@@ -973,8 +997,9 @@ def _default_block_pred(
 def _select_blocks(
     model: torch.nn.Module, block_pred: Callable | None
 ) -> list[tuple[str, torch.nn.Module]]:
-    """Walk the module tree and pick the top-most submodules to optimize
-    independently.
+    """Pick the top-most submodules to optimize independently.
+
+    Walks the module tree; the top-most matching blocks are chosen.
 
     A child is selected when it is a leaf (no children of its own) or when
     ``block_pred(parent, child_name, child)`` is true.  Selected blocks are
@@ -1002,8 +1027,10 @@ def _capture_block_inputs(
     blocks: list[tuple[str, torch.nn.Module]],
     example_input: torch.Tensor | tuple,
 ) -> dict[str, tuple[tuple, dict]]:
-    """Run the ORIGINAL model once and record each selected block's first
-    forward inputs via hooks.  Returns ``{name: (args, kwargs)}``."""
+    """Record each selected block's first forward inputs via hooks.
+
+    Runs the ORIGINAL model once.  Returns ``{name: (args, kwargs)}``.
+    """
     captured: dict[str, tuple[tuple, dict]] = {}
     handles = []
 
@@ -1051,8 +1078,10 @@ def _capture_block_inputs(
 def _replace_submodule(
     model: torch.nn.Module, dotted: str, new_mod: torch.nn.Module
 ) -> None:
-    """Set ``model.<dotted>`` to ``new_mod``, handling ModuleList /
-    Sequential integer children."""
+    """Set ``model.<dotted>`` to ``new_mod``.
+
+    Handles ModuleList / Sequential integer children.
+    """
     parent_name, _, child_name = dotted.rpartition(".")
     parent = model.get_submodule(parent_name) if parent_name else model
     if child_name.isdigit() and isinstance(

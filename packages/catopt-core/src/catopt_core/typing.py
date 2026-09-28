@@ -33,7 +33,7 @@ op-dispatch match runs — after ``_INVALID`` propagation and the
 unknown/empty early-returns — so a handler sees only non-``None``
 operand shapes and must still map a carrier-internal ``()`` operand to
 ``None``.  Zero-argument ops (``eye``/``cswap`` constant morphisms)
-have their handler called with ``shapes = ()`` — their shapes are
+have their handler called with ``shapes = []`` — their shapes are
 fully determined by attrs.
 
 The ``aff``/``apply``/``om``/``omd``/``trace``/``bdiag``/``parl``
@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from catopt_core.attrs import attr_of, is_positional_attr
 from catopt_core.ir import Const, Op, Param, Var
@@ -56,7 +56,9 @@ from catopt_core.ir import Const, Op, Param, Var
 # ---------------------------------------------------------------------------
 
 
-def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
+def _shape_of(
+    term: Any, memo: dict | None = None
+) -> tuple | str | None:
     """Best-effort shape inference for a term.
 
     ``memo`` is an optional ``id()``-keyed dict shared across a whole
@@ -95,6 +97,11 @@ def _shape_of(term: Any, memo: dict | None = None) -> tuple | None:
     return out
 
 
+#: Ops whose result shape is invariant under operand swap — used to
+#: keep unknown-shape pricing symmetric for ``add``/``mul``/``eq``/``ne``.
+_COMMUTATIVE_BROADCAST = frozenset({"add", "mul", "eq", "ne"})
+
+
 def _infer_op_shape(op: Op, memo: dict | None = None):
     # Zero-argument ops with a registered rule (constant morphisms
     # like catopt_carriers.trace's ``eye``/``cswap``): their shapes are fully
@@ -102,19 +109,27 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
     # empty-shapes early return below.
     rule = _SHAPE_RULES.get(op.op)
     if rule is not None and not op.args:
-        return rule(op, ())
+        return rule(op, [])
     shapes = [_shape_of(a, memo) for a in op.args]
     if any(s is _INVALID for s in shapes):
         return _INVALID
     if not shapes or any(s is None for s in shapes):
         if shapes and shapes[0] is not None:
             return shapes[0]
+        # Commutative element-wise ops are operand-symmetric: with the
+        # first shape unknown, fall back to whichever operand shape IS
+        # known, so add(a, b) and add(b, a) price identically.
+        if op.op in _COMMUTATIVE_BROADCAST:
+            for s in shapes:
+                if s is not None:
+                    return s
         return None
     if rule is not None:
         return rule(op, shapes)
     match op.op:
         case "matmul":
-            a, b = shapes[0], shapes[1]
+            a = cast("tuple", shapes[0])
+            b = cast("tuple", shapes[1])
             if len(a) >= 2 and len(b) >= 2:
                 return (*a[:-1], b[-1])
             # Rank-1 operands (torch.matmul semantics): matrix-vector
@@ -293,7 +308,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 if len(w) >= 1:
                     out = (*tuple(shapes[0][:-1]), w[0])
                     if len(shapes) >= 3:
-                        b = shapes[2]
+                        b = cast("tuple", shapes[2])
                         if len(b) >= 2 and b[-1] == 1:
                             # A column bias (o,1) is a rank-1 bias in
                             # disguise — prefer the squeezed (o,)
@@ -520,10 +535,9 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             hi = op.attrs.get("end")
             step = op.attrs.get("step", 1) or 1
             out = list(base)
-            if isinstance(base[d], int):
-                n = (
-                    min(hi, base[d]) if isinstance(hi, int) else base[d]
-                ) - lo
+            bd = base[d]
+            if isinstance(bd, int):
+                n = (min(hi, bd) if isinstance(hi, int) else bd) - lo
                 out[d] = max(0, -(-n // step))
             return tuple(out)
         case "embedding":
@@ -794,8 +808,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             # x (N,C,H,W) @ w (O,C,kh,kw) -> (N,O,H',W')
             x, w = shapes[0], shapes[1]
             if (
-                x is None
-                or w is None
+                not isinstance(x, tuple)
+                or not isinstance(w, tuple)
                 or len(x) < 4
                 or len(w) < 4
                 or isinstance(op.attrs.get("padding"), str)
@@ -817,12 +831,14 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             pd = pd if isinstance(pd, (tuple, list)) else (pd, pd)
             dl = dl if isinstance(dl, (tuple, list)) else (dl, dl)
             oh = ow = None
-            if x[2] is not None and w[2] is not None:
-                oh = (x[2] + 2 * pd[0] - dl[0] * (w[2] - 1) - 1) // st[
+            xh, xw = x[2], x[3]
+            wh, ww = w[2], w[3]
+            if xh is not None and wh is not None:
+                oh = (xh + 2 * pd[0] - dl[0] * (wh - 1) - 1) // st[
                     0
                 ] + 1
-            if x[3] is not None and w[3] is not None:
-                ow = (x[3] + 2 * pd[1] - dl[1] * (w[3] - 1) - 1) // st[
+            if xw is not None and ww is not None:
+                ow = (xw + 2 * pd[1] - dl[1] * (ww - 1) - 1) // st[
                     1
                 ] + 1
             return (x[0], w[0], oh, ow)
@@ -879,7 +895,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
 #: Sentinel returned by shape inference when two shapes are PROVABLY
 #: incompatible (e.g. broadcasting (out,in) against (B,T,1)).  Distinct
 #: from ``None`` (merely unknown): ill-typed terms are poisonous — the
-#: cost model must never prefer them.
+#: cost model must never prefer them.  It is a ``str`` (a sentinel
+#: value), so shape results are typed ``tuple | str | None``.
 _INVALID = "__invalid_shape__"
 
 
@@ -962,7 +979,7 @@ def _numel(shape) -> int:
 
 
 def has_var_leaf(term: Any, memo: dict | None = None) -> bool:
-    """True iff the subtree mentions a :class:`Var` leaf (runtime data).
+    """Return True iff the subtree mentions a :class:`Var` leaf.
 
     Param-only subtrees fold at compile time — this predicate is the
     activation/weight distinction used by the cost model's DAG
@@ -994,7 +1011,7 @@ def has_var_leaf(term: Any, memo: dict | None = None) -> bool:
 
 
 def _concrete(shape: Any) -> bool:
-    """True iff *shape* is a non-empty tuple of concrete int dims."""
+    """Return True iff *shape* is a tuple of concrete int dims."""
     return (
         isinstance(shape, tuple)
         and len(shape) > 0
@@ -1003,8 +1020,11 @@ def _concrete(shape: Any) -> bool:
 
 
 def _stack_dim(attrs: dict) -> int:
-    """The concatenation/stack axis from an op's attrs — the canonical
-    ``dim`` spelling, defaulting to 0 on a non-int value."""
+    """Return the concatenation/stack axis from an op's attrs.
+
+    Uses the canonical ``dim`` spelling, defaulting to 0 on a non-int
+    value.
+    """
     d = attr_of(attrs, "dim", default=0)
     return d if isinstance(d, int) else 0
 
@@ -1093,7 +1113,7 @@ _ShapeRule = Callable[[Op, list], tuple | str | None]
 
 #: ``{op_name: fn(op, shapes) -> shape}`` — consulted by
 #: ``_infer_op_shape`` after the ``_INVALID``/unknown early-returns
-#: (or immediately for zero-argument ops, which get ``shapes = ()``).
+#: (or immediately for zero-argument ops, which get ``shapes = []``).
 _SHAPE_RULES: dict[str, _ShapeRule] = {}
 
 
@@ -1137,16 +1157,21 @@ def _apply_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _om_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``om`` — the carrier triple (m, l, a); its "shape" is the
-    accumulator's — what consumers' costs are priced from."""
+    """``om`` — the carrier triple (m, l, a).
+
+    Its "shape" is the accumulator's — what consumers' costs are priced
+    from.
+    """
     out = shapes[2] if len(shapes) > 2 else shapes[0]
     return out or None
 
 
 def _om_elem_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``om_elem`` — elem(s[...,K], v[...,K,d]) reports the applied
-    output shape (...,T,d) — like ``aff``, the carrier is priced as
-    the tensor it will become under om_apply."""
+    """``om_elem`` — elem(s[...,K], v[...,K,d]).
+
+    Reports the applied output shape (...,T,d) — like ``aff``, the
+    carrier is priced as the tensor it will become under om_apply.
+    """
     s, v = shapes[0], shapes[1]
     if (
         isinstance(s, tuple)
@@ -1161,8 +1186,11 @@ def _om_elem_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _trace_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``trace`` — Tr(f): drop the first ``usize`` rows/cols of the
-    block matrix f : U⊗X → U⊗Y, leaving the X → Y map."""
+    """``trace`` — Tr(f).
+
+    Drops the first ``usize`` rows/cols of the block matrix
+    f : U⊗X → U⊗Y, leaving the X → Y map.
+    """
     s = shapes[0]
     if not (isinstance(s, tuple) and len(s) == 2):
         return s or None
@@ -1176,9 +1204,11 @@ def _trace_shape(op: Op, shapes: list) -> tuple | str | None:
 
 
 def _bdiag_shape(op: Op, shapes: list) -> tuple | str | None:
-    """``bdiag``/``parl`` — total-dims-preserving matrix juxtaposition:
+    """``bdiag``/``parl`` — total-dims-preserving matrix juxtaposition.
+
     bdiag is literal block-diagonal; parl re-lays the same blocks
-    keeping feedback wires first (see catopt_carriers.trace)."""
+    keeping feedback wires first (see catopt_carriers.trace).
+    """
     a, b = shapes[0], shapes[1]
     if (
         isinstance(a, tuple)

@@ -194,11 +194,11 @@ def test_mixin_and_module_wiring():
 def test_capture_cpu_noop_then_cuda_guard(monkeypatch):
     """``is_graph_captured`` False path, the documented CPU no-op, and
     the ValueError guard under a fake CUDA flag."""
-    # force the no-CUDA arm regardless of the host device
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     for mod, args in _cases():
         assert not mod.is_graph_captured
-        # no CUDA → documented no-op returning self, no capture state
+        # no CUDA → documented no-op returning self, no capture state.
+        # Re-set each iteration: undo() below clears the patch.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         assert mod.capture_cuda_graph(*args) is mod
         assert mod._graph is None
         assert mod._graph_inputs == []

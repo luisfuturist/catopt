@@ -174,7 +174,7 @@ def test_eval_term_memo_dedups_twin_subtrees():
         var_env=env,
         param_env=penv,
         bindings=bindings,
-        memo=memo,
+        memo_env=memo,
         strict=True,
     )
     memo_shared: dict = {}
@@ -183,7 +183,7 @@ def test_eval_term_memo_dedups_twin_subtrees():
         var_env=env,
         param_env=penv,
         bindings=bindings,
-        memo=memo_shared,
+        memo_env=memo_shared,
         strict=True,
     )
     assert torch.equal(r_twins, r_shared)

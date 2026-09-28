@@ -1,4 +1,5 @@
 """Structural term utilities + certificate verification."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -98,7 +99,7 @@ def _term_instantiate(pattern: Any, subst: dict) -> Any:
 
 
 def _subterm(term: Any, path: tuple) -> Any:
-    """The subterm of *term* at child-index path, or None if absent."""
+    """Return the subterm of *term* at child-index path, or None."""
     for i in path:
         if not isinstance(term, Op) or i >= len(term.args):
             return None
@@ -219,4 +220,3 @@ def verify_certificate(
             f"certificate claims {op_repr(cert.dst)}"
         )
     return current
-

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from catopt_core.ir import Const, Op, Param
 
@@ -49,6 +49,25 @@ from catopt_core.typing import (  # noqa: F401
     _shape_of,
     has_var_leaf,
 )
+
+
+class _CostMarkers(Protocol):
+    """The dynamic per-model markers attached to a cost-fn object.
+
+    ``EGraph.extract_best`` / ``dag_cost`` read ``charges_param_only``
+    and ``dag_exact`` off the function via ``getattr``; the ``*_for``
+    factories also hang a ``profile`` (and sometimes ``lowering`` /
+    ``best_lowering``) off the closure for reporting.  These are extras
+    on the function object, not :class:`~catopt_core.ports.CostFn`
+    members, so the assignments below cast through this Protocol.
+    """
+
+    charges_param_only: bool
+    dag_exact: bool
+    profile: Any
+    lowering: Any
+    best_lowering: Any
+
 
 # ---------------------------------------------------------------------------
 # Per-op FLOP weights
@@ -170,7 +189,10 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
             and len(w) >= 4
             and all(isinstance(d, int) for d in w[1:4])
         ):
-            k = w[1] * w[2] * w[3]
+            w1 = cast("int", w[1])
+            w2 = cast("int", w[2])
+            w3 = cast("int", w[3])
+            k = w1 * w2 * w3
             g = term.attrs.get("groups", 1)
             if isinstance(g, int) and g > 1:
                 k //= g
@@ -316,7 +338,7 @@ def _memo_dispatch(cost_fn, memo: dict | None = None):
 
 
 def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
-    """True DAG cost of an extracted term: shared subtrees charged once.
+    """Return the true DAG cost of an extracted term.
 
     ``cost_fn(term)`` counts shared subtrees once per *parent* (a tree
     walk); extracted terms can share Op objects when two e-class parents
@@ -359,7 +381,7 @@ def dag_cost(term: Any, cost_fn, memo: dict | None = None) -> float:
     var_memo: dict = {}
 
     def has_var(t: Any) -> bool:
-        """True if the subtree reads a data input (Var leaf).
+        """Return True if the subtree reads a data input (Var leaf).
 
         Subtrees over only Param/Const leaves are compile-time work —
         lowering folds them into a materialised parameter — so they are
@@ -426,7 +448,8 @@ def depth_cost(term: Any, memo: dict | None = None) -> float:
     Work-preserving reassociations (parallel scans, balanced sums,
     repeated squaring) win here even when total FLOPs are identical —
     this is the axis on which a sequential recurrence and its
-    log-depth Blelloch form differ."""
+    log-depth Blelloch form differ.
+    """
     memo = {} if memo is None else memo
     ck = ("dc", term)
     if ck in memo:
@@ -523,8 +546,8 @@ def param_bytes_cost(
 # not fold away at compile time, so param-only subtrees stay billed;
 # and the leaf/fold index is already a true DAG cost, so dag_cost
 # must not apply its subtractive per-node decomposition.
-param_bytes_cost.charges_param_only = True
-param_bytes_cost.dag_exact = True
+cast(_CostMarkers, param_bytes_cost).charges_param_only = True
+cast(_CostMarkers, param_bytes_cost).dag_exact = True
 
 
 def param_bytes_cost_for(
@@ -544,15 +567,15 @@ def param_bytes_cost_for(
         return param_bytes_cost(term, source_tensors, memo, by_bytes)
 
     cost.__name__ = "param_bytes_cost_for"
-    cost.charges_param_only = True
-    cost.dag_exact = True
+    cast(_CostMarkers, cost).charges_param_only = True
+    cast(_CostMarkers, cost).dag_exact = True
     return cost
 
 
 def _param_numel(
     p: Param, source_tensors: dict | None, by_bytes: bool = False
 ) -> float:
-    """Stored scalar count for one Param leaf.
+    """Return the stored scalar count for one Param leaf.
 
     ``source_tensors`` (name -> tensor, e.g. from ``export_to_ir`` plus
     any derived params a pass injected) is authoritative when the
@@ -603,7 +626,7 @@ _FOLDABLE_ELEMWISE = frozenset(
 
 
 def _has_var_leaf(term: Any, memo: dict) -> bool:
-    """True iff the subtree reads a data input (Var leaf).
+    """Return True iff the subtree reads a data input (Var leaf).
 
     Private alias kept for this module's fold walkers; delegates to
     :func:`catopt_core.typing.has_var_leaf` — the single implementation —
@@ -615,7 +638,7 @@ def _has_var_leaf(term: Any, memo: dict) -> bool:
 
 
 def _param_resolves(p: Param, source_tensors: dict | None) -> bool:
-    """Would ``p.name`` land in ``_param_values`` at lowering?
+    """Return whether ``p.name`` lands in ``_param_values`` at lowering.
 
     ``optimize_model`` hands the whole ``source_tensors`` dict to the
     lowerer as ``param_values`` (the sharing passes register their
@@ -630,7 +653,7 @@ def _param_resolves(p: Param, source_tensors: dict | None) -> bool:
 def _folds_to_param(
     term: Any, source_tensors: dict | None, memo: dict
 ) -> bool:
-    """True iff ``_fold_weight_chains`` rewrites *term* to a fused Param.
+    """Return whether the lowerer folds *term* to a fused Param.
 
     Mirrors the lowerer bottom-up: a param-only subtree folds when
     every argument reduces to a stored parameter — a resolvable
@@ -667,9 +690,12 @@ def _folds_to_param(
 def _fold_ewidth(
     term: Any, source_tensors: dict | None
 ) -> float | None:
-    """Element width of a materialised fold — the widest resolvable
-    leaf's dtype (the fused tensor inherits arg dtypes); ``None`` when
-    no leaf carries one, letting the caller default to fp32."""
+    """Return the element width of a materialised fold.
+
+    The widest resolvable leaf's dtype (the fused tensor inherits arg
+    dtypes); ``None`` when no leaf carries one, letting the caller
+    default to fp32.
+    """
     if isinstance(term, Param):
         if source_tensors is not None:
             t = source_tensors.get(term.name)
@@ -690,9 +716,10 @@ def _fold_ewidth(
 def _fold_numel(
     term: Op, source_tensors: dict | None, memo: dict, by_bytes: bool
 ) -> float:
-    """Stored size of the tensor a folding subtree materialises to —
-    the OUTPUT numel: ``concat`` re-stores every argument's rows, a
-    weight ``matmul`` stores the dense product.
+    """Return the stored size of a materialised fold.
+
+    The size is the OUTPUT numel: ``concat`` re-stores every argument's
+    rows, a weight ``matmul`` stores the dense product.
     """
     n = float(_numel(_shape_of(term, memo)))
     if by_bytes:
@@ -705,15 +732,15 @@ def _param_index(
     source_tensors: dict | None,
     memo: dict,
     by_bytes: bool = False,
-) -> dict[str, float]:
-    """``{key: numel}`` for every *stored* parameter entry in a term DAG.
+) -> dict[Any, float]:
+    r"""``{key: numel}`` for every *stored* parameter entry in a term DAG.
 
     Two kinds of entries, mirroring the lowered weights file:
 
     * ``{param_name: numel}`` — a Param leaf that survives folding;
       deduped by name, so a weight read by several consumers (or by
       several identically-spelled leaves) is stored once;
-    * ``{"\\x00fold:<id>": out_numel}`` — a param-only subtree the
+    * ``{"\x00fold:<id>": out_numel}`` — a param-only subtree the
       lowerer materialises (``_folds_to_param``); keyed by subtree
       object identity, matching ``_fold_memo``/``_build_params``: the
       same object reached twice is one stored tensor, and each
@@ -776,7 +803,7 @@ _STRIDE_PENALTY = 1.0  # measured: strided copies ~1.0x on this GPU
 
 
 def _is_strided(term: Any, memo: dict | None = None) -> bool:
-    """True if *term* is a view whose elements are not contiguous.
+    """Return True if *term* is a non-contiguous view.
 
     chunk on the LAST dim splits each row — consumers read with a row
     stride of 2x the logical row.  chunk on any other dim yields
@@ -1121,7 +1148,7 @@ def roofline_cost_for(
         return _roofline_cost(term, memo, pf, bw, ls, kns)
 
     cost.__name__ = "roofline_cost_for"
-    cost.profile = profile
+    cast(_CostMarkers, cost).profile = profile
     return cost
 
 
@@ -1133,10 +1160,13 @@ def _depth_cost(
     launch_s: float,
     kernel_ns=None,
 ) -> float:
-    """Shared critical-path traversal for depth_cost_for and the
-    ``base="depth"`` arm of :func:`executor_cost_for`.  The memo key
-    carries the constants so two profiles can share a memo dict
-    without colliding (the ``_roofline_cost`` convention)."""
+    """Shared critical-path traversal.
+
+    Used by depth_cost_for and the ``base="depth"`` arm of
+    :func:`executor_cost_for`.  The memo key carries the constants so
+    two profiles can share a memo dict without colliding (the
+    ``_roofline_cost`` convention).
+    """
     ck = (
         ("dc", peak_flops, peak_bw, launch_s, term)
         if kernel_ns is None
@@ -1187,7 +1217,7 @@ def depth_cost_for(profile: Any = None):
         return _depth_cost(term, memo, pf, bw, ls, kns)
 
     cost.__name__ = "depth_cost_for"
-    cost.profile = profile
+    cast(_CostMarkers, cost).profile = profile
     return cost
 
 
@@ -1200,11 +1230,13 @@ class CostModel:
         weight_coeff: float = 1.0,
         matmul_coeff: float = 2.0,
     ) -> None:
+        """Initialise the op weights and coefficients."""
         self.op_weights = op_weights or _OP_FLOPS
         self.weight_coeff = weight_coeff
         self.matmul_coeff = matmul_coeff
 
     def __call__(self, term: Any) -> float:
+        """Price *term* in weighted FLOPs."""
         if isinstance(term, Op):
             shape = _infer_op_shape(term)
             n = _numel(shape)
@@ -1212,7 +1244,11 @@ class CostModel:
             if term.op == "matmul":
                 shapes = [_shape_of(a) for a in term.args]
                 if shapes and shapes[1] is not None:
-                    k_dim = shapes[1][-2] if len(shapes[1]) >= 2 else 1
+                    k_dim = (
+                        cast("int", shapes[1][-2])
+                        if len(shapes[1]) >= 2
+                        else 1
+                    )
                     base = 2 * n * k_dim
                 else:
                     base = coeff * n
@@ -1224,7 +1260,7 @@ class CostModel:
                     and shapes[0] is not None
                     and len(shapes[0]) >= 1
                 ):
-                    base = 2 * n * shapes[0][-1]
+                    base = 2 * n * cast("int", shapes[0][-1])
                 else:
                     base = 2 * n
             else:
@@ -1243,11 +1279,13 @@ class CostModel:
 def _ops_supported(
     term: Any, allowed: frozenset[str], cache: dict[Any, bool]
 ) -> bool:
-    """True iff every :class:`Op` in ``term``'s DAG names an op in
-    ``allowed``; leaves (``Param`` / ``Const`` / ``Var``) are always
-    supported.  ``cache`` memoizes the content-keyed verdict, so a
-    shared-subterm DAG costs one linear walk across every extraction
-    probe rather than one walk per probe."""
+    """Return True iff ``term``'s DAG uses only ``allowed`` ops.
+
+    Leaves (``Param`` / ``Const`` / ``Var``) are always supported.
+    ``cache`` memoizes the content-keyed verdict, so a shared-subterm
+    DAG costs one linear walk across every extraction probe rather than
+    one walk per probe.
+    """
     hit = cache.get(term)
     if hit is not None:
         return hit
@@ -1262,8 +1300,9 @@ def _ops_supported(
 def backend_cost(
     cost_fn: CostFn, supported_ops: Collection[str]
 ) -> CostFn:
-    """Wrap ``cost_fn`` so members outside a backend's op set price at
-    ``+inf`` — extraction is *backend-relative*.
+    """Price members outside a backend's op set at ``+inf``.
+
+    Wraps ``cost_fn`` so extraction is *backend-relative*.
 
     ``supported_ops`` is the op-name set a
     :class:`~catopt_core.ports.Sink` can lower (its ``supported_ops``).
@@ -1446,9 +1485,10 @@ _SOLVER_FACTOR = 10_000.0
 
 
 def _generic_overhead(term: Any, memo: dict) -> float:
-    """Per-node dispatch count the generic evaluator performs for
-    *term* — one unit per op occurrence (+``_SOLVER_FACTOR`` for
-    solver ops).
+    """Count the per-node dispatches the generic evaluator performs.
+
+    One unit per op occurrence in *term* (+``_SOLVER_FACTOR`` for solver
+    ops).
 
     Deliberately NOT DAG-deduplicated: ``EGraph.extract_best`` recovers
     a node's local cost as ``f(t) − Σf(children)``, which is exact
@@ -2018,8 +2058,8 @@ def executor_cost_for(
         return out
 
     cost.__name__ = "executor_cost_for"
-    cost.profile = profile
-    cost.lowering = lowering
+    cast(_CostMarkers, cost).profile = profile
+    cast(_CostMarkers, cost).lowering = lowering
     return cost
 
 
@@ -2344,7 +2384,7 @@ def fused_cost_for(profile: Any = None) -> CostFn:
         return out
 
     cost.__name__ = "fused_cost_for"
-    cost.profile = profile
+    cast(_CostMarkers, cost).profile = profile
     return cost
 
 
@@ -2416,6 +2456,6 @@ def lowering_aware_cost_for(
         return min(fns, key=lambda lw: fns[lw](term, memo))
 
     cost.__name__ = "lowering_aware_cost_for"
-    cost.profile = profile
-    cost.best_lowering = best_lowering
+    cast(_CostMarkers, cost).profile = profile
+    cast(_CostMarkers, cost).best_lowering = best_lowering
     return cost

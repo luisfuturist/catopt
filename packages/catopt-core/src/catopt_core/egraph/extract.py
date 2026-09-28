@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from catopt_core.cost import (
     _FOLDABLE_ELEMWISE,
@@ -21,6 +21,10 @@ from catopt_core.egraph.types import (
 )
 from catopt_core.ir import Op
 
+if TYPE_CHECKING:
+    from catopt_core.egraph.certs import Certificate
+    from catopt_core.egraph.types import EClass
+
 logger = logging.getLogger("catopt_core.egraph.extract")
 
 #: Ops ``IRModule._fold_weight_chains`` actually folds into a
@@ -34,6 +38,41 @@ _FOLDABLE_OPS = _FOLDABLE_ELEMWISE | {"matmul", "concat"}
 
 
 class _ExtractMixin:
+    if TYPE_CHECKING:
+        # Interface supplied by ``EGraph`` (and the proof mixin) once
+        # the mixins are combined — declared here so ``self``
+        # type-checks.  Runtime never executes this block.
+        _classes: dict[int, EClass]
+        _node_to_class: dict[ENode, int]
+
+        @property
+        def n_enodes(self) -> int: ...
+
+        def find(self, eid: int) -> int: ...
+
+        def any_term(
+            self,
+            eid: int,
+            _seen: frozenset = frozenset(),
+            _memo: dict | None = None,
+        ) -> Any: ...
+
+        def certificate(
+            self,
+            src_term: Any,
+            dst_term: Any = None,
+            *,
+            root_eid: int | None = None,
+            cost_fn: Any = None,
+        ) -> Certificate: ...
+
+        def _oldest_term(
+            self,
+            eid: int,
+            _stack: frozenset = frozenset(),
+            _memo: dict | None = None,
+        ) -> Any: ...
+
     def _cost_memo_for(self, cost_fn) -> dict:
         """Shared content-keyed cost memo for *cost_fn* on this e-graph.
 
@@ -65,7 +104,6 @@ class _ExtractMixin:
         directly.  Deterministic: members are scanned in a canonical
         sorted order so ties resolve identically every run.
         """
-
         cache: dict[int, tuple[float, Any]] = {}
         in_prog: set[int] = set()
 
@@ -114,12 +152,14 @@ class _ExtractMixin:
     def extract_alternatives(
         self, eid: int, cost_fn, top_k: int = 8
     ) -> list[tuple[float, Any]]:
-        """Enumerate the root e-class frontier: for each non-leaf enode,
-        force extraction through it and record the resulting term's DAG
-        cost.  Returns the top-k cheapest *distinct* alternatives —
-        i.e. the cheapest members of the semantic equivalence class
-        [G], which is what a discovery engine inspects for unexpected
-        candidates."""
+        """Enumerate the root e-class frontier.
+
+        For each non-leaf enode, force extraction through it and record
+        the resulting term's DAG cost.  Returns the top-k cheapest
+        *distinct* alternatives — i.e. the cheapest members of the
+        semantic equivalence class [G], which is what a discovery
+        engine inspects for unexpected candidates.
+        """
         from catopt_core.cost import dag_cost
         from catopt_core.ir import op_repr
 
@@ -148,14 +188,14 @@ class _ExtractMixin:
         `matmul(softmax(mf))` and `sdpa` means the search found that
         two very different programs compute the same thing.  Returns
         classes with >= 2 distinct member ops, each with a one-line
-        sketch of every distinct member."""
-
-        out = []
+        sketch of every distinct member.
+        """
+        out: list[dict[str, Any]] = []
         for eid, ec in self._classes.items():
             ops = {n.op for n in ec.nodes if n.op != "leaf"}
             if len(ops) < 2:
                 continue
-            sketches = []
+            sketches: list[str] = []
             seen_sketch = set()
             for n in ec.nodes:
                 if n.op == "leaf":
@@ -523,8 +563,7 @@ class _ExtractMixin:
         src_term: Any = None,
         _cache_out: dict | None = None,
     ) -> Any:
-        """Extract the minimum-cost member whose derivation certifies
-        within ``max_error``.
+        """Extract the minimum-cost member certifying within ``max_error``.
 
         A member's ε lives on its *derivation*, not on the member
         itself — the certificate is what knows which bound-carrying
@@ -660,7 +699,7 @@ class _ExtractMixin:
         )
 
         def steered_score(node: Any) -> float:
-            """local cost + children best totals (member-routed pass)."""
+            """Local cost + children best totals (member-routed pass)."""
             child_terms = []
             sub = 0.0
             child_tc = 0.0

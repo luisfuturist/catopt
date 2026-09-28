@@ -166,7 +166,7 @@ def _always_true(_: Any) -> bool:
 
 
 def is_trace_rooted_term(term: Any) -> bool:
-    """Does the term's root carry the traced-monoidal carrier?
+    """Return whether the term's root carries the traced-monoidal carrier.
 
     Native forms: a bare ``trace`` fixpoint at the root, or the
     superposed (channel-split) ``bdiag(trace, trace, …)`` layout the
@@ -319,6 +319,7 @@ class Regime:
     profile: TargetProfile | dict | str | None = None
 
     def __post_init__(self) -> None:
+        """Resolve ``profile`` and default ``cost_fn`` for the regime."""
         if self.profile is None:
             return
         prof = self.profile
@@ -330,7 +331,7 @@ class Regime:
 
 
 def default_regimes() -> list[Regime]:
-    """The standard frontier: one regime per deployment point.
+    """Return the standard frontier: one regime per deployment point.
 
     * ``sequential``     — min elementwise work, serial evaluation.
     * ``parallel``       — min critical-path depth, auto executor
@@ -487,7 +488,7 @@ def _nested_carriers(census: dict[str, int]) -> list[str]:
 
 
 def architecture_signature(term: Any) -> tuple:
-    """A hashable signature identifying the *architecture* of a term.
+    """Return a hashable signature identifying the *architecture* of a term.
 
     Distinct signatures ⇒ genuinely different executable forms (dense
     tensor spine vs sequential ``applyd`` chain vs balanced
@@ -595,7 +596,9 @@ def _force_carrier(
     for cid in list(eg._classes):
         c = eg.find(cid)
         ec = eg._classes.get(c)
-        if ec is None:  # pragma: no cover — _classes self-consistent under find()
+        if (
+            ec is None
+        ):  # pragma: no cover — _classes self-consistent under find()
             continue
         inner = sorted(
             (n for n in ec.nodes if n.op in inner_ops), key=repr
@@ -668,16 +671,20 @@ class RegimeFrontier:
 
     # -- access ------------------------------------------------------
     def __getitem__(self, name: str) -> RegimeChoice:
+        """Return the :class:`RegimeChoice` named ``name``."""
         return self.choices[name]
 
     def __iter__(self) -> Iterable[RegimeChoice]:
+        """Iterate over the regime choices."""
         return iter(self.choices.values())
 
     def __len__(self) -> int:
+        """Return the number of regime choices."""
         return len(self.choices)
 
     @property
     def names(self) -> list[str]:
+        """Return the regime names."""
         return list(self.choices)
 
     # -- analysis ----------------------------------------------------
@@ -690,10 +697,11 @@ class RegimeFrontier:
 
     @property
     def n_architectures(self) -> int:
+        """Return the number of distinct architecture signatures."""
         return len(self.architecture_groups())
 
     def collapsed(self) -> list[tuple[str, list[str]]]:
-        """Groups of regimes that extracted the *same member*."""
+        """Return groups of regimes that extracted the *same member*."""
         by_term: dict[str, list[str]] = {}
         for name, ch in self.choices.items():
             if ch.term is None:
@@ -723,6 +731,7 @@ class RegimeFrontier:
 
     # -- reporting ---------------------------------------------------
     def report(self) -> str:
+        """Render the frontier as a human-readable table."""
         lines = [
             f"regime frontier: {len(self)} regimes, "
             f"{self.n_architectures} distinct architectures",
@@ -962,6 +971,7 @@ class RegimeDispatch(nn.Module):
         *,
         default: str | None = None,
     ):
+        """Build the dispatch by lowering every regime's member."""
         super().__init__()
         if frontier.ir is None:
             raise ValueError(
@@ -1008,9 +1018,11 @@ class RegimeDispatch(nn.Module):
     # -- one set of weights ------------------------------------------
     @staticmethod
     def _param_map_of(mod: nn.Module) -> dict | None:
-        """The ``{ir_name: Parameter}`` map of a module — on the module
-        itself for ``IRModule``, on ``.eval_mod`` for the specialised
-        wrappers (scan/om executors)."""
+        """Return the ``{ir_name: Parameter}`` map of a module.
+
+        On the module itself for ``IRModule``, on ``.eval_mod`` for the
+        specialised wrappers (scan/om executors).
+        """
         pm = getattr(mod, "_param_map", None)
         if pm is None:
             inner = getattr(mod, "eval_mod", None)
@@ -1022,8 +1034,10 @@ class RegimeDispatch(nn.Module):
         return pm
 
     def _share_params(self) -> None:
-        """Rebind source parameters to a single shared Parameter object
-        per name across all executor modules."""
+        """Rebind source parameters to one shared object per name.
+
+        Applies across all executor modules.
+        """
         shared: dict[str, nn.Parameter] = {}
         for mod in self.forms.values():
             pm = self._param_map_of(mod)
@@ -1049,13 +1063,16 @@ class RegimeDispatch(nn.Module):
     # -- API ---------------------------------------------------------
     @property
     def regimes(self) -> list[str]:
+        """Return the dispatched regime names."""
         return list(self._meta)
 
     @property
     def regime(self) -> str:
+        """Return the current default regime name."""
         return self._regime
 
     def set_regime(self, name: str) -> None:
+        """Select the default regime by name."""
         if name not in self._meta:
             raise KeyError(
                 f"unknown regime {name!r}; available: "
@@ -1071,11 +1088,13 @@ class RegimeDispatch(nn.Module):
         }
 
     def executor_module(self, name: str) -> nn.Module:
+        """Return the executor module serving ``name``."""
         return self.forms[self._name_map[name]]
 
     def forward(
         self, *xs: torch.Tensor, regime: str | None = None
     ) -> torch.Tensor:
+        """Run the form for ``regime`` (default: the current one)."""
         name = regime if regime is not None else self._regime
         if name not in self._meta:
             raise KeyError(
@@ -1122,6 +1141,7 @@ class RegimeDispatch(nn.Module):
         return self.verification
 
     def report(self) -> str:
+        """Render the dispatch and its verification as text."""
         lines = [self.frontier.report(), "", "built modules:"]
         for name, m in self._meta.items():
             ch = m["choice"]
@@ -1139,6 +1159,7 @@ class RegimeDispatch(nn.Module):
         return "\n".join(lines)
 
     def extra_repr(self) -> str:
+        """Return the ``nn.Module`` repr extras."""
         return f"regime={self._regime!r}, forms={list(self._meta)}"
 
 
@@ -1162,6 +1183,7 @@ CARRIER_LAWS = SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS
 
 
 def default_rules() -> list:
+    """Return the default carrier law list."""
     return list(CARRIER_LAWS)
 
 

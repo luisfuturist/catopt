@@ -23,7 +23,7 @@ Collections:
 # ruff: noqa: RUF001 RUF002 RUF003 -- the law strings and docstrings use
 # mathematical notation (σ, ⊗, ×) deliberately; ASCII would misstate it.
 
-from typing import Any
+from typing import Any, cast
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
@@ -281,14 +281,16 @@ ASSOC_LINEAR = R(
 
 
 def _check_linear_bias_compose(bound: dict) -> bool:
-    """Shape guard: the chain dims must compose for B·b1 + b2 to be
-    well-typed — A (h, i), B (o, h), b1 (h,), b2 (o,) or scalar.
+    """Shape guard: the chain dims must compose for B·b1 + b2.
+
+    Well-typed when A (h, i), B (o, h), b1 (h,), b2 (o,) or scalar.
 
     The matcher cannot see tensor types; without this the rule would
     also fire on e-nodes whose "bias" slot holds a non-vector term.
     Unknown dims pass through as equalities on None (the rewrite is
     exact wherever the LHS is a real computation — the check only
-    vetoes PROVABLE mismatches)."""
+    vetoes PROVABLE mismatches).
+    """
     x = _shape_of(bound.get("x"))
     a = _shape_of(bound.get("A"))
     b = _shape_of(bound.get("B"))
@@ -529,8 +531,8 @@ LINEAR_ROW_SCALE_REV = R(
 # ---------------------------------------------------------------------------
 
 
-def _head(t: str) -> Op:
-    """The head-splitting view: view(t, S) then transpose(1, 2)."""
+def _head(t: Any) -> Op:
+    """Build the head-splitting view: view(t, S) then transpose(1, 2)."""
     return Op.make(
         "transpose", Op.make("reshape", t, shape="S"), dim0=1, dim1=2
     )
@@ -618,7 +620,7 @@ QKV_FUSE = R(
 # ---------------------------------------------------------------------------
 
 
-def _head_v(t: Any, shape_var: str) -> Op:
+def _head_v(t: Any, shape_var: Any) -> Op:
     """Head view with a per-projection shape metavariable."""
     return Op.make(
         "transpose",
@@ -629,7 +631,7 @@ def _head_v(t: Any, shape_var: str) -> Op:
 
 
 def _derive_split_sizes(bound: dict) -> dict | None:
-    """sizes = (|Q|, |K|, |V|) — each bound weight's output dim."""
+    """Sizes = (|Q|, |K|, |V|) — each bound weight's output dim."""
     sizes = []
     for k in ("Q", "K", "V"):
         w = bound.get(k)
@@ -709,9 +711,12 @@ QKV_FUSE_ASYM = R(
 
 
 def _check_repeat_chain(bound: dict, pre: str) -> bool:
-    """reshape(expand(unsqueeze(t, d))) must be exactly repeat_interleave
-    on dim d-1: unsqueeze inserts a 1, expand broadcasts only that dim
-    by r, and the reshape merges dims d-1,d into one."""
+    """Check reshape(expand(unsqueeze(t, d))) is repeat_interleave.
+
+    Must be exactly repeat_interleave on dim d-1: unsqueeze inserts a 1,
+    expand broadcasts only that dim by r, and the reshape merges dims
+    d-1,d into one.
+    """
     from catopt_core.typing import _shape_of as _so
 
     d = bound.get(f"$attr:UD{pre}")
@@ -743,8 +748,10 @@ def _check_repeat_chain(bound: dict, pre: str) -> bool:
 
 
 def _check_gqa_absorb(bound: dict) -> bool:
-    """Both k and v must be repeat-chains with the SAME repeat factor r,
-    and q's head count must equal kv_heads * r."""
+    """Require k and v to be repeat-chains with the same factor r.
+
+    q's head count must equal kv_heads * r.
+    """
     from catopt_core.typing import _shape_of as _so
 
     for side in ("k", "v"):
@@ -752,7 +759,7 @@ def _check_gqa_absorb(bound: dict) -> bool:
             return False
     if bound["$attr:ESk"] != bound["$attr:ESv"]:
         return False
-    d = bound["$attr:UDk"] % (len(_so(bound["k"])) + 1)
+    d = bound["$attr:UDk"] % (len(cast("tuple", _so(bound["k"]))) + 1)
     r = bound["$attr:ESk"][d]
     qs, ks = _so(bound["q"]), _so(bound["k"])
     if not (
@@ -844,7 +851,7 @@ def _const_val(t):
 
 
 def _check_score_transpose(bound) -> bool:
-    """k must be transposed on its last two dims — matmul(q, k^T)."""
+    """K must be transposed on its last two dims — matmul(q, k^T)."""
     ks = _shape_of(bound.get("K"))
     d1, d2 = bound.get("$attr:TD1"), bound.get("$attr:TD2")
     if not (
@@ -859,7 +866,7 @@ def _check_score_transpose(bound) -> bool:
 
 
 def _check_softmax_dim(bound) -> bool:
-    """softmax must be over the last dim (keys) of the score matrix."""
+    """Softmax must be over the last dim (keys) of the score matrix."""
     sd = bound.get("$attr:SD")
     qs = _shape_of(bound.get("Q"))
     if not (isinstance(sd, int) and isinstance(qs, tuple) and qs):

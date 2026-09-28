@@ -240,7 +240,9 @@ def test_scan_capture_and_replay_edges(monkeypatch):
     pv = {"a": _rand((d,), 1).clamp(-0.9, 0.9), "h": _rand((d,), 2)}
     mod = to_batched_scan_module(ir, param_values=pv)
     assert mod.is_batched
-    # CPU no-op capture leaves no graph
+    # CPU no-op capture leaves no graph (force the no-CUDA arm so this
+    # holds on a CUDA host too)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert mod.capture_cuda_graph(_rand((T, d), 7)) is mod
     assert mod._graph is None
 
@@ -636,9 +638,11 @@ def test_om_compile_replay_and_capture_edges(monkeypatch):
     assert mod(torch.zeros(1, 1, 1)).shape == (1, 1, 1)
     mod.drop_cuda_graph()
 
-    # module properties + CPU no-op capture
+    # module properties + CPU no-op capture (force the no-CUDA arm so
+    # this holds on a CUDA host too)
     assert mod.is_batched and mod.n_levels >= 1 and mod.n_blocks >= 1
     assert not mod.is_graph_captured
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert mod.capture_cuda_graph(tq, tk, tv) is mod  # CPU: no-op
     assert mod._graph is None
 
@@ -992,7 +996,9 @@ def test_omd_capture_and_replay_edges(monkeypatch):
     xv = _rand((T, d), 4)
     mod = to_batched_omd_module(ir, param_values=pv)
     assert mod.is_batched
-    # CPU no-op capture leaves no graph
+    # CPU no-op capture leaves no graph (force the no-CUDA arm so this
+    # holds on a CUDA host too)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert mod.capture_cuda_graph(xv) is mod and mod._graph is None
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
