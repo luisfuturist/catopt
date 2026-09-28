@@ -13,13 +13,14 @@ from catopt_core.cost import (
     _local_roofline,
     _memo_dispatch,
     _profile_constants,
+    fusion_member_key,
 )
 from catopt_core.egraph.types import (
     ENode,
     _LeafRegistry,
     _pattern_attrs,
 )
-from catopt_core.ir import Op
+from catopt_core.ir import Op, Var
 
 if TYPE_CHECKING:
     from catopt_core.egraph.certs import Certificate
@@ -223,6 +224,7 @@ class _ExtractMixin:
         overrides: dict[int, Any] | None = None,
         bans: dict[int, set] | None = None,
         _cache_out: dict | None = None,
+        fusion_epsilon: float = 0.0,
     ) -> Any:
         """Extract the minimum-cost term from the e-class at *eid*.
 
@@ -256,6 +258,23 @@ class _ExtractMixin:
         (``catopt_core.cost.param_bytes_cost``) opt out of that discount by
         setting ``charges_param_only`` on the function — a folded
         subtree still stores its leaves' values.
+
+        ``fusion_epsilon`` > 0 enables the fusion-preferred tie-break
+        (:meth:`extract_fused` passes 0.05): members whose totals land
+        within ``fusion_epsilon`` (relative to the class minimum) are
+        near-cost-equal under this model, so they compete on the
+        fusion key — ``(len(fusion_regions(term)),
+        not exposes_pointwise, nops)`` via
+        :func:`catopt_core.cost.fusion_member_key` — instead of
+        structural size alone.  The compiled lowering collapses
+        pointwise clusters into single kernels, so among near-ties the
+        member with fewer predicted regions / a fusible root is the
+        one that actually runs cheaper under ``torch.compile``.  The
+        probe reuses the shared cost memo — each distinct candidate
+        term is region-counted once across all extraction passes —
+        and only fires when a class has more than one in-band member.
+        ``fusion_epsilon=0`` (default) disables the pass entirely and
+        selection is unchanged.
 
         Cyclic nodes (a class reachable from itself through rewrite-
         introduced unions) are skipped: they cannot be extracted.
@@ -367,6 +386,12 @@ class _ExtractMixin:
             best_ct = 0.0
             best_param_only = False
             best_nops = 0
+            # Every valid candidate, only kept when the fusion
+            # tie-break is armed: (total, term, used, local, cfn(term),
+            # param_only, nops) — the same fields the incremental
+            # winner slots carry, so the post-loop pick can re-seat a
+            # near-tie winner without re-walking children.
+            cands: list[tuple] = []
             for node in nodes:
                 if banned and node in banned:
                     continue  # excluded enode (extract_best_bounded)
@@ -374,15 +399,25 @@ class _ExtractMixin:
                     key = node.attrs[0][1] if node.attrs else "??"
                     term = _LeafRegistry.decode(key)
                     total = cfn(term)
+                    if fusion_epsilon:
+                        cands.append(
+                            (
+                                total,
+                                term,
+                                frozenset({eclass_id}),
+                                total,
+                                total,
+                                not isinstance(term, Var),
+                                0,
+                            )
+                        )
                     if best_total is None or total < best_total:
-                        from catopt_core.ir import Var as _Var
-
                         best_total = total
                         best_term = term
                         best_used = frozenset({eclass_id})
                         best_local = total
                         best_ct = total
-                        best_param_only = not isinstance(term, _Var)
+                        best_param_only = not isinstance(term, Var)
                         best_nops = 0
                     continue
 
@@ -492,6 +527,18 @@ class _ExtractMixin:
                 # param-only class, for example).  Counted incrementally
                 # from child caches — no tree walk.
                 nops = child_nops + 1
+                if fusion_epsilon:
+                    cands.append(
+                        (
+                            total,
+                            term,
+                            used,
+                            local,
+                            ct,
+                            param_only,
+                            nops,
+                        )
+                    )
                 if (
                     best_total is None
                     or total < best_total
@@ -504,6 +551,49 @@ class _ExtractMixin:
                     best_ct = ct
                     best_param_only = param_only
                     best_nops = nops
+            if fusion_epsilon and len(cands) > 1:
+                # Fusion-preferred near-tie: members priced within
+                # fusion_epsilon of the class minimum are cost-
+                # indistinguishable under this model's resolution, so
+                # pick the one the compiled lowering runs cheapest —
+                # fewest predicted kernels (fusion_regions), then a
+                # root a pointwise consumer could absorb, then fewest
+                # ops.  Region probes reuse the shared memo `m`, so
+                # each distinct candidate is counted once ever; the
+                # band is anchored at the minimum, making the pick
+                # order-independent (cands is already in the canonical
+                # sorted member order, so equal keys stay stable).
+                floor = min(c[0] for c in cands)
+                band = [
+                    c
+                    for c in cands
+                    if c[0] <= floor + fusion_epsilon * abs(floor)
+                ]
+                if len(band) > 1:
+                    win = min(
+                        band,
+                        key=lambda c: (
+                            *fusion_member_key(c[1], m),
+                            c[6],
+                        ),
+                    )
+                    (
+                        best_total,
+                        best_term,
+                        best_used,
+                        best_local,
+                        best_ct,
+                        best_param_only,
+                        best_nops,
+                    ) = (
+                        win[0],
+                        win[1],
+                        frozenset(win[2]),
+                        win[3],
+                        win[4],
+                        win[5],
+                        win[6],
+                    )
             in_progress.discard(eclass_id)
             if best_term is None:
                 best_total = float("inf")
@@ -553,6 +643,43 @@ class _ExtractMixin:
         if _cache_out is not None:
             _cache_out.update(cache)
         return term
+
+    def extract_fused(
+        self,
+        eid: int,
+        cost_fn,
+        *,
+        fusion_epsilon: float = 0.05,
+        overrides: dict[int, Any] | None = None,
+        bans: dict[int, set] | None = None,
+        _cache_out: dict | None = None,
+    ) -> Any:
+        """Extract preferring fusion-optimal members among near-ties.
+
+        :meth:`extract_best` with ``fusion_epsilon`` armed (default
+        5%): within each e-class, members priced inside the band
+        compete on :func:`catopt_core.cost.fusion_member_key` —
+        predicted kernel count of the extracted member subtree, then
+        whether its root can merge into a pointwise consumer's
+        region — rather than structural size.  This is the
+        extraction-side counterpart of the compiled criterion: local
+        per-class pricing cannot see that two near-cost-equal members
+        differ by a kernel launch once regions collapse, so the
+        tie-break picks the member the ``"compiled"`` lowering would
+        fuse best.
+
+        ``overrides``/``bans``/``_cache_out`` pass straight through to
+        :meth:`extract_best`; ``fusion_epsilon=0`` reproduces plain
+        extraction exactly.
+        """
+        return self.extract_best(
+            eid,
+            cost_fn,
+            overrides=overrides,
+            bans=bans,
+            _cache_out=_cache_out,
+            fusion_epsilon=fusion_epsilon,
+        )
 
     def extract_best_bounded(
         self,

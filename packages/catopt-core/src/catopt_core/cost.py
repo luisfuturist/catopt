@@ -14,6 +14,8 @@ Models provided include:
   executor's fusion regions.
 * fusion_regions - partition a term's op-DAG into Inductor-style
   pointwise-fusion regions (one region = one compiled kernel).
+* fusion_member_key - the per-member tie-break extraction uses to
+  prefer fusion-friendly members among near-cost-ties.
 * fused_cost_for - the compiled lowering's price: each fusion region
   costs one launch + the max of its summed member FLOPs vs its
   external/boundary memory traffic; one dispatch per compiled graph.
@@ -2176,6 +2178,55 @@ def fusion_regions(
         ]
     memo[ck] = tuple(out)
     return memo[ck]
+
+
+def _exposes_pointwise(t: Any, memo: dict) -> bool:
+    """Whether *t*'s output can merge into a pointwise consumer's region.
+
+    Mirrors :func:`fusion_regions`' effective-arg forwarding: a
+    pointwise root exposes itself; transparent plumbing (views,
+    carrier packaging) forwards the question to its own args; a
+    param-only fold, a leaf, or a boundary op is a kernel *input* —
+    there is no member op for a consumer to union with.
+    """
+    if not isinstance(t, Op) or _folds_to_param(t, None, memo):
+        return False
+    if t.op in _FUSION_POINTWISE_OPS:
+        return True
+    if t.op in _FUSION_TRANSPARENT_OPS:
+        return any(_exposes_pointwise(a, memo) for a in t.args)
+    return False
+
+
+def fusion_member_key(
+    term: Any, memo: dict | None = None
+) -> tuple[int, int]:
+    """Fusion tie-break key for near-cost-equal e-class members.
+
+    ``(n_regions, boundary)``, compared lexicographically — smaller
+    wins — by :meth:`EGraph.extract_best` when ``fusion_epsilon``
+    puts several members inside one cost band:
+
+    * ``n_regions`` — ``len(fusion_regions(term))``: the member
+      subtree's predicted kernel count under the compiled lowering.
+      A member whose pointwise internals collapse into one region
+      beats a member that must launch several kernels.
+    * ``boundary`` — 0 when the term's root can itself join a
+      pointwise consumer's region (:func:`_exposes_pointwise`), 1
+      otherwise.  Region count alone cannot see this: a pointwise
+      member and a ``matmul`` member can both occupy one region, yet
+      only the pointwise one lets a *parent* kernel absorb it.
+
+    ``memo`` is the shared extraction cost memo —
+    :func:`fusion_regions`, ``_folds_to_param`` and ``_shape_of`` all
+    key into it, so the probe prices each distinct term once across
+    every extraction pass.
+    """
+    memo = {} if memo is None else memo
+    return (
+        len(fusion_regions(term, memo)),
+        0 if _exposes_pointwise(term, memo) else 1,
+    )
 
 
 def _region_traffic(
