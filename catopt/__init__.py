@@ -28,10 +28,12 @@ _ALIAS = {
     "catopt.criteria": "catopt_optimize.criteria",
     "catopt.egraph": "catopt_core.egraph",
     "catopt.egraph.terms": "catopt_core.egraph.terms",
+    "catopt.export": "catopt_optimize.export",
     "catopt.executors": "catopt_torch.executors",
     "catopt.ir": "catopt_core.ir",
     "catopt.laws": "catopt_core.laws",
     "catopt.laws.base": "catopt_core.laws.base",
+    "catopt.laws.layout": "catopt_core.laws.layout",
     "catopt.laws.pairing": "catopt_core.laws.pairing",
     "catopt.laws.tensor": "catopt_core.laws.tensor",
     "catopt.meta": "catopt_core.meta",
@@ -129,6 +131,12 @@ with _suppress(ModuleNotFoundError):  # partial install only
         criteria_cost,
         peak_bytes_cost,
     )
+    from catopt_optimize.export import (
+        ExportError,
+        export_optimized,
+        load_optimized,
+        save_optimized,
+    )
     from catopt_optimize.optimize import optimize_model
     from catopt_optimize.runners import (
         ChainedRunner,
@@ -169,6 +177,7 @@ __all__ = [
     "DepthCriterion",
     "EGraph",
     "ENode",
+    "ExportError",
     "FlopsCriterion",
     "GenericRunner",
     "IRModule",
@@ -189,12 +198,15 @@ __all__ = [
     "build_omd_plan",
     "count_cost",
     "criteria_cost",
+    "export_optimized",
     "export_to_ir",
     "flops_cost",
     "ir_to_torch_module",
     "is_omd_apply_term",
+    "load_optimized",
     "optimize_model",
     "peak_bytes_cost",
     "runner_candidate",
+    "save_optimized",
     "to_batched_omd_module",
 ]

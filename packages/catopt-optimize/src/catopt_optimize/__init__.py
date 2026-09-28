@@ -20,6 +20,12 @@ from catopt_optimize.criteria import (
     criteria_cost,
     peak_bytes_cost,
 )
+from catopt_optimize.export import (
+    ExportError,
+    export_optimized,
+    load_optimized,
+    save_optimized,
+)
 from catopt_optimize.optimize import (
     OptimizationResourceError,
     optimize_compositional,
@@ -43,6 +49,7 @@ __all__ = [
     "Criterion",
     "CudaGraphRunner",
     "DepthCriterion",
+    "ExportError",
     "FlopsCriterion",
     "GenericRunner",
     "LatencyCriterion",
@@ -50,9 +57,12 @@ __all__ = [
     "OptimizationResourceError",
     "Runner",
     "criteria_cost",
+    "export_optimized",
+    "load_optimized",
     "optimize_compositional",
     "optimize_model",
     "optimize_model_autotuned",
     "peak_bytes_cost",
     "runner_candidate",
+    "save_optimized",
 ]
