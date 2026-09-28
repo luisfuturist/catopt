@@ -1580,6 +1580,207 @@ def _randn_param(term: Param) -> torch.Tensor:
     return torch.randn(*shape)
 
 
+#: ``_plan_cache`` sentinel for a term that cannot be plan-flattened
+#: (a non-term root such as ``42`` — the strict-eval ``TypeError``
+#: stays delegated to :func:`eval_term`).
+_UNPLANNED: Any = object()
+
+
+class _EvalPlan:
+    """A flattened, slot-indexed eval tape for one term DAG.
+
+    Plan 0003: the recursive :func:`eval_term` walk is the generic
+    executor's dispatch floor — per node it pays an isinstance chain,
+    a content-hash memo get/set, a ``bindings`` lookup, an args list
+    build and a ``dict(term.attrs)`` copy.  The plan replaces all of
+    it with a linear tape evaluated in one loop:
+
+    * **Slots** — every distinct subterm (DAG-shared nodes once, keyed
+      on the interned term object) owns one slot in a per-call
+      ``vals`` list; operand references are slot indices, so no
+      recursion and no memo dict ever runs.
+    * **Leaves** — ``var_fills`` resolve ``Var`` nodes by name through
+      the eval env (``env.get(name, x)``) or positionally from the
+      forward args (``xs[pos] if pos < len(xs) else x`` — the same
+      value, since ``forward``'s env only ever maps input names plus
+      ``"self"``); ``param_fills`` re-read ``param_map.get(name)``
+      EVERY call (``load_state_dict`` visibility) with the
+      ``_randn_param`` fallback for unregistered Params;
+      ``const_fills`` re-mint ``torch.tensor(value)`` per call so the
+      ambient default dtype at CALL time applies — caching the tensor
+      would freeze the build-time dtype.
+    * **Steps** — ``(out_slot, op_idx, arg_slots, attrs)``; ``op_idx``
+      indexes ``op_names``, whose bindings are resolved through the
+      module's op table per call — post-construction
+      ``_IR_TO_TORCH[op] = fn`` overrides keep reaching already-built
+      modules, and a deleted binding still raises the strict
+      ``ValueError`` at eval.
+
+    Plans are immutable once built and shared via the module's
+    ``_plan_cache`` — safe under concurrent forwards (two racers
+    build equal plans).
+    """
+
+    __slots__ = (
+        "const_fills",
+        "n_slots",
+        "op_names",
+        "param_fills",
+        "root_slot",
+        "steps",
+        "var_fills",
+    )
+
+    def __init__(
+        self,
+        n_slots: int,
+        var_fills: tuple,
+        param_fills: tuple,
+        const_fills: tuple,
+        steps: tuple,
+        op_names: tuple,
+        root_slot: int,
+    ) -> None:
+        self.n_slots = n_slots
+        self.var_fills = var_fills
+        self.param_fills = param_fills
+        self.const_fills = const_fills
+        self.steps = steps
+        self.op_names = op_names
+        self.root_slot = root_slot
+
+    @staticmethod
+    def build(term: Any, input_pos: dict[str, int]) -> _EvalPlan | None:
+        """Flatten ``term`` into a slot tape; ``None`` when unplannable.
+
+        Iterative post-order (scan-domain prefix chains nest O(T)
+        deep — past the recursion limit on long sequences).  A node
+        that is not a ``Var``/``Param``/``Const``/``Op`` (a stray
+        metavariable, a bare ``42`` root) makes the whole term
+        unplannable — the caller falls back to ``eval_term``'s strict
+        ``TypeError`` path.
+        """
+        slot_of: dict[Any, int] = {}
+        var_fills: list[tuple[int, str, int]] = []
+        param_fills: list[tuple[int, str, Any]] = []
+        const_fills: list[tuple[int, Any]] = []
+        steps: list[tuple[int, int, tuple, Any]] = []
+        op_names: list[str] = []
+        op_index: dict[str, int] = {}
+        n = 0
+        stack: list[tuple[Any, bool]] = [(term, False)]
+        while stack:
+            t, done = stack.pop()
+            if done:
+                s = n
+                n += 1
+                oi = op_index.get(t.op)
+                if oi is None:
+                    oi = len(op_names)
+                    op_index[t.op] = oi
+                    op_names.append(t.op)
+                steps.append(
+                    (
+                        s,
+                        oi,
+                        tuple(slot_of[a] for a in t.args),
+                        t.attrs or None,
+                    )
+                )
+                slot_of[t] = s
+                continue
+            if t in slot_of:
+                continue
+            if isinstance(t, Op):
+                stack.append((t, True))
+                stack.extend((a, False) for a in t.args)
+            elif isinstance(t, Var):
+                slot_of[t] = n
+                var_fills.append((n, t.name, input_pos.get(t.name, -1)))
+                n += 1
+            elif isinstance(t, Param):
+                slot_of[t] = n
+                param_fills.append((n, t.name, t))
+                n += 1
+            elif isinstance(t, Const):
+                slot_of[t] = n
+                const_fills.append((n, t.value))
+                n += 1
+            else:
+                return None
+        return _EvalPlan(
+            n_slots=n,
+            var_fills=tuple(var_fills),
+            param_fills=tuple(param_fills),
+            const_fills=tuple(const_fills),
+            steps=tuple(steps),
+            op_names=tuple(op_names),
+            root_slot=slot_of[term],
+        )
+
+    def run_xs(self, xs: tuple, pmap_get: Any, bget: Any) -> Any:
+        """``forward`` entry: Vars resolve positionally from ``xs``.
+
+        ``pmap_get``/``bget`` are the bound ``.get``s of the module's
+        ``_param_map`` and ``_torch_bindings``.
+        """
+        v: list = [None] * self.n_slots
+        n = len(xs)
+        x = xs[0] if n else None
+        for s, _name, pos in self.var_fills:
+            v[s] = xs[pos] if 0 <= pos < n else x
+        return self._run_tail(v, pmap_get, bget)
+
+    def run_env(
+        self, env: Any, x: Any, pmap_get: Any, bget: Any
+    ) -> Any:
+        """``_eval`` entry: Vars resolve through the caller's env dict."""
+        v: list = [None] * self.n_slots
+        eget = (env or {}).get
+        for s, name, _pos in self.var_fills:
+            v[s] = eget(name, x)
+        return self._run_tail(v, pmap_get, bget)
+
+    def _run_tail(self, v: list, pmap_get: Any, bget: Any) -> Any:
+        """Fill param/const slots, resolve bindings, run the tape."""
+        for s, name, t in self.param_fills:
+            p = pmap_get(name)
+            v[s] = p if p is not None else _randn_param(t)
+        for s, c in self.const_fills:
+            v[s] = torch.tensor(c)
+        fns: list = []
+        for nm in self.op_names:
+            f = bget(nm)
+            if f is None:
+                raise ValueError(f"No torch binding for op '{nm}'")
+            fns.append(f)
+        for o, fi, a, kw in self.steps:
+            f = fns[fi]
+            if kw is None:
+                na = len(a)
+                if na == 1:
+                    v[o] = f(v[a[0]])
+                elif na == 2:
+                    v[o] = f(v[a[0]], v[a[1]])
+                elif na == 3:
+                    v[o] = f(v[a[0]], v[a[1]], v[a[2]])
+                else:
+                    v[o] = f(*[v[i] for i in a])
+            else:
+                na = len(a)
+                if na == 0:
+                    v[o] = f(**kw)
+                elif na == 1:
+                    v[o] = f(v[a[0]], **kw)
+                elif na == 2:
+                    v[o] = f(v[a[0]], v[a[1]], **kw)
+                elif na == 3:
+                    v[o] = f(v[a[0]], v[a[1]], v[a[2]], **kw)
+                else:
+                    v[o] = f(*[v[i] for i in a], **kw)
+        return v[self.root_slot]
+
+
 def eval_term(
     term: Any,
     *,
@@ -1595,7 +1796,9 @@ def eval_term(
     """Evaluate an IR term against concrete environments.
 
     Single source for the eval-term family (plan 0002 phase D) —
-    :meth:`IRModule._eval` (strict runtime eval), the permissive
+    :meth:`IRModule._eval` (strict runtime eval; the hot path itself
+    runs the :class:`_EvalPlan` slot tape and delegates here only for
+    seeded-memo calls and unplannable terms), the permissive
     compile-time fold ``optimize._eval_const``, and
     ``_fold_weight_chains``' shallow fold
     all delegate here.  Leaf semantics:
@@ -1740,6 +1943,15 @@ class IRModule(torch.nn.Module):
         self._uses_memo: dict = {}
         self._root = self._fold_weight_chains(ir.root)
         self._build_params()
+        # Plan-tape eval (plan 0003): last-wins name→position table so
+        # the forward runner resolves Vars straight from ``xs`` without
+        # building the env dict.  ``_plan_cache`` memoises per-term
+        # plans for ``_eval``/``_eval_fast`` leaf evaluation.
+        self._input_pos = {
+            inp.name: i for i, inp in enumerate(self._inputs)
+        }
+        self._plan_cache: dict[Any, Any] = {}
+        self._root_plan = self._plan_for(self._root)
 
     def _uses_input(self, term: Any) -> bool:
         """Return True if the term mentions a data-dependent leaf.
@@ -2063,8 +2275,33 @@ class IRModule(torch.nn.Module):
             setattr(self, name, p)
             self._param_map[name] = p
 
+    def _plan_for(self, term: Any) -> _EvalPlan | None:
+        """Fetch (or build and cache) the eval plan for ``term``.
+
+        ``None`` when the term cannot be flattened — a non-term node
+        anywhere in the DAG.  Cached under the (interned, content-keyed)
+        term, so DAG-equal terms share one plan; builds are read-only
+        afterwards.
+        """
+        plan = self._plan_cache.get(term, _MISS)
+        if plan is _MISS:
+            built = _EvalPlan.build(term, self._input_pos)
+            plan = built if built is not None else _UNPLANNED
+            self._plan_cache[term] = plan
+        return None if plan is _UNPLANNED else plan
+
     def forward(self, *xs: Any) -> Any:
         """Run the module: bind inputs and evaluate the root."""
+        plan = self._root_plan
+        if plan is not None:
+            # The tape's positional Var fills compute exactly what the
+            # env dict would: ``xs[i] if i < len(xs) else x`` per
+            # input name, ``x`` for everything else.
+            return plan.run_xs(
+                xs, self._param_map.get, self._torch_bindings.get
+            )
+        # Unplannable root (e.g. a bare non-term): the strict recursive
+        # path preserves eval_term's exact failure semantics.
         x = cast(torch.Tensor, xs[0] if xs else None)
         env: dict[str, Any] = {"self": x}
         # Map input placeholders positionally to forward args
@@ -2079,23 +2316,72 @@ class IRModule(torch.nn.Module):
         x: Any,
         memo: dict[Any, Any],
     ) -> Any:
-        """Strict runtime evaluation — delegates to :func:`eval_term`.
+        """Strict runtime evaluation — plan tape, or :func:`eval_term`.
 
         ``var_default=x`` is the single-input "self" fallback (``env``
         always carries ``"self"`` → ``x``, so a Var missing from ``env``
         resolves to the first input); ``param_default=_randn_param``
         materialises Params that never registered (unshaped
         ``typ.size is None``); shared subtrees dedup through ``memo``.
+
+        A non-empty ``memo`` means caller-seeded short-circuits (the
+        omd carrier seeds batched map/projection results INTO memo —
+        they may hit at ANY depth), so the recursive evaluator runs
+        verbatim.  An empty/absent memo gets the plan tape — internal
+        dedup is structural (slots), and the top-level result is still
+        written back under ``term`` when it is an ``Op``, matching
+        ``eval_term``'s observable memo contract.
         """
-        return eval_term(
-            term,
-            var_env=env,
-            var_default=x,
-            param_env=self._param_map,
-            param_default=_randn_param,
-            bindings=self._torch_bindings,
-            memo_env=memo,
-            strict=True,
+        if memo:
+            return eval_term(
+                term,
+                var_env=env,
+                var_default=x,
+                param_env=self._param_map,
+                param_default=_randn_param,
+                bindings=self._torch_bindings,
+                memo_env=memo,
+                strict=True,
+            )
+        plan = self._plan_for(term)
+        if plan is None:
+            return eval_term(
+                term,
+                var_env=env,
+                var_default=x,
+                param_env=self._param_map,
+                param_default=_randn_param,
+                bindings=self._torch_bindings,
+                memo_env=memo,
+                strict=True,
+            )
+        out = plan.run_env(
+            env, x, self._param_map.get, self._torch_bindings.get
+        )
+        if memo is not None and isinstance(term, Op):
+            memo[term] = out
+        return out
+
+    def _eval_fast(self, term: Any, env: dict[str, Any], x: Any) -> Any:
+        """Memo-free strict eval for leaf terms — the tape, always.
+
+        Same semantics as ``_eval`` without the caller memo: used by
+        :meth:`BatchedExecutorBase.ev_factory` where the memo contract
+        is discharged by the closure itself.
+        """
+        plan = self._plan_for(term)
+        if plan is None:
+            return eval_term(
+                term,
+                var_env=env,
+                var_default=x,
+                param_env=self._param_map,
+                param_default=_randn_param,
+                bindings=self._torch_bindings,
+                strict=True,
+            )
+        return plan.run_env(
+            env, x, self._param_map.get, self._torch_bindings.get
         )
 
 

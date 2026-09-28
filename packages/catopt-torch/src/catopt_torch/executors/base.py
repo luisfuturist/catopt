@@ -32,6 +32,7 @@ from collections.abc import Callable
 from typing import Any, Self
 
 import torch
+from catopt_core.ir import Op
 
 __all__ = ["BatchedExecutorBase", "level_schedule", "slot_gathers"]
 
@@ -248,12 +249,38 @@ class BatchedExecutorBase:
     ) -> Callable[[Any], Any]:
         """Build the ``ev(t)`` leaf-evaluation closure.
 
-        ``_forward_impl`` uses it as ``t → eval_mod._eval(t, env, x,
-        memo_env)``, memoising into the caller's ``memo_env``.
+        Semantics of ``eval_mod._eval(t, env, x, memo_env)``: ``Op``
+        results dedup through (and are written back into) the caller's
+        ``memo_env``, and a hit returns the stored object verbatim.
+
+        The fast route — ``eval_mod._eval_fast`` (the slot-tape plan,
+        no memo walk) — applies while ``memo_env`` holds only entries
+        this closure wrote: ``_eval_fast``'s internal dedup is
+        structural, and the top-level write/hit above reproduces the
+        observable memo contract.  Once the caller seeds memo with
+        batched subterm results (omd's ``*_seeds`` — they must hit at
+        ANY depth, not just the leaf root), the recursive evaluator
+        takes over permanently for this env.  ``isinstance(t, Op)``
+        gates the memo touchpoints exactly like ``eval_term`` (leaves
+        never consult it).
         """
+        eval_mod = self.eval_mod
+        memo: dict[Any, Any] = memo_env if memo_env is not None else {}
+        ours: set[Any] = set()
 
         def ev(t: Any) -> Any:
-            return self.eval_mod._eval(t, env, x, memo_env)
+            if isinstance(t, Op):
+                hit = memo.get(t)
+                if hit is not None:
+                    return hit
+            if len(memo) == len(ours):
+                out = eval_mod._eval_fast(t, env, x)
+            else:
+                out = eval_mod._eval(t, env, x, memo)
+            if isinstance(t, Op):
+                ours.add(t)
+                memo[t] = out
+            return out
 
         return ev
 
