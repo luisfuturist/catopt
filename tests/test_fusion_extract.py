@@ -218,3 +218,26 @@ def test_fused_overrides_and_bans_pass_through():
         root, count_cost, overrides={root: ov_node}
     )
     assert forced.op == "matmul"
+
+
+def test_optimize_model_fusion_epsilon_kwarg():
+    """``optimize_model(fusion_epsilon=…)`` arms the near-tie band and
+    records it in stats; 0 keeps byte-identical selection."""
+    import torch
+    import torch.nn as nn
+    from catopt.optimize import optimize_model
+
+    class M(nn.Module):
+        def forward(self, x):
+            return torch.sigmoid(torch.sigmoid(x))
+
+    m = M().eval().double()
+    x = torch.randn(4, 8, dtype=torch.float64)
+    mod, stats = optimize_model(
+        m, x, fusion_epsilon=0.05, verbose=False
+    )
+    assert stats["fusion_epsilon"] == 0.05
+    with torch.no_grad():
+        assert torch.allclose(mod(x), m(x))
+    _mod2, stats2 = optimize_model(m, x, verbose=False)
+    assert "fusion_epsilon" not in stats2

@@ -572,6 +572,7 @@ def optimize_model(
     criteria: (
         dict[str, float] | Criteria | Criterion | list | tuple | None
     ) = None,
+    fusion_epsilon: float = 0.0,
     symmetry_budget: int | None = 2048,
     ops: OpTable | None = None,
     source: Source | None = None,
@@ -624,6 +625,16 @@ def optimize_model(
         when ``cost_fn`` is ``None`` — precedence is explicit
         ``cost_fn`` > ``criteria`` > the default model.
         ``stats["criteria"]`` records the normalised axes priced.
+    fusion_epsilon : float, default 0.0
+        Fusion-preferred near-tie band for extraction — forwarded to
+        :meth:`EGraph.extract_best`: members priced within this
+        relative band of the class minimum compete on
+        :func:`catopt_core.cost.fusion_member_key` (predicted kernel
+        count, then root fusibility) instead of structural size.
+        Arm it when the delivered module will be ``torch.compile``d
+        (``CompiledRunner`` / autotune's ``"compiled"`` candidate —
+        ``0.05`` is the validated band); ``0`` disables and selection
+        is byte-identical to before.
     symmetry_budget : int, optional
         Per-rule enode budget for the expansive rules in
         ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
@@ -833,11 +844,15 @@ def optimize_model(
 
     stats["rule_fires"] = dict(eg.rule_fires)
     stats["criteria"] = criteria_used
+    if fusion_epsilon:
+        stats["fusion_epsilon"] = fusion_epsilon
     if verbose:
         print(f"  E-graph: {stats}")
 
     # -- Extract best term -----------------------------------------------
-    best_term = eg.extract_best(root_eid, cost_fn)
+    best_term = eg.extract_best(
+        root_eid, cost_fn, fusion_epsilon=fusion_epsilon
+    )
     if groups:
         # Coordinated extraction: force every paired member to its split
         # enode AND steer consumers through the shared GEMM.  Compare
