@@ -3,11 +3,14 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "catopt-optimize"
+name = "catopt-cuda"
 version = "0.1.0dev"
-description = "Backend-neutral optimizer orchestrator for catopt: pipeline verbs, strategies, regime frontier."
+description = "CUDA-graph delivery mechanism for catopt — the CUDA-coupled runner package (plan 0007)"
 requires-python = ">=3.11"
-dependencies = ["catopt-core"]
+dependencies = [
+    "catopt-core",
+    "torch>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

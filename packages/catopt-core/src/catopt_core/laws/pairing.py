@@ -477,7 +477,7 @@ def _has_add(eg: Any, cid: int) -> bool:
 
 
 def _uniform_input(eg: Any, lfs: list):
-    """The shared expert-input shape — or ``None`` when unstackable.
+    """Return the shared expert-input shape — ``None`` when unstackable.
 
     The batched operand ``stack(h_0..h_{E-1})`` is spelled only when
     every ``h_e`` resolves to ONE fully-known shape of rank >= 2:

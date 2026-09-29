@@ -1,14 +1,17 @@
-"""Top-level optimization pipeline.
+"""Top-level optimization pipeline — backend-neutral (plan 0007).
 
 This module implements the four-phase killer experiment:
 
-Phase 1 — Equivalence:   PyTorch → IR
+Phase 1 — Equivalence:   model → IR (through the ``source`` port)
 Phase 2 — Search:        IR → e-graph → equality saturation → best term
-Phase 3 — Lower:          best term → torch.nn.Module
+Phase 3 — Lower:          best term → runnable (through the ``sink``
+                        port's executor routing)
 Phase 4 — Compare:        benchmark vs. vanilla TorchInductor
 
 The public surface is the *verb* pair plus the configured entry
-object (plan 0006):
+object (plan 0006), and the orchestrator is backend-neutral
+(plan 0007): it orchestrates ANY backend through the
+:class:`catopt_core.ports` protocols and imports no torch.
 
 * :func:`search` — phases 1+2: ``model -> SearchResult`` (the IR,
   saturated e-graph, extracted term, leaf values and search-record
@@ -16,22 +19,29 @@ object (plan 0006):
 * :func:`lower` — phase 3 (+verify): ``SearchResult -> LowerResult``;
   re-lowering the same result under different runners delivers
   different executables from ONE search.
-* :class:`Optimizer` — the configured entry point: required
-  ``source``/``sink`` ports plus ``criteria``/``runner`` defaults;
+* :class:`Optimizer` — the configured entry point: an explicit
+  :class:`~catopt_core.pipeline.Backend` (or explicit
+  ``source``/``sink``/``composer``/``meter`` ports — no default
+  backend) plus ``criteria``/``runner`` delivery defaults;
   ``.search`` / ``.lower`` / ``.optimize`` / ``.discover``.
 * :class:`Monolithic` / :class:`Compositional` / :class:`Autotuned` —
   the :class:`~catopt_core.ports.Strategy` seam behind
   ``Optimizer.optimize(..., strategy=...)``.
 
-The historical ``optimize_model`` / ``optimize_compositional`` /
-``optimize_model_autotuned`` / ``discover_alternatives`` names remain
-as one-line wrappers over the verbs (removed in 0008).
+Backend specifics live on the adapter side: carrier executors arrive
+through ``sink.executors``, causal-mask specialization through the
+sink's optional ``specialize_causal`` hook, per-block structural
+machinery through the ``composer`` port, and wall-clock timing
+through the ``meter`` port.  The deprecated ``optimize_*`` wrappers
+with their torch defaults moved to ``catopt_torch.api`` (resolving
+lazily here for compatibility); ``Optimizer(backend=TorchBackend())``
+is the supported torch spelling — no default is assumed anywhere in
+this package.
 """
 
 from __future__ import annotations
 
-import contextlib
-import copy
+import importlib
 import inspect
 import logging
 import sys
@@ -40,31 +50,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-import torch
-from catopt_carriers.om_lower import (
-    build_om_plan,
-    is_om_apply_term,
-    to_batched_om_module,
-)
-from catopt_carriers.omd_lower import (
-    build_omd_plan,
-    is_omd_apply_term,
-    to_batched_omd_module,
-)
-from catopt_carriers.scan_lower import (
-    build_scan_plan,
-    is_scan_apply_term,
-    to_batched_scan_module,
-)
-from catopt_carriers.trace_lift import (
-    lift_scan_to_applyd,
-    lift_scan_to_trace,
-)
-from catopt_carriers.xcarrier import (
-    gather_apply_stack,
-    gather_applyd_stack,
-    omd_tree_lift,
-)
 from catopt_core.cost import (
     backend_cost,
     dag_cost,
@@ -83,23 +68,17 @@ from catopt_core.laws import (
     share_duplicate_param_slices,
     share_duplicate_params,
 )
-from catopt_core.ops import OpTable
-from catopt_core.pipeline import LowerResult, SearchResult
+from catopt_core.pipeline import Backend, LowerResult, SearchResult
 from catopt_core.ports import (
     Capabilities,
+    Composer,
     CostFn,
-    Executor,
-    OpRegistry,
+    ExecutorSpec,
+    Meter,
+    Runner,
     Sink,
     Source,
     Strategy,
-)
-from catopt_torch.adapters import TorchSink, TorchSource
-from catopt_torch.report import (
-    BlockReport,
-    CompositionalReport,
-    OptReport,
-    verify_module,
 )
 
 from catopt_optimize.criteria import (
@@ -107,7 +86,7 @@ from catopt_optimize.criteria import (
     Criterion,
     criteria_cost,
 )
-from catopt_optimize.runners import IdentityRunner, Runner
+from catopt_optimize.runners import IdentityRunner
 
 #: Rules whose saturation closure is combinatorially explosive on
 #: stacked blocks: the pure-symmetry monoid laws enumerate every
@@ -117,7 +96,7 @@ from catopt_optimize.runners import IdentityRunner, Runner
 #: generates cross-product closures (distribute splits a sum into two
 #: matmuls that factor rules then re-pair against *every other*
 #: summand — enodes grew 337 → 40k in four iterations on a
-#: DeepParallel stack).  ``optimize_model`` runs these under a
+#: DeepParallel stack).  The pipeline runs these under a
 #: per-rule enode budget — *bounded saturation* — which truncates the
 #: reordering closure but leaves every content-bearing rewrite at the
 #: exact fixed point.  Structural fusions (qkv/swiglu/sdpa folds,
@@ -168,26 +147,32 @@ class OptimizationResourceError(RuntimeError):
     Sources: the e-graph reached ``max_enodes`` (checked once per
     saturation iteration inside ``EGraph.run`` and again at phase
     boundaries here), the process/device memory footprint crossed
-    ``max_memory_mb``, or a ``torch.cuda.OutOfMemoryError`` /
-    ``MemoryError`` surfaced anywhere in the export → saturation →
-    lowering pipeline.
+    ``max_memory_mb``, or an allocator-failure exception — host
+    ``MemoryError``, the backend's ``OutOfMemoryError`` (torch's
+    ``torch.cuda.OutOfMemoryError`` is one), or the RuntimeError
+    variants allocator failures surface as — anywhere in the
+    export → saturation → lowering pipeline.
 
     ``optimize_compositional`` records these as ordinary per-block
     failures with ``reason == "resource_limit"``; a standalone
-    :func:`optimize_model` caller gets this dedicated type instead of a
+    ``optimize_model`` caller gets this dedicated type instead of a
     raw OOM.
     """
 
 
 def _looks_like_oom(exc: BaseException) -> bool:
-    """Return True for allocator-failure exceptions.
+    """Return True for allocator-failure exceptions — backend-agnostic.
 
-    Host ``MemoryError``, ``torch.cuda.OutOfMemoryError`` and the
-    ``RuntimeError`` variants allocator failures surface as on older
-    torch / host-side paths ("CUDA out of memory", DefaultCPUAllocator's
+    Host ``MemoryError``, a backend-named ``*OutOfMemoryError*`` class
+    (``torch.cuda.OutOfMemoryError`` and any future backend's
+    equivalent), and the ``RuntimeError`` variants allocator failures
+    surface as ("CUDA out of memory", DefaultCPUAllocator's
     "can't allocate memory").
     """
-    if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
+    if isinstance(exc, MemoryError) or (
+        isinstance(exc, RuntimeError)
+        and "outofmemoryerror" in type(exc).__name__.lower()
+    ):
         return True
     if isinstance(exc, RuntimeError):
         msg = str(exc).lower()
@@ -223,11 +208,14 @@ def _oom_to_resource_error(fn):
     return wrapper
 
 
-def _current_memory_mb() -> float:
+def _current_memory_mb(meter: Any = None) -> float:
     """Return the current process memory footprint in MiB.
 
-    Host RSS plus CUDA-allocated bytes (device memory lives outside
-    RSS).
+    Host RSS (read from ``/proc/self/status``, backend-agnostic) plus
+    backend-device bytes the adapter reports — the meter's optional
+    ``device_memory_mb()`` hook (torch's implementation reads
+    ``torch.cuda.memory_allocated``; device memory lives outside RSS).
+    A meter without the hook contributes zero.
     """
     rss = 0.0
     try:
@@ -244,15 +232,14 @@ def _current_memory_mb() -> float:
         rss = (
             resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
         )
-    dev = (
-        torch.cuda.memory_allocated() / float(1 << 20)
-        if torch.cuda.is_available()
-        else 0.0
-    )
+    dev_fn = getattr(meter, "device_memory_mb", None)
+    dev = float(dev_fn()) if callable(dev_fn) else 0.0
     return rss + dev
 
 
-def _check_resources(eg, max_enodes, max_memory_mb) -> None:
+def _check_resources(
+    eg, max_enodes, max_memory_mb, meter: Any = None
+) -> None:
     """Cheap watermark check, called at phase boundaries.
 
     ``max_enodes`` is already enforced inside ``EGraph.run`` once per
@@ -273,100 +260,12 @@ def _check_resources(eg, max_enodes, max_memory_mb) -> None:
             f"(max_enodes={max_enodes})"
         )
     if max_memory_mb is not None:
-        used = _current_memory_mb()
+        used = _current_memory_mb(meter)
         if used > max_memory_mb:
             raise OptimizationResourceError(
                 f"memory footprint {used:.0f} MiB exceeds "
                 f"max_memory_mb={max_memory_mb}"
             )
-
-
-def _eval_const(
-    term: Any, params: dict, ops: OpRegistry | None = None
-) -> torch.Tensor | None:
-    """Evaluate a parameter-only subtree to a concrete tensor.
-
-    Permissive compile-time fold — any un-evaluatable piece (Var,
-    missing Param, missing binding, raising binding, non-tensor
-    result) yields ``None``.  Delegates to
-    :func:`catopt_torch.torch_bridge.eval_term` (plan 0002 phase D);
-    ``tensor_only`` reproduces the per-level isinstance check.
-    """
-    from catopt_torch.torch_bridge import _IR_TO_TORCH, eval_term
-
-    bindings = _IR_TO_TORCH if ops is None else ops.torch_bindings
-    return eval_term(
-        term,
-        param_env=params,
-        bindings=bindings,
-        tensor_only=True,
-    )
-
-
-def _is_causal_keep_mask(mask_val: torch.Tensor, q_shape) -> bool:
-    """Return True when a mask is exactly the causal lower triangle.
-
-    ``(…, T, T)`` keeps the lower triangle and T matches q's sequence
-    dim — i.e. the mask IS is_causal.
-    """
-    if not isinstance(q_shape, tuple) or len(q_shape) < 2:
-        return False
-    if (
-        mask_val.ndim < 2
-        or mask_val.shape[-1] != mask_val.shape[-2]
-        or mask_val.shape[-1] != q_shape[-2]
-    ):
-        return False
-    keep = (
-        mask_val.bool()
-        if mask_val.dtype == torch.bool
-        else mask_val > -1e30
-    )
-    tril = torch.tril(
-        torch.ones(
-            mask_val.shape[-2],
-            mask_val.shape[-1],
-            dtype=torch.bool,
-            device=mask_val.device,
-        )
-    )
-    return bool((keep == tril).all())
-
-
-def _specialize_causal(
-    term: Any,
-    params: dict,
-    memo: dict | None = None,
-    ops: OpRegistry | None = None,
-) -> Any:
-    """sdpa(q,k,v, mask) → sdpa(q,k,v, is_causal=True).
-
-    Applies when mask is parameter-only and evaluates to a causal
-    keep-mask.  Dropping the materialised mask unlocks the fused
-    flash/mem-efficient kernels.
-    """
-    from catopt_core.typing import _shape_of as _so
-
-    if memo is None:
-        memo = {}
-    if not isinstance(term, Op):
-        return term
-    key = term  # content-keyed: interned terms hash by structure
-    if key in memo:
-        return memo[key]
-    args = tuple(
-        _specialize_causal(a, params, memo, ops) for a in term.args
-    )
-    attrs = dict(term.attrs)
-    if term.op == "sdpa" and len(args) >= 4 and not attrs.get("arg5"):
-        mv = _eval_const(args[3], params, ops)
-        if mv is not None and _is_causal_keep_mask(mv, _so(args[0])):
-            args = args[:3]
-            attrs["arg5"] = True
-            memo["_hit"] = True
-    out = Op.make(term.op, *args, **attrs)
-    memo[key] = out
-    return out
 
 
 def _default_cost_fn() -> CostFn:
@@ -386,15 +285,28 @@ def _default_cost_fn() -> CostFn:
     return executor_cost_for(lowering="generic")
 
 
-#: Carrier-apply root enode ops → (batched plan builder).  A term
-#: rooted at one of these lowers through the level-batched executor.
-_CARRIER_PLANS = {
-    "apply": build_scan_plan,
-    "applyd": build_scan_plan,
-    "om_apply": build_om_plan,
-    "omd_apply": build_omd_plan,
-    "omd_applym": build_omd_plan,
-}
+def _carrier_plans() -> dict[str, Callable]:
+    """Carrier-apply root ops → (batched plan builder) — deferred.
+
+    A term rooted at one of these lowers through the level-batched
+    executor.  The builders are carrier-package machinery (torch
+    executors); they resolve at call time so the orchestrator never
+    imports a backend, and a partial install simply yields an empty
+    map (no carrier upgrades).
+    """
+    try:
+        from catopt_carriers.om_lower import build_om_plan
+        from catopt_carriers.omd_lower import build_omd_plan
+        from catopt_carriers.scan_lower import build_scan_plan
+    except ModuleNotFoundError:
+        return {}
+    return {
+        "apply": build_scan_plan,
+        "applyd": build_scan_plan,
+        "om_apply": build_om_plan,
+        "omd_apply": build_omd_plan,
+        "omd_applym": build_omd_plan,
+    }
 
 
 def _delivered_cost(
@@ -409,8 +321,8 @@ def _delivered_cost(
     """
     if compiled:
         return executor_cost_for(profile, lowering="compiled")(term)
-    if isinstance(term, Op) and term.op in _CARRIER_PLANS:
-        plan = _CARRIER_PLANS[term.op](term)
+    if isinstance(term, Op) and term.op in _carrier_plans():
+        plan = _carrier_plans()[term.op](term)
         if plan is not None:
             return executor_cost_for(profile, lowering="batched_scan")(
                 term
@@ -438,10 +350,9 @@ def _carrier_upgrade(
     carrier member is cheaper AND its batched plan exists (else the
     module degrades to serial eval and the price lied).
     """
+    plans = _carrier_plans()
     cid = eg.find(root_eid)
-    carriers = [
-        n for n in eg._classes[cid].nodes if n.op in _CARRIER_PLANS
-    ]
+    carriers = [n for n in eg._classes[cid].nodes if n.op in plans]
     if not carriers:
         return best_term
     best_price = _delivered_cost(best_term, profile, compiled)
@@ -459,30 +370,38 @@ def _lower_extracted(
     best_term: Any,
     optimized_ir: Any,
     source_tensors: dict | None,
-    sink: Any,
+    sink: Sink,
 ) -> Any:
-    """Route the extracted term to the executor that runs it best.
+    """Route the extracted term through the sink's executor table.
 
     Executor routing: term-level cost is blind to the lowering — a
-    carrier-apply term evaluated by the generic IRModule runs its
+    carrier-apply term evaluated by the generic evaluator runs its
     leaves one-by-one (~6-30x slower than the level-batched schedule
-    it was priced for).  Route apply roots to their batched executor;
-    non-matching roots delegate to IRModule inside each builder, so a
-    declined plan degrades to the generic path rather than failing.
+    it was priced for).  Route the term to the first *carrier*
+    :class:`~catopt_core.ports.ExecutorSpec` of
+    :attr:`~catopt_core.ports.Sink.executors` whose ``accepts`` probe
+    holds (mapping order is routing order); carrier-agnostic sinks
+    and non-carrier terms fall through to ``sink.lower`` — the
+    backend-neutral default.  A declined carrier plan degrades to the
+    generic path inside each builder rather than failing.
     """
-    if is_scan_apply_term(best_term):
-        return to_batched_scan_module(
-            optimized_ir, param_values=source_tensors
-        )
-    if is_om_apply_term(best_term):
-        return to_batched_om_module(
-            optimized_ir, param_values=source_tensors
-        )
-    if is_omd_apply_term(best_term):
-        return to_batched_omd_module(
-            optimized_ir, param_values=source_tensors
-        )
+    spec = _route_spec(best_term, sink)
+    if spec is not None:
+        return spec.lower(optimized_ir, source_tensors)
     return sink.lower(optimized_ir, source_tensors)
+
+
+def _route_spec(best_term: Any, sink: Sink) -> ExecutorSpec | None:
+    """First carrier executor spec accepting *best_term*, else None."""
+    table = getattr(sink, "executors", None) or {}
+    return next(
+        (
+            s
+            for s in table.values()
+            if s.carrier is not None and s.accepts(best_term)
+        ),
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +473,7 @@ def _pairing_and_lifts(
     max_enodes: int | None,
     max_memory_mb: float | None,
     source_tensors: dict,
+    meter: Any = None,
 ) -> list:
     """Non-local passes with a brief re-saturation between them.
 
@@ -571,7 +491,7 @@ def _pairing_and_lifts(
     groups = pair_shared_input_linears(eg) + pair_shared_input_convs(eg)
     if groups:
         eg.rebuild()
-        _check_resources(eg, max_enodes, max_memory_mb)
+        _check_resources(eg, max_enodes, max_memory_mb, meter)
         stats["pairing_groups"] = len(groups)
         # brief second saturation so other rules see the new enodes
         eg.run(
@@ -581,20 +501,12 @@ def _pairing_and_lifts(
             max_nodes=run_cap,
             rule_budgets=rule_budgets,
         )
-        _check_resources(eg, max_enodes, max_memory_mb)
+        _check_resources(eg, max_enodes, max_memory_mb, meter)
 
-    lifts = (
-        lift_scan_to_applyd(eg)
-        + lift_scan_to_trace(eg)
-        + gather_applyd_stack(eg)
-        + gather_apply_stack(eg)
-        + omd_tree_lift(eg)
-        + share_duplicate_params(eg, source_tensors)
-        + share_duplicate_param_slices(eg, source_tensors)
-    )
+    lifts = _carrier_lifts(eg, source_tensors)
     if lifts:
         eg.rebuild()
-        _check_resources(eg, max_enodes, max_memory_mb)
+        _check_resources(eg, max_enodes, max_memory_mb, meter)
         stats["nonlocal_lifts"] = len(lifts)
         eg.run(
             rules,
@@ -603,8 +515,42 @@ def _pairing_and_lifts(
             max_nodes=run_cap,
             rule_budgets=rule_budgets,
         )
-        _check_resources(eg, max_enodes, max_memory_mb)
+        _check_resources(eg, max_enodes, max_memory_mb, meter)
     return groups
+
+
+def _carrier_lifts(eg: EGraph, source_tensors: dict) -> list:
+    """Run the non-local carrier/tying lifts, carriers lazily resolved.
+
+    ``catopt_carriers`` machinery (the carrier lifts) resolves at call
+    time; the weight-tying lifts are core.  A partial install without
+    carriers contributes only the tying passes.
+    """
+    try:
+        from catopt_carriers.trace_lift import (
+            lift_scan_to_applyd,
+            lift_scan_to_trace,
+        )
+        from catopt_carriers.xcarrier import (
+            gather_apply_stack,
+            gather_applyd_stack,
+            omd_tree_lift,
+        )
+    except ModuleNotFoundError:
+        carrier: list = []
+    else:
+        carrier = (
+            lift_scan_to_applyd(eg)
+            + lift_scan_to_trace(eg)
+            + gather_applyd_stack(eg)
+            + gather_apply_stack(eg)
+            + omd_tree_lift(eg)
+        )
+    return (
+        carrier
+        + share_duplicate_params(eg, source_tensors)
+        + share_duplicate_param_slices(eg, source_tensors)
+    )
 
 
 def _select_best_term(
@@ -617,7 +563,7 @@ def _select_best_term(
     fusion_epsilon: float,
     delivers_compiled: bool,
     specialize_causal: bool,
-    fold_ops: OpRegistry | None,
+    capabilities: Capabilities | None,
     source_tensors: dict,
 ) -> Any:
     """Extract the search's term: greedy -> paired -> carrier -> causal.
@@ -630,9 +576,10 @@ def _select_best_term(
     * :func:`_carrier_upgrade` — the whole-spine batched-executor win
       the additive decomposition can't price, billed under the
       intended delivery (``delivers_compiled``);
-    * :func:`_specialize_causal` — the opt-out causal-mask const fold;
-      its declared need is ``fold_ops`` (a ``Capabilities.ops``
-      registry) — no capabilities, no fold.
+    * the causal-mask const fold — the opt-out specialization, run
+      through the capabilities object's optional
+      ``specialize_causal(term, params, memo) -> term`` hook (a
+      ``Sink`` carries it for the torch backend): no hook, no fold.
     """
     best_term = eg.extract_best(
         root_eid, cost_fn, fusion_epsilon=fusion_epsilon
@@ -669,13 +616,17 @@ def _select_best_term(
     )
     # Causal specialization: a param-only attn_mask that evaluates to a
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
-    if specialize_causal and fold_ops is not None:
-        _cm: dict = {}
-        best_term = _specialize_causal(
-            best_term, source_tensors, _cm, ops=fold_ops
-        )
-        if _cm.get("_hit"):
-            stats["causal_specialized"] = True
+    # The fold is backend machinery (it evaluates parameter subtrees in
+    # the backend's own runtime) — the capabilities port surfaces it
+    # via the optional ``specialize_causal`` hook; a backend without
+    # one simply skips the pass.
+    if specialize_causal and capabilities is not None:
+        fold = getattr(capabilities, "specialize_causal", None)
+        if fold is not None:
+            _cm: dict = {}
+            best_term = fold(best_term, source_tensors, _cm)
+            if _cm.get("_hit"):
+                stats["causal_specialized"] = True
     return best_term
 
 
@@ -698,6 +649,7 @@ def search(
     specialize_causal: bool = True,
     fusion_epsilon: float = 0.0,
     delivers_compiled: bool = False,
+    meter: Meter | None = None,
     verbose: bool = False,
 ) -> SearchResult:
     """Run the search phase: ``model -> SearchResult``.
@@ -717,20 +669,20 @@ def search(
     source : Source
         The graph-source port (``model -> (IR, leaves)``) — REQUIRED.
         There is no assumed frontend; choosing torch means importing
-        ``catopt_torch`` and passing :class:`TorchSource`.
+        ``catopt_torch`` and passing ``TorchSource``.
     capabilities : Capabilities, optional
         The backend's op surface — ``supported_ops`` bounds extraction
         to forms the backend can lower (``backend_cost`` pricing), and
-        ``ops`` is the registry ``specialize_causal``'s const fold
-        dispatches through.  Omitted: pricing is backend-agnostic and
-        the causal fold is skipped.  A :class:`Sink` satisfies it
+        its optional ``specialize_causal`` hook supplies the causal
+        const fold's evaluator.  Omitted: pricing is backend-agnostic
+        and the causal fold is skipped.  A :class:`Sink` satisfies it
         (every sink is a ``Capabilities``).
     cost_fn : CostFn, optional
         Term-extraction pricing; ``None`` falls to ``criteria`` then
         the executor-aware default.
     criteria : dict, Criterion, Criteria, or sequence, optional
         Selection axes blended into the extraction model — see
-        :func:`optimize_model`.
+        ``optimize_model``.
     ruleset : str
         ``"all"`` / ``"all+layout"`` / ``"simpl"`` / ``"categorical"``.
     max_iterations : int
@@ -745,7 +697,7 @@ def search(
         unbounded saturation.
     fusion_epsilon : float, default 0.0
         Near-tie fusion-preferred extraction band — see
-        :func:`optimize_model`.
+        ``optimize_model``.
     specialize_causal : bool, default True
         The causal-mask const fold is an opt-out search pass: a
         param-only ``sdpa`` mask that evaluates to the lower-triangular
@@ -755,6 +707,10 @@ def search(
         delivery will be ``torch.compile``-wrapped, the carrier upgrade
         bills terms under the fusion-region (``lowering="compiled"``)
         price.  The runner itself is a ``lower`` concern.
+    meter : Meter, optional
+        The backend's timing port — consulted only for the optional
+        device-memory read the ``max_memory_mb`` bound needs (host
+        RSS is read portably).  ``None`` counts host bytes only.
     verbose : bool
         Print progress.
 
@@ -817,7 +773,7 @@ def search(
         max_nodes=run_cap,
         rule_budgets=rule_budgets,
     )
-    _check_resources(eg, max_enodes, max_memory_mb)
+    _check_resources(eg, max_enodes, max_memory_mb, meter)
 
     groups = _pairing_and_lifts(
         eg,
@@ -829,6 +785,7 @@ def search(
         max_enodes,
         max_memory_mb,
         source_tensors,
+        meter,
     )
 
     stats["rule_fires"] = dict(eg.rule_fires)
@@ -848,9 +805,7 @@ def search(
         fusion_epsilon=fusion_epsilon,
         delivers_compiled=delivers_compiled,
         specialize_causal=specialize_causal,
-        fold_ops=(
-            capabilities.ops if capabilities is not None else None
-        ),
+        capabilities=capabilities,
         source_tensors=source_tensors,
     )
 
@@ -860,7 +815,7 @@ def search(
 
     # Final watermark before the lower phase materialises parameters —
     # the phase that turns graph choices into real tensor bytes.
-    _check_resources(eg, max_enodes, max_memory_mb)
+    _check_resources(eg, max_enodes, max_memory_mb, meter)
 
     return SearchResult(
         ir=ir,
@@ -889,12 +844,15 @@ def lower(
 ) -> LowerResult:
     """Run the lower phase: ``SearchResult -> LowerResult``.
 
-    Executor routing (``_lower_extracted``): a carrier-apply root goes
-    to its level-batched executor, everything else to ``sink.lower``.
-    The delivery runner then decides HOW the routed executor ships —
-    identity (``IdentityRunner`` — the default), ``torch.compile``
-    (``TorchCompileRunner``), CUDA-graph capture
-    (``CudaGraphRunner``), or a ``ChainedRunner`` composition.
+    Executor routing (``_lower_extracted``): a term the sink's
+    executor table claims — the first carrier ``ExecutorSpec`` whose
+    ``accepts`` probe holds — goes to that level-batched executor;
+    everything else to ``sink.lower``.  The delivery runner then
+    decides HOW the routed executor ships — identity
+    (``IdentityRunner`` — the default) or a backend-provided
+    transform like ``catopt_torch.runners.TorchCompileRunner`` /
+    ``catopt_cuda.CudaGraphRunner`` / a ``ChainedRunner``
+    composition.
     ``stats`` is a FRESH dict — the search record plus the lowering
     keys; :attr:`SearchResult.stats` is never mutated — so one search
     can feed many deliveries.
@@ -904,8 +862,8 @@ def lower(
     result : SearchResult
         What :func:`search` (or ``Optimizer.search``) produced.
     x
-        The example input — the runner needs it (``torch.compile``
-        probes, CUDA-graph capture) and ``sink.verify`` runs on it.
+        The example input — the runner needs it (compile probes,
+        graph capture) and ``sink.verify`` runs on it.
     sink : Sink
         The graph-sink port — REQUIRED.  There is no assumed backend.
     runner : Runner, optional
@@ -1006,9 +964,10 @@ class Monolithic:
     search knobs (``ruleset``, ``max_iterations``, ``max_enodes``,
     ``cost_fn``, ``symmetry_budget``, ``specialize_causal``,
     ``fusion_epsilon``, ``delivers_compiled``, ``capabilities``,
-    ``criteria``) reach the optimizer's ``.search``; lower knobs
-    (``runner``, ``verify``, ``rtol``, ``atol``) reach ``.lower``;
-    ``verbose`` reaches both.  Unknown names raise ``TypeError``.
+    ``criteria``, ``meter``) reach the optimizer's ``.search``; lower
+    knobs (``runner``, ``verify``, ``rtol``, ``atol``) reach
+    ``.lower``; ``verbose`` reaches both.  Unknown names raise
+    ``TypeError``.
     """
 
     name = "monolithic"
@@ -1038,14 +997,14 @@ class Monolithic:
 
 
 class Compositional:
-    """Per-block search+lower, then recompose — still torch-coupled.
+    """Per-block search+lower, then recompose — composer-driven.
 
-    The strategy view of :func:`optimize_compositional`: walks the
-    module tree, optimizes each selected block on its captured input,
-    runs the pairwise cross-block pass and grafts the results into a
-    parameter-sharing clone.  (The block walk is backend-native —
-    plan 0007's ``Composer`` abstracts it; until then this strategy
-    needs torch modules.)
+    The strategy view of ``optimize_compositional``: selects blocks
+    through the optimizer's :class:`~catopt_core.ports.Composer`
+    port, optimizes each on its captured input, runs the pairwise
+    cross-block pass and grafts the results into a parameter-sharing
+    clone — every backend-native step delegated to the composer, so
+    the strategy itself is backend-neutral.
 
     ``block_pred`` / ``verify_tol`` / ``max_cross_pairs`` are strategy
     configuration; the per-block search knobs (``ruleset``,
@@ -1074,8 +1033,7 @@ class Compositional:
         mod, stats = _optimize_compositional(
             model,
             x,
-            source=optimizer.source,
-            sink=optimizer.sink,
+            optimizer=optimizer,
             block_pred=self.block_pred,
             verify_tol=self.verify_tol,
             max_cross_pairs=self.max_cross_pairs,
@@ -1087,22 +1045,25 @@ class Compositional:
 class Autotuned:
     """Measured autotune: one search, N verified timed deliveries.
 
-    The strategy view of :func:`optimize_model_autotuned` — re-lowers
+    The strategy view of ``optimize_model_autotuned`` — re-lowers
     the extracted term through each candidate lowering path, verifies
-    every candidate against the model, times the survivors on the real
-    input and ships the measured winner.  Still torch-coupled
-    (``torch.compile`` / CUDA-graph candidates and wall-clock timing);
-    plan 0007's ``Meter`` abstracts it.
+    every candidate against the model, times the survivors through
+    the optimizer's :class:`~catopt_core.ports.Meter` port and ships
+    the measured winner.
 
-    ``candidates`` are names in
+    ``candidates`` are names resolved against the backend's
+    :attr:`~catopt_core.ports.Sink.executors` table (``"generic"``
+    plus every executor name — ``"batched"`` is the routing
+    pseudo-name for the pipeline's own delivery) and
     :data:`catopt_optimize.autotune.CANDIDATE_BUILDERS`
-    (``"generic"``, ``"batched"``, ``"torch_compile"``,
-    ``"torch_compile_generic"``, ``"cuda_graph"``, ``"eager"``) or
-    ``(name, builder)`` tuples; the remaining fields are the timing /
-    budget / verify knobs.  ``optimize`` kwargs (``ruleset``,
-    ``max_iterations``, ``ops``, ``runner``, …) forward to the
-    underlying :func:`optimize_model` call; an explicit ``verbose=``
-    keyword overrides the strategy field.
+    (``"eager"``), or ``(name, builder)`` tuples; backend-provided
+    builders arrive through ``builders=`` (the torch wrapper maps
+    ``"torch_compile"`` / ``"torch_compile_generic"`` /
+    ``"cuda_graph"`` via ``catopt_torch.api.TORCH_BUILDERS``).  The
+    remaining fields are the timing / budget / verify knobs.
+    ``optimize`` kwargs (``ruleset``, ``max_iterations``, ``runner``,
+    …) forward to the underlying pipeline call; an explicit
+    ``verbose=`` keyword overrides the strategy field.
     """
 
     name = "autotuned"
@@ -1118,6 +1079,7 @@ class Autotuned:
         atol: float | None = None,
         profile: Any = None,
         verbose: bool = False,
+        builders: dict[str, Any] | None = None,
     ) -> None:
         """Store the autotune configuration."""
         self.candidates = candidates
@@ -1128,6 +1090,11 @@ class Autotuned:
         self.atol = atol
         self.profile = profile
         self.verbose = verbose
+        #: Backend-provided candidate builders — names the
+        #: orchestrator-side ``CANDIDATE_BUILDERS`` map does not know
+        #: (e.g. the torch wrapper's ``TORCH_BUILDERS``).  Merged over
+        #: the neutral table; ``None`` is backend-agnostic autotuning.
+        self.builders = builders
 
     def run(
         self, model: Any, x: Any, *, optimizer: Any, **kw: Any
@@ -1142,13 +1109,13 @@ class Autotuned:
             model,
             x,
             candidates=self.candidates,
+            builders=self.builders,
             budget_s=self.budget_s,
             n_calls=self.n_calls,
             warmup=self.warmup,
             rtol=self.rtol,
             atol=self.atol,
-            source=optimizer.source,
-            sink=optimizer.sink,
+            optimizer=optimizer,
             profile=self.profile,
             verbose=kw.pop("verbose", self.verbose),
             **kw,
@@ -1160,38 +1127,80 @@ class Autotuned:
 class Optimizer:
     """The configured entry point — explicit ports, no assumed backend.
 
-    ``source`` / ``sink`` are REQUIRED: they are the ports the
-    pipeline runs through — ``catopt_torch.adapters.TorchSource`` /
-    ``TorchSink`` are one implementation, and choosing torch means
-    importing ``catopt_torch``, never a default here.  ``criteria`` is
-    the default selection blend; ``runner`` the default delivery
+    The pipeline runs through four ports — ``source`` (``model ->
+    (IR, leaves)``), ``sink`` (``IR -> runnable`` + verify +
+    executors), ``composer`` (per-block structural machinery) and
+    ``meter`` (timing) — bundled as an immutable
+    :class:`~catopt_core.pipeline.Backend` or given individually.
+    Resolution is ``backend`` first, then the explicit arguments
+    override each port it carries; every port is required — there is
+    NO default backend (choosing torch means importing
+    ``catopt_torch.backend.TorchBackend``).  ``criteria`` is the
+    default selection blend; ``runner`` the default delivery
     (``IdentityRunner`` — the no-op, backend-neutral shipping step).
 
     The phase verbs mirror the module-level functions with the
     optimizer's ports wired in; ``optimize`` composes them through a
     :class:`~catopt_core.ports.Strategy`::
 
-        opt = Optimizer(source=TorchSource(), sink=TorchSink())
+        opt = Optimizer(backend=TorchBackend())
         mod, stats = opt.optimize(model, x)
         res = opt.search(model, x)          # the inspectable mid-state
         fast = opt.lower(res, x, runner=TorchCompileRunner())
 
     """
 
-    source: Source
-    sink: Sink
+    source: Source | None = None
+    sink: Sink | None = None
+    composer: Composer | None = None
+    meter: Meter | None = None
+    backend: Backend | None = None
     criteria: (
         dict[str, float] | Criteria | Criterion | list | tuple | None
     ) = None
     runner: Runner = field(default_factory=IdentityRunner)
+
+    def __post_init__(self) -> None:
+        """Resolve ports — explicit args override the backend's.
+
+        ``source`` and ``sink`` are REQUIRED — from the backend or
+        explicitly.  ``composer``/``meter`` are the optional ports the
+        :class:`Compositional` / :class:`Autotuned` strategies need;
+        a strategy raises a clear error when its port is missing, so
+        a bare ``Optimizer(source=..., sink=...)`` still runs
+        :class:`Monolithic` — the historical minimal form.
+        """
+        if self.backend is not None:
+            if self.source is None:
+                object.__setattr__(self, "source", self.backend.source)
+            if self.sink is None:
+                object.__setattr__(self, "sink", self.backend.sink)
+            if self.composer is None:
+                object.__setattr__(
+                    self, "composer", self.backend.composer
+                )
+            if self.meter is None:
+                object.__setattr__(self, "meter", self.backend.meter)
+        missing = [
+            n for n in ("source", "sink") if getattr(self, n) is None
+        ]
+        if missing:
+            raise TypeError(
+                "Optimizer requires source/sink — pass "
+                "backend=Backend(...) or explicit "
+                "source=/sink= ports; composer=/meter= are needed "
+                f"only by the per-block/measured strategies "
+                f"(missing: {', '.join(missing)})"
+            )
 
     def search(self, model: Any, x: Any, **kw: Any) -> SearchResult:
         """Run :func:`search` through this optimizer's ports.
 
         ``capabilities`` defaults to the sink (a ``Sink`` is a
         ``Capabilities``); ``criteria`` to the configured blend;
-        ``delivers_compiled`` to the runner's marker.  Keyword
-        arguments override each default outright.
+        ``delivers_compiled`` to the runner's marker; ``meter`` to the
+        configured meter.  Keyword arguments override each default
+        outright.
         """
         kw.setdefault("source", self.source)
         kw.setdefault("capabilities", self.sink)
@@ -1200,6 +1209,7 @@ class Optimizer:
             "delivers_compiled",
             bool(getattr(self.runner, "delivers_compiled", False)),
         )
+        kw.setdefault("meter", self.meter)
         return _search(model, x, **kw)
 
     def lower(
@@ -1246,7 +1256,7 @@ class Optimizer:
 
 
 # ---------------------------------------------------------------------------
-#  Compatibility wrappers — the historical entry points (retire in 0008)
+#  The discover verb and the compositional driver
 # ---------------------------------------------------------------------------
 
 
@@ -1258,173 +1268,6 @@ _lower = lower
 
 
 @_oom_to_resource_error
-def optimize_model(
-    model: torch.nn.Module,
-    example_input: torch.Tensor | tuple[torch.Tensor, ...],
-    *,
-    ruleset: str = "all",
-    max_iterations: int = 100,
-    max_enodes: int | None = 100_000,
-    max_memory_mb: float | None = None,
-    cost_fn: CostFn | None = None,
-    criteria: (
-        dict[str, float] | Criteria | Criterion | list | tuple | None
-    ) = None,
-    fusion_epsilon: float = 0.0,
-    symmetry_budget: int | None = 2048,
-    ops: OpTable | None = None,
-    source: Source | None = None,
-    sink: Sink | None = None,
-    runner: Runner | None = None,
-    verbose: bool = True,
-) -> tuple[Executor, dict[str, Any]]:
-    """End-to-end categorical optimization — the legacy entry point.
-
-    A one-line wrapper (plan 0006): it resolves the historical
-    ``source``/``sink``/``ops``/``runner`` defaults — torch IS the
-    default here, that is what the compat name always meant — then
-    runs ``Optimizer(...).optimize(...)``, i.e.
-    :func:`lower` ∘ :func:`search`.  New code should use the verbs
-    (or :class:`Optimizer`) directly; this name retires in 0008.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to optimize.
-    example_input : torch.Tensor
-        An example input for tracing.
-    ruleset : str
-        Which rewrite rules to use: ``"all"``, ``"simpl"``, or ``"categorical"``.
-    max_iterations : int
-        Maximum equality-saturation iterations.
-    max_enodes : int, optional
-        E-node bound on the e-graph.  Enforced once per saturation
-        iteration inside ``EGraph.run`` (plus per-match for budgeted
-        rules) and re-checked at each phase boundary; reaching it
-        raises :class:`OptimizationResourceError` rather than
-        extracting from a truncated graph.  ``None`` disables the
-        bound (and the run-loop watermark).
-    max_memory_mb : float, optional
-        Process memory bound in MiB — host RSS plus CUDA-allocated
-        bytes — checked at phase boundaries; crossing it raises
-        :class:`OptimizationResourceError`.  ``None`` (default)
-        disables the check.
-    cost_fn : CostFn | None
-        Cost function for term extraction — the
-        :class:`catopt_core.ports.CostFn` port.  Defaults to
-        :func:`executor_cost_for` with ``lowering="generic"`` —
-        roofline plus per-node dispatch overhead (solver ops
-        surcharged).  Carrier-apply selections are routed to their
-        level-batched executors at lowering time rather than priced
-        in, because batched cost is non-additive over the spine and
-        ``extract_best``'s local-cost decomposition can't see it.
-    criteria : dict, Criterion, Criteria, or sequence, optional
-        Selection axes blended into the extraction model — a
-        ``{axis: weight}`` dict over the named axes
-        (:data:`~catopt_optimize.criteria.AXES`), a single
-        :class:`~catopt_optimize.criteria.Criterion`, a
-        ``Criteria``/``Blend`` composition (e.g.
-        ``LatencyCriterion() * 0.7 + MemoryCriterion("peak") * 0.3``),
-        or a list of criteria / ``(criterion, weight)`` pairs; see
-        :func:`catopt_optimize.criteria.criteria_cost`.  Consulted only
-        when ``cost_fn`` is ``None`` — precedence is explicit
-        ``cost_fn`` > ``criteria`` > the default model.
-        ``stats["criteria"]`` records the normalised axes priced.
-    fusion_epsilon : float, default 0.0
-        Fusion-preferred near-tie band for extraction — forwarded to
-        :meth:`EGraph.extract_best`: members priced within this
-        relative band of the class minimum compete on
-        :func:`catopt_core.cost.fusion_member_key` (predicted kernel
-        count, then root fusibility) instead of structural size.
-        Arm it when the delivered module will be ``torch.compile``d
-        (``TorchCompileRunner`` / autotune's ``"torch_compile"``
-        candidate — ``0.05`` is the validated band); ``0`` disables
-        and selection is byte-identical to before.
-    symmetry_budget : int, optional
-        Per-rule enode budget for the expansive rules in
-        ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
-        bounded saturation.  The reordering closure these rules
-        generate grows Catalan-fast on stacked blocks (the residual
-        accumulator's bracketings), which is what pushed monolithic
-        eqsat past ~2 blocks.  ``None`` restores unbounded
-        saturation.  The bound can only *miss* optimizations, never
-        introduce wrong ones — every recorded merge is still a real
-        equality.
-    ops : OpTable, optional
-        The op table the optimized term is lowered through (plan 0001
-        phase 2c) — used to build the default :class:`TorchSink` and
-        for the causal-mask constant evaluation.  ``None`` (default)
-        resolves to ``OpTable.full()`` — the ambient ``_IR_TO_TORCH``
-        table.  Ignored when ``sink`` is given.
-    source : Source, optional
-        The graph-source port (``model -> (IR, leaves)``), defaulting
-        to :class:`TorchSource` (``torch.export``).  Pass a different
-        source to optimize a non-torch frontend — the core search never
-        imports torch itself.
-    sink : Sink, optional
-        The graph-sink port (``IR -> runnable``, plus its op set and
-        equivalence gate), defaulting to ``TorchSink(ops=ops)``.
-        Extraction is priced against ``sink.supported_ops``
-        (:func:`catopt_core.cost.backend_cost`), so the optimizer only
-        commits to forms the sink can lower.  Takes precedence over
-        ``ops``.
-    runner : Runner, optional
-        Delivery-stage object deciding HOW the lowered executor is
-        executed — see :mod:`catopt_optimize.runners`
-        (:class:`IdentityRunner` identity, :class:`TorchCompileRunner`
-        ``torch.compile``, :class:`CudaGraphRunner` CUDA-graph
-        capture, :class:`ChainedRunner` left-to-right composition —
-        e.g. ``ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])``
-        compiles first, then defers capture to the compile's
-        outcome).  Applied once to the routed executor;
-        ``stats["runner"]`` records its name (a list of member names
-        for a chain) and the runner writes its own outcome keys
-        (``stats["compiled"]``, ``stats["cuda_graph"]``).  ``None``
-        delivers the module as lowered (:class:`IdentityRunner`).
-        Duck-typed — any object with ``name`` and
-        ``apply(module, example_input, stats)`` conforms.
-    verbose : bool
-        Print progress.  Also gates the equivalence check, exactly as
-        before — the wrapper verifies iff ``verbose``.
-
-    Returns
-    -------
-    (optimized_module, stats)
-        The optimized ``torch.nn.Module`` and a dictionary of e-graph stats.
-
-    Raises
-    ------
-    OptimizationResourceError
-        When a resource bound is crossed (``max_enodes``,
-        ``max_memory_mb``) or an allocator failure —
-        ``torch.cuda.OutOfMemoryError``, ``MemoryError``, or the
-        equivalent ``RuntimeError`` — is raised anywhere in the
-        pipeline.  ``optimize_compositional`` treats this as a normal
-        per-block fallback (status ``"failed"``,
-        ``reason == "resource_limit"``).
-
-    """
-    lr = Optimizer(
-        source=source if source is not None else TorchSource(),
-        sink=sink if sink is not None else TorchSink(ops=ops),
-        criteria=criteria,
-        runner=runner if runner is not None else IdentityRunner(),
-    ).optimize(
-        model,
-        example_input,
-        ruleset=ruleset,
-        max_iterations=max_iterations,
-        max_enodes=max_enodes,
-        max_memory_mb=max_memory_mb,
-        cost_fn=cost_fn,
-        fusion_epsilon=fusion_epsilon,
-        symmetry_budget=symmetry_budget,
-        verify=verbose,
-        verbose=verbose,
-    )
-    return cast(torch.nn.Module, lr.module), lr.stats
-
-
 def discover_alternatives(
     model: Any,
     x: Any,
@@ -1475,54 +1318,6 @@ def discover_alternatives(
     )
 
 
-def param_report(
-    model: torch.nn.Module, optimized_module: torch.nn.Module
-) -> dict:
-    """Joint graph+parameter view of the optimized weights file.
-
-    Which original parameters survive in the optimized realization,
-    which were eliminated, and which were derived (folded) — the
-    'optimized weights file' diff.
-
-    The optimized module's state_dict IS the smaller weights file:
-    ``_fold_weight_chains`` materialises derived tensors (``fused_*``)
-    and ``_build_params`` registers only parameters the extracted term
-    actually references, so eliminated subgraphs drop their weights
-    automatically.  This function makes that auditable.
-    """
-    orig = {n: p for n, p in model.state_dict().items()}
-    opt = {n: p for n, p in optimized_module.state_dict().items()}
-    orig_names = {f"p_{n.replace('.', '_')}" for n in orig}
-    opt_names = set(opt)
-    eliminated = sorted(orig_names - opt_names)
-    derived = sorted(n for n in opt_names if n not in orig_names)
-    orig_bytes = sum(
-        p.numel() * p.element_size() for p in orig.values()
-    )
-    opt_bytes = sum(p.numel() * p.element_size() for p in opt.values())
-    return {
-        "original_params": len(orig),
-        "optimized_params": len(opt),
-        "original_bytes": orig_bytes,
-        "optimized_bytes": opt_bytes,
-        "eliminated": eliminated,
-        "derived": derived,
-        "bytes_saved": orig_bytes - opt_bytes,
-        "ratio": opt_bytes / orig_bytes if orig_bytes else 1.0,
-    }
-
-
-def save_optimized_weights(
-    optimized_module: torch.nn.Module, path: str
-) -> None:
-    """Emit the optimized weights file.
-
-    Only the parameters the certified form actually needs (folded
-    derived tensors included).
-    """
-    torch.save(optimized_module.state_dict(), path)
-
-
 def ir_to_string(term: Any) -> str:
     """Pretty-print an IR term as an S-expression."""
     return op_repr(term)
@@ -1535,703 +1330,12 @@ def term_cost(term: Any, cost_fn: CostFn | None = None) -> float:
     return cost_fn(term)
 
 
-# ---------------------------------------------------------------------------
-#  Compositional optimization — per-block eqsat, then recompose
-# ---------------------------------------------------------------------------
-
-
-def _default_block_pred(
-    parent: torch.nn.Module, name: str, module: torch.nn.Module
-) -> bool:
-    """Select direct children of ``nn.ModuleList`` / ``nn.Sequential``.
-
-    The default block selector for the standard 'stacked blocks'
-    structure.
-    """
-    return isinstance(
-        parent, (torch.nn.ModuleList, torch.nn.Sequential)
-    )
-
-
-def _select_blocks(
-    model: torch.nn.Module, block_pred: Callable | None
-) -> list[tuple[str, torch.nn.Module]]:
-    """Pick the top-most submodules to optimize independently.
-
-    Walks the module tree; the top-most matching blocks are chosen.
-
-    A child is selected when it is a leaf (no children of its own) or when
-    ``block_pred(parent, child_name, child)`` is true.  Selected blocks are
-    opaque: we never descend into them, so e.g. the ``nn.Linear`` leaves
-    inside a matched ``ParallelBlock`` are not optimized separately.
-    """
-    pred = block_pred or _default_block_pred
-    blocks: list[tuple[str, torch.nn.Module]] = []
-
-    def visit(module: torch.nn.Module, prefix: str) -> None:
-        for child_name, child in module.named_children():
-            full = f"{prefix}.{child_name}" if prefix else child_name
-            is_leaf = next(child.children(), None) is None
-            if is_leaf or pred(module, child_name, child):
-                blocks.append((full, child))
-            else:
-                visit(child, full)
-
-    visit(model, "")
-    return blocks
-
-
-#: ``io`` key under which the capture pass stores the model's own
-#: return value — ``<`` is not a legal module-attribute character, so
-#: it can never collide with a real block name.
-_MODEL_KEY = "<model>"
-
-
-def _capture_block_inputs(
-    model: torch.nn.Module,
-    blocks: list[tuple[str, torch.nn.Module]],
-    example_input: torch.Tensor | tuple,
-) -> tuple[dict[str, tuple[tuple, dict]], dict[str, dict[str, Any]]]:
-    """Record each selected block's first forward inputs via hooks.
-
-    Runs the ORIGINAL model once.  Returns ``(captured, io)``:
-
-    * ``captured`` maps ``{name: (args, kwargs)}`` — detached clones of
-      the first call's arguments;
-    * ``io`` carries the cross-block dataflow evidence the pairwise
-      pass reads: per block ``{"calls", "in_objs", "out_obj", "out"}``
-      — the call count, the live arg/output OBJECTS of the first call
-      (kept referenced so ``is``-identity stays valid: a freed object's
-      id could be reused by a later allocation), and a detached clone
-      of the first output — plus ``io["<model>"]`` with the model's
-      own return.
-
-      The object identity answers "did B literally consume A's
-      output?"; the clones answer "was it modified in between?".
-    """
-    captured: dict[str, tuple[tuple, dict]] = {}
-    io: dict[str, dict[str, Any]] = {}
-    handles = []
-
-    def make_hook(name: str):
-        def hook(mod, args, kwargs, out):
-            entry = io.setdefault(
-                name,
-                {
-                    "calls": 0,
-                    "in_objs": (),
-                    "out_obj": None,
-                    "out": None,
-                },
-            )
-            entry["calls"] += 1
-            if name not in captured:
-                captured[name] = (
-                    tuple(
-                        a.detach().clone()
-                        if isinstance(a, torch.Tensor)
-                        else a
-                        for a in args
-                    ),
-                    {
-                        k: (
-                            v.detach().clone()
-                            if isinstance(v, torch.Tensor)
-                            else v
-                        )
-                        for k, v in kwargs.items()
-                    },
-                )
-                entry["in_objs"] = args
-                entry["out_obj"] = out
-                entry["out"] = (
-                    out.detach().clone()
-                    if isinstance(out, torch.Tensor)
-                    else out
-                )
-
-        return hook
-
-    for name, mod in blocks:
-        handles.append(
-            mod.register_forward_hook(make_hook(name), with_kwargs=True)
-        )
-    args = (
-        example_input
-        if isinstance(example_input, tuple)
-        else (example_input,)
-    )
-    try:
-        model.eval()
-        with torch.no_grad():
-            out = model(*args)
-        io[_MODEL_KEY] = {
-            "out_obj": out,
-            "out": (
-                out.detach().clone()
-                if isinstance(out, torch.Tensor)
-                else out
-            ),
-        }
-    finally:
-        for h in handles:
-            h.remove()
-    return captured, io
-
-
-def _replace_submodule(
-    model: torch.nn.Module, dotted: str, new_mod: torch.nn.Module
-) -> None:
-    """Set ``model.<dotted>`` to ``new_mod``.
-
-    Handles ModuleList / Sequential integer children.
-    """
-    parent_name, _, child_name = dotted.rpartition(".")
-    parent = model.get_submodule(parent_name) if parent_name else model
-    if child_name.isdigit() and isinstance(
-        parent, (torch.nn.ModuleList, torch.nn.Sequential)
-    ):
-        parent[int(child_name)] = new_mod
-    else:
-        setattr(parent, child_name, new_mod)
-
-
-def _shared_param_clone(model: torch.nn.Module) -> torch.nn.Module:
-    """Deepcopy ``model``'s module structure without copying tensors.
-
-    A plain ``copy.deepcopy`` of an ``nn.Module`` clones every parameter
-    and buffer — at ~0.5B fp16 params that doubles device memory before
-    a single optimized block is grafted, which is what OOMed
-    compositional recompose on small GPUs.  Recomposing only ever
-    *replaces* submodules (``_replace_submodule`` rebinds entries in the
-    clone's ``_modules`` dicts); it never mutates a tensor in place, so
-    the clone can share the original's tensor storage safely.
-
-    The mechanism is deepcopy's own memo: ``copy.deepcopy`` checks
-    ``memo[id(obj)]`` before dispatching to ``__deepcopy__``, so
-    pre-seeding every reachable tensor's id makes the clone reuse those
-    objects while the module ``__dict__``s, ``_modules`` /
-    ``_parameters`` / ``_buffers`` dicts, and plain attributes still
-    copy normally — the result is a real clone (``training`` flag,
-    hooks, structure) whose weights alias the original's.  Grafting
-    into it cannot touch the caller's model.
-
-    Seeding covers registered ``parameters()``/``buffers()`` plus
-    *unregistered* tensor attributes — ``mod.foo = tensor`` lands in
-    ``__dict__`` (only Parameters go to ``_parameters`` and only
-    registered buffers to ``_buffers``), which the default deepcopy
-    walk traverses by id, so the memo shares them too.  Tensors nested
-    inside non-tensor container/attribute objects (e.g.
-    ``self.cache = {"k": t}``) are not memo-hit and still clone; if
-    even that fails, the caller's in-place fallback applies.
-    """
-    memo: dict[int, Any] = {}
-    for t in list(model.parameters()) + list(model.buffers()):
-        memo[id(t)] = t
-    for mod in model.modules():
-        for v in vars(mod).values():
-            if isinstance(v, torch.Tensor):
-                memo[id(v)] = v
-    return copy.deepcopy(model, memo)
-
-
-# ---------------------------------------------------------------------------
-#  Pairwise cross-block pass — jointly optimize adjacent block pairs
-# ---------------------------------------------------------------------------
-#
-# Per-block optimization is blind across the boundary: block i's output
-# projection can compose with block i+1's input projections (a weight-only
-# chain that folds to one stored matrix), and a residual ``+`` between
-# them can absorb a shared affine.  For each *adjacent* pair the pass
-# classifies the boundary, builds a joint micro-model wrapping
-# ``B(A(x))``, runs the ordinary :func:`optimize_model` on it, verifies
-# it against the eager pair, and grafts the joint module into the clone —
-# only when it is verified AND cheaper than the two separately-optimized
-# results.
-
-#: Symmetry budget for joint runs.  The joint is a two-block
-#: micro-model — the reordering closure that motivated bounded
-#: saturation dominates its cost, and the documented break-even is
-#: identical extracted cost at every budget ≥ 512.  Truncating the
-#: reordering closure can only *miss* rewrites (the pair then simply
-#: declines on cost), never produce a wrong one.
-_CROSS_PAIR_SYMMETRY_BUDGET = 512
-
-
-def _perturbed_input(example_input: Any) -> Any:
-    """Return a second probe input — different values, same structure.
-
-    The residual-boundary check requires ``b_in == a_in + a_out``; on
-    ONE example a coincidental value match could promote a false
-    boundary, so the relation must also hold on a perturbed probe.
-    Only floating tensors are perturbed — a perturbation would corrupt
-    non-float (index) inputs.
-    """
-
-    def _perturb(t: Any) -> Any:
-        if isinstance(t, torch.Tensor) and t.is_floating_point():
-            return t * 1.5 + 0.01
-        return t
-
-    if isinstance(example_input, tuple):
-        return tuple(_perturb(a) for a in example_input)
-    return _perturb(example_input)
-
-
-def _residual_probe(
-    name_a: str,
-    name_b: str,
-    captured2: dict[str, tuple[tuple, dict]],
-    io2: dict[str, dict[str, Any]],
-) -> bool:
-    """Second-probe confirmation of a residual boundary.
-
-    On the perturbed-input capture, ``b_in == a_in + a_out`` must hold
-    again — a coincidence of values on one example can't promote the
-    pair.  Any absence (block not executed on the probe path, extra
-    call, non-tensor piece) fails closed.
-    """
-    ca = captured2.get(name_a)
-    cb = captured2.get(name_b)
-    ia = io2.get(name_a)
-    if ca is None or cb is None or ia is None or ia["calls"] != 1:
-        return False
-    args_a, _ = ca
-    args_b, _ = cb
-    a_out = ia["out"]
-    if len(args_a) != 1 or len(args_b) != 1:
-        return False
-    a_in, b_in = args_a[0], args_b[0]
-    if not (
-        isinstance(a_in, torch.Tensor)
-        and isinstance(b_in, torch.Tensor)
-        and isinstance(a_out, torch.Tensor)
-    ):
-        return False
-    return bool(
-        a_in.shape == a_out.shape and torch.equal(b_in, a_in + a_out)
-    )
-
-
-def _executor_flops(mod: Any) -> float:
-    """Delivered FLOPs of a lowered executor.
-
-    Prices the module's post-fold root term — the computation that
-    actually runs (weight chains are already materialised to single
-    params).  Carrier-batched executors expose the serial root through
-    ``eval_mod``; anything unpriceable returns ``inf`` so the pair
-    comparison simply keeps the separate modules.
-    """
-    root = getattr(mod, "_root", None)
-    if root is None:
-        root = getattr(getattr(mod, "eval_mod", None), "_root", None)
-    if root is None:
-        return float("inf")
-    return float(flops_cost(root))
-
-
-class _JointPair(torch.nn.Module):
-    """Joint micro-model for one adjacent pair, in the boundary's mode.
-
-    ``mode`` is the :func:`_pair_boundary` verdict — the joint function
-    of A's input ``x`` the optimizer sees:
-
-    * ``"chain"`` — ``x |-> B(A(x))``
-    * ``"chain_wrapped"`` — ``x |-> A(x) + B(A(x))`` (the parent's own
-      ``y + B(y)`` around B is part of the segment)
-    * ``"residual"`` — ``x |-> B(x + A(x))``
-    * ``"residual_wrapped"`` — ``x |-> (x + A(x)) + B(x + A(x))``
-    """
-
-    def __init__(
-        self,
-        a: torch.nn.Module,
-        b: torch.nn.Module,
-        mode: str,
-    ) -> None:
-        super().__init__()
-        self.a = a
-        self.b = b
-        self.mode = mode
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.a(x)
-        if self.mode.startswith("residual"):
-            y = x + y
-        out = self.b(y)
-        if self.mode.endswith("_wrapped"):
-            out = y + out
-        return out
-
-
-class _FusedPair(torch.nn.Module):
-    """Delivery wrapper grafted at block A's slot for a fused pair.
-
-    ``inner`` is the jointly-optimized executor computing the whole
-    segment as a function of A's input; B's slot becomes
-    ``nn.Identity`` (B consumed plainly) or :class:`_Zero` (the parent
-    residual-wraps B, so its slot must contribute a zero addend).
-
-    For a residual A-boundary the parent's own ``x + ·`` still runs, so
-    the wrapper returns the *delta* ``inner(x) - x`` and the outer add
-    reconstructs ``inner(x)`` (to within one rounding step).
-    """
-
-    def __init__(self, inner: torch.nn.Module, delta: bool) -> None:
-        super().__init__()
-        self.inner = inner
-        self.delta = delta
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.inner(x)
-        return out - x if self.delta else out
-
-
-class _Zero(torch.nn.Module):
-    """Exact-zero placeholder for a consumed, residual-wrapped slot.
-
-    The fused pair delivers the whole segment upstream; the parent's
-    ``y + ·`` around B still executes, so this slot contributes an
-    exact zero addend — adding literal zeros is lossless, unlike a
-    computed ``y - y`` on non-finite values.
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.zeros_like(x)
-
-
-def _plain_consumers(
-    io: dict[str, dict[str, Any]],
-    captured: dict[str, tuple[tuple, dict]],
-    out_obj: Any,
-    out_val: torch.Tensor,
-) -> list[str]:
-    """Block names whose captured args hold ``out`` (identity + value).
-
-    Object identity proves the same tensor flowed in; comparing the
-    captured clone rules out an in-place rewrite between producer and
-    consumer.
-    """
-    hits = []
-    for n, m in io.items():
-        c_args = captured.get(n, ((), {}))[0]
-        for arg, real in zip(
-            c_args, m.get("in_objs", ()), strict=False
-        ):
-            if (
-                real is out_obj
-                and isinstance(arg, torch.Tensor)
-                and torch.equal(arg, out_val)
-            ):
-                hits.append(n)
-                break
-    return hits
-
-
-def _io_has_value(
-    captured: dict[str, tuple[tuple, dict]],
-    model_out: Any,
-    val: torch.Tensor,
-) -> bool:
-    """Return True when ``val`` appears verbatim in the captured flow.
-
-    Checks the model's return and every block's captured positional
-    args — the evidence that a *computed* sum (like ``b_in + b_out``)
-    is what actually flows on.
-    """
-    if isinstance(model_out, torch.Tensor) and torch.equal(
-        model_out, val
-    ):
-        return True
-    return any(
-        isinstance(a, torch.Tensor) and torch.equal(a, val)
-        for args, _ in captured.values()
-        for a in args
-    )
-
-
-def _pair_boundary(
-    name_a: str,
-    name_b: str,
-    captured: dict[str, tuple[tuple, dict]],
-    io: dict[str, dict[str, Any]],
-    captured2: dict[str, tuple[tuple, dict]],
-    io2: dict[str, dict[str, Any]],
-) -> str | None:
-    """Classify the A→B dataflow of an adjacent block pair.
-
-    Returns the joint-micro-model mode — ``"chain"`` /
-    ``"chain_wrapped"`` / ``"residual"`` / ``"residual_wrapped"`` — or
-    ``None`` when the boundary is not a simple value flow.
-
-    A-side (what flows INTO B):
-
-    * ``chain`` — B's input IS A's output: the same live tensor object,
-      unmodified between the two calls (the captured values still
-      compare equal), and consumed by B alone;
-    * ``residual`` — B's input is ``a_in + a_out`` (the ``x + A(x)``
-      residual pattern), confirmed on the perturbed second-probe
-      capture too, and A's output feeds nothing else.
-
-    B-side (how B's OUTPUT is consumed — it decides the graft, because
-    the parent's ``b_in + B(b_in)`` wrap makes B's slot an addend, not
-    a value):
-
-    * plain — B's output object reaches another block or the model
-      return unmodified → B's slot becomes ``nn.Identity``;
-    * ``_wrapped`` — the sum ``b_in + b_out`` is what flows on → B's
-      slot becomes :class:`_Zero` and the joint absorbs B's residual;
-    * both or neither → ``None`` (ambiguous or unknown downstream).
-
-    Identity checks run on the retained live objects (``is``); equality
-    on detached clones — a coincidence of values alone never promotes a
-    boundary.
-    """
-    ca = captured.get(name_a)
-    cb = captured.get(name_b)
-    ia = io.get(name_a)
-    ib = io.get(name_b)
-    if ca is None or cb is None or ia is None or ib is None:
-        return None
-    if ia["calls"] != 1 or ib["calls"] != 1:
-        # A re-entered block is called again outside the pair window —
-        # a fused graft would rewrite that later call too.
-        return None
-    args_a, kw_a = ca
-    args_b, kw_b = cb
-    if kw_a or kw_b or len(args_a) != 1 or len(args_b) != 1:
-        return None
-    a_in, b_in, a_out = args_a[0], args_b[0], ia["out"]
-    if not (
-        isinstance(a_in, torch.Tensor)
-        and isinstance(b_in, torch.Tensor)
-        and isinstance(a_out, torch.Tensor)
-    ):
-        return None
-    model = io.get(_MODEL_KEY, {})
-    model_out, model_out_obj = model.get("out"), model.get("out_obj")
-    a_out_obj = ia["out_obj"]
-    if a_out_obj is model_out_obj:
-        return None  # A's output escapes the pair entirely
-    a_fans = _plain_consumers(io, captured, a_out_obj, a_out)
-    if ib["in_objs"][0] is a_out_obj:
-        # B literally consumed A's output object — and nothing else did.
-        if a_fans != [name_b]:
-            return None
-        a_mode = "chain"
-    elif a_fans:
-        # A's output feeds another block as well — not a simple edge.
-        return None
-    elif not (
-        a_in.shape == a_out.shape
-        and torch.equal(b_in, a_in + a_out)
-        and _residual_probe(name_a, name_b, captured2, io2)
-    ):
-        return None
-    else:
-        a_mode = "residual"
-    # B-side: how is B's own output consumed?
-    b_out, b_out_obj = ib["out"], ib["out_obj"]
-    if not isinstance(b_out, torch.Tensor):
-        return None
-    plain_ev = bool(
-        _plain_consumers(io, captured, b_out_obj, b_out)
-    ) or (
-        b_out_obj is model_out_obj
-        and isinstance(model_out, torch.Tensor)
-        and torch.equal(model_out, b_out)
-    )
-    wrapped_ev = b_in.shape == b_out.shape and _io_has_value(
-        captured, model_out, b_in + b_out
-    )
-    if plain_ev == wrapped_ev:
-        # Neither evidence, or both (ambiguous downstream) — decline.
-        return None
-    return a_mode + ("_wrapped" if wrapped_ev else "")
-
-
-def _cross_pair_pass(
-    blocks: list[tuple[str, torch.nn.Module]],
-    captured: dict[str, tuple[tuple, dict]],
-    io: dict[str, dict[str, Any]],
-    captured2: dict[str, tuple[tuple, dict]],
-    io2: dict[str, dict[str, Any]],
-    replacements: dict[str, torch.nn.Module],
-    block_reports: dict[str, BlockReport],
-    agg: dict[str, Any],
-    *,
-    ruleset: str,
-    max_iterations: int,
-    max_enodes: int | None,
-    max_memory_mb: float | None,
-    cost_fn: CostFn,
-    verify_tol: float,
-    source: Source,
-    sink: Sink,
-    max_cross_pairs: int,
-    verbose: bool,
-) -> dict[str, dict[str, Any]]:
-    """Jointly optimize adjacent block pairs across their boundary.
-
-    For each consecutive pair ``(blocks[i], blocks[i+1])`` in execution
-    order whose boundary is a simple value flow (:func:`_pair_boundary`),
-    build the :class:`_JointPair` micro-model, run the ordinary
-    :func:`optimize_model` on it (pairing, residual folds and scale
-    hoists apply across the two-block composition), verify the lowered
-    joint against the eager pair at ``verify_tol``, and graft it — a
-    :class:`_FusedPair` at A's slot, ``nn.Identity`` / :class:`_Zero`
-    at B's — only when verified AND its delivered FLOPs beat the sum
-    of the two separately-optimized results.
-
-    Combinatorics are capped: adjacent pairs only, no overlap (a block
-    consumed by a graft cannot re-pair), and at most
-    ``max_cross_pairs`` joint optimization runs.  Every failure is a
-    silent decline recorded as ``{pair: {"status", ...}}`` —
-    ``"grafted"``, ``"declined"`` (with ``reason``), or ``"skipped"``
-    (with ``reason``).  ``replacements``/``block_reports``/``agg`` are
-    updated in place for grafted pairs so the aggregate param report
-    keeps describing what is actually delivered.
-    """
-    reports: dict[str, dict[str, Any]] = {}
-    consumed: set[str] = set()
-    attempts = 0
-    for i in range(len(blocks) - 1):
-        name_a, mod_a = blocks[i]
-        name_b, mod_b = blocks[i + 1]
-        pair = f"{name_a}+{name_b}"
-        if name_a in consumed or name_b in consumed:
-            reports[pair] = {
-                "status": "skipped",
-                "reason": "member already fused",
-            }
-            continue
-        if name_a not in replacements or name_b not in replacements:
-            reports[pair] = {
-                "status": "skipped",
-                "reason": "block not optimized",
-            }
-            continue
-        mode = _pair_boundary(
-            name_a, name_b, captured, io, captured2, io2
-        )
-        if mode is None:
-            reports[pair] = {
-                "status": "skipped",
-                "reason": "no simple boundary",
-            }
-            continue
-        if attempts >= max_cross_pairs:
-            reports[pair] = {
-                "status": "skipped",
-                "reason": f"max_cross_pairs={max_cross_pairs}",
-            }
-            continue
-        attempts += 1
-        t0 = time.time()
-        entry: dict[str, Any] = {"boundary": mode}
-        try:
-            joint = _JointPair(mod_a, mod_b, mode)
-            (x,) = captured[name_a][0]
-            opt_j, st_j = optimize_model(
-                joint,
-                x,
-                ruleset="all+layout" if ruleset == "all" else ruleset,
-                max_iterations=max_iterations,
-                max_enodes=max_enodes,
-                max_memory_mb=max_memory_mb,
-                cost_fn=cost_fn,
-                source=source,
-                sink=sink,
-                symmetry_budget=_CROSS_PAIR_SYMMETRY_BUDGET,
-                verbose=verbose,
-            )
-            entry["stats"] = st_j
-            # Soundness gate, same tolerance convention as the
-            # per-block verify — the eager pair vs its lowering.
-            vr = verify_module(joint, opt_j, (x,), rtol=verify_tol)
-            entry["rel_diff"] = vr.max_rel
-            if not vr.passed:
-                entry["status"] = "declined"
-                entry["reason"] = (
-                    f"joint verify failed: {vr.max_rel:.3e}"
-                )
-            else:
-                j_cost = _executor_flops(opt_j)
-                sep = _executor_flops(
-                    replacements[name_a]
-                ) + _executor_flops(replacements[name_b])
-                entry["joint_cost"] = j_cost
-                entry["separate_cost"] = sep
-                if j_cost >= sep:
-                    entry["status"] = "declined"
-                    entry["reason"] = "no cost improvement"
-                else:
-                    fused = _FusedPair(
-                        opt_j, delta=mode.startswith("residual")
-                    )
-                    pr_j = param_report(joint, fused)
-                    pa = block_reports[name_a].param_report or {}
-                    pb = block_reports[name_b].param_report or {}
-                    delta = {
-                        k: pr_j[k] - pa.get(k, 0) - pb.get(k, 0)
-                        for k in (
-                            "original_params",
-                            "optimized_params",
-                            "original_bytes",
-                            "optimized_bytes",
-                        )
-                    }
-                    drop = (f"{name_a}:", f"{name_b}:")
-                    for k, v in delta.items():
-                        agg[k] += v
-                    agg["eliminated"] = [
-                        e
-                        for e in agg["eliminated"]
-                        if not e.startswith(drop)
-                    ]
-                    agg["derived"] = [
-                        e
-                        for e in agg["derived"]
-                        if not e.startswith(drop)
-                    ]
-                    agg["eliminated"] += [
-                        f"{pair}:{n}" for n in pr_j["eliminated"]
-                    ]
-                    agg["derived"] += [
-                        f"{pair}:{n}" for n in pr_j["derived"]
-                    ]
-                    replacements[name_a] = fused
-                    replacements[name_b] = (
-                        _Zero()
-                        if mode.endswith("_wrapped")
-                        else torch.nn.Identity()
-                    )
-                    block_reports[name_a].extra["cross_pair"] = pair
-                    block_reports[name_b].extra["cross_pair"] = pair
-                    consumed.update((name_a, name_b))
-                    entry["status"] = "grafted"
-        except Exception as e:
-            entry["status"] = "declined"
-            entry["reason"] = "error"
-            entry["error"] = f"{type(e).__name__}: {e}"
-        entry["time_s"] = time.time() - t0
-        reports[pair] = entry
-        if verbose:
-            print(
-                f"[Compositional] pair {pair}: "
-                f"{entry['status']} ({mode})"
-            )
-    return reports
-
-
 def _optimize_compositional(
-    model: torch.nn.Module,
-    example_input: torch.Tensor | tuple,
+    model: Any,
+    example_input: Any,
     *,
-    source: Source,
-    sink: Sink,
-    block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool]
-    | None = None,
+    optimizer: Optimizer,
+    block_pred: Callable | None = None,
     cost_fn: CostFn | None = None,
     ruleset: str = "all",
     max_iterations: int = 100,
@@ -2240,75 +1344,92 @@ def _optimize_compositional(
     verify_tol: float = 1e-4,
     max_cross_pairs: int = 8,
     verbose: bool = True,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
+) -> tuple[Any, dict[str, Any]]:
     """Optimize a stacked/multi-block model one block at a time.
 
     Whole-model equality saturation is monolithic: the e-graph grows with
     the product of block structures, so deep stacks saturate slowly.
-    This driver instead
+    This backend-neutral driver delegates every backend-native step to
+    the optimizer's ports and
 
-    1. walks the module tree and selects *blocks* — leaf submodules, plus
-       any child where ``block_pred(parent, name, child)`` holds
-       (default: children of ``nn.ModuleList``/``nn.Sequential``),
-    2. runs the ORIGINAL model once with forward hooks to capture each
-       block's real input (a block's input is not the model input),
-    3. runs :func:`optimize_model` on each block with its captured input,
-       verifying the lowered block against the original on that input —
-       a block that fails to export, saturate, lower, or verify keeps its
-       original implementation; a block that crosses a resource bound
-       (``max_enodes``, ``max_memory_mb``, or a caught OOM) fails with
+    1. selects *blocks* via the composer port — leaf sub-objects, plus
+       any child where ``block_pred(parent, name, child)`` holds,
+    2. runs the ORIGINAL model once (``composer.capture_inputs``) to
+       capture each block's real input (a block's input is not the
+       model input),
+    3. runs the optimizer's ``search``/``lower`` phases on each block
+       with its captured input, verifying the lowered block against
+       the original on that input — a block that fails to export,
+       saturate, lower, or verify keeps its original implementation;
+       a block that crosses a resource bound (``max_enodes``,
+       ``max_memory_mb``, or a caught OOM) fails with
        ``reason == "resource_limit"``,
-    4. runs the pairwise cross-block pass (:func:`_cross_pair_pass`):
-       for each *adjacent* pair whose boundary is a simple value flow
-       (B's input IS A's output, or the ``x + A(x)`` residual), build
-       the joint micro-model, optimize it with :func:`optimize_model`,
-       verify it against the eager pair, and graft it in place of both
-       blocks when it is verified AND cheaper than the separate results
-       — capped at ``max_cross_pairs`` joint runs (``0`` disables),
+    4. runs the pairwise cross-block pass (the composer's optional
+       ``cross_pairs`` hook): for each *adjacent* pair whose boundary
+       is a simple value flow (``composer.boundary``), build the
+       joint micro-model, optimize it, verify it against the eager
+       pair, and graft it in place of both blocks when it is verified
+       AND cheaper than the separate results — capped at
+       ``max_cross_pairs`` joint runs (``0`` disables),
     5. clones the model — structure deep-copied, parameter/buffer
-       tensors *shared* with the original (``_shared_param_clone``; no
-       second copy of the weights, so recompose does not double device
-       memory) — and grafts the optimized ``IRModule`` back in place,
-       preserving the original forward structure, then verifies
-       end-to-end equivalence on ``example_input``.
+       values *shared* with the original
+       (``composer.clone_sharing``; no second copy of the weights, so
+       recompose does not double device memory) — and grafts the
+       optimized executors back in place
+       (``composer.graft``), preserving the original forward
+       structure, then verifies end-to-end equivalence on
+       ``example_input`` through ``sink.verify``.
 
-    Returns ``(recomposed_module, stats)`` where ``stats["blocks"]`` maps
+    Returns ``(recomposed_model, stats)`` where ``stats["blocks"]`` maps
     each block's dotted name to ``{"status", "stats", "param_report",
     "time_s", ...}`` and ``stats["param_report"]`` aggregates the
     per-block parameter diffs (eliminated/derived names are prefixed by
-    block name for auditability).  ``stats["cross_pairs"]`` maps each
-    attempted pair ``"a+b"`` to ``{"status", "boundary", ...}`` —
-    ``"grafted"`` / ``"declined"`` / ``"skipped"``.  ``stats["shared_
-    params"]`` is True when the recomposed module shares the original's
-    tensor storage (the normal path); ``stats["in_place"]`` True means
-    cloning failed and the input module was returned unmodified.
+    block name for auditability) — the composer's ``param_report`` hook
+    supplies the per-block diff when it exists.  ``stats["cross_pairs"]``
+    maps each attempted pair ``"a+b"`` to ``{"status", "boundary", ...}``
+    — ``"grafted"`` / ``"declined"`` / ``"skipped"``.  ``stats["shared_
+    params"]`` is True when the recomposed model shares the original's
+    storage (the normal path); ``stats["in_place"]`` True means cloning
+    failed and the input was returned unmodified.
     """
     t_start = time.time()
+    composer = optimizer.composer
+    if composer is None:
+        raise TypeError(
+            "Compositional strategy needs a Composer port — "
+            "pass composer= (or backend=) to Optimizer"
+        )
+    # ``Optimizer.__post_init__`` already rejects a missing source/sink,
+    # so by construction both ports are present here.
+    source = cast(Source, optimizer.source)
+    sink = cast(Sink, optimizer.sink)
     if cost_fn is None:
         cost_fn = _default_cost_fn()
 
-    blocks = _select_blocks(model, block_pred)
+    blocks = composer.blocks(model, predicate=block_pred)
     if verbose:
+        names = [n for n, _ in blocks]
         print(
-            f"[Compositional] {len(blocks)} candidate blocks: "
-            f"{[n for n, _ in blocks]}"
+            f"[Compositional] {len(blocks)} candidate blocks: {names}"
         )
 
-    captured, io = _capture_block_inputs(model, blocks, example_input)
+    captured, io = composer.capture_inputs(model, blocks, example_input)
     # A second capture on a perturbed probe input arms the residual
     # boundary check against a coincidence of values (it only runs when
     # the pair pass is enabled; a probe failure fails closed — residual
     # pairs decline, identity-proven chain pairs still work).
-    captured2: dict[str, tuple[tuple, dict]] = {}
-    io2: dict[str, dict[str, Any]] = {}
+    captured2: dict[str, Any] = {}
+    io2: dict[str, Any] = {}
     if max_cross_pairs:
+        import contextlib
+
         with contextlib.suppress(Exception):
-            captured2, io2 = _capture_block_inputs(
-                model, blocks, _perturbed_input(example_input)
+            captured2, io2 = composer.capture_inputs(
+                model, blocks, composer.perturbed(example_input)
             )
 
-    replacements: dict[str, torch.nn.Module] = {}
-    block_reports: dict[str, BlockReport] = {}
+    replacements: dict[str, Any] = {}
+    block_reports: dict[str, dict[str, Any]] = {}
     agg = {
         "original_params": 0,
         "optimized_params": 0,
@@ -2317,22 +1438,27 @@ def _optimize_compositional(
         "eliminated": [],
         "derived": [],
     }
+    # The weight-file diff is an optional composer hook — a backend
+    # without one reports no parameter audit.
+    param_diff = getattr(composer, "param_report", None)
 
     for name, block in blocks:
-        rep = BlockReport(name=name, status="not_executed")
+        rep: dict[str, Any] = {"status": "not_executed"}
         block_reports[name] = rep
         cap = captured.get(name)
         if cap is None:
             continue
         args, kwargs = cap
         if kwargs:
-            rep.status = "skipped"
-            rep.reason = f"non-positional kwargs {sorted(kwargs)}"
+            rep["status"] = "skipped"
+            rep["reason"] = f"non-positional kwargs {sorted(kwargs)}"
             continue
         ex = args[0] if len(args) == 1 else args
         t0 = time.time()
         try:
-            opt_mod, st = optimize_model(
+            # Per-block search+lower — the same phases the monolithic
+            # pipeline runs, through the optimizer's ports.
+            res = optimizer.search(
                 block,
                 ex,
                 ruleset=ruleset,
@@ -2340,58 +1466,68 @@ def _optimize_compositional(
                 max_enodes=max_enodes,
                 max_memory_mb=max_memory_mb,
                 cost_fn=cost_fn,
-                source=source,
-                sink=sink,
+                delivers_compiled=False,
                 verbose=verbose,
             )
+            lr = optimizer.lower(
+                res,
+                ex,
+                runner=IdentityRunner(),
+                verify=verbose,
+                verbose=verbose,
+            )
+            opt_mod, st = lr.module, lr.stats
             # Per-block verification on the captured input — soundness
-            # gate independent of optimize_model's own (verbose-gated)
+            # gate independent of the pipeline's own (verbose-gated)
             # check.  Any mismatch or eval failure falls back.
-            vr = verify_module(block, opt_mod, args, rtol=verify_tol)
-            rep.rel_diff = vr.max_rel
+            vr = sink.verify(block, opt_mod, args, rtol=verify_tol)
+            rep["rel_diff"] = vr.max_rel
             if not vr.passed:
                 raise RuntimeError(
                     f"block verification failed: "
                     f"rel diff {vr.max_rel:.3e}"
                 )
             replacements[name] = opt_mod
-            rep.status = "optimized"
-            rep.stats = OptReport.from_stats(st)
-            pr = param_report(block, opt_mod)
-            rep.param_report = pr
-            agg["original_params"] += pr["original_params"]
-            agg["optimized_params"] += pr["optimized_params"]
-            agg["original_bytes"] += pr["original_bytes"]
-            agg["optimized_bytes"] += pr["optimized_bytes"]
-            agg["eliminated"] += [
-                f"{name}:{n}" for n in pr["eliminated"]
-            ]
-            agg["derived"] += [f"{name}:{n}" for n in pr["derived"]]
+            rep["status"] = "optimized"
+            rep["stats"] = st
+            if param_diff is not None:
+                pr = param_diff(block, opt_mod)
+                rep["param_report"] = pr
+                agg["original_params"] += pr["original_params"]
+                agg["optimized_params"] += pr["optimized_params"]
+                agg["original_bytes"] += pr["original_bytes"]
+                agg["optimized_bytes"] += pr["optimized_bytes"]
+                agg["eliminated"] += [
+                    f"{name}:{n}" for n in pr["eliminated"]
+                ]
+                agg["derived"] += [f"{name}:{n}" for n in pr["derived"]]
             if verbose:
                 print(
                     f"[Compositional] {name}: optimized "
-                    f"({rep.rel_diff:.2e})"
+                    f"({rep['rel_diff']:.2e})"
                 )
         except Exception as e:
-            rep.status = "failed"
-            rep.error = f"{type(e).__name__}: {e}"
+            rep["status"] = "failed"
+            rep["error"] = f"{type(e).__name__}: {e}"
             if isinstance(
                 e, OptimizationResourceError
             ) or _looks_like_oom(e):
-                rep.reason = "resource_limit"
+                rep["reason"] = "resource_limit"
             if verbose:
                 print(f"[Compositional] {name}: keeping original ({e})")
-        rep.time_s = time.time() - t0
+        rep["time_s"] = time.time() - t0
 
     # -- Pairwise cross-block pass --------------------------------------
     # Per-block optimization is blind across the boundary: adjacent
     # blocks can share transforms a per-block search cannot see (block
     # i's output projection composing with block i+1's input
-    # projections; a residual add absorbing a shared affine).  Verified
-    # and cost-gated; every decline keeps the separate results.
+    # projections; a residual add absorbing a shared affine).  The
+    # pass is adapter machinery — verified and cost-gated; every
+    # decline keeps the separate results.
     cross_pairs: dict[str, dict[str, Any]] = {}
-    if max_cross_pairs:
-        cross_pairs = _cross_pair_pass(
+    cross = getattr(composer, "cross_pairs", None)
+    if max_cross_pairs and callable(cross):
+        cross_pairs = cross(
             blocks,
             captured,
             io,
@@ -2413,60 +1549,54 @@ def _optimize_compositional(
         )
 
     # -- Recompose -------------------------------------------------------
-    # The clone grafts submodules, never tensors, so it shares the
+    # The clone grafts structure, never values, so it shares the
     # original's parameter/buffer storage — recomposing costs no extra
     # weight bytes (the old plain deepcopy doubled the footprint and
     # OOMed at ~0.5B fp16 on small GPUs).
     in_place = False
     try:
-        new_model = _shared_param_clone(model)
+        new_model = composer.clone_sharing(model)
     except Exception:
         # Never graft into the caller's live model: the replacements
-        # carry shape-specialized attrs baked by torch.export for the
+        # carry shape-specialized state baked by the export for the
         # example input, and a mutated caller fails at the NEXT input
         # shape (and the e2e check degenerates to self-comparison).
         new_model = model
         in_place = True
         replacements = {}
-    for name, opt_mod in replacements.items():
-        _replace_submodule(new_model, name, opt_mod)
+    composer.graft(new_model, replacements)
 
     # -- End-to-end verification ----------------------------------------
-    report = CompositionalReport(
-        compositional=True,
-        n_blocks=len(blocks),
-        n_optimized=len(replacements),
-        n_failed=sum(
-            1 for r in block_reports.values() if r.status == "failed"
-        ),
-        n_skipped=sum(
-            1
-            for r in block_reports.values()
-            if r.status in ("skipped", "not_executed")
-        ),
-        blocks=block_reports,
-        in_place=in_place,
-        shared_params=not in_place,
-        extra={"cross_pairs": cross_pairs},
-    )
     agg["bytes_saved"] = agg["original_bytes"] - agg["optimized_bytes"]
     agg["ratio"] = (
         agg["optimized_bytes"] / agg["original_bytes"]
         if agg["original_bytes"]
         else 1.0
     )
-    report.param_report = agg
+    stats: dict[str, Any] = {
+        "compositional": True,
+        "n_blocks": len(blocks),
+        "n_optimized": len(replacements),
+        "n_failed": sum(
+            1 for r in block_reports.values() if r["status"] == "failed"
+        ),
+        "n_skipped": sum(
+            1
+            for r in block_reports.values()
+            if r["status"] in ("skipped", "not_executed")
+        ),
+        "blocks": block_reports,
+        "in_place": in_place,
+        "shared_params": not in_place,
+        "param_report": agg,
+        "cross_pairs": cross_pairs,
+    }
 
-    args = (
-        example_input
-        if isinstance(example_input, tuple)
-        else (example_input,)
-    )
     if in_place:
         # new_model IS the input model — a verify would be a
         # self-comparison that always reports 0.0.  Record the
         # degenerate case honestly instead of a false pass.
-        report.end_to_end = {
+        stats["end_to_end"] = {
             "skipped": "in_place",
             "reason": "param-sharing clone failed — returned model "
             "is the input module, unmodified",
@@ -2477,105 +1607,125 @@ def _optimize_compositional(
             "report.in_place=True)"
         )
     else:
+        args2 = (
+            example_input
+            if isinstance(example_input, tuple)
+            else (example_input,)
+        )
         try:
-            vr = verify_module(model, new_model, args)
-            report.end_to_end = {
+            vr = sink.verify(model, new_model, args2)
+            stats["end_to_end"] = {
                 "max_abs_diff": vr.max_abs,
                 "max_rel_diff": vr.max_rel,
             }
             if verbose:
                 print(
                     f"[Compositional] end-to-end rel diff: "
-                    f"{report.end_to_end['max_rel_diff']:.3e}"
+                    f"{stats['end_to_end']['max_rel_diff']:.3e}"
                 )
         except Exception as e:
-            report.end_to_end = {"error": f"{type(e).__name__}: {e}"}
+            stats["end_to_end"] = {"error": f"{type(e).__name__}: {e}"}
             if verbose:
                 print(f"[Compositional] end-to-end check failed: {e}")
 
-    report.wall_time_s = time.time() - t_start
-    return new_model, report.to_dict()
+    stats["wall_time_s"] = time.time() - t_start
+    return new_model, stats
 
 
-def optimize_compositional(
-    model: torch.nn.Module,
-    example_input: torch.Tensor | tuple,
-    *,
-    block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool]
-    | None = None,
-    cost_fn: CostFn | None = None,
-    ruleset: str = "all",
-    max_iterations: int = 100,
-    max_enodes: int | None = 100_000,
-    max_memory_mb: float | None = None,
-    verify_tol: float = 1e-4,
-    ops: OpTable | None = None,
-    max_cross_pairs: int = 8,
-    source: Source | None = None,
-    sink: Sink | None = None,
-    verbose: bool = True,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
-    """Optimize a stacked/multi-block model one block at a time.
+# ---------------------------------------------------------------------------
+# Compatibility delegation — moved torch-facing names (lazy)
+# ---------------------------------------------------------------------------
+#
+# The deprecated ``optimize_*`` wrappers (torch-defaulted entry
+# points) moved to ``catopt_torch.api`` (plan 0007); the torch-native
+# structural internals (hook capture, shared-param clone, pair
+# boundary) moved to ``catopt_torch.composer``; the causal-fold
+# internals to ``catopt_torch.folds``; the typed reports stay in
+# ``catopt_torch.report``.  All resolve lazily through this module's
+# ``__getattr__`` so the historical private/compat paths
+# (``catopt.optimize.optimize_model``,
+# ``catopt.optimize._pair_boundary``, …) keep working on a torch
+# install — while ``import catopt_optimize.optimize`` itself loads no
+# backend.
 
-    A compatibility wrapper (plan 0006): resolves the historical
-    ``source``/``sink``/``ops`` defaults — torch IS the default here —
-    then runs ``Optimizer(...).optimize(..., strategy=Compositional(...))``.
-    The pipeline is :func:`_optimize_compositional`; the signature is
-    unchanged plus the (additive) ``source``/``sink`` ports it now
-    threads into every per-block :func:`optimize_model` call.
+_API_NAMES = frozenset(
+    {
+        "optimize_model",
+        "optimize_compositional",
+        "save_optimized_weights",
+    }
+)
+_COMPOSER_NAMES = frozenset(
+    {
+        "param_report",
+        "_default_block_pred",
+        "_select_blocks",
+        "_capture_block_inputs",
+        "_MODEL_KEY",
+        "_replace_submodule",
+        "_shared_param_clone",
+        "_perturbed_input",
+        "_residual_probe",
+        "_executor_flops",
+        "_JointPair",
+        "_FusedPair",
+        "_Zero",
+        "_plain_consumers",
+        "_io_has_value",
+        "_pair_boundary",
+        "_cross_pair_pass",
+        "_CROSS_PAIR_SYMMETRY_BUDGET",
+    }
+)
+_FOLD_NAMES = frozenset(
+    {
+        "_eval_const",
+        "_is_causal_keep_mask",
+        "_specialize_causal",
+    }
+)
+_REPORT_NAMES = frozenset(
+    {
+        "OptReport",
+        "BlockReport",
+        "CompositionalReport",
+        "verify_module",
+    }
+)
 
-    1. walks the module tree and selects *blocks* — leaf submodules, plus
-       any child where ``block_pred(parent, name, child)`` holds
-       (default: children of ``nn.ModuleList``/``nn.Sequential``),
-    2. runs the ORIGINAL model once with forward hooks to capture each
-       block's real input (a block's input is not the model input),
-    3. runs :func:`optimize_model` on each block with its captured input,
-       verifying the lowered block against the original on that input —
-       a block that fails to export, saturate, lower, or verify keeps its
-       original implementation; a block that crosses a resource bound
-       (``max_enodes``, ``max_memory_mb``, or a caught OOM) fails with
-       ``reason == "resource_limit"``,
-    4. runs the pairwise cross-block pass (:func:`_cross_pair_pass`):
-       for each *adjacent* pair whose boundary is a simple value flow
-       (B's input IS A's output, or the ``x + A(x)`` residual), build
-       the joint micro-model, optimize it with :func:`optimize_model`,
-       verify it against the eager pair, and graft it in place of both
-       blocks when it is verified AND cheaper than the separate results
-       — capped at ``max_cross_pairs`` joint runs (``0`` disables),
-    5. clones the model — structure deep-copied, parameter/buffer
-       tensors *shared* with the original (``_shared_param_clone``; no
-       second copy of the weights, so recompose does not double device
-       memory) — and grafts the optimized ``IRModule`` back in place,
-       preserving the original forward structure, then verifies
-       end-to-end equivalence on ``example_input``.
+#: Composer cross_pairs is a TorchComposer method — its historical
+#: free-function form is reproduced by a bound call.
+_CARRIER_PLANS_LAZY: dict[str, Callable] | None = None
 
-    Returns ``(recomposed_module, stats)`` where ``stats["blocks"]`` maps
-    each block's dotted name to ``{"status", "stats", "param_report",
-    "time_s", ...}`` and ``stats["param_report"]`` aggregates the
-    per-block parameter diffs (eliminated/derived names are prefixed by
-    block name for auditability).  ``stats["cross_pairs"]`` maps each
-    attempted pair ``"a+b"`` to ``{"status", "boundary", ...}`` —
-    ``"grafted"`` / ``"declined"`` / ``"skipped"``.  ``stats["shared_
-    params"]`` is True when the recomposed module shares the original's
-    tensor storage (the normal path); ``stats["in_place"]`` True means
-    cloning failed and the input module was returned unmodified.
-    """
-    lr = Optimizer(
-        source=source if source is not None else TorchSource(),
-        sink=sink if sink is not None else TorchSink(ops=ops),
-    ).optimize(
-        model,
-        example_input,
-        strategy=Compositional(
-            block_pred=block_pred,
-            verify_tol=verify_tol,
-            max_cross_pairs=max_cross_pairs,
-        ),
-        cost_fn=cost_fn,
-        ruleset=ruleset,
-        max_iterations=max_iterations,
-        max_enodes=max_enodes,
-        max_memory_mb=max_memory_mb,
-        verbose=verbose,
+
+def __getattr__(name: str) -> Any:
+    """Resolve the moved torch-facing names lazily."""
+    global _CARRIER_PLANS_LAZY
+    if name == "_CARRIER_PLANS":
+        if _CARRIER_PLANS_LAZY is None:
+            _CARRIER_PLANS_LAZY = _carrier_plans()
+        return _CARRIER_PLANS_LAZY
+    if name in _API_NAMES:
+        mod = importlib.import_module("catopt_torch.api")
+        return getattr(mod, name)
+    if name in _COMPOSER_NAMES:
+        mod = importlib.import_module("catopt_torch.composer")
+        if name == "_cross_pair_pass":
+            # Historical shape: the free function — now the composer
+            # method (same signature, self dropped).
+            return mod.TorchComposer().cross_pairs
+        return getattr(mod, name)
+    if name in _FOLD_NAMES:
+        mod = importlib.import_module("catopt_torch.folds")
+        return getattr(mod, name)
+    if name in _REPORT_NAMES:
+        mod = importlib.import_module("catopt_torch.report")
+        return getattr(mod, name)
+    if name == "torch":
+        # Historical patch point: ``monkeypatch.setattr(O.torch,
+        # "compile", ...)`` mutated the module attribute — the same
+        # module object the delivery runners look up at call time.
+        return importlib.import_module("torch")
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
     )
-    return cast(torch.nn.Module, lr.module), lr.stats

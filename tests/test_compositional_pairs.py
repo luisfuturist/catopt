@@ -10,6 +10,7 @@ other outcome is a silent decline recorded in ``stats["cross_pairs"]``.
 """
 
 import catopt_optimize.optimize as O
+import catopt_torch.composer as C
 import torch
 import torch.nn as nn
 from catopt.models import DeepParallel, ParallelLinear
@@ -763,7 +764,7 @@ def test_cross_pair_probe_failure_declines(monkeypatch):
             return x
 
     monkeypatch.setattr(
-        O, "_perturbed_input", lambda ex: torch.randn(3)
+        C, "_perturbed_input", lambda ex: torch.randn(3)
     )
     model = ResidualWrapped().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)

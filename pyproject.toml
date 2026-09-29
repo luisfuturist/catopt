@@ -13,6 +13,7 @@ dependencies = [
     "catopt-torch",
     "catopt-carriers",
     "catopt-optimize",
+    "catopt-cuda",
     "torch>=2.0",
     "numpy>=1.24",
 ]
@@ -90,6 +91,7 @@ catopt-core = { workspace = true }
 catopt-torch = { workspace = true }
 catopt-carriers = { workspace = true }
 catopt-optimize = { workspace = true }
+catopt-cuda = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -119,6 +121,7 @@ root_packages = [
     "catopt_torch",
     "catopt_carriers",
     "catopt_optimize",
+    "catopt_cuda",
     "catopt",
 ]
 # Required so the "core imports no tensor library" contract can forbid
@@ -133,6 +136,7 @@ forbidden_modules = [
     "catopt_torch",
     "catopt_carriers",
     "catopt_optimize",
+    "catopt_cuda",
 ]
 
 [[tool.importlinter.contracts]]
@@ -140,6 +144,19 @@ name = "core imports no tensor library"
 type = "forbidden"
 source_modules = ["catopt_core"]
 forbidden_modules = ["torch", "numpy"]
+
+[[tool.importlinter.contracts]]
+name = "orchestrator imports no backend"
+type = "forbidden"
+source_modules = ["catopt_optimize"]
+forbidden_modules = ["torch", "catopt_torch", "catopt_cuda"]
+# The backend packages may never be imported directly — backend
+# specifics live behind the Composer/Meter/Runner/ExecutorSpec ports.
+# Indirect reach is fine: the orchestrator lazily resolves carrier
+# machinery (catopt_carriers), which is what pulls torch — the runtime
+# boundary test (sys.modules stays torch-free after
+# `import catopt_optimize`) is the gate that pins the laziness.
+allow_indirect_imports = true
 
 [tool.ruff]
 target-version = "py311"
@@ -174,6 +191,7 @@ extra-paths = [
     "packages/catopt-torch/src",
     "packages/catopt-carriers/src",
     "packages/catopt-optimize/src",
+    "packages/catopt-cuda/src",
 ]
 
 [tool.ty.src]
@@ -185,7 +203,7 @@ exclude = []
 error-on-warning = false
 
 [tool.coverage.run]
-source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_optimize", "catopt"]
+source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_optimize", "catopt_cuda", "catopt"]
 branch = true
 omit = ["*/tests/*"]
 

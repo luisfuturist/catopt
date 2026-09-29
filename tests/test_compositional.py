@@ -189,7 +189,7 @@ def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
     """When the recompose clone fails (e.g. an unpicklable non-tensor
     attr), the returned model is the INPUT unmodified — the report must
     say so, not run a degenerate self-comparison verify."""
-    import catopt_optimize.optimize as O
+    import catopt_torch.composer as C
     from catopt.optimize import optimize_compositional
 
     torch.manual_seed(0)
@@ -199,7 +199,7 @@ def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("cannot pickle this attribute")
 
-    monkeypatch.setattr(O.copy, "deepcopy", boom)
+    monkeypatch.setattr(C.copy, "deepcopy", boom)
     opt, stats = optimize_compositional(model, x, verbose=False)
     assert opt is model  # same object — nothing grafted
     assert stats["in_place"] is True

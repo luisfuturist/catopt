@@ -1,14 +1,14 @@
 # ruff: noqa: RUF002
-"""Regime-adaptive architecture selection.
+"""Regime-adaptive architecture selection — the backend-neutral half.
 
 A *regime* pairs a cost model with an executor.  ``regime_frontier``
 extracts, for each regime, the best e-graph member under that regime's
-cost function and records which executor can serve it.  A
-``RegimeDispatch`` wraps the resulting ``{regime_name: (term, module)}``
-mapping into a single callable module: one set of weights, several
-certified-equivalent architectures, dispatched by regime name.
+cost function and records which executor can serve it — executor
+knowledge arriving through the ``executors`` mapping (a backend's
+:attr:`~catopt_core.ports.Sink.executors` table), not a torch
+registry.
 
-Two honesty rules govern the whole module:
+Two honesty rules govern the module:
 
 * Every served term is a member of the saturated e-graph, hence provably
   equivalent to the source (``frontier.certificate(name)`` produces the
@@ -20,9 +20,21 @@ Two honesty rules govern the whole module:
   nominates it anyway and flags ``forced=True`` with the cost premium
   recorded.
 
-Typical usage::
+This module is *backend-neutral*: importing it never loads torch.
+The executor table defaults are ambient — a backend registers its
+executor specs and dispatch class via
+:func:`register_regime_backend` (``catopt_torch.regime`` does this at
+import, keeping the historical ``EXECUTORS`` dict and
+``RegimeDispatch`` behaviour); callers may instead pass ``executors=``
+explicitly to :func:`regime_frontier`.  The torch-coupled dispatch
+machinery — ``RegimeDispatch`` (an ``nn.Module``) and the end-to-end
+``regime_dispatch`` — lives in ``catopt_torch.regime``; this module
+carries the frontier extraction, the term introspection and the
+regime normalisation both sides share.
 
-    from catopt_optimize.regime import Regime, regime_dispatch, default_regimes
+Typical usage (torch backend)::
+
+    from catopt.regime import Regime, regime_dispatch, default_regimes
     from catopt_core.cost import flops_cost, launch_aware_cost
 
     disp = regime_dispatch(model, x, regimes=[
@@ -37,16 +49,17 @@ Typical usage::
 
 Or directly on a saturated e-graph::
 
-    frontier = regime_frontier(eg, root_eid, regimes, ir=ir)
+    frontier = regime_frontier(eg, root_eid, regimes, ir=ir,
+                               executors=backend.sink.executors)
     disp = frontier.build(param_values=state)
 
 Target profiles
 ---------------
 A regime can carry a *target profile* — measured hardware constants
-from :mod:`catopt_optimize.calibrate` — which defaults its cost model to
+from :mod:`catopt_torch.calibrate` — which defaults its cost model to
 ``roofline_cost_for(profile)``::
 
-    from catopt_optimize.calibrate import calibrate, load_profile
+    from catopt_torch.calibrate import calibrate, load_profile
 
     prof = calibrate()                       # or load_profile("rtx2050")
     disp = regime_dispatch(model, x, regimes=[
@@ -60,29 +73,12 @@ from :mod:`catopt_optimize.calibrate` — which defaults its cost model to
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import contextlib
+import importlib
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import (
-    Any,
-)
+from typing import Any
 
-import torch
-import torch.nn as nn
-from catopt_carriers.decode_laws import DECODE_LAWS
-from catopt_carriers.om import OM_LAWS
-from catopt_carriers.om_lower import (
-    build_om_plan,
-    is_om_apply_term,
-    to_batched_om_module,
-    to_streaming_om_module,
-)
-from catopt_carriers.scan_lower import (
-    build_scan_plan,
-    is_scan_apply_term,
-    to_batched_scan_module,
-)
-from catopt_carriers.trace import TRACE_LAWS
-from catopt_carriers.xcarrier import XC_LAWS
 from catopt_core.cost import (
     _INVALID_COST,
     _VIEW_OPS,
@@ -95,18 +91,15 @@ from catopt_core.cost import (
 from catopt_core.egraph import EGraph, ENode
 from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
 from catopt_core.laws import SCAN_DIAG_LAWS, SCAN_LAWS
+from catopt_core.ports import ExecutorSpec
+from catopt_core.profile import TargetProfile, load_profile
 from catopt_core.typing import _INVALID, _numel, _shape_of
-from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
-
-from catopt_optimize.calibrate import TargetProfile, load_profile
 
 __all__ = [
-    "CARRIER_LAWS",
     "EXECUTORS",
     "ExecutorSpec",
     "Regime",
     "RegimeChoice",
-    "RegimeDispatch",
     "RegimeFrontier",
     "architecture_label",
     "architecture_signature",
@@ -115,8 +108,8 @@ __all__ = [
     "default_rules",
     "footprint_cost",
     "is_trace_rooted_term",
-    "regime_dispatch",
     "regime_frontier",
+    "register_regime_backend",
 ]
 
 # ---------------------------------------------------------------------------
@@ -158,12 +151,8 @@ def footprint_cost(term: Any, memo: dict | None = None) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Executors
+# Executors — ambient table + registration
 # ---------------------------------------------------------------------------
-
-
-def _always_true(_: Any) -> bool:
-    return True
 
 
 def is_trace_rooted_term(term: Any) -> bool:
@@ -185,87 +174,80 @@ def is_trace_rooted_term(term: Any) -> bool:
     return False
 
 
-@dataclass(frozen=True)
-class ExecutorSpec:
-    """An executor pairing for a regime.
+#: The ambient executor table — the default ``executors`` argument of
+#: :func:`regime_frontier` and the lookup RegimeDispatch-style builders
+#: read.  Populated by :func:`register_regime_backend` — importing a
+#: backend's regime module (``catopt.regime`` → ``catopt_torch.regime``)
+#: fills it with that backend's :class:`ExecutorSpec`s; a caller may
+#: instead pass ``executors=`` explicitly.  Kept as a plain dict so the
+#: historical ``monkeypatch.setitem(EXECUTORS, "fake", spec)`` test
+#: behaviour is byte-identical.
+EXECUTORS: dict[str, ExecutorSpec] = {}
 
-    ``lower`` builds the serving ``nn.Module`` from an ``IR``.
-    ``accepts(term)`` is the *term-level* probe: does the term have the
-    executor's native shape at the root, so the executor's specialised
-    schedule actually fires (not just its serial fallback)?
-    ``engaged(module)`` is the *module-level* probe after building.
-    ``carrier`` is ``(root_ops, inner_ops, leaf_ops)`` describing the
-    carrier family the executor accelerates, or ``None`` for generic
-    executors that accept any term.
+#: The ambient dispatch builder — ``RegimeFrontier.build`` resolves it.
+_DISPATCH_CLS: Any = None
+
+
+def register_regime_backend(
+    *,
+    executors: Mapping[str, ExecutorSpec] | None = None,
+    dispatch: Any = None,
+) -> None:
+    """Register a backend's regime machinery — the adapter-push seam.
+
+    The regime frontier is backend-neutral: a backend that wants the
+    *default* executor table (``executors=None``) and the default
+    ``frontier.build()`` dispatch calls this once — typically at its
+    own regime-module import (``catopt_torch.regime`` registers the
+    torch executor table and its ``nn.Module`` dispatch).  Registration
+    merges into the ambient :data:`EXECUTORS` dict — the same object
+    tests and downstream callers see — and records the dispatch class.
     """
+    if executors is not None:
+        EXECUTORS.update(dict(executors))
+    if dispatch is not None:
+        global _DISPATCH_CLS
+        _DISPATCH_CLS = dispatch
 
-    name: str
-    lower: Callable[[IR, dict | None], nn.Module]
-    accepts: Callable[[Any], bool]
-    engaged: Callable[[nn.Module], bool]
-    carrier: tuple[frozenset, frozenset, frozenset] | None = None
+
+def _is_scan_apply(term: Any) -> bool:
+    """Probe the scan carrier's root — resolved at call time.
+
+    ``catopt_carriers`` is optional from this module's perspective:
+    the probe defers so importing the regime machinery never loads a
+    backend.
+    """
+    from catopt_carriers.scan_lower import is_scan_apply_term
+
+    return is_scan_apply_term(term)
 
 
-EXECUTORS: dict[str, ExecutorSpec] = {
-    "generic": ExecutorSpec(
-        "generic",
-        ir_to_torch_module,
-        _always_true,
-        _always_true,
-        None,
-    ),
-    "scan": ExecutorSpec(
-        "scan",
-        to_batched_scan_module,
-        is_scan_apply_term,
-        lambda m: bool(getattr(m, "is_batched", False)),
-        (
-            frozenset({"apply", "applyd"}),
-            frozenset({"aff_compose", "affd_compose"}),
-            frozenset({"aff", "aff_diag"}),
-        ),
-    ),
-    "om_batched": ExecutorSpec(
-        "om_batched",
-        to_batched_om_module,
-        is_om_apply_term,
-        lambda m: bool(getattr(m, "is_batched", False)),
-        (
-            frozenset({"om_apply"}),
-            frozenset({"om_compose"}),
-            frozenset({"om", "om_elem"}),
-        ),
-    ),
-    "om_streaming": ExecutorSpec(
-        "om_streaming",
-        to_streaming_om_module,
-        is_om_apply_term,
-        lambda m: bool(getattr(m, "is_streaming", False)),
-        (
-            frozenset({"om_apply"}),
-            frozenset({"om_compose"}),
-            frozenset({"om", "om_elem"}),
-        ),
-    ),
-    "trace": ExecutorSpec(
-        "trace",
-        ir_to_torch_module,
-        is_trace_rooted_term,
-        _always_true,
-        (
-            frozenset({"trace"}),
-            frozenset({"parl", "bdiag"}),
-            frozenset({"eye", "cswap"}),
-        ),
-    ),
-}
+def _is_om_apply(term: Any) -> bool:
+    """Probe the om carrier's root — resolved at call time."""
+    from catopt_carriers.om_lower import is_om_apply_term
+
+    return is_om_apply_term(term)
+
+
+def _scan_plan(term: Any) -> Any:
+    """Build the batched-scan plan — resolved at call time."""
+    from catopt_carriers.scan_lower import build_scan_plan
+
+    return build_scan_plan(term)
+
+
+def _om_plan(term: Any) -> Any:
+    """Build the batched-om plan — resolved at call time."""
+    from catopt_carriers.om_lower import build_om_plan
+
+    return build_om_plan(term)
 
 
 def _auto_executor(term: Any) -> str:
     """Resolve ``"auto"`` to the executor matching the term's root."""
-    if is_scan_apply_term(term):
+    if _is_scan_apply(term):
         return "scan"
-    if is_om_apply_term(term):
+    if _is_om_apply(term):
         return "om_batched"
     if is_trace_rooted_term(term):
         return "trace"
@@ -288,9 +270,10 @@ class Regime:
     critical-path depth, pass ``extract_fn(eg, root_eid) -> term``
     instead (e.g. ``EGraph.extract_min_depth``).
 
-    ``executor`` is a key of :data:`EXECUTORS` or ``"auto"`` (resolve to
-    whatever specialised executor the extracted term's root supports,
-    else generic).
+    ``executor`` is a key of the executor table (the ambient
+    :data:`EXECUTORS` or an explicit ``executors=`` mapping) or
+    ``"auto"`` (resolve to whatever specialised executor the extracted
+    term's root supports, else generic).
 
     ``prefer_executor``: when the extracted term is not native to the
     executor but the executor's carrier *is* reachable from the root
@@ -300,10 +283,10 @@ class Regime:
     runs its serial fallback — and the choice is flagged
     ``degraded=True``.
 
-    ``profile``: a :class:`catopt_optimize.calibrate.TargetProfile`, a dict with
-    ``tflops``/``gbps``/``launch_us`` keys, or a profile name loadable
-    via ``catopt_optimize.calibrate.load_profile`` (resolved eagerly at
-    construction).  When set and ``cost_fn`` is ``None``, the cost
+    ``profile``: a :class:`catopt_core.profile.TargetProfile`, a dict
+    with ``tflops``/``gbps``/``launch_us`` keys, or a profile name
+    loadable via ``catopt_core.profile.load_profile`` (resolved eagerly
+    at construction).  When set and ``cost_fn`` is ``None``, the cost
     model defaults to ``roofline_cost_for(profile)`` — an explicit
     ``cost_fn`` always wins, so ``profile`` then only records which
     target the regime prices against (and still feeds cost accounting
@@ -498,14 +481,14 @@ def architecture_signature(term: Any) -> tuple:
     :meth:`RegimeFrontier.collapsed`.
     """
     c = _census(term)
-    if is_scan_apply_term(term):
+    if _is_scan_apply(term):
         return (
             "scan",
             "diag" if term.op == "applyd" else "dense",
             c.get("aff", 0) + c.get("aff_diag", 0),
             c.get("aff_compose", 0) + c.get("affd_compose", 0),
         )
-    if is_om_apply_term(term):
+    if _is_om_apply(term):
         return (
             "om",
             c.get("om", 0) + c.get("om_elem", 0),
@@ -527,8 +510,8 @@ def architecture_signature(term: Any) -> tuple:
 def architecture_label(term: Any) -> str:
     """Short human description of a term's architecture."""
     c = _census(term)
-    if is_scan_apply_term(term):
-        plan = build_scan_plan(term)
+    if _is_scan_apply(term):
+        plan = _scan_plan(term)
         kind = "applyd/aff_diag" if term.op == "applyd" else "apply/aff"
         n_comp = c.get("affd_compose", 0) + c.get("aff_compose", 0)
         if plan is not None:
@@ -542,8 +525,8 @@ def architecture_label(term: Any) -> str:
         else:
             sched = "unplannable"
         return f"scan[{kind}] {sched}"
-    if is_om_apply_term(term):
-        plan = build_om_plan(term)
+    if _is_om_apply(term):
+        plan = _om_plan(term)
         sched = (
             f"{len(plan['leaves'])} blocks / "
             f"{len(plan['levels'])} batched levels"
@@ -669,6 +652,7 @@ class RegimeFrontier:
     ir: IR | None
     regimes: list[Regime]
     choices: dict[str, RegimeChoice]
+    executors: Mapping[str, ExecutorSpec] = field(default_factory=dict)
 
     # -- access ------------------------------------------------------
     def __getitem__(self, name: str) -> RegimeChoice:
@@ -726,9 +710,24 @@ class RegimeFrontier:
         param_values: dict | None = None,
         *,
         default: str | None = None,
-    ) -> RegimeDispatch:
-        """Lower every choice with its executor into a RegimeDispatch."""
-        return RegimeDispatch(self, param_values, default=default)
+        dispatch: Any = None,
+    ) -> Any:
+        """Lower every choice with its executor into a dispatch module.
+
+        The dispatch class is the registered backend's by default (see
+        :func:`register_regime_backend` — ``catopt_torch.regime``
+        registers its ``nn.Module``-based ``RegimeDispatch``); pass
+        ``dispatch=`` to substitute another builder with the same
+        ``(frontier, param_values, default=…)`` signature.
+        """
+        cls = dispatch if dispatch is not None else _DISPATCH_CLS
+        if cls is None:
+            raise RuntimeError(
+                "no regime dispatch backend registered — pass "
+                "dispatch= or import a backend's regime module "
+                "(catopt_torch.regime registers RegimeDispatch)"
+            )
+        return cls(self, param_values, default=default)
 
     # -- reporting ---------------------------------------------------
     def report(self) -> str:
@@ -780,6 +779,7 @@ def regime_frontier(
     src_term: Any | None = None,
     top_k: int = 4,
     profiles: dict[str, Any] | None = None,
+    executors: Mapping[str, ExecutorSpec] | None = None,
 ) -> RegimeFrontier:
     """Extract the best member per regime and pair it with an executor.
 
@@ -795,7 +795,15 @@ def regime_frontier(
     ``ir`` (the exported source ``IR``) is needed to :meth:`build` a
     dispatch; ``src_term`` enables :meth:`certificate` — both default to
     ``ir.root`` when ``ir`` is given.
+
+    ``executors`` is the backend's executor table —
+    ``sink.executors`` for a :class:`~catopt_core.ports.Sink`
+    implementation.  ``None`` (default) resolves to the ambient
+    :data:`EXECUTORS` — the registered backend table (populated by
+    :func:`register_regime_backend`, e.g. importing
+    ``catopt.regime``).
     """
+    table = EXECUTORS if executors is None else executors
     regime_list = _attach_profiles(
         _normalise_regimes(regimes), profiles
     )
@@ -805,10 +813,10 @@ def regime_frontier(
     alt_cache: dict[int, list[tuple[float, Any]]] = {}
     choices: dict[str, RegimeChoice] = {}
     for spec in regime_list:
-        if spec.executor != "auto" and spec.executor not in EXECUTORS:
+        if spec.executor != "auto" and spec.executor not in table:
             raise KeyError(
                 f"regime {spec.name!r}: unknown executor "
-                f"{spec.executor!r} (have {sorted(EXECUTORS)} + 'auto')"
+                f"{spec.executor!r} (have {sorted(table)} + 'auto')"
             )
 
         # 1. pure extraction under the regime's objective
@@ -842,7 +850,7 @@ def regime_frontier(
             if spec.executor != "auto"
             else _auto_executor(cost_term)
         )
-        ex = EXECUTORS[ex_name]
+        ex = table[ex_name]
 
         # 3. serve the cost-best term, or force the executor's carrier
         served = cost_term
@@ -942,278 +950,86 @@ def regime_frontier(
         ir=ir,
         regimes=regime_list,
         choices=choices,
+        executors=table,
     )
 
 
 # ---------------------------------------------------------------------------
-# Dispatch
+# Laws — lazy carrier imports keep this module backend-neutral
 # ---------------------------------------------------------------------------
 
 
-def _safe_key(name: str) -> str:
-    return "".join(
-        ch if ch.isalnum() or ch == "_" else "_" for ch in name
-    )
+def _carrier_laws() -> list:
+    """Return the full carrier law list — resolved at call time.
 
-
-class RegimeDispatch(nn.Module):
-    """One set of weights, one architecture per regime.
-
-    Holds ``{regime_name: (extracted_term, executor_module)}``.  Source
-    parameters are shared objects across all executor modules — every
-    form reads the same weights.  ``forward(*xs, regime=None)`` routes
-    to the named regime (or the default).
+    ``catopt_carriers`` is a *different* package — its law modules are
+    consulted lazily so importing the regime machinery never loads a
+    tensor library.  Carriers that are absent (partial install, or a
+    process where torch is unavailable) simply contribute no laws —
+    the e-graph then only ever reaches the core scan families.
     """
+    laws = list(SCAN_LAWS) + list(SCAN_DIAG_LAWS)
+    with contextlib.suppress(ModuleNotFoundError):
+        from catopt_carriers.decode_laws import DECODE_LAWS
 
-    def __init__(
-        self,
-        frontier: RegimeFrontier,
-        param_values: dict | None = None,
-        *,
-        default: str | None = None,
-    ):
-        """Build the dispatch by lowering every regime's member."""
-        super().__init__()
-        if frontier.ir is None:
-            raise ValueError(
-                "frontier has no IR; pass ir= to regime_frontier to "
-                "build a dispatch"
-            )
-        self.frontier = frontier
-        ir = frontier.ir
+        laws += DECODE_LAWS
+    with contextlib.suppress(ModuleNotFoundError):
+        from catopt_carriers.om import OM_LAWS
 
-        self._name_map: dict[str, str] = {}
-        self._meta: dict[str, dict] = {}
-        forms: dict[str, nn.Module] = {}
-        for name, ch in frontier.choices.items():
-            if ch.term is None:
-                continue
-            spec = EXECUTORS[ch.executor]
-            ir_i = IR(
-                root=ch.term,
-                inputs=ir.inputs,
-                input_names=ir.input_names,
-                params=ir.params,
-            )
-            mod = spec.lower(ir_i, param_values)
-            key = _safe_key(name)
-            self._name_map[name] = key
-            forms[key] = mod
-            ch.engaged = spec.engaged(mod)
-            self._meta[name] = {
-                "term": ch.term,
-                "module": mod,
-                "choice": ch,
-            }
-        self.forms = nn.ModuleDict(forms)
-        self._share_params()
+        laws += OM_LAWS
+    with contextlib.suppress(ModuleNotFoundError):
+        from catopt_carriers.trace import TRACE_LAWS
 
-        names = [n for n in frontier.choices if n in self._meta]
-        if not names:
-            raise ValueError("no regime produced an executable form")
-        self._regime = default if default is not None else names[0]
-        if self._regime not in self._meta:
-            raise KeyError(f"unknown default regime {default!r}")
-        self.verification: dict[str, dict] | None = None
-
-    # -- one set of weights ------------------------------------------
-    @staticmethod
-    def _param_map_of(mod: nn.Module) -> dict | None:
-        """Return the ``{ir_name: Parameter}`` map of a module.
-
-        On the module itself for ``IRModule``, on ``.eval_mod`` for the
-        specialised wrappers (scan/om executors).
-        """
-        pm = getattr(mod, "_param_map", None)
-        if pm is None:
-            inner = getattr(mod, "eval_mod", None)
-            pm = (
-                getattr(inner, "_param_map", None)
-                if inner is not None
-                else None
-            )
-        return pm
-
-    def _share_params(self) -> None:
-        """Rebind source parameters to one shared object per name.
-
-        Applies across all executor modules.
-        """
-        shared: dict[str, nn.Parameter] = {}
-        for mod in self.forms.values():
-            pm = self._param_map_of(mod)
-            if pm is None:
-                continue
-            host = (
-                mod
-                if getattr(mod, "_param_map", None) is pm
-                else mod.eval_mod
-            )
-            for pname in pm:
-                if pname.startswith("fused_"):
-                    continue  # per-module fold intermediates
-                cur = pm[pname]
-                if not isinstance(cur, nn.Parameter):
-                    continue
-                if pname in shared:
-                    setattr(host, pname, shared[pname])
-                    pm[pname] = shared[pname]
-                else:
-                    shared[pname] = cur
-
-    # -- API ---------------------------------------------------------
-    @property
-    def regimes(self) -> list[str]:
-        """Return the dispatched regime names."""
-        return list(self._meta)
-
-    @property
-    def regime(self) -> str:
-        """Return the current default regime name."""
-        return self._regime
-
-    def set_regime(self, name: str) -> None:
-        """Select the default regime by name."""
-        if name not in self._meta:
-            raise KeyError(
-                f"unknown regime {name!r}; available: "
-                f"{sorted(self._meta)}"
-            )
-        self._regime = name
-
-    @property
-    def entries(self) -> dict[str, tuple[Any, nn.Module]]:
-        """``{regime_name: (extracted_term, executor_module)}``."""
-        return {
-            n: (m["term"], m["module"]) for n, m in self._meta.items()
-        }
-
-    def executor_module(self, name: str) -> nn.Module:
-        """Return the executor module serving ``name``."""
-        return self.forms[self._name_map[name]]
-
-    def forward(
-        self, *xs: torch.Tensor, regime: str | None = None
-    ) -> torch.Tensor:
-        """Run the form for ``regime`` (default: the current one)."""
-        name = regime if regime is not None else self._regime
-        if name not in self._meta:
-            raise KeyError(
-                f"unknown regime {name!r}; available: "
-                f"{sorted(self._meta)}"
-            )
-        return self.forms[self._name_map[name]](*xs)
-
-    # -- equivalence -------------------------------------------------
-    def certificate(self, name: str):
-        """Level-2 certificate: source term → this regime's member."""
-        return self.frontier.certificate(name)
-
-    def max_diff(
-        self,
-        reference: Any,
-        *xs: torch.Tensor,
-        regime: str | None = None,
-    ) -> dict[str, float]:
-        """Max |form(x) − reference| per regime (or one named regime)."""
-        ref = reference(*xs) if callable(reference) else reference
-        names = [regime] if regime is not None else self.regimes
-        out: dict[str, float] = {}
-        with torch.no_grad():
-            for n in names:
-                y = self.forward(*xs, regime=n)
-                out[n] = (y - ref).abs().max().item()
-        return out
-
-    def verify(
-        self, reference: Any, *xs: torch.Tensor, atol: float = 1e-9
-    ) -> dict[str, dict]:
-        """Check every dispatched form against a reference output.
-
-        ``reference`` is a tensor or a callable producing it from
-        ``*xs``.  Returns ``{regime: {"max_abs_diff": d, "ok": bool}}``
-        and caches it on ``self.verification``.
-        """
-        diffs = self.max_diff(reference, *xs)
-        self.verification = {
-            n: {"max_abs_diff": d, "ok": d <= atol}
-            for n, d in diffs.items()
-        }
-        return self.verification
-
-    def report(self) -> str:
-        """Render the dispatch and its verification as text."""
-        lines = [self.frontier.report(), "", "built modules:"]
-        for name, m in self._meta.items():
-            ch = m["choice"]
-            lines.append(
-                f"  {name:<16} {type(m['module']).__name__:<22} "
-                f"engaged={ch.engaged}"
-            )
-        if self.verification:
-            lines.append("equivalence vs reference:")
-            for n, v in self.verification.items():
-                lines.append(
-                    f"  {n:<16} max|Δ|={v['max_abs_diff']:.3e} "
-                    f"ok={v['ok']}"
-                )
-        return "\n".join(lines)
-
-    def extra_repr(self) -> str:
-        """Return the ``nn.Module`` repr extras."""
-        return f"regime={self._regime!r}, forms={list(self._meta)}"
+        laws += TRACE_LAWS
+    return laws
 
 
-# ---------------------------------------------------------------------------
-# End-to-end pipeline
-# ---------------------------------------------------------------------------
+def _xc_laws() -> list:
+    """Return the cross-carrier seam laws — ``[]`` when absent."""
+    with contextlib.suppress(ModuleNotFoundError):
+        from catopt_carriers.xcarrier import XC_LAWS
 
-#: All carrier rewrite families — one saturation serves every regime.
-#: TRACE_LAWS rides along: importing catopt_carriers.trace also registers the
-#: trace/bdiag/parl/eye/cswap/inv torch bindings, so any trace-bearing
-#: member the JSV laws reach is executable by the generic executor.
-#: trace enodes enter via the trace_lift non-local pass in optimize.py.
-#: XC_LAWS crosses the carrier seam: linear readouts exit the scan
-#: carriers, the om numerator is such a readout, and the deferred omd
-#: carrier keeps chunked attention affine in the scan's initial state.
-#: ``build_egraph`` keeps the cross-carrier seam laws (XC_LAWS) in a
-#: bounded second tier (see its ``xc`` flag): the set is mostly
-#: bidirectional pairs minting fresh enodes, so it gets its own
-#: iteration budget after the carriers are established.
-CARRIER_LAWS = (
-    SCAN_LAWS + SCAN_DIAG_LAWS + OM_LAWS + TRACE_LAWS + DECODE_LAWS
-)
+        return list(XC_LAWS)
+    return []
 
 
 def default_rules() -> list:
     """Return the default carrier law list."""
-    return list(CARRIER_LAWS)
+    return _carrier_laws()
 
 
 def build_egraph(
-    model: nn.Module,
+    model: Any,
     example_input: Any,
     *,
+    source: Any,
     rules: list | None = None,
     xc: bool = True,
     max_iterations: int = 14,
     max_nodes: int = 400_000,
 ):
-    """Export ``model`` and saturate an e-graph with carrier laws.
+    """Export ``model`` via *source* and saturate an e-graph.
 
     Returns ``(eg, root_eid, ir, source_tensors, stats)``.
 
-    ``rules`` selects the core saturating set (default
-    ``CARRIER_LAWS``).  ``xc`` (default on) adds a bounded second tier:
-    after the non-local lifts have established the carriers, the
-    cross-carrier seam laws (``XC_LAWS``) run with their own small
-    iteration budget, then a short core pass integrates the seam
-    members — looped at most twice.  Keeping XC out of the saturating
-    tier bounds the blast radius of its bidirectional promotion pairs
-    on carrier-heavy graphs while still letting om_elem_affd / the
-    readout and omd lift rules fire.
+    ``source`` is the :class:`~catopt_core.ports.Source` port —
+    REQUIRED (no assumed frontend; the torch-facing
+    ``catopt_torch.regime.build_egraph`` defaults it to
+    ``TorchSource``).  ``rules`` selects the core saturating set
+    (default the carrier law list).  ``xc`` (default on) adds a
+    bounded second tier: after the non-local lifts have established
+    the carriers, the cross-carrier seam laws (``XC_LAWS``) run with
+    their own small iteration budget, then a short core pass
+    integrates the seam members — looped at most twice.  Keeping XC
+    out of the saturating tier bounds the blast radius of its
+    bidirectional promotion pairs on carrier-heavy graphs while
+    still letting om_elem_affd / the readout and omd lift rules
+    fire.
+
+    The non-local carrier lifts resolve lazily — a backend process
+    without ``catopt_carriers`` runs the plain core saturation.
     """
-    ir, source = export_to_ir(model, example_input)
+    ir, source_tensors = source.to_ir(model, example_input)
     eg = EGraph()
     root = eg.add_term(ir.root)
     core = default_rules() if rules is None else rules
@@ -1223,31 +1039,41 @@ def build_egraph(
     # Non-local lifts: recurrences -> trace(F), stacks of same-state
     # carrier applications -> one application, om trees over scanned
     # values -> the deferred omd carrier.  Witnessed, replayable.
-    from catopt_carriers.trace_lift import lift_scan_to_trace
-    from catopt_carriers.xcarrier import (
-        gather_apply_stack,
-        gather_applyd_stack,
-        omd_tree_lift,
-    )
-
-    def _lifts():
-        return (
-            lift_scan_to_trace(eg)
-            + gather_applyd_stack(eg)
-            + gather_apply_stack(eg)
-            + omd_tree_lift(eg)
+    try:
+        from catopt_carriers.trace_lift import lift_scan_to_trace
+        from catopt_carriers.xcarrier import (
+            gather_apply_stack,
+            gather_applyd_stack,
+            omd_tree_lift,
         )
+    except ModuleNotFoundError:
+
+        def _lifts() -> list:
+            return []
+
+        xc_laws: list = []
+    else:
+
+        def _lifts() -> list:
+            return (
+                lift_scan_to_trace(eg)
+                + gather_applyd_stack(eg)
+                + gather_apply_stack(eg)
+                + omd_tree_lift(eg)
+            )
+
+        xc_laws = _xc_laws()
 
     lifts = _lifts()
     if lifts:
         eg.rebuild()
         stats["nonlocal_lifts"] = len(lifts)
         eg.run(core, root, max_iterations=5, max_nodes=max_nodes)
-    if xc:
+    if xc and xc_laws:
         xc_rounds = 0
         for _ in range(2):
             before = eg.n_enodes
-            eg.run(XC_LAWS, root, max_iterations=4, max_nodes=max_nodes)
+            eg.run(xc_laws, root, max_iterations=4, max_nodes=max_nodes)
             grew = eg.n_enodes != before
             # XC-minted members can enable new non-local offers (e.g.
             # chunk_apply putting affine maps into om leaf values, which
@@ -1265,85 +1091,48 @@ def build_egraph(
             eg.run(core, root, max_iterations=2, max_nodes=max_nodes)
         stats["xc_rounds"] = xc_rounds
         stats["xc_fires"] = sum(
-            eg.rule_fires.get(r.name, 0) for r in XC_LAWS
+            eg.rule_fires.get(r.name, 0) for r in xc_laws
         )
-    return eg, root, ir, source, stats
+    return eg, root, ir, source_tensors, stats
 
 
-def regime_dispatch(
-    model: nn.Module,
-    example_input: Any,
-    regimes: Any = None,
-    *,
-    rules: list | None = None,
-    xc: bool = True,
-    max_iterations: int = 14,
-    max_nodes: int = 400_000,
-    default: str | None = None,
-    verify: bool = True,
-    atol: float = 1e-9,
-    profiles: dict[str, Any] | None = None,
-    calibrate: Any = None,
-) -> RegimeDispatch:
-    """End-to-end: export → saturate → frontier → build → verify.
+# ---------------------------------------------------------------------------
+# Compatibility delegation — the torch-half names (lazy, no static edge)
+# ---------------------------------------------------------------------------
+#
+# ``RegimeDispatch`` (an nn.Module) and ``regime_dispatch`` (the
+# end-to-end torch pipeline) moved to ``catopt_torch.regime`` (plan
+# 0007).  These names resolve lazily — importing this module never
+# loads a backend, but the historical attribute paths keep working
+# when a backend is installed.
 
-    Returns a :class:`RegimeDispatch` whose ``.frontier`` records every
-    regime's choice.  With ``verify=True`` each form is checked against
-    the model's own output on ``example_input`` (fp64 recommended).
+_TORCH_DELEGATED = {
+    "RegimeDispatch": "catopt_torch.regime",
+    "regime_dispatch": "catopt_torch.regime",
+}
 
-    ``profiles`` is a ``{regime_name: profile_spec}`` map forwarded to
-    :func:`regime_frontier` — it fills ``profile`` on named regimes
-    that don't carry one.  ``calibrate`` is a convenience for "price
-    this model against the current device": ``calibrate=True`` calls
-    ``catopt_optimize.calibrate.calibrate()`` once and attaches the measured
-    profile to every regime still lacking one; a ``TargetProfile`` /
-    dict / persisted name does the same without measuring.  Since an
-    explicit ``cost_fn`` always wins over a profile, ``calibrate``
-    changes *extraction* only for regimes that declare no cost model —
-    elsewhere it is recorded for provenance.  ``calibrate=None`` (the
-    default) is the old behaviour.
-    """
-    args = (
-        example_input
-        if isinstance(example_input, tuple)
-        else (example_input,)
+_CARRIER_LAWS: list | None = None
+_XC_LAWS: list | None = None
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve moved/lazy names — torch-coupled or carrier-law data."""
+    global _CARRIER_LAWS, _XC_LAWS
+    if name == "CARRIER_LAWS":
+        # The carrier law list — materialised lazily so importing the
+        # regime machinery never loads a backend (see _carrier_laws).
+        if _CARRIER_LAWS is None:
+            _CARRIER_LAWS = _carrier_laws()
+        return _CARRIER_LAWS
+    if name == "XC_LAWS":
+        # Same lazy materialisation for the seam law list (``[]``
+        # without carriers).
+        if _XC_LAWS is None:
+            _XC_LAWS = _xc_laws()
+        return _XC_LAWS
+    mod = _TORCH_DELEGATED.get(name)
+    if mod is not None:
+        return getattr(importlib.import_module(mod), name)
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
     )
-    eg, root, ir, source, _stats = build_egraph(
-        model,
-        example_input,
-        rules=rules,
-        xc=xc,
-        max_iterations=max_iterations,
-        max_nodes=max_nodes,
-    )
-    regime_list = _attach_profiles(
-        _normalise_regimes(regimes), profiles
-    )
-    if calibrate:
-        pending = [r.name for r in regime_list if r.profile is None]
-        if pending:
-            if calibrate is True:
-                from catopt_optimize.calibrate import (
-                    calibrate as _measure,
-                )
-
-                prof: Any = _measure()
-            else:
-                prof = calibrate
-            regime_list = _attach_profiles(
-                regime_list, {n: prof for n in pending}
-            )
-    frontier = regime_frontier(
-        eg, root, regime_list, ir=ir, src_term=ir.root
-    )
-    disp = frontier.build(param_values=source, default=default)
-    if verify:
-        was_training = model.training
-        try:
-            model.eval()
-            with torch.no_grad():
-                ref = model(*[a.clone() for a in args])
-                disp.verify(ref, *args, atol=atol)
-        finally:
-            model.train(was_training)
-    return disp

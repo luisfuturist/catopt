@@ -40,6 +40,7 @@ from catopt_optimize.runners import (
     TorchCompileRunner,
 )
 from catopt_torch.adapters import TorchSink, TorchSource
+from catopt_torch.backend import TorchBackend
 
 from tests.test_pluggable_sink import NumpySink
 
@@ -439,7 +440,7 @@ def test_custom_strategy_runs_through_optimizer():
 def test_optimize_strategy_compositional():
     m = _Stack().eval()
     x = torch.randn(2, 8)
-    lr = _opt().optimize(
+    lr = Optimizer(backend=TorchBackend()).optimize(
         m,
         x,
         strategy=Compositional(max_cross_pairs=0),
@@ -454,7 +455,7 @@ def test_optimize_strategy_compositional():
 
 def test_optimize_strategy_autotuned():
     m, x = _make()
-    lr = _opt().optimize(
+    lr = Optimizer(backend=TorchBackend()).optimize(
         m,
         x,
         strategy=Autotuned(candidates=("generic",), n_calls=2,

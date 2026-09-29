@@ -40,7 +40,19 @@ The ports (this file)
   ``supported_ops`` (the extraction bound) + ``ops`` (the registry
   search-time const folds dispatch through).
 * :class:`Sink` — ``Capabilities`` + the whole-graph sink port,
-  ``IR -> runnable``, plus the module-level equivalence gate.
+  ``IR -> runnable``, plus the module-level equivalence gate and the
+  backend's executor table (``executors``).
+* :class:`ExecutorSpec` — one named executor entry of that table
+  (``lower`` / ``accepts`` / ``engaged`` / ``carrier``).
+* :class:`Composer` — the structural port the compositional strategy
+  uses: module-tree block selection, hooked input capture, grafting
+  and parameter-sharing clones.
+* :class:`Meter` / :class:`TimingResult` — the timing port the
+  autotuned strategy uses: ``time(runnable, inputs) -> (median, iqr)``.
+* :class:`Runner` — the delivery transform port,
+  ``apply(module, example_input, stats) -> module``.
+* :class:`Criterion` — one cost-model selection axis,
+  ``cost_fn(profile) -> CostFn``.
 * :class:`Strategy` — the optimization-policy seam behind
   ``Optimizer.optimize(..., strategy=...)``.
 * :class:`Binding` — one op's lowering, ``(*args, **attrs)``
@@ -56,7 +68,12 @@ and each carrier module's ``TORCH_BINDINGS`` entries are
 ``Executor``s; ``report.verify_equiv`` is the canonical ``Verifier``;
 ``catopt_torch.adapters.TorchSource`` / ``TorchSink`` are the canonical
 ``Source`` / ``Sink`` pair; each ``_SHAPE_RULES`` entry is a
-``ShapeRule``.  ``ops.OpTable`` is the
+``ShapeRule``.  ``catopt_torch.composer.TorchComposer`` /
+``catopt_torch.meter.TorchMeter`` are the canonical
+``Composer`` / ``Meter``; ``catopt_torch.backend.TorchBackend``
+bundles the four into the immutable
+:dataclass:`~catopt_core.pipeline.Backend` value the orchestrator
+consumes.  ``ops.OpTable`` is the
 adapter *registry* — it composes the adapters and is already the right
 shape, so ``OpRegistry`` describes its surface rather than re-wrapping
 it.  The ambient ``torch_bridge._IR_TO_TORCH`` dict remains the live
@@ -107,7 +124,8 @@ Deliberate non-fits
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -118,17 +136,23 @@ __all__ = [
     "BatchedExecutor",
     "Binding",
     "Capabilities",
+    "Composer",
     "CostFn",
+    "Criterion",
     "Executor",
+    "ExecutorSpec",
     "LawSet",
+    "Meter",
     "OpRegistry",
     "PlannedExecutor",
     "RuleLike",
     "RuleProvider",
+    "Runner",
     "ShapeRule",
     "Sink",
     "Source",
     "Strategy",
+    "TimingResult",
     "TorchBinding",
     "Verifier",
     "VerifyResult",
@@ -232,6 +256,38 @@ class BatchedExecutor(PlannedExecutor, Protocol):
     def is_batched(self) -> bool:
         """Whether the executor runs batched."""
         ...
+
+
+@dataclass(frozen=True)
+class ExecutorSpec:
+    """One named entry of a backend's :attr:`Sink.executors` table.
+
+    The registry record the executor-routing and regime-planning code
+    consumes (promoted to core in plan 0007 — the same contract the
+    regime-level ``ExecutorSpec`` always was, with backend-neutral
+    member types):
+
+    * ``name`` — the registry key (``"generic"``, ``"scan"``,
+      ``"om_batched"``, ``"om_streaming"``, ``"trace"``, …).
+    * ``lower`` — build the executor: ``(IR, param_values | None) ->
+      Executor``.
+    * ``accepts`` — the *term-level* probe: does ``term`` carry this
+      executor's native root shape, so its specialised schedule
+      actually fires (not just its serial fallback)?
+    * ``engaged`` — the *module-level* probe after building: did the
+      executor take the fast path (e.g. ``mod.is_batched``)?
+    * ``carrier`` — ``(root_ops, inner_ops, leaf_ops)`` frozensets
+      naming the carrier family this executor serves, for
+      census/diagnosis; ``None`` for executor-agnostic lowerings (the
+      generic evaluator).
+    """
+
+    name: str
+    lower: Any  # Callable[[IR, dict | None], Executor]
+    accepts: Any  # Callable[[Any], bool]
+    engaged: Any  # Callable[[Executor], bool]
+    carrier: Any = None
+    # tuple[frozenset[str], frozenset[str], frozenset[str]] | None
 
 
 @runtime_checkable
@@ -467,6 +523,199 @@ class Sink(Capabilities, Protocol):
         atol: float | None = None,
     ) -> VerifyResult:
         """Run ``ref`` and ``opt`` on ``inputs``; return the report."""
+        ...
+
+    @property
+    def executors(self) -> Mapping[str, ExecutorSpec]:
+        """Return the backend's executor table (may be empty).
+
+        The named :class:`ExecutorSpec`s the orchestrator's routing and
+        the regime planner consume.  Mapping order is routing order —
+        the pipeline routes a term to the first *carrier* entry
+        (``carrier`` not ``None``) whose ``accepts`` probe holds, and
+        falls back to :meth:`lower` otherwise; carrier executors
+        therefore precede executor-agnostic ones.  A backend without
+        executor families returns an empty mapping.
+        """
+        ...
+
+
+@runtime_checkable
+class Composer(Protocol):
+    """The structural port — module-tree composition machinery.
+
+    Adapter port (plan 0007).  Everything the per-block
+    (:class:`Compositional`) strategy needs that is backend-native:
+    which sub-objects count as blocks, how their real inputs are
+    captured, how optimized replacements are grafted back, and how a
+    structure-preserving clone shares the original's parameter
+    storage.  ``catopt_torch.composer.TorchComposer`` is the canonical
+    implementation — module-object specifics stay on the adapter side.
+
+    * ``blocks(model, *, predicate=None)`` — pick the top-most
+      sub-objects to optimize independently, in execution order,
+      ``[(dotted_name, block)]``.
+    * ``capture_inputs(model, blocks, example_input)`` — run the
+      original once; return ``(captured, io)`` where ``captured``
+      maps each name to its first call's ``(args, kwargs)`` clones and
+      ``io`` carries the object-identity dataflow evidence the
+      boundary classifier reads.
+    * ``graft(model, replacements)`` — install each
+      ``{dotted_name: optimized_module}``; returns the model.
+    * ``clone_sharing(model)`` — a structure clone that aliases the
+      original's parameter storage (grafting must never mutate the
+      caller's model).
+    * ``boundary(name_a, name_b, captured, io, captured2, io2)`` —
+      classify the A→B dataflow of an adjacent pair: a joint-mode
+      string or ``None`` (not a simple value flow).
+    * ``perturbed(example_input)`` — a second probe input, same
+      structure, different values (the residual-boundary
+      confirmation pass).
+
+    Optional adapter hooks (read via ``getattr``, not port members):
+    ``cross_pairs(...)`` — the pairwise joint-optimization pass;
+    ``param_report(model, optimized)`` — the weight-file diff.  A
+    composer without them simply skips those phases.
+    """
+
+    def blocks(self, model: Any, *, predicate: Any = None) -> list[Any]:
+        """Select ``[(name, block)]`` optimization units."""
+        ...
+
+    def capture_inputs(
+        self, model: Any, blocks: list[Any], example_input: Any
+    ) -> Any:
+        """Run ``model`` once; return ``(captured, io)``."""
+        ...
+
+    def graft(self, model: Any, replacements: Mapping) -> Any:
+        """Install ``{name: optimized}`` replacements; return model."""
+        ...
+
+    def clone_sharing(self, model: Any) -> Any:
+        """Clone structure, sharing the original's parameter storage."""
+        ...
+
+    def boundary(
+        self,
+        name_a: str,
+        name_b: str,
+        captured: Mapping,
+        io: Mapping,
+        captured2: Mapping,
+        io2: Mapping,
+    ) -> str | None:
+        """Classify the pair boundary; ``None`` declines the pair."""
+        ...
+
+    def perturbed(self, example_input: Any) -> Any:
+        """Return a same-structure, different-values probe input."""
+        ...
+
+
+@dataclass(frozen=True)
+class TimingResult:
+    """One :class:`Meter` measurement — median wall time + spread.
+
+    ``median_s`` is the median seconds of one forward;
+    ``iqr_s`` the interquartile spread (0 when fewer than 4 samples);
+    ``n_calls`` the number of timed calls the measurement ran.
+    """
+
+    median_s: float
+    iqr_s: float
+    n_calls: int
+
+
+@runtime_checkable
+class Meter(Protocol):
+    """The timing port — ``time(runnable, inputs) -> TimingResult``.
+
+    Adapter port (plan 0007): the :class:`Autotuned` strategy measures
+    candidates through it instead of running torch-side timing loops.
+    ``warmup`` untimed calls first, then ``n_calls`` timed forwards;
+    the median decides.  Device synchronisation is the adapter's
+    business (``torch.cuda.synchronize`` on CUDA inputs).
+    """
+
+    def time(
+        self,
+        runnable: Any,
+        inputs: Any,
+        *,
+        warmup: int = 5,
+        n_calls: int = 30,
+    ) -> TimingResult:
+        """Time ``runnable(*inputs)``; return median + IQR seconds."""
+        ...
+
+
+@runtime_checkable
+class Runner(Protocol):
+    """The delivery-stage transform port.
+
+    ``apply`` receives the module the lowering produced plus the
+    pipeline's ``example_input`` (tensor or positional-args tuple)
+    and returns the module to deliver — possibly a wrapped or
+    mutated version of the input.  ``stats`` is the same dict the
+    pipeline returns, so a runner records what it did
+    (``stats["compiled"]``, ``stats["cuda_graph"]``) and may read
+    what earlier runners in a chain did.  Optional marker
+    ``delivers_compiled`` hints the search's carrier pricing.
+    """
+
+    name: str
+
+    def apply(
+        self,
+        module: Any,
+        example_input: Any,
+        stats: dict[str, Any],
+    ) -> Any:
+        """Return the module to deliver, recording into *stats*."""
+        ...
+
+
+@runtime_checkable
+class Criterion(Protocol):
+    """One selection axis: a named recipe for a calibrated ``CostFn``.
+
+    Members
+    -------
+    ``name`` — the axis label; recorded into ``stats["criteria"]``
+    and the blend's ``criteria`` dict (same-named members merge).
+
+    ``cost_fn(profile=None) -> CostFn`` — build the axis's pricing
+    callable, calibrated to *profile* (a
+    ``catopt_core.profile.TargetProfile``-like object/dict, or
+    ``None`` for the built-in profile).  The callable follows the
+    ``(term, memo=None)`` convention; a member that does not declare
+    ``memo`` is called bare.
+
+    Optional markers (read with ``getattr`` defaults, propagated to
+    the built callable and aggregated over a blend):
+
+    * ``charges_param_only`` — the axis bills compile-time-foldable
+      subtrees (storage-style pricing: a folded subtree still stores
+      values).  Extraction reads the marker OFF THE BUILT COST FN to
+      keep billing them.
+    * ``charges_shape`` — the axis's prices are shape-dependent.
+      Informational: blends aggregate the flag so reporters can see
+      when a blend cares about inferred shapes.
+
+    Duck-typed in use: ``criteria_cost`` accepts any object with
+    a callable ``cost_fn`` member (a missing ``name`` falls back to
+    the class name); ``isinstance``-conformance additionally needs
+    the ``name`` attribute.
+    """
+
+    @property
+    def name(self) -> str:
+        """The axis label recorded into ``stats["criteria"]``."""
+        ...
+
+    def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the axis's pricing callable for *profile*."""
         ...
 
 

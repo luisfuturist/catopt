@@ -23,12 +23,12 @@ from importlib import import_module as _imp
 _ALIAS = {
     "catopt.adapters": "catopt_torch.adapters",
     "catopt.attrs": "catopt_core.attrs",
-    "catopt.calibrate": "catopt_optimize.calibrate",
+    "catopt.calibrate": "catopt_torch.calibrate",
     "catopt.cost": "catopt_core.cost",
     "catopt.criteria": "catopt_optimize.criteria",
     "catopt.egraph": "catopt_core.egraph",
     "catopt.egraph.terms": "catopt_core.egraph.terms",
-    "catopt.export": "catopt_optimize.export",
+    "catopt.export": "catopt_torch.export",
     "catopt.executors": "catopt_torch.executors",
     "catopt.ir": "catopt_core.ir",
     "catopt.laws": "catopt_core.laws",
@@ -48,10 +48,11 @@ _ALIAS = {
     "catopt.autotune": "catopt_optimize.autotune",
     "catopt.ports": "catopt_core.ports",
     "catopt.pipeline": "catopt_core.pipeline",
-    "catopt.regime": "catopt_optimize.regime",
+    "catopt.profile": "catopt_core.profile",
+    "catopt.regime": "catopt_torch.regime",
     "catopt.report": "catopt_torch.report",
     "catopt.rulecache": "catopt_core.rulecache",
-    "catopt.runners": "catopt_optimize.runners",
+    "catopt.runners": "catopt_torch.runners",
     "catopt.scan_lower": "catopt_carriers.scan_lower",
     "catopt.scan_fused": "catopt_carriers.scan_fused",
     "catopt.torch_bridge": "catopt_torch.torch_bridge",
@@ -107,7 +108,7 @@ from catopt_core.laws import (
     SIMPLIFICATION_RULES,
     all_rules,
 )
-from catopt_core.pipeline import LowerResult, SearchResult
+from catopt_core.pipeline import Backend, LowerResult, SearchResult
 from catopt_core.ports import (
     Binding,
     Capabilities,
@@ -127,7 +128,6 @@ with _suppress(ModuleNotFoundError):  # partial install only
         to_batched_omd_module,
     )
 with _suppress(ModuleNotFoundError):  # partial install only
-    from catopt_optimize.autotune import optimize_model_autotuned
     from catopt_optimize.criteria import (
         Blend,
         CompiledCriterion,
@@ -140,12 +140,6 @@ with _suppress(ModuleNotFoundError):  # partial install only
         criteria_cost,
         peak_bytes_cost,
     )
-    from catopt_optimize.export import (
-        ExportError,
-        export_optimized,
-        load_optimized,
-        save_optimized,
-    )
     from catopt_optimize.optimize import (
         Autotuned,
         Compositional,
@@ -153,20 +147,31 @@ with _suppress(ModuleNotFoundError):  # partial install only
         Optimizer,
         discover_alternatives,
         lower,
-        optimize_compositional,
-        optimize_model,
         search,
     )
     from catopt_optimize.runners import (
         ChainedRunner,
-        CudaGraphRunner,
         IdentityRunner,
         Runner,
-        TorchCompileRunner,
         runner_candidate,
     )
 with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_cuda import CudaGraphRunner
+with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_torch.adapters import TorchSink, TorchSource
+    from catopt_torch.api import (
+        optimize_compositional,
+        optimize_model,
+        optimize_model_autotuned,
+    )
+    from catopt_torch.backend import TorchBackend
+    from catopt_torch.export import (
+        ExportError,
+        export_optimized,
+        load_optimized,
+        save_optimized,
+    )
+    from catopt_torch.runners import TorchCompileRunner
 with _suppress(ModuleNotFoundError):  # partial install only
     from catopt_torch.torch_bridge import (
         IRModule,
@@ -183,6 +188,7 @@ __all__ = [
     "IR",
     "SIMPLIFICATION_RULES",
     "Autotuned",
+    "Backend",
     "BatchedOmdModule",
     "Binding",
     "Blend",
@@ -216,6 +222,7 @@ __all__ = [
     "Source",
     "Strategy",
     "TensorType",
+    "TorchBackend",
     "TorchCompileRunner",
     "TorchSink",
     "TorchSource",

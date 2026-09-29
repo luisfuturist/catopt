@@ -32,7 +32,7 @@ from __future__ import annotations
 import inspect
 import math
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any
 
 from catopt_core.cost import (
     _INVALID_COST,
@@ -53,49 +53,26 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 #  The Criterion port — pluggable selection axes
 # ---------------------------------------------------------------------------
+#
+# The canonical protocol lives in :mod:`catopt_core.ports` (promoted
+# in plan 0007 — the orchestrator's neutral contract); it is imported
+# here so ``catopt_optimize.criteria.Criterion`` stays the same
+# object users subclass and ``isinstance``-check against.
+from catopt_core.ports import Criterion
 
-
-@runtime_checkable
-class Criterion(Protocol):
-    """One selection axis: a named recipe for a calibrated ``CostFn``.
-
-    Members
-    -------
-    ``name`` — the axis label; recorded into ``stats["criteria"]``
-    and the blend's ``criteria`` dict (same-named members merge).
-
-    ``cost_fn(profile=None) -> CostFn`` — build the axis's pricing
-    callable, calibrated to *profile* (a
-    ``catopt_optimize.calibrate.TargetProfile``-like object/dict, or
-    ``None`` for the built-in profile).  The callable follows the
-    ``(term, memo=None)`` convention; a member that does not declare
-    ``memo`` is called bare.
-
-    Optional markers (read with ``getattr`` defaults, propagated to
-    the built callable and aggregated over a blend):
-
-    * ``charges_param_only`` — the axis bills compile-time-foldable
-      subtrees (storage-style pricing: a folded subtree still stores
-      values).  Extraction reads the marker OFF THE BUILT COST FN to
-      keep billing them.
-    * ``charges_shape`` — the axis's prices are shape-dependent.
-      Informational: blends aggregate the flag so reporters can see
-      when a blend cares about inferred shapes.
-
-    Duck-typed in use: :func:`criteria_cost` accepts any object with
-    a callable ``cost_fn`` member (a missing ``name`` falls back to
-    the class name); ``isinstance``-conformance additionally needs
-    the ``name`` attribute.
-    """
-
-    @property
-    def name(self) -> str:
-        """The axis label recorded into ``stats["criteria"]``."""
-        ...
-
-    def cost_fn(self, profile: Any = None) -> CostFn:
-        """Build the axis's pricing callable for *profile*."""
-        ...
+__all__ = [
+    "AXES",
+    "Blend",
+    "CompiledCriterion",
+    "Criteria",
+    "Criterion",
+    "DepthCriterion",
+    "FlopsCriterion",
+    "LatencyCriterion",
+    "MemoryCriterion",
+    "criteria_cost",
+    "peak_bytes_cost",
+]
 
 
 # ---------------------------------------------------------------------------

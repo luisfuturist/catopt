@@ -28,6 +28,13 @@ Port needs by phase
   plus a delivery runner.  ``stats`` is a FRESH dict — the search
   record plus the lowering keys; ``lower`` never mutates
   :attr:`SearchResult.stats`.
+
+:class:`Backend` (plan 0007) is the immutable bundle of the four
+backend ports — ``source`` / ``sink`` / ``composer`` / ``meter`` — the
+orchestrator consumes.  It is a *plain value*: no registry, no
+``register_backend``, no ``default_backend`` — a caller assembles or
+imports one explicitly (e.g. ``catopt_torch.backend.TorchBackend()``)
+and passes it to ``Optimizer(backend=...)``.
 """
 
 from __future__ import annotations
@@ -39,9 +46,42 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from catopt_core.egraph import Certificate, EGraph
     from catopt_core.ir import IR
-    from catopt_core.ports import CostFn, Executor, VerifyResult
+    from catopt_core.ports import (
+        Composer,
+        CostFn,
+        Executor,
+        Meter,
+        Sink,
+        Source,
+        VerifyResult,
+    )
 
-__all__ = ["LowerResult", "SearchResult"]
+__all__ = ["Backend", "LowerResult", "SearchResult"]
+
+
+@dataclass(frozen=True)
+class Backend:
+    """The four ports of one backend, bundled as an immutable value.
+
+    ``source`` lifts a backend-native model to IR; ``sink`` lowers IR
+    to a runnable executor and verifies equivalence; ``composer``
+    supplies the structural machinery the per-block
+    (:class:`Compositional`) strategy needs; ``meter`` times runnables
+    for the measured (:class:`Autotuned`) strategy.  All four are the
+    documented port types from :mod:`catopt_core.ports`.
+
+    This is a *value object*: constructing it performs no registration
+    and selects no defaults — the orchestrator receives exactly the
+    ports the caller chose.  ``Optimizer(backend=backend)`` resolves
+    each individual port from it; explicit ``source=``/``sink=``/
+    ``composer=``/``meter=`` arguments override a port the backend
+    carries.
+    """
+
+    source: Source
+    sink: Sink
+    composer: Composer
+    meter: Meter
 
 
 @dataclass(eq=False)

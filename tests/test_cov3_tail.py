@@ -340,7 +340,7 @@ def test_compositional_block_verify_failure(monkeypatch):
     def fake_verify(*a, **kw):
         return VerifyReport(max_abs=0.5, max_rel=0.5, passed=False)
 
-    monkeypatch.setattr("catopt.optimize.verify_module", fake_verify)
+    monkeypatch.setattr("catopt.adapters.verify_module", fake_verify)
     torch.manual_seed(0)
     m = _TwoBlock()
     _opt, rep = optimize_compositional(

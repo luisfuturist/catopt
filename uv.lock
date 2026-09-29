@@ -21,6 +21,7 @@ members = [
     "catopt",
     "catopt-carriers",
     "catopt-core",
+    "catopt-cuda",
     "catopt-optimize",
     "catopt-torch",
 ]
@@ -183,6 +184,7 @@ source = { editable = "." }
 dependencies = [
     { name = "catopt-carriers" },
     { name = "catopt-core" },
+    { name = "catopt-cuda" },
     { name = "catopt-optimize" },
     { name = "catopt-torch" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -242,6 +244,7 @@ requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.9.4" },
     { name = "catopt-carriers", editable = "packages/catopt-carriers" },
     { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-cuda", editable = "packages/catopt-cuda" },
     { name = "catopt-optimize", editable = "packages/catopt-optimize" },
     { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0" },
@@ -312,23 +315,30 @@ version = "0.1.0.dev0"
 source = { editable = "packages/catopt-core" }
 
 [[package]]
-name = "catopt-optimize"
+name = "catopt-cuda"
 version = "0.1.0.dev0"
-source = { editable = "packages/catopt-optimize" }
+source = { editable = "packages/catopt-cuda" }
 dependencies = [
-    { name = "catopt-carriers" },
     { name = "catopt-core" },
-    { name = "catopt-torch" },
     { name = "torch" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "catopt-carriers", editable = "packages/catopt-carriers" },
     { name = "catopt-core", editable = "packages/catopt-core" },
-    { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "torch", specifier = ">=2.0" },
 ]
+
+[[package]]
+name = "catopt-optimize"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-optimize" }
+dependencies = [
+    { name = "catopt-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "catopt-core", editable = "packages/catopt-core" }]
 
 [[package]]
 name = "catopt-torch"
@@ -336,12 +346,14 @@ version = "0.1.0.dev0"
 source = { editable = "packages/catopt-torch" }
 dependencies = [
     { name = "catopt-core" },
+    { name = "catopt-optimize" },
     { name = "torch" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-optimize", editable = "packages/catopt-optimize" },
     { name = "torch", specifier = ">=2.0" },
 ]
 

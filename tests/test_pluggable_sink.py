@@ -21,7 +21,7 @@ from catopt.egraph import EGraph
 from catopt.ir import IR, Const, Op, Param, Var
 from catopt.ops import OpTable
 from catopt.optimize import discover_alternatives, optimize_model
-from catopt.ports import Sink
+from catopt.ports import ExecutorSpec, Sink
 from catopt.report import VerifyReport
 from catopt_core.laws import all_rules
 
@@ -127,6 +127,18 @@ class NumpySink:
     @property
     def ops(self):
         return self._ops
+
+    @property
+    def executors(self):
+        """The generic lowering is this sink's only executor path."""
+        return {
+            "generic": ExecutorSpec(
+                name="generic",
+                accepts=lambda ir, term: True,
+                lower=self.lower,
+                engaged=lambda mod: True,
+            )
+        }
 
     def lower(self, ir, params=None):
         return _NumpyModule(

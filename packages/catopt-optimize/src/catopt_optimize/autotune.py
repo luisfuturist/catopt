@@ -1,63 +1,64 @@
-"""Measured autotuning over catopt's lowering paths.
+"""Measured autotuning over the backend's lowering paths (plan 0007).
 
-``optimize_model`` commits to a single lowering up front: the
-extracted term routes to the serial ``IRModule`` evaluator or — for
-carrier-apply roots — a level-batched executor, optionally wrapped
-in ``torch.compile``.  Which of those is actually fastest on a given
-device is an empirical question the static cost model can only guess
-at (per-node eval dispatch vs. batched compose levels vs. inductor
-fusion reorder differently across CPU and GPU).
+The pipeline commits to a single lowering up front: the extracted
+term routes through the sink's executor table — a level-batched
+carrier executor when the root plans one, the generic evaluator
+otherwise — and a delivery runner may wrap it.  Which route is
+actually fastest on a given device is an empirical question the
+static cost model can only guess at (per-node eval dispatch vs.
+batched compose levels vs. compiler fusion reorder differently
+across backends and devices).
 
-:func:`optimize_model_autotuned` runs the e-graph search ONCE, then
-re-lowers the same extracted term through each requested lowering
-path, verifies every candidate against the original model (the same
-``sink.verify`` gate the pipeline uses — an unverified candidate is
-never timed, let alone returned), measures each survivor on the real
-input, and returns the measured winner.
+The :class:`~catopt_optimize.optimize.Autotuned` strategy runs the
+e-graph search ONCE, then re-lowers the same extracted term through
+each requested lowering path, verifies every candidate against the
+model through ``sink.verify`` (an unverified candidate is never
+timed, let alone returned), measures each survivor through the
+:class:`~catopt_core.ports.Meter` port, and returns the measured
+winner.
 
 Honesty contract:
 
 * every timed candidate passed ``sink.verify`` on ``example_input``;
 * every candidate's outcome — build failure, verify failure, timing,
   budget skip — is recorded in ``stats["autotune"]["candidates"]``;
-* if every candidate fails, the unmodified ``optimize_model`` output
-  is returned and ``stats["autotune"]["fallback"]`` is True.
+* if every candidate fails, the pipeline's own delivered module is
+  returned and ``stats["autotune"]["fallback"]`` is True.
 
 Built-in candidate names (see :data:`CANDIDATE_BUILDERS`):
 
 ``generic``
-    Serial ``IRModule`` evaluation — ``sink.lower`` directly, no
-    carrier routing (the executor ``lowering="generic"`` prices).
+    The sink's plain lowering — ``sink.lower`` directly, no carrier
+    routing (the executor ``lowering="generic"`` prices).
 ``batched``
-    The pipeline's executor routing — ``_lower_extracted``: the
-    level-batched carrier executor when the extracted root plans
-    one, a plain ``IRModule`` otherwise.  This is exactly what
-    ``optimize_model()`` returns.
-``torch_compile``
-    ``torch.compile`` over the routed executor — what
-    ``optimize_model(runner=TorchCompileRunner())`` returns.
-``torch_compile_generic``
-    ``torch.compile`` over the serial ``IRModule``.
-``cuda_graph``
-    A fresh routed executor captured into a CUDA graph — what
-    ``optimize_model(runner=CudaGraphRunner())`` delivers.  Needs a
-    CUDA example input and a capture-capable executor; otherwise the
-    candidate records ``status="unavailable"``.
+    The pipeline's executor routing — ``_lower_extracted`` against
+    ``sink.executors``: the first carrier entry whose ``accepts``
+    probe holds, the generic lowering otherwise.  This is exactly
+    what the pipeline delivers.
 ``eager``
     The original model, unchanged.  Always verifies (it is the
     reference) — when nothing beats it, it wins honestly.
+``<executor name>``
+    Every name in ``sink.executors`` resolves to that
+    :class:`~catopt_core.ports.ExecutorSpec` — ``spec.lower`` on a
+    fresh lowering of the extracted term (``"scan"`` /
+    ``"om_batched"`` / ``"omd_batched"`` / ``"om_streaming"`` /
+    ``"trace"`` for the torch backend).
 
-Custom candidates: a ``candidates`` entry may be a
-``(name, builder)`` tuple where ``builder`` is a
-:data:`CandidateBuilder` callable receiving the
-:class:`AutotuneContext` and returning a runnable module.
+Backend-provided builders — ``torch.compile`` / CUDA-graph paths —
+arrive through the ``builders`` map (the torch wrapper supplies
+``catopt_torch.api.TORCH_BUILDERS``: ``"torch_compile"``,
+``"torch_compile_generic"``, ``"cuda_graph"``).  Custom candidates:
+a ``candidates`` entry may be a ``(name, builder)`` tuple where
+``builder`` is a :data:`CandidateBuilder` callable receiving the
+:class:`AutotuneContext` and returning a runnable.
 
 Measured feedback (opt-in)
 --------------------------
 
 Every timed candidate's median latency would otherwise be thrown away
 after picking the winner.  Pass a profile to ``profile=`` — a
-:class:`~catopt_optimize.calibrate.TargetProfile` or a plain dict —
+:class:`~catopt_core.profile.TargetProfile` or a plain dict —
 and two things happen:
 
 * candidates are *attempted* cheapest-predicted-first, where the
@@ -65,8 +66,8 @@ and two things happen:
   profile's learned ``corrections`` factors (once a
   (candidate, bucket) pair has enough observations) and
   ``measured_ns`` residuals for this input's
-  :func:`~catopt_optimize.calibrate.shape_bucket`
-  (see :func:`~catopt_optimize.calibrate.corrected_price_ns`); and
+  :func:`~catopt_core.profile.shape_bucket`
+  (see :func:`~catopt_core.profile.corrected_price_ns`); and
 * this run's measurements are written back into the profile's
   ``measured_ns`` map AND folded into its ``corrections`` table
   (a running geometric mean of ``median/model`` ratios per
@@ -85,34 +86,34 @@ written (``measured_ns``), and the updated profile object
 from __future__ import annotations
 
 import copy
+import importlib
 import logging
-import statistics
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, is_dataclass, replace
 from typing import Any, cast
 
-import torch
 from catopt_core.cost import (
     _profile_dispatch_s,
     executor_cost_for,
     fused_cost_for,
 )
 from catopt_core.ir import IR, Op, Param, TensorType, Var
-from catopt_core.ports import Sink, Source
-from catopt_torch.adapters import TorchSink, TorchSource
-
-from catopt_optimize.calibrate import (
+from catopt_core.ports import (
+    ExecutorSpec,
+    Sink,
+    Source,
+)
+from catopt_core.profile import (
     corrected_price_ns,
     profile_graph_overhead_us,
     record_measured,
     shape_bucket,
 )
+
 from catopt_optimize.optimize import (
-    Autotuned,
     Optimizer,
     _lower_extracted,
-    optimize_model,
 )
 
 logger = logging.getLogger("catopt_optimize.autotune")
@@ -122,7 +123,6 @@ __all__ = [
     "AutotuneContext",
     "CandidateBuilder",
     "CandidateUnavailableError",
-    "optimize_model_autotuned",
 ]
 
 
@@ -145,7 +145,7 @@ class AutotuneContext:
     extracted term after ``IRModule``'s weight-chain folding, so
     ``fused_*`` param leaves already have entries in
     ``param_values`` and re-lowering needs no re-fold.
-    ``delivered`` is the module ``optimize_model`` itself produced
+    ``delivered`` is the module the pipeline itself produced
     (``lowering`` is its ``stats["lowering"]``) — a builder may
     reuse it directly when it is already the right executor.
 
@@ -155,17 +155,17 @@ class AutotuneContext:
     ``eager`` candidates still work.
     """
 
-    model: torch.nn.Module
+    model: Any
     example_input: Any  # tensor or args tuple
     ir: IR | None
     term: Any
-    param_values: dict[str, torch.Tensor]
+    param_values: dict[str, Any]
     sink: Sink
-    delivered: torch.nn.Module
+    delivered: Any
     lowering: str
 
 
-#: ``builder(ctx) -> runnable module``; raising
+#: ``builder(ctx) -> runnable``; raising
 #: :class:`CandidateUnavailableError` marks the candidate
 #: ``"unavailable"``, any other exception ``"build_failed"``.
 CandidateBuilder = Callable[[AutotuneContext], Any]
@@ -180,7 +180,7 @@ def _require_ir(ctx: AutotuneContext) -> IR:
 
 
 def _build_generic(ctx: AutotuneContext) -> Any:
-    """Build the serial ``IRModule`` via ``sink.lower``.
+    """Build the serial executor via ``sink.lower``.
 
     Reuse ``delivered`` when the pipeline itself routed to the
     generic executor.
@@ -191,7 +191,7 @@ def _build_generic(ctx: AutotuneContext) -> Any:
 
 
 def _build_batched(ctx: AutotuneContext) -> Any:
-    """Build ``_lower_extracted`` carrier routing.
+    """Build the sink's executor-routed lowering.
 
     Reuse ``delivered`` when it already is the routed executor.
     """
@@ -202,99 +202,58 @@ def _build_batched(ctx: AutotuneContext) -> Any:
     )
 
 
-def _build_compiled(ctx: AutotuneContext) -> Any:
-    """``torch.compile`` over the routed executor.
-
-    The ``optimize_model(runner=CompiledRunner())`` delivery.
-
-    Always a FRESH module: ``torch.compile`` rewrites the module's
-    ``forward`` attribute (dynamo dispatch), so compiling
-    ``ctx.delivered`` would contaminate the ``batched`` candidate —
-    they are the same object when the pipeline routed there.
-    """
-    return torch.compile(
-        _lower_extracted(
-            ctx.term, _require_ir(ctx), ctx.param_values, ctx.sink
-        )
-    )
-
-
-def _build_compiled_generic(ctx: AutotuneContext) -> Any:
-    """``torch.compile`` over a FRESH serial ``IRModule``.
-
-    Fresh for the same ``forward``-mutation reason as ``compiled``.
-    """
-    return torch.compile(
-        cast(
-            Any,
-            ctx.sink.lower(_require_ir(ctx), ctx.param_values),
-        )
-    )
-
-
-def _capture_routed(  # pragma: no cover — CUDA-only body
-    ctx: AutotuneContext,
-) -> Any:
-    """Fresh routed executor captured into a CUDA graph.
-
-    Fresh because ``capture_cuda_graph`` mutates the module —
-    capturing ``ctx.delivered`` would silently upgrade the
-    ``batched`` candidate too.
-    """
-    mod = _lower_extracted(
-        ctx.term, _require_ir(ctx), ctx.param_values, ctx.sink
-    )
-    capture = getattr(mod, "capture_cuda_graph", None)
-    if capture is None:
-        raise CandidateUnavailableError(
-            "routed executor has no capture_cuda_graph"
-        )
-    args = (
-        ctx.example_input
-        if isinstance(ctx.example_input, tuple)
-        else (ctx.example_input,)
-    )
-    capture(*args)
-    return mod
-
-
-def _build_cuda_graph(ctx: AutotuneContext) -> Any:
-    """Build the ``cuda_graph`` candidate.
-
-    ``optimize_model(runner=CudaGraphRunner())`` semantics on a
-    fresh module (see :func:`_capture_routed`).
-    """
-    if not _input_is_cuda(ctx.example_input):
-        raise CandidateUnavailableError(
-            "cuda_graph needs a CUDA example input"
-        )
-    return _capture_routed(ctx)  # pragma: no cover — CUDA-only
-
-
 def _build_eager(ctx: AutotuneContext) -> Any:
     """Return the original model — the reference, always verified."""
     return ctx.model
 
 
-#: Built-in lowering candidates; users may add entries or pass
-#: ``(name, builder)`` tuples in ``candidates`` instead.
+#: Built-in backend-neutral lowering candidates; backend-provided
+#: names arrive through the ``builders`` map, and ``<executor name>``
+#: resolves against ``sink.executors``.  Users may add entries or
+#: pass ``(name, builder)`` tuples in ``candidates`` instead.
 CANDIDATE_BUILDERS: dict[str, CandidateBuilder] = {
     "generic": _build_generic,
     "batched": _build_batched,
-    "torch_compile": _build_compiled,
-    "torch_compile_generic": _build_compiled_generic,
-    "cuda_graph": _build_cuda_graph,
     "eager": _build_eager,
 }
 
 
-def _input_is_cuda(example_input: Any) -> bool:
-    args = (
-        example_input
-        if isinstance(example_input, tuple)
-        else (example_input,)
-    )
-    return any(isinstance(a, torch.Tensor) and a.is_cuda for a in args)
+def _executor_builder(spec: ExecutorSpec) -> CandidateBuilder:
+    """Turn a sink executor entry into a candidate builder.
+
+    ``spec.lower`` runs on a FRESH lowering of the extracted term
+    (``ctx.ir``) — never ``ctx.delivered``, which the ``batched``
+    candidate may already own.
+    """
+
+    def build(ctx: AutotuneContext) -> Any:
+        return spec.lower(_require_ir(ctx), ctx.param_values)
+
+    return build
+
+
+def _resolve_builder(
+    name: str,
+    sink: Sink,
+    builders: dict[str, CandidateBuilder] | None,
+) -> CandidateBuilder | None:
+    """Resolve a candidate name — built-in, backend, executor-table.
+
+    Order: the backend-provided ``builders`` map first (backend
+    candidates shadow neutral names deliberately — e.g. a backend
+    override of ``"batched"``), then :data:`CANDIDATE_BUILDERS`,
+    then ``sink.executors`` entries.
+    """
+    if builders is not None and name in builders:
+        return builders[name]
+    b = CANDIDATE_BUILDERS.get(name)
+    if b is not None:
+        return b
+    table = getattr(sink, "executors", None) or {}
+    spec = table.get(name)
+    if spec is not None:
+        return _executor_builder(spec)
+    return None
 
 
 def _term_params(term: Any) -> dict[str, Param]:
@@ -321,11 +280,11 @@ def _term_params(term: Any) -> dict[str, Param]:
 
 
 def _recover_ir(
-    delivered: torch.nn.Module,
-) -> tuple[IR, dict[str, torch.Tensor]]:
+    delivered: Any,
+) -> tuple[IR, dict[str, Any]]:
     """Reconstruct ``(IR, param_values)`` from a delivered module.
 
-    Recover from the module ``optimize_model`` delivered, so the
+    Recover from the module the pipeline delivered, so the
     SAME extracted term can be re-lowered through another executor
     without re-running the search.
 
@@ -334,63 +293,24 @@ def _recover_ir(
     natively, the batched executors through delegated properties —
     so one read covers every route ``_lower_extracted`` takes.
     """
-    mod = cast(Any, delivered)
-    root = mod._root
-    inputs = list(mod._inputs)
+
+    def clone(p: Any) -> Any:
+        det = getattr(p, "detach", None)
+        if callable(det):
+            p = det()
+        cl = getattr(p, "clone", None)
+        return cl() if callable(cl) else copy.copy(p)
+
+    root = delivered._root
+    inputs = list(delivered._inputs)
     ir = IR(
         root=root,
         inputs=inputs,
         input_names={v.name for v in inputs},
         params=_term_params(root),
     )
-    pvals = {
-        name: p.detach().clone() for name, p in mod._param_map.items()
-    }
+    pvals = {name: clone(p) for name, p in delivered._param_map.items()}
     return ir, pvals
-
-
-def _time_forward(
-    mod: Any,
-    example_input: Any,
-    *,
-    n_calls: int,
-    warmup: int,
-) -> tuple[float, float]:
-    """Median and IQR of one forward's wall seconds.
-
-    ``warmup`` untimed calls first (inductor autotune, cache fill);
-    every timed call ends in ``cuda.synchronize`` on CUDA inputs so
-    the measured time includes the GPU tail.
-    """
-    args = (
-        example_input
-        if isinstance(example_input, tuple)
-        else (example_input,)
-    )
-    is_cuda = _input_is_cuda(example_input)
-
-    def call() -> None:
-        with torch.no_grad():
-            mod(*args)
-
-    for _ in range(max(warmup, 0)):
-        call()
-    if is_cuda:
-        torch.cuda.synchronize()  # pragma: no cover — CUDA-only
-    times: list[float] = []
-    for _ in range(max(n_calls, 1)):
-        t0 = time.perf_counter()
-        call()
-        if is_cuda:
-            torch.cuda.synchronize()  # pragma: no cover — CUDA-only
-        times.append(time.perf_counter() - t0)
-    med = statistics.median(times)
-    if len(times) >= 4:
-        q1, _, q3 = statistics.quantiles(times, n=4)
-        iqr = q3 - q1
-    else:
-        iqr = 0.0
-    return med, iqr
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +324,9 @@ def _time_forward(
 
 #: Candidate name → the executor-cost lowering that prices it.
 #: ``"batched"`` resolves per model to the pipeline's own route
-#: (``stats["lowering"]``); ``"eager"`` and custom names get no model
-#: price — their ``measured_ns`` entries substitute the measured
-#: median outright (``measured_price_ns``).
+#: (``stats["lowering"]``); ``"eager"``, executor-table names and
+#: custom names get no model price — their ``measured_ns`` entries
+#: substitute the measured median outright (``measured_price_ns``).
 _CANDIDATE_LOWERING: dict[str, str | None] = {
     "generic": "generic",
     "batched": None,
@@ -480,7 +400,7 @@ def _compiled_model_ns(term: Any, profile: Any) -> float:
     profile's ``graph_overhead_us`` (measured guards + inductor
     dispatch) widens that term to ``max(dispatch_s,
     graph_overhead_s)`` — the contract documented on
-    :func:`~catopt_optimize.calibrate.profile_graph_overhead_us`.  If
+    :func:`~catopt_core.profile.profile_graph_overhead_us`.  If
     the installed cost model already consumes the field
     (``_fused_charges_graph_overhead``) the base price carries it and
     nothing is added here.
@@ -503,11 +423,12 @@ def _candidate_model_ns(
 
     Prices one candidate; ``None`` when the term was not recovered
     or the candidate has no priced lowering (``"eager"``, custom
-    names).
+    names, executor-table entries — the model prices delivered
+    routes, not names).
 
     The learned ``corrections`` factors are deliberately applied one
     layer up, where the attempt-order price map is built
-    (:func:`~catopt_optimize.calibrate.corrected_price_ns`) — the
+    (:func:`~catopt_core.profile.corrected_price_ns`) — the
     ``model_ns`` recorded in stats and paired with each write-back
     must stay the honest raw model estimate, since it is the
     denominator of the ratios the correction table learns.
@@ -538,7 +459,7 @@ def _candidate_model_ns(
 
 
 def _autotuned_impl(
-    model: torch.nn.Module,
+    model: Any,
     example_input: Any,  # tensor or positional-args tuple
     *,
     candidates: Iterable[str | tuple[str, CandidateBuilder]] = (
@@ -546,33 +467,35 @@ def _autotuned_impl(
         "batched",
         "torch_compile",
     ),
+    builders: dict[str, CandidateBuilder] | None = None,
     budget_s: float | None = None,
     n_calls: int = 30,
     warmup: int = 5,
     rtol: float = 1e-4,
     atol: float | None = None,
-    source: Source,
-    sink: Sink,
+    optimizer: Optimizer,
     profile: Any = None,
     verbose: bool = False,
     **optimize_kwargs: Any,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
+) -> tuple[Any, dict[str, Any]]:
     """Optimize ``model``, then autotune over lowering paths.
 
     The engine behind the :class:`~catopt_optimize.optimize.Autotuned`
-    strategy and the :func:`optimize_model_autotuned` compatibility
-    wrapper (plan 0006).  Steps:
+    strategy and the ``optimize_model_autotuned`` compatibility
+    wrapper (plan 0006/0007).  Steps:
 
-    1. Run :func:`optimize_model` once (uncompiled, no CUDA graph —
-       those are candidates, not presets) to get the extracted term
-       and the pipeline's own lowered module.
+    1. Run the monolithic pipeline once (uncompiled, no graph
+       capture — those are candidates, not presets) to get the
+       extracted term and the pipeline's own lowered module.
     2. Re-lower the same extracted term through each requested
-       candidate (see :data:`CANDIDATE_BUILDERS`).
+       candidate (see :data:`CANDIDATE_BUILDERS`, ``builders``, and
+       ``sink.executors``).
     3. ``sink.verify`` each candidate against ``model`` on
        ``example_input`` — failures are recorded and excluded;
        a candidate is never timed unverified.
-    4. Time each survivor: ``warmup`` calls + ``n_calls`` timed
-       forwards (median + IQR, CUDA-synchronised).
+    4. Time each survivor through the ``meter`` port: ``warmup``
+       calls + ``n_calls`` timed forwards (median + IQR, device
+       synchronisation is the meter's business).
     5. Return the measured-fastest candidate.
 
     Parameters
@@ -583,8 +506,12 @@ def _autotuned_impl(
         A representative input — a tensor or a positional-args
         tuple.
     candidates
-        Names into :data:`CANDIDATE_BUILDERS` and/or
+        Names resolvable by :func:`_resolve_builder` and/or
         ``(name, builder)`` tuples.
+    builders
+        Backend-provided candidate builders — names the neutral
+        table does not know (the torch wrapper supplies
+        ``TORCH_BUILDERS``).  Merged over :data:`CANDIDATE_BUILDERS`.
     budget_s
         Wall-clock budget for the WHOLE call (the search counts
         against it).  Candidates left unstarted when it expires are
@@ -594,45 +521,43 @@ def _autotuned_impl(
         timed ones; the median decides.
     rtol, atol
         The ``sink.verify`` equivalence gate.
-    source, sink
-        The port adapters — required (the :class:`~catopt_optimize.optimize.Autotuned`
-        strategy and the :func:`optimize_model_autotuned` wrapper
-        resolve them).  The same ``sink`` both lowers and verifies
-        candidates.
+    optimizer
+        The configured orchestrator — its ``source``/``sink`` run the
+        one search, its ``meter`` times the survivors, its
+        ``criteria``/``runner`` defaults apply to the search and the
+        pipeline delivery.  Required — there is no assumed backend.
     profile
         Measured-feedback channel (opt-in): a
-        :class:`~catopt_optimize.calibrate.TargetProfile`, a dict, or
+        :class:`~catopt_core.profile.TargetProfile`, a dict, or
         any object with a ``measured_ns`` mapping.  When given,
         candidates are attempted cheapest-predicted-first — the model
         price corrected by the profile's learned ``corrections``
         factors and ``measured_ns`` residuals for this input's
-        :func:`~catopt_optimize.calibrate.shape_bucket` — and this
+        :func:`~catopt_core.profile.shape_bucket` — and this
         run's timings are written back into the profile
-        (:func:`~catopt_optimize.calibrate.record_measured`), so the
-        next ``optimize_model_autotuned`` call on this shape prices
+        (:func:`~catopt_core.profile.record_measured`), so the
+        next autotuned call on this shape prices
         candidates closer to measured.  The updated object is
         returned as ``stats["autotune"]["profile"]`` — dicts update in
         place, a frozen ``TargetProfile`` comes back replaced.  The
         same ``measured_ns``/``graph_overhead_us`` keys are the
         contract a profile-aware selection path (e.g. a
-        ``profile=``-accepting ``optimize_model`` /
-        ``_delivered_cost``) consumes.
+        ``profile=``-accepting delivered-cost path) consumes.
     verbose
         Print progress.
     **optimize_kwargs
-        Forwarded to :func:`optimize_model` (``ruleset``,
-        ``max_iterations``, ``ops``, ``runner``, …).  Compilation
-        and graph capture are candidates here, not presets — pass
-        ``runner`` only to decorate the pipeline's own delivered
-        module, not as a substitute candidate.
+        Forwarded to the underlying optimize call (``ruleset``,
+        ``max_iterations``, …).  Compilation and graph capture are
+        candidates here, not presets — ``runner`` only decorates the
+        pipeline's own delivered module, not a substitute candidate.
 
     Returns
     -------
     (module, stats)
         ``module`` is the measured-fastest VERIFIED candidate (the
-        plain ``optimize_model`` output when every candidate fails
-        — ``stats["autotune"]["fallback"]``).  ``stats`` is the
-        ``optimize_model`` stats dict plus ``stats["autotune"]``:
+        pipeline's own delivery when every candidate fails —
+        ``stats["autotune"]["fallback"]``).  ``stats`` is the
+        pipeline stats dict plus ``stats["autotune"]``:
         ``winner``, ``winner_median_s``, per-candidate records
         (``status``/``median_s``/``iqr_s``/``verified``/``max_rel``/
         ``model_ns``/``predicted_ns``/``error``), ``fallback``,
@@ -643,15 +568,37 @@ def _autotuned_impl(
     """
     t_start = time.monotonic()
 
+    sink = optimizer.sink
+    meter = optimizer.meter
+    if meter is None:
+        raise TypeError(
+            "Autotuned strategy needs a Meter port — pass meter= "
+            "(or backend=) to Optimizer"
+        )
+    # ``Optimizer.__post_init__`` already rejects a missing source/sink,
+    # so by construction both ports are present here.
+    source = optimizer.source
+    sink = cast(Sink, optimizer.sink)
+    # Runner-style kwargs belong to the optimizer, not the phase
+    # verbs — pull them out like optimize_model did.
+    opt_kw = dict(optimize_kwargs)
+    runner = opt_kw.pop("runner", None)
+    criteria = opt_kw.pop("criteria", None)
+    opt_kw.pop("ops", None)  # sink already resolved — ops is moot
+
     # -- (a) the one search -----------------------------------------
-    delivered, stats = optimize_model(
-        model,
-        example_input,
-        source=source,
+    lr = Optimizer(
+        source=cast(Source, source),
         sink=sink,
-        verbose=verbose,
-        **optimize_kwargs,
+        composer=optimizer.composer,
+        meter=meter,
+        criteria=criteria,
+        runner=(runner if runner is not None else optimizer.runner),
+    ).optimize(
+        model, example_input, verify=verbose, verbose=verbose, **opt_kw
     )
+    delivered = lr.module
+    stats = lr.stats
     search_s = time.monotonic() - t_start
     lowering = str(stats.get("lowering", "generic"))
     if verbose:
@@ -693,9 +640,16 @@ def _autotuned_impl(
     # Normalise entries up front — measured-feedback pricing and the
     # predicted-order sort below need every candidate's name.
     entries: list[tuple[str, CandidateBuilder | None]] = []
+    known = (
+        sorted(set(CANDIDATE_BUILDERS) | set(builders or {}))
+        if builders
+        else sorted(CANDIDATE_BUILDERS)
+    )
     for entry in candidates:
         if isinstance(entry, str):
-            entries.append((entry, CANDIDATE_BUILDERS.get(entry)))
+            entries.append(
+                (entry, _resolve_builder(entry, sink, builders))
+            )
         else:
             entries.append(entry)
 
@@ -735,8 +689,7 @@ def _autotuned_impl(
         if builder is None:
             records[name] = {
                 "status": "unknown",
-                "error": f"no candidate {name!r}; "
-                f"known: {sorted(CANDIDATE_BUILDERS)}",
+                "error": f"no candidate {name!r}; known: {known}",
             }
             continue
         rec: dict[str, Any] = {}
@@ -777,11 +730,12 @@ def _autotuned_impl(
             rec["status"] = "verify_failed"
             continue
 
-        # -- (d) time ----------------------------------------------
+        # -- (d) time through the meter port -------------------------
         try:
-            med, iqr = _time_forward(
+            timing = meter.time(
                 mod, example_input, n_calls=n_calls, warmup=warmup
             )
+            med, iqr = timing.median_s, timing.iqr_s
         except Exception as e:
             rec["status"] = "time_failed"
             rec["error"] = f"{type(e).__name__}: {e}"
@@ -789,7 +743,7 @@ def _autotuned_impl(
         rec["status"] = "timed"
         rec["median_s"] = med
         rec["iqr_s"] = iqr
-        rec["n_calls"] = n_calls
+        rec["n_calls"] = timing.n_calls
         built[name] = mod
         if verbose:
             logger.info(
@@ -805,11 +759,11 @@ def _autotuned_impl(
     }
     if timed:
         winner = min(timed, key=lambda n: timed[n]["median_s"])
-        module = cast(torch.nn.Module, built[winner])
+        module = built[winner]
         fallback = False
     else:
-        # "falls back to generic": the unmodified optimize_model
-        # output.  Verify it too — the fallback record must not
+        # "falls back to generic": the pipeline's own delivered
+        # module.  Verify it too — the fallback record must not
         # claim an unchecked win either.
         winner = None
         module = delivered
@@ -887,65 +841,26 @@ def _autotuned_impl(
     return module, stats
 
 
-def optimize_model_autotuned(
-    model: torch.nn.Module,
-    example_input: Any,  # tensor or positional-args tuple
-    *,
-    candidates: Iterable[str | tuple[str, CandidateBuilder]] = (
-        "generic",
-        "batched",
-        "torch_compile",
-    ),
-    budget_s: float | None = None,
-    n_calls: int = 30,
-    warmup: int = 5,
-    rtol: float = 1e-4,
-    atol: float | None = None,
-    source: Source | None = None,
-    sink: Sink | None = None,
-    profile: Any = None,
-    verbose: bool = False,
-    **optimize_kwargs: Any,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
-    """Optimize ``model``, then autotune over lowering paths.
+# ---------------------------------------------------------------------------
+# Compatibility delegation — the torch-defaulted wrapper moved (lazy)
+# ---------------------------------------------------------------------------
+#
+# ``optimize_model_autotuned`` resolves torch defaults, so it lives in
+# ``catopt_torch.api`` (plan 0007); ``Autotuned`` resolves here so the
+# historical ``catopt_optimize.autotune.Autotuned`` path keeps working
+# (it lives in ``catopt_optimize.optimize``).
 
-    A compatibility wrapper (plan 0006): resolves the historical
-    ``source``/``sink``/``ops`` defaults — torch IS the default here —
-    then runs ``Optimizer(...).optimize(..., strategy=Autotuned(...))``;
-    :func:`_autotuned_impl` is the pipeline.  Retires in 0008.
+_DELEGATED = {
+    "optimize_model_autotuned": "catopt_torch.api",
+    "Autotuned": "catopt_optimize.optimize",
+}
 
-    Steps: run :func:`optimize_model` once (uncompiled — compilation
-    and capture are candidates, not presets) for the extracted term
-    and the pipeline's own lowered module; re-lower that term through
-    each requested candidate (see :data:`CANDIDATE_BUILDERS`);
-    ``sink.verify`` each candidate against ``model`` on
-    ``example_input`` (a candidate is never timed unverified); time
-    each survivor (``warmup`` + ``n_calls`` timed forwards, median
-    decides); return the measured-fastest.
 
-    Returns ``(module, stats)`` — ``stats`` is the
-    ``optimize_model`` stats dict plus ``stats["autotune"]``:
-    ``winner``, ``winner_median_s``, per-candidate records,
-    ``fallback``, ``predicted_*``/``measured_ns``/``profile``
-    (with ``profile=``), ``search_s``, ``elapsed_s``.
-    """
-    if source is None:
-        source = TorchSource()
-    if sink is None:
-        sink = cast(Sink, TorchSink(ops=optimize_kwargs.get("ops")))
-    lr = Optimizer(source=source, sink=sink).optimize(
-        model,
-        example_input,
-        strategy=Autotuned(
-            candidates,
-            budget_s=budget_s,
-            n_calls=n_calls,
-            warmup=warmup,
-            rtol=rtol,
-            atol=atol,
-            profile=profile,
-            verbose=verbose,
-        ),
-        **optimize_kwargs,
+def __getattr__(name: str) -> Any:
+    """Resolve the moved names lazily."""
+    mod = _DELEGATED.get(name)
+    if mod is not None:
+        return getattr(importlib.import_module(mod), name)
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
     )
-    return cast(torch.nn.Module, lr.module), lr.stats
