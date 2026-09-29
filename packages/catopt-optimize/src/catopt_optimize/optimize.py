@@ -7,18 +7,38 @@ Phase 2 — Search:        IR → e-graph → equality saturation → best term
 Phase 3 — Lower:          best term → torch.nn.Module
 Phase 4 — Compare:        benchmark vs. vanilla TorchInductor
 
-The main entry point is :func:`optimize_model`.
+The public surface is the *verb* pair plus the configured entry
+object (plan 0006):
+
+* :func:`search` — phases 1+2: ``model -> SearchResult`` (the IR,
+  saturated e-graph, extracted term, leaf values and search-record
+  stats, all inspectable).
+* :func:`lower` — phase 3 (+verify): ``SearchResult -> LowerResult``;
+  re-lowering the same result under different runners delivers
+  different executables from ONE search.
+* :class:`Optimizer` — the configured entry point: required
+  ``source``/``sink`` ports plus ``criteria``/``runner`` defaults;
+  ``.search`` / ``.lower`` / ``.optimize`` / ``.discover``.
+* :class:`Monolithic` / :class:`Compositional` / :class:`Autotuned` —
+  the :class:`~catopt_core.ports.Strategy` seam behind
+  ``Optimizer.optimize(..., strategy=...)``.
+
+The historical ``optimize_model`` / ``optimize_compositional`` /
+``optimize_model_autotuned`` / ``discover_alternatives`` names remain
+as one-line wrappers over the verbs (removed in 0008).
 """
 
 from __future__ import annotations
 
 import contextlib
 import copy
+import inspect
 import logging
 import sys
 import time
 from collections.abc import Callable
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import torch
 from catopt_carriers.om_lower import (
@@ -64,7 +84,16 @@ from catopt_core.laws import (
     share_duplicate_params,
 )
 from catopt_core.ops import OpTable
-from catopt_core.ports import CostFn, Executor, OpRegistry, Sink, Source
+from catopt_core.pipeline import LowerResult, SearchResult
+from catopt_core.ports import (
+    Capabilities,
+    CostFn,
+    Executor,
+    OpRegistry,
+    Sink,
+    Source,
+    Strategy,
+)
 from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.report import (
     BlockReport,
@@ -78,7 +107,7 @@ from catopt_optimize.criteria import (
     Criterion,
     criteria_cost,
 )
-from catopt_optimize.runners import GenericRunner, Runner
+from catopt_optimize.runners import IdentityRunner, Runner
 
 #: Rules whose saturation closure is combinatorially explosive on
 #: stacked blocks: the pure-symmetry monoid laws enumerate every
@@ -456,79 +485,104 @@ def _lower_extracted(
     return sink.lower(optimized_ir, source_tensors)
 
 
-def discover_alternatives(
-    model: torch.nn.Module,
-    example_input: torch.Tensor,
-    *,
-    ruleset: str = "categorical",
-    max_iterations: int = 6,
-    cost_fn: CostFn | None = None,
-    top_k: int = 8,
-    source: Source | None = None,
-    sink: Sink | None = None,
-) -> dict:
-    """Enumerate the cheapest distinct members of class [G].
+# ---------------------------------------------------------------------------
+#  The verbs — search (phases 1+2) and lower (phase 3 + verify)
+# ---------------------------------------------------------------------------
 
-    The discovery-engine view.  Runs the same export → e-graph →
-    saturation → pairing pipeline as optimize_model, but instead of
-    committing to the single best term it returns the top-k alternatives
-    under the cost model, plus the rule-fire provenance (which generic
-    laws actually fired).  Human inspection of this frontier is how
-    level-3 candidates — emergent compositions of known laws — are
-    found.
 
-    ``source`` / ``sink`` select the graph source and the (backend-
-    relative) sink, defaulting to :class:`TorchSource` /
-    :class:`TorchSink`; alternatives are priced against
-    ``sink.supported_ops`` so the frontier only ever lists forms the
-    sink can lower.
+def _resolve_cost_fn(
+    cost_fn: CostFn | None,
+    criteria: Any,
+    capabilities: Capabilities | None,
+) -> tuple[CostFn, Any]:
+    """Selection-model precedence: ``cost_fn`` > ``criteria`` > default.
+
+    Returns ``(cost_fn, criteria_used)`` — the normalised-blend marker
+    ``criteria_cost`` sets is read BEFORE the ``backend_cost`` wrap,
+    which propagates only the billing markers.  With ``capabilities``
+    given, members using an op the backend cannot lower price at
+    ``+inf``, so extraction never commits to one; omitted, pricing is
+    backend-agnostic.
     """
-    if source is None:
-        source = TorchSource()
-    if sink is None:
-        sink = TorchSink()
     if cost_fn is None:
-        cost_fn = _default_cost_fn()
-    cost_fn = backend_cost(cost_fn, sink.supported_ops)
-    ir, source_tensors = source.to_ir(model, example_input)
-    eg = EGraph()
-    root_eid = eg.add_term(ir.root)
-    rules = {
-        "all": all_rules(),
-        "all+layout": ALL_RULES_WITH_LAYOUT,
-        "simpl": SIMPLIFICATION_RULES,
-        "categorical": CATEGORICAL_RULES,
-    }[ruleset]
+        cost_fn = (
+            criteria_cost(criteria)
+            if criteria is not None
+            else _default_cost_fn()
+        )
+    criteria_used = getattr(cost_fn, "criteria", None)
+    if capabilities is not None:
+        cost_fn = backend_cost(cost_fn, capabilities.supported_ops)
+    return cost_fn, criteria_used
+
+
+#: Term-local fusion rules the pipeline SUBSUMES with the non-local
+#: ``pair_shared_input_*`` pass (it needs no consumer pattern, and
+#: keeping them would let extraction pick consumer-level chunk
+#: alternatives that bypass the globally-coordinated split choice).
+_SUBSUMED = frozenset(
+    {"swiglu_fuse", "parallel_mul_fuse", "qkv_fuse", "qkv_fuse_asym"}
+)
+
+
+def _ruleset_rules(ruleset: str) -> list:
+    """Map a ruleset name to its rewrite list.
+
+    ``"all"`` / ``"all+layout"`` / ``"simpl"`` / ``"categorical"`` —
+    every set but ``"simpl"`` drops :data:`_SUBSUMED`.
+    """
+    if ruleset == "all":
+        return [r for r in all_rules() if r.name not in _SUBSUMED]
+    if ruleset == "all+layout":
+        return [
+            r for r in ALL_RULES_WITH_LAYOUT if r.name not in _SUBSUMED
+        ]
+    if ruleset == "simpl":
+        return SIMPLIFICATION_RULES
     if ruleset == "categorical":
-        _SUBSUMED = {
-            "swiglu_fuse",
-            "qkv_fuse",
-            "qkv_fuse_asym",
-            "parallel_mul_fuse",
-        }
-        rules = [r for r in rules if r.name not in _SUBSUMED]
-    # Same bounded-saturation policy as optimize_model — the frontier
-    # stays representative but the call returns in bounded time.
-    rule_budgets = {n: 2048 for n in _EXPANSIVE_RULES}
-    stats = eg.run(
-        rules,
-        root_eid,
-        max_iterations=max_iterations,
-        rule_budgets=rule_budgets,
-    )
+        return [r for r in CATEGORICAL_RULES if r.name not in _SUBSUMED]
+    raise ValueError(f"Unknown ruleset: {ruleset}")
+
+
+def _pairing_and_lifts(
+    eg: EGraph,
+    rules: list,
+    root_eid: int,
+    stats: dict[str, Any],
+    run_cap: int,
+    rule_budgets: dict[str, int] | None,
+    max_enodes: int | None,
+    max_memory_mb: float | None,
+    source_tensors: dict,
+) -> list:
+    """Non-local passes with a brief re-saturation between them.
+
+    The diagram-level product law pairs every linear sharing an input
+    into one GEMM + split views (no consumer pattern needed); then the
+    non-local lifts — unrolled recurrences -> ``trace(F)``, stacks of
+    same-state carrier applications -> one application, whole om trees
+    over scanned values -> the deferred omd carrier, and exact weight
+    tying (duplicate Param leaves share one class).  All witnessed so
+    certificates stay replayable.
+
+    Returns the pairing-groups list — the coordinated (paired)
+    extraction in :func:`_select_best_term` needs it.
+    """
     groups = pair_shared_input_linears(eg) + pair_shared_input_convs(eg)
     if groups:
         eg.rebuild()
+        _check_resources(eg, max_enodes, max_memory_mb)
         stats["pairing_groups"] = len(groups)
+        # brief second saturation so other rules see the new enodes
         eg.run(
-            rules, root_eid, max_iterations=5, rule_budgets=rule_budgets
+            rules,
+            root_eid,
+            max_iterations=5,
+            max_nodes=run_cap,
+            rule_budgets=rule_budgets,
         )
+        _check_resources(eg, max_enodes, max_memory_mb)
 
-    # Non-local lifts: unrolled recurrences -> trace(F), stacks of
-    # same-state carrier applications -> one application, whole om
-    # trees over scanned values -> the deferred omd carrier, and exact
-    # weight tying (duplicate Param leaves share one class).
-    # All witnessed so certificates stay replayable.
     lifts = (
         lift_scan_to_applyd(eg)
         + lift_scan_to_trace(eg)
@@ -540,23 +594,667 @@ def discover_alternatives(
     )
     if lifts:
         eg.rebuild()
+        _check_resources(eg, max_enodes, max_memory_mb)
         stats["nonlocal_lifts"] = len(lifts)
         eg.run(
-            rules, root_eid, max_iterations=5, rule_budgets=rule_budgets
+            rules,
+            root_eid,
+            max_iterations=5,
+            max_nodes=run_cap,
+            rule_budgets=rule_budgets,
         )
-    alts = eg.extract_alternatives(root_eid, cost_fn, top_k=top_k)
-    return {
-        "alternatives": alts,
-        "diverse_classes": eg.diverse_classes(),
-        "rule_fires": dict(
-            sorted(eg.rule_fires.items(), key=lambda kv: -kv[1])
+        _check_resources(eg, max_enodes, max_memory_mb)
+    return groups
+
+
+def _select_best_term(
+    eg: EGraph,
+    root_eid: int,
+    cost_fn: CostFn,
+    stats: dict[str, Any],
+    *,
+    groups: list,
+    fusion_epsilon: float,
+    delivers_compiled: bool,
+    specialize_causal: bool,
+    fold_ops: OpRegistry | None,
+    source_tensors: dict,
+) -> Any:
+    """Extract the search's term: greedy -> paired -> carrier -> causal.
+
+    * ``extract_best`` — the additive DAG-cost minimum under
+      ``cost_fn`` (``fusion_epsilon`` arms the near-tie fusion band);
+    * paired extraction — with pairing groups present, force every
+      paired member to its split enode and compare true DAG costs
+      (one shared memo prices the baseline once);
+    * :func:`_carrier_upgrade` — the whole-spine batched-executor win
+      the additive decomposition can't price, billed under the
+      intended delivery (``delivers_compiled``);
+    * :func:`_specialize_causal` — the opt-out causal-mask const fold;
+      its declared need is ``fold_ops`` (a ``Capabilities.ops``
+      registry) — no capabilities, no fold.
+    """
+    best_term = eg.extract_best(
+        root_eid, cost_fn, fusion_epsilon=fusion_epsilon
+    )
+    if groups:
+        # Coordinated extraction: force every paired member to its
+        # split enode AND steer consumers through the shared GEMM.
+        # Compare true DAG costs — forcing loses if a group is only
+        # partially reachable or a bypassing alternative was already
+        # cheaper.  One shared memo across both calls: a forced term
+        # shares most subterms with the best term, and the baseline
+        # price is computed once, not per candidate.
+        _dc_memo: dict = {}
+        _best_dag = dag_cost(best_term, cost_fn, memo=_dc_memo)
+        forced = eg.extract_paired(root_eid, cost_fn, groups)
+        # Honest-decline bookkeeping: an un-extractable forced term
+        # prices at +inf, so the same comparison decides and the stats
+        # record the verdict with the cost delta.
+        _forced_dag = (
+            dag_cost(forced, cost_fn, memo=_dc_memo)
+            if forced is not None
+            else float("inf")
+        )
+        if _forced_dag <= _best_dag:
+            best_term = forced
+            stats["paired_extract"] = True
+        else:
+            stats["paired_extract"] = False
+            stats["paired_delta"] = _forced_dag - _best_dag
+    # Coordinated carrier selection: a batched-executor win is a
+    # whole-spine property the additive extraction can't price.
+    best_term = _carrier_upgrade(
+        eg, root_eid, best_term, cost_fn, compiled=delivers_compiled
+    )
+    # Causal specialization: a param-only attn_mask that evaluates to a
+    # lower-triangular keep-mask is is_causal=True — no mask op at all.
+    if specialize_causal and fold_ops is not None:
+        _cm: dict = {}
+        best_term = _specialize_causal(
+            best_term, source_tensors, _cm, ops=fold_ops
+        )
+        if _cm.get("_hit"):
+            stats["causal_specialized"] = True
+    return best_term
+
+
+@_oom_to_resource_error
+def search(
+    model: Any,
+    x: Any,
+    *,
+    source: Source,
+    capabilities: Capabilities | None = None,
+    criteria: (
+        dict[str, float] | Criteria | Criterion | list | tuple | None
+    ) = None,
+    cost_fn: CostFn | None = None,
+    ruleset: str = "all",
+    max_iterations: int = 100,
+    max_enodes: int | None = 100_000,
+    symmetry_budget: int | None = 2048,
+    max_memory_mb: float | None = None,
+    specialize_causal: bool = True,
+    fusion_epsilon: float = 0.0,
+    delivers_compiled: bool = False,
+    verbose: bool = False,
+) -> SearchResult:
+    """Run the search phase: ``model -> SearchResult``.
+
+    Export → e-graph → bounded equality saturation → non-local passes
+    → extraction.  The result carries everything the lower phase and
+    an interactive caller need: the exported ``IR`` and leaf values,
+    the saturated ``EGraph`` and root e-class, the extracted ``term``,
+    the pricing actually used, and the search-record ``stats``.
+
+    Parameters
+    ----------
+    model
+        The model to optimize — the type only ``source`` interprets.
+    x
+        An example input for tracing (tensor or positional-args tuple).
+    source : Source
+        The graph-source port (``model -> (IR, leaves)``) — REQUIRED.
+        There is no assumed frontend; choosing torch means importing
+        ``catopt_torch`` and passing :class:`TorchSource`.
+    capabilities : Capabilities, optional
+        The backend's op surface — ``supported_ops`` bounds extraction
+        to forms the backend can lower (``backend_cost`` pricing), and
+        ``ops`` is the registry ``specialize_causal``'s const fold
+        dispatches through.  Omitted: pricing is backend-agnostic and
+        the causal fold is skipped.  A :class:`Sink` satisfies it
+        (every sink is a ``Capabilities``).
+    cost_fn : CostFn, optional
+        Term-extraction pricing; ``None`` falls to ``criteria`` then
+        the executor-aware default.
+    criteria : dict, Criterion, Criteria, or sequence, optional
+        Selection axes blended into the extraction model — see
+        :func:`optimize_model`.
+    ruleset : str
+        ``"all"`` / ``"all+layout"`` / ``"simpl"`` / ``"categorical"``.
+    max_iterations : int
+        Maximum equality-saturation iterations.
+    max_enodes : int, optional
+        E-node bound; crossing it raises
+        :class:`OptimizationResourceError`.  ``None`` disables.
+    max_memory_mb : float, optional
+        Process memory bound in MiB.  ``None`` disables.
+    symmetry_budget : int, optional
+        Per-rule enode budget for the expansive rules; ``None`` is
+        unbounded saturation.
+    fusion_epsilon : float, default 0.0
+        Near-tie fusion-preferred extraction band — see
+        :func:`optimize_model`.
+    specialize_causal : bool, default True
+        The causal-mask const fold is an opt-out search pass: a
+        param-only ``sdpa`` mask that evaluates to the lower-triangular
+        keep-mask becomes ``is_causal=True``.
+    delivers_compiled : bool, default False
+        Delivery hint for carrier selection only: when the eventual
+        delivery will be ``torch.compile``-wrapped, the carrier upgrade
+        bills terms under the fusion-region (``lowering="compiled"``)
+        price.  The runner itself is a ``lower`` concern.
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    SearchResult
+        ``ir`` / ``eg`` / ``root_eid`` / ``term`` / ``param_values`` /
+        ``stats`` (the search record) / ``cost_fn`` / ``source`` /
+        ``model`` (the verify reference ``lower`` uses).
+
+    """
+    cost_fn, criteria_used = _resolve_cost_fn(
+        cost_fn, criteria, capabilities
+    )
+
+    # Recursive walks (extraction, member resolution) descend the
+    # e-class DAG, whose depth grows with the saturation closure —
+    # thousands of levels on deep stacks.
+    if sys.getrecursionlimit() < 40_000:
+        sys.setrecursionlimit(40_000)
+
+    # -- Phase 1: Export to IR -------------------------------------------
+    if verbose:
+        print(
+            f"[Phase 1] Exporting {model.__class__.__name__} to IR..."
+        )
+    ir, source_tensors = source.to_ir(model, x)
+    if verbose:
+        print(f"  IR root: {op_repr(ir.root)}")
+        print(f"  Inputs:  {[str(v) for v in ir.inputs]}")
+        print(f"  Params:  {list(ir.params.keys())}")
+
+    # -- Phase 2: Build e-graph and saturate -----------------------------
+    if verbose:
+        print(
+            "[Phase 2] Building e-graph and running equality "
+            "saturation..."
+        )
+    eg = EGraph()
+    root_eid = eg.add_term(ir.root)
+    rules = _ruleset_rules(ruleset)
+    if verbose:
+        print(f"  Rules: {[r.name for r in rules]}")
+
+    # Bounded-saturation budget for the expansive rules (see
+    # ``_EXPANSIVE_RULES``); enforced inside the matcher so a giant
+    # e-class cannot spend the whole budget in one enumeration.
+    rule_budgets = (
+        {n: symmetry_budget for n in _EXPANSIVE_RULES}
+        if symmetry_budget is not None
+        else None
+    )
+    # ``None`` = unbounded: the run loop wants a concrete watermark.
+    run_cap = max_enodes if max_enodes is not None else sys.maxsize
+
+    stats: dict[str, Any] = eg.run(
+        rules,
+        root_eid,
+        max_iterations=max_iterations,
+        max_nodes=run_cap,
+        rule_budgets=rule_budgets,
+    )
+    _check_resources(eg, max_enodes, max_memory_mb)
+
+    groups = _pairing_and_lifts(
+        eg,
+        rules,
+        root_eid,
+        stats,
+        run_cap,
+        rule_budgets,
+        max_enodes,
+        max_memory_mb,
+        source_tensors,
+    )
+
+    stats["rule_fires"] = dict(eg.rule_fires)
+    stats["criteria"] = criteria_used
+    if fusion_epsilon:
+        stats["fusion_epsilon"] = fusion_epsilon
+    if verbose:
+        print(f"  E-graph: {stats}")
+
+    # -- Extract best term -----------------------------------------------
+    best_term = _select_best_term(
+        eg,
+        root_eid,
+        cost_fn,
+        stats,
+        groups=groups,
+        fusion_epsilon=fusion_epsilon,
+        delivers_compiled=delivers_compiled,
+        specialize_causal=specialize_causal,
+        fold_ops=(
+            capabilities.ops if capabilities is not None else None
         ),
-        "stats": stats,
-        "ir": ir,
-        "eg": eg,
-        "root_eid": root_eid,
-        "source_tensors": source_tensors,
-    }
+        source_tensors=source_tensors,
+    )
+
+    if verbose:
+        print(f"  Best term: {op_repr(best_term)}")
+        print(f"  Cost: {cost_fn(best_term):.2f} FLOPs (est.)")
+
+    # Final watermark before the lower phase materialises parameters —
+    # the phase that turns graph choices into real tensor bytes.
+    _check_resources(eg, max_enodes, max_memory_mb)
+
+    return SearchResult(
+        ir=ir,
+        eg=eg,
+        root_eid=root_eid,
+        term=best_term,
+        param_values=source_tensors,
+        stats=stats,
+        cost_fn=cost_fn,
+        source=source,
+        model=model,
+    )
+
+
+@_oom_to_resource_error
+def lower(
+    result: SearchResult,
+    x: Any,
+    *,
+    sink: Sink,
+    runner: Runner | None = None,
+    verify: bool = True,
+    rtol: float = 1e-4,
+    atol: float | None = None,
+    verbose: bool = False,
+) -> LowerResult:
+    """Run the lower phase: ``SearchResult -> LowerResult``.
+
+    Executor routing (``_lower_extracted``): a carrier-apply root goes
+    to its level-batched executor, everything else to ``sink.lower``.
+    The delivery runner then decides HOW the routed executor ships —
+    identity (``IdentityRunner`` — the default), ``torch.compile``
+    (``TorchCompileRunner``), CUDA-graph capture
+    (``CudaGraphRunner``), or a ``ChainedRunner`` composition.
+    ``stats`` is a FRESH dict — the search record plus the lowering
+    keys; :attr:`SearchResult.stats` is never mutated — so one search
+    can feed many deliveries.
+
+    Parameters
+    ----------
+    result : SearchResult
+        What :func:`search` (or ``Optimizer.search``) produced.
+    x
+        The example input — the runner needs it (``torch.compile``
+        probes, CUDA-graph capture) and ``sink.verify`` runs on it.
+    sink : Sink
+        The graph-sink port — REQUIRED.  There is no assumed backend.
+    runner : Runner, optional
+        The delivery transform; ``None`` ships as lowered.
+    verify : bool, default True
+        Run the sink's equivalence gate.  The reference is a fresh
+        lowering of ``result.ir`` — the un-optimized program the
+        search exported — via ``sink.lower``: the verify contract is
+        "the delivery preserves the IR the search certified", stated
+        in the sink's own runtime so a non-torch backend works
+        unchanged.  The report lands in ``LowerResult.verified``.
+    rtol, atol
+        The equivalence tolerances, forwarded to ``sink.verify``.
+    verbose : bool
+        Print progress.
+
+    """
+    if runner is None:
+        runner = IdentityRunner()
+    stats: dict[str, Any] = dict(result.stats)
+    if verbose:
+        print("[Phase 3] Lowering optimized IR to torch module...")
+    params = dict(result.param_values)
+    optimized_ir = IR(
+        root=result.term,
+        inputs=result.ir.inputs,
+        input_names=result.ir.input_names,
+        params=result.ir.params,
+    )
+    optimized_module = _lower_extracted(
+        result.term, optimized_ir, params, sink
+    )
+    stats["lowering"] = (
+        "batched"
+        if getattr(optimized_module, "is_batched", False)
+        else "generic"
+    )
+    # Delivery: the runner decides how the routed executor ships.
+    # stats["runner"] records the name (member-name list for a chain);
+    # runners write their own outcome keys (stats["compiled"],
+    # stats["cuda_graph"]).
+    runner_names = getattr(runner, "names", None)
+    stats["runner"] = (
+        list(runner_names)
+        if runner_names is not None
+        else getattr(runner, "name", type(runner).__name__)
+    )
+    optimized_module = runner.apply(optimized_module, x, stats)
+
+    # Verify semantic equivalence — the delivered module against the
+    # un-optimized IR lowered by the same sink (backend-neutral: the
+    # reference is a runnable in the sink's runtime, which the
+    # source-side model need not be).
+    verified = None
+    if verify:
+        if verbose:
+            print("[Verify] Checking output equivalence...")
+        ref = sink.lower(result.ir, params)
+        verified = sink.verify(
+            ref, optimized_module, x, rtol=rtol, atol=atol
+        )
+        if verbose:
+            print(f"  Max abs diff:  {verified.max_abs:.6e}")
+            print(f"  Max rel diff:  {verified.max_rel:.6e}")
+            if verified.passed:
+                print("  ✓ Semantically equivalent (within tolerance)")
+            else:
+                print("  ✗ WARNING: large difference detected!")
+
+    return LowerResult(
+        module=optimized_module, stats=stats, verified=verified
+    )
+
+
+# ---------------------------------------------------------------------------
+#  The strategy seam — Optimizer + Monolithic / Compositional / Autotuned
+# ---------------------------------------------------------------------------
+
+#: Keyword names each phase verb accepts — ``Monolithic`` partitions
+#: ``optimize(..., **kw)`` between them (``verbose`` reaches both).
+_SEARCH_KW = frozenset(inspect.signature(search).parameters) - {
+    "model",
+    "x",
+    "source",
+}
+_LOWER_KW = frozenset(inspect.signature(lower).parameters) - {
+    "result",
+    "x",
+    "sink",
+}
+
+
+class Monolithic:
+    """The default strategy: ``lower ∘ search`` in one pass.
+
+    One whole-model search, one delivery — what ``optimize_model``
+    always did.  ``optimize(..., **kw)`` keywords partition by phase:
+    search knobs (``ruleset``, ``max_iterations``, ``max_enodes``,
+    ``cost_fn``, ``symmetry_budget``, ``specialize_causal``,
+    ``fusion_epsilon``, ``delivers_compiled``, ``capabilities``,
+    ``criteria``) reach the optimizer's ``.search``; lower knobs
+    (``runner``, ``verify``, ``rtol``, ``atol``) reach ``.lower``;
+    ``verbose`` reaches both.  Unknown names raise ``TypeError``.
+    """
+
+    name = "monolithic"
+
+    def run(
+        self, model: Any, x: Any, *, optimizer: Any, **kw: Any
+    ) -> LowerResult:
+        """Run search, then lower — the single-shot pipeline."""
+        unknown = sorted(set(kw) - _SEARCH_KW - _LOWER_KW)
+        if unknown:
+            raise TypeError(
+                f"optimize() got unexpected keywords: {unknown}"
+            )
+        s_kw = {k: v for k, v in kw.items() if k in _SEARCH_KW}
+        l_kw = {k: v for k, v in kw.items() if k in _LOWER_KW}
+        # A runner chosen at call time also hints the search: the
+        # carrier upgrade prices delivered cost under the
+        # fusion-region model when the delivery will be compiled.
+        runner = l_kw.get("runner")
+        if runner is not None:
+            s_kw.setdefault(
+                "delivers_compiled",
+                bool(getattr(runner, "delivers_compiled", False)),
+            )
+        result = optimizer.search(model, x, **s_kw)
+        return optimizer.lower(result, x, **l_kw)
+
+
+class Compositional:
+    """Per-block search+lower, then recompose — still torch-coupled.
+
+    The strategy view of :func:`optimize_compositional`: walks the
+    module tree, optimizes each selected block on its captured input,
+    runs the pairwise cross-block pass and grafts the results into a
+    parameter-sharing clone.  (The block walk is backend-native —
+    plan 0007's ``Composer`` abstracts it; until then this strategy
+    needs torch modules.)
+
+    ``block_pred`` / ``verify_tol`` / ``max_cross_pairs`` are strategy
+    configuration; the per-block search knobs (``ruleset``,
+    ``max_iterations``, ``cost_fn``, ``max_enodes``, ``max_memory_mb``,
+    ``verbose``) ride in ``**kw``.
+    """
+
+    name = "compositional"
+
+    def __init__(
+        self,
+        *,
+        block_pred: Callable | None = None,
+        verify_tol: float = 1e-4,
+        max_cross_pairs: int = 8,
+    ) -> None:
+        """Store the strategy configuration."""
+        self.block_pred = block_pred
+        self.verify_tol = verify_tol
+        self.max_cross_pairs = max_cross_pairs
+
+    def run(
+        self, model: Any, x: Any, *, optimizer: Any, **kw: Any
+    ) -> LowerResult:
+        """Run the per-block pipeline through the optimizer's ports."""
+        mod, stats = _optimize_compositional(
+            model,
+            x,
+            source=optimizer.source,
+            sink=optimizer.sink,
+            block_pred=self.block_pred,
+            verify_tol=self.verify_tol,
+            max_cross_pairs=self.max_cross_pairs,
+            **kw,
+        )
+        return LowerResult(module=mod, stats=stats)
+
+
+class Autotuned:
+    """Measured autotune: one search, N verified timed deliveries.
+
+    The strategy view of :func:`optimize_model_autotuned` — re-lowers
+    the extracted term through each candidate lowering path, verifies
+    every candidate against the model, times the survivors on the real
+    input and ships the measured winner.  Still torch-coupled
+    (``torch.compile`` / CUDA-graph candidates and wall-clock timing);
+    plan 0007's ``Meter`` abstracts it.
+
+    ``candidates`` are names in
+    :data:`catopt_optimize.autotune.CANDIDATE_BUILDERS`
+    (``"generic"``, ``"batched"``, ``"torch_compile"``,
+    ``"torch_compile_generic"``, ``"cuda_graph"``, ``"eager"``) or
+    ``(name, builder)`` tuples; the remaining fields are the timing /
+    budget / verify knobs.  ``optimize`` kwargs (``ruleset``,
+    ``max_iterations``, ``ops``, ``runner``, …) forward to the
+    underlying :func:`optimize_model` call; an explicit ``verbose=``
+    keyword overrides the strategy field.
+    """
+
+    name = "autotuned"
+
+    def __init__(
+        self,
+        candidates: Any = ("generic", "batched", "torch_compile"),
+        *,
+        budget_s: float | None = None,
+        n_calls: int = 30,
+        warmup: int = 5,
+        rtol: float = 1e-4,
+        atol: float | None = None,
+        profile: Any = None,
+        verbose: bool = False,
+    ) -> None:
+        """Store the autotune configuration."""
+        self.candidates = candidates
+        self.budget_s = budget_s
+        self.n_calls = n_calls
+        self.warmup = warmup
+        self.rtol = rtol
+        self.atol = atol
+        self.profile = profile
+        self.verbose = verbose
+
+    def run(
+        self, model: Any, x: Any, *, optimizer: Any, **kw: Any
+    ) -> LowerResult:
+        """Search once via the ports, then time each candidate."""
+        # Local import: autotune imports this module at top level, so
+        # the reverse edge must defer to call time (the same pattern
+        # runners.runner_candidate documents).
+        from catopt_optimize.autotune import _autotuned_impl
+
+        mod, stats = _autotuned_impl(
+            model,
+            x,
+            candidates=self.candidates,
+            budget_s=self.budget_s,
+            n_calls=self.n_calls,
+            warmup=self.warmup,
+            rtol=self.rtol,
+            atol=self.atol,
+            source=optimizer.source,
+            sink=optimizer.sink,
+            profile=self.profile,
+            verbose=kw.pop("verbose", self.verbose),
+            **kw,
+        )
+        return LowerResult(module=mod, stats=stats)
+
+
+@dataclass
+class Optimizer:
+    """The configured entry point — explicit ports, no assumed backend.
+
+    ``source`` / ``sink`` are REQUIRED: they are the ports the
+    pipeline runs through — ``catopt_torch.adapters.TorchSource`` /
+    ``TorchSink`` are one implementation, and choosing torch means
+    importing ``catopt_torch``, never a default here.  ``criteria`` is
+    the default selection blend; ``runner`` the default delivery
+    (``IdentityRunner`` — the no-op, backend-neutral shipping step).
+
+    The phase verbs mirror the module-level functions with the
+    optimizer's ports wired in; ``optimize`` composes them through a
+    :class:`~catopt_core.ports.Strategy`::
+
+        opt = Optimizer(source=TorchSource(), sink=TorchSink())
+        mod, stats = opt.optimize(model, x)
+        res = opt.search(model, x)          # the inspectable mid-state
+        fast = opt.lower(res, x, runner=TorchCompileRunner())
+
+    """
+
+    source: Source
+    sink: Sink
+    criteria: (
+        dict[str, float] | Criteria | Criterion | list | tuple | None
+    ) = None
+    runner: Runner = field(default_factory=IdentityRunner)
+
+    def search(self, model: Any, x: Any, **kw: Any) -> SearchResult:
+        """Run :func:`search` through this optimizer's ports.
+
+        ``capabilities`` defaults to the sink (a ``Sink`` is a
+        ``Capabilities``); ``criteria`` to the configured blend;
+        ``delivers_compiled`` to the runner's marker.  Keyword
+        arguments override each default outright.
+        """
+        kw.setdefault("source", self.source)
+        kw.setdefault("capabilities", self.sink)
+        kw.setdefault("criteria", self.criteria)
+        kw.setdefault(
+            "delivers_compiled",
+            bool(getattr(self.runner, "delivers_compiled", False)),
+        )
+        return _search(model, x, **kw)
+
+    def lower(
+        self, result: SearchResult, x: Any, **kw: Any
+    ) -> LowerResult:
+        """Run :func:`lower` through this optimizer's sink.
+
+        ``runner=None`` means the configured default, not the
+        identity — pass ``runner=IdentityRunner()`` explicitly to
+        override a configured delivery.
+        """
+        kw.setdefault("sink", self.sink)
+        if kw.get("runner") is None:
+            kw["runner"] = self.runner
+        return _lower(result, x, **kw)
+
+    def optimize(
+        self,
+        model: Any,
+        x: Any,
+        *,
+        strategy: Strategy | None = None,
+        **kw: Any,
+    ) -> LowerResult:
+        """Run *strategy* (default :class:`Monolithic`) end to end.
+
+        The result unpacks as ``(module, stats)`` — ``mod, stats =
+        opt.optimize(model, x)`` mirrors the historical tuple.
+        """
+        strat = strategy if strategy is not None else Monolithic()
+        return strat.run(model, x, optimizer=self, **kw)
+
+    def discover(self, model: Any, x: Any, **kw: Any) -> SearchResult:
+        """Run the discovery view — :func:`search` with frontier defaults.
+
+        ``ruleset="categorical"`` / ``max_iterations=6`` unless the
+        caller says otherwise; the :class:`SearchResult` carries the
+        whole inspectable mid-state (``.alternatives()`` /
+        ``.certificate()`` / ``.eg`` / ``.stats``).
+        """
+        kw.setdefault("ruleset", "categorical")
+        kw.setdefault("max_iterations", 6)
+        return self.search(model, x, **kw)
+
+
+# ---------------------------------------------------------------------------
+#  Compatibility wrappers — the historical entry points (retire in 0008)
+# ---------------------------------------------------------------------------
+
+
+#: The verbs bound to module level — ``Optimizer``'s methods alias the
+#: module functions so the method bodies can't be shadowed by the
+#: same-named methods.
+_search = search
+_lower = lower
 
 
 @_oom_to_resource_error
@@ -580,7 +1278,14 @@ def optimize_model(
     runner: Runner | None = None,
     verbose: bool = True,
 ) -> tuple[Executor, dict[str, Any]]:
-    """End-to-end categorical optimization of a PyTorch model.
+    """End-to-end categorical optimization — the legacy entry point.
+
+    A one-line wrapper (plan 0006): it resolves the historical
+    ``source``/``sink``/``ops``/``runner`` defaults — torch IS the
+    default here, that is what the compat name always meant — then
+    runs ``Optimizer(...).optimize(...)``, i.e.
+    :func:`lower` ∘ :func:`search`.  New code should use the verbs
+    (or :class:`Optimizer`) directly; this name retires in 0008.
 
     Parameters
     ----------
@@ -632,9 +1337,9 @@ def optimize_model(
         :func:`catopt_core.cost.fusion_member_key` (predicted kernel
         count, then root fusibility) instead of structural size.
         Arm it when the delivered module will be ``torch.compile``d
-        (``CompiledRunner`` / autotune's ``"compiled"`` candidate —
-        ``0.05`` is the validated band); ``0`` disables and selection
-        is byte-identical to before.
+        (``TorchCompileRunner`` / autotune's ``"torch_compile"``
+        candidate — ``0.05`` is the validated band); ``0`` disables
+        and selection is byte-identical to before.
     symmetry_budget : int, optional
         Per-rule enode budget for the expansive rules in
         ``_EXPANSIVE_RULES`` (monoid symmetries and scale hoists) —
@@ -666,20 +1371,21 @@ def optimize_model(
     runner : Runner, optional
         Delivery-stage object deciding HOW the lowered executor is
         executed — see :mod:`catopt_optimize.runners`
-        (:class:`GenericRunner` identity, :class:`CompiledRunner`
+        (:class:`IdentityRunner` identity, :class:`TorchCompileRunner`
         ``torch.compile``, :class:`CudaGraphRunner` CUDA-graph
         capture, :class:`ChainedRunner` left-to-right composition —
-        e.g. ``ChainedRunner([CompiledRunner(), CudaGraphRunner()])``
+        e.g. ``ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])``
         compiles first, then defers capture to the compile's
         outcome).  Applied once to the routed executor;
         ``stats["runner"]`` records its name (a list of member names
         for a chain) and the runner writes its own outcome keys
         (``stats["compiled"]``, ``stats["cuda_graph"]``).  ``None``
-        delivers the module as lowered (:class:`GenericRunner`).
+        delivers the module as lowered (:class:`IdentityRunner`).
         Duck-typed — any object with ``name`` and
         ``apply(module, example_input, stats)`` conforms.
     verbose : bool
-        Print progress.
+        Print progress.  Also gates the equivalence check, exactly as
+        before — the wrapper verifies iff ``verbose``.
 
     Returns
     -------
@@ -698,257 +1404,75 @@ def optimize_model(
         ``reason == "resource_limit"``).
 
     """
-    if source is None:
-        source = TorchSource()
-    if sink is None:
-        sink = TorchSink(ops=ops)
-    if cost_fn is None:
-        cost_fn = (
-            criteria_cost(criteria)
-            if criteria is not None
-            else _default_cost_fn()
-        )
-    # Criteria-based selection reports the normalised blend actually
-    # priced (the marker criteria_cost sets) — read before the
-    # backend_cost wrap, which propagates only the billing markers.
-    criteria_used = getattr(cost_fn, "criteria", None)
-    # Backend-relative pricing: members using an op the sink cannot
-    # lower price at +inf, so extraction never commits to one.
-    cost_fn = backend_cost(cost_fn, sink.supported_ops)
-
-    # Delivery runner — the only execution control: None ships the
-    # routed executor as lowered (GenericRunner).
-    if runner is None:
-        runner = GenericRunner()
-
-    # Recursive walks (extraction, member resolution) descend the
-    # e-class DAG, whose depth grows with the saturation closure —
-    # thousands of levels on deep stacks.
-    if sys.getrecursionlimit() < 40_000:
-        sys.setrecursionlimit(40_000)
-
-    # -- Phase 1: Export to IR -------------------------------------------
-    if verbose:
-        print(
-            f"[Phase 1] Exporting {model.__class__.__name__} to IR..."
-        )
-    ir, source_tensors = source.to_ir(model, example_input)
-    if verbose:
-        print(f"  IR root: {op_repr(ir.root)}")
-        print(f"  Inputs:  {[str(v) for v in ir.inputs]}")
-        print(f"  Params:  {list(ir.params.keys())}")
-
-    # -- Phase 2: Build e-graph and saturate -----------------------------
-    if verbose:
-        print(
-            "[Phase 2] Building e-graph and running equality saturation..."
-        )
-    eg = EGraph()
-    root_eid = eg.add_term(ir.root)
-
-    # Choose rules.  The term-local fusion rules (swiglu_fuse, qkv_fuse,
-    # parallel_mul_fuse, qkv_fuse_asym) are special cases of the product
-    # law; in the pipeline they are SUBSUMED by the non-local
-    # pair_shared_input_linears pass, which needs no consumer pattern.
-    # Keeping them would let extraction pick consumer-level chunk
-    # alternatives that bypass the globally-coordinated split choice.
-    _SUBSUMED = {
-        "swiglu_fuse",
-        "parallel_mul_fuse",
-        "qkv_fuse",
-        "qkv_fuse_asym",
-    }
-    if ruleset == "all":
-        rules = [r for r in all_rules() if r.name not in _SUBSUMED]
-    elif ruleset == "all+layout":
-        rules = [
-            r
-            for r in ALL_RULES_WITH_LAYOUT
-            if r.name not in _SUBSUMED
-        ]
-    elif ruleset == "simpl":
-        rules = SIMPLIFICATION_RULES
-    elif ruleset == "categorical":
-        rules = [
-            r for r in CATEGORICAL_RULES if r.name not in _SUBSUMED
-        ]
-    else:
-        raise ValueError(f"Unknown ruleset: {ruleset}")
-
-    if verbose:
-        print(f"  Rules: {[r.name for r in rules]}")
-
-    # Bounded-saturation budget for the expansive rules (see
-    # ``_EXPANSIVE_RULES``); enforced inside the matcher so a giant
-    # e-class cannot spend the whole budget in one enumeration.
-    rule_budgets = (
-        {n: symmetry_budget for n in _EXPANSIVE_RULES}
-        if symmetry_budget is not None
-        else None
-    )
-    # ``None`` = unbounded: the run loop wants a concrete watermark.
-    run_cap = max_enodes if max_enodes is not None else sys.maxsize
-
-    stats: dict[str, Any] = eg.run(
-        rules,
-        root_eid,
+    lr = Optimizer(
+        source=source if source is not None else TorchSource(),
+        sink=sink if sink is not None else TorchSink(ops=ops),
+        criteria=criteria,
+        runner=runner if runner is not None else IdentityRunner(),
+    ).optimize(
+        model,
+        example_input,
+        ruleset=ruleset,
         max_iterations=max_iterations,
-        max_nodes=run_cap,
-        rule_budgets=rule_budgets,
+        max_enodes=max_enodes,
+        max_memory_mb=max_memory_mb,
+        cost_fn=cost_fn,
+        fusion_epsilon=fusion_epsilon,
+        symmetry_budget=symmetry_budget,
+        verify=verbose,
+        verbose=verbose,
     )
-    _check_resources(eg, max_enodes, max_memory_mb)
+    return cast(torch.nn.Module, lr.module), lr.stats
 
-    # Diagram-level product law: pair every linear sharing an input into
-    # one GEMM + split views.  Non-local — no consumer pattern needed.
-    groups = pair_shared_input_linears(eg) + pair_shared_input_convs(eg)
-    if groups:
-        eg.rebuild()
-        _check_resources(eg, max_enodes, max_memory_mb)
-        stats["pairing_groups"] = len(groups)
-        # brief second saturation so other rules see the new enodes
-        eg.run(
-            rules,
-            root_eid,
-            max_iterations=5,
-            max_nodes=run_cap,
-            rule_budgets=rule_budgets,
-        )
-        _check_resources(eg, max_enodes, max_memory_mb)
 
-    # Non-local lifts: unrolled recurrences -> trace(F), stacks of
-    # same-state carrier applications -> one application, whole om
-    # trees over scanned values -> the deferred omd carrier, and exact
-    # weight tying (duplicate Param leaves share one class).
-    # All witnessed so certificates stay replayable.
-    lifts = (
-        lift_scan_to_applyd(eg)
-        + lift_scan_to_trace(eg)
-        + gather_applyd_stack(eg)
-        + gather_apply_stack(eg)
-        + omd_tree_lift(eg)
-        + share_duplicate_params(eg, source_tensors)
-        + share_duplicate_param_slices(eg, source_tensors)
-    )
-    if lifts:
-        eg.rebuild()
-        _check_resources(eg, max_enodes, max_memory_mb)
-        stats["nonlocal_lifts"] = len(lifts)
-        eg.run(
-            rules,
-            root_eid,
-            max_iterations=5,
-            max_nodes=run_cap,
-            rule_budgets=rule_budgets,
-        )
-        _check_resources(eg, max_enodes, max_memory_mb)
+def discover_alternatives(
+    model: Any,
+    x: Any,
+    *,
+    source: Source,
+    capabilities: Capabilities | None = None,
+    ruleset: str = "categorical",
+    max_iterations: int = 6,
+    cost_fn: CostFn | None = None,
+) -> SearchResult:
+    """Enumerate the frontier — return the :class:`SearchResult`.
 
-    stats["rule_fires"] = dict(eg.rule_fires)
-    stats["criteria"] = criteria_used
-    if fusion_epsilon:
-        stats["fusion_epsilon"] = fusion_epsilon
-    if verbose:
-        print(f"  E-graph: {stats}")
+    The discovery-engine view: the same export → e-graph → saturation
+    → pairing pipeline as :func:`search` with frontier-oriented
+    defaults (``ruleset="categorical"``, ``max_iterations=6``) — and
+    the result is the inspectable mid-state, not a fixed report:
 
-    # -- Extract best term -----------------------------------------------
-    best_term = eg.extract_best(
-        root_eid, cost_fn, fusion_epsilon=fusion_epsilon
-    )
-    if groups:
-        # Coordinated extraction: force every paired member to its split
-        # enode AND steer consumers through the shared GEMM.  Compare
-        # true DAG costs — forcing loses if a group is only partially
-        # reachable or a bypassing alternative was already cheaper.
-        # One shared memo across both calls: a forced term shares most
-        # subterms with the best term, and the baseline price is
-        # computed once, not per candidate.
-        _dc_memo: dict = {}
-        _best_dag = dag_cost(best_term, cost_fn, memo=_dc_memo)
-        forced = eg.extract_paired(root_eid, cost_fn, groups)
-        # Honest-decline bookkeeping: an un-extractable forced term
-        # prices at +inf, so the same comparison decides and the
-        # stats record the verdict with the cost delta.
-        _forced_dag = (
-            dag_cost(forced, cost_fn, memo=_dc_memo)
-            if forced is not None
-            else float("inf")
-        )
-        if _forced_dag <= _best_dag:
-            best_term = forced
-            stats["paired_extract"] = True
-        else:
-            stats["paired_extract"] = False
-            stats["paired_delta"] = _forced_dag - _best_dag
-    # Coordinated carrier selection: a batched-executor win is a
-    # whole-spine property the additive extraction can't price.
-    best_term = _carrier_upgrade(
-        eg,
-        root_eid,
-        best_term,
-        cost_fn,
-        compiled=bool(getattr(runner, "delivers_compiled", False)),
-    )
-    # Causal specialization: a param-only attn_mask that evaluates to a
-    # lower-triangular keep-mask is is_causal=True — no mask op at all.
-    _cm: dict = {}
-    best_term = _specialize_causal(
-        best_term, source_tensors, _cm, ops=sink.ops
-    )
-    if _cm.get("_hit"):
-        stats["causal_specialized"] = True
+    * ``res.alternatives(top_k)`` — the top-k cheapest distinct
+      members of the root class under the result's pricing
+      (``cost_fn`` — or its default — is backend-relative when
+      ``capabilities`` is given, so the frontier only lists forms the
+      backend can lower);
+    * ``res.eg.diverse_classes()`` — the e-classes holding
+      structurally distinct equivalent terms, where emergent
+      compositions hide;
+    * ``res.stats["rule_fires"]`` — the provenance: which generic
+      laws actually fired;
+    * ``res.term`` / ``res.eg`` / ``res.stats`` — the extraction and
+      its record.
 
-    if verbose:
-        print(f"  Best term: {op_repr(best_term)}")
-        print(f"  Cost: {cost_fn(best_term):.2f} FLOPs (est.)")
+    Human inspection of this frontier is how level-3 candidates —
+    emergent compositions of known laws — are found.  ``source`` is
+    required (no assumed frontend); ``capabilities`` supplies
+    backend-relative pricing and the const-fold registry.
 
-    # -- Phase 3: Lower back to torch -----------------------------------
-    # Final watermark before materialising the lowered parameters —
-    # the phase that turns graph choices into real tensor bytes.
-    _check_resources(eg, max_enodes, max_memory_mb)
-    if verbose:
-        print("[Phase 3] Lowering optimized IR to torch module...")
-    optimized_ir = IR(
-        root=best_term,
-        inputs=ir.inputs,
-        input_names=ir.input_names,
-        params=ir.params,
+    Ruleset names follow the pipeline's selection
+    (:func:`_ruleset_rules`) — ``"all"`` drops the pairing-subsumed
+    fusion rules here too.
+    """
+    return search(
+        model,
+        x,
+        source=source,
+        capabilities=capabilities,
+        cost_fn=cost_fn,
+        ruleset=ruleset,
+        max_iterations=max_iterations,
     )
-    optimized_module = _lower_extracted(
-        best_term, optimized_ir, source_tensors, sink
-    )
-    stats["lowering"] = (
-        "batched"
-        if getattr(optimized_module, "is_batched", False)
-        else "generic"
-    )
-    # Delivery: the runner decides how the routed executor ships —
-    # identity (generic), torch.compile, CUDA-graph capture, or a
-    # left-to-right composition.  stats["runner"] records the name
-    # (member-name list for a chain); runners write their own outcome
-    # keys (stats["compiled"], stats["cuda_graph"]).
-    runner_names = getattr(runner, "names", None)
-    stats["runner"] = (
-        list(runner_names)
-        if runner_names is not None
-        else getattr(runner, "name", type(runner).__name__)
-    )
-    optimized_module = runner.apply(
-        optimized_module, example_input, stats
-    )
-
-    # Verify semantic equivalence
-    if verbose:
-        print("[Verify] Checking output equivalence...")
-        vr = sink.verify(
-            model, optimized_module, example_input, rtol=1e-4
-        )
-        print(f"  Max abs diff:  {vr.max_abs:.6e}")
-        print(f"  Max rel diff:  {vr.max_rel:.6e}")
-        if vr.passed:
-            print("  ✓ Semantically equivalent (within tolerance)")
-        else:
-            print("  ✗ WARNING: large difference detected!")
-
-    return optimized_module, stats
 
 
 def param_report(
@@ -1542,7 +2066,8 @@ def _cross_pair_pass(
     max_memory_mb: float | None,
     cost_fn: CostFn,
     verify_tol: float,
-    ops: OpTable | None,
+    source: Source,
+    sink: Sink,
     max_cross_pairs: int,
     verbose: bool,
 ) -> dict[str, dict[str, Any]]:
@@ -1615,7 +2140,8 @@ def _cross_pair_pass(
                 max_enodes=max_enodes,
                 max_memory_mb=max_memory_mb,
                 cost_fn=cost_fn,
-                ops=ops,
+                source=source,
+                sink=sink,
                 symmetry_budget=_CROSS_PAIR_SYMMETRY_BUDGET,
                 verbose=verbose,
             )
@@ -1698,10 +2224,12 @@ def _cross_pair_pass(
     return reports
 
 
-def optimize_compositional(
+def _optimize_compositional(
     model: torch.nn.Module,
     example_input: torch.Tensor | tuple,
     *,
+    source: Source,
+    sink: Sink,
     block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool]
     | None = None,
     cost_fn: CostFn | None = None,
@@ -1710,7 +2238,6 @@ def optimize_compositional(
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
     verify_tol: float = 1e-4,
-    ops: OpTable | None = None,
     max_cross_pairs: int = 8,
     verbose: bool = True,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
@@ -1813,7 +2340,8 @@ def optimize_compositional(
                 max_enodes=max_enodes,
                 max_memory_mb=max_memory_mb,
                 cost_fn=cost_fn,
-                ops=ops,
+                source=source,
+                sink=sink,
                 verbose=verbose,
             )
             # Per-block verification on the captured input — soundness
@@ -1878,7 +2406,8 @@ def optimize_compositional(
             max_memory_mb=max_memory_mb,
             cost_fn=cost_fn,
             verify_tol=verify_tol,
-            ops=ops,
+            source=source,
+            sink=sink,
             max_cross_pairs=max_cross_pairs,
             verbose=verbose,
         )
@@ -1966,3 +2495,87 @@ def optimize_compositional(
 
     report.wall_time_s = time.time() - t_start
     return new_model, report.to_dict()
+
+
+def optimize_compositional(
+    model: torch.nn.Module,
+    example_input: torch.Tensor | tuple,
+    *,
+    block_pred: Callable[[torch.nn.Module, str, torch.nn.Module], bool]
+    | None = None,
+    cost_fn: CostFn | None = None,
+    ruleset: str = "all",
+    max_iterations: int = 100,
+    max_enodes: int | None = 100_000,
+    max_memory_mb: float | None = None,
+    verify_tol: float = 1e-4,
+    ops: OpTable | None = None,
+    max_cross_pairs: int = 8,
+    source: Source | None = None,
+    sink: Sink | None = None,
+    verbose: bool = True,
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Optimize a stacked/multi-block model one block at a time.
+
+    A compatibility wrapper (plan 0006): resolves the historical
+    ``source``/``sink``/``ops`` defaults — torch IS the default here —
+    then runs ``Optimizer(...).optimize(..., strategy=Compositional(...))``.
+    The pipeline is :func:`_optimize_compositional`; the signature is
+    unchanged plus the (additive) ``source``/``sink`` ports it now
+    threads into every per-block :func:`optimize_model` call.
+
+    1. walks the module tree and selects *blocks* — leaf submodules, plus
+       any child where ``block_pred(parent, name, child)`` holds
+       (default: children of ``nn.ModuleList``/``nn.Sequential``),
+    2. runs the ORIGINAL model once with forward hooks to capture each
+       block's real input (a block's input is not the model input),
+    3. runs :func:`optimize_model` on each block with its captured input,
+       verifying the lowered block against the original on that input —
+       a block that fails to export, saturate, lower, or verify keeps its
+       original implementation; a block that crosses a resource bound
+       (``max_enodes``, ``max_memory_mb``, or a caught OOM) fails with
+       ``reason == "resource_limit"``,
+    4. runs the pairwise cross-block pass (:func:`_cross_pair_pass`):
+       for each *adjacent* pair whose boundary is a simple value flow
+       (B's input IS A's output, or the ``x + A(x)`` residual), build
+       the joint micro-model, optimize it with :func:`optimize_model`,
+       verify it against the eager pair, and graft it in place of both
+       blocks when it is verified AND cheaper than the separate results
+       — capped at ``max_cross_pairs`` joint runs (``0`` disables),
+    5. clones the model — structure deep-copied, parameter/buffer
+       tensors *shared* with the original (``_shared_param_clone``; no
+       second copy of the weights, so recompose does not double device
+       memory) — and grafts the optimized ``IRModule`` back in place,
+       preserving the original forward structure, then verifies
+       end-to-end equivalence on ``example_input``.
+
+    Returns ``(recomposed_module, stats)`` where ``stats["blocks"]`` maps
+    each block's dotted name to ``{"status", "stats", "param_report",
+    "time_s", ...}`` and ``stats["param_report"]`` aggregates the
+    per-block parameter diffs (eliminated/derived names are prefixed by
+    block name for auditability).  ``stats["cross_pairs"]`` maps each
+    attempted pair ``"a+b"`` to ``{"status", "boundary", ...}`` —
+    ``"grafted"`` / ``"declined"`` / ``"skipped"``.  ``stats["shared_
+    params"]`` is True when the recomposed module shares the original's
+    tensor storage (the normal path); ``stats["in_place"]`` True means
+    cloning failed and the input module was returned unmodified.
+    """
+    lr = Optimizer(
+        source=source if source is not None else TorchSource(),
+        sink=sink if sink is not None else TorchSink(ops=ops),
+    ).optimize(
+        model,
+        example_input,
+        strategy=Compositional(
+            block_pred=block_pred,
+            verify_tol=verify_tol,
+            max_cross_pairs=max_cross_pairs,
+        ),
+        cost_fn=cost_fn,
+        ruleset=ruleset,
+        max_iterations=max_iterations,
+        max_enodes=max_enodes,
+        max_memory_mb=max_memory_mb,
+        verbose=verbose,
+    )
+    return cast(torch.nn.Module, lr.module), lr.stats

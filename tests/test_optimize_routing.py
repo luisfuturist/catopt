@@ -9,15 +9,14 @@ cost is blind to the lowering (``bench/cost_fidelity.py``).
 
 import pytest
 import torch
-
 from catopt.cost import flops_cost
 from catopt.ir import IR, Op, Param, TensorType, Var
 from catopt.torch_bridge import ir_to_torch_module
 from catopt_optimize.optimize import _lower_extracted
 from catopt_optimize.runners import (
     ChainedRunner,
-    CompiledRunner,
     CudaGraphRunner,
+    TorchCompileRunner,
 )
 from catopt_torch.adapters import TorchSink
 
@@ -142,7 +141,7 @@ def test_plain_term_routes_to_sink_lower():
 
 
 def test_optimize_model_compile_delivers_fused_module():
-    """runner=CompiledRunner() wraps the routed module in
+    """runner=TorchCompileRunner() wraps the routed module in
     torch.compile and verifies output; stats records what ran."""
     from catopt.optimize import optimize_model
 
@@ -154,7 +153,7 @@ def test_optimize_model_compile_delivers_fused_module():
     with torch.no_grad():
         ref = m(x)
         mod, stats = optimize_model(
-            m, x, verbose=False, runner=CompiledRunner()
+            m, x, verbose=False, runner=TorchCompileRunner()
         )
     assert stats["compiled"] is True
     with torch.no_grad():
@@ -179,7 +178,7 @@ def test_optimize_model_compile_failure_falls_back(monkeypatch):
 
         monkeypatch.setattr(O.torch, "compile", boom)
         mod, stats = O.optimize_model(
-            m, x, verbose=False, runner=CompiledRunner()
+            m, x, verbose=False, runner=TorchCompileRunner()
         )
     assert stats["compiled"] is False
     with torch.no_grad():
@@ -201,9 +200,8 @@ def test_delivered_cost_priced_by_executor():
 
 def test_carrier_upgrade_swaps_to_batched_member():
     """A cheaper batched applyd member replaces the additive winner."""
-    from catopt.egraph import EGraph
-    from catopt.optimize import optimize_model
     from catopt.models import LinearRecurrence
+    from catopt.optimize import optimize_model
 
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
@@ -253,12 +251,12 @@ def test_lift_scan_to_applyd_offers_carrier_member():
     without saturating the carrier laws."""
     from catopt.egraph import EGraph
     from catopt.models import LinearRecurrence
-    from catopt.torch_bridge import export_to_ir
-    from catopt_carriers.trace_lift import lift_scan_to_applyd
     from catopt.scan_lower import (
         is_scan_apply_term,
         to_batched_scan_module,
     )
+    from catopt.torch_bridge import export_to_ir
+    from catopt_carriers.trace_lift import lift_scan_to_applyd
 
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
@@ -429,7 +427,7 @@ def test_cuda_graph_runner_noop_on_cpu():
 
 
 def test_cuda_graph_skipped_when_compiled():
-    """[CompiledRunner, CudaGraphRunner]: the compiled module wins —
+    """[TorchCompileRunner, CudaGraphRunner]: the compiled module wins —
     capture is not attempted on it (no capture attr)."""
     from catopt.models import LinearRecurrence
     from catopt.optimize import optimize_model
@@ -441,7 +439,7 @@ def test_cuda_graph_skipped_when_compiled():
             m,
             x,
             verbose=False,
-            runner=ChainedRunner([CompiledRunner(), CudaGraphRunner()]),
+            runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
         )
     if stats.get("compiled"):
         assert stats.get("cuda_graph") is None

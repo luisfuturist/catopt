@@ -224,10 +224,8 @@ def test_discover_alternatives_with_custom_source_and_sink():
         model,
         x,
         source=TorchSource(),
-        sink=sink,
+        capabilities=sink,
         max_iterations=2,
-        top_k=2,
     )
-    assert isinstance(res["alternatives"], list)
-    for _cost, term in res["alternatives"]:
+    for _cost, term in res.alternatives(top_k=2):
         assert sink.supported_ops.issuperset(_ops_of(term))

@@ -8,16 +8,16 @@ is returned to the caller — wrap it in ``torch.compile``, capture it
 into a CUDA graph, compose several transforms left-to-right, or ship
 it untouched::
 
-    optimize_model(m, x, runner=CompiledRunner())
+    optimize_model(m, x, runner=TorchCompileRunner())
     optimize_model(
         m, x,
-        runner=ChainedRunner([CompiledRunner(), CudaGraphRunner()]),
+        runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
     )
 
 The ``runner`` parameter of :func:`optimize_model` is the only
 execution control — ``None`` ships the executor as lowered; pass a
 :class:`ChainedRunner` to compose deliveries (put
-:class:`CompiledRunner` before :class:`CudaGraphRunner` so the
+:class:`TorchCompileRunner` before :class:`CudaGraphRunner` so the
 compiled delivery keeps precedence and capture is skipped, the
 ordering the retired ``compile`` / ``cuda_graph`` flags had).
 
@@ -37,10 +37,10 @@ import torch
 
 __all__ = [
     "ChainedRunner",
-    "CompiledRunner",
     "CudaGraphRunner",
-    "GenericRunner",
+    "IdentityRunner",
     "Runner",
+    "TorchCompileRunner",
     "runner_candidate",
 ]
 
@@ -71,10 +71,10 @@ class Runner(Protocol):
         ...
 
 
-class GenericRunner:
+class IdentityRunner:
     """Identity runner — deliver the executor as lowered."""
 
-    name = "generic"
+    name = "identity"
 
     def apply(
         self,
@@ -86,7 +86,7 @@ class GenericRunner:
         return module
 
 
-class CompiledRunner:
+class TorchCompileRunner:
     """Wrap the delivered executor in ``torch.compile``.
 
     Compile failures surface at first call — the module is invoked
@@ -95,7 +95,7 @@ class CompiledRunner:
     ``stats["compiled"]`` records which ran.
     """
 
-    name = "compiled"
+    name = "torch_compile"
     #: Marker ``optimize_model`` reads to price the fusion-region
     #: cost model during carrier selection — a compiled delivery
     #: bills every term under ``lowering="compiled"``.
@@ -177,7 +177,7 @@ class CudaGraphRunner:
 class ChainedRunner:
     """Compose runners left-to-right — each sees the previous output.
 
-    ``ChainedRunner([CompiledRunner(), CudaGraphRunner()])`` compiles
+    ``ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])`` compiles
     first, then captures — and because :class:`CudaGraphRunner`
     defers to a successful compile, the "compiled wins" precedence
     is preserved inside the chain itself.
@@ -230,7 +230,7 @@ def runner_candidate(runner: Runner) -> Callable[[Any], Any]:
     touching its machinery: ``candidates=[("my_runner",
     runner_candidate(MyRunner()))]``.  The builder applies the
     runner to a FRESH routed executor — the same freshness rule the
-    ``compiled`` candidate documents, since ``torch.compile`` and
+    ``torch_compile`` candidate documents, since ``torch.compile`` and
     ``capture_cuda_graph`` mutate the module they wrap.  The
     runner's stats writes go to a scratch dict; per-candidate
     outcomes are recorded under ``stats["autotune"]["candidates"]``

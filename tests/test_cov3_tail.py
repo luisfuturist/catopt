@@ -260,13 +260,18 @@ def test_discover_alternatives_fires_pairing_and_lifts():
     """discover_alternatives runs the same pairing/lift pass — its
     re-saturation blocks execute when groups exist."""
     import catopt.models as M
+    from catopt.adapters import TorchSource
     from catopt.optimize import discover_alternatives
+    from catopt.pipeline import SearchResult
 
     torch.manual_seed(0)
     m = M.TransformerBlock(dim=64)
     x = torch.randn(1, 8, 64)
-    alts = discover_alternatives(m, x, max_iterations=2, top_k=4)
-    assert isinstance(alts, dict)
+    res = discover_alternatives(
+        m, x, source=TorchSource(), max_iterations=2
+    )
+    assert isinstance(res, SearchResult)
+    assert isinstance(res.alternatives(top_k=4), list)
 
 
 def test_verbose_verify_warning_arm(monkeypatch):

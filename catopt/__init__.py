@@ -47,6 +47,7 @@ _ALIAS = {
     "catopt.optimize": "catopt_optimize.optimize",
     "catopt.autotune": "catopt_optimize.autotune",
     "catopt.ports": "catopt_core.ports",
+    "catopt.pipeline": "catopt_core.pipeline",
     "catopt.regime": "catopt_optimize.regime",
     "catopt.report": "catopt_torch.report",
     "catopt.rulecache": "catopt_core.rulecache",
@@ -106,7 +107,14 @@ from catopt_core.laws import (
     SIMPLIFICATION_RULES,
     all_rules,
 )
-from catopt_core.ports import Binding, Sink, Source
+from catopt_core.pipeline import LowerResult, SearchResult
+from catopt_core.ports import (
+    Binding,
+    Capabilities,
+    Sink,
+    Source,
+    Strategy,
+)
 
 # Torch-domain re-exports stay fault-tolerant like the alias loop:
 # on a partial install ``import catopt`` still succeeds — the absent
@@ -119,6 +127,7 @@ with _suppress(ModuleNotFoundError):  # partial install only
         to_batched_omd_module,
     )
 with _suppress(ModuleNotFoundError):  # partial install only
+    from catopt_optimize.autotune import optimize_model_autotuned
     from catopt_optimize.criteria import (
         Blend,
         CompiledCriterion,
@@ -137,13 +146,23 @@ with _suppress(ModuleNotFoundError):  # partial install only
         load_optimized,
         save_optimized,
     )
-    from catopt_optimize.optimize import optimize_model
+    from catopt_optimize.optimize import (
+        Autotuned,
+        Compositional,
+        Monolithic,
+        Optimizer,
+        discover_alternatives,
+        lower,
+        optimize_compositional,
+        optimize_model,
+        search,
+    )
     from catopt_optimize.runners import (
         ChainedRunner,
-        CompiledRunner,
         CudaGraphRunner,
-        GenericRunner,
+        IdentityRunner,
         Runner,
+        TorchCompileRunner,
         runner_candidate,
     )
 with _suppress(ModuleNotFoundError):  # partial install only
@@ -163,12 +182,14 @@ __all__ = [
     "CATEGORICAL_RULES",
     "IR",
     "SIMPLIFICATION_RULES",
+    "Autotuned",
     "BatchedOmdModule",
     "Binding",
     "Blend",
+    "Capabilities",
     "ChainedRunner",
     "CompiledCriterion",
-    "CompiledRunner",
+    "Compositional",
     "Const",
     "CostModel",
     "Criteria",
@@ -179,17 +200,23 @@ __all__ = [
     "ENode",
     "ExportError",
     "FlopsCriterion",
-    "GenericRunner",
     "IRModule",
+    "IdentityRunner",
     "LatencyCriterion",
+    "LowerResult",
     "MemoryCriterion",
+    "Monolithic",
     "Op",
+    "Optimizer",
     "Param",
     "Rewrite",
     "Runner",
+    "SearchResult",
     "Sink",
     "Source",
+    "Strategy",
     "TensorType",
+    "TorchCompileRunner",
     "TorchSink",
     "TorchSource",
     "Var",
@@ -198,15 +225,20 @@ __all__ = [
     "build_omd_plan",
     "count_cost",
     "criteria_cost",
+    "discover_alternatives",
     "export_optimized",
     "export_to_ir",
     "flops_cost",
     "ir_to_torch_module",
     "is_omd_apply_term",
     "load_optimized",
+    "lower",
+    "optimize_compositional",
     "optimize_model",
+    "optimize_model_autotuned",
     "peak_bytes_cost",
     "runner_candidate",
     "save_optimized",
+    "search",
     "to_batched_omd_module",
 ]

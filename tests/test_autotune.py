@@ -246,17 +246,17 @@ def test_cuda_graph_unavailable_on_cpu():
     assert rec["status"] == "unavailable"  # CPU input
 
 
-def test_compiled_candidates_real_compile():
-    """The ``compiled`` candidates really wrap in torch.compile —
+def test_torch_compile_candidates_real_compile():
+    """The ``torch_compile`` candidates really wrap in torch.compile —
     a compile failure must surface as a recorded exclusion, never
     as a silent win."""
     torch.manual_seed(0)
     m = nn.Linear(4, 4).eval()
     x = torch.randn(2, 4)
     _mod, stats = _autotune(
-        m, x, candidates=("generic", "compiled", "compiled_generic")
+        m, x, candidates=("generic", "torch_compile", "torch_compile_generic")
     )
-    for name in ("compiled", "compiled_generic"):
+    for name in ("torch_compile", "torch_compile_generic"):
         rec = stats["autotune"]["candidates"][name]
         assert rec["status"] in (
             "timed",

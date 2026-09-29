@@ -8,7 +8,7 @@ import types
 import pytest
 import torch
 import torch.nn as nn
-
+from catopt.adapters import TorchSource
 from catopt.cost import flops_cost, launch_aware_cost
 from catopt.ir import Const, Op, Param, TensorType, Var
 from catopt.optimize import (
@@ -29,6 +29,7 @@ from catopt.optimize import (
     save_optimized_weights,
     term_cost,
 )
+from catopt.pipeline import SearchResult
 
 
 def _T(*shape):
@@ -260,23 +261,25 @@ def test_discover_alternatives():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
     res = discover_alternatives(
-        m, x, ruleset="all", max_iterations=2, top_k=4
+        m, x, source=TorchSource(), ruleset="all", max_iterations=2
     )
-    assert "alternatives" in res and "rule_fires" in res
-    assert "diverse_classes" in res and "stats" in res
-    assert isinstance(res["alternatives"], list)
+    assert isinstance(res, SearchResult)
+    assert isinstance(res.alternatives(4), list)
+    assert "rule_fires" in res.stats
+    assert isinstance(res.eg.diverse_classes(), list)
     res2 = discover_alternatives(
-        m, x, ruleset="simpl", max_iterations=2, top_k=2
+        m, x, source=TorchSource(), ruleset="simpl", max_iterations=2
     )
-    assert isinstance(res2["alternatives"], list)
+    assert isinstance(res2.alternatives(2), list)
     res3 = discover_alternatives(
         m,
         x,
+        source=TorchSource(),
         ruleset="categorical",
         max_iterations=2,
         cost_fn=launch_aware_cost,
     )
-    assert isinstance(res3["alternatives"], list)
+    assert isinstance(res3.alternatives(), list)
 
 
 # ---------------------------------------------------------------------------

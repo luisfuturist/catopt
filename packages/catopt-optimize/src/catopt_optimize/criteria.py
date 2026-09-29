@@ -262,7 +262,7 @@ class DepthCriterion(_Composable):
 class CompiledCriterion(_Composable):
     """Inductor-style fusion-region pricing (:func:`fused_cost_for`).
 
-    The axis that sees what ``runner=CompiledRunner()`` buys.  A
+    The axis that sees what ``runner=TorchCompileRunner()`` buys.  A
     whole-DAG region partition: non-additive inside extraction;
     prefer it for frontier reporting or small blend weights.
     """

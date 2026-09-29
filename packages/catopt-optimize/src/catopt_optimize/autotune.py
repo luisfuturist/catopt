@@ -33,10 +33,10 @@ Built-in candidate names (see :data:`CANDIDATE_BUILDERS`):
     level-batched carrier executor when the extracted root plans
     one, a plain ``IRModule`` otherwise.  This is exactly what
     ``optimize_model()`` returns.
-``compiled``
+``torch_compile``
     ``torch.compile`` over the routed executor — what
-    ``optimize_model(runner=CompiledRunner())`` returns.
-``compiled_generic``
+    ``optimize_model(runner=TorchCompileRunner())`` returns.
+``torch_compile_generic``
     ``torch.compile`` over the serial ``IRModule``.
 ``cuda_graph``
     A fresh routed executor captured into a CUDA graph — what
@@ -100,7 +100,7 @@ from catopt_core.cost import (
 )
 from catopt_core.ir import IR, Op, Param, TensorType, Var
 from catopt_core.ports import Sink, Source
-from catopt_torch.adapters import TorchSink
+from catopt_torch.adapters import TorchSink, TorchSource
 
 from catopt_optimize.calibrate import (
     corrected_price_ns,
@@ -108,7 +108,12 @@ from catopt_optimize.calibrate import (
     record_measured,
     shape_bucket,
 )
-from catopt_optimize.optimize import _lower_extracted, optimize_model
+from catopt_optimize.optimize import (
+    Autotuned,
+    Optimizer,
+    _lower_extracted,
+    optimize_model,
+)
 
 logger = logging.getLogger("catopt_optimize.autotune")
 
@@ -276,8 +281,8 @@ def _build_eager(ctx: AutotuneContext) -> Any:
 CANDIDATE_BUILDERS: dict[str, CandidateBuilder] = {
     "generic": _build_generic,
     "batched": _build_batched,
-    "compiled": _build_compiled,
-    "compiled_generic": _build_compiled_generic,
+    "torch_compile": _build_compiled,
+    "torch_compile_generic": _build_compiled_generic,
     "cuda_graph": _build_cuda_graph,
     "eager": _build_eager,
 }
@@ -405,8 +410,8 @@ def _time_forward(
 _CANDIDATE_LOWERING: dict[str, str | None] = {
     "generic": "generic",
     "batched": None,
-    "compiled": "compiled",
-    "compiled_generic": "compiled",
+    "torch_compile": "compiled",
+    "torch_compile_generic": "compiled",
     "cuda_graph": "compiled",
     "eager": None,
 }
@@ -532,29 +537,31 @@ def _candidate_model_ns(
         return None
 
 
-def optimize_model_autotuned(
+def _autotuned_impl(
     model: torch.nn.Module,
     example_input: Any,  # tensor or positional-args tuple
     *,
     candidates: Iterable[str | tuple[str, CandidateBuilder]] = (
         "generic",
         "batched",
-        "compiled",
+        "torch_compile",
     ),
     budget_s: float | None = None,
     n_calls: int = 30,
     warmup: int = 5,
     rtol: float = 1e-4,
     atol: float | None = None,
-    source: Source | None = None,
-    sink: Sink | None = None,
+    source: Source,
+    sink: Sink,
     profile: Any = None,
     verbose: bool = False,
     **optimize_kwargs: Any,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Optimize ``model``, then autotune over lowering paths.
 
-    Steps:
+    The engine behind the :class:`~catopt_optimize.optimize.Autotuned`
+    strategy and the :func:`optimize_model_autotuned` compatibility
+    wrapper (plan 0006).  Steps:
 
     1. Run :func:`optimize_model` once (uncompiled, no CUDA graph —
        those are candidates, not presets) to get the extracted term
@@ -588,9 +595,10 @@ def optimize_model_autotuned(
     rtol, atol
         The ``sink.verify`` equivalence gate.
     source, sink
-        The port adapters — defaults :class:`TorchSource` /
-        :class:`TorchSink`.  The same ``sink`` both lowers and
-        verifies candidates.
+        The port adapters — required (the :class:`~catopt_optimize.optimize.Autotuned`
+        strategy and the :func:`optimize_model_autotuned` wrapper
+        resolve them).  The same ``sink`` both lowers and verifies
+        candidates.
     profile
         Measured-feedback channel (opt-in): a
         :class:`~catopt_optimize.calibrate.TargetProfile`, a dict, or
@@ -634,8 +642,6 @@ def optimize_model_autotuned(
 
     """
     t_start = time.monotonic()
-    if sink is None:
-        sink = cast(Sink, TorchSink(ops=optimize_kwargs.get("ops")))
 
     # -- (a) the one search -----------------------------------------
     delivered, stats = optimize_model(
@@ -879,3 +885,67 @@ def optimize_model_autotuned(
         stats["autotune"]["measured_ns"] = written
         stats["autotune"]["profile"] = profile
     return module, stats
+
+
+def optimize_model_autotuned(
+    model: torch.nn.Module,
+    example_input: Any,  # tensor or positional-args tuple
+    *,
+    candidates: Iterable[str | tuple[str, CandidateBuilder]] = (
+        "generic",
+        "batched",
+        "torch_compile",
+    ),
+    budget_s: float | None = None,
+    n_calls: int = 30,
+    warmup: int = 5,
+    rtol: float = 1e-4,
+    atol: float | None = None,
+    source: Source | None = None,
+    sink: Sink | None = None,
+    profile: Any = None,
+    verbose: bool = False,
+    **optimize_kwargs: Any,
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Optimize ``model``, then autotune over lowering paths.
+
+    A compatibility wrapper (plan 0006): resolves the historical
+    ``source``/``sink``/``ops`` defaults — torch IS the default here —
+    then runs ``Optimizer(...).optimize(..., strategy=Autotuned(...))``;
+    :func:`_autotuned_impl` is the pipeline.  Retires in 0008.
+
+    Steps: run :func:`optimize_model` once (uncompiled — compilation
+    and capture are candidates, not presets) for the extracted term
+    and the pipeline's own lowered module; re-lower that term through
+    each requested candidate (see :data:`CANDIDATE_BUILDERS`);
+    ``sink.verify`` each candidate against ``model`` on
+    ``example_input`` (a candidate is never timed unverified); time
+    each survivor (``warmup`` + ``n_calls`` timed forwards, median
+    decides); return the measured-fastest.
+
+    Returns ``(module, stats)`` — ``stats`` is the
+    ``optimize_model`` stats dict plus ``stats["autotune"]``:
+    ``winner``, ``winner_median_s``, per-candidate records,
+    ``fallback``, ``predicted_*``/``measured_ns``/``profile``
+    (with ``profile=``), ``search_s``, ``elapsed_s``.
+    """
+    if source is None:
+        source = TorchSource()
+    if sink is None:
+        sink = cast(Sink, TorchSink(ops=optimize_kwargs.get("ops")))
+    lr = Optimizer(source=source, sink=sink).optimize(
+        model,
+        example_input,
+        strategy=Autotuned(
+            candidates,
+            budget_s=budget_s,
+            n_calls=n_calls,
+            warmup=warmup,
+            rtol=rtol,
+            atol=atol,
+            profile=profile,
+            verbose=verbose,
+        ),
+        **optimize_kwargs,
+    )
+    return cast(torch.nn.Module, lr.module), lr.stats

@@ -36,8 +36,13 @@ The ports (this file)
   ``report.VerifyReport`` satisfies it without core naming it.
 * :class:`Source` — the whole-graph source port,
   ``model -> (IR, leaves)``.
-* :class:`Sink` — the whole-graph sink port, ``IR -> runnable``, plus
-  the backend's supported-op set and module-level equivalence gate.
+* :class:`Capabilities` — the backend's declared op surface:
+  ``supported_ops`` (the extraction bound) + ``ops`` (the registry
+  search-time const folds dispatch through).
+* :class:`Sink` — ``Capabilities`` + the whole-graph sink port,
+  ``IR -> runnable``, plus the module-level equivalence gate.
+* :class:`Strategy` — the optimization-policy seam behind
+  ``Optimizer.optimize(..., strategy=...)``.
 * :class:`Binding` — one op's lowering, ``(*args, **attrs)``
   (``TorchBinding`` is the historical alias of the same protocol).
 * :class:`OpRegistry` — the adapter-registry port.
@@ -107,10 +112,12 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from catopt_core.ir import IR, Op
+    from catopt_core.pipeline import LowerResult
 
 __all__ = [
     "BatchedExecutor",
     "Binding",
+    "Capabilities",
     "CostFn",
     "Executor",
     "LawSet",
@@ -121,6 +128,7 @@ __all__ = [
     "ShapeRule",
     "Sink",
     "Source",
+    "Strategy",
     "TorchBinding",
     "Verifier",
     "VerifyResult",
@@ -391,31 +399,27 @@ class Source(Protocol):
 
 
 @runtime_checkable
-class Sink(Protocol):
-    """The graph-sink port: IR -> runnable, backend-relative.
+class Capabilities(Protocol):
+    """The backend's declared op surface — what the *search* needs.
 
-    Adapter port.  ``catopt_torch.adapters.TorchSink`` is the canonical
-    implementation.  Three responsibilities, all backend-owned:
+    Adapter port, split out of :class:`Sink` (plan 0006): the search
+    phase consumes only the op surface, not materialisation, so a
+    backend that wants to *price* a search — or arm its compile-time
+    folds — implements just this.
 
     * ``supported_ops`` bounds the reachable equivalence class.  It is
       the set of op names this backend can lower; extraction prices any
       member that uses an op outside it at ``+inf`` (see
       :func:`catopt_core.cost.backend_cost`), so the search never
       commits to a form the sink cannot execute — the backend
-      counterpart of the semantic-language bound.  A sink without
+      counterpart of the semantic-language bound.  A backend without
       ``sdpa`` simply never selects the attention fold.
     * ``ops`` is the lowering registry (an :class:`OpRegistry`) the
-      compile-time const folds and causal specialization dispatch
-      through.
-    * ``lower`` materialises a runnable :class:`Executor` from an IR and
-      its leaf values; ``verify`` runs a reference and an optimized
-      executable on the same inputs and returns the equivalence report
-      in the backend's own runtime.
+      compile-time const folds — e.g. the causal-mask specialization —
+      dispatch through.  ``specialize_causal``'s declared need.
 
-    ``verify`` is module-level — ``ref`` / ``opt`` are runnables in the
-    sink's runtime, not tensors; the torch implementation delegates to
-    ``report.verify_module``.  Call sites pass ``rtol`` / ``atol`` by
-    name, matching :class:`Verifier`.
+    :class:`Sink` adds ``lower`` / ``verify``; every ``Sink`` is a
+    ``Capabilities``.
     """
 
     @property
@@ -427,6 +431,25 @@ class Sink(Protocol):
     def ops(self) -> OpRegistry:
         """Return the lowering registry."""
         ...
+
+
+@runtime_checkable
+class Sink(Capabilities, Protocol):
+    """The graph-sink port: :class:`Capabilities` + IR -> runnable.
+
+    Adapter port.  ``catopt_torch.adapters.TorchSink`` is the canonical
+    implementation.  On top of the :class:`Capabilities` op surface:
+
+    * ``lower`` materialises a runnable :class:`Executor` from an IR and
+      its leaf values; ``verify`` runs a reference and an optimized
+      executable on the same inputs and returns the equivalence report
+      in the backend's own runtime.
+
+    ``verify`` is module-level — ``ref`` / ``opt`` are runnables in the
+    sink's runtime, not tensors; the torch implementation delegates to
+    ``report.verify_module``.  Call sites pass ``rtol`` / ``atol`` by
+    name, matching :class:`Verifier`.
+    """
 
     def lower(
         self, ir: IR, params: dict[str, Any] | None = None
@@ -444,6 +467,37 @@ class Sink(Protocol):
         atol: float | None = None,
     ) -> VerifyResult:
         """Run ``ref`` and ``opt`` on ``inputs``; return the report."""
+        ...
+
+
+@runtime_checkable
+class Strategy(Protocol):
+    """One optimization policy — how ``search`` and ``lower`` compose.
+
+    The seam behind ``Optimizer.optimize(..., strategy=...)`` (plan
+    0006): a strategy object receives the model, the example input and
+    the owning optimizer — through which it reaches the configured
+    ports (``optimizer.source`` / ``optimizer.sink``) and defaults
+    (``optimizer.criteria`` / ``optimizer.runner``) — and returns a
+    :class:`~catopt_core.pipeline.LowerResult`.
+
+    ``optimizer`` is typed ``Any``: core names the contract, not the
+    orchestrator's class — ``catopt_core`` may not import
+    ``catopt_optimize`` (the hexagonal boundary).  The conforming
+    implementations live there: ``Monolithic`` (the default —
+    ``lower ∘ search``), ``Compositional`` (per-block), ``Autotuned``
+    (one search, N timed deliveries).  ``run`` is keyword-flexible:
+    ``**kw`` forwards the caller's phase knobs (``ruleset``,
+    ``max_iterations``, ``verify``, …) and each strategy decides how
+    they partition.
+    """
+
+    name: str
+
+    def run(
+        self, model: Any, x: Any, *, optimizer: Any, **kw: Any
+    ) -> LowerResult:
+        """Run the policy end to end; return the lower record."""
         ...
 
 

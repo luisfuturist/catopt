@@ -19,10 +19,10 @@ from catopt_optimize.autotune import (
 from catopt_optimize.optimize import optimize_model
 from catopt_optimize.runners import (
     ChainedRunner,
-    CompiledRunner,
     CudaGraphRunner,
-    GenericRunner,
+    IdentityRunner,
     Runner,
+    TorchCompileRunner,
     runner_candidate,
 )
 from catopt_torch.adapters import TorchSink
@@ -69,10 +69,10 @@ def _make():
 
 def test_runner_protocol_conformance():
     for r in (
-        GenericRunner(),
-        CompiledRunner(),
+        IdentityRunner(),
+        TorchCompileRunner(),
         CudaGraphRunner(),
-        ChainedRunner([GenericRunner()]),
+        ChainedRunner([IdentityRunner()]),
     ):
         assert isinstance(r, Runner)
 
@@ -87,38 +87,38 @@ def test_runner_protocol_conformance():
 
 
 # ------------------------------------------------------------------
-#  GenericRunner — identity delivery
+#  IdentityRunner — identity delivery
 # ------------------------------------------------------------------
 
 
-def test_generic_runner_is_identity():
+def test_identity_runner():
     mod = nn.Linear(4, 4)
     stats: dict = {}
-    out = GenericRunner().apply(mod, torch.randn(2, 4), stats)
+    out = IdentityRunner().apply(mod, torch.randn(2, 4), stats)
     assert out is mod
     assert stats == {}
-    assert GenericRunner().name == "generic"
+    assert IdentityRunner().name == "identity"
 
 
 # ------------------------------------------------------------------
-#  CompiledRunner — torch.compile delivery
+#  TorchCompileRunner — torch.compile delivery
 # ------------------------------------------------------------------
 
 
-def test_compiled_runner_wraps_and_records():
+def test_torch_compile_runner_wraps_and_records():
     torch.manual_seed(0)
     mod = nn.Sequential(nn.Linear(8, 8), nn.SiLU()).eval()
     x = torch.randn(2, 8)
     with torch.no_grad():
         ref = mod(x)
     stats: dict = {}
-    out = CompiledRunner().apply(mod, x, stats)
+    out = TorchCompileRunner().apply(mod, x, stats)
     assert stats["compiled"] is True
     with torch.no_grad():
         assert torch.allclose(out(x), ref, atol=1e-6)
 
 
-def test_compiled_runner_falls_back_on_failure(monkeypatch):
+def test_torch_compile_runner_falls_back_on_failure(monkeypatch):
     """A compile failure keeps the uncompiled module — identical to
     the old inline flag block's contract."""
 
@@ -128,12 +128,12 @@ def test_compiled_runner_falls_back_on_failure(monkeypatch):
     monkeypatch.setattr(torch, "compile", boom)
     mod = nn.Linear(4, 4)
     stats: dict = {}
-    out = CompiledRunner().apply(mod, torch.randn(2, 4), stats)
+    out = TorchCompileRunner().apply(mod, torch.randn(2, 4), stats)
     assert out is mod
     assert stats["compiled"] is False
 
 
-def test_compiled_runner_passes_compile_kwargs(monkeypatch):
+def test_torch_compile_runner_passes_compile_kwargs(monkeypatch):
     seen: dict = {}
 
     def fake_compile(model, **kw):
@@ -143,7 +143,7 @@ def test_compiled_runner_passes_compile_kwargs(monkeypatch):
     monkeypatch.setattr(torch, "compile", fake_compile)
     mod = nn.Linear(4, 4)
     stats: dict = {}
-    out = CompiledRunner(mode="reduce-overhead").apply(
+    out = TorchCompileRunner(mode="reduce-overhead").apply(
         mod, torch.randn(2, 4), stats
     )
     assert seen == {"mode": "reduce-overhead"}
@@ -268,15 +268,15 @@ def test_chained_runner_empty():
 def test_delivers_compiled_marker_propagates():
     """``delivers_compiled`` is how extraction knows to price the
     fusion-region model — it aggregates through a chain."""
-    assert CompiledRunner().delivers_compiled is True
+    assert TorchCompileRunner().delivers_compiled is True
     assert (
         ChainedRunner(
-            [CudaGraphRunner(), CompiledRunner()]
+            [CudaGraphRunner(), TorchCompileRunner()]
         ).delivers_compiled
         is True
     )
     assert ChainedRunner([CudaGraphRunner()]).delivers_compiled is False
-    assert getattr(GenericRunner(), "delivers_compiled", False) is False
+    assert getattr(IdentityRunner(), "delivers_compiled", False) is False
 
 
 # ------------------------------------------------------------------
@@ -284,10 +284,10 @@ def test_delivers_compiled_marker_propagates():
 # ------------------------------------------------------------------
 
 
-def test_optimize_model_default_runner_is_generic():
+def test_optimize_model_default_runner_is_identity():
     m, x = _make()
     _, stats = optimize_model(m, x, verbose=False, max_iterations=3)
-    assert stats["runner"] == "generic"
+    assert stats["runner"] == "identity"
     assert "compiled" not in stats
     assert "cuda_graph" not in stats
 
@@ -323,12 +323,12 @@ def test_custom_runner_runs_and_records():
     assert "cuda_graph" not in stats
 
 
-def test_explicit_compiled_runner():
+def test_explicit_torch_compile_runner():
     m, x = _make()
     mod, stats = optimize_model(
-        m, x, verbose=False, runner=CompiledRunner(), max_iterations=3
+        m, x, verbose=False, runner=TorchCompileRunner(), max_iterations=3
     )
-    assert stats["runner"] == "compiled"
+    assert stats["runner"] == "torch_compile"
     assert stats["compiled"] is True
     with torch.no_grad():
         assert torch.allclose(mod(x), m(x), atol=1e-5)
@@ -340,10 +340,10 @@ def test_explicit_chained_runner():
         m,
         x,
         verbose=False,
-        runner=ChainedRunner([CompiledRunner(), CudaGraphRunner()]),
+        runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
         max_iterations=3,
     )
-    assert stats["runner"] == ["compiled", "cuda_graph"]
+    assert stats["runner"] == ["torch_compile", "cuda_graph"]
     assert stats["compiled"] is True
 
 
@@ -417,7 +417,7 @@ def test_runner_candidate_builds_fresh_routed_module():
 def test_runner_candidate_unavailable_without_ir():
     ctx = _ctx(with_ir=False)
     with pytest.raises(CandidateUnavailableError):
-        runner_candidate(GenericRunner())(ctx)
+        runner_candidate(IdentityRunner())(ctx)
 
 
 def test_runner_candidate_runs_inside_autotune():
@@ -426,7 +426,7 @@ def test_runner_candidate_runs_inside_autotune():
     _, stats = optimize_model_autotuned(
         m,
         x,
-        candidates=[("gen", runner_candidate(GenericRunner()))],
+        candidates=[("gen", runner_candidate(IdentityRunner()))],
         n_calls=3,
         warmup=1,
         max_iterations=3,
