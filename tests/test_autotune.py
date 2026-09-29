@@ -1,4 +1,4 @@
-"""Tests for :mod:`catopt_optimize.autotune` — measured autotuning
+"""Tests for :mod:`catopt_orchestrator.autotune` — measured autotuning
 over the lowering paths."""
 
 from __future__ import annotations
@@ -6,20 +6,25 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-import catopt_optimize.autotune as at_mod
-import catopt_optimize.calibrate as cal_mod
+import catopt_orchestrator.autotune as at_mod
+import catopt_torch.calibrate as cal_mod
+
 import pytest
 import torch
 import torch.nn as nn
-from catopt.calibrate import TargetProfile, shape_bucket
-from catopt.cost import fused_cost_for
-from catopt.ir import Op, Param, TensorType, Var
-from catopt_optimize.autotune import (
-    CandidateUnavailableError,
-    optimize_model_autotuned,
-)
+from catopt_torch.calibrate import TargetProfile, shape_bucket
+from catopt_core.cost import fused_cost_for
+from catopt_core.ir import Op, Param, TensorType, Var
+from catopt_orchestrator.autotune import CandidateUnavailableError
+
+
 from catopt_torch.adapters import TorchSink
 from catopt_torch.report import verify_module
+from catopt_orchestrator.optimize import Autotuned
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.autotune import TORCH_BUILDERS
+from catopt_torch.backend import TorchBackend
 
 
 class _MLP(nn.Module):
@@ -53,7 +58,26 @@ def _autotune(m, x, **kw):
     kw.setdefault("n_calls", 5)
     kw.setdefault("warmup", 2)
     kw.setdefault("max_iterations", 3)
-    return optimize_model_autotuned(m, x, **kw)
+    ctor = {
+        k: kw.pop(k) for k in ("source", "sink", "meter") if k in kw
+    }
+    backend = TorchBackend(ops=kw.pop("ops", None))
+    strat_kw = {
+        k: kw.pop(k)
+        for k in ("budget_s", "n_calls", "warmup", "rtol", "atol",
+                  "profile")
+        if k in kw
+    }
+    return Optimizer(backend=backend, **ctor).optimize(
+        m,
+        x,
+        strategy=Autotuned(
+            kw.pop("candidates", ("generic", "batched", "torch_compile")),
+            builders=TORCH_BUILDERS,
+            **strat_kw,
+        ),
+        **kw,
+    )
 
 
 def test_returns_verified_module_and_winner():
@@ -98,7 +122,7 @@ def test_batched_route_on_scan_model():
     """LinearRecurrence lowers to the batched carrier — the
     ``batched`` candidate reuses it and ``generic`` re-lowers the
     same term serially."""
-    from catopt.models import LinearRecurrence
+    from catopt_torch.models import LinearRecurrence
 
     torch.manual_seed(0)
     m = LinearRecurrence(dim=4, steps=8).eval()
@@ -298,15 +322,8 @@ def test_opaque_sink_recovers_via_fallback():
             raise RuntimeError("verify unavailable")
 
     m, x = _make()
-    mod, stats = optimize_model_autotuned(
-        m,
-        x,
-        candidates=("generic", "batched"),
-        sink=OpaqueSink(),
-        n_calls=5,
-        warmup=2,
-        max_iterations=3,
-    )
+    mod, stats = Optimizer(backend=TorchBackend(), sink=OpaqueSink()).optimize(m, x, strategy=Autotuned(("generic", "batched"), n_calls=5, warmup=2, builders=TORCH_BUILDERS), max_iterations=3)
+
     at = stats["autotune"]
     assert at["ir_recovered"] is False
     assert at["fallback"] is True
@@ -321,19 +338,13 @@ def test_cuda_candidates():
     """CUDA input: ``cuda_graph`` should either time (batched
     carrier captured) or record an honest status — never a silent
     win."""
-    from catopt.models import LinearRecurrence
+    from catopt_torch.models import LinearRecurrence
 
     torch.manual_seed(0)
     m = LinearRecurrence(dim=8, steps=4).cuda().eval()
     x = torch.randn(4, 8, device="cuda")
-    mod, stats = optimize_model_autotuned(
-        m,
-        x,
-        candidates=("generic", "batched", "cuda_graph"),
-        n_calls=5,
-        warmup=2,
-        max_iterations=4,
-    )
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Autotuned(("generic", "batched", "cuda_graph"), n_calls=5, warmup=2, builders=TORCH_BUILDERS), max_iterations=4)
+
     at = stats["autotune"]
     rec = at["candidates"]["cuda_graph"]
     assert rec["status"] in ("timed", "unavailable", "build_failed")

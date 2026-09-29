@@ -48,7 +48,7 @@ per step, so forward latency is the honest unit.
 
 Usage:
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/e2e_model.py \
         --device cuda
     .venv/bin/python bench/e2e_model.py --device cpu --quick
@@ -75,9 +75,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.optimize import optimize_compositional, optimize_model
+
 from catopt_torch.report import verify_equiv
 from real_win_hunt import try_compile
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -452,13 +455,8 @@ def run_cell(
     opt_c = None
     t0 = time.time()
     try:
-        opt_c, rep = optimize_compositional(
-            model,
-            ex,
-            verbose=verbose,
-            max_iterations=max_iterations,
-            max_enodes=max_enodes,
-        )
+        opt_c, rep = Optimizer(backend=TorchBackend()).optimize(model, ex, strategy=Compositional(), verbose=verbose, max_iterations=max_iterations, max_enodes=max_enodes)
+
         rec["opt_s"] = round(time.time() - t0, 2)
         rec["n_blocks"] = rep["n_blocks"]
         rec["n_optimized"] = rep["n_optimized"]
@@ -513,13 +511,8 @@ def run_cell(
                 )
                 ex64 = a64 if len(a64) > 1 else a64[0]
                 t64 = time.time()
-                opt64, rep64 = optimize_compositional(
-                    m64,
-                    ex64,
-                    verbose=False,
-                    max_iterations=max_iterations,
-                    max_enodes=max_enodes,
-                )
+                opt64, rep64 = Optimizer(backend=TorchBackend()).optimize(m64, ex64, strategy=Compositional(), verbose=False, max_iterations=max_iterations, max_enodes=max_enodes)
+
                 rec["opt64_s"] = round(time.time() - t64, 2)
                 rec["n64_optimized"] = rep64["n_optimized"]
                 with torch.no_grad():
@@ -545,13 +538,8 @@ def run_cell(
     if do_full:
 
         def _full():
-            return optimize_model(
-                copy.deepcopy(model),
-                ex,
-                verbose=False,
-                max_iterations=max_iterations,
-                max_enodes=max_enodes,
-            )
+            return Optimizer(backend=TorchBackend()).optimize(copy.deepcopy(model), ex, max_iterations=max_iterations, max_enodes=max_enodes, verify=False, verbose=False)
+
 
         out, dt, err = _sig_guarded(_full, full_timeout)
         rec["opt_full_s"] = round(dt, 2)

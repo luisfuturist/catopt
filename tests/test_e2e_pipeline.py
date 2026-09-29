@@ -9,19 +9,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from catopt.cost import flops_cost
-from catopt.egraph import EGraph, verify_certificate
-from catopt.ir import IR, Op, TensorType, Var
-from catopt.laws import all_rules
-from catopt.om_lower import (
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph, verify_certificate
+from catopt_core.ir import IR, Op, TensorType, Var
+from catopt_core.laws import all_rules
+from catopt_carriers.om_lower import (
     StreamingOMModule,
     om_apply_state,
     om_empty_state,
     om_step,
 )
-from catopt.ops import OpTable
-from catopt.optimize import optimize_compositional
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_core.ops import OpTable
+
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_orchestrator import Compositional, Optimizer
+
+
+from catopt_torch.backend import TorchBackend
 
 
 def _T(*shape):
@@ -81,7 +85,8 @@ def test_compositional_pipeline_to_compiled():
     torch.manual_seed(0)
     model = _TinyTransformer().eval()
     x = torch.randn(2, 8, 16)
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     assert stats["n_optimized"] >= 1 and stats["n_failed"] == 0
     assert stats["end_to_end"]["max_rel_diff"] < 1e-9
     with torch.no_grad():
@@ -237,7 +242,8 @@ def test_compositional_fallback_keeps_original_block():
 
     model = M().eval()
     x = torch.randn(4, d)
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     assert stats["n_optimized"] == 2
     assert stats["n_failed"] == 1
     # the fallback module reproduces the original exactly

@@ -24,16 +24,16 @@ Covered here:
 
 import torch
 
-from catopt.cost import dag_cost, flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, TensorType, Var, op_repr
-from catopt.om import (
+from catopt_core.cost import dag_cost, flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, TensorType, Var, op_repr
+from catopt_carriers.om import (
     CONCAT_BINARIZE,
     MATMUL_T_CONCAT,
     OM_LAWS,
     OM_SPLIT,
 )
-from catopt.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
+from catopt_torch.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
 
 # ---------------------------------------------------------------------------
 #  helpers
@@ -624,7 +624,7 @@ def test_concat_binarize_feeds_om_split():
 
 def test_om_cost_model_shapes_and_flops():
     """_infer_op_shape prices the carrier by its eventual tensor."""
-    from catopt.cost import _shape_of
+    from catopt_core.cost import _shape_of
 
     s = Var("s", TensorType((4, 6)))
     v = Var("v", TensorType((6, 3)))

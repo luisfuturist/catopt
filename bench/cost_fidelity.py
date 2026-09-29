@@ -72,9 +72,9 @@ sys.setrecursionlimit(400_000)
 
 import torch
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.adapters import TorchSink
-from catopt.calibrate import calibrate
-from catopt.cost import (
+from catopt_torch.adapters import TorchSink
+from catopt_torch.calibrate import calibrate
+from catopt_core.cost import (
     backend_cost,
     count_cost,
     dag_cost,
@@ -88,15 +88,15 @@ from catopt.cost import (
     roofline_cost,
     roofline_cost_for,
 )
-from catopt.ir import IR, op_repr
-from catopt.models import AttentionBlock, SwiGLU
-from catopt.optimize import (
-    OptimizationResourceError,
-    discover_alternatives,
-    optimize_model,
-)
-from catopt.scan_lower import is_scan_apply_term, to_batched_scan_module
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_core import laws
+from catopt_core.ir import IR, op_repr
+from catopt_torch.models import AttentionBlock, SwiGLU
+from catopt_orchestrator.optimize import OptimizationResourceError, discover_alternatives
+
+
+from catopt_carriers.scan_lower import is_scan_apply_term, to_batched_scan_module
+from catopt_torch.adapters import TorchSource
+from catopt_torch.torch_bridge import ir_to_torch_module
 from real_linear_attn import (
     LinearAttnStack,
     _canonical_scan_term,
@@ -104,9 +104,19 @@ from real_linear_attn import (
     try_compile,
 )
 from reassoc_scale import LinearAttnChain
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {"models": "chain,retnet", "top_k": 4}
+
+#: ``--ruleset`` CLI names → the RuleSet the frontier search runs.
+_RULESET_CHOICES = {
+    "all": laws.FULL,
+    "categorical": laws.CATEGORICAL,
+    "simpl": laws.SIMPLIFICATION,
+}
 
 _SCAN_MODES = ("retnet", "gla", "delta")
 _ALL_MODELS = ("chain", "retnet", "gla", "delta", "attn", "swiglu")
@@ -389,25 +399,25 @@ def run_cell(
     # -- 1. enumerate the frontier ------------------------------------
     t0 = time.time()
     try:
-        disc = discover_alternatives(
-            m64, x64, top_k=args.top_k, ruleset=args.ruleset
+        res = discover_alternatives(
+            m64, x64, source=TorchSource(), rules=_RULESET_CHOICES[args.ruleset]
         )
     except Exception as e:
         cell["error"] = f"discover: {type(e).__name__}: {e}"
         print(f"  discover_alternatives FAILED: {e}", flush=True)
         return cell, None
     cell["discover_s"] = round(time.time() - t0, 2)
-    ir, src = disc["ir"], disc["source_tensors"]
-    alts = disc["alternatives"]
-    st = disc["stats"]
+    ir, src = res.ir, res.param_values
+    alts = res.alternatives(args.top_k)
+    st = res.stats
     cell["n_alts"] = len(alts)
     cell["enodes"] = st.get("n_enodes")
     cell["n_classes"] = st.get("n_classes")
-    cell["diverse_classes"] = len(disc["diverse_classes"])
+    cell["diverse_classes"] = len(res.eg.diverse_classes())
     cell["rule_fires"] = dict(
         list(
             sorted(
-                ((k, v) for k, v in disc["rule_fires"].items() if v),
+                ((k, v) for k, v in res.stats["rule_fires"].items() if v),
                 key=lambda kv: -kv[1],
             )
         )[:12]
@@ -471,13 +481,8 @@ def run_cell(
     if do_opt:
         t0 = time.time()
         try:
-            opt64, _ostats = optimize_model(
-                m64,
-                x64,
-                verbose=False,
-                max_iterations=32,
-                max_enodes=300_000,
-            )
+            opt64, _ostats = Optimizer(backend=TorchBackend()).optimize(m64, x64, max_iterations=32, max_enodes=300_000, verify=False, verbose=False)
+
             cell["opt_s"] = round(time.time() - t0, 2)
             cell["opt_root"] = getattr(
                 opt64._root, "op", type(opt64._root).__name__

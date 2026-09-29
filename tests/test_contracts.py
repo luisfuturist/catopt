@@ -43,11 +43,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from catopt.cost import _INVALID, _shape_of
-from catopt.egraph import _term_instantiate
-from catopt.ir import Const, Op, Param, TensorType, Var
+from catopt_core.cost import _INVALID, _shape_of
+from catopt_core.egraph import _term_instantiate
+from catopt_core.ir import Const, Op, Param, TensorType, Var
 from catopt_core.laws import CATEGORICAL_RULES, SIMPLIFICATION_RULES
-from catopt.torch_bridge import (
+from catopt_torch.torch_bridge import (
     _ATEN_TO_IR,
     _IR_TO_TORCH,
     _IR_TO_TORCH_EXTRA,

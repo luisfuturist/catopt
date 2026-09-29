@@ -1,7 +1,7 @@
-"""Contract tests for catopt.typing — the shape/type-inference layer.
+"""Contract tests for catopt_core.typing — the shape/type-inference layer.
 
 Phase 1a extracted ``_shape_of`` / ``_infer_op_shape`` / ``_INVALID`` /
-``_broadcast`` / ``_numel`` out of catopt.cost and moved the carrier
+``_broadcast`` / ``_numel`` out of catopt_core.cost and moved the carrier
 op cases into ``register_shape_rule`` handlers.  These tests pin the
 contract the layer publishes:
 
@@ -17,8 +17,8 @@ contract the layer publishes:
 
 import pytest
 
-from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.typing import (
+from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_core.typing import (
     _INVALID,
     _SHAPE_RULES,
     _broadcast,

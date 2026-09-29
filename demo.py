@@ -36,7 +36,7 @@ Usage:
 
     # CUDA dev venv (see bench/results/GPU_RUN.md):
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python demo.py --device cuda
 """
 
@@ -56,14 +56,17 @@ from collections import Counter
 
 import torch
 import torch.nn as nn
-from catopt.egraph import verify_certificate
-from catopt.ir import Op, Param, Var, op_repr
-from catopt.optimize import (
-    discover_alternatives,
-    optimize_model,
-    param_report,
-)
-from catopt_torch.adapters import TorchSink
+from catopt_core.egraph import verify_certificate
+from catopt_core.ir import Op, Param, Var, op_repr
+from catopt_core.laws import FULL
+from catopt_orchestrator.optimize import discover_alternatives
+
+from catopt_torch.composer import param_report
+
+from catopt_torch.adapters import TorchSink, TorchSource
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # ----------------------------------------------------------------------
 #  The model
@@ -333,11 +336,12 @@ def main() -> int:
 
     # -- 2 · search ---------------------------------------------------
     _stage(2, "THE SEARCH")
-    print("optimize_model(): export → equality saturation →")
+    print("Optimizer.optimize(): export → equality saturation →")
     print("non-local passes → extract cheapest program → lower.")
     sink = RecordingSink()
     t0 = time.perf_counter()
-    opt_mod, stats = optimize_model(model, x, sink=sink, verbose=False)
+    opt_mod, stats = Optimizer(backend=TorchBackend(), sink=sink).optimize(model, x, verify=False, verbose=False)
+
     search_s = time.perf_counter() - t0
     fires = stats.get("rule_fires") or {}
     fired = (
@@ -380,9 +384,9 @@ def main() -> int:
     print("derivation; verify_certificate() re-runs each rule")
     print("application on the real terms — no e-graph involved.")
     res = discover_alternatives(
-        model, x, ruleset="all", max_iterations=100
+        model, x, source=TorchSource(), rules=FULL, max_iterations=100
     )
-    eg, ir, root_eid = res["eg"], res["ir"], res["root_eid"]
+    eg, ir, root_eid = res.eg, res.ir, res.root_eid
     cert = eg.certificate(ir.root, shipped, root_eid=root_eid)
     print("  certificate: exported program → shipped program")
     print(f"    {cert.n_steps} derivation steps")

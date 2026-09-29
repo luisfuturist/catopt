@@ -18,7 +18,7 @@ index_select by element count) — and returns a
 The *data* half — the profile type, persistence, buckets and
 correction math — lives in torch-free :mod:`catopt_core.profile`
 (plan 0007 split) and is re-exported here so the historical import
-paths (``catopt.calibrate.TargetProfile`` and friends) keep working.
+paths (``catopt_torch.calibrate.TargetProfile`` and friends) keep working.
 """
 
 from __future__ import annotations
@@ -74,9 +74,9 @@ __all__ = [
     "shape_bucket",
 ]
 
-#: The logger name stays ``catopt_optimize.calibrate`` — caplog tests
-#: and downstream filters key on the historical channel.
-logger = logging.getLogger("catopt_optimize.calibrate")
+#: The logger name is the module's own — caplog tests and downstream
+#: filters key on this channel.
+logger = logging.getLogger("catopt_torch.calibrate")
 
 #: Conservative fallbacks for the executor-overhead constants, used
 #: when a probe cannot run (missing adapter stack, exotic device) or

@@ -22,9 +22,10 @@ The ports (this file)
 ---------------------
 * :class:`CostFn` — extract-time pricing:
   ``(term, memo=None) -> float``.  Every builtin cost model conforms.
-* :class:`RuleLike` / :class:`LawSet` / :class:`RuleProvider` — laws as
-  data: the structural read-surface of ``egraph.Rewrite`` and the
-  collections ``EGraph.run`` consumes.
+* :class:`RuleLike` / :class:`RuleSetLike` / :class:`RuleSetProvider`
+  — laws as data: the structural read-surface of ``egraph.Rewrite``
+  and the collections ``EGraph.run`` consumes
+  (:class:`catopt_core.laws.RuleSet` is the concrete implementation).
 * :class:`ShapeRule` — the ``typing.register_shape_rule`` handler
   contract, ``fn(op, shapes) -> shape | _INVALID | None``.
 * :class:`Executor` / :class:`PlannedExecutor` /
@@ -116,9 +117,9 @@ Deliberate non-fits
 * ``ops`` parameters stay typed ``OpTable | None``: ``OpTable`` IS the
   registry port — ``OpRegistry`` names its surface for structural
   checks; nothing is re-wrapped.
-* ``optimize_model`` selects law sets by *name* (``ruleset: str``);
-  there is no ``rules`` parameter to annotate.  ``LawSet`` describes
-  the list-of-``Rewrite`` surface ``EGraph.run`` consumes.
+* ``RuleSetLike`` describes the iterable-of-``Rewrite`` surface
+  ``EGraph.run`` consumes — plain ``list[Rewrite]`` collections and
+  the concrete :class:`catopt_core.laws.RuleSet` both conform.
 """
 
 from __future__ import annotations
@@ -141,12 +142,12 @@ __all__ = [
     "Criterion",
     "Executor",
     "ExecutorSpec",
-    "LawSet",
     "Meter",
     "OpRegistry",
     "PlannedExecutor",
     "RuleLike",
-    "RuleProvider",
+    "RuleSetLike",
+    "RuleSetProvider",
     "Runner",
     "ShapeRule",
     "Sink",
@@ -732,11 +733,11 @@ class Strategy(Protocol):
 
     ``optimizer`` is typed ``Any``: core names the contract, not the
     orchestrator's class — ``catopt_core`` may not import
-    ``catopt_optimize`` (the hexagonal boundary).  The conforming
+    ``catopt_orchestrator`` (the hexagonal boundary).  The conforming
     implementations live there: ``Monolithic`` (the default —
     ``lower ∘ search``), ``Compositional`` (per-block), ``Autotuned``
     (one search, N timed deliveries).  ``run`` is keyword-flexible:
-    ``**kw`` forwards the caller's phase knobs (``ruleset``,
+    ``**kw`` forwards the caller's phase knobs (``rules``,
     ``max_iterations``, ``verify``, …) and each strategy decides how
     they partition.
     """
@@ -782,17 +783,19 @@ class RuleLike(Protocol):
 
 
 @runtime_checkable
-class LawSet(Protocol):
+class RuleSetLike(Protocol):
     """An iterable of :class:`RuleLike` rewrites.
 
-    The surface ``EGraph.run(rules, ...)`` consumes.
+    The surface ``EGraph.run(rules, ...)`` consumes — the renamed
+    ``LawSet`` (plan 0009's vocabulary: a *rule* is one ``Rewrite``;
+    a *rule set* is the collection).
 
-    ``list[Rewrite]`` collections conform: ``ALL_RULES`` /
+    ``list[Rewrite]`` collections conform (``ALL_RULES`` /
     ``all_rules()``, ``SIMPLIFICATION_RULES``, ``CATEGORICAL_RULES``,
-    ``SDPA_FOLD_RULES``, ``OM_LAWS``, and the filtered per-ruleset
-    lists ``optimize_model`` builds.  (Runtime check is presence-level:
-    any iterable ``isinstance``s; element conformance is the
-    static-typing half.)
+    ``SDPA_FOLD_RULES``, ``OM_LAWS``), and so does the concrete
+    :class:`catopt_core.laws.RuleSet`.  (Runtime check is
+    presence-level: any iterable ``isinstance``s; element conformance
+    is the static-typing half.)
     """
 
     def __iter__(self) -> Iterator[RuleLike]:
@@ -801,16 +804,16 @@ class LawSet(Protocol):
 
 
 @runtime_checkable
-class RuleProvider(Protocol):
-    """A zero-argument source of a :class:`LawSet`.
+class RuleSetProvider(Protocol):
+    """A zero-argument source of a :class:`RuleSetLike`.
 
-    This is the ``all_rules()`` shape.  How a ruleset *name* maps to
-    rules is a pipeline detail (``optimize_model``'s ``ruleset`` dict),
-    not part of this port.
+    This is the ``all_rules()`` shape — the renamed ``RuleProvider``.
+    How a rule-set *name* maps to rules is a preset detail
+    (:func:`catopt_core.laws.preset`), not part of this port.
     """
 
-    def __call__(self) -> LawSet:
-        """Return the law set."""
+    def __call__(self) -> RuleSetLike:
+        """Return the rule set."""
         ...
 
 

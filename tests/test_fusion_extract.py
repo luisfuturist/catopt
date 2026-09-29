@@ -10,13 +10,16 @@ root a pointwise consumer could absorb), determinism on exact ties,
 and reuse of the shared cost memo for the region probes.
 """
 
-from catopt.egraph import EGraph
-from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt_core.cost import (
     count_cost,
     fusion_member_key,
     fusion_regions,
 )
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _t(*shape):
@@ -225,7 +228,7 @@ def test_optimize_model_fusion_epsilon_kwarg():
     records it in stats; 0 keeps byte-identical selection."""
     import torch
     import torch.nn as nn
-    from catopt.optimize import optimize_model
+
 
     class M(nn.Module):
         def forward(self, x):
@@ -233,11 +236,11 @@ def test_optimize_model_fusion_epsilon_kwarg():
 
     m = M().eval().double()
     x = torch.randn(4, 8, dtype=torch.float64)
-    mod, stats = optimize_model(
-        m, x, fusion_epsilon=0.05, verbose=False
-    )
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, fusion_epsilon=0.05, verify=False, verbose=False)
+
     assert stats["fusion_epsilon"] == 0.05
     with torch.no_grad():
         assert torch.allclose(mod(x), m(x))
-    _mod2, stats2 = optimize_model(m, x, verbose=False)
+    _mod2, stats2 = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     assert "fusion_epsilon" not in stats2

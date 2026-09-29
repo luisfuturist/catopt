@@ -22,7 +22,7 @@ extracted term is asserted to nest weights-first.
 Per cell (k, d, R):
 
 * eager fp32, Inductor-compiled original, a hand-built folded
-  reference (the reachable optimum), the catopt-optimized module, and
+  reference (the reachable optimum), the catopt-orchestratord module, and
   the catopt module compiled with the same Inductor backend — all
   timed with ``torch.utils.benchmark`` (median via blocked_autorange).
 * correctness gate: ``torch.allclose`` fp32 vs the original eager
@@ -64,35 +64,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch
 import torch.nn as nn
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.cost import launch_aware_cost
-from catopt.egraph import EGraph
-from catopt.ir import Op, Param, Var, op_repr
-from catopt.optimize import _EXPANSIVE_RULES, optimize_model
+from catopt_core.cost import launch_aware_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, Param, Var, op_repr
 from catopt_core.laws import (
-    all_rules,
+    FULL,
     pair_shared_input_convs,
     pair_shared_input_linears,
     share_duplicate_param_slices,
     share_duplicate_params,
+    tags,
 )
-from catopt.torch_bridge import export_to_ir
-from catopt.typing import has_var_leaf
+from catopt_torch.torch_bridge import export_to_ir
+from catopt_core.typing import has_var_leaf
 from catopt_carriers.trace_lift import lift_scan_to_trace
 from catopt_carriers.xcarrier import (
     gather_apply_stack,
     gather_applyd_stack,
     omd_tree_lift,
 )
+from catopt_orchestrator import Optimizer
 
-#: Rules subsumed inside ``optimize_model`` by the non-local pairing
-#: pass — mirrored so the inspection e-graph below is the same search
-#: space ``optimize_model`` explores.  None can fire on a pure chain.
-_SUBSUMED = {
-    "swiglu_fuse",
-    "parallel_mul_fuse",
-    "qkv_fuse",
-    "qkv_fuse_asym",
-}
+from catopt_torch.backend import TorchBackend
+
+#: ``FULL`` — the whole core equational surface minus the
+#: pairing-subsumed folds — is the same search space the old
+#: ``ruleset="all"`` path ran; mirrored here so the inspection
+#: e-graph below sees the same members ``optimize`` explores.
+_RULES = FULL
 
 _MM_OPS = {"mm", "bmm", "addmm", "matmul"}
 
@@ -177,11 +176,10 @@ def saturate_and_extract(
     ir, source_tensors = export_to_ir(model, x)
     eg = EGraph()
     root_eid = eg.add_term(ir.root)
-    rules = [r for r in all_rules() if r.name not in _SUBSUMED]
-    budgets = {n: 2048 for n in _EXPANSIVE_RULES}
+    budgets = {r.name: 2048 for r in _RULES.tagged(tags.EXPANSIVE)}
     cap = 200_000
     stats = eg.run(
-        rules,
+        _RULES,
         root_eid,
         max_iterations=max_iterations,
         max_nodes=cap,
@@ -600,13 +598,8 @@ def run_cell(
     # -- catopt ----------------------------------------------------------
     t0 = time.time()
     try:
-        opt, stats = optimize_model(
-            m,
-            x,
-            verbose=False,
-            max_iterations=64,
-            max_enodes=200_000,
-        )
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=64, max_enodes=200_000, verify=False, verbose=False)
+
     except Exception as e:  # honest failure path — do not fake the win
         print(f"  catopt FAILED: {type(e).__name__}: {e}")
         cell["error"] = f"{type(e).__name__}: {e}"

@@ -10,9 +10,9 @@ implementations with one bit-identical computation.
 import torch
 import torch.nn as nn
 
-from catopt.models import ParallelLinear
-from catopt.optimize import optimize_compositional, optimize_model
-from catopt.report import (
+from catopt_torch.models import ParallelLinear
+
+from catopt_torch.report import (
     BlockReport,
     CompositionalReport,
     OptReport,
@@ -20,6 +20,9 @@ from catopt.report import (
     verify_equiv,
     verify_module,
 )
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _small_mlp(seed=0):
@@ -45,7 +48,8 @@ def _small_mlp(seed=0):
 def test_optreport_roundtrips_real_stats():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
-    _opt, stats = optimize_model(m, x, verbose=False, max_iterations=3)
+    _opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
 
     rep = OptReport.from_stats(stats)
     assert rep.to_dict() == stats
@@ -68,7 +72,8 @@ def test_optreport_path_dependent_keys():
 
     # absent by path → None field, omitted on serialize
     m = _small_mlp()
-    _opt, stats = optimize_model(m, x, verbose=False, max_iterations=3)
+    _opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     rep = OptReport.from_stats(stats)
     assert rep.paired_extract is None
     assert rep.causal_specialized is None
@@ -76,7 +81,8 @@ def test_optreport_path_dependent_keys():
 
     # the pairing pass sets pairing_groups / paired_extract
     pm = ParallelLinear(16, n_experts=2).eval().double()
-    _opt, stats = optimize_model(pm, x, verbose=False)
+    _opt, stats = Optimizer(backend=TorchBackend()).optimize(pm, x, verify=False, verbose=False)
+
     rep = OptReport.from_stats(stats)
     assert rep.pairing_groups == stats.get("pairing_groups")
     assert rep.pairing_groups is not None and rep.pairing_groups >= 1
@@ -160,9 +166,8 @@ def test_compositional_report_roundtrips_real_stats():
     ).double()
     x = torch.randn(4, 16, dtype=torch.float64)
 
-    _opt, stats = optimize_compositional(
-        model, x, verbose=False, max_iterations=5
-    )
+    _opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False, max_iterations=5)
+
     rep = CompositionalReport.from_stats(stats)
     assert rep.to_dict() == stats
 

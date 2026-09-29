@@ -27,6 +27,7 @@ from typing import Any, cast
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
+from catopt_core.laws import tags
 from catopt_core.laws.base import (
     R,
     _is_channel_scale,
@@ -35,6 +36,21 @@ from catopt_core.laws.base import (
     _shape_of,
 )
 from catopt_core.laws.layout import LAYOUT_RULES
+
+#: Tag bundles for the rule definitions below (see
+#: :mod:`catopt_core.laws.tags`): comm/assoc and the scale-hoist
+#: naturality rules are ``SYMMETRY`` + ``EXPANSIVE`` (the Catalan-blowup
+#: closure generators — opt-in, never in ``DEFAULT``); the rest of the
+#: bilinearity/distributivity/composition algebra is ``CATEGORICAL`` +
+#: ``EXPANSIVE`` (today's ``_EXPANSIVE_RULES`` budget set); the term-
+#: local product folds the pairing pass owns are ``FUSION`` +
+#: ``SUBSUMED``; the remaining folds (sdpa, gqa) are ``FUSION``; the
+#: basic algebraic simplifications are ``SIMPLIFICATION``.
+_SYM = (tags.SYMMETRY, tags.EXPANSIVE)
+_CAT = (tags.CATEGORICAL, tags.EXPANSIVE)
+_SUB = (tags.FUSION, tags.SUBSUMED)
+_FUS = (tags.FUSION,)
+_SIM = (tags.SIMPLIFICATION,)
 
 # ---------------------------------------------------------------------------
 #  Monoid laws: commutativity & associativity
@@ -45,6 +61,7 @@ COMM_ADD = R(
     Op.make("add", "a", "b"),
     Op.make("add", "b", "a"),
     law="Commutativity in a symmetric monoidal category: σ ∘ (f ⊗ g) = g ⊗ f.",
+    tags=_SYM,
 )
 
 COMM_MUL = R(
@@ -52,6 +69,7 @@ COMM_MUL = R(
     Op.make("mul", "a", "b"),
     Op.make("mul", "b", "a"),
     law="Hadamard product is commutative (SMC symmetry).",
+    tags=_SYM,
 )
 
 ASSOC_ADD = R(
@@ -59,6 +77,7 @@ ASSOC_ADD = R(
     Op.make("add", "a", Op.make("add", "b", "c")),
     Op.make("add", Op.make("add", "a", "b"), "c"),
     law="Associativity of sequential composition in a category.",
+    tags=_SYM,
 )
 
 ASSOC_MUL = R(
@@ -66,6 +85,7 @@ ASSOC_MUL = R(
     Op.make("mul", "a", Op.make("mul", "b", "c")),
     Op.make("mul", Op.make("mul", "a", "b"), "c"),
     law="Associativity of parallel composition in a monoidal category.",
+    tags=_SYM,
 )
 
 
@@ -78,6 +98,7 @@ ID_ADD = R(
     Op.make("add", "a", Const(0)),
     "a",
     law="Additive identity: a + 0 = a.",
+    tags=_SIM,
 )
 
 ID_MUL = R(
@@ -85,6 +106,7 @@ ID_MUL = R(
     Op.make("mul", "a", Const(1)),
     "a",
     law="Multiplicative identity: a * 1 = a.",
+    tags=_SIM,
 )
 
 DOUBLE_NEG = R(
@@ -92,6 +114,7 @@ DOUBLE_NEG = R(
     Op.make("neg", Op.make("neg", "a")),
     "a",
     law="Double negation: ¬¬a = a (involution).",
+    tags=_SIM,
 )
 
 
@@ -104,6 +127,7 @@ SUB_TO_ADD = R(
     Op.make("sub", "a", "b"),
     Op.make("add", "a", Op.make("neg", "b")),
     law="Subtraction as addition of inverse: a - b = a + (-b).",
+    tags=_SIM,
 )
 
 
@@ -116,6 +140,7 @@ SILU_EXPAND = R(
     Op.make("silu", "x"),
     Op.make("mul", "x", Op.make("sigmoid", "x")),
     law="SiLU definition: silu(x) = x · σ(x).",
+    tags=_SIM,
 )
 
 SQUARE_EXPAND = R(
@@ -123,6 +148,7 @@ SQUARE_EXPAND = R(
     Op.make("square", "x"),
     Op.make("mul", "x", "x"),
     law="Self-composition: x² = x · x.",
+    tags=_SIM,
 )
 
 # RMSNorm/pow family: connect x.pow(2) to the mul-based representation.
@@ -132,6 +158,7 @@ POW_TO_SQUARE = R(
     Op.make("pow", "x", Const(2)),
     Op.make("square", "x"),
     law="pow(x, 2) ≡ square(x) ≡ x·x (SwiGLU/RMSNorm bridge).",
+    tags=_SIM,
 )
 
 SQUARE_TO_POW = R(
@@ -139,6 +166,7 @@ SQUARE_TO_POW = R(
     Op.make("square", "x"),
     Op.make("pow", "x", Const(2)),
     law="Reverse: square(x) ≡ pow(x, 2) for shape/cost reasons.",
+    tags=_SIM,
 )
 
 # SwiGLU bridge: the exported graph has silu(linear(...)) followed by
@@ -150,6 +178,7 @@ SILU_MUL_FORM = R(
     Op.make("mul", Op.make("silu", "g"), "u"),
     Op.make("mul", Op.make("mul", "g", Op.make("sigmoid", "g")), "u"),
     law="SwiGLU: silu(g)*u = (g*sigmoid(g))*u (factor for prefix sharing).",
+    tags=_SIM,
 )
 
 
@@ -165,6 +194,7 @@ DISTRIBUTE_MUL = R(
         "add", Op.make("matmul", "W", "a"), Op.make("matmul", "W", "b")
     ),
     law="Distributivity of linear maps over addition (bilinearity).",
+    tags=_CAT,
 )
 
 # add(matmul(W, a), matmul(W, b)) → matmul(W, add(a, b))  [reverse]
@@ -175,6 +205,7 @@ FACTOR_MUL = R(
     ),
     Op.make("matmul", "W", Op.make("add", "a", "b")),
     law="Factoring common linear maps (reverse distributivity).",
+    tags=_CAT,
 )
 
 # Right-side bilinearity.  In PyTorch, `x @ W` puts the WEIGHT second, so
@@ -190,6 +221,7 @@ RIGHT_DISTRIBUTE = R(
         "add", Op.make("matmul", "a", "W"), Op.make("matmul", "b", "W")
     ),
     law="Bilinearity: linear maps distribute over addition in BOTH slots.",
+    tags=_CAT,
 )
 
 # a@W + b@W = (a + b) @ W
@@ -200,6 +232,7 @@ RIGHT_FACTOR = R(
     ),
     Op.make("matmul", Op.make("add", "a", "b"), "W"),
     law="Factor a shared right-weight (the slot `x @ W` uses).",
+    tags=_CAT,
 )
 
 # THE WEIGHT-MERGE RULE.  x@W1 + x@W2 = x @ (W1 + W2): two projections of
@@ -212,6 +245,7 @@ WEIGHT_FACTOR = R(
     ),
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input projections: x@W1 + x@W2 = x@(W1+W2).",
+    tags=_CAT,
 )
 
 # x @ (W1 + W2) = x@W1 + x@W2  [reverse: expand for cost-model choice]
@@ -222,6 +256,7 @@ WEIGHT_DISTRIBUTE = R(
         "add", Op.make("matmul", "x", "W"), Op.make("matmul", "x", "W2")
     ),
     law="Reverse weight merge (lets eqsat weigh fused vs split forms).",
+    tags=_CAT,
 )
 
 
@@ -240,6 +275,7 @@ WEIGHT_FACTOR_LINEAR = R(
     Op.make("linear", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input nn.Linears: linear(x,W1)+linear(x,W2)"
     " = linear(x, W1+W2)  (transpose distributes over +).",
+    tags=_CAT,
 )
 
 # linear(linear(x, A), B) = x @ A.T @ B.T = x @ (B@A).T = linear(x, B@A)
@@ -250,6 +286,7 @@ ASSOC_LINEAR = R(
     Op.make("linear", "x", Op.make("matmul", "B", "A")),
     law="Compose stacked nn.Linears: fused weight is B @ A"
     " (transposes flip the product order).",
+    tags=_CAT,
 )
 
 # ------------------------------------------------------------------
@@ -339,6 +376,7 @@ ASSOC_LINEAR_BIAS = R(
     "B-products fold at compile time — one GEMM plus one "
     "broadcast add at runtime.",
     check=_check_linear_bias_compose,
+    tags=_CAT,
 )
 
 # Reverse: expand a fused affine member back into the biased chain —
@@ -358,6 +396,7 @@ ASSOC_LINEAR_BIAS_REV = R(
     Op.make("linear", Op.make("linear", "x", "A", "b1"), "B", "b2"),
     law="Reverse affine composition (eqsat weighs fused vs split).",
     check=_check_linear_bias_compose,
+    tags=_CAT,
 )
 
 # a@W.T + b@W.T = (a+b)@W.T   ->   linear(add(a,b), W)
@@ -368,6 +407,7 @@ RIGHT_FACTOR_LINEAR = R(
     ),
     Op.make("linear", Op.make("add", "a", "b"), "W"),
     law="Factor a shared right-hand nn.Linear weight.",
+    tags=_CAT,
 )
 
 # reverse of weight merge for `linear`
@@ -378,6 +418,7 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
         "add", Op.make("linear", "x", "W"), Op.make("linear", "x", "W2")
     ),
     law="Expand a merged nn.Linear so eqsat can compare both forms.",
+    tags=_CAT,
 )
 
 # ---------------------------------------------------------------------------
@@ -429,6 +470,7 @@ SWIGLU_FUSE = R(
     law="Product universal property: <f,g> = (f x g) . Delta.  Two "
     "projections of the same input are ONE GEMM into V x V, then "
     "project.  (Fused SwiGLU gate/up — MergedColumnParallelLinear.)",
+    tags=_SUB,
 )
 
 # (x@A.T) * (x@B.T)  ->  chunk form without the gate nonlinearity.
@@ -458,6 +500,7 @@ PARALLEL_MUL_FUSE = R(
     ),
     law="Pairing without a gate nonlinearity: mul(<pi1 f>, <pi2 g>) "
     "recovers the parallel-product form.",
+    tags=_SUB,
 )
 
 # ---------------------------------------------------------------------------
@@ -489,6 +532,7 @@ LINEAR_CHANNEL_SCALE = R(
     law="Channel scale is a right diagonal: (xD)W = x(DW).  Folds the "
     "norm's affine gain into the weight at compile time.",
     check=_is_channel_scale,
+    tags=_SYM,
 )
 
 LINEAR_CHANNEL_SCALE_REV = R(
@@ -497,6 +541,7 @@ LINEAR_CHANNEL_SCALE_REV = R(
     Op.make("linear", Op.make("mul", "x", "c"), "W"),
     law="Reverse channel-scale fold (eqsat compares both forms).",
     check=_is_channel_scale,
+    tags=_SYM,
 )
 
 LINEAR_ROW_SCALE = R(
@@ -506,6 +551,7 @@ LINEAR_ROW_SCALE = R(
     law="Row scale is a left diagonal: commutes through the linear map "
     "to the output (naturality of scalar action).",
     check=lambda b: _is_row_scale(b["r"]),
+    tags=_SYM,
 )
 
 LINEAR_ROW_SCALE_REV = R(
@@ -514,6 +560,7 @@ LINEAR_ROW_SCALE_REV = R(
     Op.make("linear", Op.make("mul", "x", "r"), "W"),
     law="Reverse row-scale hoist (eqsat compares both forms).",
     check=lambda b: _is_row_scale(b["r"]),
+    tags=_SYM,
 )
 
 
@@ -609,6 +656,7 @@ QKV_FUSE = R(
     law="Triple pairing <q,k,v> : X -> V^3 — three projections of the "
     "same input are ONE GEMM into the product space, then three "
     "zero-cost chunk projections.  (Fused QKV.)",
+    tags=_SUB,
 )
 
 
@@ -696,6 +744,7 @@ QKV_FUSE_ASYM = R(
     "but the three projections have different output dims — one "
     "GEMM, three uneven split views.  (GQA fused QKV.)",
     derive=_derive_split_sizes,
+    tags=_SUB,
 )
 
 
@@ -825,6 +874,7 @@ GQA_ABSORB = R(
     "the kernel via enable_gqa — pushing Delta into the consumer "
     "deletes the materialisation entirely.",
     check=_check_gqa_absorb,
+    tags=_FUS,
 )
 
 
@@ -962,6 +1012,7 @@ def _make_sdpa_fold_rules() -> list:
                     "the kernel's attn_mask argument.",
                     check=check_add,
                     derive=derive,
+                    tags=_FUS,
                 )
             )
             out.append(
@@ -985,6 +1036,7 @@ def _make_sdpa_fold_rules() -> list:
                     "SDPA's keep-mask.",
                     check=check_mf,
                     derive=derive,
+                    tags=_FUS,
                 )
             )
     return out
@@ -1001,6 +1053,7 @@ NATURALITY_SCALAR = R(
     Op.make("mul", Op.make("matmul", "W", "x"), "c"),
     law="Naturality: scalar multiplication commutes with linear maps.",
     check=lambda b: _is_scalar(b["c"]),
+    tags=_CAT,
 )
 
 NATURALITY_SCALAR_REV = R(
@@ -1009,6 +1062,7 @@ NATURALITY_SCALAR_REV = R(
     Op.make("matmul", "W", Op.make("mul", "x", "c")),
     law="Reverse naturality: pull scalar into the matmul's input.",
     check=lambda b: _is_scalar(b["c"]),
+    tags=_CAT,
 )
 
 # (A @ B) @ C = A @ (B @ C)  — associativity of composition
@@ -1017,6 +1071,7 @@ ASSOC_MATMUL = R(
     Op.make("matmul", "A", Op.make("matmul", "B", "C")),
     Op.make("matmul", Op.make("matmul", "A", "B"), "C"),
     law="Associativity of composition in a category: (f∘g)∘h = f∘(g∘h).",
+    tags=_CAT,
 )
 
 # Reverse direction: explore the other association
@@ -1025,6 +1080,7 @@ ASSOC_MATMUL_REV = R(
     Op.make("matmul", Op.make("matmul", "A", "B"), "C"),
     Op.make("matmul", "A", Op.make("matmul", "B", "C")),
     law="Reverse associativity: f∘(g∘h) = (f∘g)∘h.",
+    tags=_CAT,
 )
 # ---------------------------------------------------------------------------
 #  Rule collections

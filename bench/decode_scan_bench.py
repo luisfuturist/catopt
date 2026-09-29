@@ -66,7 +66,7 @@ Usage:
     .venv/bin/python bench/decode_scan_bench.py --device cpu --quick
     .venv/bin/python bench/decode_scan_bench.py --device cpu
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/decode_scan_bench.py \
         --device cuda
 """
@@ -91,11 +91,16 @@ sys.setrecursionlimit(400_000)
 import torch
 import torch.nn as nn
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.optimize import optimize_model
-from catopt.torch_bridge import export_to_ir
+
+from catopt_torch.torch_bridge import export_to_ir
 from catopt_core.ir import IR
-from catopt_optimize.optimize import _lower_extracted
+from catopt_orchestrator.optimize import _lower_extracted
+
+
 from catopt_torch.adapters import TorchSink
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -379,13 +384,8 @@ def run_cell(
     step_src64 = None
     t0 = time.time()
     try:
-        step_opt64, sstats = optimize_model(
-            step64,
-            (x64[0], h0_64),
-            verbose=False,
-            max_iterations=32,
-            max_enodes=max_enodes,
-        )
+        step_opt64, sstats = Optimizer(backend=TorchBackend()).optimize(step64, (x64[0], h0_64), max_iterations=32, max_enodes=max_enodes, verify=False, verbose=False)
+
         cell["step_opt_s"] = time.time() - t0
         cell["step_lowering"] = sstats.get("lowering")
         cell["step_pairing_groups"] = sstats.get("pairing_groups")
@@ -414,13 +414,8 @@ def run_cell(
     chunk_src64 = None
     t0 = time.time()
     try:
-        chunk_opt64, cstats = optimize_model(
-            chunk64,
-            (x64[:C], h0_64),
-            verbose=False,
-            max_iterations=32,
-            max_enodes=max_enodes,
-        )
+        chunk_opt64, cstats = Optimizer(backend=TorchBackend()).optimize(chunk64, (x64[:C], h0_64), max_iterations=32, max_enodes=max_enodes, verify=False, verbose=False)
+
         cell["chunk_opt_s"] = time.time() - t0
         cell["chunk_lowering"] = cstats.get("lowering")
         cell["chunk_nonlocal_lifts"] = cstats.get("nonlocal_lifts")

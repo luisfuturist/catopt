@@ -54,7 +54,7 @@ Protocol per model (same contract as ``real_win_hunt``):
 
 Usage:
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/model_bench.py \
         --device cuda
     .venv/bin/python bench/model_bench.py --device cpu --quick
@@ -80,11 +80,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.models import ParallelBlock, ParallelConv
-from catopt.optimize import OptimizationResourceError, optimize_model
-from catopt_optimize.autotune import optimize_model_autotuned
+from catopt_torch.models import ParallelBlock, ParallelConv
+from catopt_orchestrator.optimize import OptimizationResourceError
+
+
+
 from real_linear_attn import LinearAttnStack
 from real_win_hunt import _rel_diff, try_compile
+from catopt_orchestrator.optimize import Autotuned
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.autotune import TORCH_BUILDERS
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.  The decoder cell is
 # dropped from --quick: the paired-DAG ``dag_cost`` pass costs ~75s per
@@ -431,13 +438,8 @@ def run_cell(
     # -- fp64 pipeline: the production search + verify -----------------
     t0 = time.time()
     try:
-        del64, st64 = optimize_model(
-            model64,
-            x64_or_t,
-            verbose=False,
-            max_iterations=max_iterations,
-            max_enodes=max_enodes,
-        )
+        del64, st64 = Optimizer(backend=TorchBackend()).optimize(model64, x64_or_t, max_iterations=max_iterations, max_enodes=max_enodes, verify=False, verbose=False)
+
         del64 = del64.to(dev).eval()
         with torch.no_grad():
             d = _rel_diff(del64(*args64), ref64)
@@ -487,19 +489,8 @@ def run_cell(
 
     best = None
     try:
-        best, st32 = optimize_model_autotuned(
-            model32,
-            x32_or_t,
-            candidates=candidates,
-            n_calls=n_calls,
-            warmup=at_warmup,
-            rtol=1e-4,
-            atol=atol_v,
-            budget_s=budget_s,
-            verbose=verbose,
-            max_iterations=max_iterations,
-            max_enodes=max_enodes,
-        )
+        best, st32 = Optimizer(backend=TorchBackend()).optimize(model32, x32_or_t, strategy=Autotuned(candidates, budget_s=budget_s, n_calls=n_calls, warmup=at_warmup, rtol=1e-4, atol=atol_v, verbose=verbose, builders=TORCH_BUILDERS), max_iterations=max_iterations, max_enodes=max_enodes)
+
         at = st32["autotune"]
         rec["lowering32"] = st32.get("lowering")
         parts = []

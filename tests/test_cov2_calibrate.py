@@ -1,4 +1,4 @@
-"""Coverage-gap tests for catopt.calibrate.
+"""Coverage-gap tests for catopt_torch.calibrate.
 
 Beyond the behavioural tests (test_calibrate.py) this file covers:
 
@@ -35,8 +35,8 @@ from pathlib import Path
 import pytest
 import torch
 
-import catopt.calibrate as C
-from catopt.calibrate import (
+import catopt_torch.calibrate as C
+from catopt_torch.calibrate import (
     PROFILE_DIR_ENV,
     TargetProfile,
     calibrate,
@@ -45,8 +45,8 @@ from catopt.calibrate import (
     profiles_dir,
     save_profile,
 )
-from catopt.cost import roofline_cost_for
-from catopt.ir import Op, Param, TensorType, Var
+from catopt_core.cost import roofline_cost_for
+from catopt_core.ir import Op, Param, TensorType, Var
 
 TOY = TargetProfile(
     "toy", tflops=1.5, gbps=20.0, launch_us=4.0, device="cpu",
@@ -237,7 +237,7 @@ def test_measure_leaf_eval_returns_per_leaf_overhead():
 
 
 def test_verbose_ctx_restores_level(caplog):
-    log = logging.getLogger("catopt.calibrate")
+    log = logging.getLogger("catopt_torch.calibrate")
     prev = log.level
     # verbose=False touches nothing
     with C._verbose_ctx(log, False):
@@ -248,7 +248,7 @@ def test_verbose_ctx_restores_level(caplog):
         assert log.level == logging.DEBUG
     assert log.level == prev
     # and DEBUG records actually flow while the context is open
-    with caplog.at_level(logging.DEBUG, logger="catopt.calibrate"):
+    with caplog.at_level(logging.DEBUG, logger="catopt_torch.calibrate"):
         with C._verbose_ctx(log, True):
             log.debug("surfaced only when verbose")
         # restore honours whatever level was in place (here caplog's)
@@ -305,7 +305,7 @@ def test_calibrate_cuda_branch_monkeypatched(monkeypatch, caplog):
     prev = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = True
     try:
-        with caplog.at_level(logging.DEBUG, logger="catopt.calibrate"):
+        with caplog.at_level(logging.DEBUG, logger="catopt_torch.calibrate"):
             p = calibrate(device="cuda", quick=True, verbose=True)
         assert p.device == "cuda"
         assert p.name == "Fake GPU"

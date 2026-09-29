@@ -13,9 +13,9 @@ import ast
 import logging
 from pathlib import Path
 
-from catopt.calibrate import calibrate
-from catopt.egraph import EGraph
-from catopt.ir import Op, Param, TensorType, Var
+from catopt_torch.calibrate import calibrate
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, Param, TensorType, Var
 from catopt_core.laws import ASSOC_LINEAR_BIAS
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -102,16 +102,15 @@ def test_verbose_true_yields_debug(caplog):
     with caplog.at_level(logging.DEBUG):
         calibrate(device="cpu", quick=True, verbose=True)
     assert any(
-        r.name == "catopt_optimize.calibrate" and r.levelno == logging.DEBUG
+        r.name == "catopt_torch.calibrate" and r.levelno == logging.DEBUG
         for r in caplog.records
     )
 
 
 def test_verbose_restores_logger_level(caplog):
-    # The real logger lives under the domain package's name —
-    # `catopt.calibrate` is only a sys.modules alias and would name a
-    # DIFFERENT logger object (making the restore check vacuous).
-    log = logging.getLogger("catopt_optimize.calibrate")
+    # `catopt_torch.calibrate` is the real logger home — name it
+    # directly (the façade's sys.modules alias layer is gone).
+    log = logging.getLogger("catopt_torch.calibrate")
     prev = log.level
     with caplog.at_level(logging.DEBUG):
         calibrate(device="cpu", quick=True, verbose=True)

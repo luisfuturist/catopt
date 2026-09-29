@@ -102,7 +102,16 @@ from typing import Any
 import torch
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Op, op_def
-from catopt_core.laws import R
+from catopt_core.laws import R as _R
+from catopt_core.laws import RuleSet
+from catopt_core.laws import tags as _tags
+
+
+def R(name: str, lhs, rhs, **kw) -> Rewrite:
+    """Module-local law constructor — trace laws carry the ``CARRIER`` tag."""
+    kw.setdefault("tags", (_tags.CARRIER,))
+    return _R(name, lhs, rhs, **kw)
+
 
 __all__ = [
     "TORCH_BINDINGS",
@@ -676,6 +685,13 @@ TRACE_LAWS: list[Rewrite] = [
     TR_EXPAND,
     TR_COLLAPSE,
 ]
+
+#: The same set as a composable :class:`~catopt_core.laws.RuleSet`.
+TRACE_RULES = RuleSet(
+    "trace",
+    tuple(TRACE_LAWS),
+    description="the traced-monoidal axioms (linear fixpoints)",
+)
 
 
 # ---------------------------------------------------------------------------

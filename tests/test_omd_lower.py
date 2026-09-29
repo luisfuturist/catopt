@@ -7,7 +7,7 @@ The coefficient maps inside the leaves are ``stack(affd_a f_j)`` /
 ``stack(affd_b f_j)`` over per-step compose chains: O(T²) unrolled
 nodes that the generic IRModule dispatches one torch call at a time.
 
-:class:`catopt.omd_lower.BatchedOmdModule` gathers all per-step
+:class:`catopt_carriers.omd_lower.BatchedOmdModule` gathers all per-step
 ``(a, b)`` pairs once, computes every prefix map with a blocked
 associative scan (chain shape) or a level-batched forest (arbitrary
 bracketing), batches the omd_compose levels, then applies the root —
@@ -16,19 +16,19 @@ fp64-equivalent to both the eager model and the serial lowering.
 
 import pytest
 import torch
-from catopt.cost import flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.omd_lower import (
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.omd_lower import (
     BatchedOmdModule,
     build_omd_plan,
     is_omd_apply_term,
     to_batched_omd_module,
 )
-from catopt.regime import default_rules
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.trace_lift import lift_scan_to_trace
-from catopt.xcarrier import (
+from catopt_torch.regime import default_rules
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_carriers.trace_lift import lift_scan_to_trace
+from catopt_carriers.xcarrier import (
     gather_apply_stack,
     gather_applyd_stack,
     omd_tree_lift,
@@ -501,7 +501,7 @@ def test_scanattn_omd_member_end_to_end(T):
 
 def test_fallback_non_omd_root():
     """Non-omd IR: BatchedOmdModule delegates to serial evaluation."""
-    from catopt.models import SwiGLU
+    from catopt_torch.models import SwiGLU
 
     torch.manual_seed(0)
     m = SwiGLU(16, hidden_mult=2).eval()

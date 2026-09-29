@@ -22,7 +22,7 @@ from radon.complexity import cc_visit
 from radon.visitors import Class
 
 ROOT = Path(__file__).resolve().parent.parent
-TARGETS = ["packages", "catopt"]
+TARGETS = ["packages"]
 BASELINE = Path(__file__).resolve().parent / "complexity_baseline.json"
 # Rank-C boundary: a brand-new function may be at most this complex
 # before it must be justified and added to the baseline explicitly.

@@ -1,4 +1,4 @@
-"""Coverage-gap tests for catopt.meta.
+"""Coverage-gap tests for catopt_core.meta.
 
 The behavioural suite (test_meta / test_synthesis_*) exercises the
 happy paths of ``canonicalize``/``stratified_run``/``synthesize_rules``.
@@ -30,9 +30,9 @@ import types
 import pytest
 import torch
 
-from catopt import meta
-from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Const, Op, Param, TensorType, Var
+from catopt_core import meta
+from catopt_core.egraph import EGraph, Rewrite
+from catopt_core.ir import Const, Op, Param, TensorType, Var
 
 
 def _T(*shape):

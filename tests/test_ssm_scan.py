@@ -36,10 +36,10 @@ import pytest
 import torch
 
 from catopt_core import laws as R
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, op_repr
-from catopt.models.ssm import DiagDenseSSM, DiagonalSSM, SelectiveSSM
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Var, op_repr
+from catopt_torch.models.ssm import DiagDenseSSM, DiagonalSSM, SelectiveSSM
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 
 def _opdepth(t, memo):

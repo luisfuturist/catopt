@@ -15,23 +15,23 @@ import pytest
 import torch
 
 from catopt_core import laws as R
-from catopt.calibrate import (
+from catopt_torch.calibrate import (
     PROFILE_DIR_ENV,
     TargetProfile,
     save_profile,
 )
-from catopt.cost import (
+from catopt_core.cost import (
     flops_cost,
     launch_aware_cost,
     roofline_cost,
     roofline_cost_for,
 )
-from catopt.egraph import EGraph, verify_certificate
-from catopt.ir import IR, Op, TensorType, Var, op_repr
-from catopt.models.ssm import DiagonalSSM
-from catopt.om import OM_LAWS
-from catopt.om_lower import is_om_apply_term
-from catopt.regime import (
+from catopt_core.egraph import EGraph, verify_certificate
+from catopt_core.ir import IR, Op, TensorType, Var, op_repr
+from catopt_torch.models.ssm import DiagonalSSM
+from catopt_carriers.om import OM_LAWS
+from catopt_carriers.om_lower import is_om_apply_term
+from catopt_torch.regime import (
     EXECUTORS,
     Regime,
     RegimeDispatch,
@@ -42,8 +42,8 @@ from catopt.regime import (
     regime_dispatch,
     regime_frontier,
 )
-from catopt.scan_lower import is_scan_apply_term
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_carriers.scan_lower import is_scan_apply_term
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 # ---------------------------------------------------------------------------
 # fixtures / helpers
@@ -412,7 +412,7 @@ class TestDegradation:
 
 
 # ---------------------------------------------------------------------------
-# target profiles (catopt.calibrate) wired into regimes
+# target profiles (catopt_torch.calibrate) wired into regimes
 # ---------------------------------------------------------------------------
 
 # Toy profiles spanning the roofline space.  GPUISH is a fat discrete

@@ -1,7 +1,7 @@
 """TorchMeter — the torch :class:`~catopt_core.ports.Meter` port.
 
 The autotuned strategy's wall-clock timing, moved verbatim from
-``catopt_optimize.autotune`` (plan 0007): ``warmup`` untimed calls
+``catopt_orchestrator.autotune`` (plan 0007): ``warmup`` untimed calls
 then ``n_calls`` timed forwards, median + IQR of wall seconds.
 CUDA inputs end every timed call in ``torch.cuda.synchronize`` so the
 measured time includes the GPU tail.

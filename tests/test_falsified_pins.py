@@ -17,8 +17,13 @@ tests pin the code-side consequences on main:
 import torch
 import torch.nn as nn
 
-from catopt.cost import param_bytes_cost_for
-from catopt.optimize import optimize_model, param_report
+from catopt_core.cost import param_bytes_cost_for
+from catopt_torch.composer import param_report
+from catopt_orchestrator import Optimizer
+
+
+from catopt_torch.backend import TorchBackend
+
 
 
 def _randn(shape, g):
@@ -62,9 +67,8 @@ def test_unmerged_adapter_no_phantom_savings():
     torch.manual_seed(0)
     model = _AdapterUnmerged().eval().double()
     x = torch.randn(4, _AdapterUnmerged.I, dtype=torch.float64)
-    low, _stats = optimize_model(
-        model, x, cost_fn=param_bytes_cost_for(), verbose=False
-    )
+    low, _stats = Optimizer(backend=TorchBackend()).optimize(model, x, cost_fn=param_bytes_cost_for(), verify=False, verbose=False)
+
     with torch.no_grad():
         ref = model(x.clone())
         out = low(x.clone())

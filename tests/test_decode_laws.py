@@ -17,9 +17,9 @@ The bandwidth-bound slice of the rewrite surface (see the audit in
 """
 
 import torch
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_torch.torch_bridge import ir_to_torch_module
 from catopt_carriers.decode_laws import (
     DECODE_LAWS,
     _check_cat_prefix,
@@ -186,7 +186,7 @@ def test_kv_append_declines_at_egraph_level():
 def test_kv_append_from_exported_graph():
     """torch.export emits cat(slice(buf,0,n), new) — the law fires on
     the real boundary spelling, and the extracted write is exact."""
-    from catopt.torch_bridge import export_to_ir
+    from catopt_torch.torch_bridge import export_to_ir
 
     class KVAppend(torch.nn.Module):
         def forward(self, buf, new):

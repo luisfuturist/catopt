@@ -21,8 +21,8 @@ from types import SimpleNamespace
 import catopt_core.ops as ops_mod
 import pytest
 import torch
-from catopt.ops import OpTable
-from catopt.torch_bridge import _IR_TO_TORCH
+from catopt_core.ops import OpTable
+from catopt_torch.torch_bridge import _IR_TO_TORCH
 
 _real_import_module = importlib.import_module
 

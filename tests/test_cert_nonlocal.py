@@ -32,10 +32,10 @@ What these tests prove:
 import pytest
 import torch
 
-import catopt.trace as _cat_trace  # noqa: F401  torch bindings
+import catopt_carriers.trace as _cat_trace  # noqa: F401  torch bindings
 
 # (trace/parl/eye/concat)
-from catopt.egraph import (
+from catopt_core.egraph import (
     CertificateVerificationError,
     EGraph,
     Rewrite,
@@ -43,9 +43,9 @@ from catopt.egraph import (
     _term_match,
     verify_certificate,
 )
-from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
-from catopt.torch_bridge import ir_to_torch_module
-from catopt.trace_lift import lift_scan_to_trace
+from catopt_core.ir import IR, Const, Op, Param, TensorType, Var, op_repr
+from catopt_torch.torch_bridge import ir_to_torch_module
+from catopt_carriers.trace_lift import lift_scan_to_trace
 
 
 @pytest.fixture(autouse=True)

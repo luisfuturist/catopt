@@ -22,7 +22,7 @@ members = [
     "catopt-carriers",
     "catopt-core",
     "catopt-cuda",
-    "catopt-optimize",
+    "catopt-orchestrator",
     "catopt-torch",
 ]
 
@@ -185,7 +185,7 @@ dependencies = [
     { name = "catopt-carriers" },
     { name = "catopt-core" },
     { name = "catopt-cuda" },
-    { name = "catopt-optimize" },
+    { name = "catopt-orchestrator" },
     { name = "catopt-torch" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -245,7 +245,7 @@ requires-dist = [
     { name = "catopt-carriers", editable = "packages/catopt-carriers" },
     { name = "catopt-core", editable = "packages/catopt-core" },
     { name = "catopt-cuda", editable = "packages/catopt-cuda" },
-    { name = "catopt-optimize", editable = "packages/catopt-optimize" },
+    { name = "catopt-orchestrator", editable = "packages/catopt-orchestrator" },
     { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.168.1" },
@@ -330,9 +330,9 @@ requires-dist = [
 ]
 
 [[package]]
-name = "catopt-optimize"
+name = "catopt-orchestrator"
 version = "0.1.0.dev0"
-source = { editable = "packages/catopt-optimize" }
+source = { editable = "packages/catopt-orchestrator" }
 dependencies = [
     { name = "catopt-core" },
 ]
@@ -346,14 +346,14 @@ version = "0.1.0.dev0"
 source = { editable = "packages/catopt-torch" }
 dependencies = [
     { name = "catopt-core" },
-    { name = "catopt-optimize" },
+    { name = "catopt-orchestrator" },
     { name = "torch" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "catopt-core", editable = "packages/catopt-core" },
-    { name = "catopt-optimize", editable = "packages/catopt-optimize" },
+    { name = "catopt-orchestrator", editable = "packages/catopt-orchestrator" },
     { name = "torch", specifier = ">=2.0" },
 ]
 

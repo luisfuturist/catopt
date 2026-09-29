@@ -5,8 +5,8 @@ The pipeline's two phases are separate verbs (plan 0006):
 * ``search : (Source + Capabilities) -> IR -> EGraph -> extracted term``
 * ``lower  : (Sink + Runner)         -> term -> runnable -> verified``
 
-:func:`catopt_optimize.optimize.search` produces a
-:class:`SearchResult`; :func:`catopt_optimize.optimize.lower` consumes
+:func:`catopt_orchestrator.optimize.search` produces a
+:class:`SearchResult`; :func:`catopt_orchestrator.optimize.lower` consumes
 one and returns a :class:`LowerResult`.  The *objects* live in
 ``catopt_core`` — torch-free, backend-neutral — because they are part
 of the hexagonal contract, not of any one orchestrator: a caller can

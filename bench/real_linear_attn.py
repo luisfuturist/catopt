@@ -103,19 +103,26 @@ sys.setrecursionlimit(400_000)
 import torch
 import torch.nn as nn
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, op_repr
-from catopt.laws import SCAN_DIAG_LAWS, SCAN_LAWS
-from catopt.optimize import OptimizationResourceError, optimize_model
-from catopt_optimize.optimize import _lower_extracted
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, op_repr
+from catopt_core.laws import SCAN_DIAG_LAWS, SCAN_LAWS
+from catopt_orchestrator.optimize import OptimizationResourceError
+
+
+from catopt_orchestrator.optimize import _lower_extracted
+
+
 from catopt_torch.adapters import TorchSink
-from catopt.scan_lower import (
+from catopt_carriers.scan_lower import (
     build_scan_plan,
     is_scan_apply_term,
     to_batched_scan_module,
 )
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 from catopt_core.egraph.types import _LeafRegistry
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 _APPLY_OPS = ("apply", "applyd")
 
@@ -878,13 +885,8 @@ def run_cell(
     elif opt_max_t >= T:
         t0 = time.time()
         try:
-            opt64, ostats = optimize_model(
-                m64,
-                x64,
-                verbose=False,
-                max_iterations=32,
-                max_enodes=300_000,
-            )
+            opt64, ostats = Optimizer(backend=TorchBackend()).optimize(m64, x64, max_iterations=32, max_enodes=300_000, verify=False, verbose=False)
+
             cell["opt_pipeline_s"] = time.time() - t0
             cell["opt_nonlocal_lifts"] = ostats.get("nonlocal_lifts")
             cell["opt_pairing_groups"] = ostats.get("pairing_groups")

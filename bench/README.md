@@ -112,7 +112,7 @@ python bench/search_efficiency.py --exact-max 11              # exact saturation
 For the k-chain the equivalent space is Catalan(k−1) (exact) /
 k!·Catalan under comm. Sweeps saturation stats vs k; reports enodes
 (bounded ~O(k³) live) vs the exponential program space, rule fires,
-wall/extract times, and the `optimize_model` end-to-end path.
+wall/extract times, and the `Optimizer.optimize` end-to-end path.
 Honest about the limits: exact saturation re-enumerates substitutions
 over fragmented classes past k≈11 (k=11 ≈ 17s); production uses
 `rule_budgets`/`meta.canonicalize`, which is precisely why the

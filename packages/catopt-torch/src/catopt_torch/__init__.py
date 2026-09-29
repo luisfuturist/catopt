@@ -14,10 +14,10 @@ Plan 0007 adds the backend ports — :func:`~catopt_torch.backend.TorchBackend`
 (:class:`~catopt_torch.runners.TorchCompileRunner`), the torch halves
 of the regime machinery (:mod:`~catopt_torch.regime`) and calibration
 (:mod:`~catopt_torch.calibrate`), the production export helpers
-(:mod:`~catopt_torch.export`), and the deprecated ``optimize_*``
-wrappers (:mod:`~catopt_torch.api`).  All resolve lazily — importing
-``catopt_torch`` pulls no pipeline machinery until the names are
-touched.
+(:mod:`~catopt_torch.export`), and the torch autotune candidate
+builders (:mod:`~catopt_torch.autotune`).  The public names below
+resolve lazily — importing ``catopt_torch`` pulls no pipeline
+machinery until the names are touched.
 """
 
 import importlib
@@ -38,9 +38,7 @@ _DELEGATED = {
     "TorchComposer": "catopt_torch.composer",
     "TorchMeter": "catopt_torch.meter",
     "TorchCompileRunner": "catopt_torch.runners",
-    "optimize_model": "catopt_torch.api",
-    "optimize_compositional": "catopt_torch.api",
-    "optimize_model_autotuned": "catopt_torch.api",
+    "TORCH_BUILDERS": "catopt_torch.autotune",
     "RegimeDispatch": "catopt_torch.regime",
     "regime_dispatch": "catopt_torch.regime",
     "calibrate": "catopt_torch.calibrate",

@@ -9,16 +9,21 @@ cost is blind to the lowering (``bench/cost_fidelity.py``).
 
 import pytest
 import torch
-from catopt.cost import flops_cost
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.torch_bridge import ir_to_torch_module
-from catopt_optimize.optimize import _lower_extracted
-from catopt_optimize.runners import (
-    ChainedRunner,
-    CudaGraphRunner,
-    TorchCompileRunner,
-)
+from catopt_core.cost import flops_cost
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_torch.torch_bridge import ir_to_torch_module
+from catopt_orchestrator.optimize import _lower_extracted
+
+
+from catopt_orchestrator.runners import ChainedRunner
+
+from catopt_cuda import CudaGraphRunner
+from catopt_torch.runners import TorchCompileRunner
+
 from catopt_torch.adapters import TorchSink
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _T(shape):
@@ -143,7 +148,7 @@ def test_plain_term_routes_to_sink_lower():
 def test_optimize_model_compile_delivers_fused_module():
     """runner=TorchCompileRunner() wraps the routed module in
     torch.compile and verifies output; stats records what ran."""
-    from catopt.optimize import optimize_model
+
 
     torch.manual_seed(0)
     m = torch.nn.Sequential(
@@ -152,9 +157,8 @@ def test_optimize_model_compile_delivers_fused_module():
     x = torch.rand(4, 8)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(
-            m, x, verbose=False, runner=TorchCompileRunner()
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), runner=TorchCompileRunner()).optimize(m, x, verify=False, verbose=False)
+
     assert stats["compiled"] is True
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
@@ -163,7 +167,7 @@ def test_optimize_model_compile_delivers_fused_module():
 def test_optimize_model_compile_failure_falls_back(monkeypatch):
     """A compile failure keeps the uncompiled module — the optimized
     term still ships."""
-    import catopt_optimize.optimize as O
+    import catopt_orchestrator.optimize as O
 
     torch.manual_seed(0)
     m = torch.nn.Sequential(
@@ -176,10 +180,9 @@ def test_optimize_model_compile_failure_falls_back(monkeypatch):
         def boom(mod):
             raise RuntimeError("no compiler")
 
-        monkeypatch.setattr(O.torch, "compile", boom)
-        mod, stats = O.optimize_model(
-            m, x, verbose=False, runner=TorchCompileRunner()
-        )
+        monkeypatch.setattr(torch, "compile", boom)
+        mod, stats = Optimizer(backend=TorchBackend(), runner=TorchCompileRunner()).optimize(m, x, verify=False, verbose=False)
+
     assert stats["compiled"] is False
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
@@ -188,7 +191,9 @@ def test_optimize_model_compile_failure_falls_back(monkeypatch):
 def test_delivered_cost_priced_by_executor():
     """Carrier-rooted plannable terms price under the batched
     lowering; non-carrier terms under generic."""
-    from catopt_optimize.optimize import _delivered_cost
+    from catopt_orchestrator.optimize import _delivered_cost
+
+
 
     ir, h, env = _scan_ir()
     batched = _delivered_cost(ir.root)
@@ -200,15 +205,16 @@ def test_delivered_cost_priced_by_executor():
 
 def test_carrier_upgrade_swaps_to_batched_member():
     """A cheaper batched applyd member replaces the additive winner."""
-    from catopt.models import LinearRecurrence
-    from catopt.optimize import optimize_model
+    from catopt_torch.models import LinearRecurrence
+
 
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
     x = torch.rand(8, 4, dtype=torch.float64)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(m, x, verbose=False)
+        mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     assert stats["lowering"] == "batched"
     assert getattr(mod, "is_batched", False)
     with torch.no_grad():
@@ -221,15 +227,16 @@ def test_optimize_model_delivered_module_captures_cuda_graph():
     scan-shaped model takes the CUDA-graph path — capture replays the
     identical computation, a changed input flows through the static
     buffers, and ``drop_cuda_graph`` restores the eager path."""
-    from catopt.models import LinearRecurrence
-    from catopt.optimize import optimize_model
+    from catopt_torch.models import LinearRecurrence
+
 
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double().cuda()
     x = torch.rand(8, 4, dtype=torch.float64, device="cuda")
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(m, x, verbose=False)
+        mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     assert stats["lowering"] == "batched"
     assert getattr(mod, "is_batched", False)
 
@@ -249,13 +256,13 @@ def test_optimize_model_delivered_module_captures_cuda_graph():
 def test_lift_scan_to_applyd_offers_carrier_member():
     """The nonlocal lift seeds applyd members on recurrence classes
     without saturating the carrier laws."""
-    from catopt.egraph import EGraph
-    from catopt.models import LinearRecurrence
-    from catopt.scan_lower import (
+    from catopt_core.egraph import EGraph
+    from catopt_torch.models import LinearRecurrence
+    from catopt_carriers.scan_lower import (
         is_scan_apply_term,
         to_batched_scan_module,
     )
-    from catopt.torch_bridge import export_to_ir
+    from catopt_torch.torch_bridge import export_to_ir
     from catopt_carriers.trace_lift import lift_scan_to_applyd
 
     torch.manual_seed(0)
@@ -296,9 +303,9 @@ def test_lift_scan_to_applyd_offers_carrier_member():
 def test_lift_scan_to_applyd_skips_existing_carrier():
     """A second pass offers nothing — classes already carrying an
     apply form are skipped."""
-    from catopt.egraph import EGraph
-    from catopt.models import LinearRecurrence
-    from catopt.torch_bridge import export_to_ir
+    from catopt_core.egraph import EGraph
+    from catopt_torch.models import LinearRecurrence
+    from catopt_torch.torch_bridge import export_to_ir
     from catopt_carriers.trace_lift import lift_scan_to_applyd
 
     torch.manual_seed(0)
@@ -315,8 +322,10 @@ def test_lift_scan_to_applyd_skips_existing_carrier():
 def test_delivered_cost_declines_non_plannable_carrier():
     """A carrier-rooted term whose batched plan can't be built prices
     as generic — the module would degrade to serial eval anyway."""
-    from catopt.cost import executor_cost_for
-    from catopt_optimize.optimize import _delivered_cost
+    from catopt_core.cost import executor_cost_for
+    from catopt_orchestrator.optimize import _delivered_cost
+
+
 
     h = Var("h", _T((2,)))
     t = Op.make(
@@ -335,8 +344,10 @@ def test_delivered_cost_declines_non_plannable_carrier():
 
 def test_carrier_upgrade_returns_incumbent_when_no_carriers():
     """No carrier enodes at root -> incumbent returned unchanged."""
-    from catopt.egraph import EGraph
-    from catopt_optimize.optimize import _carrier_upgrade
+    from catopt_core.egraph import EGraph
+    from catopt_orchestrator.optimize import _carrier_upgrade
+
+
 
     x = Var("x", _T((3,)))
     t = Op.make("add", x, _P("p_w", (3,)))
@@ -347,8 +358,8 @@ def test_carrier_upgrade_returns_incumbent_when_no_carriers():
 
 def test_carrier_upgrade_handles_failed_extraction(monkeypatch):
     """An override extraction yielding None is skipped."""
-    import catopt_optimize.optimize as O
-    from catopt.egraph import EGraph
+    import catopt_orchestrator.optimize as O
+    from catopt_core.egraph import EGraph
 
     ir, h, env = _scan_ir()
     eg = EGraph()
@@ -366,8 +377,8 @@ def test_carrier_upgrade_handles_failed_extraction(monkeypatch):
 def test_carrier_upgrade_swaps_when_delivered_cheaper(monkeypatch):
     """Carrier member wins when its delivered (batched) price beats
     the incumbent's delivered price."""
-    import catopt_optimize.optimize as O
-    from catopt.egraph import EGraph
+    import catopt_orchestrator.optimize as O
+    from catopt_core.egraph import EGraph
 
     ir, h, env = _scan_ir()
     eg = EGraph()
@@ -384,7 +395,7 @@ def test_carrier_upgrade_swaps_when_delivered_cheaper(monkeypatch):
         "_delivered_cost",
         lambda t, profile=None, compiled=False: (
             1.0
-            if isinstance(t, Op) and t.op in O._CARRIER_PLANS
+            if isinstance(t, Op) and t.op in O._carrier_plans()
             else 100.0
         ),
     )
@@ -412,15 +423,14 @@ def test_batched_module_exposes_param_map():
 def test_cuda_graph_runner_noop_on_cpu():
     """runner=CudaGraphRunner() on a CPU input: stats records False,
     module is unchanged — the runner is a no-op off-CUDA."""
-    from catopt.models import LinearRecurrence
-    from catopt.optimize import optimize_model
+    from catopt_torch.models import LinearRecurrence
+
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
     x = torch.rand(8, 4, dtype=torch.float64)
     with torch.no_grad():
-        mod, stats = optimize_model(
-            m, x, verbose=False, runner=CudaGraphRunner()
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), runner=CudaGraphRunner()).optimize(m, x, verify=False, verbose=False)
+
     assert stats.get("cuda_graph") is False
     with torch.no_grad():
         assert torch.allclose(mod(x), m(x))
@@ -429,18 +439,14 @@ def test_cuda_graph_runner_noop_on_cpu():
 def test_cuda_graph_skipped_when_compiled():
     """[TorchCompileRunner, CudaGraphRunner]: the compiled module wins —
     capture is not attempted on it (no capture attr)."""
-    from catopt.models import LinearRecurrence
-    from catopt.optimize import optimize_model
+    from catopt_torch.models import LinearRecurrence
+
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
     x = torch.rand(8, 4, dtype=torch.float64)
     with torch.no_grad():
-        mod, stats = optimize_model(
-            m,
-            x,
-            verbose=False,
-            runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])).optimize(m, x, verify=False, verbose=False)
+
     if stats.get("compiled"):
         assert stats.get("cuda_graph") is None
 
@@ -448,24 +454,25 @@ def test_cuda_graph_skipped_when_compiled():
 def test_cuda_graph_tuple_input_noop_on_cpu():
     """Tuple/list example inputs don't crash the cuda_graph path —
     non-tensor first elements degrade quietly to cuda_graph=False."""
-    from catopt.models import LinearRecurrence
-    from catopt.optimize import optimize_model
+    from catopt_torch.models import LinearRecurrence
+
     torch.manual_seed(0)
     m = LinearRecurrence(4, 8).eval().double()
     x = torch.rand(8, 4, dtype=torch.float64)
     with torch.no_grad():
         # tuple input that isn't CUDA → no capture, no crash
-        mod, stats = optimize_model(
-            m, (x,), verbose=False, runner=CudaGraphRunner()
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), runner=CudaGraphRunner()).optimize(m, (x,), verify=False, verbose=False)
+
     assert stats.get("cuda_graph") is False
 
 
 def test_delivered_cost_compiled_prices_fusion_regions():
     """compiled=True: every candidate prices under the fusion-region
     model — a 128-leaf pointwise spine bills ~1 kernel, not per-node."""
-    from catopt.cost import executor_cost_for
-    from catopt_optimize.optimize import _delivered_cost
+    from catopt_core.cost import executor_cost_for
+    from catopt_orchestrator.optimize import _delivered_cost
+
+
 
     ir, h, env = _scan_ir()
     assert _delivered_cost(

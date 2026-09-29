@@ -1,4 +1,4 @@
-"""catopt-optimize — the backend-neutral optimizer orchestrator.
+"""catopt-orchestrator — the backend-neutral optimizer orchestrator.
 
 The public seam (plan 0006/0007): :class:`Optimizer` — the configured
 entry point over an explicit
@@ -11,24 +11,20 @@ and their result objects (:class:`SearchResult` /
 :class:`Monolithic` / :class:`Compositional` / :class:`Autotuned`.
 
 This package imports **no backend**: no torch, no
-``catopt_torch``, no ``catopt_cuda``.  The deprecated
-``optimize_*`` wrappers with their torch defaults moved to
-``catopt_torch.api``; they resolve lazily through module
-``__getattr__`` — the historical names still work on a torch
-install (``catopt.optimize_model`` and friends), but importing this
-package alone never loads a tensor library.  The
-executor/dispatch (:mod:`catopt_optimize.regime`), runner
-(:mod:`catopt_optimize.runners`), calibrate and export module paths
-are likewise lazy shims.
+``catopt_torch``, no ``catopt_cuda``.  Backend specifics arrive
+through the ports the caller passes — e.g.
+``Optimizer(backend=TorchBackend())`` with
+``catopt_torch.backend.TorchBackend``.  The delivery runners live
+with their backends (:class:`catopt_torch.runners.TorchCompileRunner`,
+:class:`catopt_cuda.CudaGraphRunner`); the neutral
+:class:`IdentityRunner` / :class:`ChainedRunner` /
+:func:`runner_candidate` live in :mod:`catopt_orchestrator.runners`.
 """
-
-import importlib
-from typing import Any
 
 from catopt_core.pipeline import Backend, LowerResult, SearchResult
 from catopt_core.ports import Criterion, Runner
 
-from catopt_optimize.criteria import (
+from catopt_orchestrator.criteria import (
     Blend,
     CompiledCriterion,
     Criteria,
@@ -39,7 +35,7 @@ from catopt_optimize.criteria import (
     criteria_cost,
     peak_bytes_cost,
 )
-from catopt_optimize.optimize import (
+from catopt_orchestrator.optimize import (
     Autotuned,
     Compositional,
     Monolithic,
@@ -49,13 +45,14 @@ from catopt_optimize.optimize import (
     lower,
     search,
 )
-from catopt_optimize.runners import (
+from catopt_orchestrator.runners import (
     ChainedRunner,
     IdentityRunner,
     runner_candidate,
 )
 
 __all__ = [
+    "DEFAULT_RULES",
     "Autotuned",
     "Backend",
     "Blend",
@@ -64,9 +61,7 @@ __all__ = [
     "Compositional",
     "Criteria",
     "Criterion",
-    "CudaGraphRunner",
     "DepthCriterion",
-    "ExportError",
     "FlopsCriterion",
     "IdentityRunner",
     "LatencyCriterion",
@@ -77,54 +72,35 @@ __all__ = [
     "Optimizer",
     "Runner",
     "SearchResult",
-    "TorchCompileRunner",
     "criteria_cost",
+    "default_rules",
     "discover_alternatives",
-    "export_optimized",
-    "load_optimized",
     "lower",
-    "optimize_compositional",
-    "optimize_model",
-    "optimize_model_autotuned",
     "peak_bytes_cost",
     "runner_candidate",
-    "save_optimized",
     "search",
 ]
 
-# ---------------------------------------------------------------------------
-# Compatibility delegation — moved torch-facing names (lazy)
-# ---------------------------------------------------------------------------
-#
-# The deprecated ``optimize_*`` entry points resolve torch defaults,
-# so they live in ``catopt_torch.api``; the runner implementations in
-# ``catopt_torch.runners`` / ``catopt_cuda``; the export helpers in
-# ``catopt_torch.export``.  These resolve lazily so importing the
-# orchestrator never loads a backend, while
-# ``from catopt_optimize import optimize_model`` still works on a
-# torch install.
 
-_DELEGATED = {
-    # torch-defaulted wrappers
-    "optimize_model": "catopt_torch.api",
-    "optimize_compositional": "catopt_torch.api",
-    "optimize_model_autotuned": "catopt_torch.api",
-    # torch delivery runners
-    "TorchCompileRunner": "catopt_torch.runners",
-    "CudaGraphRunner": "catopt_cuda",
-    # torch production export
-    "ExportError": "catopt_torch.export",
-    "export_optimized": "catopt_torch.export",
-    "load_optimized": "catopt_torch.export",
-    "save_optimized": "catopt_torch.export",
-}
+def __getattr__(name: str):
+    """Lazily resolve the backend-coupled surfaces.
 
+    ``DEFAULT_RULES`` composes ``catopt_core.laws.DEFAULT`` with the
+    carrier-package ``CARRIERS`` preset on first access, and
+    ``default_rules`` is its accessor — both keep
+    ``import catopt_orchestrator`` free of the (torch-coupled)
+    carriers package.
+    """
+    if name in ("DEFAULT_RULES", "default_rules"):
+        from catopt_orchestrator import optimize
 
-def __getattr__(name: str) -> Any:
-    """Resolve the moved torch-facing names lazily."""
-    mod = _DELEGATED.get(name)
-    if mod is not None:
-        return getattr(importlib.import_module(mod), name)
+        value = optimize.default_rules()
+        resolved = {
+            "DEFAULT_RULES": value,
+            "default_rules": optimize.default_rules,
+        }
+        globals().update(resolved)
+        return resolved[name]
     raise AttributeError(
         f"module {__name__!r} has no attribute {name!r}"
     )

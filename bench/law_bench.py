@@ -65,12 +65,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.adapters import TorchSink
-from catopt.cost import backend_cost, dag_cost, executor_cost_for
-from catopt.egraph import EGraph, Rewrite
-from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
-from catopt.optimize import _lower_extracted
-from catopt.torch_bridge import IRModule  # noqa: F401 — docstring ref
+from catopt_torch.adapters import TorchSink
+from catopt_core.cost import backend_cost, dag_cost, executor_cost_for
+from catopt_core.egraph import EGraph, Rewrite
+from catopt_core.ir import IR, Const, Op, Param, TensorType, Var, op_repr
+from catopt_orchestrator.optimize import _lower_extracted
+
+
+from catopt_torch.torch_bridge import IRModule  # noqa: F401 — docstring ref
 from catopt_core.laws import (
     ALL_RULES,
     CATEGORICAL_RULES,

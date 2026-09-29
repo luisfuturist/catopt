@@ -1,4 +1,4 @@
-"""Coverage-gap tests for catopt.cost.
+"""Coverage-gap tests for catopt_core.cost.
 
 ``tests/test_cost.py`` covers the flagship semantics — broadcasting,
 weight dedup, the storage cost axis, the e-graph end-to-end.  This file
@@ -37,7 +37,7 @@ import numpy as np
 import pytest
 import torch
 
-from catopt.cost import (
+from catopt_core.cost import (
     _INVALID_COST,
     _LAUNCH_S,
     CostModel,
@@ -58,8 +58,8 @@ from catopt.cost import (
     roofline_cost,
     roofline_cost_for,
 )
-from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.typing import _INVALID, _shape_of
+from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_core.typing import _INVALID, _shape_of
 
 
 def _v(name: str, *shape) -> Var:
@@ -106,7 +106,7 @@ def test_flops_conv2d_groups_and_fallback():
 
 
 def _numel_of(t) -> int:
-    from catopt.typing import _numel
+    from catopt_core.typing import _numel
 
     return _numel(_shape_of(t))
 

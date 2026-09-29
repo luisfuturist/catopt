@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.xcarrier — the cross-carrier guards,
+"""Coverage tests for catopt_carriers.xcarrier — the cross-carrier guards,
 the carrier-aware ``_xshape`` resolver, the view-commute check/derive
 pairs, and the non-local passes' veto paths.
 
@@ -18,11 +18,11 @@ always be produced by a well-typed minted term.
 
 import torch
 
-import catopt.xcarrier as XC
-from catopt import meta
-from catopt.egraph import EGraph
-from catopt.ir import Const, Op, TensorType, Var
-from catopt.typing import _shape_of
+import catopt_carriers.xcarrier as XC
+from catopt_core import meta
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Const, Op, TensorType, Var
+from catopt_core.typing import _shape_of
 
 torch.manual_seed(0)
 

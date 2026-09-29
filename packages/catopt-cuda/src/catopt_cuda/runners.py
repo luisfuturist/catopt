@@ -1,6 +1,6 @@
 """CUDA-graph delivery runner.
 
-Moved verbatim from ``catopt_optimize.runners`` (plan 0007): the
+Moved verbatim from ``catopt_orchestrator.runners`` (plan 0007): the
 capture mechanism is torch-coupled *and* CUDA-device-coupled, so it
 sits in its own package — the orchestrator imports no torch and the
 torch package imports no CUDA-specific machinery.

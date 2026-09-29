@@ -10,19 +10,19 @@ exercised on real plans built via ``to_batched_*_module``.
 import pytest
 import torch
 
-from catopt.executors import BatchedExecutorBase
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.om_lower import BatchedOMModule, to_batched_om_module
-from catopt.omd_lower import (
+from catopt_torch.executors import BatchedExecutorBase
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.om_lower import BatchedOMModule, to_batched_om_module
+from catopt_carriers.omd_lower import (
     BatchedOmdModule,
     _select_index,
     to_batched_omd_module,
 )
-from catopt.scan_lower import (
+from catopt_carriers.scan_lower import (
     BatchedScanModule,
     to_batched_scan_module,
 )
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_torch.torch_bridge import ir_to_torch_module
 
 
 def _T(*shape):

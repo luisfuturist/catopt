@@ -32,22 +32,20 @@ Backend specifics live on the adapter side: carrier executors arrive
 through ``sink.executors``, causal-mask specialization through the
 sink's optional ``specialize_causal`` hook, per-block structural
 machinery through the ``composer`` port, and wall-clock timing
-through the ``meter`` port.  The deprecated ``optimize_*`` wrappers
-with their torch defaults moved to ``catopt_torch.api`` (resolving
-lazily here for compatibility); ``Optimizer(backend=TorchBackend())``
+through the ``meter`` port.  ``Optimizer(backend=TorchBackend())``
 is the supported torch spelling — no default is assumed anywhere in
 this package.
 """
 
 from __future__ import annotations
 
-import importlib
+import contextlib
 import inspect
 import logging
 import sys
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 from catopt_core.cost import (
@@ -59,14 +57,15 @@ from catopt_core.cost import (
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Op, op_repr
 from catopt_core.laws import (
-    ALL_RULES_WITH_LAYOUT,
-    CATEGORICAL_RULES,
-    SIMPLIFICATION_RULES,
-    all_rules,
+    RuleSet,
     pair_shared_input_convs,
     pair_shared_input_linears,
+    preset,
     share_duplicate_param_slices,
     share_duplicate_params,
+)
+from catopt_core.laws import (
+    tags as _law_tags,
 )
 from catopt_core.pipeline import Backend, LowerResult, SearchResult
 from catopt_core.ports import (
@@ -81,64 +80,30 @@ from catopt_core.ports import (
     Strategy,
 )
 
-from catopt_optimize.criteria import (
+from catopt_orchestrator.criteria import (
     Criteria,
     Criterion,
     criteria_cost,
 )
-from catopt_optimize.runners import IdentityRunner
+from catopt_orchestrator.runners import IdentityRunner
 
-#: Rules whose saturation closure is combinatorially explosive on
-#: stacked blocks: the pure-symmetry monoid laws enumerate every
-#: bracketing/ordering of a summation (Catalan-scale on the residual
-#: accumulator), the scale-hoist laws pair every scale member with
-#: every linear, and the distribute/factor/naturality/assoc algebra
-#: generates cross-product closures (distribute splits a sum into two
-#: matmuls that factor rules then re-pair against *every other*
-#: summand — enodes grew 337 → 40k in four iterations on a
-#: DeepParallel stack).  The pipeline runs these under a
-#: per-rule enode budget — *bounded saturation* — which truncates the
-#: reordering closure but leaves every content-bearing rewrite at the
-#: exact fixed point.  Structural fusions (qkv/swiglu/sdpa folds,
-#: gqa_absorb) and the simplification singletons stay unbudgeted:
-#: their matches are pattern-specific, not closure-generating.
-#: Measured on stacked ParallelBlocks (the model that motivated
-#: ``optimize_compositional``): identical extracted cost at every
-#: budget ≥ 512 while saturation drops from minutes to ~1s.
-logger = logging.getLogger("catopt_optimize.optimize")
-
-_EXPANSIVE_RULES = frozenset(
-    {
-        # monoid symmetries
-        "comm_add",
-        "comm_mul",
-        "assoc_add",
-        "assoc_mul",
-        # diagonal-scale naturality (norm folding)
-        "linear_row_scale",
-        "linear_row_scale_rev",
-        "linear_channel_scale",
-        "linear_channel_scale_rev",
-        # bilinearity: distribute / factor pairs (both directions)
-        "distribute_matmul_over_add",
-        "factor_matmul",
-        "right_distribute_matmul",
-        "right_factor_matmul",
-        "weight_factor_matmul",
-        "weight_distribute_matmul",
-        "weight_factor_linear",
-        "weight_distribute_linear",
-        "right_factor_linear",
-        # composition chains / scalar naturality
-        "assoc_linear",
-        "assoc_linear_bias",
-        "assoc_linear_bias_rev",
-        "naturality_scalar",
-        "naturality_scalar_rev",
-        "assoc_matmul",
-        "assoc_matmul_rev",
-    }
-)
+#: Bounded saturation: the rules tagged
+#: :data:`catopt_core.laws.tags.EXPANSIVE` — the pure-symmetry monoid
+#: laws enumerating every bracketing/ordering of a summation
+#: (Catalan-scale on the residual accumulator), the scale-hoist laws
+#: pairing every scale member with every linear, and the
+#: distribute/factor/naturality/assoc algebra generating cross-product
+#: closures (enodes grew 337 → 40k in four iterations on a
+#: DeepParallel stack) — run under a per-rule enode budget, which
+#: truncates the reordering closure but leaves every content-bearing
+#: rewrite at the exact fixed point.  Structural fusions
+#: (qkv/swiglu/sdpa folds, gqa_absorb) and the simplification
+#: singletons stay unbudgeted: their matches are pattern-specific,
+#: not closure-generating.  Measured on stacked ParallelBlocks (the
+#: model that motivated ``optimize_compositional``): identical
+#: extracted cost at every budget ≥ 512 while saturation drops from
+#: minutes to ~1s.
+logger = logging.getLogger("catopt_orchestrator.optimize")
 
 
 class OptimizationResourceError(RuntimeError):
@@ -153,10 +118,10 @@ class OptimizationResourceError(RuntimeError):
     variants allocator failures surface as — anywhere in the
     export → saturation → lowering pipeline.
 
-    ``optimize_compositional`` records these as ordinary per-block
-    failures with ``reason == "resource_limit"``; a standalone
-    ``optimize_model`` caller gets this dedicated type instead of a
-    raw OOM.
+    The :class:`Compositional` strategy records these as ordinary
+    per-block failures with ``reason == "resource_limit"``; a
+    standalone ``Optimizer.optimize`` caller gets this dedicated type
+    instead of a raw OOM.
     """
 
 
@@ -435,37 +400,82 @@ def _resolve_cost_fn(
     return cost_fn, criteria_used
 
 
-#: Term-local fusion rules the pipeline SUBSUMES with the non-local
-#: ``pair_shared_input_*`` pass (it needs no consumer pattern, and
-#: keeping them would let extraction pick consumer-level chunk
-#: alternatives that bypass the globally-coordinated split choice).
-_SUBSUMED = frozenset(
-    {"swiglu_fuse", "parallel_mul_fuse", "qkv_fuse", "qkv_fuse_asym"}
-)
+#: The composed default rule set — ``catopt_core.laws.DEFAULT`` plus
+#: the carrier-package ``CARRIERS`` preset.  Composed **once,
+#: lazily**: ``catopt_carriers`` is a different, torch-coupled
+#: package, so reaching into it here at import time would break the
+#: orchestrator's backend-neutral contract; a partial install simply
+#: contributes the core default.  Subsumed- and symmetry-tagged
+#: rules are excluded by the *preset*, not by a filter in this module
+#: — the ``_SUBSUMED`` hidden list and the ``ruleset: str`` switch
+#: are gone (plan 0009).
+_DEFAULT_RULES: RuleSet | None = None
 
 
-def _ruleset_rules(ruleset: str) -> list:
-    """Map a ruleset name to its rewrite list.
+def default_rules() -> RuleSet:
+    """Return the pipeline's composed default rule set (``DEFAULT_RULES``)."""
+    global _DEFAULT_RULES
+    if _DEFAULT_RULES is None:
+        from catopt_core import laws
 
-    ``"all"`` / ``"all+layout"`` / ``"simpl"`` / ``"categorical"`` —
-    every set but ``"simpl"`` drops :data:`_SUBSUMED`.
+        rs = laws.DEFAULT
+        with contextlib.suppress(ModuleNotFoundError):
+            from catopt_carriers import CARRIERS
+
+            rs = rs + CARRIERS
+        _DEFAULT_RULES = replace(
+            rs,
+            name="default_rules",
+            description=(
+                "the pipeline default — core DEFAULT + the "
+                "carrier-package CARRIERS preset"
+            ),
+        )
+    return _DEFAULT_RULES
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily materialise ``DEFAULT_RULES`` (carrier composition)."""
+    if name == "DEFAULT_RULES":
+        return default_rules()
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
+    )
+
+
+def _resolve_rules(rules: Any) -> RuleSet:
+    """Normalise a ``rules`` argument to a :class:`RuleSet`.
+
+    ``None`` → :data:`DEFAULT_RULES` (the composed default above).
+    A string resolves to a named preset — the orchestrator-level
+    names (``default`` / ``carrier_search`` / ``xc``) first, then
+    :func:`catopt_core.laws.preset`; anything else iterable becomes
+    an anonymous set.  The old ``ruleset: str`` switch and the hidden
+    ``_SUBSUMED`` exclusion are gone — the preset itself says what
+    is in.
     """
-    if ruleset == "all":
-        return [r for r in all_rules() if r.name not in _SUBSUMED]
-    if ruleset == "all+layout":
-        return [
-            r for r in ALL_RULES_WITH_LAYOUT if r.name not in _SUBSUMED
-        ]
-    if ruleset == "simpl":
-        return SIMPLIFICATION_RULES
-    if ruleset == "categorical":
-        return [r for r in CATEGORICAL_RULES if r.name not in _SUBSUMED]
-    raise ValueError(f"Unknown ruleset: {ruleset}")
+    if rules is None:
+        return default_rules()
+    if isinstance(rules, RuleSet):
+        return rules
+    if isinstance(rules, str):
+        if rules == "carrier_search":
+            from catopt_orchestrator.regime import _carrier_search
+
+            return _carrier_search()
+        if rules == "xc":
+            from catopt_orchestrator.regime import _xc_rules
+
+            return _xc_rules()
+        if rules in ("default", "default_rules"):
+            return default_rules()
+        return preset(rules)
+    return RuleSet("custom", tuple(rules))
 
 
 def _pairing_and_lifts(
     eg: EGraph,
-    rules: list,
+    rules: Iterable,
     root_eid: int,
     stats: dict[str, Any],
     run_cap: int,
@@ -641,7 +651,7 @@ def search(
         dict[str, float] | Criteria | Criterion | list | tuple | None
     ) = None,
     cost_fn: CostFn | None = None,
-    ruleset: str = "all",
+    rules: RuleSet | str | Iterable | None = None,
     max_iterations: int = 100,
     max_enodes: int | None = 100_000,
     symmetry_budget: int | None = 2048,
@@ -683,8 +693,16 @@ def search(
     criteria : dict, Criterion, Criteria, or sequence, optional
         Selection axes blended into the extraction model — see
         ``optimize_model``.
-    ruleset : str
-        ``"all"`` / ``"all+layout"`` / ``"simpl"`` / ``"categorical"``.
+    rules : RuleSet, str, or iterable, optional
+        The saturation rule set — a first-class
+        :class:`~catopt_core.laws.RuleSet`, a preset *name* (resolved
+        by :func:`catopt_core.laws.preset` plus the orchestrator-level
+        ``"default"`` / ``"carrier_search"`` / ``"xc"``), or a plain
+        iterable of rewrites.  ``None`` resolves to
+        :data:`DEFAULT_RULES` — ``core.DEFAULT + carriers.CARRIERS``.
+        Subsumed/symmetry exclusion is the preset's business: pass
+        ``laws.DEFAULT + laws.SYMMETRY`` (or ``laws.FULL``) to opt
+        into the symmetry generators.
     max_iterations : int
         Maximum equality-saturation iterations.
     max_enodes : int, optional
@@ -751,15 +769,19 @@ def search(
         )
     eg = EGraph()
     root_eid = eg.add_term(ir.root)
-    rules = _ruleset_rules(ruleset)
+    rules = _resolve_rules(rules)
     if verbose:
         print(f"  Rules: {[r.name for r in rules]}")
 
-    # Bounded-saturation budget for the expansive rules (see
-    # ``_EXPANSIVE_RULES``); enforced inside the matcher so a giant
-    # e-class cannot spend the whole budget in one enumeration.
+    # Bounded-saturation budget for the EXPANSIVE-tagged rules (the
+    # tag replaced the ``_EXPANSIVE_RULES`` name list); enforced
+    # inside the matcher so a giant e-class cannot spend the whole
+    # budget in one enumeration.
     rule_budgets = (
-        {n: symmetry_budget for n in _EXPANSIVE_RULES}
+        {
+            r.name: symmetry_budget
+            for r in rules.tagged(_law_tags.EXPANSIVE)
+        }
         if symmetry_budget is not None
         else None
     )
@@ -961,7 +983,7 @@ class Monolithic:
 
     One whole-model search, one delivery — what ``optimize_model``
     always did.  ``optimize(..., **kw)`` keywords partition by phase:
-    search knobs (``ruleset``, ``max_iterations``, ``max_enodes``,
+    search knobs (``rules``, ``max_iterations``, ``max_enodes``,
     ``cost_fn``, ``symmetry_budget``, ``specialize_causal``,
     ``fusion_epsilon``, ``delivers_compiled``, ``capabilities``,
     ``criteria``, ``meter``) reach the optimizer's ``.search``; lower
@@ -1007,7 +1029,7 @@ class Compositional:
     the strategy itself is backend-neutral.
 
     ``block_pred`` / ``verify_tol`` / ``max_cross_pairs`` are strategy
-    configuration; the per-block search knobs (``ruleset``,
+    configuration; the per-block search knobs (``rules``,
     ``max_iterations``, ``cost_fn``, ``max_enodes``, ``max_memory_mb``,
     ``verbose``) ride in ``**kw``.
     """
@@ -1055,13 +1077,13 @@ class Autotuned:
     :attr:`~catopt_core.ports.Sink.executors` table (``"generic"``
     plus every executor name — ``"batched"`` is the routing
     pseudo-name for the pipeline's own delivery) and
-    :data:`catopt_optimize.autotune.CANDIDATE_BUILDERS`
+    :data:`catopt_orchestrator.autotune.CANDIDATE_BUILDERS`
     (``"eager"``), or ``(name, builder)`` tuples; backend-provided
     builders arrive through ``builders=`` (the torch wrapper maps
     ``"torch_compile"`` / ``"torch_compile_generic"`` /
-    ``"cuda_graph"`` via ``catopt_torch.api.TORCH_BUILDERS``).  The
+    ``"cuda_graph"`` via ``catopt_torch.autotune.TORCH_BUILDERS``).  The
     remaining fields are the timing / budget / verify knobs.
-    ``optimize`` kwargs (``ruleset``, ``max_iterations``, ``runner``,
+    ``optimize`` kwargs (``rules``, ``max_iterations``, ``runner``,
     …) forward to the underlying pipeline call; an explicit
     ``verbose=`` keyword overrides the strategy field.
     """
@@ -1103,7 +1125,7 @@ class Autotuned:
         # Local import: autotune imports this module at top level, so
         # the reverse edge must defer to call time (the same pattern
         # runners.runner_candidate documents).
-        from catopt_optimize.autotune import _autotuned_impl
+        from catopt_orchestrator.autotune import _autotuned_impl
 
         mod, stats = _autotuned_impl(
             model,
@@ -1159,6 +1181,9 @@ class Optimizer:
         dict[str, float] | Criteria | Criterion | list | tuple | None
     ) = None
     runner: Runner = field(default_factory=IdentityRunner)
+    #: The optimizer's default saturation rule set — ``None`` resolves
+    #: to the composed :data:`DEFAULT_RULES` at search time.
+    rules: RuleSet | str | Iterable | None = None
 
     def __post_init__(self) -> None:
         """Resolve ports — explicit args override the backend's.
@@ -1205,6 +1230,7 @@ class Optimizer:
         kw.setdefault("source", self.source)
         kw.setdefault("capabilities", self.sink)
         kw.setdefault("criteria", self.criteria)
+        kw.setdefault("rules", self.rules)
         kw.setdefault(
             "delivers_compiled",
             bool(getattr(self.runner, "delivers_compiled", False)),
@@ -1245,12 +1271,12 @@ class Optimizer:
     def discover(self, model: Any, x: Any, **kw: Any) -> SearchResult:
         """Run the discovery view — :func:`search` with frontier defaults.
 
-        ``ruleset="categorical"`` / ``max_iterations=6`` unless the
-        caller says otherwise; the :class:`SearchResult` carries the
+        ``max_iterations=6`` unless the caller says otherwise (the
+        ``rules`` default is the composed :data:`DEFAULT_RULES`);
+        the :class:`SearchResult` carries the
         whole inspectable mid-state (``.alternatives()`` /
         ``.certificate()`` / ``.eg`` / ``.stats``).
         """
-        kw.setdefault("ruleset", "categorical")
         kw.setdefault("max_iterations", 6)
         return self.search(model, x, **kw)
 
@@ -1274,7 +1300,7 @@ def discover_alternatives(
     *,
     source: Source,
     capabilities: Capabilities | None = None,
-    ruleset: str = "categorical",
+    rules: RuleSet | str | Iterable | None = None,
     max_iterations: int = 6,
     cost_fn: CostFn | None = None,
 ) -> SearchResult:
@@ -1282,7 +1308,8 @@ def discover_alternatives(
 
     The discovery-engine view: the same export → e-graph → saturation
     → pairing pipeline as :func:`search` with frontier-oriented
-    defaults (``ruleset="categorical"``, ``max_iterations=6``) — and
+    defaults (``max_iterations=6``; ``rules=None`` resolves to the
+    composed :data:`DEFAULT_RULES`) — and
     the result is the inspectable mid-state, not a fixed report:
 
     * ``res.alternatives(top_k)`` — the top-k cheapest distinct
@@ -1303,9 +1330,10 @@ def discover_alternatives(
     required (no assumed frontend); ``capabilities`` supplies
     backend-relative pricing and the const-fold registry.
 
-    Ruleset names follow the pipeline's selection
-    (:func:`_ruleset_rules`) — ``"all"`` drops the pairing-subsumed
-    fusion rules here too.
+    ``rules`` follows :func:`search`'s contract — a ``RuleSet``, a
+    preset name, a plain iterable, or ``None`` for the composed
+    default.  The pairing-subsumed fusion rules are excluded by the
+    presets, never by a filter inside the pipeline.
     """
     return search(
         model,
@@ -1313,7 +1341,7 @@ def discover_alternatives(
         source=source,
         capabilities=capabilities,
         cost_fn=cost_fn,
-        ruleset=ruleset,
+        rules=rules,
         max_iterations=max_iterations,
     )
 
@@ -1337,7 +1365,7 @@ def _optimize_compositional(
     optimizer: Optimizer,
     block_pred: Callable | None = None,
     cost_fn: CostFn | None = None,
-    ruleset: str = "all",
+    rules: RuleSet | str | Iterable | None = None,
     max_iterations: int = 100,
     max_enodes: int | None = 100_000,
     max_memory_mb: float | None = None,
@@ -1461,7 +1489,7 @@ def _optimize_compositional(
             res = optimizer.search(
                 block,
                 ex,
-                ruleset=ruleset,
+                rules=rules,
                 max_iterations=max_iterations,
                 max_enodes=max_enodes,
                 max_memory_mb=max_memory_mb,
@@ -1536,7 +1564,7 @@ def _optimize_compositional(
             replacements,
             block_reports,
             agg,
-            ruleset=ruleset,
+            rules=rules,
             max_iterations=max_iterations,
             max_enodes=max_enodes,
             max_memory_mb=max_memory_mb,
@@ -1630,102 +1658,3 @@ def _optimize_compositional(
 
     stats["wall_time_s"] = time.time() - t_start
     return new_model, stats
-
-
-# ---------------------------------------------------------------------------
-# Compatibility delegation — moved torch-facing names (lazy)
-# ---------------------------------------------------------------------------
-#
-# The deprecated ``optimize_*`` wrappers (torch-defaulted entry
-# points) moved to ``catopt_torch.api`` (plan 0007); the torch-native
-# structural internals (hook capture, shared-param clone, pair
-# boundary) moved to ``catopt_torch.composer``; the causal-fold
-# internals to ``catopt_torch.folds``; the typed reports stay in
-# ``catopt_torch.report``.  All resolve lazily through this module's
-# ``__getattr__`` so the historical private/compat paths
-# (``catopt.optimize.optimize_model``,
-# ``catopt.optimize._pair_boundary``, …) keep working on a torch
-# install — while ``import catopt_optimize.optimize`` itself loads no
-# backend.
-
-_API_NAMES = frozenset(
-    {
-        "optimize_model",
-        "optimize_compositional",
-        "save_optimized_weights",
-    }
-)
-_COMPOSER_NAMES = frozenset(
-    {
-        "param_report",
-        "_default_block_pred",
-        "_select_blocks",
-        "_capture_block_inputs",
-        "_MODEL_KEY",
-        "_replace_submodule",
-        "_shared_param_clone",
-        "_perturbed_input",
-        "_residual_probe",
-        "_executor_flops",
-        "_JointPair",
-        "_FusedPair",
-        "_Zero",
-        "_plain_consumers",
-        "_io_has_value",
-        "_pair_boundary",
-        "_cross_pair_pass",
-        "_CROSS_PAIR_SYMMETRY_BUDGET",
-    }
-)
-_FOLD_NAMES = frozenset(
-    {
-        "_eval_const",
-        "_is_causal_keep_mask",
-        "_specialize_causal",
-    }
-)
-_REPORT_NAMES = frozenset(
-    {
-        "OptReport",
-        "BlockReport",
-        "CompositionalReport",
-        "verify_module",
-    }
-)
-
-#: Composer cross_pairs is a TorchComposer method — its historical
-#: free-function form is reproduced by a bound call.
-_CARRIER_PLANS_LAZY: dict[str, Callable] | None = None
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve the moved torch-facing names lazily."""
-    global _CARRIER_PLANS_LAZY
-    if name == "_CARRIER_PLANS":
-        if _CARRIER_PLANS_LAZY is None:
-            _CARRIER_PLANS_LAZY = _carrier_plans()
-        return _CARRIER_PLANS_LAZY
-    if name in _API_NAMES:
-        mod = importlib.import_module("catopt_torch.api")
-        return getattr(mod, name)
-    if name in _COMPOSER_NAMES:
-        mod = importlib.import_module("catopt_torch.composer")
-        if name == "_cross_pair_pass":
-            # Historical shape: the free function — now the composer
-            # method (same signature, self dropped).
-            return mod.TorchComposer().cross_pairs
-        return getattr(mod, name)
-    if name in _FOLD_NAMES:
-        mod = importlib.import_module("catopt_torch.folds")
-        return getattr(mod, name)
-    if name in _REPORT_NAMES:
-        mod = importlib.import_module("catopt_torch.report")
-        return getattr(mod, name)
-    if name == "torch":
-        # Historical patch point: ``monkeypatch.setattr(O.torch,
-        # "compile", ...)`` mutated the module attribute — the same
-        # module object the delivery runners look up at call time.
-        return importlib.import_module("torch")
-    raise AttributeError(
-        f"module {__name__!r} has no attribute {name!r}"
-    )

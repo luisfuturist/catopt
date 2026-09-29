@@ -43,10 +43,10 @@ from __future__ import annotations
 
 import torch
 
-import catopt.xcarrier as XC
-from catopt import meta
-from catopt.egraph import EGraph
-from catopt.ir import Op, TensorType, Var
+import catopt_carriers.xcarrier as XC
+from catopt_core import meta
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, TensorType, Var
 
 # ---------------------------------------------------------------------------
 #  helpers (same conventions as test_xcarrier.py)
@@ -539,10 +539,10 @@ def test_mha_omd_fires_and_is_exact():
     ``omd_applym`` lands in the om_apply class — nested (wo follows
     the attention, so omd is NOT at the root — same as the chunked-MH
     variant).  The extracted member evaluates fp64-exact."""
-    from catopt.ir import IR
-    from catopt.regime import default_rules
-    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-    from catopt.xcarrier import (
+    from catopt_core.ir import IR
+    from catopt_torch.regime import default_rules
+    from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt_carriers.xcarrier import (
         XC_LAWS,
         _elem_affine_options,
         gather_apply_stack,
@@ -636,10 +636,10 @@ def test_mha_omd_value_member_is_viewed_apply():
     the om leaf contains apply(aff(map,h)) whose A part is a
     transpose/reshape view of the projected scan coefficients —
     rank-4 (nh,T,hd,D)."""
-    from catopt.cost import _shape_of
-    from catopt.regime import default_rules
-    from catopt.torch_bridge import export_to_ir
-    from catopt.xcarrier import (
+    from catopt_core.cost import _shape_of
+    from catopt_torch.regime import default_rules
+    from catopt_torch.torch_bridge import export_to_ir
+    from catopt_carriers.xcarrier import (
         XC_LAWS,
         _elem_affine_options,
         gather_apply_stack,

@@ -278,7 +278,7 @@ def canonicalize(term: Any, memo: dict | None = None) -> Any:
 
 def stratified_run(
     eg: EGraph,
-    rules: list[Rewrite],
+    rules: Iterable[Rewrite],
     term: Any,
     *,
     max_iterations: int = 100,
@@ -1250,7 +1250,7 @@ def _subsumed(cand: Rewrite, existing: list[Rewrite]) -> bool:
 
 
 def synthesize_rules(
-    rules: list[Rewrite],
+    rules: Iterable[Rewrite],
     seed_terms: Iterable[Any] = (),
     *,
     fuel: int = 512,

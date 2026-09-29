@@ -12,8 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 import torch.nn as nn
-from catopt.models import ParallelBlock
-from catopt.optimize import optimize_model
+from catopt_torch.models import ParallelBlock
+
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 class MiniGPT(nn.Module):
@@ -75,9 +78,8 @@ def main():
 
         t0 = time.perf_counter()
         print("  optimizing...", flush=True)
-        opt, stats = optimize_model(
-            m, x, verbose=False, max_iterations=8, max_enodes=200_000
-        )
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=8, max_enodes=200_000, verify=False, verbose=False)
+
         opt = opt.to(dev).eval()
         pipe_s = time.perf_counter() - t0
 

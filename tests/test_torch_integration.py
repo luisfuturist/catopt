@@ -6,12 +6,17 @@ These cover the real-model path added for the polyhedral-RFC targets
 
 import pytest
 import torch
-from catopt.cost import flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
-from catopt.models import MatrixChain, RMSNorm, SwiGLU
-from catopt_core.laws import CATEGORICAL_RULES, SIMPLIFICATION_RULES
-from catopt.torch_bridge import (
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Const, Op, Param, TensorType, Var, op_repr
+from catopt_torch.models import MatrixChain, RMSNorm, SwiGLU
+from catopt_core.laws import (
+    CATEGORICAL,
+    CATEGORICAL_RULES,
+    SIMPLIFICATION,
+    SIMPLIFICATION_RULES,
+)
+from catopt_torch.torch_bridge import (
     _SCALAR_OPERAND_OPS,
     _canon_aten_name,
     export_to_ir,
@@ -237,7 +242,7 @@ def test_rmsnorm_roundtrip_and_optimize():
 
 def test_pow_to_square_bridge():
     """pow(x, 2) and square(x) land in the same e-class."""
-    from catopt.ir import TensorType, Var
+    from catopt_core.ir import TensorType, Var
     from catopt_core.laws import POW_TO_SQUARE, SQUARE_TO_POW
 
     x = Var("x", TensorType((4, 4)))
@@ -257,7 +262,7 @@ def test_pow_to_square_bridge():
 
 def test_silu_mul_form_rule():
     """silu(g)*u expands to (g*sigmoid(g))*u in the e-graph."""
-    from catopt.ir import TensorType, Var
+    from catopt_core.ir import TensorType, Var
     from catopt_core.laws import SILU_MUL_FORM
 
     g = Var("g", TensorType((4, 4)))
@@ -293,7 +298,10 @@ def test_silu_mul_form_rule():
 #  Parallel projections: weight merging (bilinearity) — the composed win
 # ---------------------------------------------------------------------------
 
-from catopt.models import DeepParallel, ParallelLinear  # noqa: E402
+from catopt_torch.models import DeepParallel, ParallelLinear  # noqa: E402
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _eqsat_best(model, x):
@@ -429,7 +437,7 @@ def test_assoc_linear_bias_end_to_end_param_drop():
     """A biased 2-layer chain collapses to one fused weight + fused
     bias when the hidden dim sits above the break-even — real
     parameter storage reduction, not just a rewrite."""
-    from catopt.optimize import optimize_model
+
 
     torch.manual_seed(0)
 
@@ -444,7 +452,8 @@ def test_assoc_linear_bias_end_to_end_param_drop():
 
     m = BiasedMLP().eval().double()
     x = torch.randn(4, 32, dtype=torch.float64)
-    low, _stats = optimize_model(m, x, cost_fn=flops_cost)
+    low, _stats = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=flops_cost)
+
     with torch.no_grad():
         ref = m(x)
         y = low(x)
@@ -453,7 +462,8 @@ def test_assoc_linear_bias_end_to_end_param_drop():
     assert n_params < sum(p.numel() for p in m.parameters())
 
     # the optimized weights file: eliminated originals + derived folds
-    from catopt.optimize import param_report
+    from catopt_torch.composer import param_report
+
 
     r = param_report(m, low)
     assert r["optimized_bytes"] < r["original_bytes"]
@@ -467,7 +477,8 @@ def test_share_duplicate_params_drops_tied_weight():
     e-class — the duplicate name never reaches the extracted term, so
     the optimized state dict stores one copy.  Exact weight tying,
     discovered rather than declared."""
-    from catopt.optimize import optimize_model, param_report
+    from catopt_torch.composer import param_report
+
 
     torch.manual_seed(0)
 
@@ -488,7 +499,8 @@ def test_share_duplicate_params_drops_tied_weight():
 
     m = SharedUse().eval().double()
     x = torch.randn(4, 128, dtype=torch.float64)
-    low, _ = optimize_model(m, x, cost_fn=flops_cost)
+    low, _ = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=flops_cost)
+
     with torch.no_grad():
         assert (m(x) - low(x)).abs().max() < 1e-9
     r = param_report(m, low)
@@ -548,7 +560,7 @@ def test_swiglu_fuse_produces_shared_gemm():
     where the two `linear` subterms are literally the SAME object — the
     e-graph stores the fused projection once and lowering runs one GEMM.
     """
-    from catopt.cost import launch_aware_cost
+    from catopt_core.cost import launch_aware_cost
 
     torch.manual_seed(0)
     m = SwiGLU(32, hidden_mult=2)
@@ -589,7 +601,7 @@ def test_swiglu_fuse_produces_shared_gemm():
 
 def test_swiglu_fuse_evals_fused_gemm_once():
     """_eval memoization: the shared fused linear runs exactly once."""
-    from catopt.cost import launch_aware_cost
+    from catopt_core.cost import launch_aware_cost
 
     torch.manual_seed(0)
     m = SwiGLU(32, hidden_mult=2)
@@ -613,7 +625,7 @@ def test_swiglu_fuse_evals_fused_gemm_once():
         calls.append(1)
         return orig_linear(*a, **kw)
 
-    import catopt.torch_bridge as tb
+    import catopt_torch.torch_bridge as tb
 
     saved = tb._IR_TO_TORCH["linear"]
     tb._IR_TO_TORCH["linear"] = counting
@@ -656,7 +668,7 @@ def test_swiglu_fuse_requires_shared_input():
 
 def test_attention_roundtrip():
     """AttentionBlock exports and lowers bit-exactly."""
-    from catopt.models import AttentionBlock
+    from catopt_torch.models import AttentionBlock
 
     torch.manual_seed(0)
     m = AttentionBlock(64, n_heads=4).eval()
@@ -672,8 +684,8 @@ def test_attention_roundtrip():
 
 def test_qkv_fuse_produces_single_gemm():
     """qkv_fuse merges q/k/v into one GEMM + three chunk projections."""
-    from catopt.cost import launch_aware_cost
-    from catopt.models import AttentionBlock
+    from catopt_core.cost import launch_aware_cost
+    from catopt_torch.models import AttentionBlock
 
     torch.manual_seed(0)
     m = AttentionBlock(64, n_heads=4).eval()
@@ -713,7 +725,7 @@ def test_qkv_fuse_produces_single_gemm():
 
 def test_attr_metavariable_binds_shape():
     """Pattern attr value-as-string binds the node's concrete attr."""
-    from catopt.models import AttentionBlock
+    from catopt_torch.models import AttentionBlock
     from catopt_core.laws import QKV_FUSE
 
     torch.manual_seed(0)
@@ -742,8 +754,8 @@ def test_attr_metavariable_binds_shape():
 
 def test_normlinear_folds_channel_scale():
     """linear(x*rms*wn, W) -> rms * linear(x, W*wn): gain folds at compile time."""
-    from catopt.cost import launch_aware_cost
-    from catopt.models import NormLinear
+    from catopt_core.cost import launch_aware_cost
+    from catopt_torch.models import NormLinear
 
     torch.manual_seed(0)
     m = NormLinear(64, 64).eval()
@@ -801,8 +813,8 @@ def test_row_scale_rejects_data_scale():
 
 def test_gqa_asym_fuse():
     """qkv_fuse_asym: uneven head counts -> split with derived sizes."""
-    from catopt.cost import launch_aware_cost
-    from catopt.models import GQAAttention
+    from catopt_core.cost import launch_aware_cost
+    from catopt_torch.models import GQAAttention
 
     torch.manual_seed(0)
     m = GQAAttention(128, n_heads=4, n_kv_heads=2).eval()
@@ -839,7 +851,7 @@ def test_gqa_asym_fuse():
 
 def test_derive_hook_computes_sizes():
     """Rewrite.derive injects computed attrs into the instantiation."""
-    from catopt.models import GQAAttention
+    from catopt_torch.models import GQAAttention
     from catopt_core.laws import QKV_FUSE_ASYM
 
     torch.manual_seed(0)
@@ -862,8 +874,8 @@ def test_derive_hook_computes_sizes():
 
 def test_transformer_block_stacks_fusions():
     """One saturation pass finds BOTH fusions in a full block."""
-    from catopt.cost import launch_aware_cost
-    from catopt.models import TransformerBlock
+    from catopt_core.cost import launch_aware_cost
+    from catopt_torch.models import TransformerBlock
 
     torch.manual_seed(0)
     m = TransformerBlock(128, n_heads=4, hidden_mult=2).eval()
@@ -900,14 +912,15 @@ def test_transformer_block_stacks_fusions():
 
 def test_pairing_pass_five_way_parallel_block():
     """ParallelBlock: all 5 same-source projections fuse into ONE GEMM."""
-    from catopt.ir import op_repr
-    from catopt.models import ParallelBlock
-    from catopt.optimize import optimize_model
+    from catopt_core.ir import op_repr
+    from catopt_torch.models import ParallelBlock
+
 
     torch.manual_seed(0)
     m = ParallelBlock(128, n_heads=4, hidden_mult=2).eval()
     x = torch.randn(4, 16, 128)
-    opt, stats = optimize_model(m, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     r = op_repr(opt._root)
     assert stats.get("paired_extract")
     assert r.count("(split") >= 5
@@ -922,8 +935,8 @@ def test_pairing_pass_five_way_parallel_block():
 
 def test_pairing_subsumes_swiglu_rule():
     """The pairing pass alone fuses gate/up — no consumer pattern needed."""
-    from catopt.cost import dag_cost, launch_aware_cost
-    from catopt.models import SwiGLU
+    from catopt_core.cost import dag_cost, launch_aware_cost
+    from catopt_torch.models import SwiGLU
     from catopt_core.laws import (
         CATEGORICAL_RULES,
         PARALLEL_MUL_FUSE,
@@ -1010,7 +1023,7 @@ def test_channel_scale_rejects_row_scale():
 
 
 def test_multi_input_module():
-    from catopt.optimize import optimize_model
+
 
     """Modules with several tensor inputs export, optimize, and verify."""
     import torch.nn as nn
@@ -1027,14 +1040,15 @@ def test_multi_input_module():
     m = TwoInput().eval()
     x = torch.randn(4, 16)
     s = torch.randn(4, 16)
-    opt, _stats = optimize_model(m, (x, s), verbose=False)
+    opt, _stats = Optimizer(backend=TorchBackend()).optimize(m, (x, s), verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(x, s) - opt(x, s)).abs().max().item()
     assert diff < 1e-4
 
 
 def test_dropout_eval_is_identity():
-    from catopt.optimize import optimize_model
+
 
     """Dropout exported in eval mode is a semantic identity and must lower."""
     import torch.nn as nn
@@ -1056,7 +1070,8 @@ def test_dropout_eval_is_identity():
     torch.manual_seed(0)
     m = WithDropout().eval()
     x = torch.randn(8, 16)
-    opt, stats = optimize_model(m, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1065,7 +1080,7 @@ def test_dropout_eval_is_identity():
 
 
 def test_rope_style_ops_roundtrip():
-    from catopt.optimize import optimize_model
+
 
     """RoPE-shaped graphs (unbind/stack/expand/flatten/slice) lower and run."""
     import torch.nn as nn
@@ -1085,7 +1100,8 @@ def test_rope_style_ops_roundtrip():
     x = torch.randn(2, 8, 4, 16)
     fc = torch.randn(8, 8)
     fs = torch.randn(8, 8)
-    opt, _stats = optimize_model(m, (x, fc, fs), verbose=False)
+    opt, _stats = Optimizer(backend=TorchBackend()).optimize(m, (x, fc, fs), verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(x, fc, fs) - opt(x, fc, fs)).abs().max().item()
     assert diff < 1e-4
@@ -1112,7 +1128,7 @@ def test_dag_sharing_scales():
     eg = EGraph()
     t0 = time.time()
     root = eg.add_term(t)
-    from catopt.cost import launch_aware_cost
+    from catopt_core.cost import launch_aware_cost
 
     best = eg.extract_best(root, launch_aware_cost)
     mod = ir_to_torch_module(
@@ -1148,13 +1164,12 @@ def test_conv2d_pairing_asymmetric_and_incompatible():
         def forward(self, x):
             return torch.cat([self.c1(x), self.c2(x)], 1) + self.c3(x)
 
-    from catopt.optimize import optimize_model
+
 
     m = MixedConv().eval()
     x = torch.randn(2, 16, 8, 8)
-    opt, info = optimize_model(
-        m, x, ruleset="simpl", max_iterations=2, verbose=False
-    )
+    opt, info = Optimizer(backend=TorchBackend()).optimize(m, x, rules=SIMPLIFICATION, max_iterations=2, verify=False, verbose=False)
+
     # exactly one pairing group: c1/c2 fuse (96-ch conv + 32/64 split),
     # c3 (3x3 kernel) is excluded by the compat cluster key
     assert info.get("pairing_groups") == 1
@@ -1166,9 +1181,9 @@ def test_conv2d_pairing_not_offered_for_grouped():
     """groups>1 convs must not pair — cat on out-channels would mix
     grouped convolutions incorrectly."""
     import torch.nn as nn
-    from catopt.egraph import EGraph
+    from catopt_core.egraph import EGraph
     from catopt_core.laws import pair_shared_input_convs
-    from catopt.torch_bridge import export_to_ir
+    from catopt_torch.torch_bridge import export_to_ir
 
     class Grouped(nn.Module):
         def __init__(self):
@@ -1190,7 +1205,7 @@ def test_conv2d_pairing_not_offered_for_grouped():
 def test_reshape_negative_dim_shape_inference():
     """reshape attrs keep literal -1 dims; shape inference must resolve
     them from input numel rather than poisoning broadcast as _INVALID."""
-    from catopt.cost import _broadcast, _infer_op_shape
+    from catopt_core.cost import _broadcast, _infer_op_shape
 
     x = Var("x", TensorType((4, 8)))
     r = Op.make("reshape", x, shape=(-1, 2, 4))
@@ -1203,15 +1218,14 @@ def test_gqa_absorb_repeat_kv():
     """unsqueeze->expand->reshape before sdpa is repeat_kv (the
     diagonal); the rule must absorb it into enable_gqa and the soundness
     check must verify the repeat structure."""
-    from catopt.models import RepeatKVAttention
-    from catopt.optimize import optimize_model
+    from catopt_torch.models import RepeatKVAttention
+
 
     torch.manual_seed(0)
     m = RepeatKVAttention(dim=128, n_heads=8, n_kv_heads=2).eval()
     x = torch.randn(1, 16, 128)
-    opt, _ = optimize_model(
-        m, x, ruleset="categorical", max_iterations=4, verbose=False
-    )
+    opt, _ = Optimizer(backend=TorchBackend()).optimize(m, x, rules=CATEGORICAL, max_iterations=4, verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1247,16 +1261,15 @@ def test_sdpa_fold_masked_fill():
     """nanoGPT-style masked_fill causal attention must fold to
     sdpa(is_causal=True): the whole softmax-mask-attention chain
     collapses into one fused kernel call."""
-    from catopt.ir import op_repr
-    from catopt.models import EagerAttention
-    from catopt.optimize import optimize_model
+    from catopt_core.ir import op_repr
+    from catopt_torch.models import EagerAttention
+
 
     torch.manual_seed(0)
     m = EagerAttention(dim=128, n_heads=4, block_size=64).eval()
     x = torch.randn(1, 32, 128)
-    opt, info = optimize_model(
-        m, x, ruleset="categorical", max_iterations=4, verbose=False
-    )
+    opt, info = Optimizer(backend=TorchBackend()).optimize(m, x, rules=CATEGORICAL, max_iterations=4, verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1267,16 +1280,15 @@ def test_sdpa_fold_masked_fill():
 
 def test_sdpa_fold_additive_mask():
     """HF-style additive causal mask must fold to sdpa(attn_mask=...)."""
-    from catopt.ir import op_repr
-    from catopt.models import AdditiveMaskAttention
-    from catopt.optimize import optimize_model
+    from catopt_core.ir import op_repr
+    from catopt_torch.models import AdditiveMaskAttention
+
 
     torch.manual_seed(0)
     m = AdditiveMaskAttention(dim=128, n_heads=4, block_size=64).eval()
     x = torch.randn(1, 32, 128)
-    opt, _info = optimize_model(
-        m, x, ruleset="categorical", max_iterations=4, verbose=False
-    )
+    opt, _info = Optimizer(backend=TorchBackend()).optimize(m, x, rules=CATEGORICAL, max_iterations=4, verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(x) - opt(x)).abs().max().item()
     assert diff < 1e-4
@@ -1285,7 +1297,7 @@ def test_sdpa_fold_additive_mask():
 
 def test_sdpa_fold_rejects_wrong_dim():
     """softmax over a non-key dim is NOT attention — must not fold."""
-    from catopt.ir import TensorType, Var
+    from catopt_core.ir import TensorType, Var
     from catopt_core.laws import _check_softmax_dim
 
     q = Var("q", TensorType((1, 4, 32, 16)))
@@ -1298,10 +1310,10 @@ def test_linear_recurrence_scan_structure():
     LTI recurrence h_t = A h_{t-1} + x_t reassociates so matrix powers
     A^k become shared subproducts and the critical path shortens.
     Verified exact in fp64."""
-    from catopt.egraph import EGraph
-    from catopt.ir import IR, Op
-    from catopt.models import LinearRecurrence
-    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt_core.egraph import EGraph
+    from catopt_core.ir import IR, Op
+    from catopt_torch.models import LinearRecurrence
+    from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
     from catopt_core import laws as R
 
@@ -1354,10 +1366,10 @@ def test_affine_monoid_parallel_scan():
     rewriting cannot synthesise."""
     import math
 
-    from catopt.egraph import EGraph
-    from catopt.ir import IR, Op
-    from catopt.models import LinearRecurrence
-    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt_core.egraph import EGraph
+    from catopt_core.ir import IR, Op
+    from catopt_torch.models import LinearRecurrence
+    from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
     from catopt_core import laws as R
 
@@ -1396,7 +1408,7 @@ def test_affine_monoid_parallel_scan():
 def test_aff_monoid_ops_verify():
     """aff/aff_compose/apply lower to tuple-passing torch code and
     compute the affine composition correctly."""
-    from catopt.torch_bridge import _IR_TO_TORCH
+    from catopt_torch.torch_bridge import _IR_TO_TORCH
 
     torch.manual_seed(0)
     A, b = torch.randn(8, 8), torch.randn(8)
@@ -1412,21 +1424,15 @@ def test_aff_monoid_ops_verify():
 def test_linear_attention_reassociation():
     """(Q K^T) V reassociates to Q (K^T V) — O(T^2 d) -> O(T d^2).
     Exact identity (verified in fp64); the cost model must pick it."""
-    from catopt.cost import roofline_cost
-    from catopt.models import LinearAttention
-    from catopt.optimize import optimize_model
+    from catopt_core.cost import roofline_cost
+    from catopt_torch.models import LinearAttention
+
 
     m = LinearAttention().eval()
     t, d = 512, 64
     q = k = v = torch.randn(1, t, d, dtype=torch.float64)
-    opt, _ = optimize_model(
-        m,
-        (q, k, v),
-        ruleset="categorical",
-        max_iterations=4,
-        cost_fn=roofline_cost,
-        verbose=False,
-    )
+    opt, _ = Optimizer(backend=TorchBackend()).optimize(m, (q, k, v), rules=CATEGORICAL, max_iterations=4, cost_fn=roofline_cost, verify=False, verbose=False)
+
     with torch.no_grad():
         diff = (m(q, k, v) - opt(q, k, v)).abs().max().item()
     assert diff < 1e-8  # fp64: reassociation is exact up to rounding
@@ -1436,7 +1442,7 @@ def test_index_bindings_canonical_spelling():
     """chunk/split/unbind bindings read the canonical
     ``chunks``/``dim``/``index`` spellings."""
     x = torch.arange(24.0).reshape(2, 3, 4)
-    from catopt.torch_bridge import _IR_TO_TORCH
+    from catopt_torch.torch_bridge import _IR_TO_TORCH
 
     want = x.chunk(2, dim=1)[1]
     got = _IR_TO_TORCH["chunk"](x, chunks=2, dim=1, index=1)
@@ -1458,7 +1464,7 @@ def test_eval_term_does_not_leak_env():
 
     x = Var("x", TensorType((4,)))
     t = Op.make("add", x, Const(1.0))
-    from catopt.torch_bridge import _IR_TO_TORCH, eval_term
+    from catopt_torch.torch_bridge import _IR_TO_TORCH, eval_term
 
     def _run(data):
         env = {"x": data}  # temp dict — only the closure outlives it

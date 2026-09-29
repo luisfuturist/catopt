@@ -17,32 +17,27 @@ import torch
 import torch.nn as nn
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_core.laws import CATEGORICAL
 from catopt_core.pipeline import LowerResult, SearchResult
 from catopt_core.ports import Capabilities, Sink, Strategy
-from catopt_optimize import (
-    Autotuned,
-    Compositional,
-    LatencyCriterion,
-    MemoryCriterion,
-    Monolithic,
-    OptimizationResourceError,
-    Optimizer,
-    discover_alternatives,
-    lower,
-    optimize_compositional,
-    optimize_model,
-    optimize_model_autotuned,
-    search,
-)
-from catopt_optimize.runners import (
-    ChainedRunner,
-    CudaGraphRunner,
-    TorchCompileRunner,
-)
+from catopt_orchestrator.optimize import Autotuned
+
+
+from catopt_orchestrator import Compositional, LatencyCriterion, MemoryCriterion, Monolithic, OptimizationResourceError, Optimizer, discover_alternatives, lower, search
+
+
+
+from catopt_orchestrator.runners import ChainedRunner
+
+
+from catopt_cuda import CudaGraphRunner
+from catopt_torch.runners import TorchCompileRunner
+
 from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.backend import TorchBackend
 
 from tests.test_pluggable_sink import NumpySink
+from catopt_torch.autotune import TORCH_BUILDERS
 
 
 class _MLP(nn.Module):
@@ -141,19 +136,19 @@ def test_search_without_capabilities_is_backend_agnostic():
 def test_specialize_causal_opt_out():
     """specialize_causal=False skips the fold even when the sdpa +
     causal-mask shape is present."""
-    from catopt.models import EagerAttention
+    from catopt_torch.models import EagerAttention
 
     torch.manual_seed(0)
     m = EagerAttention(dim=64, n_heads=2, block_size=16).eval()
     x = torch.randn(1, 8, 64)
     on = search(
         m, x, source=TorchSource(), capabilities=TorchSink(),
-        ruleset="categorical", max_iterations=4,
+        rules=CATEGORICAL, max_iterations=4,
     )
     assert on.stats.get("causal_specialized") is True
     off = search(
         m, x, source=TorchSource(), capabilities=TorchSink(),
-        ruleset="categorical", max_iterations=4,
+        rules=CATEGORICAL, max_iterations=4,
         specialize_causal=False,
     )
     assert "causal_specialized" not in off.stats
@@ -474,7 +469,8 @@ def test_optimize_strategy_autotuned():
 
 def test_optimize_model_wrapper_parity():
     m, x = _make()
-    mod, stats = optimize_model(m, x, verbose=False, max_iterations=3)
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == "identity"
     assert stats["lowering"] == "generic"
     assert "rule_fires" in stats and "compiled" not in stats
@@ -484,7 +480,8 @@ def test_optimize_model_wrapper_parity():
 
 def test_optimize_model_verbose_verifies_and_prints(capsys):
     m, x = _make()
-    optimize_model(m, x, verbose=True, max_iterations=1)
+    Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=1, verify=True, verbose=True)
+
     out = capsys.readouterr().out
     assert "[Verify] Checking output equivalence..." in out
     assert "Semantically equivalent" in out
@@ -492,13 +489,8 @@ def test_optimize_model_verbose_verifies_and_prints(capsys):
 
 def test_wrappers_chained_runner_names():
     m, x = _make()
-    _, stats = optimize_model(
-        m,
-        x,
-        verbose=False,
-        runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
-        max_iterations=3,
-    )
+    _, stats = Optimizer(backend=TorchBackend(), runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == ["torch_compile", "cuda_graph"]
     assert stats["compiled"] is True
 
@@ -507,9 +499,8 @@ def test_optimize_compositional_wrapper_parity():
     torch.manual_seed(0)
     m = _Stack().eval()
     x = torch.randn(2, 8)
-    mod, stats = optimize_compositional(
-        m, x, max_iterations=3, max_cross_pairs=0, verbose=False
-    )
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(max_cross_pairs=0), max_iterations=3, verbose=False)
+
     assert stats["n_blocks"] == 2
     with torch.no_grad():
         assert torch.allclose(mod(x), m(x), atol=1e-4)
@@ -517,15 +508,8 @@ def test_optimize_compositional_wrapper_parity():
 
 def test_optimize_model_autotuned_wrapper_parity():
     m, x = _make()
-    mod, stats = optimize_model_autotuned(
-        m,
-        x,
-        candidates=("generic",),
-        n_calls=2,
-        warmup=0,
-        max_iterations=3,
-        verbose=False,
-    )
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Autotuned(("generic",), n_calls=2, warmup=0, verbose=False, builders=TORCH_BUILDERS), max_iterations=3)
+
     assert stats["autotune"]["winner"] == "generic"
     with torch.no_grad():
         assert torch.allclose(mod(x), m(x), atol=1e-5)
@@ -535,9 +519,8 @@ def test_optimize_model_resource_error_still_raises():
     """The OOM adapter still wraps the wrapper."""
     m, x = _make()
     with pytest.raises(OptimizationResourceError):
-        optimize_model(
-            m, x, verbose=False, max_iterations=3, max_enodes=1
-        )
+        Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, max_enodes=1, verify=False, verbose=False)
+
 
 
 def test_discover_alternatives_returns_search_result():

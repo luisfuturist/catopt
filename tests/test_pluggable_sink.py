@@ -15,15 +15,20 @@ would not fit; that it fits is the conformance evidence.
 import numpy as np
 import torch
 import torch.nn as nn
-from catopt.adapters import TorchSource
-from catopt.cost import backend_cost, launch_aware_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Const, Op, Param, Var
-from catopt.ops import OpTable
-from catopt.optimize import discover_alternatives, optimize_model
-from catopt.ports import ExecutorSpec, Sink
-from catopt.report import VerifyReport
+from catopt_torch.adapters import TorchSource
+from catopt_core.cost import backend_cost, launch_aware_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Const, Op, Param, Var
+from catopt_core.ops import OpTable
+from catopt_orchestrator.optimize import discover_alternatives
+
+
+from catopt_core.ports import ExecutorSpec, Sink
+from catopt_torch.report import VerifyReport
 from catopt_core.laws import all_rules
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _to_np(v):
@@ -214,14 +219,8 @@ def test_backend_relative_extraction_avoids_unsupported_ops():
 def test_optimize_model_with_numpy_sink():
     model = _model()
     x = torch.randn(2, 8)
-    mod, _stats = optimize_model(
-        model,
-        x,
-        source=TorchSource(),
-        sink=NumpySink(),
-        verbose=False,
-        max_iterations=2,
-    )
+    mod, _stats = Optimizer(backend=TorchBackend(), source=TorchSource(), sink=NumpySink()).optimize(model, x, max_iterations=2, verify=False, verbose=False)
+
     assert isinstance(mod, _NumpyModule)
     got = mod(x.detach().numpy())
     want = model(x).detach().numpy()

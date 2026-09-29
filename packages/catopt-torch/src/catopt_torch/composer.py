@@ -2,7 +2,7 @@
 
 Everything structural the per-block (:class:`Compositional`) strategy
 needs from a torch module tree (plan 0007, moved verbatim from
-``catopt_optimize.optimize``):
+``catopt_orchestrator.optimize``):
 
 * block selection — the ``named_children`` walk picking the top-most
   matching submodules;
@@ -30,12 +30,64 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
+from catopt_core import laws as _core_laws
 from catopt_core.cost import flops_cost
 from catopt_core.ports import CostFn, Sink, Source
 
 from catopt_torch.report import verify_module
 
 __all__ = ["TorchComposer", "param_report"]
+
+#: The joint pass's widened set when the caller used the pipeline
+#: default — the historical ``ruleset="all"`` → ``"all+layout"``
+#: upgrade: the full core surface plus the layout migration laws,
+#: minus the pairing-subsumed folds.
+_JOINT_DEFAULT = _core_laws.WITH_LAYOUT - _core_laws.WITH_LAYOUT.tagged(
+    _core_laws.tags.SUBSUMED
+)
+
+
+def _joint_rules(rules: Any) -> Any:
+    """Return the rule set the joint pair pass saturates with.
+
+    ``None`` — or a set equal to the pipeline's composed default —
+    widens to the layout-inclusive surface (the historical
+    ``"all"`` → ``"all+layout"`` upgrade); a caller-chosen
+    :class:`~catopt_core.laws.RuleSet` is used as-is.
+    """
+    from catopt_orchestrator.optimize import (
+        _resolve_rules,
+        default_rules,
+    )
+
+    resolved = _resolve_rules(rules)
+    if {r.name for r in resolved} == {r.name for r in default_rules()}:
+        return _JOINT_DEFAULT
+    return resolved
+
+
+def _joint_optimize(
+    joint: torch.nn.Module,
+    x: Any,
+    *,
+    source: Source,
+    sink: Sink,
+    verbose: bool = True,
+    **kw: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """One joint micro-model optimization — the cross-pair seam.
+
+    Runs the monolithic pipeline on the joint block through the same
+    ``source``/``sink`` ports the per-block passes used and returns
+    ``(module, stats)``.  Module-level so tests can stub the joint
+    run (``monkeypatch.setattr(composer, "_joint_optimize", ...)``).
+    """
+    from catopt_orchestrator.optimize import Optimizer
+
+    lr = Optimizer(source=source, sink=sink).optimize(
+        joint, x, verify=verbose, verbose=verbose, **kw
+    )
+    return lr.module, lr.stats
 
 
 def _default_block_pred(
@@ -590,7 +642,7 @@ class TorchComposer:
 
     Thin port object over the module-level machinery in this file —
     the function names stay importable for the historical private
-    paths (``catopt.optimize._select_blocks`` and friends resolve
+    paths (``catopt_orchestrator.optimize._select_blocks`` and friends resolve
     through the compatibility delegation too).
     """
 
@@ -653,7 +705,7 @@ class TorchComposer:
         block_reports: dict[str, dict],
         agg: dict[str, Any],
         *,
-        ruleset: str,
+        rules: Any,
         max_iterations: int,
         max_enodes: int | None,
         max_memory_mb: float | None,
@@ -728,26 +780,20 @@ class TorchComposer:
             try:
                 joint = _JointPair(mod_a, mod_b, mode)
                 (x,) = captured[name_a][0]
-                # Deferred edge: the joint run goes through the same
-                # torch-facing wrapper the per-block pipeline did —
-                # resolved through the orchestrator's lazy delegation
-                # (``catopt_optimize.optimize.optimize_model`` →
-                # ``catopt_torch.api``) so the historical monkeypatch
-                # target intercepts it too.
-                import catopt_optimize.optimize as _pipeline
-
-                opt_j, st_j = _pipeline.optimize_model(
+                # The joint run goes through the same monolithic
+                # pipeline the per-block pass did — via the
+                # module-level ``_joint_optimize`` seam so a stub can
+                # intercept it in tests.
+                opt_j, st_j = _joint_optimize(
                     joint,
                     x,
-                    ruleset=(
-                        "all+layout" if ruleset == "all" else ruleset
-                    ),
+                    source=source,
+                    sink=sink,
+                    rules=_joint_rules(rules),
                     max_iterations=max_iterations,
                     max_enodes=max_enodes,
                     max_memory_mb=max_memory_mb,
                     cost_fn=cost_fn,
-                    source=source,
-                    sink=sink,
                     symmetry_budget=_CROSS_PAIR_SYMMETRY_BUDGET,
                     verbose=verbose,
                 )

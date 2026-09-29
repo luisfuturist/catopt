@@ -75,8 +75,17 @@ from typing import Any
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Op
-from catopt_core.laws import R
+from catopt_core.laws import R as _R
+from catopt_core.laws import RuleSet
+from catopt_core.laws import tags as _tags
 from catopt_core.laws.tensor import _check_repeat_chain
+
+
+def R(name: str, lhs, rhs, **kw) -> Rewrite:
+    """Module-local law constructor — decode laws carry ``CARRIER``+``DECODE``."""
+    kw.setdefault("tags", (_tags.CARRIER, _tags.DECODE))
+    return _R(name, lhs, rhs, **kw)
+
 
 __all__ = [
     "DECODE_LAWS",
@@ -494,3 +503,10 @@ DECODE_LAWS: list[Rewrite] = [
     REPEAT_AS_GATHER,
     INDEX_SELECT_ID,
 ]
+
+#: The same set as a composable :class:`~catopt_core.laws.RuleSet`.
+DECODE_RULES = RuleSet(
+    "decode",
+    tuple(DECODE_LAWS),
+    description="the decode/KV-cache carrier laws",
+)

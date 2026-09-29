@@ -74,18 +74,18 @@ sys.setrecursionlimit(400_000)
 
 import torch
 
-from catopt.cost import _shape_of, flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op
-from catopt.omd_lower import to_batched_omd_module
-from catopt.regime import default_rules
-from catopt.torch_bridge import (
+from catopt_core.cost import _shape_of, flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op
+from catopt_carriers.omd_lower import to_batched_omd_module
+from catopt_torch.regime import default_rules
+from catopt_torch.torch_bridge import (
     _IR_TO_TORCH,
     export_to_ir,
     ir_to_torch_module,
 )
-from catopt.trace_lift import lift_scan_to_trace
-from catopt.xcarrier import (
+from catopt_carriers.trace_lift import lift_scan_to_trace
+from catopt_carriers.xcarrier import (
     XC_LAWS,
     _elem_affine_options,
     gather_apply_stack,

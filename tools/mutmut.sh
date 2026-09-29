@@ -7,7 +7,7 @@
 # per-package `src/` layout imports as `catopt_core.attrs`.  This script
 # builds a flat sandbox (`.mutmut-sandbox/`, gitignored) where each
 # package is symlinked at the top level (so path == import name)
-# alongside `tests/`, the `catopt` façade and `uv.lock`, writes a
+# alongside `tests/` and `uv.lock`, writes a
 # matching `[tool.mutmut]`, and runs mutmut there.  The sandbox persists
 # so `run`/`results`/`browse` share one cache; delete it to reset.
 #
@@ -36,14 +36,14 @@ for spec in \
     catopt-core:catopt_core \
     catopt-torch:catopt_torch \
     catopt-carriers:catopt_carriers \
-    catopt-optimize:catopt_optimize
+    catopt-cuda:catopt_cuda \
+    catopt-orchestrator:catopt_orchestrator
 do
     dir=${spec%%:*}
     mod=${spec##*:}
     [ -e "$sandbox/$mod" ] || ln -s "$root/packages/$dir/src/$mod" "$sandbox/$mod"
 done
 [ -e "$sandbox/tests" ] || ln -s "$root/tests" "$sandbox/tests"
-[ -e "$sandbox/catopt" ] || ln -s "$root/catopt" "$sandbox/catopt"
 [ -e "$sandbox/uv.lock" ] || ln -s "$root/uv.lock" "$sandbox/uv.lock"
 
 only=${MUTMUT_ONLY:-}
@@ -52,10 +52,9 @@ sel=$(printf '%s' "$tests" | sed 's/ /", "/g')
 
 {
     echo '[tool.mutmut]'
-    echo 'source_paths = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_optimize"]'
+    echo 'source_paths = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_orchestrator", "catopt_cuda"]'
     echo 'pytest_add_cli_args = ["-p", "no:cacheprovider", "-q"]'
     echo "pytest_add_cli_args_test_selection = [\"$sel\"]"
-    echo 'also_copy = ["catopt/"]'
     [ -n "$only" ] && echo "only_mutate = [\"$only\"]"
 } > "$sandbox/pyproject.toml"
 

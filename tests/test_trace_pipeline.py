@@ -1,5 +1,5 @@
 """Traced-monoidal carrier in the *pipeline* — regime saturation,
-frontier extraction, and executor dispatch (``catopt.regime``).
+frontier extraction, and executor dispatch (``catopt_torch.regime``).
 
 ``tests/test_trace.py`` proves the JSV axioms as isolated rewrites.
 This file proves the pipeline-level story:
@@ -13,7 +13,7 @@ This file proves the pipeline-level story:
   exports contain no ``trace``/``inv``/``eye`` foothold, and no
   lhs→rhs law can mint one (``tr_collapse``'s resolvent LHS needs
   shared ``split``-projections nothing produces).  The bridge is
-  ``catopt.trace_lift.lift_scan_to_trace`` — wired into
+  ``catopt_carriers.trace_lift.lift_scan_to_trace`` — wired into
   ``build_egraph`` — which *constructs* the nilpotent block-shift F
   from the whole unrolled horizon and offers
   ``matmul(trace(F, T·d), vec)``, witnessed.  Post-lift the JSV laws
@@ -34,16 +34,16 @@ tolerance-lottery.
 import pytest
 import torch
 
-import catopt.trace as cat_trace  # noqa: F401  (registers torch bindings)
-from catopt import meta
+import catopt_carriers.trace as cat_trace  # noqa: F401  (registers torch bindings)
+from catopt_core import meta
 from catopt_core import laws as R
-from catopt.cost import flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Param, TensorType, Var, op_repr
-from catopt.models.hybrid import HybridBlock
-from catopt.models.ssm import DiagonalSSM
-from catopt.om import OM_LAWS
-from catopt.regime import (
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Param, TensorType, Var, op_repr
+from catopt_torch.models.hybrid import HybridBlock
+from catopt_torch.models.ssm import DiagonalSSM
+from catopt_carriers.om import OM_LAWS
+from catopt_torch.regime import (
     CARRIER_LAWS,
     EXECUTORS,
     Regime,
@@ -52,8 +52,8 @@ from catopt.regime import (
     regime_dispatch,
     regime_frontier,
 )
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt.trace import TRACE_LAWS
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_carriers.trace import TRACE_LAWS
 
 
 @pytest.fixture(autouse=True)
@@ -113,7 +113,7 @@ class TestTraceInPipeline:
         for r in TRACE_LAWS:
             assert r in CARRIER_LAWS, r.name
         # default_rules() (what build_egraph saturates with) carries them
-        from catopt.regime import default_rules
+        from catopt_torch.regime import default_rules
 
         names = {r.name for r in default_rules()}
         assert {r.name for r in TRACE_LAWS} <= names

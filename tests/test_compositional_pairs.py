@@ -9,12 +9,15 @@ AND its delivered FLOPs beat the sum of the separate results; every
 other outcome is a silent decline recorded in ``stats["cross_pairs"]``.
 """
 
-import catopt_optimize.optimize as O
 import catopt_torch.composer as C
+import catopt_torch.composer as O
 import torch
 import torch.nn as nn
-from catopt.models import DeepParallel, ParallelLinear
-from catopt.optimize import optimize_compositional
+from catopt_torch.models import DeepParallel, ParallelLinear
+
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 class _Scale(nn.Module):
@@ -70,7 +73,8 @@ def test_cross_pair_chain_grafts_jointly():
     model = _ChainStack(dim=32, depth=4).eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     pairs = stats["cross_pairs"]
     e01 = pairs["blocks.0+blocks.1"]
@@ -123,7 +127,8 @@ def test_cross_pair_residual_wrapped_graft():
     model = _ResidualStack(dim=32, depth=3).eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "grafted"
@@ -172,7 +177,8 @@ def test_cross_pair_residual_plain_graft():
     model = ResidualPlain().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "grafted"
@@ -211,7 +217,8 @@ def test_cross_pair_chain_wrapped_graft():
     model = ChainWrapped().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "grafted"
@@ -244,7 +251,8 @@ def test_cross_pair_declined_no_cost_improvement():
     model = SigStack().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=True)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=True)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "declined"
@@ -278,7 +286,8 @@ def test_cross_pair_non_adjacent_declines():
     model = Interleaved().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     pairs = stats["cross_pairs"]
     # blocks.0's output is consumed by blocks.2, not blocks.1.
@@ -325,7 +334,8 @@ def test_cross_pair_member_not_optimized():
     model = Mixed().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     assert stats["blocks"]["blocks.1"]["status"] == "failed"
     for k in ("blocks.0+blocks.1", "blocks.1+blocks.2"):
@@ -342,19 +352,20 @@ def test_cross_pair_verify_decline(monkeypatch):
     """A joint that fails the eager-equivalence verify is declined —
     the individually-optimized modules stay grafted."""
     torch.manual_seed(0)
-    orig = O.optimize_model
+    orig = O._joint_optimize
 
     def fake(m, ex, **kw):
         if isinstance(m, O._JointPair):
             return nn.Identity(), {}
         return orig(m, ex, **kw)
 
-    monkeypatch.setattr(O, "optimize_model", fake)
+    monkeypatch.setattr(O, "_joint_optimize", fake)
 
     model = _ChainStack(dim=32, depth=2).eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "declined"
@@ -368,19 +379,20 @@ def test_cross_pair_verify_decline(monkeypatch):
 def test_cross_pair_error_decline(monkeypatch):
     """Any exception inside a pair attempt is a silent decline."""
     torch.manual_seed(0)
-    orig = O.optimize_model
+    orig = O._joint_optimize
 
     def boom(m, ex, **kw):
         if isinstance(m, O._JointPair):
             raise RuntimeError("export boom")
         return orig(m, ex, **kw)
 
-    monkeypatch.setattr(O, "optimize_model", boom)
+    monkeypatch.setattr(O, "_joint_optimize", boom)
 
     model = _ChainStack(dim=32, depth=2).eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "declined"
@@ -397,9 +409,8 @@ def test_cross_pair_budget_cap():
     model = _ChainStack(dim=32, depth=4).eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(
-        model, x, verbose=False, max_cross_pairs=1
-    )
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(max_cross_pairs=1), verbose=False)
+
 
     pairs = stats["cross_pairs"]
     assert pairs["blocks.0+blocks.1"]["status"] == "grafted"
@@ -419,9 +430,8 @@ def test_cross_pair_disabled():
     model = _ChainStack(dim=32, depth=2).eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(
-        model, x, verbose=False, max_cross_pairs=0
-    )
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(max_cross_pairs=0), verbose=False)
+
 
     assert stats["cross_pairs"] == {}
     assert stats["n_optimized"] == 2
@@ -769,7 +779,8 @@ def test_cross_pair_probe_failure_declines(monkeypatch):
     model = ResidualWrapped().eval().double()
     x = torch.randn(8, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     e = stats["cross_pairs"]["blocks.0+blocks.1"]
     assert e["status"] == "skipped"
@@ -815,13 +826,10 @@ def test_executor_flops_paths():
     and returns inf when nothing is priceable."""
     import types
 
-    from catopt.optimize import optimize_model
-
     torch.manual_seed(0)
     x = torch.randn(4, 8, dtype=torch.float64)
-    mod, _st = optimize_model(
-        nn.Linear(8, 8, bias=False).double(), x, verbose=False
-    )
+    mod, _st = Optimizer(backend=TorchBackend()).optimize(nn.Linear(8, 8, bias=False).double(), x, verify=False, verbose=False)
+
     direct = O._executor_flops(mod)
     assert 0.0 < direct < float("inf")
     # Carrier-style wrapper: root reachable through eval_mod only.

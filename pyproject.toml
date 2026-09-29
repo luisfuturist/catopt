@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "catopt"
 version = "0.1.0dev"
-description = "Categorical optimization of neural-network computation graphs — meta distribution (façade over the domain packages in packages/)"
+description = "Categorical optimization of neural-network computation graphs — meta distribution over the domain packages in packages/ (no importable `catopt` package)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "catopt-core",
     "catopt-torch",
     "catopt-carriers",
-    "catopt-optimize",
+    "catopt-orchestrator",
     "catopt-cuda",
     "torch>=2.0",
     "numpy>=1.24",
@@ -49,7 +49,7 @@ bench = [
 # op/law subset.  It is deliberately NOT in `dev`: the repo stays light
 # (egglog is a compiled Rust extension), the oracle test self-skips via
 # `pytest.importorskip("egglog")` when the group is absent, and nothing
-# under packages/ or catopt/ imports it.  Run with:
+# under packages/ imports it.  Run with:
 #   uv sync --group oracle && .venv/bin/python -m pytest tests/test_egglog_oracle.py
 # egglog ships wheels for CPython >= 3.12 only, so the entry carries a
 # `python_version` marker: the workspace still declares `>=3.11`, but
@@ -77,10 +77,10 @@ dev = [
     "semgrep>=1.178.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["catopt"]
-exclude = ["packages*", "tests*", "bench*"]
+# The root project is a pure meta distribution — plan 0008 removed the
+# ``catopt`` façade package, so nothing under the repo root is shipped.
+[tool.setuptools]
+packages = []
 
 # --- uv workspace: the domain packages ---------------------------
 [tool.uv.workspace]
@@ -90,7 +90,7 @@ members = ["packages/*"]
 catopt-core = { workspace = true }
 catopt-torch = { workspace = true }
 catopt-carriers = { workspace = true }
-catopt-optimize = { workspace = true }
+catopt-orchestrator = { workspace = true }
 catopt-cuda = { workspace = true }
 
 [tool.pytest.ini_options]
@@ -103,13 +103,13 @@ markers = [
 # vulture: flag unreachable/unused code at high confidence.  The suite
 # is pinned at 100% coverage, so a genuine dead branch is a real
 # finding, not noise.  Run `.venv/bin/vulture` (uses these paths) or
-# `.venv/bin/vulture packages catopt tests --min-confidence 80`; a
+# `.venv/bin/vulture packages tests --min-confidence 80`; a
 # non-zero exit (3) means dead code.  If a public member is kept only
 # for the compatibility aliases, add its name to `ignore_names` here
 # rather than leaving a false positive.
 [tool.vulture]
 min_confidence = 80
-paths = ["packages", "catopt", "tests"]
+paths = ["packages", "tests"]
 
 # import-linter: the hexagonal-boundary ratchet.  The key contract is
 # "core is torch-free" — catopt-core (the zero-dependency engine) must
@@ -120,9 +120,8 @@ root_packages = [
     "catopt_core",
     "catopt_torch",
     "catopt_carriers",
-    "catopt_optimize",
+    "catopt_orchestrator",
     "catopt_cuda",
-    "catopt",
 ]
 # Required so the "core imports no tensor library" contract can forbid
 # the external torch/numpy packages.
@@ -135,7 +134,7 @@ source_modules = ["catopt_core"]
 forbidden_modules = [
     "catopt_torch",
     "catopt_carriers",
-    "catopt_optimize",
+    "catopt_orchestrator",
     "catopt_cuda",
 ]
 
@@ -148,14 +147,14 @@ forbidden_modules = ["torch", "numpy"]
 [[tool.importlinter.contracts]]
 name = "orchestrator imports no backend"
 type = "forbidden"
-source_modules = ["catopt_optimize"]
+source_modules = ["catopt_orchestrator"]
 forbidden_modules = ["torch", "catopt_torch", "catopt_cuda"]
 # The backend packages may never be imported directly — backend
 # specifics live behind the Composer/Meter/Runner/ExecutorSpec ports.
 # Indirect reach is fine: the orchestrator lazily resolves carrier
 # machinery (catopt_carriers), which is what pulls torch — the runtime
 # boundary test (sys.modules stays torch-free after
-# `import catopt_optimize`) is the gate that pins the laziness.
+# `import catopt_orchestrator`) is the gate that pins the laziness.
 allow_indirect_imports = true
 
 [tool.ruff]
@@ -190,12 +189,12 @@ extra-paths = [
     "packages/catopt-core/src",
     "packages/catopt-torch/src",
     "packages/catopt-carriers/src",
-    "packages/catopt-optimize/src",
+    "packages/catopt-orchestrator/src",
     "packages/catopt-cuda/src",
 ]
 
 [tool.ty.src]
-include = ["packages", "catopt"]
+include = ["packages"]
 exclude = []
 
 [tool.ty.terminal]
@@ -203,7 +202,7 @@ exclude = []
 error-on-warning = false
 
 [tool.coverage.run]
-source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_optimize", "catopt_cuda", "catopt"]
+source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_orchestrator", "catopt_cuda"]
 branch = true
 omit = ["*/tests/*"]
 

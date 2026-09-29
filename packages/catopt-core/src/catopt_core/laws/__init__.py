@@ -15,9 +15,20 @@
 * :mod:`catopt_core.laws.pairing` — the non-local passes over the whole
   e-graph (pairing, weight sharing).  These are diagram-level passes,
   not equational laws.
+* :mod:`catopt_core.laws.tags` — the rule-tag constants
+  (``SYMMETRY`` / ``EXPANSIVE`` / ``SUBSUMED`` / ``FUSION`` / …).
+* :mod:`catopt_core.laws.ruleset` — :class:`RuleSet`, the composable
+  rule-set value (+/-/& algebra, ``named``/``tagged`` subsets, the
+  ``priorities`` scheduling map with ``EARLY``/``NORMAL``/``LATE``),
+  and the named presets (``SIMPLIFICATION`` / ``CATEGORICAL`` /
+  ``FUSION`` / ``SYMMETRY`` / ``CARRIERS`` / ``WITH_LAYOUT`` /
+  ``DEFAULT`` / ``FULL``).
 
 This package is the canonical rewrite surface — the historical
-``catopt_core.rules`` module (and its ``catopt.rules`` alias) is gone.
+``catopt_core.rules`` module (and its ``catopt.rules`` façade alias)
+is gone.  The loose group lists (``*_RULES`` / ``*_LAWS``,
+``all_rules()``) remain as thin list aliases during migration; the
+first-class values are the ``RuleSet`` presets.
 """
 
 # Public surface (in ``__all__``) plus the private side-condition /
@@ -25,6 +36,7 @@ This package is the canonical rewrite surface — the historical
 # ``catopt_core.rules`` shim (and its ``catopt.rules`` alias).  The
 # private names are re-exported (hence ``noqa: F401``) so
 # ``catopt_core.laws._x`` keeps resolving, but stay out of ``__all__``.
+from catopt_core.laws import tags as tags
 from catopt_core.laws.base import (  # noqa: F401
     _SHAPE_MEMO,
     R,
@@ -58,6 +70,23 @@ from catopt_core.laws.pairing import (  # noqa: F401
     pair_shared_input_linears,
     share_duplicate_param_slices,
     share_duplicate_params,
+)
+from catopt_core.laws.ruleset import (
+    CARRIER_SEARCH,
+    CARRIERS,
+    CATEGORICAL,
+    DEFAULT,
+    EARLY,
+    FULL,
+    FUSION,
+    LATE,
+    NORMAL,
+    PRESETS,
+    SIMPLIFICATION,
+    SYMMETRY,
+    WITH_LAYOUT,
+    RuleSet,
+    preset,
 )
 from catopt_core.laws.scan import (  # noqa: F401
     _AFFD_UNIT,
@@ -190,15 +219,23 @@ __all__ = [
     "ASSOC_MATMUL",
     "ASSOC_MATMUL_REV",
     "ASSOC_MUL",
+    "CARRIERS",
+    "CARRIER_SEARCH",
+    "CATEGORICAL",
     "CATEGORICAL_RULES",
     "COMM_ADD",
     "COMM_MUL",
+    "DEFAULT",
     "DISTRIBUTE_MUL",
     "DOUBLE_NEG",
+    "EARLY",
     "FACTOR_MUL",
+    "FULL",
+    "FUSION",
     "GQA_ABSORB",
     "ID_ADD",
     "ID_MUL",
+    "LATE",
     "LAYOUT_RULES",
     "LINEAR_CHANNEL_SCALE",
     "LINEAR_CHANNEL_SCALE_REV",
@@ -209,8 +246,10 @@ __all__ = [
     "LINEAR_TO_MM_T",
     "NATURALITY_SCALAR",
     "NATURALITY_SCALAR_REV",
+    "NORMAL",
     "PARALLEL_MUL_FUSE",
     "POW_TO_SQUARE",
+    "PRESETS",
     "QKV_FUSE",
     "QKV_FUSE_ASYM",
     "RIGHT_DISTRIBUTE",
@@ -221,19 +260,25 @@ __all__ = [
     "SDPA_FOLD_RULES",
     "SILU_EXPAND",
     "SILU_MUL_FORM",
+    "SIMPLIFICATION",
     "SIMPLIFICATION_RULES",
     "SQUARE_EXPAND",
     "SQUARE_TO_POW",
     "SUB_TO_ADD",
     "SWIGLU_FUSE",
+    "SYMMETRY",
     "WEIGHT_DISTRIBUTE",
     "WEIGHT_DISTRIBUTE_LINEAR",
     "WEIGHT_FACTOR",
     "WEIGHT_FACTOR_LINEAR",
+    "WITH_LAYOUT",
     "R",
+    "RuleSet",
     "all_rules",
     "pair_shared_input_convs",
     "pair_shared_input_linears",
+    "preset",
     "share_duplicate_param_slices",
     "share_duplicate_params",
+    "tags",
 ]

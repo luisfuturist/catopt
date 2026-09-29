@@ -1,7 +1,7 @@
 """Tests for the IR / term algebra."""
 
 import pytest
-from catopt.ir import (
+from catopt_core.ir import (
     IR,
     Const,
     Op,

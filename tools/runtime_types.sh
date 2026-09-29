@@ -3,7 +3,7 @@
 #
 # Instruments the torch-free core (``catopt_core``) plus the three
 # adapter/orchestrator packages (``catopt_torch``, ``catopt_carriers``,
-# ``catopt_optimize``) and runs the typeguard-clean test files, so
+# ``catopt_orchestrator``) and runs the typeguard-clean test files, so
 # annotation drift surfaces as a runtime ``TypeCheckError`` rather than
 # silent ``Any``.  After the ty burn-down emptied ``[tool.ty.src]
 # exclude`` these tests pass under full instrumentation; grow the list
@@ -16,7 +16,7 @@
 # ``runtime-types`` hook / the CI workflow.
 set -eu
 exec .venv/bin/python -m pytest -q -p no:cacheprovider \
-    --typeguard-packages=catopt_core,catopt_torch,catopt_carriers,catopt_optimize \
+    --typeguard-packages=catopt_core,catopt_torch,catopt_carriers,catopt_orchestrator \
     tests/test_ir.py \
     tests/test_egraph.py \
     tests/test_laws_structure.py \

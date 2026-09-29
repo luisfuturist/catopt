@@ -15,14 +15,14 @@ bench hunts on five/six real-topology cells:
   reordering) and the product-law pairing of the three input
   projections into one GEMM.
 * ``palm_stack`` — PaLM/GPT-J parallel blocks
-  ``x + attn(norm x) + mlp(norm x)`` (``catopt.models.ParallelBlock``
+  ``x + attn(norm x) + mlp(norm x)`` (``catopt_torch.models.ParallelBlock``
   ×2): five same-input projections the pairing pass can fold into
   one GEMM per block.  Same FLOPs, fewer launches.
 * ``moe_sum`` — mixture-of-small-matmuls / model-soup merge:
   ``Σ_i x @ W_i`` over 8 experts — ``weight_factor_linear`` folds it
   to ONE matmul (a real FLOP cut deployment tools do by hand).
 * ``conv_stem`` — ResNet-style 1×1 multi-branch stem
-  (``catopt.models.ParallelConv``): 4 same-input convs paired into
+  (``catopt_torch.models.ParallelConv``): 4 same-input convs paired into
   one cuDNN call; Inductor does not fuse conv calls.
 * ``decode_retnet`` — chunked streaming decode of a RetNet step,
   UNBATCHED vector state (the form the affine carrier lifts): the
@@ -75,7 +75,7 @@ medians stable within ~10-20%):
 
 Usage:
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/real_win_hunt.py \
         --device cuda
     .venv/bin/python bench/real_win_hunt.py --device cpu --quick
@@ -101,10 +101,15 @@ sys.setrecursionlimit(400_000)
 import torch
 import torch.nn as nn
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.models import ParallelBlock, ParallelConv, ParallelLinear
-from catopt.optimize import optimize_model
-from catopt_optimize.autotune import optimize_model_autotuned
+from catopt_torch.models import ParallelBlock, ParallelConv, ParallelLinear
+
+
 from decode_scan_bench import ChunkedStep, DecodeStep
+from catopt_orchestrator.optimize import Autotuned
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.autotune import TORCH_BUILDERS
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -488,13 +493,8 @@ def run_cell(
     # -- fp64 pipeline: the production search + verify -----------------
     t0 = time.time()
     try:
-        del64, st64 = optimize_model(
-            model64,
-            x64_or_t,
-            verbose=False,
-            max_iterations=max_iterations,
-            max_enodes=max_enodes,
-        )
+        del64, st64 = Optimizer(backend=TorchBackend()).optimize(model64, x64_or_t, max_iterations=max_iterations, max_enodes=max_enodes, verify=False, verbose=False)
+
         del64 = del64.to(dev).eval()
         with torch.no_grad():
             d = _rel_diff(del64(*args64), ref64)
@@ -536,19 +536,8 @@ def run_cell(
     best = None
     at = {}
     try:
-        best, st32 = optimize_model_autotuned(
-            model32,
-            x32_or_t,
-            candidates=candidates,
-            n_calls=n_calls,
-            warmup=at_warmup,
-            rtol=1e-4,
-            atol=atol_v,
-            budget_s=budget_s,
-            verbose=verbose,
-            max_iterations=max_iterations,
-            max_enodes=max_enodes,
-        )
+        best, st32 = Optimizer(backend=TorchBackend()).optimize(model32, x32_or_t, strategy=Autotuned(candidates, budget_s=budget_s, n_calls=n_calls, warmup=at_warmup, rtol=1e-4, atol=atol_v, verbose=verbose, builders=TORCH_BUILDERS), max_iterations=max_iterations, max_enodes=max_enodes)
+
         at = st32["autotune"]
         rec["lowering32"] = st32.get("lowering")
         parts = []

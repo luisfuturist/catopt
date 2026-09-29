@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "catopt-optimize"
+name = "catopt-orchestrator"
 version = "0.1.0dev"
 description = "Backend-neutral optimizer orchestrator for catopt: pipeline verbs, strategies, regime frontier."
 requires-python = ">=3.11"

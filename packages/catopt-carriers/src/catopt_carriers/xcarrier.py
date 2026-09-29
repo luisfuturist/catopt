@@ -138,7 +138,16 @@ from typing import Any, Literal, TypeGuard, cast
 import torch
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import Op, TensorType, Var
-from catopt_core.laws import R
+from catopt_core.laws import R as _R
+from catopt_core.laws import RuleSet
+from catopt_core.laws import tags as _tags
+
+
+def R(name: str, lhs, rhs, **kw) -> Rewrite:
+    """Module-local law constructor — seam laws carry the ``CARRIER`` tag."""
+    kw.setdefault("tags", (_tags.CARRIER,))
+    return _R(name, lhs, rhs, **kw)
+
 
 __all__ = [
     "TORCH_BINDINGS",
@@ -2004,6 +2013,14 @@ XC_LAWS: list[Rewrite] = [
     XC_OMD_PAIR_LIFT,
     XC_OMD_SPLIT,
 ]
+
+#: The same set as a composable :class:`~catopt_core.laws.RuleSet` —
+#: the bounded second tier of the regime e-graph build.
+XC_RULES = RuleSet(
+    "xc",
+    tuple(XC_LAWS),
+    description="the cross-carrier seam laws",
+)
 
 
 # ---------------------------------------------------------------------------

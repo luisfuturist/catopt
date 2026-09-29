@@ -85,6 +85,12 @@ class Rewrite:
     the LHS — e.g. the uneven ``split`` sizes of an asymmetric pairing,
     derived from the bound weight shapes.  Returning ``None`` vetoes the
     rewrite.
+
+    ``tags`` is the rule's intrinsic classification — constants from
+    :mod:`catopt_core.laws.tags` (symmetry / expansive / subsumed /
+    fusion / carrier / …).  It is *metadata about what the rule is*;
+    scheduling priority is a ``RuleSet`` concern and deliberately does
+    not live here, so the e-graph type stays free of scheduling policy.
     """
 
     name: str
@@ -93,6 +99,7 @@ class Rewrite:
     law: str = ""
     check: Any = None  # Callable[[dict[str, Any]], bool] | None
     derive: Any = None  # Callable[[dict], dict | None] | None
+    tags: frozenset[str] = frozenset()
     # Bounded-error axis (ε-laws): when set, this rewrite is a
     # *certified approximation* — ``‖lhs − rhs‖ ≤ error_bound`` in the
     # norm named by ``bound_norm`` (e.g. spectral on a substituted

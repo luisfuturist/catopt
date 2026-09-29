@@ -25,8 +25,12 @@ import os
 
 import pytest
 import torch
-from catopt.cost import flops_cost, param_bytes_cost_for
-from catopt.optimize import optimize_model, param_report
+from catopt_core.cost import flops_cost, param_bytes_cost_for
+from catopt_torch.composer import param_report
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
+
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CKPT = "/tmp/stories15M.bin"
@@ -111,9 +115,8 @@ def test_gqa_head_dedup_stories15m_layout_end_to_end():
     )
     x = torch.randn(4, 3 * DIM, dtype=torch.float64)
 
-    low, stats = optimize_model(
-        m, x, cost_fn=param_bytes_cost_for(), verbose=False
-    )
+    low, stats = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=param_bytes_cost_for(), verify=False, verbose=False)
+
 
     # fp64-equivalent output (other exact rewrites may reassociate
     # fp ops — residual is fp64 noise, ~1e-13, NOT a sharing error).
@@ -186,9 +189,8 @@ def test_slice_dedup_all_heads_identical():
         .double()
     )
     x = torch.randn(2, 3 * DIM, dtype=torch.float64)
-    low, _ = optimize_model(
-        m, x, cost_fn=param_bytes_cost_for(), verbose=False
-    )
+    low, _ = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=param_bytes_cost_for(), verify=False, verbose=False)
+
     with torch.no_grad():
         assert (low(x) - m(x)).abs().max() < 1e-9
     sd = low.state_dict()
@@ -210,9 +212,8 @@ def test_slice_dedup_no_fire_when_heads_distinct():
         .double()
     )
     x = torch.randn(2, 3 * DIM, dtype=torch.float64)
-    low, _ = optimize_model(
-        m, x, cost_fn=param_bytes_cost_for(), verbose=False
-    )
+    low, _ = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=param_bytes_cost_for(), verify=False, verbose=False)
+
     with torch.no_grad():
         assert (low(x) - m(x)).abs().max() < 1e-9
     r = param_report(m, low)
@@ -237,7 +238,8 @@ def test_slice_dedup_requires_storage_cost_axis():
         .double()
     )
     x = torch.randn(2, 3 * DIM, dtype=torch.float64)
-    low, _ = optimize_model(m, x, cost_fn=flops_cost, verbose=False)
+    low, _ = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=flops_cost, verify=False, verbose=False)
+
     with torch.no_grad():
         assert (low(x) - m(x)).abs().max() < 1e-9  # still exact
     _r = param_report(m, low)
@@ -256,7 +258,8 @@ def test_tied_embedding_classifier_if_stored_twice():
     share_duplicate_params merges the two Param leaves bitwise and the
     optimised file stores one copy — the pass would have exposed the
     tying rather than needing it declared."""
-    from catopt.optimize import param_report
+    from catopt_torch.composer import param_report
+
 
     torch.manual_seed(4)
     vocab = 512
@@ -274,7 +277,8 @@ def test_tied_embedding_classifier_if_stored_twice():
 
     m = TiedLM().eval().double()
     idx = torch.randint(0, vocab, (8,))
-    low, _ = optimize_model(m, idx, verbose=False)
+    low, _ = Optimizer(backend=TorchBackend()).optimize(m, idx, verify=False, verbose=False)
+
     with torch.no_grad():
         assert (low(idx) - m(idx)).abs().max() < 1e-9
     r = param_report(m, low)
@@ -301,8 +305,8 @@ def test_real_stories15m_checkpoint_has_no_exact_duplicates():
     import numpy as np
 
     sys.path.insert(0, REPO)
-    from catopt.egraph import EGraph
-    from catopt.ir import Param, TensorType
+    from catopt_core.egraph import EGraph
+    from catopt_core.ir import Param, TensorType
     from catopt_core.laws import (
         share_duplicate_param_slices,
         share_duplicate_params,

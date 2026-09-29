@@ -1,16 +1,16 @@
 """The torch half of regime-adaptive selection (plan 0007).
 
-The torch-coupled pieces moved out of ``catopt_optimize.regime``:
+The torch-coupled pieces moved out of ``catopt_orchestrator.regime``:
 :class:`RegimeDispatch` — the ``nn.Module`` holding every executor —
 and the end-to-end :func:`regime_dispatch` / :func:`build_egraph`
 wrappers with their historical torch defaults.  Importing this module
 also registers the ambient regime backend (the torch executor table +
 this dispatch class) with the neutral frontier, so
-:func:`catopt_optimize.regime.regime_frontier` and the historical
-``catopt.regime.EXECUTORS`` surface keep working unchanged.
+:func:`catopt_orchestrator.regime.regime_frontier` and the historical
+``catopt_torch.regime.EXECUTORS`` surface keep working unchanged.
 
 Every dispatched executor is still the lowered form of a certified
-e-graph member — see :mod:`catopt_optimize.regime` for the frontier
+e-graph member — see :mod:`catopt_orchestrator.regime` for the frontier
 machinery and honesty contract.
 """
 
@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-from catopt_optimize.regime import (
+from catopt_orchestrator.regime import (
     CARRIER_LAWS,
     EXECUTORS,
     ExecutorSpec,
@@ -36,26 +36,26 @@ from catopt_optimize.regime import (
     regime_frontier,
     register_regime_backend,
 )
-from catopt_optimize.regime import (
+from catopt_orchestrator.regime import (
     build_egraph as _build_egraph,
 )
 
 # Compat re-exports — the private helpers tests reach through the
-# historical ``catopt.regime`` path.  The redundant alias marks each
+# historical ``catopt_torch.regime`` path.  The redundant alias marks each
 # as an intentional re-export, not an unused import.
-from catopt_optimize.regime import (  # isort: skip
+from catopt_orchestrator.regime import (  # isort: skip
     _as_regime as _as_regime,
 )
-from catopt_optimize.regime import (  # isort: skip
+from catopt_orchestrator.regime import (  # isort: skip
     _attach_profiles as _attach_profiles,
 )
-from catopt_optimize.regime import (  # isort: skip
+from catopt_orchestrator.regime import (  # isort: skip
     _auto_executor as _auto_executor,
 )
-from catopt_optimize.regime import (  # isort: skip
+from catopt_orchestrator.regime import (  # isort: skip
     _force_carrier as _force_carrier,
 )
-from catopt_optimize.regime import (  # isort: skip
+from catopt_orchestrator.regime import (  # isort: skip
     _normalise_regimes as _normalise_regimes,
 )
 
@@ -87,7 +87,7 @@ def build_egraph(
     example_input: Any,
     *,
     source: Any = None,
-    rules: list | None = None,
+    rules: Any = None,
     xc: bool = True,
     max_iterations: int = 14,
     max_nodes: int = 400_000,
@@ -99,7 +99,7 @@ def build_egraph(
     ``source`` defaults to :class:`TorchSource` (``torch.export``);
     pass a different :class:`~catopt_core.ports.Source` to steer the
     export.  Everything else delegates to the backend-neutral
-    :func:`catopt_optimize.regime.build_egraph` — ``rules`` selects
+    :func:`catopt_orchestrator.regime.build_egraph` — ``rules`` selects
     the core saturating set (default the carrier law list), ``xc``
     adds the bounded cross-carrier seam tier.
     """
@@ -335,7 +335,7 @@ def regime_dispatch(
     example_input: Any,
     regimes: Any = None,
     *,
-    rules: list | None = None,
+    rules: Any = None,
     xc: bool = True,
     max_iterations: int = 14,
     max_nodes: int = 400_000,
@@ -354,7 +354,7 @@ def regime_dispatch(
     the model's own output on ``example_input`` (fp64 recommended).
 
     ``profiles`` is a ``{regime_name: profile_spec}`` map forwarded to
-    :func:`~catopt_optimize.regime.regime_frontier` — it fills
+    :func:`~catopt_orchestrator.regime.regime_frontier` — it fills
     ``profile`` on named regimes that don't carry one.  ``calibrate``
     is a convenience for "price this model against the current
     device": ``calibrate=True`` calls

@@ -1,7 +1,9 @@
 """Production export of optimized models — catopt-free artifacts.
 
-:func:`catopt_optimize.optimize_model` and
-:func:`catopt_optimize.optimize_compositional` return modules whose
+:class:`~catopt_orchestrator.Optimizer` deliveries
+(:meth:`~catopt_orchestrator.Optimizer.optimize` under the
+:class:`~catopt_orchestrator.Monolithic` or
+:class:`~catopt_orchestrator.Compositional` strategy) return modules whose
 forward runs catopt machinery — ``IRModule``'s term-evaluation plan
 tapes or the level-batched carrier executors (``BatchedScanModule`` /
 ``BatchedOMModule`` / ``BatchedOmdModule``).  Loading such a module at
@@ -71,6 +73,7 @@ __all__ = [
     "export_optimized",
     "load_optimized",
     "save_optimized",
+    "save_optimized_weights",
 ]
 
 
@@ -642,6 +645,17 @@ def export_optimized(
 
 # ``save_optimized`` reads better at call sites that pass a filename.
 save_optimized = export_optimized
+
+
+def save_optimized_weights(
+    optimized_module: torch.nn.Module, path: str | Path
+) -> None:
+    """Emit the optimized weights file.
+
+    Only the parameters the certified form actually needs (folded
+    derived tensors included).
+    """
+    torch.save(optimized_module.state_dict(), str(path))
 
 
 def load_optimized(path: str | Path) -> Any:

@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.rulecache — the JSON codec (attrs, terms,
+"""Coverage tests for catopt_core.rulecache — the JSON codec (attrs, terms,
 bindings, rule records incl. guarded re-expression), fingerprinting,
 the filesystem store/load contract, and the cached-synthesis key
 derivation.  Real codec paths only; the synthesis itself is stubbed
@@ -11,10 +11,10 @@ import json
 import pytest
 import torch
 
-import catopt.meta as meta
-from catopt.egraph import Rewrite
-from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.rulecache import (
+import catopt_core.meta as meta
+from catopt_core.egraph import Rewrite
+from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_core.rulecache import (
     CACHE_VERSION,
     RuleCache,
     _dec_attr,

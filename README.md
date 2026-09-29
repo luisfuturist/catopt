@@ -5,9 +5,10 @@ finds faster programs the compiler can't express, proves they're
 equivalent, and hands them to Inductor (or a CUDA graph) to run.
 
 ```python
-from catopt.optimize import optimize_model
+from catopt_orchestrator import Optimizer
+from catopt_torch import TorchBackend
 
-opt, stats = optimize_model(model, example_input)
+opt, stats = Optimizer(backend=TorchBackend()).optimize(model, example_input)
 out = opt(x)        # same function as model(x), verified rtol=1e-4
 ```
 
@@ -28,31 +29,37 @@ python demo.py          # 60-second end-to-end run on CPU
 ### Choose how the result is delivered
 
 ```python
-from catopt_optimize import (
-    CompiledRunner, CudaGraphRunner, ChainedRunner,
-    optimize_model_autotuned, optimize_compositional,
+from catopt_cuda import CudaGraphRunner
+from catopt_orchestrator import (
+    Autotuned, ChainedRunner, Compositional, Optimizer,
 )
+from catopt_torch import TorchBackend, TorchCompileRunner
+from catopt_torch.autotune import TORCH_BUILDERS
 
-opt, stats = optimize_model(model, x, runner=CompiledRunner())
+opt = Optimizer(backend=TorchBackend())
+
+opt_mod, stats = opt.optimize(model, x, runner=TorchCompileRunner())
 # torch.compile wraps the delivered module (stats["compiled"])
 
-opt, stats = optimize_model(model, x, runner=CudaGraphRunner())
+opt_mod, stats = opt.optimize(model, x, runner=CudaGraphRunner())
 # captures the executor into a CUDA graph (stats["cuda_graph"]) —
 # compile-free; works without Inductor
 
-opt, stats = optimize_model(
+opt_mod, stats = opt.optimize(
     model, x,
-    runner=ChainedRunner([CompiledRunner(), CudaGraphRunner()]),
+    runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
 )
 # runners compose left-to-right; the Runner protocol is duck-typed,
 # so your own runner drops in
 
-opt, stats = optimize_model_autotuned(model, x)
+opt_mod, stats = opt.optimize(
+    model, x, strategy=Autotuned(builders=TORCH_BUILDERS),
+)
 # re-lowers the same extracted term through each candidate executor
-# ("generic", "batched", "compiled"), verifies each, times them on
-# the real input, returns the measured winner
+# ("generic", "batched", "torch_compile", "cuda_graph"), verifies
+# each, times them on the real input, returns the measured winner
 
-opt, stats = optimize_compositional(model, x)
+opt_mod, stats = opt.optimize(model, x, strategy=Compositional())
 # multi-block models: optimizes each block against its captured real
 # input, recomposes with per-block + end-to-end verification and
 # automatic fallback (stats["blocks"], stats["end_to_end"])
@@ -61,9 +68,9 @@ opt, stats = optimize_compositional(model, x)
 ### Steer what "cheapest" means
 
 ```python
-from catopt_optimize import LatencyCriterion, MemoryCriterion
+from catopt_orchestrator import LatencyCriterion, MemoryCriterion
 
-opt, stats = optimize_model(
+opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(
     model, x,
     criteria=LatencyCriterion() * 0.7 + MemoryCriterion("peak") * 0.3,
 )
@@ -83,7 +90,7 @@ opt, stats = optimize_model(
   reach: parallel scans, streaming softmax, closed-form resolvents.
 - **measured or priced selection** — extraction is priced per-backend
   (`sink.supported_ops` bounds the search to executable forms), or
-  measured end-to-end by `optimize_model_autotuned`, which reports
+  measured end-to-end by the `Autotuned` strategy, which reports
   the winner honestly — including when it loses.
 
 ## When it helps — honest numbers
@@ -135,29 +142,32 @@ per-suite flags in `bench/README.md`.
 | `real_linear_attn.py` | scan lift on RetNet/GLA/delta-rule blocks, CPU+CUDA |
 | `decode_scan_bench.py` | chunked decode on carriers, eager vs CUDA-graphed |
 | `decode_bench.py` | launch-bound (B,T) sweep — the falsified hypothesis, losses included |
-| `stories15m_bench.py` | real llama2.c checkpoints through `optimize_compositional` |
+| `stories15m_bench.py` | real llama2.c checkpoints through `strategy=Compositional()` |
 | `e2e_model.py`, `e2e_llm.py`, `e2e_models2.py` | whole-model E2E: llama-toy, ~0.4B prefill+decode, non-decoder shapes |
 | `model_bench.py` | complete multi-block models: latency, peak memory, compile time |
 | `cost_fidelity.py` | predicted-cost vs measured-latency rank correlation |
-| `killer_demo.py` | `optimize_model_autotuned` per-model lowering selection |
+| `killer_demo.py` | `Autotuned` per-model lowering selection |
 | `law_bench.py` | per-rewrite-law value harness |
 | `run_all.py` | drives the harnessed suites, writes `bench/results/` |
 
 ## API surface
 
-Everything below is importable from `catopt_optimize` (or
-`catopt.optimize` / the `catopt` façade where noted).
+The orchestration surface lives in `catopt_orchestrator`
+(backend-neutral — it imports no torch); the torch ports, runners
+and autotune candidate builders live in `catopt_torch` /
+`catopt_cuda`; the engine itself is `catopt_core`.
 
 | Name | Signature / role |
 |---|---|
-| `optimize_model` | `(model, example_input, *, ruleset="all", cost_fn=None, criteria=None, runner=None, source=None, sink=None, max_enodes=100_000, verbose=True)` → `(module, stats)` |
-| `optimize_compositional` | `(model, example_input, *, block_pred=None, verify_tol=1e-4, max_cross_pairs=8, …)` → `(module, stats)` — block-wise path for deep stacks; `max_cross_pairs` also re-judges adjacent block pairs jointly |
-| `optimize_model_autotuned` | `(model, example_input, *, candidates=("generic","batched","compiled"), budget_s=None, profile=None, …)` → `(module, stats)` — `profile=` persists measured corrections across runs |
-| `export_optimized` / `load_optimized` | `(model, opt, path, fmt="module"|"safetensors"|"state_dict"|"torchscript", …)` — `.pt2` roundtrips run standalone, no catopt at inference |
+| `Optimizer` | `(backend=..., source=..., sink=..., composer=..., meter=..., criteria=..., runner=...)` — the configured entry point; `.optimize(model, x, **kw)` → `(module, stats)`, plus `.search` / `.lower` / `.discover` phase verbs |
+| `Monolithic` / `Compositional` / `Autotuned` | the `strategy=` argument of `Optimizer.optimize`: whole-model search (default), per-block + recompose (`block_pred=`, `verify_tol=`, `max_cross_pairs=` re-judges adjacent pairs jointly), measured autotune (`candidates=`, `budget_s=`, `profile=` persists measured corrections, `builders=TORCH_BUILDERS`) |
+| `search` / `lower` | the phase verbs: `model -> SearchResult`, `SearchResult -> LowerResult` — re-lower one search under different runners |
+| `discover_alternatives` | `(model, x, *, source, ...)` → `SearchResult` — enumerate the equivalence frontier (`.alternatives(top_k)`, `.certificate()`) |
+| `export_optimized` / `load_optimized` | `catopt_torch.export` — `(model, opt, path, fmt="module"|"safetensors"|"state_dict"|"torchscript", …)`; `.pt2` roundtrips run standalone, no catopt at inference |
 | Criteria | `LatencyCriterion`, `FlopsCriterion`, `DepthCriterion`, `MemoryCriterion("weights"|"peak"|"combined")`, `CompiledCriterion` — compose with `*` / `+`, or pass `{"axis": weight}` dicts |
-| Runners | `GenericRunner` (default), `CompiledRunner(**compile_kwargs)`, `CudaGraphRunner()`, `ChainedRunner([...])` — duck-typed `Runner` protocol |
-| Ports | `Source` / `Sink` (defaults `TorchSource` / `TorchSink`) — a new backend implements `Sink`; the engine never imports it |
-| Verification | `catopt.egraph.verify_certificate` — replays the derivation shipped with every extracted program |
+| Runners | `IdentityRunner` (default), `TorchCompileRunner()`, `CudaGraphRunner()`, `ChainedRunner([...])` — duck-typed `Runner` protocol |
+| Ports | `Source` / `Sink` (`catopt_core.ports`; torch impls `TorchSource` / `TorchSink`) — a new backend implements `Sink`; the engine never imports it |
+| Verification | `catopt_core.egraph.verify_certificate` — replays the derivation shipped with every extracted program |
 
 ## Limits
 
@@ -165,8 +175,8 @@ Everything below is importable from `catopt_optimize` (or
   pairing, folds, reassociation, carrier lifts. If the model is
   already dense-GEMM-bound with no shared structure, expect parity.
 - **Search is compile-time work** — seconds per block; monolithic
-  eqsat slows past ~8 blocks, which is why `optimize_compositional`
-  exists.
+  eqsat slows past ~8 blocks, which is why the `Compositional`
+  strategy exists.
 - **Inference only** — weight folding destroys per-layer gradients;
   no backward-graph rewriting.
 - **Coverage gaps** — `matmul`+bias and grouped convs aren't
@@ -181,15 +191,17 @@ Everything below is importable from `catopt_optimize` (or
 Python ≥3.11 (developed on 3.13), `torch>=2.0`, `numpy>=1.24`.
 uv-workspace monorepo: `packages/catopt-core` (zero-dependency
 engine), `catopt-torch` (PyTorch adapters), `catopt-carriers`
-(scan/attention carriers), `catopt-optimize` (the pipelines);
-`catopt/` is the façade with compat aliases for historical imports.
+(scan/attention carriers), `catopt-cuda` (the CUDA-graph runner),
+`catopt-orchestrator` (the backend-neutral pipelines). The `catopt`
+façade is gone — import the domain packages directly.
 
 ```bash
 uv sync                                  # everything, editable
 
 # or with pip:
 pip install -e packages/catopt-core -e packages/catopt-torch \
-    -e packages/catopt-carriers -e packages/catopt-optimize -e .
+    -e packages/catopt-carriers -e packages/catopt-cuda \
+    -e packages/catopt-orchestrator
 
 pip install -e packages/catopt-core      # engine only, zero deps
 ```

@@ -1,4 +1,4 @@
-"""Coverage-gap tests for catopt.torch_bridge.
+"""Coverage-gap tests for catopt_torch.torch_bridge.
 
 ``tests/test_torch_integration.py`` exercises the flagship pipeline
 (export → eqsat → lower → verify).  This file drives the boundary and
@@ -37,9 +37,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from catopt.ir import IR, Const, Op, Param, TensorType, Var, op_repr
-from catopt.ops import OpTable
-from catopt.torch_bridge import (
+from catopt_core.ir import IR, Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.ops import OpTable
+from catopt_torch.torch_bridge import (
     _IR_TO_TORCH,
     _aten_name,
     _canon_aten_name,

@@ -1,7 +1,8 @@
 """Structure tests for the ``catopt_core.laws`` rewrite surface.
 
-``catopt_core.rules`` — and its ``catopt.rules`` alias — used to be a
-pure compatibility shim over the ``catopt_core.laws`` package.  That
+``catopt_core.rules`` — and its ``catopt.rules`` façade alias — used
+to be a pure compatibility shim over the ``catopt_core.laws``
+package.  That
 shim is gone; ``catopt_core.laws`` is now the canonical rewrite
 surface.  These tests pin the contract:
 
@@ -28,7 +29,7 @@ from catopt_core.egraph import Rewrite
 
 #: Every public name the old ``catopt_core.rules`` shim exposed — the
 #: union of all ``from catopt_core.rules import ...`` sites across
-#: packages/, catopt/, tests/, and bench/, plus the rule objects
+#: packages/, the old façade, tests/, and bench/, plus the rule objects
 #: accessed as module attributes.
 PUBLIC_NAMES = [
     # rewrite-constructor shorthand (om/trace/xcarrier use it)

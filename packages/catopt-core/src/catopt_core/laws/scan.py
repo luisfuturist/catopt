@@ -17,7 +17,16 @@ associativity alone once steps are lifted into the carrier domain.
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
-from catopt_core.laws.base import R, _shape_of
+from catopt_core.laws import tags as _tags
+from catopt_core.laws.base import R as _R
+from catopt_core.laws.base import _shape_of
+
+
+def R(name: str, lhs, rhs, **kw) -> Rewrite:
+    """Module-local law constructor — scan laws carry the ``SCAN`` tag."""
+    kw.setdefault("tags", (_tags.SCAN,))
+    return _R(name, lhs, rhs, **kw)
+
 
 # ---------------------------------------------------------------------------
 # Scan monoid: affine-map domain

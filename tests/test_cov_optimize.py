@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.optimize — resource bounds, the OOM
+"""Coverage tests for catopt_orchestrator.optimize — resource bounds, the OOM
 adapter, causal-mask specialization, the discovery entry point, the
 parameter-diff report, and the compositional driver."""
 # ruff: noqa: RUF059 — test-idiom unpacking
@@ -8,28 +8,20 @@ import types
 import pytest
 import torch
 import torch.nn as nn
-from catopt.adapters import TorchSource
-from catopt.cost import flops_cost, launch_aware_cost
-from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.optimize import (
-    OptimizationResourceError,
-    _check_resources,
-    _current_memory_mb,
-    _eval_const,
-    _is_causal_keep_mask,
-    _looks_like_oom,
-    _oom_to_resource_error,
-    _select_blocks,
-    _specialize_causal,
-    discover_alternatives,
-    ir_to_string,
-    optimize_compositional,
-    optimize_model,
-    param_report,
-    save_optimized_weights,
-    term_cost,
-)
-from catopt.pipeline import SearchResult
+from catopt_torch.adapters import TorchSource
+from catopt_core import laws
+from catopt_core.cost import flops_cost, launch_aware_cost
+from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_orchestrator.optimize import OptimizationResourceError, _check_resources, _current_memory_mb, _looks_like_oom, _oom_to_resource_error, discover_alternatives, ir_to_string, term_cost
+
+from catopt_torch.folds import _eval_const, _is_causal_keep_mask, _specialize_causal
+from catopt_torch.composer import _select_blocks, param_report
+from catopt_torch.export import save_optimized_weights
+
+from catopt_core.pipeline import SearchResult
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _T(*shape):
@@ -110,13 +102,11 @@ def test_optimize_model_resource_bounds():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
     with pytest.raises(OptimizationResourceError):
-        optimize_model(
-            m, x, max_enodes=1, verbose=False
-        )
+        Optimizer(backend=TorchBackend()).optimize(m, x, max_enodes=1, verify=False, verbose=False)
+
     with pytest.raises(OptimizationResourceError):
-        optimize_model(
-            m, x, max_memory_mb=0.0, verbose=False
-        )
+        Optimizer(backend=TorchBackend()).optimize(m, x, max_memory_mb=0.0, verify=False, verbose=False)
+
 
 
 # ---------------------------------------------------------------------------
@@ -208,25 +198,24 @@ def test_specialize_causal_drops_param_tril_mask():
 def test_optimize_model_rulesets_and_equivalence():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
-    for ruleset in ("all", "simpl", "categorical"):
-        opt, stats = optimize_model(
-            m, x, ruleset=ruleset, verbose=False, max_iterations=3
-        )
+    for rules in (laws.FULL, laws.SIMPLIFICATION, laws.CATEGORICAL):
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, rules=rules, max_iterations=3, verify=False, verbose=False)
+
         with torch.no_grad():
             assert (
                 m(x) - opt(x)
-            ).abs().max().item() < 1e-6, ruleset
+            ).abs().max().item() < 1e-6, rules
         assert "rule_fires" in stats
     with pytest.raises(ValueError, match="ruleset"):
-        optimize_model(m, x, ruleset="nonsense", verbose=False)
+        Optimizer(backend=TorchBackend()).optimize(m, x, rules="nonsense", verify=False, verbose=False)
+
 
 
 def test_optimize_model_cost_fn_override():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
-    opt, stats = optimize_model(
-        m, x, cost_fn=flops_cost, verbose=False, max_iterations=3
-    )
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, cost_fn=flops_cost, max_iterations=3, verify=False, verbose=False)
+
     assert opt is not None
     # the lowered module runs and stays equivalent
     with torch.no_grad():
@@ -248,9 +237,8 @@ def test_optimize_model_tuple_input():
     m = TwoIn().eval().double()
     a = torch.randn(2, 8, dtype=torch.float64)
     b = torch.randn(2, 8, dtype=torch.float64)
-    opt, stats = optimize_model(
-        m, (a, b), verbose=False, max_iterations=3
-    )
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, (a, b), max_iterations=3, verify=False, verbose=False)
+
     with torch.no_grad():
         ref = m(a, b)
         got = opt(a, b)
@@ -261,21 +249,21 @@ def test_discover_alternatives():
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
     res = discover_alternatives(
-        m, x, source=TorchSource(), ruleset="all", max_iterations=2
+        m, x, source=TorchSource(), rules=laws.FULL, max_iterations=2
     )
     assert isinstance(res, SearchResult)
     assert isinstance(res.alternatives(4), list)
     assert "rule_fires" in res.stats
     assert isinstance(res.eg.diverse_classes(), list)
     res2 = discover_alternatives(
-        m, x, source=TorchSource(), ruleset="simpl", max_iterations=2
+        m, x, source=TorchSource(), rules=laws.SIMPLIFICATION, max_iterations=2
     )
     assert isinstance(res2.alternatives(2), list)
     res3 = discover_alternatives(
         m,
         x,
         source=TorchSource(),
-        ruleset="categorical",
+        rules=laws.CATEGORICAL,
         max_iterations=2,
         cost_fn=launch_aware_cost,
     )
@@ -290,7 +278,8 @@ def test_discover_alternatives():
 def test_param_report_and_weights_file(tmp_path):
     m = _small_mlp()
     x = torch.randn(2, 16, dtype=torch.float64)
-    opt, _stats = optimize_model(m, x, verbose=False, max_iterations=3)
+    opt, _stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     pr = param_report(m, opt)
     assert pr["original_params"] >= 1
     assert pr["optimized_params"] >= 1
@@ -351,9 +340,8 @@ def test_optimize_compositional_sequential():
         nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8)
     ).double()
     x = torch.randn(4, 8, dtype=torch.float64)
-    new_m, stats = optimize_compositional(
-        m, x, verbose=False, max_iterations=3
-    )
+    new_m, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(), verbose=False, max_iterations=3)
+
     assert stats["compositional"]
     assert stats["n_blocks"] >= 1
     assert stats["end_to_end"]["max_abs_diff"] < 1e-6
@@ -409,9 +397,8 @@ def test_optimize_compositional_failed_and_skipped_blocks():
 
     m = M().eval().double()
     x = torch.randn(2, 8, dtype=torch.float64)
-    _new, stats = optimize_compositional(
-        m, x, verbose=False, max_iterations=2
-    )
+    _new, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(), verbose=False, max_iterations=2)
+
     blocks = stats["blocks"]
     assert blocks["blocks.0"]["status"] in ("optimized", "failed")
     # export fails on the data-dependent block → kept original
@@ -432,9 +419,8 @@ def test_optimize_compositional_max_enodes_resource_limit():
     torch.manual_seed(0)
     m = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)).double()
     x = torch.randn(2, 8, dtype=torch.float64)
-    _new, stats = optimize_compositional(
-        m, x, verbose=False, max_enodes=1, max_iterations=2
-    )
+    _new, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(), verbose=False, max_enodes=1, max_iterations=2)
+
     reasons = {
         e.get("reason")
         for e in stats["blocks"].values()

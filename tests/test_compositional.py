@@ -13,8 +13,11 @@ import time
 import pytest
 import torch
 import torch.nn as nn
-from catopt.models import DeepParallel, ParallelBlock, ParallelLinear
-from catopt.optimize import optimize_compositional
+from catopt_torch.models import DeepParallel, ParallelBlock, ParallelLinear
+
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 class MiniGPT(nn.Module):
@@ -48,7 +51,8 @@ def test_compositional_parallel_block_stack():
     x = torch.randn(2, 16, 64)
 
     t0 = time.time()
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     elapsed = time.time() - t0
     assert elapsed < 60, f"compositional pass took {elapsed:.1f}s"
 
@@ -102,7 +106,8 @@ def test_compositional_sequential_stack_fp64():
     model = MLPStack().eval().double()
     x = torch.randn(64, 32, dtype=torch.float64)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     assert stats["n_optimized"] == 4
     assert stats["shared_params"] is True
     for i in range(4):
@@ -150,7 +155,8 @@ def test_compositional_fallback_keeps_original():
     model = MixedStack().eval()
     x = torch.randn(64, dim)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     bad = stats["blocks"]["blocks.1"]
     assert bad["status"] == "failed"
@@ -190,7 +196,7 @@ def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
     attr), the returned model is the INPUT unmodified — the report must
     say so, not run a degenerate self-comparison verify."""
     import catopt_torch.composer as C
-    from catopt.optimize import optimize_compositional
+
 
     torch.manual_seed(0)
     model = MiniGPT(dim=32, n_heads=2, depth=1, hidden_mult=2).eval()
@@ -200,7 +206,8 @@ def test_compositional_in_place_clone_failure_is_reported(monkeypatch):
         raise RuntimeError("cannot pickle this attribute")
 
     monkeypatch.setattr(C.copy, "deepcopy", boom)
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     assert opt is model  # same object — nothing grafted
     assert stats["in_place"] is True
     assert stats["shared_params"] is False
@@ -237,7 +244,8 @@ def test_compositional_recompose_shares_tensor_storage():
     model = _RootParam(dim=32, depth=2).eval()
     x = torch.randn(8, 32)
 
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
 
     assert stats["n_optimized"] == 2
     assert stats["in_place"] is False
@@ -262,7 +270,7 @@ def test_compositional_recompose_shares_tensor_storage():
 def test_shared_param_clone_preserves_structure_and_training():
     """Unit-level check of the clone helper: every module shell and
     dict is fresh, every tensor is aliased, non-tensor attrs copy."""
-    import catopt_optimize.optimize as O
+    import catopt_torch.composer as O
 
     torch.manual_seed(0)
     model = MiniGPT(dim=32, n_heads=2, depth=2, hidden_mult=2)
@@ -294,7 +302,7 @@ def test_shared_param_clone_preserves_structure_and_training():
 def test_shared_param_clone_cuda_no_param_copy():
     """On GPU the clone allocates no second copy of the weights: device
     memory grows only by the (host-side) module shells."""
-    import catopt_optimize.optimize as O
+    import catopt_torch.composer as O
 
     torch.manual_seed(0)
     model = MiniGPT(dim=512, n_heads=8, depth=4, hidden_mult=4)

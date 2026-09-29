@@ -51,11 +51,11 @@ from __future__ import annotations
 
 import torch
 
-import catopt.xcarrier as XC
-from catopt import meta
-from catopt.egraph import EGraph
-from catopt.ir import Op, TensorType, Var
-from catopt.torch_bridge import _IR_TO_TORCH
+import catopt_carriers.xcarrier as XC
+from catopt_core import meta
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, TensorType, Var
+from catopt_torch.torch_bridge import _IR_TO_TORCH
 
 # ---------------------------------------------------------------------------
 #  helpers
@@ -1073,9 +1073,9 @@ def test_scan_to_attention_lifts_into_omd_end_to_end():
     ``omd_apply`` member at the root class — chunked attention over
     scanned values as ONE affine-in-h0 recurrence — and the member
     evaluates fp64-exact."""
-    from catopt.ir import IR
-    from catopt.regime import build_egraph
-    from catopt.torch_bridge import ir_to_torch_module
+    from catopt_core.ir import IR
+    from catopt_torch.regime import build_egraph
+    from catopt_torch.torch_bridge import ir_to_torch_module
 
     torch.manual_seed(0)
     m = _ScanAttn(8, 8).eval().double()

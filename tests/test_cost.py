@@ -3,7 +3,7 @@
 import types
 
 import pytest
-from catopt.cost import (
+from catopt_core.cost import (
     _LAUNCH_S,
     _PEAK_BW,
     _PEAK_FLOPS,
@@ -22,7 +22,7 @@ from catopt.cost import (
     roofline_cost,
     roofline_cost_for,
 )
-from catopt.ir import Const, Op, Param, TensorType, Var
+from catopt_core.ir import Const, Op, Param, TensorType, Var
 
 
 def _v(name: str, *shape) -> Var:
@@ -64,7 +64,7 @@ def test_broadcast_shape_inference():
     model credit mul((B,T,1),(B,T,C)) with only B*T elements, which
     fabricated a 1.98x 'optimization' out of two identical forms.
     """
-    from catopt.cost import _infer_op_shape
+    from catopt_core.cost import _infer_op_shape
 
     a = Var("a", TensorType((4, 8, 1)))
     b = Var("b", TensorType((4, 8, 32)))
@@ -118,7 +118,7 @@ def test_cost_model_matmul_heavier():
 
 def test_concat_chunk_shapes():
     """concat joins along dim; chunk splits it — shape inference."""
-    from catopt.cost import _infer_op_shape
+    from catopt_core.cost import _infer_op_shape
 
     a = Param("A", TensorType((8, 4)))
     b = Param("B", TensorType((8, 4)))
@@ -200,7 +200,7 @@ def test_rank1_matmul_shapes():
     assoc_linear_bias's RHS broadcast _INVALID against the (…,o)
     linear output and priced at _INVALID_COST.
     """
-    from catopt.cost import _infer_op_shape
+    from catopt_core.cost import _infer_op_shape
 
     A = Param("A", TensorType((8, 4)))
     M = Param("M", TensorType((4, 8)))
@@ -218,7 +218,7 @@ def test_linear_bias_broadcast_shapes():
     """linear(x, W, b) broadcasts the bias slot: (o,) and the
     column-vector disguise (o,1) are rank-1 biases; a provably
     wrong bias is ill-typed (_INVALID), not silently ignored."""
-    from catopt.cost import _INVALID, _infer_op_shape
+    from catopt_core.cost import _INVALID, _infer_op_shape
 
     x = Var("x", TensorType((4, 16)))
     W = Param("W", TensorType((8, 16)))
@@ -240,7 +240,7 @@ def test_assoc_linear_bias_rhs_finite_cost():
     could never win extraction on cost — the rule existed but its
     product was unselectable except via the bias-slot dodge.
     """
-    from catopt.cost import (
+    from catopt_core.cost import (
         _INVALID_COST,
         _infer_op_shape,
         dag_cost,
@@ -283,8 +283,8 @@ def test_assoc_linear_bias_rule_member_extracts_finite():
     """End-to-end through the e-graph: the assoc_linear_bias rewrite
     fires and its RHS member sits in the class with a finite cost —
     extraction must never see _INVALID_COST on the real shape."""
-    from catopt.cost import _INVALID_COST, _shape_of
-    from catopt.egraph import EGraph
+    from catopt_core.cost import _INVALID_COST, _shape_of
+    from catopt_core.egraph import EGraph
     from catopt_core.laws import ASSOC_LINEAR_BIAS
 
     i, h, o = 8, 16, 8
@@ -356,7 +356,7 @@ def _balanced_tree(leaves: list[Op]) -> Op:
 
 
 def test_executor_overhead_generic_counts_ops():
-    from catopt.cost import _SOLVER_FACTOR
+    from catopt_core.cost import _SOLVER_FACTOR
 
     x = _v("x", 4, 8)
     # hand-built chain: add(mul(x, 2), neg(x)) -> 3 dispatched ops
@@ -841,7 +841,7 @@ def _aff_tree(leaves: list[Op]) -> Op:
 def test_batched_scan_latency_dense_and_leaf_edges():
     """The dense affine (``apply``) compose path and non pair-carrier
     leaf shapes take their own priced branches."""
-    from catopt.cost import _leaf_gather_base, _leaf_shared_a
+    from catopt_core.cost import _leaf_gather_base, _leaf_shared_a
 
     prof = {
         "tflops": 2.5,
@@ -1028,7 +1028,7 @@ def test_fusion_regions_folded_params_are_free():
 def test_fusion_regions_solver_and_leaves():
     """Solver ops are singleton regions billed _SOLVER_FACTOR
     dispatches; leaves emit nothing."""
-    from catopt.cost import _SOLVER_FACTOR
+    from catopt_core.cost import _SOLVER_FACTOR
 
     inv = Op.make("inv", _p("M", 4, 4))
     regions = fusion_regions(inv)
@@ -1074,7 +1074,7 @@ def _bare(prof: dict) -> dict:
 
 
 def test_kernel_signature_op_classes():
-    from catopt.cost import _kernel_signature
+    from catopt_core.cost import _kernel_signature
 
     x = _v("x", 64, 64)
     assert _kernel_signature(
@@ -1111,7 +1111,7 @@ def test_kernel_signature_op_classes():
 
 def test_kernel_signature_fallbacks():
     """Unshapeable / un-bucketed ops return None → roofline path."""
-    from catopt.cost import _kernel_signature
+    from catopt_core.cost import _kernel_signature
 
     # ill-typed op: _INVALID output shape
     bad = Op.make("add", _v("a", 2), _v("b", 3))
@@ -1157,7 +1157,7 @@ def test_kernel_signature_fallbacks():
 def test_kernel_lookup_parsing():
     """Table parsing: nearest-bucket in log space; malformed entries
     are skipped; empty/unusable tables disable the floor."""
-    from catopt.cost import _kernel_lookup
+    from catopt_core.cost import _kernel_lookup
 
     assert _kernel_lookup(None) is None
     assert _kernel_lookup({}) is None
@@ -1332,7 +1332,7 @@ def test_fused_cost_region_measured_work_floor():
 def test_graph_overhead_profile_paths():
     """_profile_graph_overhead_s: None / dict / object branches all
     feed the fused per-graph charge — the inductor guard overhead."""
-    from catopt.cost import fused_cost_for
+    from catopt_core.cost import fused_cost_for
 
     x = _v("x", 8, 8)
     t = Op.make("neg", x)

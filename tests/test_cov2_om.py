@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.om — the guard branches behind the
+"""Coverage tests for catopt_carriers.om — the guard branches behind the
 online-softmax monoid laws.
 
 Every check/derive hook is driven BOTH ways: a bound substitution that
@@ -18,9 +18,9 @@ fire whose result is evaluated against a serial fp64 reference.
 
 import torch
 
-import catopt.om as OM
-from catopt import meta
-from catopt.ir import Const, Op, TensorType, Var
+import catopt_carriers.om as OM
+from catopt_core import meta
+from catopt_core.ir import Const, Op, TensorType, Var
 
 torch.manual_seed(0)
 

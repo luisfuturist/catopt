@@ -26,6 +26,9 @@ from torch.utils.benchmark import Timer
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llama2c import load_llama2c
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def cache_dir() -> Path:
@@ -198,10 +201,11 @@ def main():
         f"device={args.device} — logits {tuple(ref.shape)}"
     )
 
-    from catopt.optimize import optimize_compositional
+
 
     t0 = time.time()
-    opt, rep = optimize_compositional(m, idx, verbose=False)
+    opt, rep = Optimizer(backend=TorchBackend()).optimize(m, idx, strategy=Compositional(), verbose=False)
+
     pipeline = time.time() - t0
     with torch.no_grad():
         err = (opt(idx) - ref).abs().max().item()

@@ -1,4 +1,4 @@
-"""Coverage-gap tests for catopt.regime.
+"""Coverage-gap tests for catopt_torch.regime.
 
 Complements tests/test_regime.py with the paths it never reaches:
 
@@ -33,19 +33,19 @@ import pytest
 import torch
 import torch.nn as nn
 
-import catopt.calibrate as cal_mod
-from catopt.cost import (
+import catopt_torch.calibrate as cal_mod
+from catopt_core.cost import (
     _INVALID_COST,
     flops_cost,
     launch_aware_cost,
     roofline_cost,
 )
-from catopt.egraph import EGraph, verify_certificate
-from catopt.ir import IR, Op, TensorType, Var, op_repr
-from catopt.models.ssm import DiagonalSSM
-from catopt.om import OM_LAWS
-from catopt.om_lower import is_om_apply_term
-from catopt.regime import (
+from catopt_core.egraph import EGraph, verify_certificate
+from catopt_core.ir import IR, Op, TensorType, Var, op_repr
+from catopt_torch.models.ssm import DiagonalSSM
+from catopt_carriers.om import OM_LAWS
+from catopt_carriers.om_lower import is_om_apply_term
+from catopt_torch.regime import (
     EXECUTORS,
     ExecutorSpec,
     Regime,
@@ -63,8 +63,8 @@ from catopt.regime import (
     regime_dispatch,
     regime_frontier,
 )
-from catopt.scan_lower import is_scan_apply_term
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_carriers.scan_lower import is_scan_apply_term
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 
 def _T(*shape):
@@ -342,7 +342,7 @@ def test_force_carrier_accepts_fallback(attention):
 def test_force_carrier_multi_candidate_fallback():
     """Several carrier enodes in the root class, accepts rejecting all:
     the loop keeps the first extractable candidate and returns it."""
-    from catopt.egraph import Rewrite
+    from catopt_core.egraph import Rewrite
 
     x, y = Var("x", _T()), Var("y", _T())
     comm = Rewrite(

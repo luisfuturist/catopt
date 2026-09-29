@@ -1,4 +1,4 @@
-"""Runtime conformance for the ports layer (:mod:`catopt.ports`).
+"""Runtime conformance for the ports layer (:mod:`catopt_core.ports`).
 
 The hexagonal boundary: real adapters must satisfy their port
 protocols (``isinstance`` on ``@runtime_checkable`` protocols checks
@@ -8,7 +8,7 @@ a ``CostFn``.
 """
 
 import torch
-from catopt.cost import (
+from catopt_core.cost import (
     CostModel,
     count_cost,
     dag_cost,
@@ -17,24 +17,24 @@ from catopt.cost import (
     param_bytes_cost,
     param_bytes_cost_for,
 )
-from catopt.ir import IR, Op, TensorType, Var
-from catopt.om_lower import (
+from catopt_core.ir import IR, Op, TensorType, Var
+from catopt_carriers.om_lower import (
     StreamingOMModule,
     to_batched_om_module,
     to_streaming_om_module,
 )
-from catopt.omd_lower import to_batched_omd_module
-from catopt.ops import OpTable
-from catopt.ports import (
+from catopt_carriers.omd_lower import to_batched_omd_module
+from catopt_core.ops import OpTable
+from catopt_core.ports import (
     BatchedExecutor,
     Binding,
     CostFn,
     Executor,
-    LawSet,
     OpRegistry,
     PlannedExecutor,
     RuleLike,
-    RuleProvider,
+    RuleSetLike,
+    RuleSetProvider,
     ShapeRule,
     Sink,
     Source,
@@ -42,11 +42,11 @@ from catopt.ports import (
     Verifier,
     signature_conforms,
 )
-from catopt.report import VerifyReport, verify_equiv
-from catopt_core.laws import CATEGORICAL_RULES, all_rules
-from catopt.scan_lower import to_batched_scan_module
-from catopt.torch_bridge import _IR_TO_TORCH, IRModule
-from catopt.typing import _SHAPE_RULES
+from catopt_torch.report import VerifyReport, verify_equiv
+from catopt_core.laws import CATEGORICAL, CATEGORICAL_RULES, all_rules
+from catopt_carriers.scan_lower import to_batched_scan_module
+from catopt_torch.torch_bridge import _IR_TO_TORCH, IRModule
+from catopt_core.typing import _SHAPE_RULES
 
 # ---------------------------------------------------------------------------
 #  Fixtures — minimal real terms for each executor
@@ -204,7 +204,7 @@ def test_verify_result_is_core_owned_and_satisfied_by_verify_report():
     """Core's structural ``VerifyResult`` is what the ports return; the
     torch adapter's ``VerifyReport`` satisfies it without core naming
     that type (the decoupling Phase 1 pins)."""
-    from catopt.ports import VerifyResult
+    from catopt_core.ports import VerifyResult
 
     rep = VerifyReport(0.0, 0.0, True)
     assert isinstance(rep, VerifyResult)
@@ -220,14 +220,14 @@ def test_verify_result_is_core_owned_and_satisfied_by_verify_report():
 
 
 def test_torch_source_is_source():
-    from catopt.adapters import TorchSource
+    from catopt_torch.adapters import TorchSource
 
     assert isinstance(TorchSource(), Source)
     assert not isinstance(object(), Source)
 
 
 def test_torch_sink_is_sink():
-    from catopt.adapters import TorchSink
+    from catopt_torch.adapters import TorchSink
 
     sink = TorchSink()
     assert isinstance(sink, Sink)
@@ -280,16 +280,17 @@ def test_shape_rules_conform():
 
 
 # ---------------------------------------------------------------------------
-#  LawSet / RuleProvider / RuleLike — laws as data
+#  RuleSetLike / RuleSetProvider / RuleLike — laws as data
 # ---------------------------------------------------------------------------
 
 
 def test_rule_collections_conform():
-    assert isinstance(CATEGORICAL_RULES, LawSet)
-    assert isinstance(all_rules(), LawSet)
+    assert isinstance(CATEGORICAL_RULES, RuleSetLike)
+    assert isinstance(all_rules(), RuleSetLike)
+    assert isinstance(CATEGORICAL, RuleSetLike)
     assert all(isinstance(r, RuleLike) for r in CATEGORICAL_RULES)
-    assert isinstance(all_rules, RuleProvider)
-    # presence-level: a dict IS iterable (LawSet) — documented caveat.
-    assert not isinstance(42, LawSet)
-    assert not isinstance(42, RuleProvider)
+    assert isinstance(all_rules, RuleSetProvider)
+    # presence-level: a dict IS iterable (RuleSetLike) — documented caveat.
+    assert not isinstance(42, RuleSetLike)
+    assert not isinstance(42, RuleSetProvider)
     assert not isinstance(object(), RuleLike)

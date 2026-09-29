@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.omd_lower — projection/leaf recognizers,
+"""Coverage tests for catopt_carriers.omd_lower — projection/leaf recognizers,
 plan rejection paths (inside_map_leaf projections, domain mismatches,
 non-uniform signatures), the opaque-leaf path in _leaf_part, index
 gathers in _eval_leaf_parts, the serial compose fallback, and the
@@ -8,8 +8,8 @@ runtime fallback counter.  CPU only."""
 import pytest
 import torch
 
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.omd_lower import (
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.omd_lower import (
     BatchedOmdModule,
     _compose_pair,
     _concrete,
@@ -23,7 +23,7 @@ from catopt.omd_lower import (
     is_omd_apply_term,
     to_batched_omd_module,
 )
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_torch.torch_bridge import ir_to_torch_module
 
 
 def _T(*shape):

@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.egraph internals.
+"""Coverage tests for catopt_core.egraph internals.
 
 ``test_egraph.py`` / ``test_certificates.py`` / ``test_cert_nonlocal.py``
 pin the headline behaviour of the package; this file closes the residual
@@ -53,8 +53,8 @@ Everything is deterministic (small graphs, no RNG).
 import pytest
 
 from catopt_core import laws as R
-from catopt.cost import count_cost, dag_cost
-from catopt.egraph import (
+from catopt_core.cost import count_cost, dag_cost
+from catopt_core.egraph import (
     Certificate,
     CertificateVerificationError,
     CertStep,
@@ -65,7 +65,7 @@ from catopt.egraph import (
     _LeafRegistry,
     verify_certificate,
 )
-from catopt.egraph.terms import (
+from catopt_core.egraph.terms import (
     _iter_ops,
     _replace_subterm,
     _subterm,
@@ -73,7 +73,7 @@ from catopt.egraph.terms import (
     _term_match,
     _term_paths,
 )
-from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt_core.laws import pair_shared_input_linears
 
 

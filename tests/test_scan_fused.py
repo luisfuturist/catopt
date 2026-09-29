@@ -11,13 +11,13 @@ and the routing invariants (``is_batched``/``n_levels``/``_plan``).
 
 import pytest
 import torch
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.scan_lower import (
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.scan_lower import (
     BatchedScanModule,
     build_scan_plan,
     to_batched_scan_module,
 )
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_torch.torch_bridge import ir_to_torch_module
 from catopt_carriers.scan_fused import (
     fused_dense_levels,
     fused_diag_levels,

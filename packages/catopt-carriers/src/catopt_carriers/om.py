@@ -61,7 +61,16 @@ from typing import Any, Literal
 import torch
 from catopt_core.egraph import Rewrite, _LeafRegistry
 from catopt_core.ir import Const, Op, op_def
-from catopt_core.laws import R
+from catopt_core.laws import R as _R
+from catopt_core.laws import RuleSet
+from catopt_core.laws import tags as _tags
+
+
+def R(name: str, lhs, rhs, **kw) -> Rewrite:
+    """Module-local law constructor — om laws carry the ``CARRIER`` tag."""
+    kw.setdefault("tags", (_tags.CARRIER,))
+    return _R(name, lhs, rhs, **kw)
+
 
 #: The canonical concat-axis attr KEY (see the module note on concat
 #: attrs).  Spelled as a ``Literal`` so that ``Op.make(..., **{key: v})``
@@ -1291,3 +1300,11 @@ OM_LAWS: list[Rewrite] = [
     *OM_MASK_LAWS,
     *SDPA_CAT_LAWS,
 ]
+
+#: The same set as a composable :class:`~catopt_core.laws.RuleSet` —
+#: the value the orchestrator's presets compose.
+OM_RULES = RuleSet(
+    "om",
+    tuple(OM_LAWS),
+    description="the online-softmax monoid laws (chunked attention)",
+)

@@ -1,7 +1,7 @@
 # ruff: noqa: RUF002, RUF003
 """Hybrid SSM+attention blocks — TWO monoid carriers in one e-graph.
 
-``catopt.models.hybrid.HybridBlock`` stacks a diagonal-affine scan
+``catopt_torch.models.hybrid.HybridBlock`` stacks a diagonal-affine scan
 (``aff_diag`` / ``affd_compose`` / ``applyd`` — ``SCAN_DIAG_LAWS``)
 under chunked self-attention (``om_elem`` / ``om_compose`` /
 ``om_apply`` — ``OM_LAWS``).  ``TwoLayerHybrid`` goes SSM → attention →
@@ -57,14 +57,14 @@ Findings encoded as tests (T=16, d=16 unless noted):
 
 import torch
 
-from catopt import meta
+from catopt_core import meta
 from catopt_core import laws as R
-from catopt.cost import dag_cost, flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Var, op_repr
-from catopt.models.hybrid import HybridBlock, TwoLayerHybrid
-from catopt.om import OM_LAWS
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_core.cost import dag_cost, flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Var, op_repr
+from catopt_torch.models.hybrid import HybridBlock, TwoLayerHybrid
+from catopt_carriers.om import OM_LAWS
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 # ---------------------------------------------------------------------------
 #  helpers

@@ -2,14 +2,14 @@
 
 Two complements to :mod:`tests.test_core_torch_free` (the core half):
 
-* **static** — an AST walk over ``packages/catopt-optimize/src``
+* **static** — an AST walk over ``packages/catopt-orchestrator/src``
   rejects any direct ``import``/``from`` of the backend roots
   (``torch``, ``catopt_torch``, ``catopt_cuda``).  The
   ``catopt_carriers`` imports the regime/carrier helpers defer to
   call time are *not* forbidden at the statement level — carriers
   are optional rewrite machinery — but the runtime proof below
   blocks them too and the whole package must still import.
-* **runtime** — ``catopt_optimize`` is imported in a subprocess with
+* **runtime** — ``catopt_orchestrator`` is imported in a subprocess with
   ``torch``/``numpy``/``catopt_torch``/``catopt_carriers``/
   ``catopt_cuda`` all blocked by a meta-path finder; every
   submodule walks, the lazy carrier fallbacks degrade cleanly, and
@@ -48,17 +48,19 @@ from catopt_core.ports import (
     Source,
     TimingResult,
 )
-from catopt_optimize import (
-    Autotuned,
-    Compositional,
-    Optimizer,
-)
-from catopt_optimize.optimize import _lower_extracted
+from catopt_orchestrator.optimize import Autotuned
+
+from catopt_orchestrator import Compositional, Optimizer
+
+
+from catopt_orchestrator.optimize import _lower_extracted
+
+
 
 _OPT_SRC = (
     pathlib.Path(__file__).resolve().parents[1]
     / "packages"
-    / "catopt-optimize"
+    / "catopt-orchestrator"
     / "src"
 )
 
@@ -67,7 +69,7 @@ _FORBIDDEN = frozenset({"torch", "catopt_torch", "catopt_cuda"})
 
 
 # ---------------------------------------------------------------------------
-#  Static proof — no direct backend import statement in catopt_optimize
+#  Static proof — no direct backend import statement in catopt_orchestrator
 # ---------------------------------------------------------------------------
 
 
@@ -95,7 +97,7 @@ def test_optimize_source_has_no_backend_imports():
                 rel = path.relative_to(_OPT_SRC)
                 offenders.append(f"{rel}:{lineno} imports {root}")
     assert offenders == [], (
-        "catopt-optimize must import no backend directly; found:\n"
+        "catopt-orchestrator must import no backend directly; found:\n"
         + "\n".join(offenders)
     )
 
@@ -123,20 +125,13 @@ sys.meta_path.insert(0, _Blocker())
 import importlib
 import pkgutil
 
-import catopt_optimize
+import catopt_orchestrator
 
 # Walk EVERY orchestrator submodule — none may need a blocked package
 # at import time.
 for _info in pkgutil.walk_packages(
-    catopt_optimize.__path__, "catopt_optimize."
+    catopt_orchestrator.__path__, "catopt_orchestrator."
 ):
-    # The compat shims/aliases whose whole point is resolving the
-    # torch package must raise the blocked ModuleNotFoundError, not
-    # a different failure.
-    if _info.name in (
-        "catopt_optimize.calibrate", "catopt_optimize.export"
-    ):
-        continue
     importlib.import_module(_info.name)
 
 assert "torch" not in sys.modules
@@ -144,15 +139,16 @@ assert "catopt_torch" not in sys.modules
 assert "catopt_carriers" not in sys.modules
 
 # The lazy carrier fallbacks degrade to empty structures, never raise.
-import catopt_optimize.optimize as O
-import catopt_optimize.regime as R
+import catopt_orchestrator.optimize as O
+import catopt_orchestrator.regime as R
 
 assert O._carrier_plans() == {}
 assert O._carrier_lifts(object(), {}) == []
-assert R._xc_laws() == []
-assert O._CARRIER_PLANS == {}
+assert len(R._xc_rules()) == 0
 # Core scan laws compose in; blocked carriers contribute nothing.
-assert isinstance(R.CARRIER_LAWS, list)
+from catopt_core.laws import RuleSet
+assert isinstance(R.CARRIER_LAWS, RuleSet)
+assert len(R.CARRIER_LAWS) == len(R.core_laws.CARRIER_SEARCH)
 
 print("optimize-imported-torch-free")
 """
@@ -479,102 +475,100 @@ def test_lower_extracted_routes_to_sink_executor():
 
 
 # ---------------------------------------------------------------------------
-#  Delegation arms — moved names still resolve (torch install present)
+#  No-compat state — moved names do NOT resolve through the orchestrator
 # ---------------------------------------------------------------------------
 
 
-def test_optimize_module_delegations():
-    import catopt_optimize.optimize as O
+def test_optimize_module_has_no_compat_attrs():
+    """Plan 0008: the torch-facing names moved to their real homes."""
+    import catopt_orchestrator.optimize as O
 
-    # API wrappers moved to catopt_torch.api — resolvable, lazy.
-    assert callable(O.optimize_model)
-    assert callable(O.optimize_compositional)
-    # Composer internals.
-    assert callable(O._select_blocks)
-    assert callable(O._perturbed_input)
-    assert callable(O._cross_pair_pass)  # bound composer method shape
-    # Fold internals.
-    assert callable(O._specialize_causal)
-    # Report internals.
-    assert callable(O.verify_module)
-    # The historical torch patch point resolves the shared module.
-    import torch as _t
-
-    assert O.torch is _t
-    # Carrier-plan cache materialises lazily and caches.
-    plans = O._CARRIER_PLANS
-    assert O._CARRIER_PLANS is plans
+    for gone in (
+        "optimize_model",
+        "optimize_compositional",
+        "optimize_model_autotuned",
+        "param_report",
+        "_select_blocks",
+        "save_optimized_weights",
+        "torch",
+        "_CARRIER_PLANS",
+    ):
+        assert not hasattr(O, gone), gone
     with pytest.raises(AttributeError):
         _ = O.bogus_name
 
 
-def test_runners_module_delegations():
-    import catopt_optimize.runners as R
-    from catopt_cuda import CudaGraphRunner
-    from catopt_torch.runners import TorchCompileRunner
+def test_orchestrator_package_surface_is_neutral():
+    import catopt_orchestrator as pkg
 
-    assert R.TorchCompileRunner is TorchCompileRunner
-    assert R.CudaGraphRunner is CudaGraphRunner
-    with pytest.raises(AttributeError):
-        _ = R.bogus_name
+    assert pkg.Optimizer is not None
+    assert pkg.Autotuned is not None
+    for gone in (
+        "optimize_model",
+        "optimize_compositional",
+        "optimize_model_autotuned",
+        "TorchCompileRunner",
+        "CudaGraphRunner",
+        "export_optimized",
+    ):
+        with pytest.raises(AttributeError):
+            getattr(pkg, gone)
 
 
-def test_regime_module_delegations():
-    import catopt_optimize.regime as R
+def test_runners_module_has_no_backend_names():
+    import catopt_orchestrator.runners as R
 
-    # CARRIER_LAWS materialises once, then caches.
+    assert R.IdentityRunner is not None
+    for gone in ("TorchCompileRunner", "CudaGraphRunner"):
+        with pytest.raises(AttributeError):
+            getattr(R, gone)
+
+
+def test_regime_module_lazy_laws_only():
+    import catopt_orchestrator.regime as R
+
+    # CARRIER_LAWS / XC_LAWS materialise once, then cache.
     laws = R.CARRIER_LAWS
     assert R.CARRIER_LAWS is laws
-    assert list(R.XC_LAWS) == R.XC_LAWS
-    from catopt_torch.regime import RegimeDispatch
-
-    assert R.RegimeDispatch is RegimeDispatch
+    xc = R.XC_LAWS
+    assert R.XC_LAWS is xc
+    with pytest.raises(AttributeError):
+        _ = R.RegimeDispatch
     with pytest.raises(AttributeError):
         _ = R.bogus_name
 
 
-def test_autotune_module_delegations():
-    import catopt_optimize.autotune as A
-    from catopt_optimize.optimize import Autotuned
-    from catopt_torch.api import optimize_model_autotuned
+def test_shim_modules_are_gone():
+    """The calibrate/export redirect shims were deleted (plan 0008)."""
+    import importlib
 
-    assert A.Autotuned is Autotuned
-    assert A.optimize_model_autotuned is optimize_model_autotuned
-    with pytest.raises(AttributeError):
-        _ = A.bogus_name
-
-
-def test_package_delegations():
-    import catopt_optimize as pkg
-    from catopt_torch.api import optimize_model
-    from catopt_torch.export import export_optimized
-
-    assert pkg.optimize_model is optimize_model
-    assert pkg.export_optimized is export_optimized
-    with pytest.raises(AttributeError):
-        _ = pkg.bogus_name
+    for mod in (
+        "catopt_orchestrator.calibrate",
+        "catopt_orchestrator.export",
+    ):
+        sys.modules.pop(mod, None)
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(mod)
 
 
 def test_torch_package_delegations():
     import catopt_torch
+    from catopt_torch.autotune import TORCH_BUILDERS
     from catopt_torch.backend import TorchBackend
     from catopt_torch.runners import TorchCompileRunner
 
     assert catopt_torch.TorchBackend is TorchBackend
     assert catopt_torch.TorchCompileRunner is TorchCompileRunner
-    assert callable(catopt_torch.optimize_model)
+    assert catopt_torch.TORCH_BUILDERS is TORCH_BUILDERS
+    for gone in (
+        "optimize_model",
+        "optimize_compositional",
+        "optimize_model_autotuned",
+    ):
+        with pytest.raises(AttributeError):
+            getattr(catopt_torch, gone)
     with pytest.raises(AttributeError):
         _ = catopt_torch.bogus_name
-
-
-def test_compat_shim_modules_alias_the_torch_ones():
-    import catopt_optimize.calibrate as shim_cal
-    import catopt_optimize.export as shim_exp
-    import catopt_torch.calibrate
-    import catopt_torch.export
-
-    assert shim_cal is catopt_torch.calibrate
-    assert shim_exp is catopt_torch.export
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +577,7 @@ def test_compat_shim_modules_alias_the_torch_ones():
 
 
 def test_register_regime_backend_partial_args(monkeypatch):
-    import catopt_optimize.regime as R
+    import catopt_orchestrator.regime as R
 
     sentinel = object()
     monkeypatch.setattr(R, "_DISPATCH_CLS", None)
@@ -593,7 +587,7 @@ def test_register_regime_backend_partial_args(monkeypatch):
 
 
 def test_frontier_build_without_dispatch(monkeypatch):
-    import catopt_optimize.regime as R
+    import catopt_orchestrator.regime as R
 
     monkeypatch.setattr(R, "_DISPATCH_CLS", None)
     frontier = R.RegimeFrontier(
@@ -644,11 +638,10 @@ def test_build_egraph_accepts_explicit_source():
 
 
 def test_torch_builder_requires_ir():
-    from catopt_optimize.autotune import (
-        AutotuneContext,
-        CandidateUnavailableError,
-    )
-    from catopt_torch.api import TORCH_BUILDERS
+    from catopt_orchestrator.autotune import AutotuneContext, CandidateUnavailableError
+
+
+    from catopt_torch.autotune import TORCH_BUILDERS
 
     ctx = AutotuneContext(
         model=None,
@@ -666,11 +659,12 @@ def test_torch_builder_requires_ir():
 
 
 def test_runner_candidate_requires_ir():
-    from catopt_optimize.autotune import (
-        AutotuneContext,
-        CandidateUnavailableError,
-    )
-    from catopt_optimize.runners import IdentityRunner, runner_candidate
+    from catopt_orchestrator.autotune import AutotuneContext, CandidateUnavailableError
+
+
+    from catopt_orchestrator.runners import IdentityRunner, runner_candidate
+
+
 
     ctx = AutotuneContext(
         model=None,
@@ -690,8 +684,8 @@ def test_carrier_helpers_degrade_without_carriers(monkeypatch):
     """The lazy carrier fallbacks return empty in-process too."""
     import sys as _sys
 
-    import catopt_optimize.optimize as O
-    import catopt_optimize.regime as R
+    import catopt_orchestrator.optimize as O
+    import catopt_orchestrator.regime as R
     from catopt_core.egraph import EGraph
 
     for name in (
@@ -705,7 +699,7 @@ def test_carrier_helpers_degrade_without_carriers(monkeypatch):
     assert O._carrier_plans() == {}
     # A real (empty) e-graph — the share/tying passes tolerate it.
     assert isinstance(O._carrier_lifts(EGraph(), {}), list)
-    assert R._xc_laws() == []
+    assert len(R._xc_rules()) == 0
     # build_egraph with blocked carriers runs the plain core tier.
     eg, _root, ir, _src, _st = R.build_egraph(
         _ListModel(), [1.0, 2.0], source=FakeSource(), rules=[], xc=True
@@ -714,7 +708,7 @@ def test_carrier_helpers_degrade_without_carriers(monkeypatch):
 
 
 def test_register_regime_backend_executors_only():
-    import catopt_optimize.regime as R
+    import catopt_orchestrator.regime as R
 
     R.register_regime_backend(executors={"_probe": object()})
     assert "_probe" in R.EXECUTORS

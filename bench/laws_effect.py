@@ -37,7 +37,7 @@ picked, or is picked but doesn't pay at runtime, is reported as such.
 
 Usage:
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/laws_effect.py \
         --device cuda
     .venv/bin/python bench/laws_effect.py --device cpu --quick
@@ -63,10 +63,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.optimize import optimize_compositional, optimize_model
+
 from catopt_core.cost import flops_cost, launch_aware_cost
 from catopt_core.ir import IR, Op
-from catopt_optimize.regime import (
+from catopt_orchestrator.regime import (
     Regime,
     build_egraph,
     regime_frontier,
@@ -74,6 +74,9 @@ from catopt_optimize.regime import (
 from catopt_torch.report import verify_equiv
 from catopt_torch.torch_bridge import ir_to_torch_module
 from real_win_hunt import try_compile
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -292,9 +295,8 @@ def _decode_cell(args, dev: torch.device) -> tuple[dict, Case]:
     # -- main path (optimize_model / ALL_RULES): does it see these? ----
     t0 = time.time()
     try:
-        opt_m, st_m = optimize_model(
-            model, args_t, verbose=False, max_iterations=max_it
-        )
+        opt_m, st_m = Optimizer(backend=TorchBackend()).optimize(model, args_t, max_iterations=max_it, verify=False, verbose=False)
+
         rec["main_opt_s"] = round(time.time() - t0, 2)
         rec["fires_main_decode"] = _fires_for(
             st_m.get("rule_fires", {}), _DECODE_PREFIXES
@@ -421,13 +423,8 @@ def _cross_cell(args, dev: torch.device) -> tuple[dict, Case]:
 
     # -- block-only pass (the pre-change behaviour) ---------------------
     t0 = time.time()
-    opt_b, _rep_b = optimize_compositional(
-        model,
-        x,
-        verbose=False,
-        max_iterations=max_it,
-        max_cross_pairs=0,
-    )
+    opt_b, _rep_b = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(max_cross_pairs=0), verbose=False, max_iterations=max_it)
+
     rec["opt_blocks_s"] = round(time.time() - t0, 2)
     rec["blocks_census"] = _module_census(opt_b)
     ok, rel = _verify(ref, opt_b, args_t)
@@ -437,13 +434,8 @@ def _cross_cell(args, dev: torch.device) -> tuple[dict, Case]:
 
     # -- with the cross-block pair pass --------------------------------
     t0 = time.time()
-    opt_c, rep_c = optimize_compositional(
-        model,
-        x,
-        verbose=False,
-        max_iterations=max_it,
-        max_cross_pairs=8,
-    )
+    opt_c, rep_c = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(max_cross_pairs=8), verbose=False, max_iterations=max_it)
+
     rec["opt_cross_s"] = round(time.time() - t0, 2)
     cp = (
         rep_c.get("cross_pairs")
@@ -566,9 +558,8 @@ def _layout_cell(args, dev: torch.device) -> tuple[dict, Case]:
 
     t0 = time.time()
     try:
-        opt_m, st_m = optimize_model(
-            model, x, verbose=False, max_iterations=max_it
-        )
+        opt_m, st_m = Optimizer(backend=TorchBackend()).optimize(model, x, max_iterations=max_it, verify=False, verbose=False)
+
         rec["opt_s"] = round(time.time() - t0, 2)
         rec["fires_layout"] = _fires_for(
             st_m.get("rule_fires", {}), _LAYOUT_PREFIXES

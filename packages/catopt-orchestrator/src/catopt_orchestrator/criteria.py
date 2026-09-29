@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 #
 # The canonical protocol lives in :mod:`catopt_core.ports` (promoted
 # in plan 0007 — the orchestrator's neutral contract); it is imported
-# here so ``catopt_optimize.criteria.Criterion`` stays the same
+# here so ``catopt_orchestrator.criteria.Criterion`` stays the same
 # object users subclass and ``isinstance``-check against.
 from catopt_core.ports import Criterion
 

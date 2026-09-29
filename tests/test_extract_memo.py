@@ -9,8 +9,8 @@ These tests pin the semantics of those fast paths and cover their
 self-gating edge cases.
 """
 
-from catopt.egraph import EGraph, ENode
-from catopt.ir import Op, Param, TensorType, Var, op_repr
+from catopt_core.egraph import EGraph, ENode
+from catopt_core.ir import Op, Param, TensorType, Var, op_repr
 from catopt_core.cost import (
     _profile_constants,
     _roofline_cost,

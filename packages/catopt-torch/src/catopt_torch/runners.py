@@ -4,12 +4,12 @@ The delivery runners split by backend (plan 0007): the backend-neutral
 :class:`Runner` protocol lives in :mod:`catopt_core.ports`;
 :class:`IdentityRunner` / :class:`ChainedRunner` /
 :func:`runner_candidate` live in the orchestrator
-(:mod:`catopt_optimize.runners`); the torch-coupled
+(:mod:`catopt_orchestrator.runners`); the torch-coupled
 :class:`TorchCompileRunner` lives here; and the CUDA-device-coupled
 :class:`CudaGraphRunner` lives in :mod:`catopt_cuda`.
 
 This module re-exports the whole runner surface so the historical
-``catopt.runners`` path (and ``from catopt_torch.runners import …``)
+``catopt_orchestrator.runners`` path (and ``from catopt_torch.runners import …``)
 resolves every name — ``CudaGraphRunner`` is optional: a partial
 install without :mod:`catopt_cuda` simply lacks it.
 """
@@ -21,7 +21,7 @@ from typing import Any, cast
 
 import torch
 from catopt_core.ports import Runner
-from catopt_optimize.runners import (
+from catopt_orchestrator.runners import (
     ChainedRunner,
     IdentityRunner,
     runner_candidate,

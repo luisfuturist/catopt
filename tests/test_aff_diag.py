@@ -3,7 +3,7 @@
 
 ``SCAN_LAWS`` lifts a dense recurrence step ``add(matmul(A,h), x)`` into
 the affine-map monoid and lets associativity discover the Blelloch
-parallel scan.  ``catopt.models.ssm.DiagonalSSM`` is the Mamba-faithful
+parallel scan.  ``catopt_torch.models.ssm.DiagonalSSM`` is the Mamba-faithful
 elementwise form ``h_t = a_t ⊙ h_{t-1} + b_t ⊙ x_t``, which exports as
 ``add(mul(a_t, h), mul(b_t, x_t))`` — no ``matmul`` node, so ``AFF_LIFT``
 never binds (see test_ssm_scan.py::test_diagonal_elementwise_ssm_does_not_lift
@@ -52,14 +52,14 @@ import math
 
 import torch
 
-from catopt import meta
+from catopt_core import meta
 from catopt_core import laws as R
-from catopt.cost import dag_cost, flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, op_repr
-from catopt.models.ssm import DiagDenseSSM, DiagonalSSM
-from catopt.scan_lower import is_scan_apply_term, to_batched_scan_module
-from catopt.torch_bridge import (
+from catopt_core.cost import dag_cost, flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, op_repr
+from catopt_torch.models.ssm import DiagDenseSSM, DiagonalSSM
+from catopt_carriers.scan_lower import is_scan_apply_term, to_batched_scan_module
+from catopt_torch.torch_bridge import (
     _IR_TO_TORCH,
     export_to_ir,
     ir_to_torch_module,

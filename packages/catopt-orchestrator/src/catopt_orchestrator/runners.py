@@ -8,15 +8,11 @@ backend-neutral members — :class:`IdentityRunner`,
 :class:`ChainedRunner`, :func:`runner_candidate` — live here; the
 torch-coupled :class:`TorchCompileRunner` lives in
 ``catopt_torch.runners`` and the CUDA-device-coupled
-:class:`CudaGraphRunner` in ``catopt_cuda``.  Both resolve through
-module-level ``__getattr__`` so the historical
-``catopt_optimize.runners`` / ``catopt.runners`` attribute paths keep
-working on a torch install.
+:class:`CudaGraphRunner` in ``catopt_cuda``.
 """
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -93,8 +89,8 @@ class ChainedRunner:
 def runner_candidate(runner: Runner) -> Callable[[Any], Any]:
     """Adapt a :class:`Runner` into an autotune ``CandidateBuilder``.
 
-    The hook that makes runners usable inside
-    :func:`catopt_optimize.autotune.optimize_model_autotuned` without
+    The hook that makes runners usable inside the
+    :class:`~catopt_orchestrator.optimize.Autotuned` strategy without
     touching its machinery: ``candidates=[("my_runner",
     runner_candidate(MyRunner()))]``.  The builder applies the
     runner to a FRESH routed executor — the same freshness rule the
@@ -106,8 +102,10 @@ def runner_candidate(runner: Runner) -> Callable[[Any], Any]:
     """
 
     def build(ctx: Any) -> Any:
-        from catopt_optimize.autotune import CandidateUnavailableError
-        from catopt_optimize.optimize import _lower_extracted
+        from catopt_orchestrator.autotune import (
+            CandidateUnavailableError,
+        )
+        from catopt_orchestrator.optimize import _lower_extracted
 
         if ctx.ir is None:
             raise CandidateUnavailableError(
@@ -119,29 +117,3 @@ def runner_candidate(runner: Runner) -> Callable[[Any], Any]:
         return runner.apply(mod, ctx.example_input, {})
 
     return build
-
-
-# ---------------------------------------------------------------------------
-# Compatibility delegation — the backend-coupled runners (lazy)
-# ---------------------------------------------------------------------------
-#
-# ``TorchCompileRunner`` (torch.compile) lives in
-# ``catopt_torch.runners``; ``CudaGraphRunner`` (CUDA capture) in
-# ``catopt_cuda``.  Both resolve lazily: importing this module never
-# loads a backend, but the historical attribute paths keep working on
-# an install that has them.
-
-_DELEGATED = {
-    "TorchCompileRunner": "catopt_torch.runners",
-    "CudaGraphRunner": "catopt_cuda",
-}
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve the backend-coupled runner names lazily."""
-    mod = _DELEGATED.get(name)
-    if mod is not None:
-        return getattr(importlib.import_module(mod), name)
-    raise AttributeError(
-        f"module {__name__!r} has no attribute {name!r}"
-    )

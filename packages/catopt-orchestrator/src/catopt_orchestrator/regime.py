@@ -34,7 +34,7 @@ regime normalisation both sides share.
 
 Typical usage (torch backend)::
 
-    from catopt.regime import Regime, regime_dispatch, default_regimes
+    from catopt_torch.regime import Regime, regime_dispatch, default_regimes
     from catopt_core.cost import flops_cost, launch_aware_cost
 
     disp = regime_dispatch(model, x, regimes=[
@@ -74,11 +74,11 @@ from :mod:`catopt_torch.calibrate` — which defaults its cost model to
 from __future__ import annotations
 
 import contextlib
-import importlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import catopt_core.laws as core_laws
 from catopt_core.cost import (
     _INVALID_COST,
     _VIEW_OPS,
@@ -90,7 +90,7 @@ from catopt_core.cost import (
 )
 from catopt_core.egraph import EGraph, ENode
 from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
-from catopt_core.laws import SCAN_DIAG_LAWS, SCAN_LAWS
+from catopt_core.laws import RuleSet
 from catopt_core.ports import ExecutorSpec
 from catopt_core.profile import TargetProfile, load_profile
 from catopt_core.typing import _INVALID, _numel, _shape_of
@@ -177,7 +177,7 @@ def is_trace_rooted_term(term: Any) -> bool:
 #: The ambient executor table — the default ``executors`` argument of
 #: :func:`regime_frontier` and the lookup RegimeDispatch-style builders
 #: read.  Populated by :func:`register_regime_backend` — importing a
-#: backend's regime module (``catopt.regime`` → ``catopt_torch.regime``)
+#: backend's regime module (``catopt_torch.regime`` → ``catopt_torch.regime``)
 #: fills it with that backend's :class:`ExecutorSpec`s; a caller may
 #: instead pass ``executors=`` explicitly.  Kept as a plain dict so the
 #: historical ``monkeypatch.setitem(EXECUTORS, "fake", spec)`` test
@@ -801,7 +801,7 @@ def regime_frontier(
     implementation.  ``None`` (default) resolves to the ambient
     :data:`EXECUTORS` — the registered backend table (populated by
     :func:`register_regime_backend`, e.g. importing
-    ``catopt.regime``).
+    ``catopt_torch.regime``).
     """
     table = EXECUTORS if executors is None else executors
     regime_list = _attach_profiles(
@@ -959,43 +959,50 @@ def regime_frontier(
 # ---------------------------------------------------------------------------
 
 
-def _carrier_laws() -> list:
-    """Return the full carrier law list — resolved at call time.
+def _carrier_search() -> RuleSet:
+    """Return the carrier-search rule set — resolved at call time.
 
-    ``catopt_carriers`` is a *different* package — its law modules are
-    consulted lazily so importing the regime machinery never loads a
-    tensor library.  Carriers that are absent (partial install, or a
-    process where torch is unavailable) simply contribute no laws —
-    the e-graph then only ever reaches the core scan families.
+    The ``CARRIER_SEARCH`` preset: the core scan monoids plus the
+    carrier-package decode / om / trace families (the historical
+    ``CARRIER_LAWS`` list, promoted to a ``RuleSet``).  The
+    cross-carrier seam set (:func:`_xc_rules`) is a *separate*
+    bounded tier, deliberately not folded in.
+
+    ``catopt_carriers`` is a *different* package — its law modules
+    are consulted lazily so importing the regime machinery never
+    loads a tensor library.  Carriers that are absent (partial
+    install, or a process where torch is unavailable) simply
+    contribute no laws — the e-graph then only ever reaches the
+    core scan families.
     """
-    laws = list(SCAN_LAWS) + list(SCAN_DIAG_LAWS)
+    laws = core_laws.CARRIER_SEARCH
     with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.decode_laws import DECODE_LAWS
+        from catopt_carriers.decode_laws import DECODE_RULES
 
-        laws += DECODE_LAWS
+        laws = laws + DECODE_RULES
     with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.om import OM_LAWS
+        from catopt_carriers.om import OM_RULES
 
-        laws += OM_LAWS
+        laws = laws + OM_RULES
     with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.trace import TRACE_LAWS
+        from catopt_carriers.trace import TRACE_RULES
 
-        laws += TRACE_LAWS
+        laws = laws + TRACE_RULES
     return laws
 
 
-def _xc_laws() -> list:
-    """Return the cross-carrier seam laws — ``[]`` when absent."""
+def _xc_rules() -> RuleSet:
+    """Return the cross-carrier seam rule set — empty when absent."""
     with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.xcarrier import XC_LAWS
+        from catopt_carriers.xcarrier import XC_RULES
 
-        return list(XC_LAWS)
-    return []
+        return XC_RULES
+    return RuleSet("xc", ())
 
 
-def default_rules() -> list:
-    """Return the default carrier law list."""
-    return _carrier_laws()
+def default_rules() -> RuleSet:
+    """Return the default carrier-search rule set."""
+    return _carrier_search()
 
 
 def build_egraph(
@@ -1003,7 +1010,7 @@ def build_egraph(
     example_input: Any,
     *,
     source: Any,
-    rules: list | None = None,
+    rules: Iterable | None = None,
     xc: bool = True,
     max_iterations: int = 14,
     max_nodes: int = 400_000,
@@ -1015,8 +1022,10 @@ def build_egraph(
     ``source`` is the :class:`~catopt_core.ports.Source` port —
     REQUIRED (no assumed frontend; the torch-facing
     ``catopt_torch.regime.build_egraph`` defaults it to
-    ``TorchSource``).  ``rules`` selects the core saturating set
-    (default the carrier law list).  ``xc`` (default on) adds a
+    ``TorchSource``).  ``rules`` selects the core saturating set —
+    a :class:`~catopt_core.laws.RuleSet` or any rule iterable
+    (default the ``CARRIER_SEARCH`` preset).  ``xc`` (default on)
+    adds a
     bounded second tier: after the non-local lifts have established
     the carriers, the cross-carrier seam laws (``XC_LAWS``) run with
     their own small iteration budget, then a short core pass
@@ -1051,7 +1060,7 @@ def build_egraph(
         def _lifts() -> list:
             return []
 
-        xc_laws: list = []
+        xc_laws: Iterable = []
     else:
 
         def _lifts() -> list:
@@ -1062,7 +1071,7 @@ def build_egraph(
                 + omd_tree_lift(eg)
             )
 
-        xc_laws = _xc_laws()
+        xc_laws = _xc_rules()
 
     lifts = _lifts()
     if lifts:
@@ -1097,42 +1106,34 @@ def build_egraph(
 
 
 # ---------------------------------------------------------------------------
-# Compatibility delegation — the torch-half names (lazy, no static edge)
+# Lazy carrier-law surfaces (no static edge)
 # ---------------------------------------------------------------------------
 #
-# ``RegimeDispatch`` (an nn.Module) and ``regime_dispatch`` (the
-# end-to-end torch pipeline) moved to ``catopt_torch.regime`` (plan
-# 0007).  These names resolve lazily — importing this module never
-# loads a backend, but the historical attribute paths keep working
-# when a backend is installed.
+# ``CARRIER_LAWS`` (the ``CARRIER_SEARCH`` preset) and ``XC_LAWS``
+# (the ``XC_RULES`` seam set) materialise lazily so importing the
+# regime machinery never loads the (torch-coupled) carriers package.
+# The torch-half names — ``RegimeDispatch`` and ``regime_dispatch``
+# — live in ``catopt_torch.regime`` (plan 0007); import them there.
 
-_TORCH_DELEGATED = {
-    "RegimeDispatch": "catopt_torch.regime",
-    "regime_dispatch": "catopt_torch.regime",
-}
-
-_CARRIER_LAWS: list | None = None
-_XC_LAWS: list | None = None
+_CARRIER_SEARCH: RuleSet | None = None
+_XC_RULES: RuleSet | None = None
 
 
 def __getattr__(name: str) -> Any:
-    """Resolve moved/lazy names — torch-coupled or carrier-law data."""
-    global _CARRIER_LAWS, _XC_LAWS
+    """Resolve the lazily-materialised carrier rule sets."""
+    global _CARRIER_SEARCH, _XC_RULES
     if name == "CARRIER_LAWS":
-        # The carrier law list — materialised lazily so importing the
-        # regime machinery never loads a backend (see _carrier_laws).
-        if _CARRIER_LAWS is None:
-            _CARRIER_LAWS = _carrier_laws()
-        return _CARRIER_LAWS
+        # The carrier-search set — materialised lazily so importing
+        # the regime machinery never loads a backend.
+        if _CARRIER_SEARCH is None:
+            _CARRIER_SEARCH = _carrier_search()
+        return _CARRIER_SEARCH
     if name == "XC_LAWS":
-        # Same lazy materialisation for the seam law list (``[]``
-        # without carriers).
-        if _XC_LAWS is None:
-            _XC_LAWS = _xc_laws()
-        return _XC_LAWS
-    mod = _TORCH_DELEGATED.get(name)
-    if mod is not None:
-        return getattr(importlib.import_module(mod), name)
+        # Same lazy materialisation for the seam rule set (empty
+        # RuleSet without carriers).
+        if _XC_RULES is None:
+            _XC_RULES = _xc_rules()
+        return _XC_RULES
     raise AttributeError(
         f"module {__name__!r} has no attribute {name!r}"
     )

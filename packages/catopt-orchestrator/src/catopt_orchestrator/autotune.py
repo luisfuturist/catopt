@@ -9,7 +9,7 @@ static cost model can only guess at (per-node eval dispatch vs.
 batched compose levels vs. compiler fusion reorder differently
 across backends and devices).
 
-The :class:`~catopt_optimize.optimize.Autotuned` strategy runs the
+The :class:`~catopt_orchestrator.optimize.Autotuned` strategy runs the
 e-graph search ONCE, then re-lowers the same extracted term through
 each requested lowering path, verifies every candidate against the
 model through ``sink.verify`` (an unverified candidate is never
@@ -47,7 +47,7 @@ Built-in candidate names (see :data:`CANDIDATE_BUILDERS`):
 
 Backend-provided builders — ``torch.compile`` / CUDA-graph paths —
 arrive through the ``builders`` map (the torch wrapper supplies
-``catopt_torch.api.TORCH_BUILDERS``: ``"torch_compile"``,
+``catopt_torch.autotune.TORCH_BUILDERS``: ``"torch_compile"``,
 ``"torch_compile_generic"``, ``"cuda_graph"``).  Custom candidates:
 a ``candidates`` entry may be a ``(name, builder)`` tuple where
 ``builder`` is a :data:`CandidateBuilder` callable receiving the
@@ -86,7 +86,6 @@ written (``measured_ns``), and the updated profile object
 from __future__ import annotations
 
 import copy
-import importlib
 import logging
 import time
 from collections.abc import Callable, Iterable
@@ -111,12 +110,9 @@ from catopt_core.profile import (
     shape_bucket,
 )
 
-from catopt_optimize.optimize import (
-    Optimizer,
-    _lower_extracted,
-)
+from catopt_orchestrator.optimize import Optimizer, _lower_extracted
 
-logger = logging.getLogger("catopt_optimize.autotune")
+logger = logging.getLogger("catopt_orchestrator.autotune")
 
 __all__ = [
     "CANDIDATE_BUILDERS",
@@ -480,9 +476,8 @@ def _autotuned_impl(
 ) -> tuple[Any, dict[str, Any]]:
     """Optimize ``model``, then autotune over lowering paths.
 
-    The engine behind the :class:`~catopt_optimize.optimize.Autotuned`
-    strategy and the ``optimize_model_autotuned`` compatibility
-    wrapper (plan 0006/0007).  Steps:
+    The engine behind the :class:`~catopt_orchestrator.optimize.Autotuned`
+    strategy (plan 0006/0007).  Steps:
 
     1. Run the monolithic pipeline once (uncompiled, no graph
        capture — those are candidates, not presets) to get the
@@ -546,7 +541,7 @@ def _autotuned_impl(
     verbose
         Print progress.
     **optimize_kwargs
-        Forwarded to the underlying optimize call (``ruleset``,
+        Forwarded to the underlying optimize call (``rules``,
         ``max_iterations``, …).  Compilation and graph capture are
         candidates here, not presets — ``runner`` only decorates the
         pipeline's own delivered module, not a substitute candidate.
@@ -839,28 +834,3 @@ def _autotuned_impl(
         stats["autotune"]["measured_ns"] = written
         stats["autotune"]["profile"] = profile
     return module, stats
-
-
-# ---------------------------------------------------------------------------
-# Compatibility delegation — the torch-defaulted wrapper moved (lazy)
-# ---------------------------------------------------------------------------
-#
-# ``optimize_model_autotuned`` resolves torch defaults, so it lives in
-# ``catopt_torch.api`` (plan 0007); ``Autotuned`` resolves here so the
-# historical ``catopt_optimize.autotune.Autotuned`` path keeps working
-# (it lives in ``catopt_optimize.optimize``).
-
-_DELEGATED = {
-    "optimize_model_autotuned": "catopt_torch.api",
-    "Autotuned": "catopt_optimize.optimize",
-}
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve the moved names lazily."""
-    mod = _DELEGATED.get(name)
-    if mod is not None:
-        return getattr(importlib.import_module(mod), name)
-    raise AttributeError(
-        f"module {__name__!r} has no attribute {name!r}"
-    )

@@ -35,10 +35,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from catopt.cost import _INVALID, _shape_of, flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import Op, TensorType, Var
-from catopt.optimize import optimize_compositional, optimize_model
+from catopt_core.cost import _INVALID, _shape_of, flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, TensorType, Var
+
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # ---------------------------------------------------------------------------
 #  A batched rope-style block — mirrors bench/decode_bench.py's BatchedBlock
@@ -173,8 +176,8 @@ def test_extract_best_never_picks_illtyped_reshape():
     reshape with a numel-mismatched attr must extract the good member:
     the ill-typed view would otherwise win on cost and crash eval."""
     torch.manual_seed(0)
-    from catopt.ir import IR
-    from catopt.torch_bridge import ir_to_torch_module
+    from catopt_core.ir import IR
+    from catopt_torch.torch_bridge import ir_to_torch_module
 
     B, T, D = 16, 256, 768
     x = _V("x", (B, T, D))
@@ -209,9 +212,8 @@ def test_batched_rope_egraph_reshapes_welltyped():
     child class's inferred numel — the reported minted shape may never
     appear ill-typed."""
     torch.manual_seed(0)
-    from catopt.optimize import _EXPANSIVE_RULES
-    from catopt_core.laws import all_rules
-    from catopt.torch_bridge import export_to_ir
+    from catopt_core.laws import DEFAULT, tags
+    from catopt_torch.torch_bridge import export_to_ir
 
     blk = RopeBlock().eval()
     B, T, D = 16, 128, 96
@@ -221,15 +223,8 @@ def test_batched_rope_egraph_reshapes_welltyped():
 
     eg = EGraph()
     root = eg.add_term(ir.root)
-    _SUB = {
-        "swiglu_fuse",
-        "parallel_mul_fuse",
-        "qkv_fuse",
-        "qkv_fuse_asym",
-    }
-    rules = [r for r in all_rules() if r.name not in _SUB]
-    budgets = {n: 2048 for n in _EXPANSIVE_RULES}
-    eg.run(rules, root, rule_budgets=budgets)
+    budgets = {r.name: 2048 for r in DEFAULT.tagged(tags.EXPANSIVE)}
+    eg.run(DEFAULT, root, rule_budgets=budgets)
 
     bad = []
     for en in eg._node_to_class:
@@ -262,7 +257,8 @@ def test_compositional_leaves_caller_model_pristine():
     model = RopeStories(depth=2).eval()
     for T in (64, 128):
         idx = torch.randint(0, 256, (4, T))
-        opt, rep = optimize_compositional(model, idx, verbose=False)
+        opt, rep = Optimizer(backend=TorchBackend()).optimize(model, idx, strategy=Compositional(), verbose=False)
+
         assert rep["in_place"] is False
         # the caller's model is never the recomposed one
         assert opt is not model
@@ -300,7 +296,8 @@ def test_compositional_inplace_fallback_preserves_model():
     orig = copy.deepcopy
     copy.deepcopy = flaky
     try:
-        _opt, rep = optimize_compositional(model, idx64, verbose=False)
+        _opt, rep = Optimizer(backend=TorchBackend()).optimize(model, idx64, strategy=Compositional(), verbose=False)
+
     finally:
         copy.deepcopy = orig
     assert rep["in_place"] is True
@@ -324,7 +321,8 @@ def test_batched_rope_optimize_model_multi_shape():
         h = torch.randn(B, T, 96)
         cos = torch.randn(T, 12)
         sin = torch.randn(T, 12)
-        opt, _stats = optimize_model(blk, (h, cos, sin), verbose=False)
+        opt, _stats = Optimizer(backend=TorchBackend()).optimize(blk, (h, cos, sin), verify=False, verbose=False)
+
         with torch.no_grad():
             ref = blk(h, cos, sin)
             out = opt(h, cos, sin)

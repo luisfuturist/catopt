@@ -4,10 +4,12 @@ Categorical optimization of neural-network computation graphs
 (Python 3.13, torch + numpy). Monorepo layout: the domain packages
 live under `packages/` (`catopt-core` — the torch-free engine;
 `catopt-torch` — PyTorch adapters; `catopt-carriers` — carrier
-laws/executors; `catopt-optimize` — pipeline orchestrators);
-`catopt/` is the façade
-+ compat aliases (every historical `catopt.X` import path resolves to
-its new home via `sys.modules` aliases). Tests in
+laws/executors; `catopt-cuda` — the CUDA-graph runner;
+`catopt-orchestrator` — the backend-neutral pipeline). The `catopt`
+façade is gone (plan 0008): `import catopt` fails and every name
+lives at its real package path — `catopt_core.egraph`,
+`catopt_torch.adapters`, `catopt_orchestrator.optimize`,
+`catopt_cuda.CudaGraphRunner`, … Tests in
 `tests/`. The dev virtualenv is `.venv/` (uv-managed).
 
 ## Verification commands
@@ -21,10 +23,10 @@ uv run pytest                 # full test suite (pytest-xdist enabled)
 .venv/bin/ruff format --check # formatting
 .venv/bin/vulture             # dead code (uses [tool.vulture] paths)
 .venv/bin/lint-imports        # hexagonal boundary contracts
-.venv/bin/bandit -c .bandit.yaml -r packages catopt   # security SAST
-.venv/bin/semgrep --config .semgrep.yml packages catopt   # dataflow (offline)
+.venv/bin/bandit -c .bandit.yaml -r packages   # security SAST
+.venv/bin/semgrep --config .semgrep.yml packages   # dataflow (offline)
 .venv/bin/python tools/radon_ratchet.py   # complexity ratchet
-coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_optimize,catopt -m pytest tests/ -q
+coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_orchestrator,catopt_cuda -m pytest tests/ -q
 coverage report -m                                              # coverage (fail_under=100)
 ```
 
@@ -32,7 +34,7 @@ Manual-stage gates (not run on every commit — network/slower):
 
 ```sh
 .venv/bin/pip-audit                                          # dependency CVEs (network)
-.venv/bin/semgrep --config p/python --config p/security-audit packages catopt  # registry rules (network)
+.venv/bin/semgrep --config p/python --config p/security-audit packages  # registry rules (network)
 sh tools/runtime_types.sh                                    # typeguard runtime contracts
 MUTMUT_ONLY=catopt_core/ir.py MUTMUT_TESTS='tests/test_ir.py' tools/mutmut.sh run  # mutation testing
 ```
@@ -44,14 +46,14 @@ import-linter, vulture, bandit, semgrep and the radon ratchet.  The
 
 Known drift: the installed ruff (0.16.9) still flags pre-existing
 isort / format differences across `tests/` and `bench/`, which are not
-format-checked.  The shipped source — `packages`, `catopt` and `tools` —
+format-checked.  The shipped source — `packages` and `tools` —
 is clean under both `ruff check` and `ruff format --check`.
 
 ## Typecheck (ty)
 
 - Checker: **ty** (`[tool.ty]` in `pyproject.toml`) — Astral's type
   checker, replacing the earlier pyright ratchet.
-  `[tool.ty.src] include = ["packages","catopt"]` scopes checking to the
+  `[tool.ty.src] include = ["packages"]` scopes checking to the
   shipped packages (tests/ and bench/ are not type-checked);
   `[tool.ty.environment]` sets the 3.13 target and the per-package
   `extra-paths`; `[tool.ty.terminal] error-on-warning = false`.
@@ -70,13 +72,13 @@ Two dev-only ratchets (both in the `dev` dependency group, both
 configured in `pyproject.toml`):
 
 - **vulture** (`[tool.vulture]`, `min_confidence = 80`) flags
-  unreachable / unused code across `packages` / `catopt` / `tests`.
+  unreachable / unused code across `packages` / `tests`.
   The suite is pinned at 100% coverage, so a genuine dead branch is a
   real finding, not noise.  Run `.venv/bin/vulture` (uses the
   configured `paths`); a non-zero exit (3) means dead code.
 - **import-linter** (`[tool.importlinter]`) pins the hexagonal boundary:
   a `forbidden` contract makes `catopt_core` importing `catopt_torch` /
-  `catopt_carriers` / `catopt_optimize` — or the `torch`
+  `catopt_carriers` / `catopt_orchestrator` — or the `torch`
   / `numpy` external packages — a hard error.  Run
   `.venv/bin/lint-imports`.  Core is a *sink* for adapter-pushed state
   (see `catopt_core.ops` *Backend wiring*), never a puller: the adapter
@@ -104,12 +106,12 @@ enodes that become identical after child canonicalisation are unioned
 
 ## Static analysis & security
 
-- **Bandit** (`.bandit.yaml`, dev dep): SAST over `packages` + `catopt`
+- **Bandit** (`.bandit.yaml`, dev dep): SAST over `packages`
   (tests/bench excluded).  The only finding is two `B112`
   (try/except/continue) in `catopt_core.meta`'s rule matcher, where a
   guard/derive raising is the *signal to reject a candidate* — a
   justified config-level skip.  Run `.venv/bin/bandit -c .bandit.yaml
-  -r packages catopt`.
+  -r packages`.
 - **Semgrep** (`.semgrep.yml`, dev dep): the committed config is
   deterministic/offline (no-`eval`/`exec`, no-`shell=True`,
   no-unsafe-`yaml.load`).  The deeper registry scan
@@ -136,7 +138,7 @@ regenerate with `--update` and review the diff.  Run
 The pydocstyle ruleset is enabled through ruff (`select = [..., "D"]`).
 The `D` ignore list is now **empty**: the whole backlog (550 violations
 — missing docstrings, summary/blank-line style, imperative mood, …) has
-been cleared, so `ruff check packages catopt` enforces `D` in full.  The
+been cleared, so `ruff check packages` enforces `D` in full.  The
 codebase adopts **D211** (blank line before a class docstring) and
 **D212** (multi-line summary on the first line) over the mutually
 exclusive D203/D213 — ruff prints its usual "incompatible" warning for
@@ -148,8 +150,8 @@ error.  The gate applies to shipped code only — `tests/**` and
 
 `typeguard` (dev dep) enforces annotations at runtime.
 `tools/runtime_types.sh` instruments all four packages
-(`--typeguard-packages=catopt_core,catopt_torch,catopt_carriers,catopt_optimize`)
-and runs 68 test files (1372 tests) — a manual-stage gate that CI also
+(`--typeguard-packages=catopt_core,catopt_torch,catopt_carriers,catopt_orchestrator`)
+and runs the curated (1372 tests) — a manual-stage gate that CI also
 runs (~11 min).  It caught several real annotation bugs, all fixed:
 `laws/tensor._head` was annotated `str` but takes an `Op`;
 `typing._infer_op_shape` passed a `tuple` to zero-arg shape rules typed
@@ -171,7 +173,7 @@ list in the script.
 (`.mutmut-sandbox/`, gitignored): mutmut 3 derives mutant keys from
 paths, but a per-package `src/` layout imports under a different dotted
 name, so the wrapper symlinks each package at the sandbox top level
-(path == import name) plus `tests/`, `catopt/` and `uv.lock`, and writes
+(path == import name) plus `tests/` and `uv.lock`, and writes
 the matching `[tool.mutmut]`.  Scope a fast loop with `MUTMUT_ONLY` /
 `MUTMUT_TESTS`; a surviving mutant is a weak-assertion finding (the
 suite is pinned at 100% coverage, so it is not a coverage gap).  The
@@ -185,7 +187,7 @@ equality-saturation search against the Rust **egglog** library on a
 small op/law subset.  It is an **opt-in, test-only oracle** — not a
 production dependency and not an engine swap: `catopt-core` stays
 pure-Python / zero-dependency, and nothing under `packages/` or
-`catopt/` imports `egglog`.  The ported prototype and its documented
+`packages/` imports `egglog`.  The ported prototype and its documented
 limitations (untyped-by-shape terms, unconditional `check` rewrites, no
 proof replay) live in `tests/egglog_oracle.py`.
 
@@ -218,8 +220,13 @@ the workspace keeps `requires-python = ">=3.11"`.
 (`model -> (IR, leaves)`) and `Sink` (`IR -> runnable`, plus its
 `supported_ops` set and the module-level equivalence gate); the per-op
 port is `Binding` (`TorchBinding` is an alias of the same object).
-`optimize_model` / `discover_alternatives` take `source=` / `sink=`
-(defaults: `catopt_torch.adapters.TorchSource` / `TorchSink`).
+`catopt_orchestrator.Optimizer` takes the ports as a
+`catopt_core.pipeline.Backend` value (torch:
+`Optimizer(backend=TorchBackend())`, the
+`catopt_torch.backend.TorchBackend` bundle of
+`TorchSource`/`TorchSink`/`TorchComposer`/`TorchMeter`) or explicitly
+(`source=`/`sink=`/…); `discover_alternatives` takes `source=`.
+There is no default backend.
 Extraction is priced through
 `catopt_core.cost.backend_cost(cost_fn, sink.supported_ops)`, so the
 search only selects forms the backend can lower.  A new backend
@@ -265,8 +272,10 @@ hook: `bound` maps each metavar to a resolved member term (use
 the rule in a group list at the bottom of its module
 (`SIMPLIFICATION_RULES`, `CATEGORICAL_RULES`, `SDPA_FOLD_RULES`,
 `SCAN_LAWS`, `SCAN_DIAG_LAWS`; `ALL_RULES`/`all_rules()` is the union).
-Expansive closure-generating rules also join
-`catopt_optimize.optimize._EXPANSIVE_RULES` (bounded-saturation budget).
+Rules also carry tags from `catopt_core.laws.tags` (pass
+`R(..., tags=...)`); `EXPANSIVE` marks the closure-generating rules the
+pipeline budgets (`rules.tagged(EXPANSIVE)`).  The composable `RuleSet`
+presets live in `catopt_core.laws.ruleset`.
 
 Measure it: `python bench/law_bench.py --laws <name[,name|group]>`
 `--sizes <d[,d]>` — per law: registered synthetic term → `eg.run` on
@@ -275,4 +284,4 @@ that rule alone → extraction (pipeline cost model) → `_lower_extracted`
 picked / verified / cost & ms before→after; non-firing laws report
 honestly.  Add a builder in `LAW_CASES` keyed by rule name for new
 laws.  Gates: `uv run pytest`, `.venv/bin/ty`,
-`.venv/bin/ruff check` (packages catopt), coverage stays 100.
+`.venv/bin/ruff check` (packages), coverage stays 100.

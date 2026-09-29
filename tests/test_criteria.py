@@ -2,7 +2,7 @@
 ``optimize_model(criteria=...)`` param.
 
 The blend is a weighted sum of named cost axes
-(:func:`catopt_optimize.criteria.criteria_cost`).  Sum of
+(:func:`catopt_orchestrator.criteria.criteria_cost`).  Sum of
 additive-per-node models is additive, so extraction's subtractive
 local-cost recovery stays exact for the additive axes — the tests
 below check that contract, the selection flip when two axes
@@ -13,7 +13,7 @@ import math
 
 import pytest
 import torch
-from catopt.cost import (
+from catopt_core.cost import (
     _LAUNCH_S,
     _local_roofline,
     dag_cost,
@@ -21,10 +21,10 @@ from catopt.cost import (
     flops_cost,
     param_bytes_cost_for,
 )
-from catopt.egraph import EGraph
-from catopt.ir import Op, Param, TensorType, Var
-from catopt.ports import CostFn, signature_conforms
-from catopt_optimize.criteria import (
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, Param, TensorType, Var
+from catopt_core.ports import CostFn, signature_conforms
+from catopt_orchestrator.criteria import (
     AXES,
     Blend,
     CompiledCriterion,
@@ -37,6 +37,10 @@ from catopt_optimize.criteria import (
     criteria_cost,
     peak_bytes_cost,
 )
+from catopt_orchestrator import Optimizer
+
+
+from catopt_torch.backend import TorchBackend
 
 
 def _v(name: str, *shape) -> Var:
@@ -261,46 +265,41 @@ def _tiny_model():
 def test_optimize_model_criteria_records_stats():
     """criteria= builds the blend, stats records the normalised
     weights actually priced, and the module stays equivalent."""
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(
-            m, x, verbose=False, criteria={"latency": 2.0}
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), criteria={"latency": 2.0}).optimize(m, x, verify=False, verbose=False)
+
     assert stats["criteria"] == {"latency": 1.0}
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
 
 
 def test_optimize_model_default_run_records_no_criteria():
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with torch.no_grad():
-        _mod, stats = optimize_model(m, x, verbose=False)
+        _mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     assert stats["criteria"] is None
 
 
 def test_optimize_model_explicit_cost_fn_beats_criteria():
     """Precedence: explicit cost_fn > criteria > default — a given
     cost_fn leaves the criteria record empty (none was priced)."""
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(
-            m,
-            x,
-            verbose=False,
-            cost_fn=flops_cost,
-            criteria={"memory": 1.0},
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), criteria={"memory": 1.0}).optimize(m, x, cost_fn=flops_cost, verify=False, verbose=False)
+
     assert stats["criteria"] is None
     with torch.no_grad():
         assert torch.allclose(mod(x), ref, atol=1e-5)
@@ -309,12 +308,13 @@ def test_optimize_model_explicit_cost_fn_beats_criteria():
 def test_optimize_model_bad_criteria_fails_loud():
     """An unknown axis surfaces as ValueError from the optimizer —
     validation isn't deferred to extraction."""
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with pytest.raises(ValueError, match="unknown criteria axes"):
-        optimize_model(m, x, verbose=False, criteria={"speed": 1.0})
+        Optimizer(backend=TorchBackend(), criteria={"speed": 1.0}).optimize(m, x, verify=False, verbose=False)
+
 
 
 # ---------------------------------------------------------------------------
@@ -747,23 +747,18 @@ def test_peak_bytes_poisons_ill_typed_members():
 def test_optimize_model_accepts_criterion_objects():
     """criteria=<Criterion> and criteria=<Blend> price through the
     same path as the dict spelling; stats records resolved axes."""
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(
-            m, x, verbose=False, criteria=FlopsCriterion()
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), criteria=FlopsCriterion()).optimize(m, x, verify=False, verbose=False)
+
         assert stats["criteria"] == {"flops": 1.0}
         assert torch.allclose(mod(x), ref, atol=1e-5)
-        mod, stats = optimize_model(
-            m,
-            x,
-            verbose=False,
-            criteria=LatencyCriterion() * 0.5 + MemoryCriterion() * 0.5,
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), criteria=LatencyCriterion() * 0.5 + MemoryCriterion() * 0.5).optimize(m, x, verify=False, verbose=False)
+
         assert stats["criteria"] == {"latency": 0.5, "memory": 0.5}
         assert torch.allclose(mod(x), ref, atol=1e-5)
 
@@ -771,23 +766,18 @@ def test_optimize_model_accepts_criterion_objects():
 def test_optimize_model_criteria_list_and_peak_mode():
     """A list spec and a mode-qualified dict axis both run
     end-to-end."""
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with torch.no_grad():
         ref = m(x)
-        mod, stats = optimize_model(
-            m,
-            x,
-            verbose=False,
-            criteria=[FlopsCriterion(), (DepthCriterion(), 1.0)],
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), criteria=[FlopsCriterion(), (DepthCriterion(), 1.0)]).optimize(m, x, verify=False, verbose=False)
+
         assert stats["criteria"] == {"flops": 0.5, "depth": 0.5}
         assert torch.allclose(mod(x), ref, atol=1e-5)
-        mod, stats = optimize_model(
-            m, x, verbose=False, criteria={"memory:peak": 1.0}
-        )
+        mod, stats = Optimizer(backend=TorchBackend(), criteria={"memory:peak": 1.0}).optimize(m, x, verify=False, verbose=False)
+
         assert stats["criteria"] == {"memory:peak": 1.0}
         assert torch.allclose(mod(x), ref, atol=1e-5)
 
@@ -795,11 +785,13 @@ def test_optimize_model_criteria_list_and_peak_mode():
 def test_optimize_model_criteria_spec_errors_surface():
     """Bad spec types raise TypeError; bad members raise their own
     errors — validation isn't deferred to extraction."""
-    from catopt.optimize import optimize_model
+
 
     m = _tiny_model()
     x = torch.rand(4, 8)
     with pytest.raises(TypeError, match="unsupported criteria spec"):
-        optimize_model(m, x, verbose=False, criteria=object())
+        Optimizer(backend=TorchBackend(), criteria=object()).optimize(m, x, verify=False, verbose=False)
+
     with pytest.raises(TypeError, match="not a Criterion"):
-        optimize_model(m, x, verbose=False, criteria=[object()])
+        Optimizer(backend=TorchBackend(), criteria=[object()]).optimize(m, x, verify=False, verbose=False)
+

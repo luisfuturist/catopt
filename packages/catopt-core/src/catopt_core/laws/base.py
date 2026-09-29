@@ -23,10 +23,22 @@ def R(
     law: str = "",
     check=None,
     derive=None,
+    tags: Any = (),
 ) -> Rewrite:
-    """Shorthand for creating a rewrite rule."""
+    """Shorthand for creating a rewrite rule.
+
+    ``tags`` are the rule's intrinsic classification — constants from
+    :mod:`catopt_core.laws.tags` (any iterable is frozen into a
+    ``frozenset``).
+    """
     return Rewrite(
-        name=name, lhs=lhs, rhs=rhs, law=law, check=check, derive=derive
+        name=name,
+        lhs=lhs,
+        rhs=rhs,
+        law=law,
+        check=check,
+        derive=derive,
+        tags=frozenset(tags),
     )
 
 

@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.om_lower — the operand-gather recognizers,
+"""Coverage tests for catopt_carriers.om_lower — the operand-gather recognizers,
 elem-group analysis modes, the batched module's runtime paths (serial
 leaves, DAG multiplicities, masked rows, cache), and the streaming
 schedule's incremental API.  All CPU; CUDA paths stay in
@@ -7,8 +7,8 @@ test_om_batched.py."""
 
 import torch
 
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.om_lower import (
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.om_lower import (
     StreamingOMModule,
     _analyze_elem_group,
     _batched_compose,
@@ -503,7 +503,7 @@ def test_batched_short_sequence_and_properties():
 def _export_silu():
     import torch.nn as nn
 
-    from catopt.torch_bridge import export_to_ir
+    from catopt_torch.torch_bridge import export_to_ir
 
     torch.manual_seed(0)
     m = nn.SiLU().eval()
@@ -593,6 +593,6 @@ def test_om_module_cached_and_repeat_idx():
 
 
 def ir_to_torch_module(ir, param_values=None):
-    from catopt.torch_bridge import ir_to_torch_module as _f
+    from catopt_torch.torch_bridge import ir_to_torch_module as _f
 
     return _f(ir, param_values=param_values)

@@ -26,13 +26,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from catopt.ir import Const, IR, Op, TensorType, Var
-from catopt.torch_bridge import (
+from catopt_core.ir import Const, IR, Op, TensorType, Var
+from catopt_torch.torch_bridge import (
     _IR_TO_TORCH,
     export_to_ir,
     ir_to_torch_module,
 )
-from catopt.typing import _INVALID, _shape_of
+from catopt_core.typing import _INVALID, _shape_of
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _v(name: str, *shape: int) -> Var:
@@ -1449,11 +1452,12 @@ def test_unbound_op_is_a_boundary_not_a_failure():
     Param at lowering while the opaque op sits outside, and the
     delivered module fails loudly ("No torch binding"), never
     silently."""
-    from catopt_optimize.optimize import optimize_model
+
 
     m = _UnboundWrap().eval()
     x = _t(4, 8)
-    opt, stats = optimize_model(m, x, verbose=False, max_iterations=2)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=2, verify=False, verbose=False)
+
     # The bound subtree was still optimized — the matmul chain folded
     # into one fused parameter at lowering.
     fused = [k for k in opt.state_dict() if k.startswith("fused")]
@@ -1470,7 +1474,7 @@ def test_compositional_falls_back_around_unbound_op():
     original; a sibling block still optimizes and the recomposed
     model stays correct."""
     import torch.nn as nn
-    from catopt_optimize.optimize import optimize_compositional
+
 
     class Outer(nn.Module):
         def __init__(self):
@@ -1483,7 +1487,8 @@ def test_compositional_falls_back_around_unbound_op():
 
     model = Outer().eval()
     x = _t(4, 8)
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     # The linear block optimized; the fft block fell back (its eval
     # failure is a boundary, not a wrong result).
     lin = stats["blocks"]["lin"]
@@ -1514,7 +1519,7 @@ def test_minted_index_put_without_layout():
 def test_handle_copy_early_returns():
     """``_handle_copy_`` no-ops on missing args, missing env entries,
     and a missing viewed base."""
-    from catopt.torch_bridge import _handle_copy_
+    from catopt_torch.torch_bridge import _handle_copy_
 
     class _N:
         def __init__(self, name, args=(), target=None):
@@ -1551,7 +1556,7 @@ def test_handle_copy_early_returns():
 def test_handle_copy_unrecognised_view_is_whole_tensor_copy():
     """A copy_ through a view we don't decompose (e.g. a transpose)
     rewrites the view's own readers to the ``copy`` op."""
-    from catopt.torch_bridge import _handle_copy_
+    from catopt_torch.torch_bridge import _handle_copy_
 
     class _N:
         def __init__(self, name, args=(), target=None):
@@ -1570,7 +1575,7 @@ def test_handle_copy_unrecognised_view_is_whole_tensor_copy():
 
 
 def test_resolve_attr_walks_dotted_names():
-    from catopt.torch_bridge import _resolve_attr
+    from catopt_torch.torch_bridge import _resolve_attr
 
     class Inner(torch.nn.Module):
         def __init__(self):

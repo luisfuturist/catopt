@@ -1,6 +1,6 @@
 """Compile-time const folds — the causal-mask specialization.
 
-Moved from ``catopt_optimize.optimize`` (plan 0007): the fold
+Moved from ``catopt_orchestrator.optimize`` (plan 0007): the fold
 evaluates parameter-only subtrees to concrete tensors and rewrites
 ``sdpa(q,k,v, mask)`` → ``sdpa(q,k,v, is_causal=True)`` when the
 materialised mask is exactly the causal lower triangle.  The

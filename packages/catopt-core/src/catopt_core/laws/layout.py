@@ -40,8 +40,17 @@ from typing import Any
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Op
-from catopt_core.laws.base import R, _shape_of
+from catopt_core.laws import tags as _tags
+from catopt_core.laws.base import R as _R
+from catopt_core.laws.base import _shape_of
 from catopt_core.typing import _axis_pair, _broadcast
+
+
+def R(name: str, lhs, rhs, **kw) -> Rewrite:
+    """Module-local law constructor — layout laws carry the ``LAYOUT`` tag."""
+    kw.setdefault("tags", (_tags.LAYOUT,))
+    return _R(name, lhs, rhs, **kw)
+
 
 # ---------------------------------------------------------------------------
 #  Pattern/mint helpers

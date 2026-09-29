@@ -145,7 +145,7 @@ def _always_true(_: Any) -> bool:
 
 def _is_trace_rooted(term: Any) -> bool:
     """Probe for a trace root — deferred to the orchestrator probe."""
-    from catopt_optimize.regime import is_trace_rooted_term
+    from catopt_orchestrator.regime import is_trace_rooted_term
 
     return is_trace_rooted_term(term)
 

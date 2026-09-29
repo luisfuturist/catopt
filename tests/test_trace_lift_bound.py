@@ -16,8 +16,8 @@ untracked path in ``_add_enode_dedup``.  The offers still land:
 only the certificate records are absent.
 """
 
-from catopt.egraph import EGraph
-from catopt.ir import Op, Param, TensorType
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, Param, TensorType
 from catopt_carriers import trace_lift as TL
 
 

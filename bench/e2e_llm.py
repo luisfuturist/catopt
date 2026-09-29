@@ -61,7 +61,7 @@ Honesty conventions:
 
 Usage:
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \\
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \\
         /tmp/catopt-cuda-venv/bin/python bench/e2e_llm.py --device cuda
 """
 # ruff: noqa: E402, RUF003 -- ×, ·, → in strings are deliberate math
@@ -83,10 +83,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from benchkit import Case, Cell, Report, Runner, Variant, collect_env
-from catopt.optimize import optimize_compositional
+
 from catopt_torch.report import verify_equiv
 from real_win_hunt import try_compile
 from torch.utils.benchmark import Timer
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -550,14 +553,8 @@ def _catopt(mod: nn.Module, example, args, rec: dict):
     verbose = bool(getattr(args, "verbose", False))
     t0 = time.time()
     try:
-        opt, rep = optimize_compositional(
-            mod,
-            example,
-            verbose=verbose,
-            max_iterations=max_iter,
-            max_enodes=max_en,
-            verify_tol=verify_tol,
-        )
+        opt, rep = Optimizer(backend=TorchBackend()).optimize(mod, example, strategy=Compositional(verify_tol=verify_tol), verbose=verbose, max_iterations=max_iter, max_enodes=max_en)
+
     except Exception as e:
         rec["opt_s"] = round(time.time() - t0, 2)
         rec["opt_error"] = (

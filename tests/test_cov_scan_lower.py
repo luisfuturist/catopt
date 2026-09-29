@@ -1,4 +1,4 @@
-"""Coverage tests for catopt.scan_lower — nested-apply folding, the
+"""Coverage tests for catopt_carriers.scan_lower — nested-apply folding, the
 aff-tree/domain recognizers, leaf-shape and gather analyses, the
 diagonal carrier, the leaf-b gather fast path, and the shared-A (LTI)
 expand path.  CPU only; CUDA paths live in test_scan_batched.py."""
@@ -6,8 +6,8 @@ expand path.  CPU only; CUDA paths live in test_scan_batched.py."""
 
 import torch
 
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.scan_lower import (
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.scan_lower import (
     _fold_nested_apply,
     _is_aff_tree,
     _leaf_b_gather,
@@ -18,7 +18,7 @@ from catopt.scan_lower import (
     is_scan_apply_term,
     to_batched_scan_module,
 )
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_torch.torch_bridge import ir_to_torch_module
 
 
 def _T(*shape):

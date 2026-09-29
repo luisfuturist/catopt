@@ -94,7 +94,7 @@ def _opt_with_layout(m, x, cost_fn):
     so the e2e law tests drive the real pipeline directly:
     export → e-graph → saturate(union) → extract → lower.
     """
-    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
     from catopt_core.laws import all_rules
 
     ir, source = export_to_ir(m, x)

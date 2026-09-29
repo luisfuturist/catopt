@@ -4,7 +4,7 @@ The e-graph discovers that ``softmax(q @ cat(k_i).T) @ cat(v_i)`` is a
 product in the (m, l, a) carrier and extracts a chunked
 ``om_apply(om_compose-tree of om_elem)`` term.  The generic IRModule
 evaluates that tree serially via tuple passing;
-:class:`catopt.om_lower.BatchedOMModule` instead batches every om_elem
+:class:`catopt_carriers.om_lower.BatchedOMModule` instead batches every om_elem
 leaf group into one amax/exp/sum/bmm sequence and every compose level
 into one batched FlashAttention combine — a few kernels per level
 instead of per node.
@@ -15,18 +15,18 @@ import math
 import pytest
 import torch
 
-from catopt.cost import flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, TensorType, Var, op_repr
-from catopt.models import SwiGLU
-from catopt.om import OM_LAWS
-from catopt.om_lower import (
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, TensorType, Var, op_repr
+from catopt_torch.models import SwiGLU
+from catopt_carriers.om import OM_LAWS
+from catopt_carriers.om_lower import (
     BatchedOMModule,
     build_om_plan,
     is_om_apply_term,
     to_batched_om_module,
 )
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 # ---------------------------------------------------------------------------
 #  helpers

@@ -15,11 +15,11 @@ results either way.
 
 import torch
 
-from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
-from catopt.meta import canonicalize, match_pattern
-from catopt.om_lower import _is_om_tree, build_om_plan
-from catopt.omd_lower import _is_omd_tree, build_omd_plan
-from catopt.typing import has_var_leaf
+from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.meta import canonicalize, match_pattern
+from catopt_carriers.om_lower import _is_om_tree, build_om_plan
+from catopt_carriers.omd_lower import _is_omd_tree, build_omd_plan
+from catopt_core.typing import has_var_leaf
 
 
 def _T(*shape):
@@ -155,7 +155,7 @@ def test_build_omd_plan_dedups_equal_distinct_leaves():
 def test_eval_term_memo_dedups_twin_subtrees():
     # ``eval_term``'s memo is content-keyed: a twin subtree evaluates
     # through the same memo entry as a truly shared (interned) subtree.
-    from catopt.torch_bridge import eval_term
+    from catopt_torch.torch_bridge import eval_term
 
     x = Var("x", _T(2, 3))
     w = Param("w", _T(3, 4))

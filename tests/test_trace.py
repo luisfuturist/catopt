@@ -1,5 +1,5 @@
 # ruff: noqa: RUF002, RUF003
-"""Tests for catopt.trace — JSV traced-monoidal axioms as e-graph rules.
+"""Tests for catopt_carriers.trace — JSV traced-monoidal axioms as e-graph rules.
 
 Each axiom is checked two ways:
 
@@ -25,12 +25,12 @@ independent traces — channels that may be scheduled in parallel.
 import pytest
 import torch
 
-import catopt.trace as cat_trace  # noqa: F401  (registers torch bindings)
-from catopt.cost import count_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Const, Op, Param, TensorType, Var
-from catopt.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
-from catopt.trace import (
+import catopt_carriers.trace as cat_trace  # noqa: F401  (registers torch bindings)
+from catopt_core.cost import count_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Const, Op, Param, TensorType, Var
+from catopt_torch.torch_bridge import _IR_TO_TORCH, ir_to_torch_module
+from catopt_carriers.trace import (
     TR_COLLAPSE,
     TR_EXPAND,
     TR_SLIDE,
@@ -87,7 +87,7 @@ def _var(name: str, shape) -> Var:
 
 def _ev(term, env: dict | None = None) -> torch.Tensor:
     """Evaluate a term through the torch op table (the same table
-    ``IRModule._eval`` consults — ``catopt.trace`` registered its ops
+    ``IRModule._eval`` consults — ``catopt_carriers.trace`` registered its ops
     there at import)."""
     env = env or {}
 

@@ -26,7 +26,7 @@ Usage:
 
     # CUDA dev venv:
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
-packages/catopt-carriers/src:packages/catopt-optimize/src:." \
+packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/killer_demo.py \
         --device cuda
 """
@@ -48,9 +48,14 @@ sys.setrecursionlimit(400_000)
 import torch
 import torch.nn as nn
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt.models import LinearRecurrence, MatrixChain, ResidualMLP
-from catopt_optimize.autotune import optimize_model_autotuned
+from catopt_torch.models import LinearRecurrence, MatrixChain, ResidualMLP
+
 from real_linear_attn import LinearAttnStack, try_compile
+from catopt_orchestrator.optimize import Autotuned
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.autotune import TORCH_BUILDERS
+from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -137,14 +142,8 @@ def run_cell(
     model = model.to(device).eval()
     x = x.to(device)
 
-    opt_mod, stats = optimize_model_autotuned(
-        model,
-        x,
-        candidates=candidates,
-        n_calls=n_calls,
-        warmup=at_warmup,
-        verbose=verbose,
-    )
+    opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Autotuned(candidates, n_calls=n_calls, warmup=at_warmup, verbose=verbose, builders=TORCH_BUILDERS))
+
     at = stats["autotune"]
     cand_recs = at["candidates"]
 

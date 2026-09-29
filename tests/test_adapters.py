@@ -8,9 +8,9 @@ delegates the equivalence gate to ``report.verify_module``.
 
 import torch
 import torch.nn as nn
-from catopt.adapters import TorchSink, TorchSource
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.ops import OpTable
+from catopt_torch.adapters import TorchSink, TorchSource
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_core.ops import OpTable
 
 
 def _neg_ir() -> IR:

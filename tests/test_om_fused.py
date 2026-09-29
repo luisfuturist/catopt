@@ -13,13 +13,13 @@ an end-to-end run on an egraph-extracted om term.
 import catopt_carriers.xcarrier  # noqa: F401 — omd_* torch bindings
 import pytest
 import torch
-from catopt.cost import flops_cost
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.om import OM_LAWS
-from catopt.om_lower import build_om_plan, to_batched_om_module
-from catopt.omd_lower import build_omd_plan
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_carriers.om import OM_LAWS
+from catopt_carriers.om_lower import build_om_plan, to_batched_om_module
+from catopt_carriers.omd_lower import build_omd_plan
+from catopt_torch.torch_bridge import ir_to_torch_module
 from catopt_carriers.om_fused import (
     fused_om_levels,
     fused_omd_levels,
@@ -159,7 +159,7 @@ def test_fused_om_matches_serial(n_blocks):
 def test_fused_om_matches_batched_module():
     """Same term through BatchedOMModule (itself a canonical
     reduction) — cross-schedule agreement at fp64."""
-    from catopt.om_lower import to_batched_om_module
+    from catopt_carriers.om_lower import to_batched_om_module
 
     torch.manual_seed(0)
     B, H, T, d, dv = 1, 2, 8, 4, 6

@@ -16,9 +16,9 @@ registration:
 import pytest
 import torch
 
-from catopt.ir import IR, Op, TensorType, Var
-from catopt.ops import OpTable
-from catopt.torch_bridge import (
+from catopt_core.ir import IR, Op, TensorType, Var
+from catopt_core.ops import OpTable
+from catopt_torch.torch_bridge import (
     _IR_TO_TORCH,
     IRModule,
     ir_to_torch_module,
@@ -27,14 +27,14 @@ from catopt.torch_bridge import (
 #: Ops whose bindings live in carrier ``TORCH_BINDINGS`` exports —
 #: absent from ``OpTable.core()``, present in ``OpTable.full()``.
 CARRIER_OPS = (
-    # catopt.trace
+    # catopt_carriers.trace
     "trace",
     "bdiag",
     "parl",
     "eye",
     "cswap",
     "inv",
-    # catopt.xcarrier
+    # catopt_carriers.xcarrier
     "affd_a",
     "affd_b",
     "aff_A",
@@ -46,7 +46,7 @@ CARRIER_OPS = (
     "omd_compose",
     "omd_apply",
     "omd_applym",
-    # catopt.om
+    # catopt_carriers.om
     "cmask",
     "fill",
     "attnbias",
@@ -136,8 +136,8 @@ class TestOpTableComposition:
 
     def test_register_module_name_dict_and_kwargs(self):
         t = OpTable.core()
-        t.register("catopt.trace")  # by module path
-        t.register("om")  # bare name resolves to catopt.om
+        t.register("catopt_carriers.trace")  # by module path
+        t.register("om")  # bare name resolves to catopt_carriers.om
         assert "trace" in t.torch_bindings
         assert "cmask" in t.torch_bindings
         sentinel = lambda *a, **kw: "bound"  # noqa: E731
@@ -186,7 +186,7 @@ class TestCustomTableLowering:
         """core + xcarrier lowers an omd carrier term — composed
         explicitly, no import side effects."""
         torch.manual_seed(0)
-        import catopt.xcarrier as xc
+        import catopt_carriers.xcarrier as xc
 
         tbl = OpTable.core().register(xc)
         mod = IRModule(_omd_apply_ir(), ops=tbl)
@@ -205,7 +205,7 @@ class TestCustomTableLowering:
         """core + xcarrier alone cannot lower a trace op — the table
         boundary is real."""
         torch.manual_seed(0)
-        import catopt.xcarrier as xc
+        import catopt_carriers.xcarrier as xc
 
         tbl = OpTable.core().register(xc)
         assert "trace" not in tbl.torch_bindings
@@ -224,7 +224,7 @@ class TestCustomTableLowering:
         """Deleting a binding from a custom table surfaces the
         'no torch binding' error at eval — no ambient fallback."""
         torch.manual_seed(0)
-        import catopt.xcarrier as xc
+        import catopt_carriers.xcarrier as xc
 
         tbl = OpTable.core().register(xc)
         del tbl.torch_bindings["omd_elem"]

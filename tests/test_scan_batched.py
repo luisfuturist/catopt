@@ -4,7 +4,7 @@ The e-graph discovers that an unrolled recurrence ``h_t = A·h_{t-1} + x_t``
 is a composition of affine maps and extracts a balanced
 ``apply(aff_compose-tree, h0)`` term (~2·log2 T depth).  The generic
 IRModule evaluates that tree serially via tuple passing;
-:class:`catopt.scan_lower.BatchedScanModule` instead batches every tree
+:class:`catopt_carriers.scan_lower.BatchedScanModule` instead batches every tree
 level into one matmul pair — O(log T) kernel launches.
 """
 
@@ -14,16 +14,16 @@ import pytest
 import torch
 
 from catopt_core import laws as R
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, op_repr
-from catopt.models import LinearRecurrence, SwiGLU
-from catopt.scan_lower import (
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, op_repr
+from catopt_torch.models import LinearRecurrence, SwiGLU
+from catopt_carriers.scan_lower import (
     BatchedScanModule,
     build_scan_plan,
     is_scan_apply_term,
     to_batched_scan_module,
 )
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 
 def _opdepth(t, memo):

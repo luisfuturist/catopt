@@ -32,20 +32,20 @@ import math
 import pytest
 import torch
 
-import catopt.trace as cat_trace  # registers torch bindings
-import catopt.trace_lift as TL
+import catopt_carriers.trace as cat_trace  # registers torch bindings
+import catopt_carriers.trace_lift as TL
 from catopt_core import laws as R
-from catopt.cost import (
+from catopt_core.cost import (
     _INVALID_COST,
     dag_cost,
     depth_cost,
     flops_cost,
     roofline_cost,
 )
-from catopt.egraph import EGraph, verify_certificate
-from catopt.ir import IR, Op, Param, TensorType, Var, op_repr
-from catopt.models.ssm import DiagDenseSSM, DiagonalSSM
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_core.egraph import EGraph, verify_certificate
+from catopt_core.ir import IR, Op, Param, TensorType, Var, op_repr
+from catopt_torch.models.ssm import DiagDenseSSM, DiagonalSSM
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 TRACE_LAWS = cat_trace.TRACE_LAWS
 
@@ -474,7 +474,7 @@ class TestStorageBound:
     def test_lifted_param_storage_parity(self):
         """The lifted member stores the same leaves as the loop body —
         no per-step F param materialises in the weights file."""
-        from catopt.cost import param_bytes_cost
+        from catopt_core.cost import param_bytes_cost
 
         T, d = 10, 6
         term, _, _ = _diag_term(T, d)

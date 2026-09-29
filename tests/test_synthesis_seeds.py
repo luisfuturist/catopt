@@ -36,11 +36,11 @@ Covered here:
 
 import torch
 
-from catopt import meta
-from catopt import om as OM
+from catopt_core import meta
+from catopt_carriers import om as OM
 from catopt_core import laws as R
-from catopt.egraph import EGraph, Rewrite
-from catopt.ir import Const, Op, TensorType, Var, op_repr
+from catopt_core.egraph import EGraph, Rewrite
+from catopt_core.ir import Const, Op, TensorType, Var, op_repr
 
 
 def _T(*shape):

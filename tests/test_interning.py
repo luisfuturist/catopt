@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import gc
 
-from catopt.ir import Const, Op, Param, TensorType, Var
+from catopt_core.ir import Const, Op, Param, TensorType, Var
 
 x = Var("x", TensorType((4,)))
 w = Param("w", TensorType((4, 4)))

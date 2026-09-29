@@ -39,8 +39,11 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from catopt.cost import param_bytes_cost_for
-from catopt.optimize import optimize_model, param_report
+from catopt_core.cost import param_bytes_cost_for
+from catopt_orchestrator import Optimizer
+from catopt_torch.backend import TorchBackend
+from catopt_torch.composer import param_report
+
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CKPT = "/tmp/stories15M.bin"
@@ -56,10 +59,11 @@ def _opt(model, example, **kw):
     model = model.eval().double()
     if example.is_floating_point():
         example = example.double()
-    low, stats = optimize_model(
+    low, stats = Optimizer(backend=TorchBackend()).optimize(
         model,
         example,
         cost_fn=param_bytes_cost_for(),
+        verify=False,
         verbose=False,
         **kw,
     )
@@ -322,8 +326,8 @@ def test_real_stories15m_checkpoint_offers_zero():
     import numpy as np
 
     sys.path.insert(0, REPO)
-    from catopt.egraph import EGraph
-    from catopt.ir import Param, TensorType
+    from catopt_core.egraph import EGraph
+    from catopt_core.ir import Param, TensorType
     from catopt_core.laws import (
         share_duplicate_param_slices,
         share_duplicate_params,
@@ -509,8 +513,8 @@ def test_param_bytes_bills_materialised_folds():
       its subtractive per-node decomposition, which would subtract a
       leaf at every ancestor fold and erase the copies).
     """
-    from catopt.cost import dag_cost, param_bytes_cost
-    from catopt.ir import Op, Param, TensorType, Var
+    from catopt_core.cost import dag_cost, param_bytes_cost
+    from catopt_core.ir import Op, Param, TensorType, Var
 
     W = Param("W", TensorType((64, 64)))
     A = Param("A", TensorType((8, 128)))

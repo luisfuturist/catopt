@@ -6,15 +6,18 @@ rulecache env, ports signature internals, compositional e2e arms."""
 import pytest
 import torch
 import torch.nn as nn
-from catopt.attrs import is_positional_attr
-from catopt.ir import Const, Op, Param, TensorType, Var
-from catopt.optimize import (
-    OptimizationResourceError,
-    _eval_const,
-    optimize_compositional,
-    optimize_model,
-)
-from catopt.ports import CostFn, Verifier, signature_conforms
+from catopt_core.attrs import is_positional_attr
+from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_orchestrator.optimize import OptimizationResourceError
+
+
+from catopt_torch.folds import _eval_const
+
+from catopt_core.ports import CostFn, Verifier, signature_conforms
+from catopt_orchestrator import Compositional, Optimizer
+
+
+from catopt_torch.backend import TorchBackend
 
 
 class _MLP(nn.Module):
@@ -40,23 +43,24 @@ def test_optimize_verbose_and_memory_paths():
     torch.manual_seed(0)
     m = _MLP()
     x = torch.randn(2, 8)
-    opt, stats = optimize_model(m, x, verbose=True, max_iterations=2)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=2, verify=True, verbose=True)
+
     assert opt is not None and isinstance(stats, dict)
 
 
 def test_optimize_memory_budget_raises():
     torch.manual_seed(0)
     with pytest.raises(OptimizationResourceError):
-        optimize_model(_MLP(), torch.randn(2, 8), max_memory_mb=0.00001)
+        Optimizer(backend=TorchBackend()).optimize(_MLP(), torch.randn(2, 8), max_memory_mb=0.00001)
+
 
 
 def test_compositional_verbose_and_e2e():
     torch.manual_seed(0)
     m = _TwoBlock()
     x = torch.randn(2, 8)
-    opt, rep = optimize_compositional(
-        m, x, verbose=True, max_iterations=2
-    )
+    opt, rep = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(), verbose=True, max_iterations=2)
+
     assert rep["n_blocks"] == 2
     assert rep["end_to_end"] is not None
 
@@ -77,9 +81,8 @@ def test_compositional_e2e_error_arm():
             return _orig(inp)
 
         m.forward = flaky
-        _opt, rep = optimize_compositional(
-            m, x, max_iterations=1, verbose=verbose
-        )
+        _opt, rep = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(), max_iterations=1, verbose=verbose)
+
         assert "error" in rep["end_to_end"]
 
 
@@ -110,7 +113,7 @@ def test_is_positional_attr():
 
 
 def test_rulecache_default_dir_env(monkeypatch):
-    from catopt.rulecache import _default_cache_dir
+    from catopt_core.rulecache import _default_cache_dir
 
     monkeypatch.delenv("CATOPT_RULECACHE_DIR", raising=False)
     assert "catopt" in str(_default_cache_dir())
@@ -199,7 +202,8 @@ def test_compositional_verbose_failed_block():
             return self.w(x).float().sum()
 
     x = torch.arange(6.0)
-    _opt, rep = optimize_compositional(Wrap(), x, verbose=True)
+    _opt, rep = Optimizer(backend=TorchBackend()).optimize(Wrap(), x, strategy=Compositional(), verbose=True)
+
     assert rep["n_blocks"] >= 1
     assert any(b["status"] == "failed" for b in rep["blocks"].values())
 
@@ -207,9 +211,8 @@ def test_compositional_verbose_failed_block():
 def test_optimize_memory_budget_pass():
     """used <= max_memory_mb → the check's pass-through arm."""
     torch.manual_seed(0)
-    opt, _s = optimize_model(
-        _MLP(), torch.randn(2, 8), max_memory_mb=1e6, max_iterations=1
-    )
+    opt, _s = Optimizer(backend=TorchBackend()).optimize(_MLP(), torch.randn(2, 8), max_memory_mb=1e6, max_iterations=1)
+
     assert opt is not None
 
 
@@ -229,7 +232,8 @@ def test_pairing_groups_fire():
     x = torch.randn(2, 8)
     m = Paired()
     ref = m(x)
-    opt, stats = optimize_model(m, x, max_iterations=6)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=6)
+
     assert stats.get("pairing_groups", 0) >= 0
     assert torch.allclose(ref, opt(x), atol=1e-5)
 
@@ -237,13 +241,14 @@ def test_pairing_groups_fire():
 def test_transformer_block_full_pipeline():
     """Real transformer block — pairing + lifts + re-saturation + verify
     print, in one verbose optimize_model call."""
-    import catopt.models as M
+    import catopt_torch.models as M
 
     torch.manual_seed(0)
     m = M.TransformerBlock(dim=64)
     x = torch.randn(1, 8, 64)
     ref = m(x)
-    opt, stats = optimize_model(m, x, max_iterations=3, verbose=True)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=True, verbose=True)
+
     assert stats["nonlocal_lifts"] >= 1
     assert stats["pairing_groups"] >= 1
     assert torch.allclose(ref, opt(x), atol=1e-5)
@@ -252,17 +257,21 @@ def test_transformer_block_full_pipeline():
 def test_compositional_no_blocks():
     """A module with no candidate blocks → early exit arm."""
     m = nn.Linear(4, 4)
-    _opt, rep = optimize_compositional(m, torch.randn(2, 4))
+    _opt, rep = Optimizer(backend=TorchBackend()).optimize(m, torch.randn(2, 4), strategy=Compositional())
+
     assert rep["n_blocks"] == 0
 
 
 def test_discover_alternatives_fires_pairing_and_lifts():
     """discover_alternatives runs the same pairing/lift pass — its
     re-saturation blocks execute when groups exist."""
-    import catopt.models as M
-    from catopt.adapters import TorchSource
-    from catopt.optimize import discover_alternatives
-    from catopt.pipeline import SearchResult
+    import catopt_torch.models as M
+    from catopt_torch.adapters import TorchSource
+    from catopt_orchestrator.optimize import discover_alternatives
+
+
+
+    from catopt_core.pipeline import SearchResult
 
     torch.manual_seed(0)
     m = M.TransformerBlock(dim=64)
@@ -281,15 +290,16 @@ def test_verbose_verify_warning_arm(monkeypatch):
     ``optimize_model`` now verifies through the sink, so the torch
     sink's ``verify_module`` is the patched seam (plan 0004).
     """
-    from catopt.report import VerifyReport
+    from catopt_torch.report import VerifyReport
 
     def fake_verify(*a, **kw):
         return VerifyReport(max_abs=0.5, max_rel=0.5, passed=False)
 
-    monkeypatch.setattr("catopt.adapters.verify_module", fake_verify)
+    monkeypatch.setattr("catopt_torch.adapters.verify_module", fake_verify)
     torch.manual_seed(0)
     x = torch.randn(2, 8)
-    opt, _s = optimize_model(_MLP(), x, verbose=True, max_iterations=1)
+    opt, _s = Optimizer(backend=TorchBackend()).optimize(_MLP(), x, max_iterations=1, verify=True, verbose=True)
+
     assert opt is not None
 
 
@@ -307,7 +317,8 @@ def test_hook_dedup_repeated_block():
             return self.b(self.b(x))
 
     x = torch.randn(2, 8)
-    _opt, rep = optimize_compositional(Twice(), x, max_iterations=1)
+    _opt, rep = Optimizer(backend=TorchBackend()).optimize(Twice(), x, strategy=Compositional(), max_iterations=1)
+
     assert rep["n_blocks"] >= 1
 
 
@@ -323,29 +334,27 @@ def test_signature_conforms_no_self_sig():
 
 def test_compositional_custom_cost_fn():
     """cost_fn provided → the not-None arc."""
-    from catopt.cost import flops_cost
+    from catopt_core.cost import flops_cost
 
     m = _TwoBlock()
-    _opt, rep = optimize_compositional(
-        m, torch.randn(2, 8), cost_fn=flops_cost, max_iterations=1
-    )
+    _opt, rep = Optimizer(backend=TorchBackend()).optimize(m, torch.randn(2, 8), strategy=Compositional(), cost_fn=flops_cost, max_iterations=1)
+
     assert rep["n_blocks"] >= 1
 
 
 def test_compositional_block_verify_failure(monkeypatch):
     """verify_module reports failure → the RuntimeError verify arm →
     block marked failed, compositional falls back."""
-    from catopt.report import VerifyReport
+    from catopt_torch.report import VerifyReport
 
     def fake_verify(*a, **kw):
         return VerifyReport(max_abs=0.5, max_rel=0.5, passed=False)
 
-    monkeypatch.setattr("catopt.adapters.verify_module", fake_verify)
+    monkeypatch.setattr("catopt_torch.adapters.verify_module", fake_verify)
     torch.manual_seed(0)
     m = _TwoBlock()
-    _opt, rep = optimize_compositional(
-        m, torch.randn(2, 8), max_iterations=1
-    )
+    _opt, rep = Optimizer(backend=TorchBackend()).optimize(m, torch.randn(2, 8), strategy=Compositional(), max_iterations=1)
+
     assert any(b["status"] == "failed" for b in rep["blocks"].values())
 
 

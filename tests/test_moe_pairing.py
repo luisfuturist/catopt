@@ -30,13 +30,16 @@ extraction picks the member only when honestly cheaper.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from catopt.egraph import EGraph
-from catopt.ir import Op, Param, TensorType, Var
-from catopt.laws.pairing import (
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, Param, TensorType, Var
+from catopt_core.laws.pairing import (
     batch_tiled_expert_sums,
     pair_shared_input_linears,
 )
-from catopt.optimize import optimize_model
+
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 def _v(name, *shape):
@@ -266,7 +269,8 @@ def test_moe_stacked_experts_pair_and_verify():
     torch.manual_seed(0)
     m = RoutedMoEFFN().eval()
     x = torch.randn(2, 16, 64)
-    opt, stats = optimize_model(m, x, verbose=False, max_iterations=12)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=12, verify=False, verbose=False)
+
     assert stats.get("pairing_groups", 0) >= 1
     assert stats.get("paired_extract") is True
     with torch.no_grad():
@@ -310,7 +314,8 @@ def test_partial_tile_decline_is_recorded():
     torch.manual_seed(0)
     m = PartialTile().eval()
     x = torch.randn(4, 16, 64)
-    opt, stats = optimize_model(m, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     assert stats.get("pairing_groups") == 1
     assert stats.get("paired_extract") is False
     assert stats.get("paired_delta") > 0
@@ -326,7 +331,8 @@ def test_weight_factor_beats_pairing_decline():
     torch.manual_seed(0)
     m = SumExperts().eval()
     x = torch.randn(4, 16, 64)
-    opt, stats = optimize_model(m, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, verify=False, verbose=False)
+
     assert stats.get("pairing_groups", 0) >= 1
     assert stats.get("paired_extract") is False
     assert stats.get("paired_delta") > 0
@@ -588,7 +594,7 @@ def test_batch_cyclic_sum_declines():
 def test_batch_leaf_classification_edges():
     """``_expert_leaf`` declines non-expert classes; ``_linear_tile``
     declines biased linears, non-tile weights, and non-rank-3 bases."""
-    from catopt.laws.pairing import _expert_leaf, _linear_tile
+    from catopt_core.laws.pairing import _expert_leaf, _linear_tile
 
     eg = EGraph()
     x = eg.add_term(_v("x", 2, 16))

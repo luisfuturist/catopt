@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 from catopt_core.egraph.certs import (
@@ -1072,7 +1073,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     def run(
         self,
-        rules: list[Rewrite],
+        rules: Iterable[Rewrite],
         root_eid: int,
         max_iterations: int = 100,
         max_nodes: int = 100_000,

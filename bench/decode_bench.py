@@ -56,13 +56,16 @@ from torch.utils.benchmark import Timer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catopt.report import CompositionalReport, verify_equiv
+from catopt_torch.report import CompositionalReport, verify_equiv
 from llama2c import load_llama2c
 from stories15m_bench import (
     Block,
     Stories15M,
     resolve_ckpt,
 )
+from catopt_orchestrator import Compositional, Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +314,7 @@ def main():
     if args.device == "cuda":
         torch.cuda.empty_cache()
 
-    from catopt.optimize import optimize_compositional
+
 
     rows = []
     gemm_evidence = None
@@ -329,9 +332,8 @@ def main():
                 with torch.no_grad():
                     ref = model(idx)
                 t_opt = time.time()
-                opt, rep = optimize_compositional(
-                    model, idx, verbose=False
-                )
+                opt, rep = Optimizer(backend=TorchBackend()).optimize(model, idx, strategy=Compositional(), verbose=False)
+
                 t_opt = time.time() - t_opt
                 with torch.no_grad():
                     vr = verify_equiv(ref, opt(idx), rtol=1e-4)

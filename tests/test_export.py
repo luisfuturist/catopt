@@ -17,20 +17,15 @@ import types
 import pytest
 import torch
 import torch.nn as nn
-from catopt_optimize.export import (
-    ExportError,
-    _diff,
-    _read_safetensors,
-    export_optimized,
-    load_optimized,
-    save_optimized,
-)
-from catopt_optimize.optimize import (
-    optimize_compositional,
-    optimize_model,
-)
+from catopt_torch.export import ExportError, _diff, _read_safetensors, export_optimized, load_optimized, save_optimized
+
+
 
 from tests.test_compositional import MiniGPT
+from catopt_orchestrator import Compositional, Optimizer
+
+
+from catopt_torch.backend import TorchBackend
 
 
 @pytest.fixture
@@ -39,7 +34,8 @@ def optimized_stack():
     torch.manual_seed(0)
     model = MiniGPT(dim=32, n_heads=2, depth=2, hidden_mult=2).eval()
     x = torch.randn(1, 8, 32)
-    opt, stats = optimize_compositional(model, x, verbose=False)
+    opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(), verbose=False)
+
     assert stats["n_optimized"] == 2  # IRModules grafted
     return model, opt, x
 
@@ -526,7 +522,8 @@ def test_optimize_model_output_exports_to_pt2(tmp_path):
     mod = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
     mod = mod.eval()
     x = torch.randn(4, 8)
-    opt, _ = optimize_model(mod, x, verbose=False)
+    opt, _ = Optimizer(backend=TorchBackend()).optimize(mod, x, verify=False, verbose=False)
+
     manifest = export_optimized(
         mod, opt, tmp_path / "om.pt2", example_input=x
     )

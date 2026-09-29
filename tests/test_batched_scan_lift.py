@@ -27,20 +27,24 @@ Everything fp64: the reassociation is exact to ~1e-15.
 
 import math
 
-import catopt.trace_lift as TL
+import catopt_carriers.trace_lift as TL
 import pytest
 import torch
 import torch.nn as nn
-from catopt.egraph import EGraph
-from catopt.ir import IR, Op, Param, TensorType, Var
-from catopt.optimize import optimize_model
-from catopt.scan_lower import (
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op, Param, TensorType, Var
+
+from catopt_carriers.scan_lower import (
     build_scan_plan,
     is_scan_apply_term,
     to_batched_scan_module,
 )
-from catopt.torch_bridge import ir_to_torch_module
+from catopt_torch.torch_bridge import ir_to_torch_module
 from catopt_core.typing import _matmul_shape
+from catopt_orchestrator import Optimizer
+
+
+from catopt_torch.backend import TorchBackend
 
 
 @pytest.fixture(autouse=True)
@@ -1089,9 +1093,8 @@ class TestEndToEnd:
         m = _FlatChunkMod(d, B, C).eval()
         x = torch.randn(C, B, d)
         h = torch.randn(B, d)
-        opt, stats = optimize_model(
-            m, (x, h), verbose=False, max_iterations=32
-        )
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, (x, h), max_iterations=32, verify=False, verbose=False)
+
         assert stats["lowering"] == "batched"
         assert getattr(opt, "is_batched", False)
         with torch.no_grad():
@@ -1105,9 +1108,8 @@ class TestEndToEnd:
         m = _BatchedChunkMod(d, C).eval()
         x = torch.randn(C, B, d)
         h = torch.randn(B, d)
-        opt, stats = optimize_model(
-            m, (x, h), verbose=False, max_iterations=32
-        )
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, (x, h), max_iterations=32, verify=False, verbose=False)
+
         assert stats["lowering"] == "batched"
         assert getattr(opt, "is_batched", False)
         with torch.no_grad():
@@ -1121,9 +1123,8 @@ class TestEndToEnd:
         m = _BatchedChunkMod(d, C).double().eval()
         x = torch.randn(N, B, d, dtype=torch.float64)
         h = torch.randn(B, d, dtype=torch.float64)
-        opt, stats = optimize_model(
-            m, (x[:C], h), verbose=False, max_iterations=32
-        )
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, (x[:C], h), max_iterations=32, verify=False, verbose=False)
+
         assert stats["lowering"] == "batched"
         with torch.no_grad():
             href, hgot = h, h

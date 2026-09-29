@@ -1,7 +1,7 @@
 # ruff: noqa: RUF002
 """Streaming (bounded-working-set) lowering for the om monoid.
 
-:class:`catopt.om_lower.StreamingOMModule` evaluates the same
+:class:`catopt_carriers.om_lower.StreamingOMModule` evaluates the same
 ``om_apply(<om_compose tree over om_elem>)`` term as
 :class:`BatchedOMModule`, but as a LEFT FOLD: each leaf's score/value
 block is evaluated, composed into a running ``(m, l, a)`` carrier, and
@@ -18,11 +18,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import catopt.om_lower as om_lower
-import catopt.torch_bridge as torch_bridge
-from catopt.ir import IR, Op, TensorType, Var
-from catopt.models import SwiGLU
-from catopt.om_lower import (
+import catopt_carriers.om_lower as om_lower
+import catopt_torch.torch_bridge as torch_bridge
+from catopt_core.ir import IR, Op, TensorType, Var
+from catopt_torch.models import SwiGLU
+from catopt_carriers.om_lower import (
     StreamingOMModule,
     om_apply_state,
     om_empty_state,
@@ -31,7 +31,7 @@ from catopt.om_lower import (
     to_batched_om_module,
     to_streaming_om_module,
 )
-from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -519,7 +519,7 @@ def test_empty_state_is_identity():
     for a, b in zip(st_none, st_empty, strict=True):
         assert torch.equal(a, b)
     # composing the empty state on the RIGHT is also the identity
-    from catopt.torch_bridge import _om_compose
+    from catopt_torch.torch_bridge import _om_compose
 
     st2 = _om_compose(
         st_none, om_empty_state((B, H, Tq), dv, dtype=torch.float64)

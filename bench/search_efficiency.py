@@ -80,6 +80,9 @@ from catopt_core.laws import (
     ASSOC_MATMUL_REV,
     all_rules,
 )
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.backend import TorchBackend
 
 #: Hidden dims pattern for the chain (varied so bracketings genuinely
 #: differ in FLOP cost — extraction solves the matrix-chain-ordering
@@ -341,7 +344,7 @@ def measure_e2e(k: int, device: str) -> dict[str, Any]:
     under the production bounded-saturation budget
     (``symmetry_budget=2048``) — the same pipeline a user gets."""
     import torch
-    from catopt_optimize.optimize import optimize_model
+
 
     dims = chain_dims(k)
     model = torch.nn.Sequential(
@@ -352,7 +355,8 @@ def measure_e2e(k: int, device: str) -> dict[str, Any]:
     ).to(device)
     x = torch.randn(4, dims[0], device=device)
     t0 = time.perf_counter()
-    opt_mod, stats = optimize_model(model, x, verbose=False)
+    opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(model, x, verify=False, verbose=False)
+
     wall = time.perf_counter() - t0
     with torch.no_grad():
         rel = (

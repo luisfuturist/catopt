@@ -1,7 +1,7 @@
 """Tests for the e-graph and equality saturation."""
 
-from catopt.egraph import EGraph, ENode, UnionFind
-from catopt.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.egraph import EGraph, ENode, UnionFind
+from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt_core.laws import (
     CATEGORICAL_RULES,
 )
@@ -141,7 +141,7 @@ def test_extract_best():
     eid = eg.add_term(term)
 
     # Cost function: prefer fewer ops (count_cost)
-    from catopt.cost import count_cost
+    from catopt_core.cost import count_cost
 
     best = eg.extract_best(eid, count_cost)
     # Should extract either add(x, 0) or x (they're in the same e-class
@@ -171,7 +171,7 @@ def test_associativity_rewriting():
     print(f"Stats: {stats}")
 
     # Extract the best (minimum FLOPs) form
-    from catopt.cost import flops_cost
+    from catopt_core.cost import flops_cost
 
     best = eg.extract_best(eid, flops_cost)
     print(f"Best: {op_repr(best)}")
@@ -207,7 +207,7 @@ def test_naturality_rewriting():
     eid = eg.add_term(original)
     eg.run(CATEGORICAL_RULES, eid, max_iterations=5, max_nodes=1000)
 
-    from catopt.cost import count_cost
+    from catopt_core.cost import count_cost
 
     _best = eg.extract_best(eid, count_cost)
 
@@ -216,7 +216,7 @@ def test_naturality_rewriting():
     assert len(root_class.nodes) >= 2
     eg.run(CATEGORICAL_RULES, eid, max_iterations=5, max_nodes=1000)
 
-    from catopt.cost import count_cost, flops_cost
+    from catopt_core.cost import count_cost, flops_cost
 
     _best = eg.extract_best(eid, flops_cost)
 
@@ -320,7 +320,7 @@ def test_rule_budgets_bound_expansion():
     assert stats["rule_budgets"]["assoc_add"] >= 20
     assert "assoc_add" in stats["budget_suspended"]
     # Extraction still works and returns a valid member.
-    from catopt.cost import count_cost
+    from catopt_core.cost import count_cost
 
     best = eg.extract_best(eid, count_cost)
     assert best is not None
@@ -443,7 +443,7 @@ def test_incremental_saturation_same_fixed_point():
     )
     assert stats2["iterations"] <= 1  # clean frontier: no work
     assert eg.n_enodes == n1
-    from catopt.cost import flops_cost
+    from catopt_core.cost import flops_cost
 
     best = eg.extract_best(eid, flops_cost)
     assert best is not None

@@ -1,4 +1,4 @@
-"""Delivery runners — ``catopt_optimize.runners``.
+"""Delivery runners — ``catopt_orchestrator.runners``.
 
 ``optimize_model``'s ``runner=`` parameter is the sole execution
 control: each runner class owns one delivery transform
@@ -11,21 +11,21 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-from catopt_optimize.autotune import (
-    AutotuneContext,
-    CandidateUnavailableError,
-    optimize_model_autotuned,
-)
-from catopt_optimize.optimize import optimize_model
-from catopt_optimize.runners import (
-    ChainedRunner,
-    CudaGraphRunner,
-    IdentityRunner,
-    Runner,
-    TorchCompileRunner,
-    runner_candidate,
-)
+from catopt_orchestrator.autotune import AutotuneContext, CandidateUnavailableError
+
+
+
+from catopt_orchestrator.runners import ChainedRunner, IdentityRunner, Runner, runner_candidate
+
+from catopt_cuda import CudaGraphRunner
+from catopt_torch.runners import TorchCompileRunner
+
 from catopt_torch.adapters import TorchSink
+from catopt_orchestrator.optimize import Autotuned
+from catopt_orchestrator import Optimizer
+
+from catopt_torch.autotune import TORCH_BUILDERS
+from catopt_torch.backend import TorchBackend
 
 
 class _MLP(nn.Module):
@@ -286,7 +286,8 @@ def test_delivers_compiled_marker_propagates():
 
 def test_optimize_model_default_runner_is_identity():
     m, x = _make()
-    _, stats = optimize_model(m, x, verbose=False, max_iterations=3)
+    _, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == "identity"
     assert "compiled" not in stats
     assert "cuda_graph" not in stats
@@ -297,9 +298,11 @@ def test_removed_flag_kwargs_raise_typeerror():
     only execution control."""
     m, x = _make()
     with pytest.raises(TypeError):
-        optimize_model(m, x, verbose=False, compile=True)
+        Optimizer(backend=TorchBackend()).optimize(m, x, compile=True, verify=False, verbose=False)
+
     with pytest.raises(TypeError):
-        optimize_model(m, x, verbose=False, cuda_graph=True)
+        Optimizer(backend=TorchBackend()).optimize(m, x, cuda_graph=True, verify=False, verbose=False)
+
 
 
 def test_custom_runner_runs_and_records():
@@ -314,9 +317,8 @@ def test_custom_runner_runs_and_records():
             stats["custom_ran"] = True
             return module
 
-    _, stats = optimize_model(
-        m, x, verbose=False, runner=Custom(), max_iterations=3
-    )
+    _, stats = Optimizer(backend=TorchBackend(), runner=Custom()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == "custom"
     assert stats["custom_ran"] is True
     assert "compiled" not in stats
@@ -325,9 +327,8 @@ def test_custom_runner_runs_and_records():
 
 def test_explicit_torch_compile_runner():
     m, x = _make()
-    mod, stats = optimize_model(
-        m, x, verbose=False, runner=TorchCompileRunner(), max_iterations=3
-    )
+    mod, stats = Optimizer(backend=TorchBackend(), runner=TorchCompileRunner()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == "torch_compile"
     assert stats["compiled"] is True
     with torch.no_grad():
@@ -336,13 +337,8 @@ def test_explicit_torch_compile_runner():
 
 def test_explicit_chained_runner():
     m, x = _make()
-    _, stats = optimize_model(
-        m,
-        x,
-        verbose=False,
-        runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
-        max_iterations=3,
-    )
+    _, stats = Optimizer(backend=TorchBackend(), runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == ["torch_compile", "cuda_graph"]
     assert stats["compiled"] is True
 
@@ -356,9 +352,8 @@ def test_runner_without_name_records_class_name():
         def apply(self, module, example_input, stats):
             return module
 
-    _, stats = optimize_model(
-        m, x, verbose=False, runner=Nameless(), max_iterations=3
-    )
+    _, stats = Optimizer(backend=TorchBackend(), runner=Nameless()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+
     assert stats["runner"] == "Nameless"
 
 
@@ -369,7 +364,7 @@ def test_runner_without_name_records_class_name():
 
 def _ctx(with_ir: bool = True) -> AutotuneContext:
     """An AutotuneContext over a trivial ``add(x, p_w)`` term."""
-    from catopt.ir import IR, Op, Param, TensorType, Var
+    from catopt_core.ir import IR, Op, Param, TensorType, Var
 
     x = Var("x", TensorType((3,)))
     w = Param(name="p_w", typ=TensorType((3,)))
@@ -423,15 +418,8 @@ def test_runner_candidate_unavailable_without_ir():
 def test_runner_candidate_runs_inside_autotune():
     """End-to-end: a runner-shaped candidate verifies and times."""
     m, x = _make()
-    _, stats = optimize_model_autotuned(
-        m,
-        x,
-        candidates=[("gen", runner_candidate(IdentityRunner()))],
-        n_calls=3,
-        warmup=1,
-        max_iterations=3,
-        verbose=False,
-    )
+    _, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Autotuned([("gen", runner_candidate(IdentityRunner()))], n_calls=3, warmup=1, verbose=False, builders=TORCH_BUILDERS), max_iterations=3)
+
     rec = stats["autotune"]["candidates"]["gen"]
     assert rec["status"] == "timed"
     assert stats["autotune"]["winner"] == "gen"
