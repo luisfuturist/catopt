@@ -179,13 +179,16 @@ def _pair_shared_input(
                 sizes.append(s[0])
             if len(sizes) != len(weights):
                 continue
-            cat = weights[0]
-            for w in weights[1:]:
-                cat = eg.add_enode("concat", (cat, w), {"dim": 0})
+            ordered_w, ordered_sizes, cat_args = _tile_fused_weight(
+                eg, weights, sizes
+            )
+            cat = cat_args[0]
+            for a in cat_args[1:]:
+                cat = eg.add_enode("concat", (cat, a), {"dim": 0})
             fused = eg.add_enode(
                 op, (x_eid, cat), dict(cluster[0][0].attrs)
             )
-            index_of = {w: i for i, w in enumerate(weights)}
+            index_of = {w: i for i, w in enumerate(ordered_w)}
             group: dict[int, Any] = {}
             for _, cid, w in cluster:
                 enode = ENode(
@@ -194,14 +197,14 @@ def _pair_shared_input(
                     (
                         ("dim", split_dim),
                         ("index", index_of[w]),
-                        ("sizes", tuple(sizes)),
+                        ("sizes", ordered_sizes),
                     ),
                 )
                 split_eid = eg.add_enode(
                     "split",
                     (fused,),
                     {
-                        "sizes": tuple(sizes),
+                        "sizes": ordered_sizes,
                         "dim": split_dim,
                         "index": index_of[w],
                     },
@@ -231,6 +234,96 @@ def _wshape(t: Any):
     from catopt_core.typing import _shape_of as _so
 
     return _so(t)
+
+
+def _select_tile(eg: Any, w_eid: int):
+    """Return ``(base_eid, index, base_shape)`` for dim-0 ``select`` tiles.
+
+    ``None`` unless *w_eid*'s class carries a ``select(base, dim≡0,
+    index=i)`` enode over a known-shape base.  Routed-MoE exports
+    spell stacked expert parameters ``W (E, out, in)`` as
+    ``select(W, 0, e)`` per expert; detected on the *enode* so a
+    rule-introduced class representative cannot hide the tile.
+    """
+    from catopt_core.typing import _shape_of as _so
+
+    for n in eg._classes[eg.find(w_eid)].nodes:
+        if n.op != "select" or len(n.children) != 1:
+            continue
+        a = dict(n.attrs)
+        idx = a.get("index")
+        if not isinstance(idx, int):
+            continue
+        base = eg.find(n.children[0])
+        bt = eg._any_term_cached(base)
+        bs = _so(bt) if bt is not None else None
+        if not (
+            isinstance(bs, tuple)
+            and len(bs) >= 2
+            and a.get("dim", 0) % len(bs) == 0
+            and all(isinstance(d, int) for d in bs)
+        ):
+            continue
+        return (base, idx, bs)
+    return None
+
+
+def _tile_fused_weight(
+    eg: Any, weights: list[int], sizes: list[int]
+) -> tuple[list[int], tuple[int, ...], list[int]]:
+    """Fused-weight arguments with stacked-parameter re-tiling.
+
+    Member weights spelled ``select(W, dim=0, index=i)`` that jointly
+    cover ALL ``W.shape[0]`` tiles of one stacked base concat to
+    exactly that base flattened — emit ``reshape(W, (K·o, …))``, a
+    free view the lowerer folds to one fused Param, instead of a
+    runtime concat over the deliberately non-folding select views
+    (which is what made routed-MoE pairing lose extraction: the gate
+    side is honestly unroutable, but the fused weight was billed for
+    re-assembling itself every call).  Members that only partially
+    tile a base keep their own weight e-class as an argument.
+
+    Returns ``(ordered_weights, ordered_sizes, cat_args)`` — the
+    member weight e-class ids and their out-dim sizes in fused row
+    order, plus the ordered concat-argument e-class ids.
+    """
+    tiles: dict[int, dict[int, int]] = {}  # base eid -> {index: pos}
+    shapes: dict[int, tuple] = {}
+    for pos, w in enumerate(weights):
+        t = _select_tile(eg, w)
+        if t is not None:
+            tiles.setdefault(t[0], {})[t[1]] = pos
+            shapes[t[0]] = t[2]
+    ordered_w: list[int] = []
+    ordered_s: list[int] = []
+    cat_args: list[int] = []
+    seen: set[int] = set()
+    for pos, w in enumerate(weights):
+        t = _select_tile(eg, w)
+        if t is None:
+            cat_args.append(w)
+            ordered_w.append(w)
+            ordered_s.append(sizes[pos])
+            continue
+        if t[0] in seen:
+            continue  # this base's piece already covers the member
+        base, _idx, bs = t
+        idxs = tiles[base]
+        if len(idxs) != bs[0] or sorted(idxs) != list(range(bs[0])):
+            # partial tile — the selects stay runtime arguments
+            cat_args.append(w)
+            ordered_w.append(w)
+            ordered_s.append(sizes[pos])
+            continue
+        seen.add(base)
+        merged = (bs[0] * bs[1], *bs[2:])
+        cat_args.append(
+            eg.add_enode("reshape", (base,), {"shape": merged})
+        )
+        for i in sorted(idxs):
+            ordered_w.append(weights[idxs[i]])
+            ordered_s.append(sizes[idxs[i]])
+    return ordered_w, tuple(ordered_s), cat_args
 
 
 def pair_shared_input_linears(eg: Any) -> list[dict[int, Any]]:

@@ -185,13 +185,14 @@ def test_laws_exports_every_rewrite():
 
 
 def test_all_rules_count_unchanged():
-    assert len(laws.all_rules()) == 127
+    # The default set excludes LAYOUT_RULES (opt-in — closure-cost
+    # regression documented in laws.tensor); WITH_LAYOUT keeps 127.
+    assert len(laws.all_rules()) == 50
     assert laws.all_rules() == laws.ALL_RULES
     assert len(laws.ALL_RULES) == (
-        len(laws.SIMPLIFICATION_RULES)
-        + len(laws.CATEGORICAL_RULES)
-        + len(laws.LAYOUT_RULES)
+        len(laws.SIMPLIFICATION_RULES) + len(laws.CATEGORICAL_RULES)
     )
+    assert len(laws.ALL_RULES_WITH_LAYOUT) == 127
     # each call returns a fresh list, not the shared ALL_RULES object
     assert laws.all_rules() is not laws.ALL_RULES
 

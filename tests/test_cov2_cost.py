@@ -351,9 +351,18 @@ def test_folds_to_param_non_op_and_const_rules():
         )
         is True
     )
-    # Non-foldable ops (reshape) never fold even param-only.
+    # Value-preserving views fold (the lowerer's ``elif`` list folds
+    # them): a param-only reshape materialises at compile time.
     assert (
         _folds_to_param(Op.make("reshape", P, shape=(2, 2)), None, memo)
+        is True
+    )
+    # The slice/extraction family stays runtime — the lowerer
+    # deliberately declines to fold it (dedup re-materialisation).
+    assert (
+        _folds_to_param(
+            Op.make("select", _p("W", 8, 4), dim=0, index=1), None, memo
+        )
         is False
     )
     # Bound source_tensors: a leaf absent from it cannot fold.

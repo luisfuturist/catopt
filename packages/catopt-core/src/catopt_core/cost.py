@@ -627,6 +627,34 @@ _FOLDABLE_ELEMWISE = frozenset(
 )
 
 
+#: Value-preserving view/copy ops the same ``_fold_weight_chains``
+#: ``elif`` list folds on param-only subtrees: a ``reshape`` /
+#: ``transpose`` of stored weights is compile-time work — unlike the
+#: slice/extraction family (``select``/``index_select``/``slice``/
+#: ``gather``/…), which deliberately stays runtime so dedup
+#: re-materialisation keeps its saving.  ``reshape`` is how the
+#: pairing pass spells a stacked expert parameter re-tiled as one
+#: fused weight, so pricing it as foldable is what lets that member
+#: win extraction.
+_FOLDABLE_VIEWS = frozenset(
+    {
+        "reshape",
+        "flatten",
+        "unflatten",
+        "transpose",
+        "permute",
+        "movedim",
+        "unsqueeze",
+        "squeeze",
+        "contiguous",
+        "detach",
+        "detach_",
+        "alias",
+        "clone",
+    }
+)
+
+
 def _has_var_leaf(term: Any, memo: dict) -> bool:
     """Return True iff the subtree reads a data input (Var leaf).
 
@@ -683,7 +711,10 @@ def _folds_to_param(
 
         if term.op in ("matmul", "concat") and len(term.args) >= 2:
             res = all(to_param(a, False) for a in term.args)
-        elif term.op in _FOLDABLE_ELEMWISE:
+        elif term.op in _FOLDABLE_ELEMWISE | _FOLDABLE_VIEWS:
+            # Elementwise ops and value-preserving views alike accept
+            # Const operands at lowering (``isinstance(a, (_Param,
+            # Const))``) — the Const arity rule is uniform.
             res = all(to_param(a, True) for a in term.args)
     memo[k] = res
     return res

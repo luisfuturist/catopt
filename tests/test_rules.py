@@ -26,11 +26,20 @@ def test_rules_have_correct_names():
 
 
 def test_all_rules_contains_all():
-    """ALL_RULES: simplification + categorical + layout rules."""
-    from catopt_core.laws import LAYOUT_RULES
-
-    combined = SIMPLIFICATION_RULES + CATEGORICAL_RULES + LAYOUT_RULES
+    """ALL_RULES = the default set (layout laws are opt-in — the
+    closure-cost regression is documented in laws.tensor)."""
+    combined = SIMPLIFICATION_RULES + CATEGORICAL_RULES
     assert len(all_rules()) == len(combined)
+
+
+def test_all_rules_with_layout_includes_layout():
+    """ALL_RULES_WITH_LAYOUT: default + the opt-in layout laws."""
+    from catopt_core.laws import ALL_RULES_WITH_LAYOUT, LAYOUT_RULES
+
+    assert len(ALL_RULES_WITH_LAYOUT) == (
+        len(all_rules()) + len(LAYOUT_RULES)
+    )
+    assert all(r in ALL_RULES_WITH_LAYOUT for r in LAYOUT_RULES)
 
 
 def test_id_add_simplifies():

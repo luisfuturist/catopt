@@ -1081,11 +1081,20 @@ CATEGORICAL_RULES: list[Rewrite] = [
     # Softmax-attention fold (flash-attention transform)
     *SDPA_FOLD_RULES,
 ]
-#: All rules combined — the tensor algebra plus the layout laws
-#: (:mod:`catopt_core.laws.layout`, transpose/pointwise/GEMM relayout).
-ALL_RULES: list[Rewrite] = (
-    SIMPLIFICATION_RULES + CATEGORICAL_RULES + LAYOUT_RULES
-)
+#: All rules combined — the default saturation set.
+#:
+#: LAYOUT_RULES are deliberately NOT in the default: measured on the
+#: laws_effect bench they deliver runtime parity (the NT-GEMM form is
+#: structurally correct but not faster), while their bidirectional
+#: transpose↔pointwise pairs explode the saturation closure
+#: (~10–40× search wall on a quarter-B model, enough to push a T=8192
+#: block past a 4 GB enode budget and lose the whole cell).  Opt-in
+#: via :data:`ALL_RULES_WITH_LAYOUT` or ``eg.run(LAYOUT_RULES, …)``.
+ALL_RULES: list[Rewrite] = SIMPLIFICATION_RULES + CATEGORICAL_RULES
+
+#: The full set including layout migration — for callers that want
+#: the wider search space and can pay the closure cost.
+ALL_RULES_WITH_LAYOUT: list[Rewrite] = ALL_RULES + LAYOUT_RULES
 
 
 def all_rules() -> list[Rewrite]:

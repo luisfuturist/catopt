@@ -54,6 +54,7 @@ from catopt_core.cost import (
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Op, op_repr
 from catopt_core.laws import (
+    ALL_RULES_WITH_LAYOUT,
     CATEGORICAL_RULES,
     SIMPLIFICATION_RULES,
     all_rules,
@@ -494,6 +495,7 @@ def discover_alternatives(
     root_eid = eg.add_term(ir.root)
     rules = {
         "all": all_rules(),
+        "all+layout": ALL_RULES_WITH_LAYOUT,
         "simpl": SIMPLIFICATION_RULES,
         "categorical": CATEGORICAL_RULES,
     }[ruleset]
@@ -747,6 +749,12 @@ def optimize_model(
     }
     if ruleset == "all":
         rules = [r for r in all_rules() if r.name not in _SUBSUMED]
+    elif ruleset == "all+layout":
+        rules = [
+            r
+            for r in ALL_RULES_WITH_LAYOUT
+            if r.name not in _SUBSUMED
+        ]
     elif ruleset == "simpl":
         rules = SIMPLIFICATION_RULES
     elif ruleset == "categorical":
@@ -841,12 +849,20 @@ def optimize_model(
         _dc_memo: dict = {}
         _best_dag = dag_cost(best_term, cost_fn, memo=_dc_memo)
         forced = eg.extract_paired(root_eid, cost_fn, groups)
-        if (
-            forced is not None
-            and dag_cost(forced, cost_fn, memo=_dc_memo) <= _best_dag
-        ):
+        # Honest-decline bookkeeping: an un-extractable forced term
+        # prices at +inf, so the same comparison decides and the
+        # stats record the verdict with the cost delta.
+        _forced_dag = (
+            dag_cost(forced, cost_fn, memo=_dc_memo)
+            if forced is not None
+            else float("inf")
+        )
+        if _forced_dag <= _best_dag:
             best_term = forced
             stats["paired_extract"] = True
+        else:
+            stats["paired_extract"] = False
+            stats["paired_delta"] = _forced_dag - _best_dag
     # Coordinated carrier selection: a batched-executor win is a
     # whole-spine property the additive extraction can't price.
     best_term = _carrier_upgrade(
@@ -1579,7 +1595,7 @@ def _cross_pair_pass(
             opt_j, st_j = optimize_model(
                 joint,
                 x,
-                ruleset=ruleset,
+                ruleset="all+layout" if ruleset == "all" else ruleset,
                 max_iterations=max_iterations,
                 max_enodes=max_enodes,
                 max_memory_mb=max_memory_mb,

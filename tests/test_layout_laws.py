@@ -84,6 +84,40 @@ def _eval(term, feeds, params=None):
         return mod(*xs.values())
 
 
+
+def _opt_with_layout(m, x, cost_fn):
+    """optimize_model-equivalent with the layout laws opted in.
+
+    ``all_rules()`` excludes ``LAYOUT_RULES`` — their bidirectional
+    transpose↔pointwise pairs explode the saturation closure
+    (~10–40× search wall on real blocks; runtime parity measured) —
+    so the e2e law tests drive the real pipeline directly:
+    export → e-graph → saturate(union) → extract → lower.
+    """
+    from catopt.torch_bridge import export_to_ir, ir_to_torch_module
+    from catopt_core.laws import all_rules
+
+    ir, source = export_to_ir(m, x)
+    eg = EGraph()
+    eid = eg.add_term(ir.root)
+    eg.run(
+        all_rules() + LAYOUT_RULES,
+        eid,
+        max_iterations=100,
+        max_nodes=100_000,
+    )
+    best = eg.extract_best(eid, cost_fn)
+    mod = ir_to_torch_module(
+        IR(
+            root=best,
+            inputs=ir.inputs,
+            input_names=ir.input_names,
+            params=ir.params,
+        ),
+        param_values=source,
+    )
+    return mod, eg
+
 def _fired(eg, name):
     return eg.rule_fires.get(name, 0) > 0
 
@@ -896,7 +930,6 @@ def test_double_transpose_roundtrip_via_pointwise():
 def test_e2e_optimize_model_selects_linear_form():
     """``x @ W.t()`` exports as matmul(x, transpose(W)); with linear
     priced below matmul+transpose, extraction ships the NT call."""
-    from catopt_optimize.optimize import optimize_model
 
     class M(torch.nn.Module):
         def __init__(self):
@@ -910,15 +943,12 @@ def test_e2e_optimize_model_selects_linear_form():
 
     m = M().eval()
     x = torch.randn(4, 16, dtype=torch.float64)
-    mod, stats = optimize_model(
+    mod, eg = _opt_with_layout(
         m,
         x,
-        cost_fn=_weighted(
-            {"linear": 1.0, "matmul": 10.0, "transpose": 0.0}
-        ),
-        verbose=False,
+        _weighted({"linear": 1.0, "matmul": 10.0, "transpose": 0.0}),
     )
-    assert stats["rule_fires"].get("linear_from_matmul_t_bare", 0) > 0
+    assert eg.rule_fires.get("linear_from_matmul_t_bare", 0) > 0
     assert mod._root.op == "linear"
     with torch.no_grad():
         torch.testing.assert_close(mod(x), m(x), rtol=0, atol=1e-12)
@@ -928,7 +958,6 @@ def test_e2e_optimize_model_selects_transposed_form():
     """The same graph under a linear-expensive mock cost keeps the
     explicit-transpose matmul — the e-graph holds both layouts and
     extraction picks whichever is cheaper."""
-    from catopt_optimize.optimize import optimize_model
 
     class M(torch.nn.Module):
         def __init__(self):
@@ -942,15 +971,12 @@ def test_e2e_optimize_model_selects_transposed_form():
 
     m = M().eval()
     x = torch.randn(4, 16, dtype=torch.float64)
-    mod, stats = optimize_model(
+    mod, eg = _opt_with_layout(
         m,
         x,
-        cost_fn=_weighted(
-            {"linear": 50.0, "matmul": 1.0, "transpose": 0.0}
-        ),
-        verbose=False,
+        _weighted({"linear": 50.0, "matmul": 1.0, "transpose": 0.0}),
     )
-    assert stats["rule_fires"].get("linear_from_matmul_t_bare", 0) > 0
+    assert eg.rule_fires.get("linear_from_matmul_t_bare", 0) > 0
     assert mod._root.op == "matmul"
     with torch.no_grad():
         torch.testing.assert_close(mod(x), m(x), rtol=0, atol=1e-12)
@@ -960,7 +986,7 @@ def test_e2e_transpose_movement_through_pointwise_pipeline():
     """A model whose output is (relu(x @ W.t())).t() — the full law
     family composes: NT bridge + pointwise commute + involution all
     fire and the result verifies."""
-    from catopt_optimize.optimize import optimize_model
+
 
     class M(torch.nn.Module):
         def __init__(self):
@@ -974,10 +1000,10 @@ def test_e2e_transpose_movement_through_pointwise_pipeline():
 
     m = M().eval()
     x = torch.randn(4, 16, dtype=torch.float64)
-    mod, stats = optimize_model(
+    mod, eg = _opt_with_layout(
         m,
         x,
-        cost_fn=_weighted(
+        _weighted(
             {
                 "linear": 1.0,
                 "matmul": 5.0,
@@ -985,9 +1011,7 @@ def test_e2e_transpose_movement_through_pointwise_pipeline():
                 "relu": 1.0,
             }
         ),
-        verbose=False,
     )
-    fires = stats["rule_fires"]
-    assert fires.get("linear_from_matmul_t_bare", 0) > 0
+    assert eg.rule_fires.get("linear_from_matmul_t_bare", 0) > 0
     with torch.no_grad():
         torch.testing.assert_close(mod(x), m(x), rtol=0, atol=1e-12)
