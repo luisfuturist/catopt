@@ -106,6 +106,7 @@ equivalent:
 | Morphism windows (`bench/morphism_e2e.py`) | **12.4–12.5× measured wall** on 4-block chains at GEMM-bound sizes — term flops −92% fully translates; 10.7–11.4× vs plain Inductor (the compile-time weight fold is out of its reach) |
 | Residual reassoc (`ResidualReassoc`) | term flops −66% → measured 1.3–2.2× (partial conversion — distributed adds/fillers eat headroom; +inductor recovers more) |
 | KV latent sharing (`KVLatentShare`, opt-in) | kv flops/bytes −62.5%, module params −31% — a memory/params win, NOT wall-time (compute parity, −14% at tiny sizes — reported honestly) |
+| Bounded rewrites (`error_budget=`) | certified-approximation mode: `search(..., error_budget=1e-3)` accepts rewrites whose proven bound fits the budget; near-dead weight rows elide at bound 8e-4 (measured 3e-4), `KVLatentShare(budget=)` compresses approximately low-rank families (bound recorded, verified-with-tolerance). `None` = exact only |
 | Whole model E2E (`bench/e2e_model.py`) | **~1.05× over plain Inductor** — pairing fires per block, verified fp64-exact |
 | Real trained checkpoints (stories15M/110M) | Parity — all blocks transform and verify; the dims don't pay |
 
