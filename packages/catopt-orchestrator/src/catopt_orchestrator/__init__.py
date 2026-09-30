@@ -35,6 +35,21 @@ from catopt_orchestrator.criteria import (
     criteria_cost,
     peak_bytes_cost,
 )
+from catopt_orchestrator.morphisms import (
+    DEFAULT_MORPHISM_LAWS,
+    BlockSig,
+    MorphismGraph,
+    MorphismLaw,
+    MorphismMatch,
+    MorphismSearch,
+    NormSig,
+    ReifySpec,
+    WeightRef,
+    Wire,
+    block_signature,
+    lift_graph,
+    optimize_morphisms,
+)
 from catopt_orchestrator.optimize import (
     Autotuned,
     Compositional,
@@ -44,6 +59,7 @@ from catopt_orchestrator.optimize import (
     discover_alternatives,
     lower,
     search,
+    structural_key,
 )
 from catopt_orchestrator.runners import (
     ChainedRunner,
@@ -52,10 +68,12 @@ from catopt_orchestrator.runners import (
 )
 
 __all__ = [
+    "DEFAULT_MORPHISM_LAWS",
     "DEFAULT_RULES",
     "Autotuned",
     "Backend",
     "Blend",
+    "BlockSig",
     "ChainedRunner",
     "CompiledCriterion",
     "Compositional",
@@ -68,17 +86,29 @@ __all__ = [
     "LowerResult",
     "MemoryCriterion",
     "Monolithic",
+    "MorphismGraph",
+    "MorphismLaw",
+    "MorphismMatch",
+    "MorphismSearch",
+    "NormSig",
     "OptimizationResourceError",
     "Optimizer",
+    "ReifySpec",
     "Runner",
     "SearchResult",
+    "WeightRef",
+    "Wire",
+    "block_signature",
     "criteria_cost",
     "default_rules",
     "discover_alternatives",
+    "lift_graph",
     "lower",
+    "optimize_morphisms",
     "peak_bytes_cost",
     "runner_candidate",
     "search",
+    "structural_key",
 ]
 
 
