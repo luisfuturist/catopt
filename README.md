@@ -173,6 +173,19 @@ and autotune candidate builders live in `catopt_torch` /
 | Ports | `Source` / `Sink` (`catopt_core.ports`; torch impls `TorchSource` / `TorchSink`) — a new backend implements `Sink`; the engine never imports it |
 | Verification | `catopt_core.egraph.verify_certificate` — replays the derivation shipped with every extracted program |
 
+## Generality — honest split
+
+The **framework** is general: e-graph saturation, verification,
+cost extraction, backends, strategies, runners and rule sets are
+all pluggable and model-agnostic. What is **narrow** is the *law
+library*: like every rule-based optimizer (Halide, TASO, verified
+compilers), catopt finds the structures its laws describe — an
+unmatched block is an opaque boundary, never a wrong answer. The
+morphism engine is the generality mechanism: laws target signature
+*classes* (any residual chain, any shared-projection family)
+rather than specific op trees, so coverage grows at the right
+level of abstraction.
+
 ## Limits
 
 - **Wins are regime-dependent** — the transform set is structural:
