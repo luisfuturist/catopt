@@ -65,6 +65,7 @@ DEFAULT_SUITES = [
     "e2e_models2",
     "laws_effect",
     "morphism_e2e",
+    "bounded_e2e",
 ]
 
 

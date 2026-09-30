@@ -142,6 +142,36 @@ count inversion matters on launch-bound devices), and data-dependent
 leaves (gla/delta) don't amortise per-leaf eval on CPU. The fp32
 gate attributes which variant fails (`gate_checks` in aux).
 
+## bounded_e2e.py — certified bounded rewrites on a real checkpoint
+
+```bash
+python bench/bounded_e2e.py --device cpu        # ~20 min (the 32k-row
+                                                # head's bounded analysis dominates)
+python bench/bounded_e2e.py --quick             # none + 1e-3 only
+```
+
+Sweeps ``search(..., error_budget=B)`` with ``detect_specials=True``
+(B ∈ {None, 1e-4, 1e-3, 3e-3, 1e-2}) on the real stories15M
+checkpoint through the ``Compositional`` pipeline; times eager /
+inductor / catopt / catopt+inductor and measures held-out next-token
+agreement (mean/max KL, top-1/top-5) on seeded prompts.  Also probes
+the morphism lane (``KVLatentShare(budget=)``).
+
+**Measured (CPU, T=128):** bounded rewrites buy **nothing** on this
+model — 0 bounded members accepted at every budget.  The one real
+candidate is the tied LM head: >50% of vocab rows have a
+near-duplicate partner within 1e-4 (median nearest-row Chebyshev
+distance ≈2.4e-6), so ``elide_bounded`` fires and is *delivered* by
+extraction — then declined by the honest bound gate at every budget
+(measured output rel exceeds the weight-space certified bound by
+~2–8×).  Cost of asking: pipeline wall time 19 s → 134–365 s (the
+O(rows²) near-dup clustering in ``specials._bounded_elide`` on the
+32000×288 head).  Plumbing gaps documented in the report:
+``error_budget`` does not reach ``MorphismSearch``'s per-block
+searches (TypeError through ``optimize``), and ``KVLatentShare``
+cannot match stories15M's 3-input ``Block(h, cos, sin)`` at any
+budget.
+
 ## benchkit.py — the shared harness + reports
 
 ```bash
