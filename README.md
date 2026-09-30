@@ -103,8 +103,9 @@ equivalent:
 | Blocks with exploitable structure (`bench/real_win_hunt.py`) | **~1.1–10× vs Inductor** — unnormalized-attention reassoc ~2×, PaLM parallel blocks ~1.2×, expert-sum weight fold ~7× |
 | Carrier + CUDA-graph decode (`bench/decode_scan_bench.py`, `decode_retnet`) | **1.65–3.4× vs Inductor / best non-carrier** — chunked scan carriers amortize to zero launches |
 | Deep weight chains (`bench/reassoc_scale.py`) | 8.9–16.1× vs Inductor — a form Inductor's post-grad graph provably can't reach |
-| Morphism windows (`optimize_morphisms`) | term-level flops: 4-block projection chains −92% (49,664→4,096), residual streams −66% (50,176→17,024), fp64-verified |
-| KV latent sharing (`KVLatentShare`, opt-in) | kv flops/bytes −62.5% on factorable (low-rank/tied/pruned) weight families; correctly declines on full-rank weights |
+| Morphism windows (`bench/morphism_e2e.py`) | **12.4–12.5× measured wall** on 4-block chains at GEMM-bound sizes — term flops −92% fully translates; 10.7–11.4× vs plain Inductor (the compile-time weight fold is out of its reach) |
+| Residual reassoc (`ResidualReassoc`) | term flops −66% → measured 1.3–2.2× (partial conversion — distributed adds/fillers eat headroom; +inductor recovers more) |
+| KV latent sharing (`KVLatentShare`, opt-in) | kv flops/bytes −62.5%, module params −31% — a memory/params win, NOT wall-time (compute parity, −14% at tiny sizes — reported honestly) |
 | Whole model E2E (`bench/e2e_model.py`) | **~1.05× over plain Inductor** — pairing fires per block, verified fp64-exact |
 | Real trained checkpoints (stories15M/110M) | Parity — all blocks transform and verify; the dims don't pay |
 
