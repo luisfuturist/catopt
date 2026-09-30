@@ -977,9 +977,10 @@ def _carrier_search() -> RuleSet:
     """
     laws = core_laws.CARRIER_SEARCH
     with contextlib.suppress(ModuleNotFoundError):
+        from catopt_carriers.decode_geom import DECODE_GEOM_RULES
         from catopt_carriers.decode_laws import DECODE_RULES
 
-        laws = laws + DECODE_RULES
+        laws = laws + DECODE_RULES + DECODE_GEOM_RULES
     with contextlib.suppress(ModuleNotFoundError):
         from catopt_carriers.om import OM_RULES
 
