@@ -164,6 +164,8 @@ and autotune candidate builders live in `catopt_torch` /
 | `search` / `lower` | the phase verbs: `model -> SearchResult`, `SearchResult -> LowerResult` — re-lower one search under different runners |
 | `discover_alternatives` | `(model, x, *, source, ...)` → `SearchResult` — enumerate the equivalence frontier (`.alternatives(top_k)`, `.certificate()`) |
 | `export_optimized` / `load_optimized` | `catopt_torch.export` — `(model, opt, path, fmt="module"|"safetensors"|"state_dict"|"torchscript", …)`; `.pt2` roundtrips run standalone, no catopt at inference |
+| Rule sets | `search(..., rules=DEFAULT)` — composable `RuleSet` algebra (`FULL - SYMMETRY`, `WITH_LAYOUT`, presets in `catopt_core.laws.ruleset`) |
+| Engines | `search(..., engine=NativeEngine())` — the pure-Python engine is the default/reference; `catopt-native` (PyO3/Rust) is an explicit opt-in (~17× on match-bound closures) |
 | Criteria | `LatencyCriterion`, `FlopsCriterion`, `DepthCriterion`, `MemoryCriterion("weights"|"peak"|"combined")`, `CompiledCriterion` — compose with `*` / `+`, or pass `{"axis": weight}` dicts |
 | Runners | `IdentityRunner` (default), `TorchCompileRunner()`, `CudaGraphRunner()`, `ChainedRunner([...])` — duck-typed `Runner` protocol |
 | Ports | `Source` / `Sink` (`catopt_core.ports`; torch impls `TorchSource` / `TorchSink`) — a new backend implements `Sink`; the engine never imports it |
