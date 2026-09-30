@@ -34,6 +34,7 @@ from typing import Any
 
 from catopt_core.egraph import Rewrite
 from catopt_core.laws import tags
+from catopt_core.laws.attention import ATTENTION_RULES
 from catopt_core.laws.scan import SCAN_DIAG_LAWS, SCAN_LAWS
 from catopt_core.laws.tensor import (
     ALL_RULES_WITH_LAYOUT,
@@ -42,6 +43,7 @@ from catopt_core.laws.tensor import (
 )
 
 __all__ = [
+    "ATTENTION",
     "CARRIERS",
     "CARRIER_SEARCH",
     "CATEGORICAL",
@@ -309,6 +311,22 @@ FUSION = RuleSet(
     ),
 )
 
+#: The attention-path laws — rotary composition and scale
+#: commutation, the right-multiply absorb, and the score-scale
+#: migration.  Opt-in: the uniform-scale/view commutation pairs are
+#: closure-generating on any graph with view ops, and the rotary
+#: folds pay only where the exported spellings occur — see
+#: :mod:`catopt_core.laws.attention` for the applicability class.
+ATTENTION = RuleSet(
+    "attention",
+    tuple(ATTENTION_RULES),
+    description=(
+        "the attention-path laws — rope composition/commutation, "
+        "right-multiply absorb, score-scale migration (opt-in; the "
+        "uniform-scale/view pairs are closure-generating)"
+    ),
+)
+
 #: The closure-generating symmetry laws — opt-in, never in
 #: :data:`DEFAULT`.  comm/assoc plus the scale-hoist naturality rules.
 SYMMETRY = RuleSet(
@@ -394,6 +412,7 @@ PRESETS: dict[str, RuleSet] = {
         CATEGORICAL,
         FUSION,
         SYMMETRY,
+        ATTENTION,
         CARRIERS,
         CARRIER_SEARCH,
         WITH_LAYOUT,

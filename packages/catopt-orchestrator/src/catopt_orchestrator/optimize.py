@@ -509,6 +509,7 @@ def _pairing_and_lifts(
     max_memory_mb: float | None,
     source_tensors: dict,
     meter: Any = None,
+    detect_factors: bool = False,
 ) -> list:
     """Non-local passes with a brief re-saturation between them.
 
@@ -516,9 +517,11 @@ def _pairing_and_lifts(
     into one GEMM + split views (no consumer pattern needed); then the
     non-local lifts — unrolled recurrences -> ``trace(F)``, stacks of
     same-state carrier applications -> one application, whole om trees
-    over scanned values -> the deferred omd carrier, and exact weight
-    tying (duplicate Param leaves share one class).  All witnessed so
-    certificates stay replayable.
+    over scanned values -> the deferred omd carrier, exact weight
+    tying (duplicate Param leaves share one class), and — opt-in via
+    ``detect_factors`` — the low-rank factored-parameter offers of
+    :func:`catopt_core.laws.factored.offer_low_rank_factors`.  All
+    witnessed so certificates stay replayable.
 
     Returns the pairing-groups list — the coordinated (paired)
     extraction in :func:`_select_best_term` needs it.
@@ -538,7 +541,7 @@ def _pairing_and_lifts(
         )
         _check_resources(eg, max_enodes, max_memory_mb, meter)
 
-    lifts = _carrier_lifts(eg, source_tensors)
+    lifts = _carrier_lifts(eg, source_tensors, stats, detect_factors)
     if lifts:
         eg.rebuild()
         _check_resources(eg, max_enodes, max_memory_mb, meter)
@@ -579,12 +582,19 @@ def _pairing_and_lifts(
     return groups
 
 
-def _carrier_lifts(eg: EGraph, source_tensors: dict) -> list:
+def _carrier_lifts(
+    eg: EGraph,
+    source_tensors: dict,
+    stats: dict[str, Any],
+    detect_factors: bool,
+) -> list:
     """Run the non-local carrier/tying lifts, carriers lazily resolved.
 
     ``catopt_carriers`` machinery (the carrier lifts) resolves at call
     time; the weight-tying lifts are core.  A partial install without
-    carriers contributes only the tying passes.
+    carriers contributes only the tying passes.  ``detect_factors``
+    arms the opt-in low-rank detection offers of
+    :func:`catopt_core.laws.factored.offer_low_rank_factors`.
     """
     try:
         from catopt_carriers.trace_lift import (
@@ -610,7 +620,33 @@ def _carrier_lifts(eg: EGraph, source_tensors: dict) -> list:
         carrier
         + share_duplicate_params(eg, source_tensors)
         + share_duplicate_param_slices(eg, source_tensors)
+        + _factor_lifts(eg, source_tensors, stats, detect_factors)
     )
+
+
+def _factor_lifts(
+    eg: EGraph,
+    source_tensors: dict,
+    stats: dict[str, Any],
+    detect_factors: bool,
+) -> list:
+    """Opt-in low-rank factored-parameter offers (``detect_factors``).
+
+    The detection pass itself is the branch — when off this returns
+    ``[]`` without touching the graph; when on, each certified
+    offer lands in ``stats["low_rank_factors"]`` (minus the e-class
+    id, which means nothing outside this run).
+    """
+    if not detect_factors:
+        return []
+    from catopt_core.laws.factored import offer_low_rank_factors
+
+    offers = offer_low_rank_factors(eg, source_tensors)
+    if offers:
+        stats["low_rank_factors"] = [
+            {k: v for k, v in r.items() if k != "eid"} for r in offers
+        ]
+    return offers
 
 
 def _select_best_term(
@@ -721,6 +757,7 @@ def search(
     stop: str = "fixed_point",
     patience: int = 3,
     engine: Any = None,
+    detect_factors: bool = False,
 ) -> SearchResult:
     """Run the search phase: ``model -> SearchResult``.
 
@@ -814,6 +851,19 @@ def search(
         ``union(witness=...)`` surface) run only on the Python
         engine and are skipped otherwise; certificates likewise stay
         a Python-engine concern.
+    detect_factors : bool, default False
+        Opt-in low-rank detection pass
+        (:func:`catopt_core.laws.factored.offer_low_rank_factors`):
+        weight parameters whose *stored values* factor at rank ``r``
+        below the ``r·(i+o) < i·o`` break-even get a witnessed
+        factored member (``x@A@B`` / ``linear(linear(x,A),B)``) in
+        their consumer's e-class — a dense-but-low-rank ``Linear``
+        then extracts as the two-GEMM chain when the cost model
+        prefers it.  Spelled factorisations (LoRA ``lora_A`` /
+        ``lora_B`` pairs, ``x@(A@B)`` terms) need no detection — the
+        ``assoc_*`` laws already derive both directions and the cost
+        model picks; this flag covers weights whose low rank is only
+        visible in the values.
     verbose : bool
         Print progress.
 
@@ -900,6 +950,7 @@ def search(
             max_memory_mb,
             source_tensors,
             meter,
+            detect_factors,
         )
     else:
         # Non-local passes (pairing + carrier lifts) offer members

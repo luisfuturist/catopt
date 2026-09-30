@@ -8,6 +8,10 @@
   ``ALL_RULES`` / ``all_rules()``.
 * :mod:`catopt_core.laws.scan` — the scan-monoid law sets: ``SCAN_LAWS``
   (dense affine carrier) and ``SCAN_DIAG_LAWS`` (diagonal-affine).
+* :mod:`catopt_core.laws.attention` — the attention-path laws:
+  ``ATTENTION_RULES`` (rotary composition and scale commutation, the
+  right-multiply absorb, the score-scale migration) — opt-in via the
+  ``attention`` preset, never in ``DEFAULT``/``all_rules()``.
 * :mod:`catopt_core.laws.layout` — the transpose/layout laws:
   ``LAYOUT_RULES`` (pointwise commutation, involution, the
   product-transpose law, and the ``linear``/NT-GEMM bridge), folded
@@ -15,6 +19,10 @@
 * :mod:`catopt_core.laws.pairing` — the non-local passes over the whole
   e-graph (pairing, weight sharing).  These are diagram-level passes,
   not equational laws.
+* :mod:`catopt_core.laws.factored` — the factored-parameter path:
+  ``offer_low_rank_factors`` detects numerically low-rank weight
+  values and offers the ``(x@A)@B`` / ``linear(linear(x,A),B)``
+  member into the consumer's e-class under a certified bound.
 * :mod:`catopt_core.laws.tags` — the rule-tag constants
   (``SYMMETRY`` / ``EXPANSIVE`` / ``SUBSUMED`` / ``FUSION`` / …).
 * :mod:`catopt_core.laws.ruleset` — :class:`RuleSet`, the composable
@@ -37,6 +45,38 @@ first-class values are the ``RuleSet`` presets.
 # private names are re-exported (hence ``noqa: F401``) so
 # ``catopt_core.laws._x`` keeps resolving, but stay out of ``__all__``.
 from catopt_core.laws import tags as tags
+from catopt_core.laws.attention import (  # noqa: F401
+    ATTENTION_RULES,
+    LINEAR_MM_ABSORB,
+    LINEAR_MM_ABSORB_BIAS,
+    LINEAR_MM_ABSORB_BIAS_REV,
+    LINEAR_MM_ABSORB_REV,
+    LINEAR_OUT_SCALE,
+    LINEAR_OUT_SCALE_REV,
+    NATURALITY_SCALAR_LEFT,
+    NATURALITY_SCALAR_LEFT_REV,
+    ROPE_CAT_COMPOSE,
+    ROPE_CAT_SCALE_IN,
+    ROPE_CAT_SCALE_OUT,
+    ROPE_RH_SCALE_IN,
+    ROPE_RH_SCALE_OUT,
+    _check_left_scale,
+    _check_linear_mm_absorb,
+    _check_linear_mm_absorb_bias,
+    _check_linear_out_scale,
+    _check_rope_cat_compose,
+    _check_rope_scale,
+    _check_uniform,
+    _half_bounds,
+    _is_uniform,
+    _replant,
+    _rope_axis,
+    _rope_cat,
+    _rope_rh,
+    _slice,
+    _to_end,
+    _view_scale_rules,
+)
 from catopt_core.laws.base import (  # noqa: F401
     _SHAPE_MEMO,
     R,
@@ -44,6 +84,9 @@ from catopt_core.laws.base import (  # noqa: F401
     _is_row_scale,
     _is_scalar,
     _shape_of,
+)
+from catopt_core.laws.factored import (
+    offer_low_rank_factors,
 )
 from catopt_core.laws.layout import (  # noqa: F401
     LAYOUT_RULES,
@@ -129,6 +172,7 @@ from catopt_core.laws.tensor import (  # noqa: F401
     ASSOC_LINEAR,
     ASSOC_LINEAR_BIAS,
     ASSOC_LINEAR_BIAS_REV,
+    ASSOC_LINEAR_REV,
     ASSOC_MATMUL,
     ASSOC_MATMUL_REV,
     ASSOC_MUL,
@@ -216,9 +260,11 @@ __all__ = [
     "ASSOC_LINEAR",
     "ASSOC_LINEAR_BIAS",
     "ASSOC_LINEAR_BIAS_REV",
+    "ASSOC_LINEAR_REV",
     "ASSOC_MATMUL",
     "ASSOC_MATMUL_REV",
     "ASSOC_MUL",
+    "ATTENTION_RULES",
     "CARRIERS",
     "CARRIER_SEARCH",
     "CATEGORICAL",
@@ -241,10 +287,18 @@ __all__ = [
     "LINEAR_CHANNEL_SCALE_REV",
     "LINEAR_FROM_MM_T",
     "LINEAR_FROM_MM_T_BARE",
+    "LINEAR_MM_ABSORB",
+    "LINEAR_MM_ABSORB_BIAS",
+    "LINEAR_MM_ABSORB_BIAS_REV",
+    "LINEAR_MM_ABSORB_REV",
+    "LINEAR_OUT_SCALE",
+    "LINEAR_OUT_SCALE_REV",
     "LINEAR_ROW_SCALE",
     "LINEAR_ROW_SCALE_REV",
     "LINEAR_TO_MM_T",
     "NATURALITY_SCALAR",
+    "NATURALITY_SCALAR_LEFT",
+    "NATURALITY_SCALAR_LEFT_REV",
     "NATURALITY_SCALAR_REV",
     "NORMAL",
     "PARALLEL_MUL_FUSE",
@@ -255,6 +309,11 @@ __all__ = [
     "RIGHT_DISTRIBUTE",
     "RIGHT_FACTOR",
     "RIGHT_FACTOR_LINEAR",
+    "ROPE_CAT_COMPOSE",
+    "ROPE_CAT_SCALE_IN",
+    "ROPE_CAT_SCALE_OUT",
+    "ROPE_RH_SCALE_IN",
+    "ROPE_RH_SCALE_OUT",
     "SCAN_DIAG_LAWS",
     "SCAN_LAWS",
     "SDPA_FOLD_RULES",
@@ -275,6 +334,7 @@ __all__ = [
     "R",
     "RuleSet",
     "all_rules",
+    "offer_low_rank_factors",
     "pair_shared_input_convs",
     "pair_shared_input_linears",
     "preset",

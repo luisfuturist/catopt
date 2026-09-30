@@ -65,21 +65,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 from benchkit import Case, Report, Runner, Variant, collect_env
-from catopt_torch.adapters import TorchSink
 from catopt_core.cost import backend_cost, dag_cost, executor_cost_for
 from catopt_core.egraph import EGraph, Rewrite
-from catopt_core.ir import IR, Const, Op, Param, TensorType, Var, op_repr
-from catopt_orchestrator.optimize import _lower_extracted
-
-
-from catopt_torch.torch_bridge import IRModule  # noqa: F401 — docstring ref
+from catopt_core.ir import (
+    IR,
+    Const,
+    Op,
+    Param,
+    TensorType,
+    Var,
+    op_repr,
+)
 from catopt_core.laws import (
     ALL_RULES,
+    ATTENTION_RULES,
     CATEGORICAL_RULES,
     SCAN_DIAG_LAWS,
     SCAN_LAWS,
     SDPA_FOLD_RULES,
     SIMPLIFICATION_RULES,
+)
+from catopt_orchestrator.optimize import _lower_extracted
+from catopt_torch.adapters import TorchSink
+from catopt_torch.torch_bridge import (
+    IRModule,  # noqa: F401 — docstring ref
 )
 
 _B = 512  # batch rows for the matmul/elementwise cases
@@ -231,6 +240,17 @@ def _c_assoc_linear(d: int, dev: torch.device):
     a, b = _p("A", d, d), _p("B", d, d)
     env = {"x": _r(dev, _B, d), "A": _r(dev, d, d), "B": _r(dev, d, d)}
     t = Op.make("linear", Op.make("linear", x, a), b)
+    return t, env, [x]
+
+
+def _c_assoc_linear_rev(d: int, dev: torch.device):
+    """The fused→split direction on a rank-4 adapter (B@A, d×r·r×d) —
+    the low-rank regime where the factored chain wins."""
+    r = 4
+    x = _v("x", _B, d)
+    a, b = _p("A", r, d), _p("B", d, r)
+    env = {"x": _r(dev, _B, d), "A": _r(dev, r, d), "B": _r(dev, d, r)}
+    t = Op.make("linear", x, Op.make("matmul", b, a))
     return t, env, [x]
 
 
@@ -532,6 +552,247 @@ def _c_pow(d: int, dev: torch.device):
     return t, {"x": _r(dev, _B, d)}, [x]
 
 
+# -- attention-path cases ----------------------------------------------------
+
+_RIPE_END = 1 << 62  # the int64 sentinel exports spell for x[..., h:]
+
+
+def _rope_half(t: Op, c: Any, s: Any, h: int, dim: int = 3) -> Op:
+    """The exported half-split cat-rotary: cat(x1·c - x2·s, x2·c+x1·s)."""
+    x1 = Op.make("slice", t, dim=dim, start=0, end=h)
+    x2 = Op.make("slice", t, dim=dim, start=h, end=_RIPE_END)
+    return Op.make(
+        "concat",
+        Op.make("sub", Op.make("mul", x1, c), Op.make("mul", x2, s)),
+        Op.make("add", Op.make("mul", x2, c), Op.make("mul", x1, s)),
+        dim=-1,
+    )
+
+
+def _rope_env(d: int, dev: torch.device, b: int, h: int, t: int):
+    """x plus the broadcast cos/sin tables for a (B,H,T,2h) rope."""
+    dh = max(8, d // 8)
+    x = _v("x", b, h, t, 2 * dh)
+    c, s = _p("cos", 1, 1, t, dh), _p("sin", 1, 1, t, dh)
+    pos = torch.arange(t, dtype=torch.float64)[:, None]
+    freq = torch.exp(
+        -torch.arange(dh, dtype=torch.float64) * (math.log(10_000) / dh)
+    )[None, :]
+    ang = (pos * freq).to(dev)
+    env = {
+        "x": _r(dev, b, h, t, 2 * dh),
+        "cos": torch.cos(ang).reshape(1, 1, t, dh),
+        "sin": torch.sin(ang).reshape(1, 1, t, dh),
+    }
+    return x, c, s, dh, env
+
+
+def _c_rope_compose(d: int, dev: torch.device):
+    """rope₂∘rope₁ — the angle-addition fold."""
+    x, c, s, dh, env = _rope_env(d, dev, 2, 4, 64)
+    return _rope_half(_rope_half(x, c, s, dh), c, s, dh), env, [x]
+
+
+def _rope_rh_half(t: Op, c: Any, s: Any, h: int, dim: int = 3) -> Op:
+    """The rotate-half add spelling: x·c + cat(-x2, x1)·s."""
+    x1 = Op.make("slice", t, dim=dim, start=0, end=h)
+    x2 = Op.make("slice", t, dim=dim, start=h, end=_RIPE_END)
+    rot = Op.make("concat", Op.make("neg", x2), x1, dim=-1)
+    return Op.make(
+        "add", Op.make("mul", t, c), Op.make("mul", rot, s)
+    )
+
+
+def _c_rope_scale(d: int, dev: torch.device):
+    """a·rope(x) — the uniform-factor commutation (scale_in LHS)."""
+    x, c, s, dh, env = _rope_env(d, dev, 2, 4, 64)
+    a = _p("a", 1, 1, 1, 1)
+    env["a"] = _r(dev, 1, 1, 1, 1)
+    t = Op.make("mul", _rope_half(x, c, s, dh), a)
+    return t, env, [x]
+
+
+def _c_rope_scaled_input(d: int, dev: torch.device):
+    """rope(a·x) — the commutation in the scale_out direction."""
+    x, c, s, dh, env = _rope_env(d, dev, 2, 4, 64)
+    a = _p("a", 1, 1, 1, 1)
+    env["a"] = _r(dev, 1, 1, 1, 1)
+    t = _rope_half(Op.make("mul", x, a), c, s, dh)
+    return t, env, [x]
+
+
+def _c_rope_rh_scaled(d: int, dev: torch.device):
+    """The rotate-half spelling over a scaled input (scale_out LHS)."""
+    x, _c, _s, dh, env = _rope_env(d, dev, 2, 4, 64)
+    a = _p("a", 1, 1, 1, 1)
+    env["a"] = _r(dev, 1, 1, 1, 1)
+    c2, s2 = _p("cosf", 1, 1, 64, 2 * dh), _p("sinf", 1, 1, 64, 2 * dh)
+    env["cosf"] = _r(dev, 1, 1, 64, 2 * dh)
+    env["sinf"] = _r(dev, 1, 1, 64, 2 * dh)
+    t = _rope_rh_half(Op.make("mul", x, a), c2, s2, dh)
+    return t, env, [x]
+
+
+def _c_mm_absorb(d: int, dev: torch.device):
+    """(x@Wᵀ)@R — a constant right-multiply after a projection."""
+    b, i, o = _B, d, d
+    x, w, r = _v("x", b, i), _p("W", o, i), _p("R", o, o)
+    env = {
+        "x": _r(dev, b, i),
+        "W": _r(dev, o, i),
+        "R": _r(dev, o, o),
+    }
+    t = Op.make("matmul", Op.make("linear", x, w), r)
+    return t, env, [x]
+
+
+def _c_mm_absorb_folded(d: int, dev: torch.device):
+    """linear(x, RᵀW) — the folded member the rev direction expands."""
+    b, i, o = _B, d, d
+    x, w, r = _v("x", b, i), _p("W", o, i), _p("R", o, o)
+    env = {
+        "x": _r(dev, b, i),
+        "W": _r(dev, o, i),
+        "R": _r(dev, o, o),
+    }
+    t = Op.make(
+        "linear",
+        x,
+        Op.make(
+            "matmul", Op.make("transpose", r, dim0=-2, dim1=-1), w
+        ),
+    )
+    return t, env, [x]
+
+
+def _c_mm_absorb_bias(d: int, dev: torch.device):
+    """(xWᵀ + b)@R — the affine right-multiply absorb."""
+    b, i, o = _B, d, d
+    x, w, bb, r = (
+        _v("x", b, i),
+        _p("W", o, i),
+        _p("b", o),
+        _p("R", o, o),
+    )
+    env = {
+        "x": _r(dev, b, i),
+        "W": _r(dev, o, i),
+        "b": _r(dev, o),
+        "R": _r(dev, o, o),
+    }
+    t = Op.make("matmul", Op.make("linear", x, w, bb), r)
+    return t, env, [x]
+
+
+def _c_mm_absorb_bias_folded(d: int, dev: torch.device):
+    """linear(x, RᵀW, bR) — the biased member the rev expands."""
+    b, i, o = _B, d, d
+    x, w, bb, r = (
+        _v("x", b, i),
+        _p("W", o, i),
+        _p("b", o),
+        _p("R", o, o),
+    )
+    env = {
+        "x": _r(dev, b, i),
+        "W": _r(dev, o, i),
+        "b": _r(dev, o),
+        "R": _r(dev, o, o),
+    }
+    t = Op.make(
+        "linear",
+        x,
+        Op.make(
+            "matmul", Op.make("transpose", r, dim0=-2, dim1=-1), w
+        ),
+        Op.make("matmul", bb, r),
+    )
+    return t, env, [x]
+
+
+def _c_mm_scaled_left(d: int, dev: torch.device):
+    """matmul(A·s, B) — the left-scale pull-out case."""
+    a, b, s = _v("A", _B, d), _p("B", d, d), Const(0.5)
+    env = {"A": _r(dev, _B, d), "B": _r(dev, d, d)}
+    t = Op.make("matmul", Op.make("mul", a, s), b)
+    return t, env, [a]
+
+
+def _c_view_scale_transpose(d: int, dev: torch.device):
+    """mul(t.mT, s) — a uniform factor through a transpose."""
+    t = _v("t", _B, d)
+    env = {"t": _r(dev, _B, d)}
+    term = Op.make(
+        "mul", Op.make("transpose", t, dim0=0, dim1=1), Const(0.5)
+    )
+    return term, env, [t]
+
+
+def _c_view_scale_reshape(d: int, dev: torch.device):
+    """mul(reshape(t), s) — a uniform factor through a reshape."""
+    t = _v("t", _B, d)
+    env = {"t": _r(dev, _B, d)}
+    term = Op.make(
+        "mul",
+        Op.make("reshape", t, shape=(_B // 4, 4 * d)),
+        Const(0.5),
+    )
+    return term, env, [t]
+
+
+def _c_linear_out_scale_rev(d: int, dev: torch.device):
+    """linear(x, sW) — the folded member the rev direction expands."""
+    b, i, o = _B, d, d
+    x, w = _v("x", b, i), _p("W", o, i)
+    env = {"x": _r(dev, b, i), "W": _r(dev, o, i)}
+    t = Op.make("linear", x, Op.make("mul", w, Const(0.5)))
+    return t, env, [x]
+
+
+def _c_linear_out_scale(d: int, dev: torch.device):
+    """s·linear(x,W) — the uniform fold into the weight."""
+    b, i, o = _B, d, d
+    x, w = _v("x", b, i), _p("W", o, i)
+    env = {"x": _r(dev, b, i), "W": _r(dev, o, i)}
+    t = Op.make("mul", Op.make("linear", x, w), Const(0.5))
+    return t, env, [x]
+
+
+def _c_score_scale(d: int, dev: torch.device):
+    """softmax-free scores·s — folds into Wq via the migration laws."""
+    b, h, t = 2, 4, 64
+    dh, i = max(8, d // 8), d
+    o = h * dh
+    x = _v("x", b, t, i)
+    wq, wk = _p("Wq", o, i), _p("Wk", o, i)
+
+    def head(term):
+        return Op.make(
+            "transpose",
+            Op.make("reshape", term, shape=(b, t, h, dh)),
+            dim0=1,
+            dim1=2,
+        )
+
+    kt = Op.make(
+        "transpose",
+        head(Op.make("linear", x, wk)),
+        dim0=-2,
+        dim1=-1,
+    )
+    t_ = Op.make(
+        "mul",
+        Op.make("matmul", head(Op.make("linear", x, wq)), kt),
+        Const(0.5),
+    )
+    env = {
+        "x": _r(dev, b, t, i),
+        "Wq": _r(dev, o, i),
+        "Wk": _r(dev, o, i),
+    }
+    return t_, env, [x]
+
+
 # ---------------------------------------------------------------------------
 #  Registry: rule name -> synthetic case builder
 # ---------------------------------------------------------------------------
@@ -566,6 +827,7 @@ LAW_CASES: dict[str, Any] = {
     ),
     "right_factor_linear": _c_right_factor_linear,
     "assoc_linear": _c_assoc_linear,
+    "assoc_linear_rev": _c_assoc_linear_rev,
     "assoc_linear_bias": lambda d, dev: _biased_chain(d, dev, False),
     "assoc_linear_bias_rev": lambda d, dev: _biased_chain(d, dev, True),
     "naturality_scalar": _c_naturality,
@@ -594,6 +856,23 @@ LAW_CASES: dict[str, Any] = {
     # SCAN_LAWS / SCAN_DIAG_LAWS
     "aff_lift": _c_aff_lift,
     "affd_lift": _c_affd_lift,
+    # ATTENTION_RULES
+    "rope_cat_compose": _c_rope_compose,
+    "rope_cat_scale_out": _c_rope_scaled_input,
+    "rope_cat_scale_in": _c_rope_scale,
+    "rope_rh_scale_out": _c_rope_rh_scaled,
+    "linear_mm_absorb": _c_mm_absorb,
+    "linear_mm_absorb_rev": _c_mm_absorb_folded,
+    "linear_mm_absorb_bias": _c_mm_absorb_bias,
+    "linear_mm_absorb_bias_rev": _c_mm_absorb_bias_folded,
+    "naturality_scalar_left": _c_mm_scaled_left,
+    "naturality_scalar_left_rev": _c_score_scale,
+    "linear_out_scale": _c_linear_out_scale,
+    "linear_out_scale_rev": _c_linear_out_scale_rev,
+    "scale_in_transpose": _c_view_scale_transpose,
+    "scale_out_transpose": _c_view_scale_transpose,
+    "scale_in_reshape": _c_view_scale_reshape,
+    "scale_out_reshape": _c_view_scale_reshape,
 }
 
 #: The curated set: laws that fire on simple terms and span the
@@ -617,7 +896,8 @@ DEFAULT_LAWS = [
 ]
 
 _RULE_INDEX: dict[str, Rewrite] = {
-    r.name: r for r in ALL_RULES + SCAN_LAWS + SCAN_DIAG_LAWS
+    r.name: r
+    for r in ALL_RULES + SCAN_LAWS + SCAN_DIAG_LAWS + ATTENTION_RULES
 }
 
 _GROUPS: dict[str, list[Rewrite]] = {
@@ -626,7 +906,8 @@ _GROUPS: dict[str, list[Rewrite]] = {
     "sdpa_fold": SDPA_FOLD_RULES,
     "scan": SCAN_LAWS,
     "scan_diag": SCAN_DIAG_LAWS,
-    "all": ALL_RULES + SCAN_LAWS + SCAN_DIAG_LAWS,
+    "attention": ATTENTION_RULES,
+    "all": ALL_RULES + SCAN_LAWS + SCAN_DIAG_LAWS + ATTENTION_RULES,
     "default": [_RULE_INDEX[n] for n in DEFAULT_LAWS],
 }
 
@@ -743,7 +1024,9 @@ def _bench_one(
             return Case(rule.name, params, [], aux)
         if isinstance(rule.rhs, Op):
             aux["rhs_member"] = (
-                "yes" if list(eg.matches(rule.rhs, eg.find(root))) else "no"
+                "yes"
+                if list(eg.matches(rule.rhs, eg.find(root)))
+                else "no"
             )
         else:
             aux["rhs_member"] = "yes"  # bare metavar: the merge IS it

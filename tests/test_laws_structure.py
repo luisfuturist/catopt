@@ -181,26 +181,27 @@ def test_laws_exports_every_rewrite():
 
     found = _iter_module_rules(laws)
     assert all(isinstance(r, Rewrite) for r in found)
-    # 50 tensor + 6 dense-scan + 16 diagonal-scan + 77 layout rewrites.
-    assert len(found) == 149
+    # 51 tensor (assoc_linear_rev added) + 6 dense-scan
+    # + 16 diagonal-scan + 77 layout + 37 attention rewrites.
+    assert len(found) == 187
 
 
 def test_all_rules_count_unchanged():
     # The default set excludes LAYOUT_RULES (opt-in — closure-cost
-    # regression documented in laws.tensor); WITH_LAYOUT keeps 127.
-    assert len(laws.all_rules()) == 50
+    # regression documented in laws.tensor); WITH_LAYOUT keeps 128.
+    assert len(laws.all_rules()) == 51
     assert laws.all_rules() == laws.ALL_RULES
     assert len(laws.ALL_RULES) == (
         len(laws.SIMPLIFICATION_RULES) + len(laws.CATEGORICAL_RULES)
     )
-    assert len(laws.ALL_RULES_WITH_LAYOUT) == 127
+    assert len(laws.ALL_RULES_WITH_LAYOUT) == 128
     # each call returns a fresh list, not the shared ALL_RULES object
     assert laws.all_rules() is not laws.ALL_RULES
 
 
 def test_collections_split_by_domain():
     assert len(laws.SIMPLIFICATION_RULES) == 13
-    assert len(laws.CATEGORICAL_RULES) == 37
+    assert len(laws.CATEGORICAL_RULES) == 38
     assert len(laws.SCAN_LAWS) == 6
     assert len(laws.SCAN_DIAG_LAWS) == 16
     # layout: 12 unary + 4 binary pointwise commutations x 2 spellings
@@ -248,6 +249,7 @@ def test_laws_modules_import_cleanly():
         "catopt_core.laws.scan": ["SCAN_LAWS", "SCAN_DIAG_LAWS"],
         "catopt_core.laws.layout": ["LAYOUT_RULES"],
         "catopt_core.laws.pairing": PAIRING_PASSES,
+        "catopt_core.laws.factored": ["offer_low_rank_factors"],
     }
     for modname, names in expected.items():
         mod = sys.modules.get(modname) or importlib.import_module(

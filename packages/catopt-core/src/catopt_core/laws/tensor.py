@@ -289,6 +289,18 @@ ASSOC_LINEAR = R(
     tags=_CAT,
 )
 
+# Reverse direction: split a fused weight product back into the
+# two-GEMM chain — wins when the inner dim sits below the
+# oi/(o+i) break-even (the LoRA / built-low-rank regime).
+ASSOC_LINEAR_REV = R(
+    "assoc_linear_rev",
+    Op.make("linear", "x", Op.make("matmul", "B", "A")),
+    Op.make("linear", Op.make("linear", "x", "A"), "B"),
+    law="Reverse linear composition: linear(x, B@A) = "
+    "linear(linear(x, A), B) (eqsat weighs fused vs split).",
+    tags=_CAT,
+)
+
 # ------------------------------------------------------------------
 #  Biased composition — the affine-map law on the 3-ary `linear`.
 #
@@ -1116,6 +1128,7 @@ CATEGORICAL_RULES: list[Rewrite] = [
     WEIGHT_DISTRIBUTE_LINEAR,
     RIGHT_FACTOR_LINEAR,
     ASSOC_LINEAR,
+    ASSOC_LINEAR_REV,
     ASSOC_LINEAR_BIAS,
     ASSOC_LINEAR_BIAS_REV,
     NATURALITY_SCALAR,

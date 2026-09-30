@@ -26,6 +26,10 @@ priority is a :class:`~catopt_core.laws.RuleSet` concern instead.
 * :data:`LAYOUT` — the transpose/layout migration laws.
 * :data:`SCAN` — the core scan monoids (dense + diagonal affine).
 * :data:`DECODE` — the decode/KV-cache carrier laws.
+* :data:`ATTENTION` — the attention-path laws (rotary composition and
+  scale commutation, the right-multiply absorb, the score-scale
+  migration) — opt-in, never in
+  :data:`~catopt_core.laws.DEFAULT`.
 """
 
 SIMPLIFICATION = "simplification"
@@ -38,8 +42,10 @@ SUBSUMED = "subsumed"
 LAYOUT = "layout"
 SCAN = "scan"
 DECODE = "decode"
+ATTENTION = "attention"
 
 __all__ = [
+    "ATTENTION",
     "CARRIER",
     "CATEGORICAL",
     "DECODE",

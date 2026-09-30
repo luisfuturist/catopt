@@ -143,7 +143,7 @@ import catopt_orchestrator.optimize as O
 import catopt_orchestrator.regime as R
 
 assert O._carrier_plans() == {}
-assert O._carrier_lifts(object(), {}) == []
+assert O._carrier_lifts(object(), {}, {}, False) == []
 assert len(R._xc_rules()) == 0
 # Core scan laws compose in; blocked carriers contribute nothing.
 from catopt_core.laws import RuleSet
@@ -698,7 +698,7 @@ def test_carrier_helpers_degrade_without_carriers(monkeypatch):
         monkeypatch.setitem(_sys.modules, name, None)
     assert O._carrier_plans() == {}
     # A real (empty) e-graph — the share/tying passes tolerate it.
-    assert isinstance(O._carrier_lifts(EGraph(), {}), list)
+    assert isinstance(O._carrier_lifts(EGraph(), {}, {}, False), list)
     assert len(R._xc_rules()) == 0
     # build_egraph with blocked carriers runs the plain core tier.
     eg, _root, ir, _src, _st = R.build_egraph(
