@@ -172,7 +172,7 @@ class TestInsertion:
             Op.make("matmul", Op.make("trace", "f", usize="U"), "v"),
             shape="S",
         )
-        assert eg.matches(pat, root)
+        assert list(eg.matches(pat, root))
 
     def test_certificate_records_nonlocal_step(self):
         T, d = 4, 4
@@ -350,7 +350,7 @@ class TestPostLiftSaturation:
             ),
             shape="S",
         )
-        binds = eg.matches(pat, root)
+        binds = list(eg.matches(pat, root))
         assert binds, "bdiag-of-traces not reachable after saturation"
 
         # extract that member and check it numerically

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Iterator
+from typing import Any, cast
 
 from catopt_core.egraph.certs import (
     ProofEdge,
 )
 from catopt_core.egraph.extract import _ExtractMixin
+from catopt_core.egraph.match import (
+    _Epoch,
+    _PLeaf,
+    _POp,
+    _Prog,
+    _PVar,
+    compile_pattern,
+)
 from catopt_core.egraph.proof import _ProofMixin
 from catopt_core.egraph.types import (
     EClass,
@@ -99,6 +107,25 @@ class EGraph(_ExtractMixin, _ProofMixin):
         # those classes, so the per-iteration scan never touches the
         # rest of the graph.
         self._op_classes: dict[str, set[int]] = {}
+        # ``(op, arity) -> canonical class ids`` — the targeted-
+        # eligibility index (plan 0010, lever 1b): a compiled pattern
+        # only scans classes holding a member of the right head shape.
+        self._opk: dict[tuple[str, int], set[int]] = {}
+        # ``pattern -> compiled matcher program`` (lever 1a).  Patterns
+        # are hashable and interned, so each distinct LHS compiles once
+        # per e-graph.
+        self._progs: dict[Any, _Prog] = {}
+        # Live frozen-read epochs (lever 2b): a suspended match
+        # enumeration registers here so ``union`` can journal the
+        # merges it must hide from the matcher.
+        self._epochs: list[_Epoch] = []
+        # Incremental congruence state (lever 2c): ``_cong_owner`` is
+        # the persistent ``canonical enode -> owning class`` map;
+        # ``_cong_pend`` is the worklist of ``(class, enode)`` pairs
+        # needing an ownership pass — populated on enode birth, on
+        # child re-canonicalisation, and on class merges.
+        self._cong_owner: dict[ENode, int] = {}
+        self._cong_pend: set[tuple[int, ENode]] = set()
         # Names of rules already applied to the whole graph once —
         # after the first pass the dirty frontier suffices.
         self._applied_rules: set[str] = set()
@@ -129,7 +156,25 @@ class EGraph(_ExtractMixin, _ProofMixin):
         return len(self._node_to_class)
 
     def find(self, eid: int) -> int:
-        """Return the canonical e-class id of ``eid``."""
+        """Return the canonical e-class id of ``eid``.
+
+        While a frozen-read match epoch is live (a suspended
+        enumeration), path-halving writes are JOURNALED into every
+        active epoch's ``jph`` overlay — first write wins, so the
+        epoch keeps the freeze-time parent of every reparented node.
+        Answers are identical to plain union-find; only the write
+        journaling differs.
+        """
+        if self._epochs:
+            parent = self._uf.parent
+            while parent[eid] != eid:
+                p = parent[eid]
+                gp = parent[p]
+                for ep in self._epochs:
+                    ep.jph.setdefault(eid, p)
+                parent[eid] = gp
+                eid = gp
+            return eid
         return self._uf.find(eid)
 
     def get_class(self, eid: int) -> EClass:
@@ -183,6 +228,10 @@ class EGraph(_ExtractMixin, _ProofMixin):
         # so future changes below propagate dirtiness upward.
         self._dirty.add(eid)
         self._op_classes.setdefault(enode.op, set()).add(eid)
+        self._opk.setdefault(
+            (enode.op, len(enode.children)), set()
+        ).add(eid)
+        self._cong_pend.add((eid, enode))
         for c in enode.children:
             self._parents.setdefault(self.find(c), set()).add(eid)
         if self._track:
@@ -274,6 +323,24 @@ class EGraph(_ExtractMixin, _ProofMixin):
             old_canon = ra if new_canon == rb else rb
             target = self._classes[new_canon]
             source = self._classes[old_canon]
+            if self._epochs:
+                # Frozen-read journaling (lever 2b): a suspended match
+                # enumeration must keep seeing the pre-merge graph —
+                # record the lost root, the deleted class object, and
+                # the members that just moved into ``new_canon``.
+                moved = source.nodes - target.nodes
+                for ep in self._epochs:
+                    ep.ovr[old_canon] = old_canon
+                    ep.dead[old_canon] = source
+                    acc = ep.added.get(new_canon)
+                    if acc is None:
+                        # Per-epoch copy: coexisting epochs freeze at
+                        # different times and must not share the set —
+                        # a later union mutating it would leak into an
+                        # epoch that should keep the earlier members.
+                        ep.added[new_canon] = set(moved)
+                    else:
+                        acc |= moved
             target.nodes |= source.nodes
             target.cache.clear()
             target.by_op = None
@@ -290,11 +357,27 @@ class EGraph(_ExtractMixin, _ProofMixin):
             p_old = self._parents.pop(old_canon, None)
             if p_old:
                 self._parents.setdefault(new_canon, set()).update(p_old)
+                # Incremental congruence (lever 2c): the enodes that
+                # re-key because their child resolved to ``old_canon``
+                # are exactly the direct parents' members mentioning
+                # it — queue them for the ownership worklist.
+                for p0 in p_old:
+                    # ``find`` returns a live canonical id — the class
+                    # is always present.
+                    pc = self.find(p0)
+                    for n in self._classes[pc].nodes:
+                        if old_canon in n.children:
+                            self._cong_pend.add((pc, n))
             for n in source.nodes:
                 oc = self._op_classes.get(n.op)
                 if oc is not None:
                     oc.discard(old_canon)
                     oc.add(new_canon)
+                key = (n.op, len(n.children))
+                ok = self._opk.get(key)
+                if ok is not None:
+                    ok.discard(old_canon)
+                    ok.add(new_canon)
             stack = [new_canon]
             while stack:
                 c = stack.pop()
@@ -483,64 +566,273 @@ class EGraph(_ExtractMixin, _ProofMixin):
         return self.union(cid, rhs_eid, witness=wit, note=note)
 
     # -- pattern matching --
+    #
+    # Patterns are compiled once per e-graph into a :class:`_Prog`
+    # decision tree (lever 1a) and enumerated lazily (lever 2b):
+    # ``matches`` is a generator — no per-class substitution list is
+    # ever materialised on the unbounded path.  Between two yielded
+    # substitutions ``apply_rule`` may merge classes; the enumeration
+    # keeps reading the graph as of call time through the frozen
+    # ``_Epoch`` overlays (``_mfind`` / ``_mclass`` / ``_mnodes``), so
+    # the substitution stream is *identical* to what eager
+    # enumeration produced.  ``max_results`` still caps the count,
+    # preserving the bounded semantics exactly — including the quirk
+    # that an e-node whose enumeration crosses the cap contributes
+    # nothing (``_m_bounded`` mirrors the interpreted algorithm).
+
+    def _prog_for(self, pattern: Any) -> _Prog:
+        """Return the compiled matcher for *pattern* (cached per graph)."""
+        try:
+            prog = self._progs.get(pattern)
+        except TypeError:
+            # Unhashable non-Op pattern (e.g. a list leaf): compile it
+            # uncached — it can only ever be a concrete leaf key.
+            return compile_pattern(pattern)
+        if prog is None:
+            prog = compile_pattern(pattern)
+            self._progs[pattern] = prog
+        return prog
 
     def matches(
         self, pattern: Any, eid: int, max_results: int | None = None
-    ) -> list[dict[str, Any]]:
-        """Find all substitutions that match *pattern* at e-class *eid*.
+    ) -> Iterator[dict[str, Any]]:
+        """Yield every substitution matching *pattern* at e-class *eid*.
+
+        The enumeration is LAZY: the caller drives it, and may mutate
+        the graph between substitutions — each enumeration reads a
+        frozen view of the graph (see ``_Epoch``) so the stream equals
+        the list the old eager matcher returned, in the same order.
+        Materialise with ``list(...)`` when a sequence is needed.
 
         ``max_results`` bounds the enumeration: matching stops once
-        that many substitutions have been found — deterministic (the
+        that many substitutions have been yielded — deterministic (the
         first-found wins) and used by the saturation loop to enforce
         per-rule expansion budgets inside giant e-classes.
         """
-        results: list[dict[str, Any]] = []
-        self._match(pattern, eid, {}, results, max_results)
-        return results
+        return self._iter_matches(
+            self._prog_for(pattern), eid, max_results
+        )
 
-    def _match(
+    def _iter_matches(
+        self, prog: _Prog, eid: int, limit: int | None
+    ) -> Iterator[dict[str, Any]]:
+        """Drive one compiled match under a fresh frozen-read epoch.
+
+        Only the streaming path registers the epoch: bounded
+        enumeration (:meth:`_m_bounded`) completes before the first
+        yield, so its overlays would stay empty forever — registering
+        it would just tax every union during consumption.  It still
+        reads through the same frozen accessors on an *unregistered*
+        epoch (empty overlays ≡ live reads), keeping one code path.
+        """
+        if limit is not None:
+            ep = _Epoch(watermark=self._next_id)
+            results: list[dict[str, Any]] = []
+            self._m_bounded(prog.root, eid, {}, results, limit, ep)
+            yield from results
+            return
+        ep = _Epoch(watermark=self._next_id)
+        self._epochs.append(ep)
+        try:
+            bindings: dict[str, Any] = {}
+            for _ in self._m_stream(prog.root, eid, bindings, ep):
+                yield dict(bindings)
+        finally:
+            self._epochs.remove(ep)
+
+    # -- frozen reads (live inside a match epoch) ------------------------
+
+    def _mfind(self, eid: int, ep: _Epoch) -> int:
+        """Canonical e-class id of ``eid`` *as of the epoch freeze*.
+
+        Walks ``uf.parent`` with the epoch's overlays: every root
+        that lost a merge mid-enumeration maps to itself (``ovr``),
+        and every node path-halving reparented mid-enumeration
+        resolves through its journaled freeze-time parent (``jph``).
+        All other parent pointers are untouched by the only two
+        mutations possible mid-epoch (halving, root unions).
+        """
+        ovr = ep.ovr
+        jph = ep.jph
+        parent = self._uf.parent
+        while True:
+            p = ovr.get(eid)
+            if p is None:
+                p = jph.get(eid)
+            if p is None:
+                p = parent[eid]
+            if p == eid:
+                return eid
+            eid = p
+
+    def _mclass(self, eid: int, ep: _Epoch) -> EClass:
+        """Return the e-class of a frozen id (alive or merged away)."""
+        ec = ep.dead.get(eid)
+        if ec is not None:
+            return ec
+        return self._classes[eid]
+
+    def _mnodes(self, eid: int, op: str, ep: _Epoch) -> list:
+        """Frozen ``op``-member list of a frozen class, epoch-cached.
+
+        Members merged in after the freeze (``ep.added``) are
+        subtracted, preserving the call-time member set — and its
+        iteration order (``ec.nodes`` order minus removals).
+        """
+        key = (eid, op)
+        lst = ep.nlists.get(key)
+        if lst is None:
+            ec = self._mclass(eid, ep)
+            added = ep.added.get(eid)
+            if added is None:
+                # Class unchanged since the freeze — the frozen
+                # member list is exactly the live one: reuse the
+                # e-class's persistent ``by_op`` cache instead of
+                # rebuilding the filter every epoch.
+                lst = self._nodes_of(ec, op)
+            else:
+                lst = [
+                    n for n in ec.nodes if n.op == op and n not in added
+                ]
+            ep.nlists[key] = lst
+        return lst
+
+    # -- streaming matcher (unbounded enumeration) -----------------------
+
+    def _m_stream(
+        self, pn: Any, eid: int, b: dict, ep: _Epoch
+    ) -> Iterator[None]:
+        """Yield once per substitution of *pn* at ``eid``.
+
+        Bindings live in the single mutable table ``b`` — bind on
+        descend, undo on backtrack (the trail is each frame's own
+        undo; no per-branch ``dict`` copies).  When the generator
+        yields, ``b`` holds a complete substitution for this subtree.
+        """
+        cls = pn.__class__
+        if cls is _PVar:
+            ce = self._mfind(eid, ep)
+            if pn.name in b:
+                if b[pn.name] == ce:
+                    yield
+                return
+            b[pn.name] = ce
+            yield
+            del b[pn.name]
+            return
+        if cls is _PLeaf:
+            nid = self._node_to_class.get(pn.enode)
+            # ``nid >= watermark``: the leaf was interned mid-
+            # enumeration — the eager matcher never saw it.
+            if (
+                nid is not None
+                and nid < ep.watermark
+                and self._mfind(nid, ep) == self._mfind(eid, ep)
+            ):
+                yield
+            return
+        # _POp
+        ce = self._mfind(eid, ep)
+        for node in self._mnodes(ce, pn.op, ep):
+            if len(node.children) != len(pn.children):
+                continue
+            node_attrs = dict(node.attrs)
+            if set(node_attrs) != pn.keyset:
+                continue
+            # Attribute matching: literal values must equal; a string
+            # pattern value is an attribute metavariable bound under
+            # "$attr:<name>" — binding must be consistent everywhere
+            # the metavar repeats.
+            marked: list[str] = []
+            ok = True
+            for k, pv in pn.attrs:
+                nv = node_attrs[k]
+                if isinstance(pv, str):
+                    key = "$attr:" + pv
+                    if key in b:
+                        if b[key] != nv:
+                            ok = False
+                            break
+                    else:
+                        b[key] = nv
+                        marked.append(key)
+                elif nv != pv:
+                    ok = False
+                    break
+            if ok:
+                yield from self._m_pos(
+                    pn.children, node.children, 0, b, ep
+                )
+            for key in marked:
+                del b[key]
+
+    def _m_pos(
         self,
-        pattern: Any,
+        pats: tuple,
+        children: tuple,
+        i: int,
+        b: dict,
+        ep: _Epoch,
+    ) -> Iterator[None]:
+        """Yield once per joint substitution of child positions ``i..``.
+
+        Threads the incoming bindings so a metavariable appearing at
+        several positions (the shared ``x`` in ``x@W1 + x@W2``) is
+        checked for consistency — the eager semantics' soundness rule.
+        """
+        if i == len(pats):
+            yield
+            return
+        for _ in self._m_stream(pats[i], children[i], b, ep):
+            yield from self._m_pos(pats, children, i + 1, b, ep)
+
+    # -- bounded matcher (max_results) ------------------------------------
+
+    def _m_bounded(
+        self,
+        pn: Any,
         eid: int,
         subst: dict[str, Any],
         results: list[dict[str, Any]],
-        limit: int | None = None,
+        limit: int,
+        ep: _Epoch,
     ) -> None:
-        if limit is not None and len(results) >= limit:
-            return
-        eid = self.find(eid)
-        eclass = self._classes[eid]
+        """Enumerate matches under a result cap — the interpreted spec.
 
-        if isinstance(pattern, str):
-            if pattern in subst:
-                if subst[pattern] == eid:
+        Mirrors the pre-compilation ``_match`` *exactly*, including
+        the cap semantics: an e-node whose enumeration crosses
+        ``limit`` contributes ZERO substitutions (the ``ok=False``
+        drop), while earlier nodes keep theirs.  Bounded memory by
+        construction — ``results`` never exceeds ``limit``.
+        """
+        if len(results) >= limit:
+            return
+        eid = self._mfind(eid, ep)
+
+        if pn.__class__ is _PVar:
+            if pn.name in subst:
+                if subst[pn.name] == eid:
                     results.append(dict(subst))
                 return
-            else:
-                subst[pattern] = eid
-                results.append(dict(subst))
-                del subst[pattern]
-                return
+            subst[pn.name] = eid
+            results.append(dict(subst))
+            del subst[pn.name]
+            return
 
-        if isinstance(pattern, Op):
-            attr_t = _pattern_attrs(pattern)
-            for node in self._nodes_of(eclass, pattern.op):
-                if limit is not None and len(results) >= limit:
-                    return  # pragma: no cover — limit reached only inside trailing extend
-                if len(node.children) != len(pattern.args):
+        if pn.__class__ is _POp:
+            for node in self._mnodes(eid, pn.op, ep):
+                # NB: no cap re-check here — ``results`` only reaches
+                # ``limit`` inside the ``ok`` arm below, which returns
+                # immediately, so a guard at the loop head can never
+                # fire.
+                if len(node.children) != len(pn.children):
                     continue
-                # Attribute matching: every pattern attr key must exist in
-                # the node with an equal value — UNLESS the pattern value
-                # is a string, which makes it an attribute metavariable
-                # bound into the substitution under a "$attr:" key.
-                # This is how shape-polymorphic rules match e.g.
-                # view(t, shape=S) for any concrete S.
                 node_attrs = dict(node.attrs)
-                if set(node_attrs) != {k for k, _ in attr_t}:
+                if set(node_attrs) != pn.keyset:
                     continue
                 attr_substs: list[dict[str, Any]] = [dict(subst)]
                 attr_ok = True
-                for k, pv in attr_t:
+                for k, pv in pn.attrs:
                     nv = node_attrs[k]
                     if isinstance(pv, str):
                         key = "$attr:" + pv
@@ -562,29 +854,24 @@ class EGraph(_ExtractMixin, _ProofMixin):
                         break
                 if not attr_ok:
                     continue
-                # Thread the incoming bindings so that a metavariable which
-                # appears at several positions (e.g. the shared input x in
-                # x@W1 + x@W2) is checked for consistency everywhere.
-                # Starting from {} would silently rebind it, turning an
-                # unSound rewrite into an apparent match.
+                # Thread the incoming bindings so shared metavariables
+                # are checked for consistency at every position.
                 child_substs: list[dict[str, Any]] = attr_substs
                 ok = True
-                for i, pat_arg in enumerate(pattern.args):
+                for i, cp in enumerate(pn.children):
                     new_substs: list[dict[str, Any]] = []
                     for cs in child_substs:
-                        if (
-                            limit is not None
-                            and len(results) + len(new_substs) >= limit
-                        ):
+                        if len(results) + len(new_substs) >= limit:
                             ok = False
                             break
                         child_results: list[dict[str, Any]] = []
-                        self._match(
-                            pat_arg,
+                        self._m_bounded(
+                            cp,
                             node.children[i],
                             dict(cs),
                             child_results,
                             limit,
+                            ep,
                         )
                         new_substs.extend(child_results)
                     if not new_substs:
@@ -592,23 +879,19 @@ class EGraph(_ExtractMixin, _ProofMixin):
                         break
                     child_substs = new_substs
                 if ok:
-                    # child_substs already contain the incoming bindings;
-                    # conflicts were rejected inside the metavar branch.
-                    if limit is not None:
-                        room = limit - len(results)
-                        results.extend(child_substs[:room])
-                        if len(results) >= limit:
-                            return
-                    else:
-                        results.extend(child_substs)
+                    room = limit - len(results)
+                    results.extend(child_substs[:room])
+                    if len(results) >= limit:
+                        return
             return
 
-        # Leaf (Const/Param/Var) — match by key
-        key = ("key", repr(pattern))
-        enode = ENode("leaf", (), (key,))
+        # Concrete leaf — match by registry key.  ``nid >= watermark``
+        # means the leaf was interned mid-enumeration (invisible).
+        nid = self._node_to_class.get(pn.enode)
         if (
-            enode in self._node_to_class
-            and self.find(self._node_to_class[enode]) == eid
+            nid is not None
+            and nid < ep.watermark
+            and self._mfind(nid, ep) == eid
         ):
             results.append(dict(subst))
 
@@ -687,6 +970,14 @@ class EGraph(_ExtractMixin, _ProofMixin):
         nn = ENode(node.op, canon, node.attrs)
         if self._track:
             self._inherit_provenance(node, nn, eid)
+        # Incremental congruence: ``node`` re-keyed out of ``eid`` —
+        # drop its ownership claim if this class held it (a stale claim
+        # would merge a later owner into the wrong class) and queue the
+        # canonical ``nn`` for the ownership worklist.
+        prev = self._cong_owner.get(node)
+        if prev is not None and self.find(prev) == eid:
+            del self._cong_owner[node]
+        self._cong_pend.add((eid, nn))
         return nn, True
 
     def _inherit_provenance(
@@ -701,38 +992,86 @@ class EGraph(_ExtractMixin, _ProofMixin):
             self._enode_app.setdefault(nn, self._enode_app[node])
         self._node_to_class.setdefault(nn, eid)
 
+    def _cong_canon(self, node: ENode) -> ENode:
+        """Return ``node`` with canonically-resolved children."""
+        canon = tuple(self.find(c) for c in node.children)
+        if canon == node.children:
+            return node
+        return ENode(node.op, canon, node.attrs)
+
     def _close_congruence(self) -> bool:
         """Union e-classes whose canonical enodes coincide.
 
         Congruence: two enodes that are identical after child
-        canonicalisation must share a class.  ``union`` merges them and
-        can make further children canonical, so iterate to a fixed
-        point.  All duplicates found in a scan are merged in one round
-        (rather than one per round) — the merge cascade depth is small,
-        so this is O(rounds · enodes), not O(duplicates · enodes).  Only
-        the unrestricted :meth:`rebuild` calls this; the incremental
-        (dirty-frontier) pass relies on the final unrestricted rebuild.
+        canonicalisation must share a class.  This is the INCREMENTAL
+        version (plan 0010, lever 2c): ``_cong_owner`` — the
+        ``canonical enode -> owning class`` map — persists across
+        calls, and the worklist ``_cong_pend`` carries only the enodes
+        that could need re-keying since the last pass: freshly added
+        members (:meth:`_add_enode`), members re-canonicalised by
+        :meth:`_canonicalise`, and members whose child resolved to a
+        class that just merged (:meth:`union`).  The pass is
+        proportional to the delta, not to ``E``; merges it fires
+        enqueue their own deltas, iterating to the same fixed point
+        the whole-graph rescan reached.
         """
+        owner = self._cong_owner
+        pend = self._cong_pend
         changed = False
-        while True:
-            owner: dict[ENode, int] = {}
+        while pend:
             merges: list[tuple[int, int]] = []
-            for eid in list(self._classes.keys()):
-                for node in self._classes[eid].nodes:
-                    prev = owner.setdefault(node, eid)
-                    if prev != eid:
-                        merges.append((prev, eid))
+            while pend:
+                eid0, node = pend.pop()
+                eid = self.find(eid0)
+                # ``find`` returns a live canonical id — always present.
+                eclass = self._classes[eid]
+                nn = self._cong_canon(node)
+                if nn is not node:
+                    # Re-keyed out of the class — apply the
+                    # canonicalisation pointwise.
+                    if node in eclass.nodes:
+                        eclass.nodes.discard(node)
+                        eclass.nodes.add(nn)
+                        eclass.by_op = None
+                        if self._track:
+                            # ``_inherit_provenance`` also hash-conses
+                            # ``nn`` into ``_node_to_class``.
+                            self._inherit_provenance(node, nn, eid)
+                        for c in nn.children:
+                            self._parents.setdefault(
+                                self.find(c), set()
+                            ).add(eid)
+                        # Drop the pre-canonical form's claim — a
+                        # claim can only belong to the class holding
+                        # the node (``eid`` or a predecessor that
+                        # merged into it), so an unconditional pop is
+                        # equivalent to checking ``find(prev)==eid``.
+                        owner.pop(node, None)
+                    if nn not in eclass.nodes:
+                        continue
+                    node = nn
+                elif node not in eclass.nodes:
+                    # Stale worklist item — the enode is gone.
+                    continue
+                prev = owner.setdefault(node, eid)
+                if self.find(prev) != eid:
+                    merges.append((prev, eid))
             if not merges:
                 return changed
             changed = True
             for a, b in merges:
                 self.union(a, b)
-            self._canonicalise(list(self._classes.keys()))
+        return changed
 
     # -- rule application --
 
-    def _instantiate(self, pattern: Any, subst: dict[str, Any]) -> int:
-        """Instantiate a pattern (RHS) with a substitution.
+    def _instantiate(self, pn: Any, subst: dict[str, Any]) -> int:
+        """Instantiate a compiled pattern (RHS) with a substitution.
+
+        Takes the compiled ``_PNode`` tree (see
+        :func:`catopt_core.egraph.match.compile_pattern`) — the same
+        recursion the interpreted version ran, minus the per-node
+        ``isinstance`` ladder and ``_pattern_attrs`` recomputation.
 
         When proof tracking is on, ``self._inst_last_enode`` records the
         enode realising the pattern's root (post-order: the outermost
@@ -740,31 +1079,35 @@ class EGraph(_ExtractMixin, _ProofMixin):
         instantiated RHS is headed by — or ``None`` when the RHS is a
         bare metavariable/leaf binding.
         """
-        if isinstance(pattern, str):
+        cls = pn.__class__
+        if cls is _PVar:
             self._inst_last_enode = None
-            return subst[pattern]
-        if isinstance(pattern, Op):
+            return subst[pn.name]
+        if cls is _POp:
             child_eids = tuple(
-                self._instantiate(a, subst) for a in pattern.args
+                self._instantiate(a, subst) for a in pn.children
             )
-            attr_t = _pattern_attrs(pattern)
-            # Attribute metavariables (string values) resolve through the
-            # substitution's "$attr:" namespace.
-            attrs = {}
-            for k, v in attr_t:
-                if isinstance(v, str):
-                    attrs[k] = subst.get("$attr:" + v, v)
-                else:
-                    attrs[k] = v
-            enode = ENode(
-                pattern.op,
-                tuple(self.find(c) for c in child_eids),
-                tuple(
+            if pn.attrs:
+                # Attribute metavariables (string values) resolve
+                # through the substitution's "$attr:" namespace.
+                attrs = {}
+                for k, v in pn.attrs:
+                    if isinstance(v, str):
+                        attrs[k] = subst.get("$attr:" + v, v)
+                    else:
+                        attrs[k] = v
+                attr_t = tuple(
                     sorted(
                         (k, _norm_attr_value(v))
                         for k, v in attrs.items()
                     )
-                ),
+                )
+            else:
+                attr_t = ()
+            enode = ENode(
+                pn.op,
+                tuple(self.find(c) for c in child_eids),
+                attr_t,
             )
             if enode in self._node_to_class:
                 eid = self.find(self._node_to_class[enode])
@@ -772,18 +1115,16 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 eid = self._add_enode(enode)
             self._inst_last_enode = enode
             return eid
-        else:
-            # Register the concrete leaf BEFORE minting the enode: a
-            # leaf key that was never seen by ``add_term`` (a Const in
-            # a rule RHS, or a re-used repr name) would otherwise
-            # decode to a stale cross-call term — or to the raw key
-            # string, which poisons any extracted member it lands in.
-            _LeafRegistry.register(pattern)
-            eid = self.add_leaf(repr(pattern))
-            self._inst_last_enode = ENode(
-                "leaf", (), (("key", repr(pattern)),)
-            )
-            return eid
+        # _PLeaf
+        # Register the concrete leaf BEFORE minting the enode: a
+        # leaf key that was never seen by ``add_term`` (a Const in
+        # a rule RHS, or a re-used repr name) would otherwise
+        # decode to a stale cross-call term — or to the raw key
+        # string, which poisons any extracted member it lands in.
+        _LeafRegistry.register(pn.term)
+        eid = self.add_leaf(pn.key)
+        self._inst_last_enode = pn.enode
+        return eid
 
     def any_term(
         self,
@@ -922,26 +1263,55 @@ class EGraph(_ExtractMixin, _ProofMixin):
             eclass.cache["min_term"] = (t, s)
         return t
 
+    def _head_ok(self, prog: _Prog, eid: int) -> bool:
+        """Cheap child-op eligibility check for one candidate class.
+
+        True iff some ``head_op`` member of the class has, at every
+        Op-typed child position of the compiled pattern, a child class
+        containing a member of the required op.  Pure existence filter
+        — the matcher still does the real work, but a class that
+        cannot possibly match never opens a match enumeration.
+        """
+        eclass = self._classes[eid]
+        reqs = prog.child_reqs
+        # ``child_reqs`` only exists on ``_POp`` roots — head_op is set.
+        head_op = cast(str, prog.head_op)
+        for node in self._nodes_of(eclass, head_op):
+            if len(node.children) != prog.head_arity:
+                continue
+            if all(
+                self.find(node.children[i])
+                in self._op_classes.get(op, ())
+                for i, op in reqs
+            ):
+                return True
+        return False
+
     def _candidate_classes(
-        self, lhs: Any, search: set | list | None
+        self, prog: _Prog, search: set | list | None
     ) -> Any:
-        """E-classes a rule's LHS could possibly match at.
+        """E-classes a rule's compiled LHS could possibly match at.
 
         ``search=None`` scans the whole graph (the pre-incremental
         behaviour); a set restricts to the dirty frontier.  In both
         cases an Op-rooted pattern additionally filters to classes
-        that contain a member with the pattern's head op, a
-        metavariable pattern binds at any class, and a concrete-leaf
-        pattern can only match at the leaf's own class.
+        that contain a member with the pattern's head ``(op, arity)``
+        — the targeted-eligibility index (lever 1b) — plus the
+        child-op existence check when the pattern's children are
+        Op-typed; a metavariable pattern binds at any class, and a
+        concrete-leaf pattern can only match at the leaf's own class.
         """
-        if isinstance(lhs, Op):
+        if prog.head_op is not None:
             eligible = {
-                self.find(c) for c in self._op_classes.get(lhs.op, ())
+                self.find(c)
+                for c in self._opk.get(
+                    (prog.head_op, prog.head_arity), ()
+                )
             }
-        elif isinstance(lhs, str):
+        elif prog.leaf_key is None:
             eligible = None
         else:
-            leaf = ENode("leaf", (), (("key", repr(lhs)),))
+            leaf = ENode("leaf", (), (("key", prog.leaf_key),))
             leid = self._node_to_class.get(leaf)
             eligible = {self.find(leid)} if leid is not None else set()
         # ``_classes`` mutates under us as unions fire — snapshot.
@@ -949,6 +1319,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
         for eid0 in ids:
             eid = self.find(eid0)
             if eligible is not None and eid not in eligible:
+                continue
+            if prog.child_reqs and not self._head_ok(prog, eid):
                 continue
             yield eid
 
@@ -982,8 +1354,10 @@ class EGraph(_ExtractMixin, _ProofMixin):
         changed = False
         n_start = self.n_enodes
         self._anyterm_memo = {}
+        lhs_prog = self._prog_for(rule.lhs)
+        rhs_prog = self._prog_for(rule.rhs)
         try:
-            candidates = self._candidate_classes(rule.lhs, search)
+            candidates = self._candidate_classes(lhs_prog, search)
             for eid in candidates:
                 match_cap = None
                 if enode_budget is not None:
@@ -993,8 +1367,13 @@ class EGraph(_ExtractMixin, _ProofMixin):
                     match_cap = min(
                         enode_budget - spent, self._MATCH_CAP
                     )
-                for subst in self.matches(
-                    rule.lhs, eid, max_results=match_cap
+                # Streaming consumption (lever 2b): each substitution
+                # is applied as it is yielded; the enumeration reads
+                # the frozen epoch so the stream equals the eager
+                # list.  The epoch is released by the generator's own
+                # ``finally`` on exhaustion/close.
+                for subst in self._iter_matches(
+                    lhs_prog, eid, match_cap
                 ):
                     if (
                         rule.check is not None
@@ -1029,13 +1408,17 @@ class EGraph(_ExtractMixin, _ProofMixin):
                         self._collect = []
                         self._inst_last_enode = None
                         try:
-                            rhs_eid = self._instantiate(rule.rhs, subst)
+                            rhs_eid = self._instantiate(
+                                rhs_prog.root, subst
+                            )
                         finally:
                             self._tag_rule = None
                             created = self._collect
                             self._collect = None
                     else:
-                        rhs_eid = self._instantiate(rule.rhs, subst)
+                        rhs_eid = self._instantiate(
+                            rhs_prog.root, subst
+                        )
                     self._rule_objs.setdefault(rule.name, rule)
                     merged = self.union(
                         eid, rhs_eid, rule=rule.name, subst=subst
@@ -1078,6 +1461,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
         max_iterations: int = 100,
         max_nodes: int = 100_000,
         rule_budgets: dict[str, int] | None = None,
+        stop: str = "fixed_point",
+        patience: int = 3,
+        cost_fn: Any = None,
     ) -> dict[str, Any]:
         """Run equality saturation until a fixed point.
 
@@ -1104,11 +1490,49 @@ class EGraph(_ExtractMixin, _ProofMixin):
         point that — measured on the transformer pipeline — already
         covers every rewrite the extractor can exploit.  Budget
         accounting is reported in ``stats["rule_budgets"]``.
+
+        Rule scheduling (lever 1c): when ``rules`` carries a
+        ``priority_of`` map (a :class:`~catopt_core.laws.RuleSet`), each
+        iteration applies the rules in priority order — lower first, so
+        cheap/filtering rules fire before the closure-generating ones.
+        Ordering is a stable sort, so rules at the default priority
+        keep their declared order — the default presets (no
+        priorities) behave identically to before.
+
+        Lazy saturation (lever 1d, opt-in): ``stop="improving"``
+        extracts the best term after every iteration and stops once
+        the cost has not strictly improved for ``patience``
+        consecutive iterations.  It is a **heuristic** — it can stop
+        before the true optimum — and stays opt-in; the default
+        ``"fixed_point"`` is unchanged.  ``cost_fn`` is required for
+        ``"improving"``.  Termination is reported in
+        ``stats["stop"]`` (``"fixed_point"`` / ``"improving"`` /
+        ``"max_nodes"`` / ``"max_iterations"``) and, under
+        ``"improving"``, ``stats["improved"]`` counts the iterations
+        that lowered the extracted cost.
         """
+        if stop not in ("fixed_point", "improving"):
+            raise ValueError(
+                f"stop must be 'fixed_point' or 'improving', "
+                f"got {stop!r}"
+            )
+        if stop == "improving" and cost_fn is None:
+            raise ValueError(
+                "stop='improving' needs a cost_fn to extract with"
+            )
+        ordered = list(rules)
+        priority_of = getattr(rules, "priority_of", None)
+        if priority_of is not None:
+            # Stable sort — equal priorities keep declaration order.
+            ordered.sort(key=priority_of)
         budgets = rule_budgets or {}
         spent = self._budget_spent
         for name in budgets:
             spent.setdefault(name, 0)
+        stop_reason = "max_iterations"
+        best_cost = float("inf")
+        stall = 0
+        improved = 0
         iteration = -1
         for iteration in range(max_iterations):
             n_before = self.n_enodes
@@ -1117,7 +1541,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
             # fixed point is unchanged, the schedule is tighter.
             search = sorted({self.find(e) for e in self._dirty})
             self._dirty.clear()
-            for rule in rules:
+            for rule in ordered:
                 budget = budgets.get(rule.name)
                 if budget is not None:
                     remaining = budget - spent[rule.name]
@@ -1159,6 +1583,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
                     "  [egraph] stopping: max_nodes (%d) reached",
                     max_nodes,
                 )
+                stop_reason = "max_nodes"
                 break
             if n_after == n_before and not self._dirty:
                 logger.info(
@@ -1169,7 +1594,25 @@ class EGraph(_ExtractMixin, _ProofMixin):
                         "classes": self.n_classes,
                     },
                 )
+                stop_reason = "fixed_point"
                 break
+            if stop == "improving":
+                # Lazy saturation: re-extract each iteration — the
+                # shared cost memo (``_cost_memo_for``) makes repeat
+                # extractions cheap on an only-just-grown graph.
+                term = self.extract_best(root_eid, cost_fn)
+                cost = (
+                    cost_fn(term) if term is not None else float("inf")
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    stall = 0
+                    improved += 1
+                else:
+                    stall += 1
+                    if stall >= patience:
+                        stop_reason = "improving"
+                        break
         # Leave the graph in the same canonicalised postcondition the
         # unrestricted loop guaranteed (downstream passes and
         # extraction traverse it directly).
@@ -1177,7 +1620,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         # The payload mixes counts with the ``rule_budgets`` map and the
         # ``budget_suspended`` list, so the return type is ``dict[str,
         # Any]``.
-        return {
+        stats: dict[str, Any] = {
             "iterations": iteration + 1,
             "n_enodes": self.n_enodes,
             "n_classes": self.n_classes,
@@ -1187,6 +1630,10 @@ class EGraph(_ExtractMixin, _ProofMixin):
             "budget_suspended": [
                 n for n in budgets if spent[n] >= budgets[n]
             ],
+            "stop": stop_reason,
         }
+        if stop == "improving":
+            stats["improved"] = improved
+        return stats
 
     # -- extraction --

@@ -1,8 +1,8 @@
 # Bandit configuration for catopt.
 #
-# Run: .venv/bin/bandit -c .bandit.yaml -r packages catopt
+# Run: .venv/bin/bandit -c .bandit.yaml -r packages
 #
-# The scan is already scoped to shipped source by `-r packages catopt`;
+# The scan is already scoped to shipped source by `-r packages`;
 # `exclude_dirs` is stated explicitly so that a bare
 # `bandit -c .bandit.yaml -r .` stays equivalent.  tests/ and bench/ are
 # not production code and are intentionally out of scope.

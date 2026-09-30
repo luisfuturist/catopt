@@ -86,7 +86,7 @@ def test_pattern_match_metavar():
 
     # Match: add("a", "b") should match add(x, y)
     pattern = Op.make("add", "a", "b")
-    matches = eg.matches(pattern, eg.find(eid))
+    matches = list(eg.matches(pattern, eg.find(eid)))
     assert len(matches) == 1
     # The match should bind a and b
     m = matches[0]
@@ -119,7 +119,7 @@ def test_repeated_metavar_enforces_same_eclass():
     )
     eg_same = EGraph()
     eid_same = eg_same.add_term(same)
-    assert len(eg_same.matches(pattern, eg_same.find(eid_same))) >= 1
+    assert len(list(eg_same.matches(pattern, eg_same.find(eid_same)))) >= 1
 
     # Case 2: different inputs x and y — must NOT match.
     diff = Op.make(
@@ -127,7 +127,7 @@ def test_repeated_metavar_enforces_same_eclass():
     )
     eg_diff = EGraph()
     eid_diff = eg_diff.add_term(diff)
-    assert len(eg_diff.matches(pattern, eg_diff.find(eid_diff))) == 0
+    assert len(list(eg_diff.matches(pattern, eg_diff.find(eid_diff)))) == 0
 
 
 def test_extract_best():
@@ -369,14 +369,14 @@ def test_matches_max_results_cap():
 
     eg.run([ASSOC_ADD, COMM_ADD], eid, max_iterations=10)
     root = eg.find(eid)
-    full = eg.matches(
+    full = list(eg.matches(
         Op.make("add", "a", Op.make("add", "b", "c")), root
-    )
-    capped = eg.matches(
+    ))
+    capped = list(eg.matches(
         Op.make("add", "a", Op.make("add", "b", "c")),
         root,
         max_results=3,
-    )
+    ))
     assert len(capped) == 3
     assert len(full) > 3
 

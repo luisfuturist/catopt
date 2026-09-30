@@ -1221,10 +1221,10 @@ def test_match_limit_caps():
     fy = eg.add_term(Op.make("f", y))
     eg.union(fx, fy)
     E = eg.find(fx)
-    assert eg.matches(Op.make("f", "a"), E, max_results=0) == []
-    one = eg.matches(Op.make("f", "a"), E, max_results=1)
+    assert list(eg.matches(Op.make("f", "a"), E, max_results=0)) == []
+    one = list(eg.matches(Op.make("f", "a"), E, max_results=1))
     assert len(one) == 1
-    assert len(eg.matches(Op.make("f", "a"), E)) == 2
+    assert len(list(eg.matches(Op.make("f", "a"), E))) == 2
 
     # cap hit mid-argument: first arg expands to 2 substs, the second
     # arg's enumeration is truncated by the results limit
@@ -1236,8 +1236,8 @@ def test_match_limit_caps():
     yc = eg2.add_term(y)
     g = eg2.add_enode("g", (E2, yc))
     pat = Op.make("g", Op.make("f", "a"), "b")
-    assert len(eg2.matches(pat, g, max_results=1)) == 1
-    assert len(eg2.matches(pat, g)) == 2
+    assert len(list(eg2.matches(pat, g, max_results=1))) == 1
+    assert len(list(eg2.matches(pat, g))) == 2
 
 
 def test_match_attr_metavar_multi_bind():
@@ -1250,10 +1250,10 @@ def test_match_attr_metavar_multi_bind():
     v2 = eg.add_enode("vf", (xc,), {"k": 2})
     eg.union(v1, v2)
     cls = eg.find(v1)
-    got = eg.matches(Op.make("vf", "a", k="S"), cls)
+    got = list(eg.matches(Op.make("vf", "a", k="S"), cls))
     assert {m["$attr:S"] for m in got} == {1, 2}
     # concrete attr patterns filter to equal-valued members
-    got1 = eg.matches(Op.make("vf", "a", k=1), cls)
+    got1 = list(eg.matches(Op.make("vf", "a", k=1), cls))
     assert len(got1) == 1
     # by_op index rebuilt after the union (nodes_of lazily re-indexes)
     assert {m["a"] for m in got} == {cls} or len(got) == 2
@@ -1426,8 +1426,8 @@ def test_match_repeated_metavar_consistency():
     same = eg.add_enode("add", (E, E))
     diff = eg.add_enode("add", (E, dc))
     pat = Op.make("add", "a", "a")
-    assert len(eg.matches(pat, same)) == 1
-    assert eg.matches(pat, diff) == []
+    assert len(list(eg.matches(pat, same))) == 1
+    assert list(eg.matches(pat, diff)) == []
 
 
 def test_match_enode_arity_and_attrkey_mismatch():
@@ -1439,16 +1439,16 @@ def test_match_enode_arity_and_attrkey_mismatch():
     eg.union(f1, f2)
     cls = eg.find(f1)
     # the 2-ary member is skipped on the arity check
-    assert len(eg.matches(Op.make("f", "a"), cls)) == 1
+    assert len(list(eg.matches(Op.make("f", "a"), cls))) == 1
     # attribute key-set mismatch: node has {k, k2}, pattern only {k}
     v1 = eg.add_enode("vf", (xc,), {"k": 1})
     v2 = eg.add_enode("vf", (xc,), {"k": 1, "k2": 5})
     eg.union(v1, v2)
     vcls = eg.find(v1)
-    got = eg.matches(Op.make("vf", "a", k="S"), vcls)
+    got = list(eg.matches(Op.make("vf", "a", k="S"), vcls))
     assert len(got) == 1 and got[0]["$attr:S"] == 1
     # concrete leaf pattern for an absent leaf -> no result
-    assert eg.matches(Const(9), cls) == []
+    assert list(eg.matches(Const(9), cls)) == []
 
 
 def test_match_shared_attr_metavar_recheck():
@@ -1461,7 +1461,7 @@ def test_match_shared_attr_metavar_recheck():
     bad = eg.add_enode("vf", (xc,), {"k": 1, "k2": 9})
     eg.union(good, bad)
     cls = eg.find(good)
-    got = eg.matches(Op.make("vf", "a", k="S", k2="S"), cls)
+    got = list(eg.matches(Op.make("vf", "a", k="S", k2="S"), cls))
     assert len(got) == 1
     assert got[0]["$attr:S"] == 1
 
@@ -1474,8 +1474,8 @@ def test_match_limit_larger_than_results():
     fx = eg.add_term(Op.make("f", x))
     fy = eg.add_term(Op.make("f", y))
     eg.union(fx, fy)
-    assert len(eg.matches(Op.make("f", "a"), eg.find(fx),
-                          max_results=5)) == 2
+    assert len(list(eg.matches(Op.make("f", "a"), eg.find(fx),
+                          max_results=5))) == 2
 
 
 def test_match_multiarg_cap_breaks_mid_enumeration():
@@ -1495,8 +1495,8 @@ def test_match_multiarg_cap_breaks_mid_enumeration():
     pat = Op.make("g", Op.make("f", "a"), Op.make("f", "b"))
     # the second arg's enumeration overflows the cap mid-loop: the
     # whole node match is rejected (the cap is per-node atomic)
-    assert eg.matches(pat, g, max_results=2) == []
-    assert len(eg.matches(pat, g)) == 4
+    assert list(eg.matches(pat, g, max_results=2)) == []
+    assert len(list(eg.matches(pat, g))) == 4
 
 
 def test_rebuild_inherits_rule_provenance():

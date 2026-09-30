@@ -945,6 +945,26 @@ def run_bench(args: argparse.Namespace) -> Report:
         )
     print()
 
+    # -- scaling table: enodes vs seconds (plan 0010 evidence) -------
+    print(
+        "SCALING (enodes -> saturation seconds; the matcher/closure "
+        "cost this repo's perf plan attacks):"
+    )
+    hdr = f"{'policy':>9} | {'k':>4} | {'enodes':>7} | {'seconds':>8}"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in exact_rows:
+        print(
+            f"{'exact':>9} | {r['k']:>4} | {r['enodes']:>7} | "
+            f"{r['wall_ms'] / 1e3:>8.3f}"
+        )
+    for r in bounded_rows:
+        print(
+            f"{'bounded':>9} | {r['k']:>4} | {r['enodes']:>7} | "
+            f"{r['wall_ms'] / 1e3:>8.3f}"
+        )
+    print()
+
     # -- the honest comparison ------------------------------------------
     kmax = max(depths)
     bmax = max(bounded_rows, key=lambda r: r["k"])

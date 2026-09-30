@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "catopt-native"
+version = "0.1.0dev"
+description = "Optional native (Rust) search core for catopt equality saturation — PyO3 bindings implementing union-find, enode storage, compiled matching, rebuild/congruence and the saturation loop behind the catopt_core Engine protocol."
+requires-python = ">=3.11"
+dependencies = [
+    "catopt-core",
+]
+
+[tool.maturin]
+# The compiled extension lands INSIDE the catopt_native package as
+# ``catopt_native._native``; the pure-Python adapter (serialization +
+# the Engine surface) lives next to it under ``python/``.
+python-source = "python"
+module-name = "catopt_native._native"
+features = ["pyo3/extension-module"]

@@ -318,7 +318,7 @@ class TestSeededTracePipeline:
         assert eg.rule_fires.get("tr_vanish_split", 0) >= 1
         # the channel-split form is a member of the root e-class
         # (matches() is e-class relative: match the whole rooted term)
-        assert eg.matches(
+        assert list(eg.matches(
             Op.make(
                 "matmul",
                 Op.make(
@@ -329,7 +329,7 @@ class TestSeededTracePipeline:
                 "x",
             ),
             root,
-        )
+        ))
 
     def test_frontier_serves_trace_members_fp64(self):
         """regime_frontier extracts trace-bearing members; both the

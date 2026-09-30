@@ -314,10 +314,17 @@ def _carrier_upgrade(
     billed under the executor it would route to.  Swap only when the
     carrier member is cheaper AND its batched plan exists (else the
     module degrades to serial eval and the price lied).
+
+    An engine without a materialised ``_classes`` view (the
+    :class:`~catopt_core.ports.Engine` port does not require one)
+    skips the pass — greedy extraction already ran.
     """
+    eclasses = getattr(eg, "_classes", None)
+    if eclasses is None:
+        return best_term
     plans = _carrier_plans()
     cid = eg.find(root_eid)
-    carriers = [n for n in eg._classes[cid].nodes if n.op in plans]
+    carriers = [n for n in eclasses[cid].nodes if n.op in plans]
     if not carriers:
         return best_term
     best_price = _delivered_cost(best_term, profile, compiled)
@@ -471,6 +478,24 @@ def _resolve_rules(rules: Any) -> RuleSet:
             return default_rules()
         return preset(rules)
     return RuleSet("custom", tuple(rules))
+
+
+def _resolve_engine(engine: Any) -> Any:
+    """Materialise the saturation engine for :func:`search`.
+
+    ``None`` → the pure-Python reference :class:`EGraph` (the
+    default).  A class or zero-arg factory is called to produce the
+    engine; an engine instance — anything carrying the
+    :class:`~catopt_core.ports.Engine` surface, duck-typed on
+    ``add_term`` — is used directly.  Engines are **never
+    auto-detected**: installing ``catopt_native`` changes nothing
+    until ``engine=`` is passed.
+    """
+    if engine is None:
+        return EGraph()
+    if isinstance(engine, type) or not hasattr(engine, "add_term"):
+        engine = engine()
+    return engine
 
 
 def _pairing_and_lifts(
@@ -661,6 +686,9 @@ def search(
     delivers_compiled: bool = False,
     meter: Meter | None = None,
     verbose: bool = False,
+    stop: str = "fixed_point",
+    patience: int = 3,
+    engine: Any = None,
 ) -> SearchResult:
     """Run the search phase: ``model -> SearchResult``.
 
@@ -729,6 +757,31 @@ def search(
         The backend's timing port — consulted only for the optional
         device-memory read the ``max_memory_mb`` bound needs (host
         RSS is read portably).  ``None`` counts host bytes only.
+    stop : {"fixed_point", "improving"}, default "fixed_point"
+        Saturation stop policy (plan 0010, lever 1d).
+        ``"fixed_point"`` runs to the exact fixed point — the
+        historical behaviour and the default.  ``"improving"`` is an
+        **opt-in heuristic**: the best term is re-extracted after
+        every iteration and saturation stops once its cost has not
+        strictly improved for ``patience`` consecutive iterations —
+        most wins land in the first few iterations, but it can stop
+        before the true optimum.  The outcome is recorded in
+        ``stats["stop"]`` and ``stats["improved"]``.
+    patience : int, default 3
+        Consecutive non-improving iterations tolerated under
+        ``stop="improving"``.
+    engine : Engine, optional
+        The saturation engine — an instance, class, or zero-arg
+        factory conforming to :class:`catopt_core.ports.Engine`.
+        ``None`` uses the pure-Python reference ``EGraph``.  The
+        optional native accelerator is
+        ``catopt_native.NativeEngine`` — engines are never
+        auto-detected, and ``stats["engine"]`` records which ran.
+        The engine port covers the *search* only: the non-local
+        pairing/lift passes (which mutate through the proof-carrying
+        ``union(witness=...)`` surface) run only on the Python
+        engine and are skipped otherwise; certificates likewise stay
+        a Python-engine concern.
     verbose : bool
         Print progress.
 
@@ -767,7 +820,7 @@ def search(
             "[Phase 2] Building e-graph and running equality "
             "saturation..."
         )
-    eg = EGraph()
+    eg = _resolve_engine(engine)
     root_eid = eg.add_term(ir.root)
     rules = _resolve_rules(rules)
     if verbose:
@@ -794,21 +847,36 @@ def search(
         max_iterations=max_iterations,
         max_nodes=run_cap,
         rule_budgets=rule_budgets,
+        stop=stop,
+        patience=patience,
+        cost_fn=cost_fn,
     )
+    # Which saturation core ran — the reference engine needs no marker,
+    # engines declare ``engine_name`` ("native", ...).
+    stats["engine"] = getattr(eg, "engine_name", "python")
     _check_resources(eg, max_enodes, max_memory_mb, meter)
 
-    groups = _pairing_and_lifts(
-        eg,
-        rules,
-        root_eid,
-        stats,
-        run_cap,
-        rule_budgets,
-        max_enodes,
-        max_memory_mb,
-        source_tensors,
-        meter,
-    )
+    if isinstance(eg, EGraph):
+        groups = _pairing_and_lifts(
+            eg,
+            rules,
+            root_eid,
+            stats,
+            run_cap,
+            rule_budgets,
+            max_enodes,
+            max_memory_mb,
+            source_tensors,
+            meter,
+        )
+    else:
+        # Non-local passes (pairing + carrier lifts) offer members
+        # through the proof-carrying ``union(witness=...)`` surface —
+        # a Python-engine capability the ``Engine`` port does not
+        # require.  A run needing them (or certificates) uses the
+        # Python engine; see the ``engine`` docstring.
+        groups = []
+        stats["nonlocal_passes"] = "skipped (engine is not an EGraph)"
 
     stats["rule_fires"] = dict(eg.rule_fires)
     stats["criteria"] = criteria_used
@@ -1184,6 +1252,12 @@ class Optimizer:
     #: The optimizer's default saturation rule set — ``None`` resolves
     #: to the composed :data:`DEFAULT_RULES` at search time.
     rules: RuleSet | str | Iterable | None = None
+    #: The default saturation engine — ``None`` uses the pure-Python
+    #: reference ``EGraph``; an instance, class, or zero-arg factory
+    #: conforming to :class:`catopt_core.ports.Engine` (e.g.
+    #: ``catopt_native.NativeEngine``) selects explicitly.  Never
+    #: auto-detected.
+    engine: Any = None
 
     def __post_init__(self) -> None:
         """Resolve ports — explicit args override the backend's.
@@ -1236,6 +1310,7 @@ class Optimizer:
             bool(getattr(self.runner, "delivers_compiled", False)),
         )
         kw.setdefault("meter", self.meter)
+        kw.setdefault("engine", self.engine)
         return _search(model, x, **kw)
 
     def lower(

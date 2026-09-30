@@ -11,7 +11,7 @@ For each named law it
 2. interns the term in an ``EGraph`` and runs THAT LAW ALONE to
    saturation (``eg.run([rule], ...)``),
 3. reports whether the law fired (``eg.rule_fires``), whether its
-   RHS landed in the root e-class (``eg.matches(rule.rhs, root)``),
+   RHS landed in the root e-class (``list(eg.matches(rule.rhs, root))``),
    and whether cost-model extraction actually *picked* the new
    member — firing is necessary but not sufficient: an equal-cost
    or pricier member is found but never selected,
@@ -743,7 +743,7 @@ def _bench_one(
             return Case(rule.name, params, [], aux)
         if isinstance(rule.rhs, Op):
             aux["rhs_member"] = (
-                "yes" if eg.matches(rule.rhs, eg.find(root)) else "no"
+                "yes" if list(eg.matches(rule.rhs, eg.find(root))) else "no"
             )
         else:
             aux["rhs_member"] = "yes"  # bare metavar: the merge IS it

@@ -59,6 +59,12 @@ The ports (this file)
 * :class:`Binding` — one op's lowering, ``(*args, **attrs)``
   (``TorchBinding`` is the historical alias of the same protocol).
 * :class:`OpRegistry` — the adapter-registry port.
+* :class:`Engine` — the saturation *engine* seam (plan 0010, lever 3):
+  the search core behind ``search``/``Optimizer`` — ``add_term`` /
+  ``find`` / ``run`` / ``extract_best``.  ``EGraph`` is the reference
+  implementation and the default; ``catopt_native.NativeEngine`` is the
+  optional native accelerator.  Engine selection is explicit only —
+  never auto-detected.
 
 Outside the hexagon (the adapters)
 ----------------------------------
@@ -140,6 +146,7 @@ __all__ = [
     "Composer",
     "CostFn",
     "Criterion",
+    "Engine",
     "Executor",
     "ExecutorSpec",
     "Meter",
@@ -814,6 +821,101 @@ class RuleSetProvider(Protocol):
 
     def __call__(self) -> RuleSetLike:
         """Return the rule set."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+#  The engine seam — which saturation core runs the search
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class Engine(Protocol):
+    """A saturation engine: the search core behind ``search``.
+
+    The port (plan 0010, lever 3) names the surface
+    ``catopt_orchestrator.optimize.search`` consumes, so the pure-Python
+    :class:`~catopt_core.egraph.EGraph` (the reference implementation
+    and the default) and the optional ``catopt_native.NativeEngine``
+    are interchangeable values:
+
+    * ``add_term(term) -> eid`` — intern a program's DAG; each call
+      registers every enode and returns the root's e-class.
+    * ``find(eid) -> canonical eid`` — union-find lookup.
+    * ``run(rules, root_eid, max_iterations, max_nodes, rule_budgets,
+      stop, patience, cost_fn) -> stats`` — equality saturation under
+      the given schedule; the stats dict carries ``iterations``,
+      ``n_enodes``, ``n_classes``, ``rule_budgets``,
+      ``budget_suspended``, ``stop``.
+    * ``extract_best(eid, cost_fn, **kw) -> term`` — greedy
+      minimum-cost member extraction (``overrides`` / ``bans`` /
+      ``fusion_epsilon`` ride in ``**kw`` like ``EGraph``'s signature).
+    * ``rebuild(classes=None) -> bool`` — canonicalise (+congruence
+      on an unrestricted pass).
+    * ``rule_fires``, ``n_enodes``, ``n_classes`` — the run record.
+
+    Engines are **never auto-detected**: ``search``/``Optimizer`` take
+    ``engine=`` explicitly and ``stats["engine"]`` records which ran
+    (``"python"`` by convention when the object does not declare an
+    ``engine_name`` — ``EGraph`` is the reference, so it needs no
+    marker; ``NativeEngine.engine_name == "native"``).
+
+    The scope boundary is part of the contract: the port covers the
+    *search* only.  Proof machinery (merge logs, applications,
+    certificates) and the non-local pairing/lift passes are
+    Python-engine capabilities — a conforming engine is not required
+    to provide them, and the pipeline falls back to skipping the
+    non-local passes when the engine is not an ``EGraph``.
+    """
+
+    def add_term(
+        self,
+        term: Any,
+        _memo: dict | None = None,
+        provenance: str = "input",
+    ) -> int:
+        """Intern *term*; return the root's e-class id."""
+        ...
+
+    def find(self, eid: int) -> int:
+        """Return the canonical e-class id of ``eid``."""
+        ...
+
+    def rebuild(self, classes: Any = None) -> bool:
+        """Canonicalise children; close congruence when unrestricted."""
+        ...
+
+    def run(
+        self,
+        rules: RuleSetLike,
+        root_eid: int,
+        max_iterations: int = 100,
+        max_nodes: int = 100_000,
+        rule_budgets: dict[str, int] | None = None,
+        stop: str = "fixed_point",
+        patience: int = 3,
+        cost_fn: CostFn | None = None,
+    ) -> dict[str, Any]:
+        """Saturate under *rules*; return the run record stats."""
+        ...
+
+    def extract_best(self, eid: int, cost_fn: CostFn, **kw: Any) -> Any:
+        """Return the minimum-cost member of the e-class at *eid*."""
+        ...
+
+    @property
+    def n_enodes(self) -> int:
+        """Return the number of enodes interned."""
+        ...
+
+    @property
+    def n_classes(self) -> int:
+        """Return the number of e-classes."""
+        ...
+
+    @property
+    def rule_fires(self) -> dict[str, int]:
+        """Return ``{rule_name: merge_count}`` from the last run."""
         ...
 
 

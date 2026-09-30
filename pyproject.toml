@@ -85,6 +85,11 @@ packages = []
 # --- uv workspace: the domain packages ---------------------------
 [tool.uv.workspace]
 members = ["packages/*"]
+# catopt-native is an OPTIONAL distribution built with maturin/cargo —
+# excluded from the uv workspace so ``uv sync``/``uv lock`` never need
+# a Rust toolchain.  Build it explicitly:
+#   maturin develop --release   (from packages/catopt-native)
+exclude = ["packages/catopt-native"]
 
 [tool.uv.sources]
 catopt-core = { workspace = true }
@@ -191,6 +196,10 @@ extra-paths = [
     "packages/catopt-carriers/src",
     "packages/catopt-orchestrator/src",
     "packages/catopt-cuda/src",
+    # catopt-native is optional (maturin-built); its `python/` source
+    # dir holds the adapter plus the `_native.pyi` stub ty resolves
+    # against the compiled extension.
+    "packages/catopt-native/python",
 ]
 
 [tool.ty.src]

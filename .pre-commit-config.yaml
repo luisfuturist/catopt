@@ -14,7 +14,7 @@ repos:
       - id: ty
         name: ty
         # Whole-project typecheck: [tool.ty.src] include/exclude in
-        # pyproject.toml scope it to packages/ + catopt/ and pin the
+        # pyproject.toml scope it to packages/ and pin the
         # ratchet baseline.  ty is fast (Rust), so this is whole-tree.
         entry: .venv/bin/ty check
         language: system
@@ -40,7 +40,7 @@ repos:
       - id: bandit
         name: bandit
         # Security SAST; excludes + justified skips in .bandit.yaml.
-        entry: .venv/bin/bandit -c .bandit.yaml -r packages catopt
+        entry: .venv/bin/bandit -c .bandit.yaml -r packages
         language: system
         pass_filenames: false
         always_run: true
@@ -49,7 +49,7 @@ repos:
         # Offline, deterministic ruleset from .semgrep.yml.  For the
         # deeper registry scan run (network) see AGENTS.md:
         #   .venv/bin/semgrep --config p/python --config p/security-audit
-        entry: .venv/bin/semgrep --config .semgrep.yml packages catopt
+        entry: .venv/bin/semgrep --config .semgrep.yml packages
         language: system
         pass_filenames: false
         always_run: true
@@ -86,7 +86,7 @@ repos:
         # p/security-audit rulesets, so it is a manual-stage gate.
         entry: >-
           .venv/bin/semgrep --config .semgrep.yml --config p/python
-          --config p/security-audit packages catopt
+          --config p/security-audit packages
         language: system
         pass_filenames: false
         always_run: true

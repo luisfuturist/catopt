@@ -1,0 +1,19 @@
+[package]
+name = "catopt-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native (Rust) search core for catopt equality saturation"
+
+[lib]
+name = "catopt_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# `extension-module` comes from maturin (`[tool.maturin] features` in
+# pyproject.toml) — leaving it off here keeps `cargo test` linkable.
+pyo3 = { version = "0.26" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

@@ -1,7 +1,7 @@
 # Repo-local Semgrep rules for catopt.
 #
 # Used together with the registry ruleset:
-#   .venv/bin/semgrep --config .semgrep.yml --config p/python packages catopt
+#   .venv/bin/semgrep --config .semgrep.yml --config p/python packages
 #
 # These rules pin a few project-specific security invariants that the
 # generic registry rulesets do not cover.  They currently produce zero

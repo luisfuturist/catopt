@@ -201,10 +201,10 @@ def test_vanishing_split_and_merge():
     eid = eg.add_term(lhs)
     eg.run([TR_VANISH_SPLIT], eid)
     assert eg.rule_fires.get("tr_vanish_split", 0) >= 1
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make("trace", Op.make("trace", "f", usize="DU"), usize="DV"),
         eid,
-    )
+    ))
 
     # merge fires back
     eg2 = EGraph()
@@ -244,14 +244,14 @@ def test_superpose_splits_independent_channels():
     eg.run([TR_SUPERPOSE], eid)
     assert eg.rule_fires.get("tr_superpose", 0) >= 1
     # the split form is a member of the root e-class
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make(
             "bdiag",
             Op.make("trace", "f", usize="DU"),
             Op.make("trace", "g", usize="DV"),
         ),
         eid,
-    )
+    ))
 
     # reverse direction: independent loops fuse back into the joint loop
     eg2 = EGraph()
@@ -287,9 +287,9 @@ def test_superpose_with_untraced_context():
     assert eg.rule_fires.get("tr_superpose", 0) >= 1
     assert eg.rule_fires.get("tr_vanish_unit", 0) >= 1
     # root e-class contains bdiag(trace(F, du), G)
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make("bdiag", Op.make("trace", "f", usize="DU"), "g"), eid
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +328,7 @@ def test_slide():
     eid = eg.add_term(lhs)
     eg.run([TR_SLIDE], eid)
     assert eg.rule_fires.get("tr_slide", 0) >= 1
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make(
             "trace",
             Op.make(
@@ -339,7 +339,7 @@ def test_slide():
             usize="DU",
         ),
         eid,
-    )
+    ))
 
     # reverse direction
     eg2 = EGraph()
@@ -360,7 +360,7 @@ def test_slide_pulls_matrix_out_of_recurrence():
     eg.run([TR_SLIDE], eid)
     # both orientations coexist in the class
     assert eg.rule_fires.get("tr_slide", 0) >= 1
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make(
             "trace",
             Op.make(
@@ -371,8 +371,8 @@ def test_slide_pulls_matrix_out_of_recurrence():
             usize="DU",
         ),
         eid,
-    )
-    assert eg.matches(
+    ))
+    assert list(eg.matches(
         Op.make(
             "trace",
             Op.make(
@@ -383,7 +383,7 @@ def test_slide_pulls_matrix_out_of_recurrence():
             usize="DU",
         ),
         eid,
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -412,9 +412,9 @@ def test_tighten_out():
     eid = eg.add_term(lhs)
     eg.run([TR_TIGHTEN_OUT], eid)
     assert eg.rule_fires.get("tr_tighten_out", 0) >= 1
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make("matmul", "k", Op.make("trace", "f", usize="DU")), eid
-    )
+    ))
 
     eg2 = EGraph()
     eid2 = eg2.add_term(rhs)
@@ -443,9 +443,9 @@ def test_tighten_in():
     eid = eg.add_term(lhs)
     eg.run([TR_TIGHTEN_IN], eid)
     assert eg.rule_fires.get("tr_tighten_in", 0) >= 1
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make("matmul", Op.make("trace", "f", usize="DU"), "j"), eid
-    )
+    ))
 
     eg2 = EGraph()
     eid2 = eg2.add_term(rhs)
@@ -559,7 +559,7 @@ def test_collapse_folds_closed_form_back():
     eid = eg.add_term(closed)
     eg.run([TR_COLLAPSE], eid)
     assert eg.rule_fires.get("tr_collapse", 0) >= 1
-    assert eg.matches(Op.make("trace", "f", usize="DU"), eid)
+    assert list(eg.matches(Op.make("trace", "f", usize="DU"), eid))
 
 
 # ---------------------------------------------------------------------------
@@ -656,9 +656,9 @@ def test_trace_laws_collection_runs_together():
     stats = eg.run(TRACE_LAWS, eid, max_iterations=10, max_nodes=20_000)
     assert stats["n_enodes"] < 20_000
     # split form reachable
-    assert eg.matches(
+    assert list(eg.matches(
         Op.make("trace", Op.make("trace", "f", usize="DU"), usize="DV"),
         eid,
-    )
+    ))
     # closed form reachable
     assert any(n.op == "inv" for n in _all_nodes(eg))

@@ -18,19 +18,19 @@
 #   * CPU torch — the lockfile resolves a CUDA wheel on Linux, but four
 #     tests assume a CPU build (and CUDA-graph capture is flaky on CI);
 #     force the CPU wheel before running anything.
-#   * ruff check packages catopt tools — lint (line length 72, etc.).
+#   * ruff check packages tools — lint (line length 72, etc.).
 #     Scoped to shipped source; tests/ + bench/ carry pre-existing
 #     isort drift under the pinned ruff.
-#   * ruff format --check packages catopt tools — formatting.
+#   * ruff format --check packages tools — formatting.
 #   * ty check — the typecheck ratchet ([tool.ty.src] include/exclude in
-#     pyproject.toml scope it to packages/ + catopt/).  0 errors.
+#     pyproject.toml scope it to packages/).  0 errors.
 #   * vulture — dead-code scan ([tool.vulture] paths + min-confidence).
 #   * lint-imports — the hexagonal boundary contract: catopt_core must
 #     not import the adapters or torch/numpy.
-#   * bandit -c .bandit.yaml -r packages catopt — security SAST; the
+#   * bandit -c .bandit.yaml -r packages — security SAST; the
 #     config carries the scoped excludes + justified rule skips.
 #   * semgrep --config .semgrep.yml --config p/python
-#     --config p/security-audit packages catopt — repo-local invariants
+#     --config p/security-audit packages — repo-local invariants
 #     plus the registry dataflow/security rulesets (network).
 #   * pip-audit — dependency-vulnerability audit (network).
 #   * python tools/radon_ratchet.py — cyclomatic-complexity ratchet:
@@ -65,10 +65,10 @@ jobs:
         run: uv pip install --torch-backend cpu --reinstall torch
 
       - name: ruff check
-        run: .venv/bin/ruff check packages catopt tools
+        run: .venv/bin/ruff check packages tools
 
       - name: ruff format --check
-        run: .venv/bin/ruff format --check packages catopt tools
+        run: .venv/bin/ruff format --check packages tools
 
       - name: ty check
         run: .venv/bin/ty check
@@ -80,12 +80,12 @@ jobs:
         run: .venv/bin/lint-imports
 
       - name: bandit
-        run: .venv/bin/bandit -c .bandit.yaml -r packages catopt
+        run: .venv/bin/bandit -c .bandit.yaml -r packages
 
       - name: semgrep (local + registry rulesets)
         run: >-
           .venv/bin/semgrep --config .semgrep.yml --config p/python
-          --config p/security-audit packages catopt
+          --config p/security-audit packages
 
       - name: pip-audit
         run: .venv/bin/pip-audit
@@ -99,7 +99,7 @@ jobs:
       - name: coverage run (full suite)
         run: >-
           .venv/bin/coverage run
-          --source=catopt_core,catopt_torch,catopt_carriers,catopt_optimize,catopt
+          --source=catopt_core,catopt_torch,catopt_carriers,catopt_orchestrator,catopt_cuda
           -m pytest tests/ -q
 
       - name: coverage report (fail_under=100)
