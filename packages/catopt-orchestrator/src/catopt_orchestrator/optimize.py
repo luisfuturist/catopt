@@ -377,6 +377,319 @@ def _route_spec(best_term: Any, sink: Sink) -> ExecutorSpec | None:
 
 
 # ---------------------------------------------------------------------------
+#  Certified bounded-error offers (plan 0012) — the budget plumbing
+# ---------------------------------------------------------------------------
+
+
+def _check_budget_engine(eg: Any, error_budget: float | None) -> None:
+    """Bounded extraction needs proof witnesses — the reference EGraph.
+
+    No-op when ``error_budget`` is ``None``.  A non-``EGraph`` engine
+    lacks ``certificate`` / ``extract_best_bounded`` (the
+    :class:`~catopt_core.ports.Engine` port does not require them),
+    and a level-1 e-graph records no merge witnesses — in either case
+    the bound gate would silently pass every bounded member.  Fail
+    loudly instead.
+    """
+    if error_budget is None:
+        return
+    if not isinstance(eg, EGraph):
+        raise TypeError(
+            "error_budget requires the reference EGraph engine — "
+            "bounded offers and their certificates are Python-engine "
+            f"machinery (got {type(eg).__name__})"
+        )
+    if eg.truncation_level < 2:
+        raise TypeError(
+            "error_budget requires proof witnesses — the engine was "
+            "built at truncation_level < 2"
+        )
+
+
+def _subterms(term: Any) -> Iterable:
+    """Yield *term* and every subterm, pre-order."""
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        yield t
+        if isinstance(t, Op):
+            stack.extend(t.args)
+
+
+def _term_params(term: Any) -> set[str]:
+    """Names of every ``Param`` leaf *term* carries."""
+    return {t.name for t in _subterms(term) if isinstance(t, Param)}
+
+
+def _bound_rules(eg: EGraph) -> dict[str, Any]:
+    """Return the bound-carrying rewrites this run registered."""
+    return {n: r for n, r in eg._rule_objs.items() if r.error_bound}
+
+
+def _delivered_bound(
+    eg: EGraph, term: Any, bound: dict[str, Any]
+) -> set[str]:
+    """Bound-carrying rule names whose offered member *term* delivers.
+
+    A bound offer survives extraction under two fingerprints, both
+    robust to saturation rewriting the offered member after it was
+    registered:
+
+    * *verbatim delivery* — the member's root enode is registered to
+      the bound witness's synthetic application (``_enode_app``), so
+      a term locating to it used the offer directly;
+    * *derived params* — bounded members introduce ``Param`` leaves
+      the exact side lacks (``__bl`` / ``__lr`` derived weights);
+      leaves survive rewriting, so a term still carrying one is a
+      rewritten delivery of the member.
+    """
+    used_params = _term_params(term)
+    delivered = {
+        nm
+        for nm, r in bound.items()
+        if (_term_params(r.rhs) - _term_params(r.lhs)) & used_params
+    }
+    # Enodes registered to bound-carrying applications: a verbatim
+    # delivered member locates to one of these.
+    tainted: dict[Any, str] = {
+        en: eg._applications[ai]["rule"]
+        for en, ai in eg._enode_app.items()
+        if eg._applications[ai]["rule"] in bound
+    }
+    for sub in _subterms(term):
+        _ce, en = eg._locate(sub)
+        if rn := tainted.get(en):
+            delivered.add(rn)
+    return delivered
+
+
+def _bound_ledger(
+    eg: EGraph, cert: Any, term: Any
+) -> tuple[list[dict], float]:
+    """Compute the bound ledger of a delivered term — entries + total.
+
+    The certificate is the primary source: each replayed bound step
+    contributes its rule's declared ``error_bound``.  But a derivation
+    that exhausts its budget records ``egraph_dependent`` stubs and
+    any bound merge inside such a gap contributes *nothing* to
+    ``cert.error_bound`` — a silent undercount.  :func:`_delivered_bound`
+    therefore re-scans the term itself for bound-member fingerprints;
+    a detected-but-uncertified rule is appended and its bound added,
+    so the ledger is never silently empty on an approximate term.
+    """
+    entries = _error_bound_entries(cert)
+    bound = _bound_rules(eg)
+    if not bound:
+        return entries, cert.error_bound
+    covered = {e["rule"] for e in entries}
+    extra = sorted(_delivered_bound(eg, term, bound) - covered)
+    for nm in extra:
+        r = bound[nm]
+        entries.append(
+            {
+                "rule": nm,
+                "law": r.law,
+                "bound": r.error_bound,
+                "norm": r.bound_norm,
+                "measured_max_rel": None,
+            }
+        )
+    return entries, cert.error_bound + sum(
+        bound[nm].error_bound for nm in extra
+    )
+
+
+def _ban_bound_members(
+    eg: EGraph, term: Any, bound: dict[str, Any], bans: dict[int, set]
+) -> bool:
+    """Exclude every bound member *term* delivers; True on new bans.
+
+    For each delivered bound rule this bans (a) the offered member's
+    root enode, (b) its derived ``Param`` leaf enodes — rewritten
+    spellings keep the leaf, so banning it kills every variant — and
+    (c) the enode the term actually picked inside the offered class,
+    which covers bound members carrying no derived param at all
+    (``zero_bounded``).  Each new ban strictly shrinks the candidate
+    space, so a caller looping on this either fits the budget or
+    stalls — reported by the ``False`` return.
+    """
+    delivered = _delivered_bound(eg, term, bound)
+    if not delivered:
+        return False
+    want: set = set()
+    derived: list = []
+    for nm in delivered:
+        r = bound[nm]
+        ce, _en = eg._locate(r.rhs)
+        want.add(ce)
+        keep = _term_params(r.lhs)
+        derived += [
+            sub
+            for sub in _subterms(r.rhs)
+            if isinstance(sub, Param) and sub.name not in keep
+        ]
+    progress = False
+
+    def _ban(ce: Any, en: Any) -> None:
+        nonlocal progress
+        slot = bans.setdefault(ce, set())
+        if en not in slot:
+            slot.add(en)
+            progress = True
+
+    for sub in _subterms(term):
+        ce, en = eg._locate(sub)
+        if ce in want:
+            _ban(ce, en)
+    for p in derived:
+        _ban(*eg._locate(p))
+    return progress
+
+
+def _bounded_term(
+    eg: EGraph,
+    root_eid: int,
+    src: Any,
+    cost_fn: CostFn,
+    error_budget: float,
+) -> tuple[Any, list[dict], float]:
+    """Cheapest member whose delivered bound fits ``error_budget``.
+
+    Iterates ``extract_best`` under accumulating enode bans: each
+    round's ledger — the certificate plus the delivered-member
+    fingerprints — either fits the budget (done) or names the bound
+    members to exclude for the next round.  The original member is
+    never bound-carried, so a real search root always satisfies the
+    budget; ``None``/stall are reachable only for a degenerate
+    fully-cyclic class or a bound member no fingerprint can name.
+    """
+    bans: dict[int, set] = {}
+    bound = _bound_rules(eg)
+    while True:
+        term = eg.extract_best(root_eid, cost_fn, bans=bans)
+        if term is None:
+            raise OptimizationResourceError(
+                f"error_budget={error_budget}: no member of the root "
+                "e-class certifies within the budget"
+            )
+        cert = eg.certificate(src, term, root_eid=root_eid)
+        entries, total = _bound_ledger(eg, cert, term)
+        if total <= error_budget:
+            return term, entries, total
+        if not _ban_bound_members(eg, term, bound, bans):
+            raise OptimizationResourceError(
+                f"error_budget={error_budget}: the cheapest member "
+                "relies on a bound offer that cannot be excluded"
+            )
+
+
+def _bound_gate(
+    eg: EGraph,
+    root_eid: int,
+    src: Any,
+    cost_fn: CostFn,
+    stats: dict[str, Any],
+    best_term: Any,
+    error_budget: float | None,
+) -> Any:
+    """Apply the error-budget ledger gate to the extracted term.
+
+    Pass-through when ``error_budget`` is ``None``.  Otherwise ledger
+    the winner — the certificate plus the delivered-member
+    fingerprints (a derivation that exhausted its budget undercounts)
+    — and re-extract through :func:`_bounded_term`'s ban loop when
+    the total exceeds the budget.  ``stats`` always records the
+    request and the accepted bound — never silent.
+    """
+    if error_budget is None:
+        return best_term
+    cert = eg.certificate(src, best_term, root_eid=root_eid)
+    entries, bound_total = _bound_ledger(eg, cert, best_term)
+    if bound_total > error_budget:
+        best_term, entries, bound_total = _bounded_term(
+            eg, root_eid, src, cost_fn, error_budget
+        )
+    stats["error_budget"] = error_budget
+    stats["error_bound_total"] = bound_total
+    stats["error_bounds"] = entries
+    return best_term
+
+
+def _error_bound_entries(cert: Any) -> list[dict]:
+    """One record per bound-carrying step of the accepted derivation.
+
+    ``measured_max_rel`` stays ``None`` until ``lower``'s verify fills
+    it with the delivered-vs-original measurement — the ledger is
+    surfaced either way, never silent.
+    """
+    return [
+        {
+            "rule": s.rule,
+            "law": r.law,
+            "bound": r.error_bound,
+            "norm": r.bound_norm,
+            "measured_max_rel": None,
+        }
+        for s in cert.steps
+        if (r := cert.rules.get(s.rule)) is not None and r.error_bound
+    ]
+
+
+def _bounded_gate(report: Any, bound: float) -> bool:
+    """Return the verify predicate under an accepted error bound.
+
+    ``report.passed`` is the sink's tolerance gate; the honest bound
+    gate additionally requires the measured relative error to stay
+    within the certified bound — a delivery whose measured error
+    exceeds its claimed bound declines even when the looser
+    tolerance passed.
+    """
+    return bool(report.passed) and (
+        bound == 0.0 or report.max_rel <= bound
+    )
+
+
+def _bound_verify(
+    stats: dict[str, Any], report: Any, bound_total: float
+) -> Any:
+    """Apply the honest bound gate to a verify report.
+
+    No-op when ``bound_total`` is 0 (the accepted term delivers no
+    bound members).  Otherwise each ``stats["error_bounds"]`` entry
+    records the measured value — the ledger is never silent — and
+    ``stats["error_bounds_honored"]`` flags the verdict: a measured
+    error exceeding the claimed bound substitutes a ``passed=False``
+    report, even when the (widened) tolerance alone passed.
+    """
+    if bound_total <= 0.0:
+        return report
+    stats["error_bounds"] = [
+        {**e, "measured_max_rel": report.max_rel}
+        for e in stats.get("error_bounds", [])
+    ]
+    stats["error_bounds_honored"] = bool(report.max_rel <= bound_total)
+    if report.max_rel > bound_total:
+        return _BoundedVerify(
+            max_abs=report.max_abs, max_rel=report.max_rel
+        )
+    return report
+
+
+@dataclass(frozen=True)
+class _BoundedVerify:
+    """A ``VerifyResult``-shaped report forced to ``passed=False``.
+
+    ``lower`` substitutes this when a delivered module's measured
+    error exceeds the certified bound its accepted members claimed —
+    the bound gate is stricter than the verify tolerance.
+    """
+
+    max_abs: float
+    max_rel: float
+    passed: bool = False
+
+
+# ---------------------------------------------------------------------------
 #  The verbs — search (phases 1+2) and lower (phase 3 + verify)
 # ---------------------------------------------------------------------------
 
@@ -511,6 +824,7 @@ def _pairing_and_lifts(
     meter: Any = None,
     detect_factors: bool = False,
     detect_specials: bool = False,
+    error_budget: float | None = None,
 ) -> list:
     """Non-local passes with a brief re-saturation between them.
 
@@ -522,10 +836,12 @@ def _pairing_and_lifts(
     tying (duplicate Param leaves share one class), and — opt-in via
     ``detect_factors`` — the low-rank factored-parameter offers of
     :func:`catopt_core.laws.factored.offer_low_rank_factors`, plus —
-    opt-in via ``detect_specials`` — the exact structurally-special
+    opt-in via ``detect_specials`` — the structurally-special
     weight offers of
-    :func:`catopt_core.laws.specials.offer_weight_specials`.  All
-    witnessed so certificates stay replayable.
+    :func:`catopt_core.laws.specials.offer_weight_specials` (exact —
+    or, when ``error_budget`` is set, additionally its bounded
+    near-dead / near-duplicate elision members).  All witnessed so
+    certificates stay replayable.
 
     Returns the pairing-groups list — the coordinated (paired)
     extraction in :func:`_select_best_term` needs it.
@@ -546,7 +862,12 @@ def _pairing_and_lifts(
         _check_resources(eg, max_enodes, max_memory_mb, meter)
 
     lifts = _carrier_lifts(
-        eg, source_tensors, stats, detect_factors, detect_specials
+        eg,
+        source_tensors,
+        stats,
+        detect_factors,
+        detect_specials,
+        error_budget,
     )
     if lifts:
         eg.rebuild()
@@ -594,6 +915,7 @@ def _carrier_lifts(
     stats: dict[str, Any],
     detect_factors: bool,
     detect_specials: bool = False,
+    error_budget: float | None = None,
 ) -> list:
     """Run the non-local carrier/tying lifts, carriers lazily resolved.
 
@@ -602,8 +924,9 @@ def _carrier_lifts(
     carriers contributes only the tying passes.  ``detect_factors``
     arms the opt-in low-rank detection offers of
     :func:`catopt_core.laws.factored.offer_low_rank_factors`;
-    ``detect_specials`` arms the opt-in exact weight-structure offers
-    of :func:`catopt_core.laws.specials.offer_weight_specials`.
+    ``detect_specials`` arms the opt-in weight-structure offers of
+    :func:`catopt_core.laws.specials.offer_weight_specials` — exact
+    by default, additionally bounded when ``error_budget`` is set.
     """
     try:
         from catopt_carriers.trace_lift import (
@@ -630,7 +953,9 @@ def _carrier_lifts(
         + share_duplicate_params(eg, source_tensors)
         + share_duplicate_param_slices(eg, source_tensors)
         + _factor_lifts(eg, source_tensors, stats, detect_factors)
-        + _special_lifts(eg, source_tensors, stats, detect_specials)
+        + _special_lifts(
+            eg, source_tensors, stats, detect_specials, error_budget
+        )
     )
 
 
@@ -664,20 +989,28 @@ def _special_lifts(
     source_tensors: dict,
     stats: dict[str, Any],
     detect_specials: bool,
+    error_budget: float | None = None,
 ) -> list:
     """Opt-in structurally-special weight offers (``detect_specials``).
 
     The detection pass itself is the branch — when off this returns
-    ``[]`` without touching the graph; when on, each certified exact
-    offer (identity/diagonal/zero/elide/block-diag members, all
+    ``[]`` without touching the graph; when on, each certified offer
+    (identity/diagonal/zero/elide/block-diag members, all
     ``error_bound=0``) lands in ``stats["weight_specials"]`` (minus
-    the e-class id, which means nothing outside this run).
+    the e-class id, which means nothing outside this run).  With
+    ``error_budget`` set, the pass additionally offers the bounded
+    ``elide_bounded`` / ``zero_bounded`` members — certified
+    approximate, each carrying its measured ``error_bound ≤
+    error_budget``; the selection gate downstream enforces the
+    accumulated bound.
     """
     if not detect_specials:
         return []
     from catopt_core.laws.specials import offer_weight_specials
 
-    offers = offer_weight_specials(eg, source_tensors)
+    offers = offer_weight_specials(
+        eg, source_tensors, budget=error_budget
+    )
     if offers:
         stats["weight_specials"] = [
             {k: v for k, v in r.items() if k != "eid"} for r in offers
@@ -697,6 +1030,8 @@ def _select_best_term(
     specialize_causal: bool,
     capabilities: Capabilities | None,
     source_tensors: dict,
+    error_budget: float | None = None,
+    src: Any = None,
 ) -> Any:
     """Extract the search's term: greedy -> paired -> carrier -> causal.
 
@@ -711,7 +1046,15 @@ def _select_best_term(
     * the causal-mask const fold — the opt-out specialization, run
       through the capabilities object's optional
       ``specialize_causal(term, params, memo) -> term`` hook (a
-      ``Sink`` carries it for the torch backend): no hook, no fold.
+      ``Sink`` carries it for the torch backend): no hook, no fold;
+    * the error-budget gate (``error_budget``, plan 0012) — the
+      chosen term's bound ledger (the ``src`` -> ``best_term``
+      certificate plus delivered-member fingerprints, since a
+      budget-exhausted derivation undercounts) must total at most
+      ``error_budget``; a violation re-extracts through
+      :func:`_bounded_term`'s ban loop.  Every bound-carrying member
+      the accepted term delivers lands in ``stats["error_bounds"]``
+      — never silent.
     """
     best_term = eg.extract_best(
         root_eid, cost_fn, fusion_epsilon=fusion_epsilon
@@ -766,6 +1109,11 @@ def _select_best_term(
                 # evaluate to the causal triangle), so the cached form
                 # is the one BEFORE this rewrite.
                 stats["pre_causal_term"] = pre_fold
+    # The bound gate: only members whose delivered bound accumulates
+    # to at most ``error_budget`` are acceptable — see ``_bound_gate``.
+    best_term = _bound_gate(
+        eg, root_eid, src, cost_fn, stats, best_term, error_budget
+    )
     return best_term
 
 
@@ -795,6 +1143,7 @@ def search(
     engine: Any = None,
     detect_factors: bool = False,
     detect_specials: bool = False,
+    error_budget: float | None = None,
 ) -> SearchResult:
     """Run the search phase: ``model -> SearchResult``.
 
@@ -911,7 +1260,33 @@ def search(
         projections plus gathers, per-block splits — in their
         consumer's e-class.  Unlike ``detect_factors`` nothing here
         is approximate: a slice is dead iff every value is exactly
-        0.0, and duplicates dedupe bitwise.
+        0.0, and duplicates dedupe bitwise.  See ``error_budget`` for
+        the certified-approximate extension.
+    error_budget : float, optional
+        Opt-in certified-approximation budget (plan 0012).  ``None``
+        (the default) keeps the search exact — no bounded member is
+        offered and no bound gate runs.  When a float is given:
+
+        * ``detect_specials``'s pass additionally offers the bounded
+          ``elide_bounded`` / ``zero_bounded`` members of
+          :func:`catopt_core.laws.specials.offer_weight_specials`
+          (each with a measured ``error_bound ≤ error_budget``);
+        * extraction accepts a term only when its ledgered bound —
+          the certificate's accumulated ``error_bound`` plus any
+          bound member the delivered term provably uses — stays
+          within the budget (a derivation that exhausts its budget
+          records ``egraph_dependent`` stubs which undercount, so
+          delivered members are also fingerprinted directly);
+        * the ledger is never silent: ``stats["error_budget"]``
+          echoes the request, ``stats["error_bound_total"]`` is the
+          accepted certificate bound, and ``stats["error_bounds"]``
+          lists every bound-carrying member used (``rule`` / ``law``
+          / ``bound`` / ``norm``; ``measured_max_rel`` is filled in
+          by :func:`lower`'s verify).
+
+        Requires the reference ``EGraph`` at ``truncation_level >= 2``
+        (the bound ledger reads certificates and rule-application
+        witnesses); anything else raises :class:`TypeError`.
     verbose : bool
         Print progress.
 
@@ -951,6 +1326,7 @@ def search(
             "saturation..."
         )
     eg = _resolve_engine(engine)
+    _check_budget_engine(eg, error_budget)
     root_eid = eg.add_term(ir.root)
     rules = _resolve_rules(rules)
     if verbose:
@@ -1000,6 +1376,7 @@ def search(
             meter,
             detect_factors,
             detect_specials,
+            error_budget,
         )
     else:
         # Non-local passes (pairing + carrier lifts) offer members
@@ -1029,6 +1406,8 @@ def search(
         specialize_causal=specialize_causal,
         capabilities=capabilities,
         source_tensors=source_tensors,
+        error_budget=error_budget,
+        src=ir.root,
     )
 
     if verbose:
@@ -1099,6 +1478,15 @@ def lower(
         unchanged.  The report lands in ``LowerResult.verified``.
     rtol, atol
         The equivalence tolerances, forwarded to ``sink.verify``.
+        When the search ran under ``error_budget`` and accepted
+        bounded members (``stats["error_bound_total"]``), the
+        effective tolerance widens to ``max(rtol, bound)`` and the
+        *measured* ``max_rel`` must additionally stay within the
+        certified bound — a violation declines the delivery
+        (``verified.passed`` False, ``stats["error_bounds_honored"]``
+        False), even when the loose tolerance alone would pass.  Each
+        ``stats["error_bounds"]`` entry then records the measured
+        ``max_rel`` — the ledger is never silent.
     verbose : bool
         Print progress.
 
@@ -1144,8 +1532,17 @@ def lower(
         if verbose:
             print("[Verify] Checking output equivalence...")
         ref = sink.lower(result.ir, params)
-        verified = sink.verify(
-            ref, optimized_module, x, rtol=rtol, atol=atol
+        bound_total = float(stats.get("error_bound_total", 0.0))
+        verified = _bound_verify(
+            stats,
+            sink.verify(
+                ref,
+                optimized_module,
+                x,
+                rtol=max(rtol, bound_total),
+                atol=atol,
+            ),
+            bound_total,
         )
         if verbose:
             print(f"  Max abs diff:  {verified.max_abs:.6e}")
@@ -2088,6 +2485,8 @@ def _optimize_compositional(
     verify_tol: float = 1e-4,
     max_cross_pairs: int = 8,
     cache: dict | None = None,
+    error_budget: float | None = None,
+    detect_specials: bool = False,
     verbose: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     """Optimize a stacked/multi-block model one block at a time.
@@ -2124,6 +2523,13 @@ def _optimize_compositional(
        (``composer.graft``), preserving the original forward
        structure, then verifies end-to-end equivalence on
        ``example_input`` through ``sink.verify``.
+
+    ``error_budget`` / ``detect_specials`` forward to each per-block
+    :meth:`Optimizer.search` — with a budget set, a block's certified
+    bound also widens its verify tolerance (``max(verify_tol,
+    bound)``) and the measured error must honor the bound
+    (:func:`_bounded_gate`) or the block keeps its original
+    implementation.
 
     ``cache`` (the :class:`Compositional` strategy resolves its
     ``cache=`` flag into this mapping): when a dict is given, each
@@ -2247,10 +2653,16 @@ def _optimize_compositional(
                             verify=verbose,
                             verbose=verbose,
                         )
-                        vh = sink.verify(
-                            block, lr2.module, args, rtol=verify_tol
+                        bound2 = float(
+                            lr2.stats.get("error_bound_total", 0.0)
                         )
-                        if vh.passed:
+                        vh = sink.verify(
+                            block,
+                            lr2.module,
+                            args,
+                            rtol=max(verify_tol, bound2),
+                        )
+                        if _bounded_gate(vh, bound2):
                             opt_mod, st = lr2.module, lr2.stats
                             cache_hits += 1
                             rep["cache"] = "hit"
@@ -2287,6 +2699,8 @@ def _optimize_compositional(
                     max_memory_mb=max_memory_mb,
                     cost_fn=cost_fn,
                     delivers_compiled=False,
+                    error_budget=error_budget,
+                    detect_specials=detect_specials,
                     verbose=verbose,
                 )
                 lr = optimizer.lower(
@@ -2310,13 +2724,19 @@ def _optimize_compositional(
                 # Per-block verification on the captured input —
                 # soundness gate independent of the pipeline's own
                 # (verbose-gated) check.  Any mismatch or eval failure
-                # falls back.
-                vr = sink.verify(block, opt_mod, args, rtol=verify_tol)
+                # falls back.  Under a bounded search the gate is
+                # two-sided: the tolerance widens to the accepted
+                # bound AND the measured error must honor it.
+                bound = float(st.get("error_bound_total", 0.0))
+                vr = sink.verify(
+                    block, opt_mod, args, rtol=max(verify_tol, bound)
+                )
                 rep["rel_diff"] = vr.max_rel
-                if not vr.passed:
+                if not _bounded_gate(vr, bound):
                     raise RuntimeError(
                         f"block verification failed: "
-                        f"rel diff {vr.max_rel:.3e}"
+                        f"rel diff {vr.max_rel:.3e} "
+                        f"(accepted bound {bound:.3e})"
                     )
             replacements[name] = opt_mod
             rep["status"] = "optimized"

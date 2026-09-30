@@ -44,6 +44,17 @@ exactly ``0.0``, and slices deduplicate on bitwise content — no
 tolerance, no "small".  Out of scope (same boundaries as the
 low-rank pass): left-weight ``matmul(W, data)``, non-leaf weight
 expressions, and non-2-D weights.
+
+Bounded mode (``budget=``) — the certified-approximation counterpart
+of dead/duplicate elision (plan 0012): a slice whose ``max|·|``
+stays within ``budget`` is *nearly* dead, and a row within
+``max|Δ| ≤ budget`` of an earlier representative is a *near*
+duplicate.  Those offer ``elide_bounded`` / ``zero_bounded``
+members whose witness carries ``error_bound`` = the measured max
+elementwise weight error (``bound_norm="max_abs"``, never 0) —
+they compete with the exact members and lose to them whenever the
+bound gate or the cost model prefers precision.  ``budget=None``
+keeps the pass bitwise-exact — the default, and unchanged.
 """
 
 # ruff: noqa: RUF003 -- comments/docstrings use
@@ -179,7 +190,95 @@ def _blocks(
     ]
 
 
-def _analyse(wn: Any, o: int, i: int) -> dict:
+def _live_cols(
+    wn: Any, i: int, budget: float
+) -> tuple[list[int], float]:
+    """Columns surviving the budget; measure the dropped max|·|."""
+    keep: list[int] = []
+    bound = 0.0
+    for c in range(i):
+        ca = float(_detach(wn[:, c]).abs().max())
+        if ca <= budget:
+            bound = max(bound, ca)
+        else:
+            keep.append(c)
+    return keep, bound
+
+
+def _bounded_elide(wn: Any, o: int, i: int, budget: float) -> dict:
+    """Budget-gated elision analysis of a normalized ``(out, in)`` weight.
+
+    The bounded counterpart of the bitwise scan: an input column is
+    kept iff some element exceeds ``budget`` in magnitude; an output
+    row joins the zero group when its ``max|·| ≤ budget``, or the
+    first representative row within ``max|Δ| ≤ budget`` (greedy
+    first-occurrence clustering — the ``_dedup`` convention), else
+    it opens a new representative.  The zero group reuses a real
+    all-zero row as its representative when one exists and otherwise
+    takes a *synthetic* zero row appended to the shrunk weight —
+    a near-dead row can never serve as the rep, since two rows each
+    within budget of zero may be almost ``2·budget`` apart.
+
+    Returns ``{keep, imap, firsts, zero_appended, bound, all_dead}``:
+    ``imap`` positions index the shrunk weight's rows —
+    ``wn[firsts]`` plus, when ``zero_appended``, one zeroed row at
+    position ``len(firsts)``; ``bound`` is the measured max
+    elementwise weight error the member commits (always ``≤ budget``
+    by construction); ``all_dead`` means every row lies within budget
+    of zero — the bounded-zero member claims the site instead.
+    ``firsts`` excludes the appended zero row; ``imap`` for a
+    zero-group row points at the zero representative.
+    """
+    keep, bound = _live_cols(wn, i, budget)
+    firsts: list[int] = []
+    rep_vals: list[Any] = []
+    zero_rows: list[int] = []
+    real_zero: int | None = None
+    imap = [0] * o
+    for r in range(o):
+        row = _detach(wn[r])
+        ra = float(row.abs().max())
+        if ra <= budget:
+            bound = max(bound, ra)
+            zero_rows.append(r)
+            if ra == 0.0 and real_zero is None:
+                real_zero = r
+            continue
+        pos = -1
+        for j, rv in enumerate(rep_vals):
+            d = float((row - rv).abs().max())
+            if d <= budget:
+                bound = max(bound, d)
+                pos = j
+                break
+        if pos < 0:
+            pos = len(firsts)
+            firsts.append(r)
+            rep_vals.append(row)
+        imap[r] = pos
+    zero_appended = False
+    if zero_rows:
+        if real_zero is not None:
+            firsts.append(real_zero)
+            zpos = len(firsts) - 1
+        else:
+            zero_appended = True
+            zpos = len(firsts)
+        for r in zero_rows:
+            imap[r] = zpos
+    return {
+        "keep": tuple(keep),
+        "imap": tuple(imap),
+        "firsts": tuple(firsts),
+        "zero_appended": zero_appended,
+        "bound": bound,
+        "all_dead": len(zero_rows) == o,
+    }
+
+
+def _analyse(
+    wn: Any, o: int, i: int, budget: float | None = None
+) -> dict:
     """Slice-level structure of a normalized ``(out, in)`` weight.
 
     ``wn`` is the weight with output slices as rows and input slices
@@ -187,6 +286,11 @@ def _analyse(wn: Any, o: int, i: int) -> dict:
     analysis serves every member builder: output-slice byte
     signatures dedupe duplicate/dead rows, per-column nonzero checks
     find dead inputs, and row spans drive the diagonal/block tests.
+
+    ``budget`` arms the bounded analysis (``a["b"]`` —
+    :func:`_bounded_elide`): nearly-dead slices and near-duplicate
+    rows become elidable, carrying the measured error bound.  ``None``
+    keeps the pass bitwise-exact (``a["b"] is None``).
     """
     spans = _row_spans(wn, o, i)
     sigs = [_sig(wn[r : r + 1]) for r in range(o)]
@@ -207,6 +311,11 @@ def _analyse(wn: Any, o: int, i: int) -> dict:
         # A diagonal weight IS 1×1-block-diagonal, but the pointwise
         # mul member strictly dominates o tiny GEMMs — don't compute.
         "blocks": _blocks(spans, o, i) if not diag else None,
+        "b": (
+            _bounded_elide(wn, o, i, float(budget))
+            if budget is not None
+            else None
+        ),
     }
 
 
@@ -334,6 +443,71 @@ def _m_elide(
     return ("elide", _bias_add(eg, core, node), {"w_param": w_name})
 
 
+def _m_elide_bounded(
+    eg: Any,
+    node: Any,
+    orient: str,
+    data_c: int,
+    p: Param,
+    wn: Any,
+    a: dict,
+    tensors: dict,
+) -> tuple | None:
+    """Bounded elision member — near-dead slices + near-dup rows.
+
+    The ``a["b"]``-driven counterpart of ``_m_elide``: nearly-dead
+    input slices gather away, near-duplicate and nearly-dead output
+    rows re-expand onto their representatives (a real all-zero row,
+    or a synthetic zero row appended to the shrunk weight and zeroed
+    in place).  Returns ``None`` when no budget applies (``a["b"] is
+    None``), when the weight is wholly near-zero (the
+    ``zero_bounded`` member claims it), or when the bounded reading
+    adds nothing over the exact one (``bound == 0`` — bitwise-equal
+    members would duplicate).  The witness carries the measured
+    ``max|ΔW|`` as ``error_bound`` under ``bound_norm="max_abs"``.
+    """
+    o, i = a["o"], a["i"]
+    b = a["b"]
+    if b is None or b["bound"] == 0.0 or b["all_dead"]:
+        return None
+    keep, firsts, imap = b["keep"], b["firsts"], b["imap"]
+    n_sub = len(firsts) + int(b["zero_appended"])
+    if len(keep) == i and n_sub == o:
+        return None
+    fidx = list(firsts)
+    if b["zero_appended"]:
+        # A slot for the synthetic zero representative — ``firsts``
+        # is nonempty here (``all_dead`` returned early), so row
+        # ``firsts[0]``'s values are placeholders overwritten below.
+        fidx.append(firsts[0])
+    sub = wn[fidx][:, list(keep)]
+    if b["zero_appended"]:
+        sub[len(firsts)] = 0.0
+    w_eid, w_name = _reg(
+        eg,
+        tensors,
+        f"{p.name}__bl{len(fidx)}x{len(keep)}",
+        sub if orient == "linear" else sub.T,
+    )
+    g = eg.find(data_c)
+    if len(keep) < i:
+        g = _gather(eg, g, keep)
+    core = eg.add_enode(_op(orient), (g, w_eid), {}, provenance=_PROV)
+    if imap != tuple(range(o)):
+        # ``n_sub == o`` can still need the gather: the appended zero
+        # representative lands last, permuting a mid-array elided row.
+        core = _gather(eg, core, imap)
+    return (
+        "elide_bounded",
+        _bias_add(eg, core, node),
+        {
+            "w_param": w_name,
+            "error_bound": b["bound"],
+            "bound_norm": "max_abs",
+        },
+    )
+
+
 def _m_blocks(
     eg: Any,
     node: Any,
@@ -396,6 +570,12 @@ def _members(
     dominate every coarser reading of the same weight.  ``elide`` and
     ``block_diag`` can coexist (dup rows inside real blocks, blocks
     beside dead inputs), so both are offered and extraction picks.
+
+    Under ``a["b"]`` (a ``budget=`` analysis) two certified-
+    approximate members join: ``zero_bounded`` when every row lies
+    within budget of zero (the bounded whole-weight elision), and
+    ``elide_bounded`` for near-dead/near-duplicate elision — it
+    competes beside the exact ``elide`` member, never replaces it.
     """
     if a["ident"]:
         ms = [_m_identity(eg, node, data_c)]
@@ -403,9 +583,24 @@ def _members(
         ms = [_m_diag(eg, node, data_c, p, wn, tensors)]
     elif a["zero"]:
         ms = [_m_zero(eg, node, data_c, a["o"])]
+    elif a["b"] is not None and a["b"]["all_dead"]:
+        _k, eid, _x = _m_zero(eg, node, data_c, a["o"])
+        ms = [
+            (
+                "zero_bounded",
+                eid,
+                {
+                    "error_bound": a["b"]["bound"],
+                    "bound_norm": "max_abs",
+                },
+            )
+        ]
     else:
         ms = [
             _m_elide(eg, node, orient, data_c, p, wn, a, tensors),
+            _m_elide_bounded(
+                eg, node, orient, data_c, p, wn, a, tensors
+            ),
             _m_blocks(eg, node, orient, data_c, p, wn, a, tensors),
         ]
     return [m for m in ms if m is not None]
@@ -446,6 +641,80 @@ _LAW = {
     ),
 }
 
+#: Bounded-member law texts — keyed by the ``*_bounded`` kinds; the
+#: witness's ``error_bound`` is the measured max elementwise weight
+#: error, not zero.
+_LAW_BOUNDED = {
+    "zero_bounded": (
+        "pointwise witness for near-zero elision (bounded): the "
+        "weight's stored value is within the error budget of zero, "
+        "so the projection is approximately the zero map — "
+        "error_bound is the measured max|W|, established by the "
+        "specials pass"
+    ),
+    "elide_bounded": (
+        "pointwise witness for bounded dead/duplicate-slice elision: "
+        "the weight's stored value has input slices and output-slice "
+        "deviations within the error budget, so the projection "
+        "approximates a narrower projection plus a gather — "
+        "error_bound is the measured max|ΔW|, established by the "
+        "specials pass"
+    ),
+}
+
+
+def _emit_member(
+    eg: Any,
+    cid: int,
+    eid: int,
+    kind: str,
+    extra: dict,
+    p: Param,
+    orient: str,
+    dims: tuple[int, int],
+    witness: bool,
+) -> dict | None:
+    """Witness-offer one member; return its record, or ``None``.
+
+    A bounded member (``error_bound > 0`` in ``extra``) takes the
+    ``_LAW_BOUNDED`` text and notes its measured bound; exact members
+    keep their ``_LAW`` entry.  ``None`` when the union was already
+    done — a re-offer is a no-op.
+    """
+    bound = float(extra.get("error_bound") or 0.0)
+    norm = extra.get("bound_norm") or "frobenius"
+    o, i = dims
+    note = f"offer_weight_specials: {p.name} [{orient}] {kind}"
+    if bound > 0:
+        law = _LAW_BOUNDED[kind]
+        note += f" (bounded: max|ΔW| {bound:.3e})"
+    else:
+        law = _LAW[kind]
+    merged = eg._offer_witness(
+        cid,
+        eid,
+        rhs_term=eg.any_term(eid),
+        provenance=_PROV,
+        law=law,
+        witness=witness,
+        error_bound=bound,
+        bound_norm=norm,
+        note=note,
+    )
+    if not merged:
+        return None
+    return {
+        "param": p.name,
+        "orient": orient,
+        "kind": kind,
+        "in_dim": i,
+        "out_dim": o,
+        "eid": eid,
+        "error_bound": bound,
+        "bound_norm": norm,
+        **extra,
+    }
+
 
 def _offer_one_site(
     eg: Any,
@@ -457,8 +726,13 @@ def _offer_one_site(
     source_tensors: dict,
     cache: dict,
     witness: bool,
+    budget: float | None = None,
 ) -> list[dict]:
-    """Analyse one leaf weight's value and offer its special members."""
+    """Analyse one leaf weight's value and offer its special members.
+
+    ``budget`` arms the bounded members of :func:`_bounded_elide` —
+    ``None`` (the default) keeps the site bitwise-exact.
+    """
     w = source_tensors.get(p.name)
     if w is None or not _is_tensor(w) or len(w.shape) != 2:
         return []
@@ -469,35 +743,17 @@ def _offer_one_site(
     key = (p.name, orient)
     a = cache.get(key)
     if a is None:
-        a = _analyse(wn, o, i)
+        a = _analyse(wn, o, i, budget)
         cache[key] = a
     recs: list[dict] = []
     for kind, eid, extra in _members(
         eg, node, orient, data_c, p, wn, a, source_tensors
     ):
-        merged = eg._offer_witness(
-            cid,
-            eid,
-            rhs_term=eg.any_term(eid),
-            provenance=_PROV,
-            law=_LAW[kind],
-            witness=witness,
-            error_bound=0.0,
-            bound_norm="frobenius",
-            note=(f"offer_weight_specials: {p.name} [{orient}] {kind}"),
+        rec = _emit_member(
+            eg, cid, eid, kind, extra, p, orient, (o, i), witness
         )
-        if merged:
-            recs.append(
-                {
-                    "param": p.name,
-                    "orient": orient,
-                    "kind": kind,
-                    "in_dim": i,
-                    "out_dim": o,
-                    "eid": eid,
-                    **extra,
-                }
-            )
+        if rec is not None:
+            recs.append(rec)
     return recs
 
 
@@ -506,6 +762,7 @@ def offer_weight_specials(
     source_tensors: dict,
     *,
     witness: bool = True,
+    budget: float | None = None,
 ) -> list[dict]:
     """Offer exact members for structurally-special weight params.
 
@@ -526,8 +783,20 @@ def offer_weight_specials(
     derived parameters are registered into ``source_tensors`` so
     lowering materialises them like any weight.
 
+    ``budget`` (plan 0012, opt-in): when a float is given, the elide
+    analysis additionally treats *nearly*-dead slices (row/col
+    ``max|·| ≤ budget``) and *near*-duplicate rows (``max|Δ| ≤
+    budget``) as elidable — offered as ``elide_bounded`` /
+    ``zero_bounded`` members whose witnesses carry
+    ``error_bound = measured max|ΔW|`` (``bound_norm="max_abs"``).
+    Bounded members sit beside the exact ones in the same e-class —
+    extraction and the search-level ``error_budget`` gate decide.
+    ``None`` keeps the pass bitwise-exact — today's behavior,
+    unchanged.
+
     Returns one record per offered member: ``{param, orient, kind,
-    in_dim, out_dim, <derived param names>, eid}``.
+    in_dim, out_dim, error_bound, bound_norm, <derived param names>,
+    eid}``.
     """
     offers: list[dict] = []
     has_var = _cls_has_var(eg, {})
@@ -554,6 +823,7 @@ def offer_weight_specials(
                     source_tensors,
                     cache,
                     witness,
+                    budget,
                 )
                 if recs:
                     offers.extend(recs)

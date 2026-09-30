@@ -258,6 +258,30 @@ def _notes(fmt: str, has_catopt: bool) -> list[str]:
     return notes
 
 
+#: Certified bounded-rewrite ledger keys (plan 0012) copied into the
+#: manifest when the pipeline stats carry them.
+_BOUND_KEYS = (
+    "error_budget",
+    "error_bound_total",
+    "error_bounds",
+    "error_bounds_honored",
+)
+
+
+def _bound_manifest(stats: dict[str, Any] | None) -> dict[str, Any]:
+    """Slice the bounded-rewrite ledger out of *stats* for the manifest.
+
+    Plan-0012 honesty: an approximate delivery is never silent in the
+    exported artifact — a ``False`` ``error_bounds_honored`` is a
+    signal, not an omission, so ``is not None`` keeps it.
+    """
+    if stats is None:
+        return {}
+    return {
+        k: stats[k] for k in _BOUND_KEYS if stats.get(k) is not None
+    }
+
+
 # ---------------------------------------------------------------------------
 #  forward-output comparison (verify)
 # ---------------------------------------------------------------------------
@@ -556,6 +580,7 @@ def export_optimized(
     example_kwargs: dict[str, Any] | None = None,
     dynamic_shapes: Any = None,
     verify: bool = True,
+    stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Export an optimized model to a catopt-free artifact.
 
@@ -589,6 +614,13 @@ def export_optimized(
         Reload the artifact and assert the forward (runnable formats)
         or the weights (weights formats) round-trip.  On mismatch an
         :class:`ExportError` is raised — the manifest is not written.
+    stats : dict, optional
+        The pipeline's search/lower stats (``LowerResult.stats``).
+        When they carry certified bounded members — ``error_budget`` /
+        ``error_bound_total`` / ``error_bounds`` /
+        ``error_bounds_honored`` — the keys are copied into the
+        manifest verbatim, so an approximate delivery is never silent
+        about its error envelope.
 
     Returns
     -------
@@ -617,6 +649,7 @@ def export_optimized(
         "catopt_modules": catopt_mods,
     }
     manifest["notes"] = _notes(fmt_c, bool(catopt_mods))
+    manifest.update(_bound_manifest(stats))
 
     p.parent.mkdir(parents=True, exist_ok=True)
     if fmt_c == "pt2":

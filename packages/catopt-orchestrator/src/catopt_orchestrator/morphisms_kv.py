@@ -30,6 +30,16 @@ Applicability, honestly:
   anything beyond declines.  Random full-rank weights factor only
   trivially at ``r = d_in`` and the cost gate drops the match.
 
+* **bounded mode** (plan 0012, opt-in ``budget``) — real models
+  carry the shared structure *approximately* (xKV: aligned
+  cross-layer singular vectors).  With a budget the common basis is
+  *truncated*: directions whose summed per-site Frobenius residual
+  fits the budget are dropped, the measured residual becomes the
+  certified ``error_bound`` on the witness, the rewrite fires only
+  when ``residual ≤ budget``, and the pair verify gates at the
+  propagated bound — certified-bound replaces certified-exact,
+  never silent: the graft record and match stats carry the bound.
+
 The same machinery applies *inside* one block: a block whose K and V
 projections share a data operand and a right-factor is the per-layer
 MLA fold — no wiring evidence needed.
@@ -467,15 +477,131 @@ def _certify(
     return max_err
 
 
+def _family_residual(
+    kept: list[tuple[_KVSite, Any, Any]], Ut: Any
+) -> tuple[float, float]:
+    """Per-site reconstruction residuals — ``(Σ_i err_i, max_i err_i)``.
+
+    ``err_i = ‖eff_i - (eff_i·U_t)·U_tᵀ‖_F``: the *measured*
+    Frobenius error of the factorised weights, never estimated.  The
+    sum is the bound the budget gates and the witness certifies;
+    the max feeds the per-site ``factor_max_err`` stat.
+    """
+    errs = [_fnorm(k[2] - (k[2] @ Ut) @ Ut.T) for k in kept]
+    return sum(errs), max(errs)
+
+
+def _basis_masses(mats: list[Any], u: Any) -> list[float]:
+    """Squared Frobenius mass one basis vector captures, per matrix.
+
+    For an orthonormal basis vector ``u``, ``Σ_j (u·m_j)²`` is
+    exactly the residual² site ``m`` gains when ``u`` is dropped —
+    the coin the bounded-mode truncation spends.
+    """
+    return [
+        sum(float((u * m[j]).sum()) ** 2 for j in range(m.shape[0]))
+        for m in mats
+    ]
+
+
+def _spend_drops(
+    per: list[list[float]],
+    resid2: list[float],
+    keep: int,
+    budget: float,
+) -> set[int]:
+    """Greedy drop set: basis indices whose mass fits the budget.
+
+    Candidates are tried smallest-mass first — the cheapest signal
+    to discard — and a drop lands only while the running summed
+    per-site residual (``Σ_i √(resid2_i)``) stays within ``budget``.
+    """
+    drops: set[int] = set()
+    order = sorted(
+        (j for j in range(len(per)) if j != keep),
+        key=lambda j: sum(per[j]),
+    )
+    for j in order:
+        trial = [r + pm for r, pm in zip(resid2, per[j], strict=True)]
+        if sum(t**0.5 for t in trial) <= budget:
+            resid2 = trial
+            drops.add(j)
+    return drops
+
+
+def _truncate_basis(
+    mats: list[Any], basis: list[Any], budget: float
+) -> list[Any]:
+    """Drop lowest-mass directions while the summed residual ≤ budget.
+
+    Bounded-mode basis selection.  The exact cover keeps every
+    direction above ``factor_tol`` — a useless rank on approximate
+    weights, where the noise directions outnumber the signal.  Here
+    the family may instead *spend* up to ``budget`` of summed
+    per-site Frobenius residual.  The heaviest direction is never
+    dropped: the law still factors, it does not zero out the family.
+    The accept gate re-measures the residual exactly afterwards, so
+    the greedy order only ever costs compression, never honesty.
+    """
+    if not basis or budget <= 0:
+        return list(basis)
+    per = [_basis_masses(mats, u) for u in basis]
+    resid2 = [
+        max(_fnorm(m) ** 2 - sum(pm[i] for pm in per), 0.0)
+        for i, m in enumerate(mats)
+    ]
+    keep = max(range(len(basis)), key=lambda j: sum(per[j]))
+    drops = _spend_drops(per, resid2, keep, budget)
+    return [u for j, u in enumerate(basis) if j not in drops]
+
+
+def _certified_factor(
+    kept: list[tuple[_KVSite, Any, Any]],
+    d_in: int | None,
+    tol: float,
+    budget: float | None,
+) -> tuple[Any, int, float, list] | None:
+    """Basis selection + certification for the kept triples.
+
+    Exact mode: the ``tol`` cover plus the per-site relative
+    residual gate (``_certify``).  Bounded mode: the budget-
+    truncated basis (``_truncate_basis``) and the measured summed
+    residual as ``err`` — the caller gates it against ``budget``.
+    """
+    mats = [k[2] for k in kept]
+    basis = _gs_row_basis(mats, tol)
+    if budget is not None:
+        basis = _truncate_basis(mats, basis, budget)
+    if not basis or d_in is None:
+        return None
+    Ut = _stack_cols(basis)
+    if budget is None:
+        err = _certify(kept, Ut, tol)
+    else:
+        err, _site_max = _family_residual(kept, Ut)
+    if err is None:
+        return None
+    return Ut, int(d_in), err, kept
+
+
 def _factor_sites(
-    sites: list[_KVSite], leaves: dict, tol: float
+    sites: list[_KVSite],
+    leaves: dict,
+    tol: float,
+    budget: float | None = None,
 ) -> tuple[Any, int, float, list] | None:
     """Factor the sites' weight values through one common right-factor.
 
-    Returns ``(Ut, d_in, max_abs_err, kept)`` where ``kept`` is
+    Returns ``(Ut, d_in, err, kept)`` where ``kept`` is
     ``(site, weight, eff)`` triples; ``None`` when a weight is not a
-    2-D tensor, the input dims disagree, or the reconstruction
-    residual exceeds ``tol`` relative Frobenius.
+    2-D tensor, the input dims disagree, or — exact mode — the
+    reconstruction residual exceeds ``tol`` relative Frobenius.
+
+    With ``budget`` the basis is truncated
+    (:func:`_truncate_basis`): directions whose summed residual mass
+    fits the budget are dropped, and ``err`` is the measured summed
+    per-site Frobenius residual — the certified bound the caller
+    gates against ``budget`` and offers on the witness.
     """
     kept: list[tuple[_KVSite, Any, Any]] = []
     d_in: int | None = None
@@ -489,14 +615,7 @@ def _factor_sites(
         elif d_in != d_s:
             return None
         kept.append((s, w, eff))
-    basis = _gs_row_basis([k[2] for k in kept], tol)
-    if not basis or d_in is None:
-        return None
-    Ut = _stack_cols(basis)
-    err = _certify(kept, Ut, tol)
-    if err is None:
-        return None
-    return Ut, int(d_in), err, kept
+    return _certified_factor(kept, d_in, tol, budget)
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +910,17 @@ class KVLatentShare:
     intra, cross : bool
         Enable the single-block (K+V inside one block) and
         cross-block (shared input) forms.
+    budget : float | None
+        Bounded-error mode (plan 0012).  ``None`` — the default —
+        keeps today's exact gate: the common factor must hold within
+        ``factor_tol`` and nothing else fires.  A float enables the
+        certified-approximate mode: the common basis is truncated to
+        the directions whose summed per-site Frobenius residual fits
+        the budget, the offer certifies ``error_bound = residual``
+        (measured, never claimed smaller), the rewrite fires only
+        when ``residual ≤ budget``, and the delivered module is
+        verified at the propagated bound rather than left
+        unverified — certified-bound instead of certified-exact.
 
     """
 
@@ -804,6 +934,7 @@ class KVLatentShare:
         factor_tol: float = 1e-8,
         intra: bool = True,
         cross: bool = True,
+        budget: float | None = None,
     ) -> None:
         """Store the law's detection and tolerance configuration."""
         self.tokens = tuple(tokens)
@@ -811,6 +942,7 @@ class KVLatentShare:
         self.factor_tol = float(factor_tol)
         self.intra = bool(intra)
         self.cross = bool(cross)
+        self.budget = None if budget is None else float(budget)
 
     def match(self, graph: M.MorphismGraph) -> list[M.MorphismMatch]:
         """Match shared-data KV families — cross-block and intra."""
@@ -853,6 +985,7 @@ class KVLatentShare:
                     "tokens": self.tokens,
                     "qkv_tokens": self.qkv_tokens,
                     "factor_tol": self.factor_tol,
+                    "budget": self.budget,
                     "data": data,
                 },
             ),
@@ -946,17 +1079,30 @@ def _latent_rewrite(
     params: dict,
     leaves: dict,
     intra: bool,
-) -> tuple[Any, int, int, float, list] | None:
+    budget: float | None = None,
+) -> tuple[tuple[Any, int, int, float, float, list] | None, str | None]:
     """Certify the common factor and build the factorized joint term.
 
-    Returns ``(joint2, r, d_in, max_err, kept)`` — the rewritten
-    joint plus the certification record — or ``None`` when no
-    certified common right-factor exists.
+    Returns ``((joint2, r, d_in, bound, site_max, kept), None)`` —
+    the rewritten joint plus the certification record (``bound`` is
+    the witnessed error bound: the per-site max in exact mode, the
+    summed family residual in bounded mode; ``site_max`` is always
+    the max per-site residual) — or ``(None, reason)`` on the
+    honest declines: no certified common right-factor, or a
+    measured residual over ``budget``.
     """
-    fac = _factor_sites(sites, leaves, tol)
+    fac = _factor_sites(sites, leaves, tol, budget=budget)
     if fac is None:
-        return None
-    Ut, d_in, max_err, kept = fac
+        return None, "no certified common factor"
+    Ut, d_in, err, kept = fac
+    if budget is None:
+        bound, site_max = err, err
+    else:
+        bound, site_max = _family_residual(kept, Ut)
+        if bound > budget:
+            return None, (
+                f"bound exceeds budget: {bound:.3e} > {budget:.3e}"
+            )
     r = int(Ut.shape[1])
     Ut_p = Param("p_kv_latent_ut", TensorType((d_in, r)))
     params[Ut_p.name] = Ut_p
@@ -977,7 +1123,73 @@ def _latent_rewrite(
         if intra
         else _add_chain([bodies2[n] for n in nodes])
     )
-    return joint2, r, d_in, max_err, kept
+    return (joint2, r, d_in, bound, site_max, kept), None
+
+
+def _tmax(t: Any) -> float | None:
+    """``float(t.abs().max())`` duck-typed; ``None`` when absent."""
+    a = getattr(t, "abs", None)
+    if not callable(a):
+        return None
+    m = getattr(a(), "max", None)
+    return float(m()) if callable(m) else None
+
+
+def _propagated_bound(
+    recs: list[Any], x_val: Any, residual: float
+) -> tuple[float | None, float | None]:
+    """Cheap output-space estimate of the certified weight residual.
+
+    Each site's output perturbation is ``x·E_iᵀ``, so the family-sum
+    output moves by at most ``‖x‖_F · Σ_i‖E_i‖_F`` on a given input —
+    the per-consumer sensitivity estimate propagated through the
+    residual distribution.  Returns ``(abs, rel)`` where ``rel``
+    normalises by the captured joint-output magnitude — the same
+    normalisation the pair verify applies.  Whichever leg the
+    captured values cannot supply comes back ``None``.  This is an
+    *estimate* — the attention path is not Lipschitz-analysed; the
+    certified bound stays the weight-space residual.
+    """
+    if not _is_tensor(x_val):
+        return None, None
+    out_abs = _fnorm(x_val) * residual
+    scale = _tmax(_sum_vals(r.out_val for r in recs))
+    if scale is None:
+        return out_abs, None
+    return out_abs, out_abs / (scale + 1e-8)
+
+
+def _bounded_ctx(
+    recs: list[Any], verify_tol: float, budget: float, bound: float
+) -> tuple[float, str, dict[str, Any]]:
+    """Bounded-mode extras: verify tolerance, law suffix, stat block.
+
+    Verified-with-tolerance, not unverified: the pair verify gates
+    at the residual propagated to the verify metric's own
+    (output-relative) units, never below ``verify_tol``.  The stats
+    carry the certified bound — the match record always shows which
+    bounded rewrites fired and at what bound.
+    """
+    out_bound, rel_bound = _propagated_bound(
+        recs, recs[0].example, bound
+    )
+    eff_tol = max(
+        verify_tol,
+        rel_bound if rel_bound is not None else bound,
+    )
+    suffix = (
+        f" (bounded: measured Frobenius residual {bound:.3e} "
+        f"≤ budget {budget:.3e})"
+    )
+    stats = {
+        "bounded": True,
+        "error_bound": bound,
+        "bound_norm": "frobenius",
+        "error_budget": budget,
+        "error_bound_out": out_bound,
+        "verify_tol": eff_tol,
+    }
+    return eff_tol, suffix, stats
 
 
 def _reify_family(
@@ -1007,6 +1219,9 @@ def _reify_family(
     tokens = tuple(extra.get("tokens", _KV_TOKENS))
     qkv_tokens = tuple(extra.get("qkv_tokens", _QKV_TOKENS))
     tol = float(extra.get("factor_tol", 1e-8))
+    budget = extra.get("budget")
+    if budget is not None:
+        budget = float(budget)
     data = extra.get("data")
     prep = _family_prep(match, graph)
     if prep.get("status") == "declined":
@@ -1030,7 +1245,7 @@ def _reify_family(
             "status": "declined",
             "reason": "no shared-data kv sites",
         }
-    fac = _latent_rewrite(
+    fac, why = _latent_rewrite(
         sites,
         tol,
         data,
@@ -1039,13 +1254,26 @@ def _reify_family(
         params,
         leaves,
         intra,
+        budget=budget,
     )
     if fac is None:
         return {
             "status": "declined",
-            "reason": "no certified common factor",
+            "reason": why or "no certified common factor",
         }
-    joint2, r, d_in, max_err, kept = fac
+    joint2, r, d_in, bound, site_max, kept = fac
+    if budget is not None:
+        eff_tol, suffix, bstats = _bounded_ctx(
+            recs, verify_tol, budget, bound
+        )
+    else:
+        eff_tol, suffix, bstats = verify_tol, "", {}
+    law_text = (
+        "kv_latent_share: the member weights' rows share a "
+        f"certified rank-{r} subspace — W = (W·U_t)·U within "
+        "the factor tolerance; morphism-level assertion, "
+        "gated by the fp64 verify"
+    ) + suffix
     eg, eid = M._saturate(
         joint,
         M._recipe_rules(spec.rules),
@@ -1055,14 +1283,11 @@ def _reify_family(
         offers=[
             (
                 joint2,
-                "kv_latent_share: the member weights' rows share a "
-                f"certified rank-{r} subspace — W = (W·U_t)·U within "
-                "the factor tolerance; morphism-level assertion, "
-                "gated by the fp64 verify",
+                law_text,
                 {
                     "note": "kv_latent_share: common right-factor "
                     "fold over the shared input",
-                    "error_bound": max_err,
+                    "error_bound": bound,
                     "bound_norm": "frobenius",
                 },
             )
@@ -1075,9 +1300,10 @@ def _reify_family(
         "latent_rank": r,
         "d_in": d_in,
         "n_kv_sites": len(sites),
-        "factor_max_err": max_err,
+        "factor_max_err": site_max,
         **_kv_numbers(kept, d_in, r, data),
     }
+    info.update(bstats)
     return _family_gate(
         match,
         recs,
@@ -1085,7 +1311,7 @@ def _reify_family(
         intra=intra,
         sink=sink,
         cost_fn=cost_fn,
-        verify_tol=verify_tol,
+        verify_tol=eff_tol,
         joint=joint,
         best=best,
         x=x,
