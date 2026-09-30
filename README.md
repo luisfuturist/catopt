@@ -103,6 +103,8 @@ equivalent:
 | Blocks with exploitable structure (`bench/real_win_hunt.py`) | **~1.1–10× vs Inductor** — unnormalized-attention reassoc ~2×, PaLM parallel blocks ~1.2×, expert-sum weight fold ~7× |
 | Carrier + CUDA-graph decode (`bench/decode_scan_bench.py`, `decode_retnet`) | **1.65–3.4× vs Inductor / best non-carrier** — chunked scan carriers amortize to zero launches |
 | Deep weight chains (`bench/reassoc_scale.py`) | 8.9–16.1× vs Inductor — a form Inductor's post-grad graph provably can't reach |
+| Morphism windows (`optimize_morphisms`) | term-level flops: 4-block projection chains −92% (49,664→4,096), residual streams −66% (50,176→17,024), fp64-verified |
+| KV latent sharing (`KVLatentShare`, opt-in) | kv flops/bytes −62.5% on factorable (low-rank/tied/pruned) weight families; correctly declines on full-rank weights |
 | Whole model E2E (`bench/e2e_model.py`) | **~1.05× over plain Inductor** — pairing fires per block, verified fp64-exact |
 | Real trained checkpoints (stories15M/110M) | Parity — all blocks transform and verify; the dims don't pay |
 
