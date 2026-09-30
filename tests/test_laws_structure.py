@@ -250,6 +250,7 @@ def test_laws_modules_import_cleanly():
         "catopt_core.laws.layout": ["LAYOUT_RULES"],
         "catopt_core.laws.pairing": PAIRING_PASSES,
         "catopt_core.laws.factored": ["offer_low_rank_factors"],
+        "catopt_core.laws.specials": ["offer_weight_specials"],
     }
     for modname, names in expected.items():
         mod = sys.modules.get(modname) or importlib.import_module(

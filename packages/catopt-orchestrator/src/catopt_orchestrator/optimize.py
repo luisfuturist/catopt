@@ -510,6 +510,7 @@ def _pairing_and_lifts(
     source_tensors: dict,
     meter: Any = None,
     detect_factors: bool = False,
+    detect_specials: bool = False,
 ) -> list:
     """Non-local passes with a brief re-saturation between them.
 
@@ -520,7 +521,10 @@ def _pairing_and_lifts(
     over scanned values -> the deferred omd carrier, exact weight
     tying (duplicate Param leaves share one class), and — opt-in via
     ``detect_factors`` — the low-rank factored-parameter offers of
-    :func:`catopt_core.laws.factored.offer_low_rank_factors`.  All
+    :func:`catopt_core.laws.factored.offer_low_rank_factors`, plus —
+    opt-in via ``detect_specials`` — the exact structurally-special
+    weight offers of
+    :func:`catopt_core.laws.specials.offer_weight_specials`.  All
     witnessed so certificates stay replayable.
 
     Returns the pairing-groups list — the coordinated (paired)
@@ -541,7 +545,9 @@ def _pairing_and_lifts(
         )
         _check_resources(eg, max_enodes, max_memory_mb, meter)
 
-    lifts = _carrier_lifts(eg, source_tensors, stats, detect_factors)
+    lifts = _carrier_lifts(
+        eg, source_tensors, stats, detect_factors, detect_specials
+    )
     if lifts:
         eg.rebuild()
         _check_resources(eg, max_enodes, max_memory_mb, meter)
@@ -587,6 +593,7 @@ def _carrier_lifts(
     source_tensors: dict,
     stats: dict[str, Any],
     detect_factors: bool,
+    detect_specials: bool = False,
 ) -> list:
     """Run the non-local carrier/tying lifts, carriers lazily resolved.
 
@@ -594,7 +601,9 @@ def _carrier_lifts(
     time; the weight-tying lifts are core.  A partial install without
     carriers contributes only the tying passes.  ``detect_factors``
     arms the opt-in low-rank detection offers of
-    :func:`catopt_core.laws.factored.offer_low_rank_factors`.
+    :func:`catopt_core.laws.factored.offer_low_rank_factors`;
+    ``detect_specials`` arms the opt-in exact weight-structure offers
+    of :func:`catopt_core.laws.specials.offer_weight_specials`.
     """
     try:
         from catopt_carriers.trace_lift import (
@@ -621,6 +630,7 @@ def _carrier_lifts(
         + share_duplicate_params(eg, source_tensors)
         + share_duplicate_param_slices(eg, source_tensors)
         + _factor_lifts(eg, source_tensors, stats, detect_factors)
+        + _special_lifts(eg, source_tensors, stats, detect_specials)
     )
 
 
@@ -644,6 +654,32 @@ def _factor_lifts(
     offers = offer_low_rank_factors(eg, source_tensors)
     if offers:
         stats["low_rank_factors"] = [
+            {k: v for k, v in r.items() if k != "eid"} for r in offers
+        ]
+    return offers
+
+
+def _special_lifts(
+    eg: EGraph,
+    source_tensors: dict,
+    stats: dict[str, Any],
+    detect_specials: bool,
+) -> list:
+    """Opt-in structurally-special weight offers (``detect_specials``).
+
+    The detection pass itself is the branch — when off this returns
+    ``[]`` without touching the graph; when on, each certified exact
+    offer (identity/diagonal/zero/elide/block-diag members, all
+    ``error_bound=0``) lands in ``stats["weight_specials"]`` (minus
+    the e-class id, which means nothing outside this run).
+    """
+    if not detect_specials:
+        return []
+    from catopt_core.laws.specials import offer_weight_specials
+
+    offers = offer_weight_specials(eg, source_tensors)
+    if offers:
+        stats["weight_specials"] = [
             {k: v for k, v in r.items() if k != "eid"} for r in offers
         ]
     return offers
@@ -758,6 +794,7 @@ def search(
     patience: int = 3,
     engine: Any = None,
     detect_factors: bool = False,
+    detect_specials: bool = False,
 ) -> SearchResult:
     """Run the search phase: ``model -> SearchResult``.
 
@@ -864,6 +901,17 @@ def search(
         ``assoc_*`` laws already derive both directions and the cost
         model picks; this flag covers weights whose low rank is only
         visible in the values.
+    detect_specials : bool, default False
+        Opt-in structurally-special weight pass
+        (:func:`catopt_core.laws.specials.offer_weight_specials`):
+        weight parameters whose *stored values* are identity,
+        diagonal, zero, block-diagonal, or carry bitwise-dead input
+        slices / bitwise-duplicate output slices get witnessed
+        **exact** members (bound 0) — skip/pointwise-mul, narrowed
+        projections plus gathers, per-block splits — in their
+        consumer's e-class.  Unlike ``detect_factors`` nothing here
+        is approximate: a slice is dead iff every value is exactly
+        0.0, and duplicates dedupe bitwise.
     verbose : bool
         Print progress.
 
@@ -951,6 +999,7 @@ def search(
             source_tensors,
             meter,
             detect_factors,
+            detect_specials,
         )
     else:
         # Non-local passes (pairing + carrier lifts) offer members

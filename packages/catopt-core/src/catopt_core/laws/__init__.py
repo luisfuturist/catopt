@@ -23,6 +23,11 @@
   ``offer_low_rank_factors`` detects numerically low-rank weight
   values and offers the ``(x@A)@B`` / ``linear(linear(x,A),B)``
   member into the consumer's e-class under a certified bound.
+* :mod:`catopt_core.laws.specials` — the exact-elision sibling:
+  ``offer_weight_specials`` detects structurally-special stored
+  weights (identity, diagonal, zero, dead/duplicate slices,
+  block-diagonal) and offers exact members under a certified zero
+  bound.
 * :mod:`catopt_core.laws.tags` — the rule-tag constants
   (``SYMMETRY`` / ``EXPANSIVE`` / ``SUBSUMED`` / ``FUSION`` / …).
 * :mod:`catopt_core.laws.ruleset` — :class:`RuleSet`, the composable
@@ -160,6 +165,9 @@ from catopt_core.laws.scan import (  # noqa: F401
     _affd_state_like,
     _affd_unit_state_like,
     _derive_affd_unit,
+)
+from catopt_core.laws.specials import (
+    offer_weight_specials,
 )
 from catopt_core.laws.tensor import (  # noqa: F401
     _QK_SCORES,
@@ -335,6 +343,7 @@ __all__ = [
     "RuleSet",
     "all_rules",
     "offer_low_rank_factors",
+    "offer_weight_specials",
     "pair_shared_input_convs",
     "pair_shared_input_linears",
     "preset",
