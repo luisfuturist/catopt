@@ -38,6 +38,7 @@ from catopt_orchestrator.criteria import (
 from catopt_orchestrator.morphisms import (
     DEFAULT_MORPHISM_LAWS,
     BlockSig,
+    CrossBlockCSE,
     KVLatentShare,
     MorphismGraph,
     MorphismLaw,
@@ -80,6 +81,7 @@ __all__ = [
     "Compositional",
     "Criteria",
     "Criterion",
+    "CrossBlockCSE",
     "DepthCriterion",
     "FlopsCriterion",
     "IdentityRunner",

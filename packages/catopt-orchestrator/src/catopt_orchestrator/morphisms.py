@@ -55,6 +55,7 @@ from catopt_core.pipeline import LowerResult
 from catopt_core.ports import Composer, CostFn, Meter, Sink, Source
 from catopt_core.typing import _shape_of, has_var_leaf
 
+from catopt_orchestrator.crossblock_cse import CrossBlockCSE
 from catopt_orchestrator.morphisms_kv import KVLatentShare
 from catopt_orchestrator.runners import IdentityRunner
 
@@ -63,6 +64,7 @@ log = logging.getLogger("catopt_orchestrator.morphisms")
 __all__ = [
     "DEFAULT_MORPHISM_LAWS",
     "BlockSig",
+    "CrossBlockCSE",
     "KVLatentShare",
     "MorphismGraph",
     "MorphismLaw",
@@ -1704,6 +1706,21 @@ def _reify(
         from catopt_orchestrator.morphisms_kv import _reify_family
 
         return _reify_family(
+            match,
+            graph,
+            sink=sink,
+            cost_fn=cost_fn,
+            verify_tol=verify_tol,
+            max_iterations=max_iterations,
+            max_enodes=max_enodes,
+            symmetry_budget=symmetry_budget,
+        )
+    if spec.mode == "cse":
+        # The cross-block shared-subterm rewrite lives in the
+        # sibling module; resolved lazily like ``family``.
+        from catopt_orchestrator.crossblock_cse import _reify_cse
+
+        return _reify_cse(
             match,
             graph,
             sink=sink,
