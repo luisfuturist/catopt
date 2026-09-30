@@ -785,13 +785,21 @@ def test_shape_tuple_edges():
 
 def test_e2e_chain_out_in_compose_grafts_fp64():
     """DeepParallel chain: out∘in fires, grafts, and the delivered
-    model is fp64-exact vs the original."""
+    model is fp64-exact vs the original.
+
+    The law list is explicit — under the default family the
+    :class:`WindowCompose` window law claims the whole chain first.
+    """
     torch.manual_seed(0)
     model = _ChainStack(dim=16, depth=4).eval().double()
     x = _x()
 
     opt, stats = Optimizer(backend=TorchBackend()).optimize(
-        model, x, strategy=MorphismSearch(optimize_rest=False)
+        model,
+        x,
+        strategy=MorphismSearch(
+            laws=[M.OutInCompose()], optimize_rest=False
+        ),
     )
 
     m = stats["matches"]["out_in_compose:blocks.0+blocks.1"]

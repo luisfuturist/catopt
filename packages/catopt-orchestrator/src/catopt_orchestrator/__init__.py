@@ -38,6 +38,7 @@ from catopt_orchestrator.criteria import (
 from catopt_orchestrator.morphisms import (
     DEFAULT_MORPHISM_LAWS,
     BlockSig,
+    KVLatentShare,
     MorphismGraph,
     MorphismLaw,
     MorphismMatch,
@@ -82,6 +83,7 @@ __all__ = [
     "DepthCriterion",
     "FlopsCriterion",
     "IdentityRunner",
+    "KVLatentShare",
     "LatencyCriterion",
     "LowerResult",
     "MemoryCriterion",

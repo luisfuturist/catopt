@@ -55,6 +55,7 @@ from catopt_core.pipeline import LowerResult
 from catopt_core.ports import Composer, CostFn, Meter, Sink, Source
 from catopt_core.typing import _shape_of, has_var_leaf
 
+from catopt_orchestrator.morphisms_kv import KVLatentShare
 from catopt_orchestrator.runners import IdentityRunner
 
 log = logging.getLogger("catopt_orchestrator.morphisms")
@@ -62,6 +63,7 @@ log = logging.getLogger("catopt_orchestrator.morphisms")
 __all__ = [
     "DEFAULT_MORPHISM_LAWS",
     "BlockSig",
+    "KVLatentShare",
     "MorphismGraph",
     "MorphismLaw",
     "MorphismMatch",
@@ -72,8 +74,10 @@ __all__ = [
     "OutInCompose",
     "ReifySpec",
     "ResidualAbsorb",
+    "ResidualReassoc",
     "WeightRef",
     "WeightTie",
+    "WindowCompose",
     "Wire",
     "block_signature",
     "lift_graph",
@@ -441,7 +445,16 @@ class Wire:
 
 @dataclass
 class _BlockRecord:
-    """The lift record for one node — IR, leaves, captured IO."""
+    """The lift record for one node — IR, leaves, captured IO.
+
+    Beyond the exported IR and leaf values, the record keeps the
+    captured-IO evidence morphism laws read: ``in_obj`` / ``out_obj``
+    are the *live* argument/output objects of the block's first call
+    (object identity is the structural proof two blocks shared an
+    input or that an output escaped), ``out_val`` its detached output
+    clone, ``calls`` the invocation count, and ``example2`` /
+    ``out_val2`` the perturbed-probe counterparts.
+    """
 
     name: str
     module: Any
@@ -450,6 +463,51 @@ class _BlockRecord:
     args: tuple = ()
     example: Any = None
     note: str | None = None
+    in_obj: Any = None
+    out_obj: Any = None
+    out_val: Any = None
+    calls: int = 0
+    example2: Any = None
+    out_val2: Any = None
+
+
+def _io_evidence(
+    rec: _BlockRecord, ient: dict, cap2: Any, ient2: dict
+) -> None:
+    """Store the captured-IO evidence on the record.
+
+    Live objects (``in_obj``/``out_obj``) carry identity evidence —
+    two blocks sharing one input object consume literally the same
+    tensor; detached clones (``out_val``/``out_val2``) carry the
+    value evidence the additive-consumption checks compare.
+    """
+    in_objs = ient.get("in_objs")
+    rec.in_obj = in_objs[0] if in_objs else None
+    rec.out_obj = ient.get("out_obj")
+    rec.out_val = ient.get("out")
+    rec.calls = int(ient.get("calls", 0))
+    if cap2 is not None:
+        rec.example2 = cap2[0][0]
+    rec.out_val2 = ient2.get("out")
+
+
+def _aux_outs(io: Any, names: set) -> tuple[tuple, tuple]:
+    """Return the non-block io entries' (out values, out objects).
+
+    Entries keyed by something that is not a block name are
+    model-level rows — their outputs are the "consumed value"
+    targets the family laws check.
+    """
+    outs: list = []
+    objs: list = []
+    for k, e in (io or {}).items():
+        if k in names or not isinstance(e, dict):
+            continue
+        if e.get("out") is not None:
+            outs.append(e["out"])
+        if e.get("out_obj") is not None:
+            objs.append(e["out_obj"])
+    return tuple(outs), tuple(objs)
 
 
 class MorphismGraph:
@@ -468,12 +526,24 @@ class MorphismGraph:
         nodes: list[MorphismNode],
         wires: list[Wire],
         records: dict[str, _BlockRecord],
+        io: Any = None,
+        io2: Any = None,
     ) -> None:
-        """Store the graph — construction is :func:`lift_graph`'s job."""
+        """Store the graph — construction is :func:`lift_graph`'s job.
+
+        ``io`` / ``io2`` are the composer's captured dataflow maps
+        (first capture and perturbed probe); entries whose key is not
+        a block name are model-level rows — their outputs are the
+        "consumed value" targets the family laws check.
+        """
         self.nodes = tuple(nodes)
         self.wires = tuple(wires)
         self._records = records
         self._by_name = {n.name: n for n in self.nodes}
+        names = set(self._by_name)
+        self._model_outs, self._model_out_objs = _aux_outs(io, names)
+        self._model_outs2 = _aux_outs(io2, names)[0]
+        self._probe2 = bool(io2)
 
     def node(self, name: str) -> MorphismNode:
         """Return the :class:`MorphismNode` for *name*."""
@@ -548,6 +618,12 @@ def lift_graph(
         else:
             rec.args = cap[0]
             rec.example = cap[0][0]
+            _io_evidence(
+                rec,
+                io.get(name, {}),
+                captured2.get(name),
+                io2.get(name, {}),
+            )
             try:
                 rec.ir, rec.leaves = source.to_ir(mod, rec.example)
             except Exception as e:
@@ -581,7 +657,7 @@ def lift_graph(
         )
         for i in range(len(blocks) - 1)
     ]
-    return MorphismGraph(nodes, wires, records)
+    return MorphismGraph(nodes, wires, records, io=io, io2=io2)
 
 
 # ---------------------------------------------------------------------------
@@ -610,12 +686,24 @@ class ReifySpec:
       level and gated by the pair verify.
     * ``share`` — run the value-exact weight-tying pass on the joint
       e-graph before extraction.
+    * ``kinds`` — for *window* rewrites (``len(nodes) >= 3``), the
+      per-wire boundary kinds in arrow order (``len(nodes) - 1``
+      entries).  ``mode`` then mirrors ``kinds[-1]``: it still drives
+      the first-slot delta and last-slot filler conventions.  Empty
+      for pair / intra / tie matches.
+    * ``extra`` — an opaque law-carried payload the mode's reify
+      reads back: the ``"family"`` mode (KV latent sharing,
+      :mod:`catopt_orchestrator.morphisms_kv`) packs the name-token
+      sets, the factor tolerance and the shared data term
+      identifying the latent group.
     """
 
     mode: str
     rules: str = "compose"
     distribute: bool = False
     share: bool = False
+    kinds: tuple[str, ...] = ()
+    extra: Any = None
 
 
 @dataclass(frozen=True)
@@ -874,9 +962,201 @@ class WeightTie:
         return out
 
 
-#: The default morphism law family, in application order — pair-level
-#: transforms first (they claim nodes), then node-level and tying.
+def _compose_pair_ok(a: BlockSig | None, b: BlockSig | None) -> bool:
+    """Check the out∘in signature predicate on one adjacent pair."""
+    return (
+        a is not None
+        and b is not None
+        and bool(a.out_proj)
+        and bool(b.in_projs)
+        and _dims_compatible(a, b)
+    )
+
+
+def _wire_composes(
+    graph: MorphismGraph, w: Wire, kinds: frozenset[str]
+) -> bool:
+    """Check a wire's boundary kind and both sides' signatures."""
+    return w.kind in kinds and _compose_pair_ok(
+        graph.sig(w.src), graph.sig(w.dst)
+    )
+
+
+def _window_nodes(wires: tuple[Wire, ...], i: int, j: int) -> tuple:
+    """Block names for wires ``i..j`` inclusive — arrow order."""
+    return (
+        *(wires[t].src for t in range(i, j + 1)),
+        wires[j].dst,
+    )
+
+
+def _stream_commutes(
+    graph: MorphismGraph, nodes: tuple[str, ...]
+) -> bool:
+    """Check a residual window carries a real commute opportunity.
+
+    Every node must be lifted (an opaque block is a boundary, never
+    crossed), and some earlier block's out-projection must compose
+    into a *later* block's input projections.  The receiving block's
+    projections must read the stream with no pre-norm in the way —
+    ``norm.pre`` marks a nonlinear normaliser bilinearity cannot
+    cross.
+    """
+    sigs = [graph.sig(n) for n in nodes]
+    if any(s is None for s in sigs):
+        return False
+    lifted = [s for s in sigs if s is not None]
+    return any(
+        _stream_pair_ok(si, sj)
+        for i, si in enumerate(lifted[:-1])
+        for sj in lifted[i + 1 :]
+    )
+
+
+def _stream_pair_ok(a: BlockSig, b: BlockSig) -> bool:
+    """One contributing pair: out-proj into a pre-norm-free receiver."""
+    return (
+        bool(a.out_proj)
+        and bool(b.in_projs)
+        and not b.norm.pre
+        and _dims_compatible(a, b)
+    )
+
+
+class WindowCompose:
+    """``A.out ∘ B.in ∘ C.in ∘ …`` — compose a whole chain window.
+
+    Generalises :class:`OutInCompose` from a boundary pair to a
+    maximal run of ≥3 blocks: interior wires must be plain ``chain``
+    (each block's output is consumed by exactly the next input), and
+    the final wire may additionally be ``chain_wrapped`` (the
+    parent's ``y + B(y)`` wrap around the last block).  One
+    :class:`MorphismMatch` per window carries one :class:`ReifySpec`
+    — a single joint term, a single joint e-graph, a single verify —
+    instead of k-1 pairwise passes that would consume the blocks two
+    at a time.
+    """
+
+    name = "window_compose"
+
+    def match(self, graph: MorphismGraph) -> list[MorphismMatch]:
+        """Grow maximal composable chain windows left-to-right."""
+        out: list[MorphismMatch] = []
+        wires = graph.wires
+        i = 0
+        while i < len(wires):
+            if not _wire_composes(
+                graph, wires[i], frozenset({"chain"})
+            ):
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(wires) and _wire_composes(
+                graph, wires[j + 1], frozenset({"chain"})
+            ):
+                j += 1
+            kinds = [wires[t].kind for t in range(i, j + 1)]
+            # A wrapped tail may close the window (last block only).
+            if j + 1 < len(wires) and _wire_composes(
+                graph, wires[j + 1], frozenset({"chain_wrapped"})
+            ):
+                j += 1
+                kinds.append("chain_wrapped")
+            if j - i >= 1:  # >=2 wires -> >=3 blocks
+                nodes = _window_nodes(wires, i, j)
+                out.append(
+                    MorphismMatch(
+                        law=self.name,
+                        nodes=nodes,
+                        boundary="+".join(kinds),
+                        reify=ReifySpec(
+                            mode=kinds[-1],
+                            rules="compose",
+                            kinds=tuple(kinds),
+                        ),
+                        detail=(
+                            f"{nodes[0]}->…->{nodes[-1]}: "
+                            f"{len(nodes)}-block out∘in window"
+                        ),
+                    )
+                )
+            i = j + 1
+        return out
+
+
+class ResidualReassoc:
+    """The residual ``+`` monoid commutes receivers past blocks.
+
+    On a residual-stream run ``s = x + f0(x) + f1(·) + …`` the stream
+    every block reads is a *sum* of all earlier contributions, so a
+    later block's input projections may legally distribute over
+    addends a non-adjacent block produced:
+    ``linear(s, W) = linear(x, W) + Σ linear(f_i(·), W)`` — and each
+    ``linear(f_i(·), W)`` is the ``f_i.out ∘ W`` composition the pair
+    laws reach only for adjacent blocks.  The additive monoid
+    (associativity + commutativity of ``+``) is the legal commute
+    path; bilinearity does the absorption.
+
+    Matches maximal windows of ≥3 blocks whose interior wires are
+    ``residual_wrapped`` (the stream flows on), optionally closed by
+    a plain ``residual`` receiver; emits one match whose reify offers
+    the stream-distributed joint — a constructed equality asserted at
+    morphism level and gated by the fp64 verify + the cost gate.
+    """
+
+    name = "residual_reassoc"
+
+    def match(self, graph: MorphismGraph) -> list[MorphismMatch]:
+        """Grow maximal residual-stream windows left-to-right."""
+        out: list[MorphismMatch] = []
+        wires = graph.wires
+        i = 0
+        while i < len(wires):
+            if wires[i].kind != "residual_wrapped":
+                i += 1
+                continue
+            j = i
+            while (
+                j + 1 < len(wires)
+                and wires[j + 1].kind == "residual_wrapped"
+            ):
+                j += 1
+            # An unwrapped receiver may close the window.
+            if j + 1 < len(wires) and wires[j + 1].kind == "residual":
+                j += 1
+            if j - i >= 1:  # >=2 wires -> >=3 blocks on the stream
+                nodes = _window_nodes(wires, i, j)
+                if _stream_commutes(graph, nodes):
+                    kinds = [wires[t].kind for t in range(i, j + 1)]
+                    out.append(
+                        MorphismMatch(
+                            law=self.name,
+                            nodes=nodes,
+                            boundary="+".join(kinds),
+                            reify=ReifySpec(
+                                mode=kinds[-1],
+                                rules="compose",
+                                distribute=True,
+                                kinds=tuple(kinds),
+                            ),
+                            detail=(
+                                f"{nodes[0]}->…->{nodes[-1]}: residual"
+                                " stream reassociation over "
+                                f"{len(nodes)} blocks"
+                            ),
+                        )
+                    )
+            i = j + 1
+        return out
+
+
+#: The default morphism law family, in application order — widest
+#: spans first (a window claims its nodes before any pair law sees
+#: them; a declined window leaves its pairs to the pair laws), then
+#: pair-level transforms, then node-level and tying.
 DEFAULT_MORPHISM_LAWS: tuple[MorphismLaw, ...] = (
+    WindowCompose(),
+    ResidualReassoc(),
     OutInCompose(),
     ResidualAbsorb(),
     NormCascade(),
@@ -955,6 +1235,74 @@ def _joint_parts(
     return joint, x, mid, params, leaves
 
 
+def _joint_parts_window(
+    irs: list[IR],
+    recs: list[_BlockRecord],
+    kinds: tuple[str, ...],
+) -> tuple[Any, Var, tuple, dict, dict]:
+    """Compose a ≥3-block window's IRs — the n-ary :func:`_joint_parts`.
+
+    Returns ``(joint, x, mids, params, leaves)``: ``joint`` is the
+    whole window's function of the first block's input ``x``;
+    ``mids`` is the tuple of residual-*stream* nodes the later blocks
+    read (in creation order ``s_0..s_{k-2}`` — the distribute offer
+    expands them outermost-first); empty for the chain family, which
+    has no additive structure to distribute over.
+
+    Construction is driven by ``kinds`` (one per interior boundary):
+    a residual-family window accumulates the stream
+    ``s_j = s_{j-1} + f_j(s_{j-1})`` every later block reads; a
+    chain-family window nests ``f_j(f_{j-1}(·))``.  In both, the last
+    wire's ``_wrapped`` mark decides whether the segment's value is
+    the raw last body or ``in + body``.
+    """
+    pres = [_ns_prefix(r.name) for r in recs]
+    roots = [
+        _prefix_params(ir.root, pre)
+        for ir, pre in zip(irs, pres, strict=True)
+    ]
+    params: dict[str, Param] = {}
+    leaves: dict[str, Any] = {}
+    for ir, rec, pre in zip(irs, recs, pres, strict=True):
+        params.update(
+            {
+                pre + k: Param(pre + k, p.typ)
+                for k, p in ir.params.items()
+            }
+        )
+        leaves.update({pre + k: v for k, v in rec.leaves.items()})
+    x = irs[0].inputs[0]
+    first = _subst(roots[0], irs[0].inputs[0], x)
+    mids: list[Any] = []
+    if kinds[0].startswith("residual"):
+        # Stream semantics: block j >= 1 reads s_{j-1}, the running
+        # in+out sum; interior wires are residual_wrapped by the law's
+        # own grammar (the stream must flow on).
+        stream = Op.make("add", x, first)
+        mids.append(stream)
+        for j in range(1, len(irs) - 1):
+            fj = _subst(roots[j], irs[j].inputs[0], stream)
+            stream = Op.make("add", stream, fj)
+            mids.append(stream)
+        body = _subst(roots[-1], irs[-1].inputs[0], stream)
+        joint = (
+            Op.make("add", stream, body)
+            if kinds[-1].endswith("_wrapped")
+            else body
+        )
+    else:
+        cur = first
+        for j in range(1, len(irs) - 1):
+            cur = _subst(roots[j], irs[j].inputs[0], cur)
+        body = _subst(roots[-1], irs[-1].inputs[0], cur)
+        joint = (
+            Op.make("add", cur, body)
+            if kinds[-1].endswith("_wrapped")
+            else body
+        )
+    return joint, x, tuple(mids), params, leaves
+
+
 def _distribute_over(term: Any, mid: Any) -> Any:
     """Distribute projections whose data operand IS the residual sum.
 
@@ -964,6 +1312,8 @@ def _distribute_over(term: Any, mid: Any) -> Any:
     sum.  A *constructed* equality: the rule set has no ``linear``-slot
     distribute law, so this step is offered into the joint e-graph
     under a pointwise witness and gated by the pair's fp64 verify.
+    ``mid`` is always an additive node by construction — the joint
+    builders only ever pass residual-stream ``add`` nodes.
     """
     if not isinstance(term, Op):
         return term
@@ -1054,6 +1404,34 @@ def _recipe_rules(name: str) -> Any:
     return rs
 
 
+def _witness_offer(
+    eg: EGraph, eid: int, term: Any, offered: tuple
+) -> None:
+    """Merge one constructed equality into the joint's e-class.
+
+    ``offered`` is ``(term, law_text)`` plus an optional kwargs dict
+    (``note`` / ``error_bound`` / ``bound_norm`` — the KV-latent
+    offer certifies its factorisation residual); identity offers are
+    skipped.
+    """
+    term_o, law_text = offered[0], offered[1]
+    if term_o is term:
+        return
+    kw = dict(offered[2]) if len(offered) > 2 else {}
+    kw.setdefault(
+        "note",
+        "residual_absorb: data-slot bilinearity over the residual add",
+    )
+    eg._offer_witness(
+        eid,
+        rhs_term=term_o,
+        lhs_term=term,
+        provenance="morphism_reify",
+        law=law_text,
+        **kw,
+    )
+
+
 def _saturate(
     term: Any,
     rules: Any,
@@ -1070,21 +1448,15 @@ def _saturate(
     pointwise witness — the documented non-local-pass ritual (the
     pairing/tying passes use ``EGraph._offer_witness`` the same way);
     they replay in certificates like every other witnessed merge and
-    the pair verify gates the assertion.  Returns ``(eg, root_eid)``.
+    the pair verify gates the assertion.  A third element, when
+    present, is a kwargs dict for the witness (``note`` /
+    ``error_bound`` / ``bound_norm`` — the KV-latent offer certifies
+    its factorisation residual).  Returns ``(eg, root_eid)``.
     """
     eg = EGraph()
     eid = eg.add_term(term)
-    for offered, law_text in offers or ():
-        if offered is not term:
-            eg._offer_witness(
-                eid,
-                rhs_term=offered,
-                lhs_term=term,
-                provenance="morphism_reify",
-                law=law_text,
-                note="residual_absorb: data-slot bilinearity over "
-                "the residual add",
-            )
+    for offered in offers or ():
+        _witness_offer(eg, eid, term, offered)
     if len(rules):
         budgets = (
             {
@@ -1150,6 +1522,154 @@ def _slot_filler(sink: Sink, var: Var, mode: str) -> Any:
     return sink.lower(ir, {})
 
 
+def _intra_joint(
+    match: MorphismMatch, graph: MorphismGraph
+) -> tuple[tuple | None, str | None]:
+    """Resolve an intra (single-node) match — its own IR as joint."""
+    rec = graph.record(match.nodes[0])
+    if rec.ir is None:
+        return None, "opaque node"
+    return (
+        (
+            rec.ir.root,
+            rec.ir.inputs[0],
+            (),
+            rec.ir.params,
+            rec.leaves,
+            rec.args,
+        ),
+        None,
+    )
+
+
+def _window_joint(
+    match: MorphismMatch, graph: MorphismGraph
+) -> tuple[tuple | None, str | None]:
+    """Resolve a ≥3-block window match — the n-ary joint term."""
+    spec = match.reify
+    recs = [graph.record(n) for n in match.nodes]
+    if len(spec.kinds) != len(recs) - 1 or len(recs) < 2:
+        return None, "malformed window spec"
+    if any(r.ir is None for r in recs):
+        return None, "opaque node"
+    joint, var, mids, params, leaves = _joint_parts_window(
+        [r.ir for r in recs if r.ir is not None],
+        recs,
+        spec.kinds,
+    )
+    return (
+        (
+            joint,
+            var,
+            mids if spec.distribute else (),
+            params,
+            leaves,
+            recs[0].args,
+        ),
+        None,
+    )
+
+
+def _pair_joint(
+    match: MorphismMatch, graph: MorphismGraph
+) -> tuple[tuple | None, str | None]:
+    """Resolve a boundary-pair match — the two-block joint term."""
+    spec = match.reify
+    rec_a, rec_b = (graph.record(n) for n in match.nodes)
+    if rec_a.ir is None or rec_b.ir is None:
+        return None, "opaque node"
+    term, var, mid, params, leaves = _joint_parts(
+        rec_a.ir, rec_b.ir, rec_a, rec_b, spec.mode
+    )
+    return (
+        (
+            term,
+            var,
+            (mid,) if spec.distribute else (),
+            params,
+            leaves,
+            rec_a.args,
+        ),
+        None,
+    )
+
+
+def _resolve_joint(
+    match: MorphismMatch, graph: MorphismGraph
+) -> tuple[tuple | None, str | None]:
+    """Resolve a match to its joint term plus lowering context.
+
+    Returns ``((term, var, mids, params, leaves, args), None)`` —
+    the joint program over the first block's input variable, the
+    additive nodes to distribute over (already gated by
+    ``spec.distribute``, so empty unless the spec asks), the
+    namespaced param/leaf tables, and the first block's captured
+    args — or ``(None, reason)`` for an honest decline.
+    """
+    spec = match.reify
+    if spec.mode == "intra":
+        return _intra_joint(match, graph)
+    if spec.kinds:
+        return _window_joint(match, graph)
+    return _pair_joint(match, graph)
+
+
+def _distribute_offers(term: Any, mids: tuple) -> list:
+    """Build the constructed bilinear steps, progressive over each mid.
+
+    Expands every projection whose data operand IS one of the
+    additive mid nodes — outermost first, so a window's nested
+    stream fully unfolds.  Each progressively-distributed form is a
+    separate exact-equality offer merged at the joint's e-class;
+    the pair verify gates the whole assertion once.
+    """
+    dist = term
+    offers = []
+    for m_node in reversed(mids):
+        nxt = _distribute_over(dist, m_node)
+        if nxt is not dist:
+            offers.append(
+                (
+                    nxt,
+                    "bilinearity of the projection's data slot "
+                    "over the residual add — morphism-level "
+                    "assertion, gated by the pair verify",
+                )
+            )
+            dist = nxt
+    return offers
+
+
+def _window_reps(
+    best: Any,
+    match: MorphismMatch,
+    var: Var,
+    params: dict,
+    leaves: dict,
+    sink: Sink,
+) -> dict[str, Any]:
+    """Per-slot replacements for a grafted ≥3-block window.
+
+    The fused term lands at the first slot — a ``best - x`` delta
+    when the family wraps the first block's output in a residual
+    add.  Each later slot's filler follows the wire INTO it: a
+    wrapped consumption takes the exact-zero addend, a plain one
+    the identity passthrough — same convention as the pair slots.
+    """
+    spec = match.reify
+    a_term = (
+        Op.make("sub", best, var)
+        if spec.mode.startswith("residual")
+        else best
+    )
+    reps = {
+        match.nodes[0]: _lower_term(a_term, var, params, leaves, sink)
+    }
+    for j, name in enumerate(match.nodes[1:], start=1):
+        reps[name] = _slot_filler(sink, var, spec.kinds[j - 1])
+    return reps
+
+
 def _reify(
     match: MorphismMatch,
     graph: MorphismGraph,
@@ -1177,37 +1697,28 @@ def _reify(
             cost_fn=cost_fn,
             verify_tol=verify_tol,
         )
-    if spec.mode == "intra":
-        rec = graph.record(match.nodes[0])
-        if rec.ir is None:
-            return {"status": "declined", "reason": "opaque node"}
-        term = rec.ir.root
-        var = rec.ir.inputs[0]
-        params = rec.ir.params
-        leaves = rec.leaves
-        args = rec.args
-        mid = None
-    else:
-        rec_a, rec_b = (graph.record(n) for n in match.nodes)
-        if rec_a.ir is None or rec_b.ir is None:
-            return {"status": "declined", "reason": "opaque node"}
-        term, var, mid, params, leaves = _joint_parts(
-            rec_a.ir, rec_b.ir, rec_a, rec_b, spec.mode
-        )
-        args = rec_a.args
+    if spec.mode == "family":
+        # The KV-latent rewrite lives in the sibling module (its
+        # factorisation machinery is substantial); resolved lazily
+        # to keep the modules acyclic.
+        from catopt_orchestrator.morphisms_kv import _reify_family
 
-    offers = []
-    if spec.distribute and mid is not None:
-        dist = _distribute_over(term, mid)
-        if dist != term:
-            offers.append(
-                (
-                    dist,
-                    "bilinearity of the projection's data slot over "
-                    "the residual add — morphism-level assertion, "
-                    "gated by the pair verify",
-                )
-            )
+        return _reify_family(
+            match,
+            graph,
+            sink=sink,
+            cost_fn=cost_fn,
+            verify_tol=verify_tol,
+            max_iterations=max_iterations,
+            max_enodes=max_enodes,
+            symmetry_budget=symmetry_budget,
+        )
+    resolved, decline = _resolve_joint(match, graph)
+    if resolved is None:
+        return {"status": "declined", "reason": decline}
+    term, var, mids, params, leaves, args = resolved
+
+    offers = _distribute_offers(term, mids)
     eg, eid = _saturate(
         term,
         _recipe_rules(spec.rules),
@@ -1245,6 +1756,8 @@ def _reify(
         reps = {
             match.nodes[0]: _lower_term(best, var, params, leaves, sink)
         }
+    elif spec.kinds:
+        reps = _window_reps(best, match, var, params, leaves, sink)
     else:
         a_name, b_name = match.nodes
         a_term = (
@@ -1452,6 +1965,7 @@ def _optimize_morphisms(
     match_stats: dict[str, dict[str, Any]] = {}
     consumed: set[str] = set()
     consumed_by: dict[str, str] = {}
+    morphism_fires: dict[str, int] = {}
     for m in matches:
         key = f"{m.law}:{'+'.join(m.nodes)}"
         if any(n in consumed for n in m.nodes):
@@ -1488,6 +2002,7 @@ def _optimize_morphisms(
             for n in m.nodes:
                 consumed.add(n)
                 consumed_by[n] = m.law
+            morphism_fires[m.law] = morphism_fires.get(m.law, 0) + 1
             if verbose:
                 log.info("[Morphism] %s: grafted (%s)", key, m.detail)
 
@@ -1573,6 +2088,7 @@ def _optimize_morphisms(
         },
         "wires": [(w.src, w.dst, w.kind) for w in graph.wires],
         "matches": match_stats,
+        "morphism_fires": morphism_fires,
         "n_rewritten": len(consumed),
         "blocks": block_reports,
         "in_place": in_place,
