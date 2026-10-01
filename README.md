@@ -1,10 +1,11 @@
 # catopt
 
-Certified-equivalent program search over your PyTorch model — it
-finds faster programs the compiler can't express, proves they're
+Certified-equivalent program search over neural computation graphs —
+it finds faster programs the compiler can't express, proves they're
 equivalent (or, under `error_budget=`, certifies a proven
-approximation bound), and hands them to Inductor (or a CUDA graph)
-to run.
+approximation bound), and hands them to a backend to run. The engine
+and orchestrator are backend-agnostic (no torch imports); PyTorch is
+the shipped reference backend — `catopt_torch` implements the ports.
 
 ```python
 from catopt_orchestrator import Optimizer
@@ -14,11 +15,11 @@ opt, stats = Optimizer(backend=TorchBackend()).optimize(model, example_input)
 out = opt(x)        # same function as model(x), verified rtol=1e-4
 ```
 
-One call runs the whole pipeline: `torch.export` lifts the module to
-a typed IR, equality saturation enumerates equivalent programs, a
-cost model extracts the cheapest one the backend can execute, the
-lowered module is checked against the original, and you get back a
-`torch.nn.Module` plus a stats dict (`stats["rule_fires"]`,
+One call runs the whole pipeline: the backend's `Source` lifts the
+model to a typed IR (torch: `torch.export`), equality saturation
+enumerates equivalent programs, a cost model extracts the cheapest
+one the backend can execute, the lowered module is checked against
+the original, and you get back a `torch.nn.Module` plus a stats dict (`stats["rule_fires"]`,
 `stats["lowering"]`, `stats["runner"]`, …).
 
 ## Quickstart
