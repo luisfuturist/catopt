@@ -28,6 +28,10 @@
   weights (identity, diagonal, zero, dead/duplicate slices,
   block-diagonal) and offers exact members under a certified zero
   bound.
+* :mod:`catopt_core.laws.headshare` — ``share_duplicate_attention_heads``:
+  the compute-level fold for bitwise-equal attention heads — an
+  ``sdpa`` over provably-identical heads runs on the ``k`` unique
+  ones and re-expands by gather (exact, witnessed).
 * :mod:`catopt_core.laws.tags` — the rule-tag constants
   (``SYMMETRY`` / ``EXPANSIVE`` / ``SUBSUMED`` / ``FUSION`` / …).
 * :mod:`catopt_core.laws.ruleset` — :class:`RuleSet`, the composable
@@ -92,6 +96,10 @@ from catopt_core.laws.base import (  # noqa: F401
 )
 from catopt_core.laws.factored import (
     offer_low_rank_factors,
+)
+from catopt_core.laws.headshare import (
+    headshare_keys_hold,
+    share_duplicate_attention_heads,
 )
 from catopt_core.laws.layout import (  # noqa: F401
     LAYOUT_RULES,
@@ -342,11 +350,13 @@ __all__ = [
     "R",
     "RuleSet",
     "all_rules",
+    "headshare_keys_hold",
     "offer_low_rank_factors",
     "offer_weight_specials",
     "pair_shared_input_convs",
     "pair_shared_input_linears",
     "preset",
+    "share_duplicate_attention_heads",
     "share_duplicate_param_slices",
     "share_duplicate_params",
     "tags",

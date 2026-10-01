@@ -58,9 +58,11 @@ from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
 from catopt_core.laws import (
     RuleSet,
+    headshare_keys_hold,
     pair_shared_input_convs,
     pair_shared_input_linears,
     preset,
+    share_duplicate_attention_heads,
     share_duplicate_param_slices,
     share_duplicate_params,
 )
@@ -1402,6 +1404,7 @@ def _pairing_and_lifts(
     meter: Any = None,
     detect_factors: bool = False,
     detect_specials: bool = False,
+    detect_headshare: bool = False,
     error_budget: float | None = None,
 ) -> list:
     """Non-local passes with a brief re-saturation between them.
@@ -1445,6 +1448,7 @@ def _pairing_and_lifts(
         stats,
         detect_factors,
         detect_specials,
+        detect_headshare,
         error_budget,
     )
     if lifts:
@@ -1475,7 +1479,20 @@ def _pairing_and_lifts(
             for r in lifts
             if isinstance(r, dict) and "dedup_param" in r
         }
-        stats["param_sharing"] = {"ties": ties, "derived": derived}
+        # HeadShare sites carry the same replay burden: a cached term
+        # whose sdpa gathers rely on head equality is valid only for
+        # blocks whose own weights reproduce it — recorded as recheck
+        # recipes for ``_cache_replay``'s ``_headshare_holds`` gate.
+        headshare = [
+            r["recheck"]
+            for r in lifts
+            if isinstance(r, dict) and "recheck" in r
+        ]
+        stats["param_sharing"] = {
+            "ties": ties,
+            "derived": derived,
+            "headshare": headshare,
+        }
         eg.run(
             rules,
             root_eid,
@@ -1493,6 +1510,7 @@ def _carrier_lifts(
     stats: dict[str, Any],
     detect_factors: bool,
     detect_specials: bool = False,
+    detect_headshare: bool = False,
     error_budget: float | None = None,
 ) -> list:
     """Run the non-local carrier/tying lifts, carriers lazily resolved.
@@ -1504,7 +1522,10 @@ def _carrier_lifts(
     :func:`catopt_core.laws.factored.offer_low_rank_factors`;
     ``detect_specials`` arms the opt-in weight-structure offers of
     :func:`catopt_core.laws.specials.offer_weight_specials` — exact
-    by default, additionally bounded when ``error_budget`` is set.
+    by default, additionally bounded when ``error_budget`` is set;
+    ``detect_headshare`` arms the opt-in bitwise-equal-head compute
+    sharing of
+    :func:`catopt_core.laws.headshare.share_duplicate_attention_heads`.
     """
     try:
         from catopt_carriers.trace_lift import (
@@ -1530,11 +1551,28 @@ def _carrier_lifts(
         carrier
         + share_duplicate_params(eg, source_tensors)
         + share_duplicate_param_slices(eg, source_tensors)
+        + _headshare_lifts(eg, source_tensors, detect_headshare)
         + _factor_lifts(eg, source_tensors, stats, detect_factors)
         + _special_lifts(
             eg, source_tensors, stats, detect_specials, error_budget
         )
     )
+
+
+def _headshare_lifts(
+    eg: EGraph, source_tensors: dict, detect_headshare: bool
+) -> list:
+    """Opt-in bitwise-equal-head sharing offers (``detect_headshare``).
+
+    The detection pass itself is the branch — when off this returns
+    ``[]`` and the graph never sees the gather-``sdpa``-gather member.
+    When on, each ``sdpa`` site whose (Wq, Wk, Wv) head blocks are
+    bitwise-equal gets a witnessed deduplicated alternative; the offer
+    is exact by construction and competes on cost like any other.
+    """
+    if not detect_headshare:
+        return []
+    return share_duplicate_attention_heads(eg, source_tensors)
 
 
 def _factor_lifts(
@@ -1721,6 +1759,7 @@ def search(
     engine: Any = None,
     detect_factors: bool = False,
     detect_specials: bool = False,
+    detect_headshare: bool = False,
     error_budget: float | None = None,
     task: TaskMetric | None = None,
     task_tol: float | None = None,
@@ -1842,6 +1881,17 @@ def search(
         is approximate: a slice is dead iff every value is exactly
         0.0, and duplicates dedupe bitwise.  See ``error_budget`` for
         the certified-approximate extension.
+    detect_headshare : bool, default False
+        Opt-in shared-head detection pass
+        (:func:`catopt_core.laws.headshare.share_duplicate_attention_heads`):
+        ``sdpa`` sites whose per-head (Wq, Wk, Wv) weight blocks are
+        *bitwise-equal* under a resolved head structure get a
+        witnessed gather-``sdpa``-gather member computing each unique
+        head once — exact (bound 0), competing through the normal
+        extraction cost.  Applicability is deliberately narrow:
+        shared-head architectures, quantization-induced ties, GQA
+        kv replication, post-``WeightTie`` merges — ordinary trained
+        weights almost never tie bitwise, in which case nothing fires.
     error_budget : float, optional
         Opt-in certified-approximation budget (plan 0012).  ``None``
         (the default) keeps the search exact — no bounded member is
@@ -1975,6 +2025,7 @@ def search(
             meter,
             detect_factors,
             detect_specials,
+            detect_headshare,
             error_budget,
         )
     else:
@@ -2962,6 +3013,7 @@ def _cache_entry(res: SearchResult) -> dict[str, Any]:
         "inputs": tuple(v.name for v in res.ir.inputs),
         "term_params": term_params,
         "ties": sharing.get("ties", ()),
+        "headshare": sharing.get("headshare", ()),
         "derived": {
             n: sharing.get("derived", {}).get(n)
             for n in term_params - set(order)
@@ -3077,6 +3129,15 @@ def _cache_replay(
         entry["ties"], entry["term_params"], pmap, params
     ):
         return None
+    # HeadShare offers lean on bitwise head equality — re-verify the
+    # recorded key slices against this block's own tensors (names
+    # remapped through pmap + the derived-name map).
+    if not headshare_keys_hold(
+        entry.get("headshare", ()),
+        lambda n: dmap.get(n, pmap.get(n)),
+        params,
+    ):
+        return None
 
     term = _remap_term(entry["term"], pmap, vmap, dmap)
     if term is None:
@@ -3126,6 +3187,7 @@ def _optimize_compositional(
     error_budget: float | None = None,
     detect_specials: bool = False,
     detect_factors: bool = False,
+    detect_headshare: bool = False,
     task: TaskMetric | None = None,
     task_tol: float | None = None,
     verbose: bool = True,
@@ -3165,7 +3227,8 @@ def _optimize_compositional(
        structure, then verifies end-to-end equivalence on
        ``example_input`` through ``sink.verify``.
 
-    ``error_budget`` / ``detect_specials`` / ``detect_factors``
+    ``error_budget`` / ``detect_specials`` / ``detect_factors`` /
+    ``detect_headshare``
     forward to each per-block :meth:`Optimizer.search` — with a
     budget set, a block's certified weight-space bound propagates to
     an output bound (:func:`_propagate_bounds`, evaluated on the
@@ -3354,6 +3417,7 @@ def _optimize_compositional(
                     error_budget=error_budget,
                     detect_specials=detect_specials,
                     detect_factors=detect_factors,
+                    detect_headshare=detect_headshare,
                     task=task,
                     task_tol=task_tol,
                     verbose=verbose,
