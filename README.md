@@ -2,7 +2,9 @@
 
 Certified-equivalent program search over your PyTorch model — it
 finds faster programs the compiler can't express, proves they're
-equivalent, and hands them to Inductor (or a CUDA graph) to run.
+equivalent (or, under `error_budget=`, certifies a proven
+approximation bound), and hands them to Inductor (or a CUDA graph)
+to run.
 
 ```python
 from catopt_orchestrator import Optimizer
@@ -152,6 +154,10 @@ per-suite flags in `bench/README.md`.
 | `cost_fidelity.py` | predicted-cost vs measured-latency rank correlation |
 | `killer_demo.py` | `Autotuned` per-model lowering selection |
 | `law_bench.py` | per-rewrite-law value harness |
+| `morphism_e2e.py` | term-flops → wall-time conversion for the morphism laws |
+| `bounded_e2e.py` | `error_budget` sweep on a real checkpoint (speedup vs bound vs KL/top-k drift) |
+| `structure_census.py` | how much catopt-exploitable structure real trained weights carry |
+| `bound_amplification.py` | weight-bound → output-error propagation on real activations |
 | `run_all.py` | drives the harnessed suites, writes `bench/results/` |
 
 ## API surface
@@ -170,9 +176,10 @@ and autotune candidate builders live in `catopt_torch` /
 | `export_optimized` / `load_optimized` | `catopt_torch.export` — `(model, opt, path, fmt="module"|"safetensors"|"state_dict"|"torchscript", …)`; `.pt2` roundtrips run standalone, no catopt at inference |
 | Rule sets | `search(..., rules=DEFAULT)` — composable `RuleSet` algebra (`FULL - SYMMETRY`, `WITH_LAYOUT`, presets in `catopt_core.laws.ruleset`) |
 | Engines | `search(..., engine=NativeEngine())` — the pure-Python engine is the default/reference; `catopt-native` (PyO3/Rust) is an explicit opt-in (~17× on match-bound closures) |
+| Detection passes | `search(..., detect_factors=True)` — certified low-rank weight factoring; `detect_specials=True` — exact dead/diag/dup/block-diag weight elision; `error_budget=` — certified bounded approximations (bound ledger + output-propagated verify) |
 | Criteria | `LatencyCriterion`, `FlopsCriterion`, `DepthCriterion`, `MemoryCriterion("weights"|"peak"|"combined")`, `CompiledCriterion` — compose with `*` / `+`, or pass `{"axis": weight}` dicts |
 | Runners | `IdentityRunner` (default), `TorchCompileRunner()`, `CudaGraphRunner()`, `ChainedRunner([...])` — duck-typed `Runner` protocol |
-| Ports | `Source` / `Sink` (`catopt_core.ports`; torch impls `TorchSource` / `TorchSink`) — a new backend implements `Sink`; the engine never imports it |
+| Ports | `Source` / `Sink` (`catopt_core.ports`; torch impls `catopt_torch.adapters.TorchSource`/`TorchSink`, bundled as `TorchBackend`) — a new backend implements `Sink`; the engine never imports it |
 | Verification | `catopt_core.egraph.verify_certificate` — replays the derivation shipped with every extracted program |
 
 ## Generality — honest split
@@ -212,7 +219,9 @@ uv-workspace monorepo: `packages/catopt-core` (zero-dependency
 engine), `catopt-torch` (PyTorch adapters), `catopt-carriers`
 (scan/attention carriers), `catopt-cuda` (the CUDA-graph runner),
 `catopt-orchestrator` (the backend-neutral pipelines). The `catopt`
-façade is gone — import the domain packages directly.
+façade is gone — import the domain packages directly. Optional:
+`packages/catopt-native` is the PyO3/Rust search engine (build with
+maturin; opt-in via `engine=` — never auto-detected).
 
 ```bash
 uv sync                                  # everything, editable
