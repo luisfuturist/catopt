@@ -52,6 +52,7 @@ q,k,v-equal-thirds convention.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -73,6 +74,27 @@ from catopt_core.typing import _shape_of, has_var_leaf
 import catopt_orchestrator.morphisms as M
 
 __all__ = ["KVLatentShare"]
+
+log = logging.getLogger("catopt_orchestrator.morphisms_kv")
+
+
+def _usable_member(graph: Any, name: str) -> bool:
+    """Check a record can join a family — lifted, sig-consistent.
+
+    The member's signature must exist (lifted), describe the
+    record's *current* IR arity (a sig/IR arity mismatch means the
+    signature is stale for this record), and pass the multi-input
+    lift verdict — one activation input plus pass-through context.
+    """
+    ir = graph.record(name).ir
+    sig = graph.sig(name)
+    return (
+        ir is not None
+        and sig is not None
+        and len(sig.inputs) == len(ir.inputs)
+        and M._sig_liftable(sig) is None
+    )
+
 
 #: Weight-name tokens marking a standalone K or V projection.
 _KV_TOKENS: tuple[str, ...] = ("k_proj", "v_proj")
@@ -781,12 +803,19 @@ def _derived_leaves(
     return derived, qsec_w, qsec_b, site_b
 
 
-def _zero_slot(sink: Sink, var: Var) -> Any:
-    """Lower an exact-zero filler — ``zeros_like`` on the slot input."""
+def _zero_slot(
+    sink: Sink, var: Var, inputs: tuple | None = None
+) -> Any:
+    """Lower an exact-zero filler — ``zeros_like`` on the slot input.
+
+    ``inputs`` widens the filler's call signature for multi-input
+    member slots; the context args are ignored.
+    """
+    ins = list(inputs) if inputs is not None else [var]
     ir = IR(
         root=Op.make("mul", var, Const(0)),
-        inputs=[var],
-        input_names={var.name},
+        inputs=ins,
+        input_names={v.name for v in ins},
         params={},
     )
     return sink.lower(ir, {})
@@ -798,7 +827,9 @@ def _family_bodies(
     """Prefix+substitute each member's root onto the shared var.
 
     ``members`` is ``(name, ir)`` pairs — the caller already checked
-    every record exported.
+    every record exported.  Single-input members only: each input var
+    maps to the first member's (the family's shared input object,
+    proven by capture identity upstream).
     """
     x = members[0][1].inputs[0]
     return {
@@ -807,6 +838,35 @@ def _family_bodies(
         )
         for n, i in members
     }
+
+
+def _family_bodies_ctx(
+    members: list[tuple[str, Any]],
+    recs: list[Any],
+    graph: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Like :func:`_family_bodies`, but multi-input-aware.
+
+    Each member's *activation* var maps to the first member's;
+    non-activation inputs must be the same captured object as one of
+    the first member's inputs
+    (:func:`catopt_orchestrator.morphisms._ctx_var_map`) — an
+    unshared context input returns ``(None, reason)``.
+    """
+    sig0 = graph.sig(members[0][0])
+    act0 = M._act_index(sig0.inputs) if sig0 is not None else 0
+    x = members[0][1].inputs[act0]
+    bodies: dict[str, Any] = {}
+    for (n, i), rec in zip(members, recs, strict=True):
+        sig = graph.sig(n)
+        act = M._act_index(sig.inputs) if sig is not None else 0
+        cmap, why = M._ctx_var_map(recs[0], rec, act)
+        if cmap is None:
+            return None, why
+        body = M._prefix_params(i.root, M._ns_prefix(n))
+        body = M._subst(M._subst_ctx(body, cmap), i.inputs[act], x)
+        bodies[n] = body
+    return bodies, None
 
 
 def _family_tables(recs: list[Any]) -> tuple[dict, dict]:
@@ -955,7 +1015,7 @@ class KVLatentShare:
                 if n.opaque:
                     continue
                 ir = graph.record(n.name).ir
-                if ir is None or len(ir.inputs) != 1:
+                if ir is None or not _usable_member(graph, n.name):
                     continue
                 for data in _latent_groups(
                     {n.name: ir.root},
@@ -1003,11 +1063,15 @@ class KVLatentShare:
         usable: list[tuple[str, Any]] = []
         for n in fam:
             ir = graph.record(n).ir
-            if ir is not None and len(ir.inputs) == 1:
+            if _usable_member(graph, n):
                 usable.append((n, ir))
         if len(usable) < 2:
             return []
-        bodies = _family_bodies(usable)
+        recs = [graph.record(n) for n, _ in usable]
+        bodies, why = _family_bodies_ctx(usable, recs, graph)
+        if bodies is None:
+            log.debug("kv cross family %s declined: %s", fam, why)
+            return []
         out: list[M.MorphismMatch] = []
         for data, sites in _latent_groups(
             bodies, self.tokens, self.qkv_tokens
@@ -1039,29 +1103,43 @@ def _family_prep(
     """
     recs = [graph.record(n) for n in match.nodes]
     irs = []
+    sigs: dict[str, Any] = {}
     for r_ in recs:
         ir = r_.ir
-        if ir is None:
+        sig = graph.sig(r_.name)
+        if ir is None or sig is None:
             return {"status": "declined", "reason": "opaque node"}
+        if len(sig.inputs) != len(ir.inputs):
+            # The sig describes a different-arity IR — a multi-input
+            # record the lifted signature does not cover.
+            return {"status": "declined", "reason": "multi-input block"}
+        why_ = M._sig_liftable(sig)
+        if why_ is not None:
+            return {"status": "declined", "reason": why_}
         irs.append(ir)
-    if any(len(i.inputs) != 1 for i in irs):
-        return {"status": "declined", "reason": "multi-input block"}
+        sigs[r_.name] = sig
     intra = len(recs) == 1
+    act0 = M._act_index(sigs[recs[0].name].inputs)
     if intra:
-        bodies = {recs[0].name: irs[0].root}
+        bodies: dict[str, Any] | None = {recs[0].name: irs[0].root}
         params = dict(irs[0].params)
         leaves = dict(recs[0].leaves)
         joint = irs[0].root
     else:
-        bodies = _family_bodies(
-            [(r_.name, i_) for r_, i_ in zip(recs, irs, strict=True)]
+        bodies, why = _family_bodies_ctx(
+            [(r_.name, i_) for r_, i_ in zip(recs, irs, strict=True)],
+            recs,
+            graph,
         )
+        if bodies is None:
+            return {"status": "declined", "reason": why}
         params, leaves = _family_tables(recs)
         joint = _add_chain([bodies[n] for n in match.nodes])
     return {
         "recs": recs,
         "irs": irs,
-        "x": irs[0].inputs[0],
+        "x": irs[0].inputs[act0],
+        "inputs": tuple(irs[0].inputs),
         "intra": intra,
         "bodies": bodies,
         "params": params,
@@ -1229,6 +1307,7 @@ def _reify_family(
     recs = prep["recs"]
     irs = prep["irs"]
     x = prep["x"]
+    inputs = prep["inputs"]
     intra = prep["intra"]
     bodies = prep["bodies"]
     params = prep["params"]
@@ -1308,6 +1387,7 @@ def _reify_family(
         match,
         recs,
         irs,
+        graph,
         intra=intra,
         sink=sink,
         cost_fn=cost_fn,
@@ -1315,6 +1395,7 @@ def _reify_family(
         joint=joint,
         best=best,
         x=x,
+        inputs=inputs,
         params=params,
         leaves=leaves,
         info=info,
@@ -1325,6 +1406,7 @@ def _family_gate(
     match: M.MorphismMatch,
     recs: list[Any],
     irs: list[Any],
+    graph: Any,
     *,
     intra: bool,
     sink: Sink,
@@ -1333,6 +1415,7 @@ def _family_gate(
     joint: Any,
     best: Any,
     x: Any,
+    inputs: tuple,
     params: dict,
     leaves: dict,
     info: dict,
@@ -1359,6 +1442,7 @@ def _family_gate(
         leaves,
         recs[0].args,
         verify_tol,
+        inputs,
     )
     info["rel_diff"] = vr.max_rel
     if not vr.passed:
@@ -1368,9 +1452,17 @@ def _family_gate(
             **info,
         }
     reps = {
-        match.nodes[0]: M._lower_term(best, x, params, leaves, sink)
+        match.nodes[0]: M._lower_term(
+            best, x, params, leaves, sink, inputs
+        )
     }
     if not intra:
         for r_, i_ in zip(recs[1:], irs[1:], strict=True):
-            reps[r_.name] = _zero_slot(sink, i_.inputs[0])
+            sig_j = graph.sig(r_.name)
+            act_j = (
+                M._act_index(sig_j.inputs) if sig_j is not None else 0
+            )
+            reps[r_.name] = _zero_slot(
+                sink, i_.inputs[act_j], tuple(i_.inputs)
+            )
     return {"status": "grafted", "reps": reps, **info}

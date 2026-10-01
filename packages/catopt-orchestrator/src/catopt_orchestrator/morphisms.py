@@ -43,6 +43,7 @@ import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from dataclasses import replace as _dc_replace
 from typing import Any, Protocol, runtime_checkable
 
 from catopt_core import laws
@@ -50,7 +51,11 @@ from catopt_core.cost import dag_cost, flops_cost
 from catopt_core.egraph import EGraph
 from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
 from catopt_core.laws import tags as _law_tags
-from catopt_core.laws.pairing import share_duplicate_params
+from catopt_core.laws.pairing import (
+    _exact_equal,
+    _is_tensor,
+    share_duplicate_params,
+)
 from catopt_core.pipeline import LowerResult
 from catopt_core.ports import Composer, CostFn, Meter, Sink, Source
 from catopt_core.typing import _shape_of, has_var_leaf
@@ -65,6 +70,7 @@ __all__ = [
     "DEFAULT_MORPHISM_LAWS",
     "BlockSig",
     "CrossBlockCSE",
+    "InputSig",
     "KVLatentShare",
     "MorphismGraph",
     "MorphismLaw",
@@ -144,6 +150,330 @@ _ACT_OPS = frozenset(
 
 
 @dataclass(frozen=True)
+class InputSig:
+    """One block input's role in the signature — the multi-input arm.
+
+    A block's ``ir.inputs`` are its call's positional tensor args (in
+    order).  Each classifies into a ``kind``:
+
+    * ``"activation"`` — the computed stream the block transforms:
+      an input that *enters* computation as data (a projection's data
+      operand, a norm's subject, a bare ``add``/``sub`` stream
+      addend, an ``sdpa`` operand).  Exactly one may exist for the
+      block to lift.
+    * ``"const_table"`` — context that rides alongside the stream in
+      positions a ``Param``/``Const`` could fill (the pointwise
+      factor/mask/table roles — rope ``cos``/``sin`` tables,
+      embedding/gather/index sources, ``sdpa`` masks).  Passes
+      through a composition unchanged.
+    * ``"state"`` — call-varying context (``role`` ``"read_only"`` —
+      the refined kind for a context input whose captured value
+      differs across the two lift probes) or a mutable buffer the
+      block *writes* (``role`` ``"mutated"`` — it is arg0 of a
+      write op; an honest lift decline).
+    * ``"opaque"`` — an unhandled use (a runtime-supplied weight,
+      an op the signature cannot classify).  Honest decline.
+
+    ``role`` is the finer structural descriptor (``"stream"`` /
+    ``"table"`` / ``"dead"`` / ``"mutated"`` / ``"read_only"`` /
+    ``"unhandled"``); ``index`` is the position in ``ir.inputs`` and
+    in the captured call args (lift requires tensor-only args, so the
+    two orders coincide).
+    """
+
+    index: int
+    name: str
+    kind: str
+    role: str
+    shape: tuple | None
+
+
+#: Write ops — arg0 is the mutated base in the functionalised IR
+#: spelling (``copy_`` threads as ``copy``/``*_scatter``).
+_MUT_OPS = frozenset(
+    {
+        "copy",
+        "index_put",
+        "index_add",
+        "slice_scatter",
+        "select_scatter",
+        "scatter",
+        "scatter_add",
+        "scatter_reduce",
+    }
+)
+
+#: Transparent view/read ops — a var passing through arg0 keeps its
+#: pending classification: the *terminal* (non-view) consumer decides
+#: the role (``unsqueeze(cos) → mul`` is still a table read;
+#: ``slice(x) → linear`` is still a stream entry).
+_VIEW_OPS = frozenset(
+    {
+        "slice",
+        "select",
+        "narrow",
+        "getitem",
+        "unsqueeze",
+        "squeeze",
+        "reshape",
+        "view",
+        "expand",
+        "expand_as",
+        "broadcast_to",
+        "permute",
+        "transpose",
+        "flatten",
+        "unflatten",
+        "movedim",
+        "contiguous",
+        "detach",
+        "detach_",
+        "clone",
+        "to",
+        "type_as",
+        "float",
+        "double",
+        "half",
+        "bfloat16",
+        "repeat",
+        "chunk",
+        "split",
+        "tensor_split",
+        "unbind",
+        "roll",
+        "flip",
+        "pad",
+        "triu",
+        "tril",
+        "alias",
+    }
+)
+
+#: Multi-operand pointwise ops — the "context position" test: a var
+#: operand whose sibling args carry a var is a factor/table riding
+#: the stream; one whose siblings are all var-free IS the stream.
+_POINTWISE_OPS = frozenset(
+    {
+        "mul",
+        "div",
+        "pow",
+        "fmod",
+        "remainder",
+        "maximum",
+        "minimum",
+        "fmax",
+        "fmin",
+        "atan2",
+        "xlogy",
+        "heaviside",
+        "isclose",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "logical_and",
+        "logical_or",
+        "logical_xor",
+        "bitwise_and",
+        "bitwise_or",
+        "where",
+        "lerp",
+        "clamp",
+        "clamp_min",
+        "clamp_max",
+        "addcmul",
+        "addcdiv",
+        "masked_fill",
+    }
+)
+
+#: Ops whose operand positions are all table/index roles — the var
+#: is read like a lookup table, never streamed.
+_TABLE_OPS = frozenset(
+    {
+        "embedding",
+        "index",
+        "index_select",
+        "gather",
+        "take_along_dim",
+        "searchsorted",
+        "one_hot",
+        "nonzero",
+        "item",
+        "numel",
+    }
+)
+
+#: Ops where the var operand is a norm's *subject* at position 0 —
+#: stream entries.  A var at a later position is a runtime weight —
+#: unhandled.
+_NORM_OPS = frozenset(
+    {"layer_norm", "rms_norm", "batch_norm", "group_norm"}
+)
+
+
+def _use_roles_positional(op: str, pos: int) -> str | None:
+    """Classify positional-stream ops — ``None`` when unhandled here.
+
+    Projections, convs and norms take the stream at position 0 — a
+    var anywhere else is a runtime weight (``opaque``).  ``sdpa``'s
+    query is the stream; its k/v/mask operands are context reads
+    (a ``(x, kv_cache)`` block's cache state).
+    """
+    if op in ("linear", "matmul", "einsum", "conv1d", "conv2d"):
+        # A var operand is data — ``conv``/``matmul`` weights arrive
+        # as params in normal exports; a var weight is still a data
+        # read (the op computes on it), not a signature projection.
+        return "stream" if pos == 0 else "opaque"
+    if op == "sdpa":
+        return "stream" if pos == 0 else "context"
+    if op in _NORM_OPS:
+        return "stream" if pos == 0 else "opaque"
+    return None
+
+
+def _use_roles(n: Op, pos: int) -> str:
+    """Classify one terminal use of an input var: stream or context.
+
+    ``"stream"`` — the var enters as computed data; ``"context"`` —
+    it sits in a position a ``Param``/``Const`` table could fill;
+    ``"mutated"`` — it is the destination of a write op;
+    ``"opaque"`` — the use is one the signature cannot classify.
+    """
+    op = n.op
+    if op in _MUT_OPS:
+        return "mutated" if pos == 0 else "opaque"
+    role = _use_roles_positional(op, pos)
+    if role is not None:
+        return role
+    if op in ("add", "sub", "concat", "stack", "hstack", "vstack"):
+        # A raw addend/concatenand is a consumed read — context; the
+        # activation's stream role comes through a projection/norm/
+        # attention use, not by being summed.
+        return "context"
+    if op in _POINTWISE_OPS:
+        siblings = [a for j, a in enumerate(n.args) if j != pos]
+        return (
+            "context"
+            if any(has_var_leaf(a) for a in siblings)
+            else "stream"
+        )
+    if op in _TABLE_OPS:
+        return "context"
+    return "opaque"
+
+
+def _var_uses(root: Any, v: Var, parents: dict[Any, list]) -> list[str]:
+    """Collect the terminal use-roles of one input var.
+
+    Follows transparent view ops (``_VIEW_OPS`` arg0) to the
+    consuming terminal op; a var reaching the root through views —
+    or being the root — counts as stream (the output IS the var,
+    transformed).  Non-arg0 uses inside view ops (the index list of
+    an ``index``…) are terminal ``context`` uses.
+    """
+    roles: list[str] = []
+    work = [(p, pos) for p, pos in parents.get(v, ())]
+    seen: set = set()
+    while work:
+        n, pos = work.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        if n.op in _VIEW_OPS and pos == 0:
+            consumers = parents.get(n)
+            if consumers is None:
+                # The view result IS the block root — the var flows
+                # straight to the output: a stream.
+                roles.append("stream")
+            else:
+                work.extend(consumers)
+        elif n.op in _VIEW_OPS:
+            roles.append("context")
+        else:
+            roles.append(_use_roles(n, pos))
+    return roles
+
+
+def _classify_inputs(ir: IR) -> tuple[InputSig, ...]:
+    """Classify each of the block's ``ir.inputs`` — term level only.
+
+    Single-input IRs keep the historical semantics: the one input is
+    the activation, unconditionally.  For multi-input IRs the
+    per-var terminal uses vote: any ``mutated`` use marks the input
+    ``"state"``/``"mutated"``; any ``opaque`` use makes it opaque;
+    any ``stream`` use makes it an activation candidate; the rest
+    are context — provisionally ``"const_table"`` (lift's probe
+    evidence may refine the kind to ``"state"``/``"read_only"``).
+    """
+    out: list[InputSig] = []
+    if len(ir.inputs) == 1:
+        v = ir.inputs[0]
+        return (
+            InputSig(0, v.name, "activation", "stream", v.typ.shape),
+        )
+    parents: dict[Any, list] = {}
+    for n in _iter_ops(root := ir.root):
+        for pos, a in enumerate(n.args):
+            parents.setdefault(a, []).append((n, pos))
+    if not isinstance(root, Op):
+        parents.setdefault(root, [])
+    for i, v in enumerate(ir.inputs):
+        roles = _var_uses(root, v, parents)
+        if root == v:
+            roles.append("stream")
+        kind, role = _kind_of_roles(roles)
+        out.append(InputSig(i, v.name, kind, role, v.typ.shape))
+    return tuple(out)
+
+
+def _kind_of_roles(roles: list[str]) -> tuple[str, str]:
+    """Fold a var's use-roles into its ``(kind, role)``."""
+    if any(r == "mutated" for r in roles):
+        return "state", "mutated"
+    if any(r == "opaque" for r in roles):
+        return "opaque", "unhandled"
+    if any(r == "stream" for r in roles):
+        return "activation", "stream"
+    if not roles:
+        return "const_table", "dead"
+    return "const_table", "table"
+
+
+def _act_index(inputs: tuple[InputSig, ...]) -> int:
+    """Return the activation input's position — ``0`` for legacy sigs."""
+    for inp in inputs:
+        if inp.kind == "activation":
+            return inp.index
+    return 0
+
+
+def _sig_liftable(sig: BlockSig) -> str | None:
+    """Give the honest lift verdict — ``None`` when the sig is composable.
+
+    One activation input plus pass-through context is liftable;
+    multiple/zero activations, mutated state, and opaque inputs are
+    the honest declines.
+    """
+    if not sig.inputs:
+        return None  # legacy hand-built sig — nothing to classify
+    if any(
+        i.kind == "state" and i.role == "mutated" for i in sig.inputs
+    ):
+        return "mutates an input"
+    n_act = sum(1 for i in sig.inputs if i.kind == "activation")
+    if n_act == 0:
+        return "no activation input"
+    if n_act > 1:
+        return "multi-activation inputs"
+    if any(i.kind == "opaque" for i in sig.inputs):
+        return "opaque input kind"
+    return None
+
+
+@dataclass(frozen=True)
 class BlockSig:
     """The structural signature of one block — the morphism object.
 
@@ -162,6 +492,14 @@ class BlockSig:
       (``x + f(x)``).
     * ``shape`` — ``(in_shape, out_shape)`` tuples (elements may be
       ``None``); from the captured IO when lifted, else inferred.
+      ``in_shape`` is the *activation* input's shape.
+    * ``inputs`` — the per-input :class:`InputSig` roles, in
+      ``ir.inputs`` order.  Single-input blocks carry exactly one
+      ``"activation"`` entry (the historical spelling); a
+      multi-input block lifts when exactly one input is the
+      activation and the rest classify ``const_table`` /
+      read-only ``state`` — rope ``(x, cos, sin)`` blocks and
+      cache-carrying ``(x, kv_cache)`` blocks included.
     """
 
     in_projs: tuple[WeightRef, ...]
@@ -170,6 +508,7 @@ class BlockSig:
     act: tuple[str, ...]
     residual: bool
     shape: tuple
+    inputs: tuple[InputSig, ...] = ()
 
 
 def _iter_ops(term: Any) -> list[Op]:
@@ -323,6 +662,8 @@ def block_signature(
     ``NORM_CASCADE``'s pair form matches).
     """
     root, inputs = ir.root, list(ir.inputs)
+    input_sigs = _classify_inputs(ir)
+    act_idx = _act_index(input_sigs)
     projs = _projections(root)
     proj_nodes = {n for n, _, _ in projs}
     memo: dict = {}
@@ -363,7 +704,7 @@ def block_signature(
     i_shp = (
         in_shape
         if in_shape is not None
-        else (inputs[0].typ.shape if inputs else None)
+        else (inputs[act_idx].typ.shape if inputs else None)
     )
     o_shp = (
         out_shape if out_shape is not None else _shape_of(root, memo)
@@ -373,8 +714,9 @@ def block_signature(
         out_proj=out_refs,
         norm=norm,
         act=acts,
-        residual=_residual_spine(root, inputs),
+        residual=_residual_spine(root, inputs[act_idx : act_idx + 1]),
         shape=(i_shp, o_shp),
+        inputs=input_sigs,
     )
 
 
@@ -455,7 +797,11 @@ class _BlockRecord:
     (object identity is the structural proof two blocks shared an
     input or that an output escaped), ``out_val`` its detached output
     clone, ``calls`` the invocation count, and ``example2`` /
-    ``out_val2`` the perturbed-probe counterparts.
+    ``out_val2`` the perturbed-probe counterparts.  For multi-input
+    blocks ``in_obj``/``example``/``example2`` track the *activation*
+    argument (``act`` — the arg position the signature's activation
+    input occupies), while ``in_objs``/``in_objs2`` keep the full
+    per-call arg object tuples for the context-input identity map.
     """
 
     name: str
@@ -466,9 +812,12 @@ class _BlockRecord:
     example: Any = None
     note: str | None = None
     in_obj: Any = None
+    in_objs: tuple = ()
+    in_objs2: tuple = ()
     out_obj: Any = None
     out_val: Any = None
     calls: int = 0
+    act: int = 0
     example2: Any = None
     out_val2: Any = None
 
@@ -478,18 +827,21 @@ def _io_evidence(
 ) -> None:
     """Store the captured-IO evidence on the record.
 
-    Live objects (``in_obj``/``out_obj``) carry identity evidence —
-    two blocks sharing one input object consume literally the same
-    tensor; detached clones (``out_val``/``out_val2``) carry the
-    value evidence the additive-consumption checks compare.
+    Live objects (``in_obj``/``out_obj``/``in_objs``) carry identity
+    evidence — two blocks sharing one input object consume literally
+    the same tensor; detached clones (``out_val``/``out_val2``)
+    carry the value evidence the additive-consumption checks
+    compare.  ``rec.act`` selects the activation argument position.
     """
-    in_objs = ient.get("in_objs")
-    rec.in_obj = in_objs[0] if in_objs else None
+    in_objs = tuple(ient.get("in_objs") or ())
+    rec.in_objs = in_objs
+    rec.in_obj = in_objs[rec.act] if rec.act < len(in_objs) else None
+    rec.in_objs2 = tuple(ient2.get("in_objs") or ())
     rec.out_obj = ient.get("out_obj")
     rec.out_val = ient.get("out")
     rec.calls = int(ient.get("calls", 0))
-    if cap2 is not None:
-        rec.example2 = cap2[0][0]
+    if cap2 is not None and rec.act < len(cap2[0]):
+        rec.example2 = cap2[0][rec.act]
     rec.out_val2 = ient2.get("out")
 
 
@@ -579,6 +931,167 @@ def _shape_tuple(t: Any) -> tuple | None:
         return None
 
 
+def _probe_value(a: Any, idx: int) -> Any:
+    """Return an index-perturbed clone of a float tensor arg.
+
+    Each arg position gets a distinct affine map — a write like
+    ``cache[0] = x[0]`` copies a differently-perturbed value into the
+    destination, so the post-run comparison cannot be satisfied
+    idempotently.
+    """
+    if not _is_tensor(a):
+        return a
+    c = a.clone()
+    is_flt = getattr(a, "is_floating_point", None)
+    if callable(is_flt) and is_flt():
+        return c * (1.5 + 0.25 * idx) + (0.01 + 0.003 * idx)
+    return c
+
+
+def _mutates_arg(mod: Any, args: tuple) -> str | None:
+    """Probe in-place mutation: rerun the block on perturbed clones.
+
+    A functionalised export drops a write-only mutation outright (the
+    written value is never returned), so the IR cannot see it — the
+    empirical probe is the honest check: run the block on perturbed
+    arg clones and compare each arg against its own pre-run clone.
+    Perturbing first defeats idempotent writes (``cache[0] = x[0]``
+    reproduces the captured state on an unperturbed replay); a write
+    whose value depends on the args — or is a constant — then shows.
+    ``None`` = provably no in-place write; a string = the decline
+    reason (a mutated position, or an un-runnable probe — a block
+    that cannot be replayed standalone is not composable).
+    """
+    try:
+        probe = [_probe_value(a, i) for i, a in enumerate(args)]
+        before = [a.clone() if _is_tensor(a) else a for a in probe]
+        mod(*probe)
+    except Exception as e:
+        return f"input-mutation probe failed: {type(e).__name__}"
+    for i, (b, a) in enumerate(zip(before, probe, strict=True)):
+        if _is_tensor(b) and not _exact_equal(b, a):
+            return f"mutates input {i}"
+    return None
+
+
+def _param_bound_ids(model: Any) -> set[int]:
+    """Object ids of the model's param/buffer/attr tensors."""
+    ids: set[int] = set()
+    for coll in (
+        getattr(model, "parameters", list)(),
+        getattr(model, "buffers", list)(),
+    ):
+        for t in coll:
+            ids.add(id(t))
+    for mod in getattr(model, "modules", list)():
+        for v in vars(mod).values():
+            if _is_tensor(v):
+                ids.add(id(v))
+    return ids
+
+
+def _refine_inputs(
+    sig: BlockSig,
+    rec: _BlockRecord,
+    cap2: Any,
+    const_ids: set[int],
+) -> BlockSig:
+    """Refine the provisional kinds with capture/probe evidence.
+
+    A context input whose captured value is identical across both
+    probes — or whose live arg object IS a model param/buffer/tensor
+    attr — is ``const_table`` (Param/Const-bound context).  A
+    context input whose value varies between the captures is
+    call-dependent state — ``state``/``read_only`` (a KV cache read
+    positionally, a per-step index table).  Activations and opaque
+    inputs pass through unchanged.
+    """
+    refined: list[InputSig] = []
+    for inp in sig.inputs:
+        if inp.kind != "const_table" or inp.index >= len(rec.in_objs):
+            refined.append(inp)
+            continue
+        obj = rec.in_objs[inp.index]
+        v1 = rec.args[inp.index] if inp.index < len(rec.args) else None
+        v2 = (
+            cap2[0][inp.index]
+            if cap2 is not None and inp.index < len(cap2[0])
+            else None
+        )
+        bound = id(obj) in const_ids
+        invariant = (
+            _is_tensor(v1) and _is_tensor(v2) and _exact_equal(v1, v2)
+        )
+        if bound or invariant:
+            refined.append(inp)
+        else:
+            refined.append(
+                _dc_replace(inp, kind="state", role="read_only")
+            )
+    return _dc_replace(sig, inputs=tuple(refined))
+
+
+def _lift_block(
+    rec: _BlockRecord,
+    mod: Any,
+    cap: Any,
+    cap2: Any,
+    ient: dict,
+    ient2: dict,
+    source: Source,
+    const_ids: set[int],
+) -> BlockSig | None:
+    """Export, classify, probe and refine one captured block's sig.
+
+    Every decline records ``rec.note`` and returns ``None`` — the
+    node lands opaque on the graph.  Success returns the refined
+    signature and leaves the record's activation-anchored IO
+    evidence populated.
+    """
+    if cap is None:
+        rec.note = "not executed on the captured input"
+        return None
+    if cap[1] or not cap[0]:
+        rec.note = "not a single-positional-arg call"
+        return None
+    if not all(_is_tensor(a) for a in cap[0]):
+        # A non-tensor positional arg shifts the input/arg position
+        # correspondence — the lowered module's positional binding
+        # could not reproduce the call.
+        rec.note = "non-tensor positional argument"
+        return None
+    rec.args = cap[0]
+    rec.example = cap[0][0]
+    _io_evidence(rec, ient, cap2, ient2)
+    try:
+        rec.ir, rec.leaves = source.to_ir(
+            mod, cap[0] if len(cap[0]) > 1 else cap[0][0]
+        )
+    except Exception as e:
+        rec.note = f"export failed: {type(e).__name__}: {e}"
+        return None
+    sig = block_signature(
+        rec.ir,
+        out_shape=_shape_tuple(ient.get("out")),
+    )
+    decline = _sig_liftable(sig)
+    if decline is not None:
+        rec.note = decline
+        return None
+    # Re-anchor the IO evidence on the activation input.
+    rec.act = _act_index(sig.inputs)
+    rec.example = cap[0][rec.act]
+    if rec.act < len(rec.in_objs):
+        rec.in_obj = rec.in_objs[rec.act]
+    if cap2 is not None and rec.act < len(cap2[0]):
+        rec.example2 = cap2[0][rec.act]
+    mut = _mutates_arg(mod, cap[0])
+    if mut is not None:
+        rec.note = mut
+        return None
+    return _refine_inputs(sig, rec, cap2, const_ids)
+
+
 def lift_graph(
     model: Any,
     x: Any,
@@ -591,12 +1104,23 @@ def lift_graph(
 
     Blocks come from the composer's ``blocks`` port (the same
     selection the compositional strategy uses); each block's IR is
-    exported through the ``source`` port on its captured input and
-    summarised by :func:`block_signature`.  Wires between adjacent
-    blocks come from ``composer.boundary`` over the two-capture IO
-    evidence (the perturbed second probe included).  Blocks that fail
-    export, never executed, or take a non-tensor call signature are
-    kept as opaque boundary nodes.
+    exported through the ``source`` port on its captured call args
+    and summarised by :func:`block_signature` — *multi-input calls
+    lift*: ``(x, cos, sin)`` attention blocks and ``(x, kv_cache)``
+    state readers classify their inputs, and the block lifts when
+    exactly one input is the activation and the rest are
+    pass-through context (``const_table`` / read-only ``state``).
+    The honest declines stay boundary nodes: multi-activation calls,
+    blocks that mutate an input, unclassifiable input roles,
+    non-tensor args, kwargs calls, export failures, and blocks that
+    never executed.
+
+    Wires between adjacent blocks come from ``composer.boundary``
+    over the two-capture IO evidence; when the composer cannot
+    classify a boundary that crosses a multi-input block, the
+    position-aware fallback :func:`_mi_boundary` classifies the
+    *activation* edge (the context args are not part of the wire —
+    they pass through each block's own call).
     """
     blocks = composer.blocks(model, predicate=block_pred)
     captured, io = composer.capture_inputs(model, blocks, x)
@@ -606,43 +1130,27 @@ def lift_graph(
         )
     except Exception:
         captured2, io2 = {}, {}
-
+    const_ids = _param_bound_ids(model)
     nodes: list[MorphismNode] = []
     records: dict[str, _BlockRecord] = {}
     for name, mod in blocks:
         rec = _BlockRecord(name=name, module=mod)
         records[name] = rec
-        cap = captured.get(name)
-        if cap is None:
-            rec.note = "not executed on the captured input"
-        elif len(cap[0]) != 1 or cap[1]:
-            rec.note = "not a single-positional-arg call"
-        else:
-            rec.args = cap[0]
-            rec.example = cap[0][0]
-            _io_evidence(
-                rec,
-                io.get(name, {}),
-                captured2.get(name),
-                io2.get(name, {}),
-            )
-            try:
-                rec.ir, rec.leaves = source.to_ir(mod, rec.example)
-            except Exception as e:
-                rec.note = f"export failed: {type(e).__name__}: {e}"
-        sig = (
-            block_signature(
-                rec.ir,
-                in_shape=_shape_tuple(rec.example),
-                out_shape=_shape_tuple(io.get(name, {}).get("out")),
-            )
-            if rec.ir is not None
-            else None
+        sig = _lift_block(
+            rec,
+            mod,
+            captured.get(name),
+            captured2.get(name),
+            io.get(name, {}),
+            io2.get(name, {}),
+            source,
+            const_ids,
         )
         nodes.append(
             MorphismNode(name=name, sig=sig, opaque=sig is None)
         )
 
+    node_map = {n.name: n for n in nodes}
     wires = [
         Wire(
             blocks[i][0],
@@ -655,11 +1163,238 @@ def lift_graph(
                 captured2,
                 io2,
             )
+            or _mi_boundary(
+                blocks[i][0],
+                blocks[i + 1][0],
+                captured,
+                io,
+                captured2,
+                io2,
+                node_map,
+            )
             or "opaque",
         )
         for i in range(len(blocks) - 1)
     ]
     return MorphismGraph(nodes, wires, records, io=io, io2=io2)
+
+
+# ---------------------------------------------------------------------------
+#  Multi-input boundary fallback — the activation edge of a block pair
+# ---------------------------------------------------------------------------
+
+
+def _mi_consumers(
+    io: Any, captured: Any, out_obj: Any, out_val: Any
+) -> list[str]:
+    """Blocks whose captured args hold ``out`` — identity + value.
+
+    The position-agnostic counterpart of the composer's
+    ``_plain_consumers``: any arg position (activation or context)
+    holding the same live object with the captured value counts.
+    """
+    hits = []
+    for n, m in (io or {}).items():
+        c_args = captured.get(n, ((), {}))[0]
+        for arg, real in zip(
+            c_args, m.get("in_objs", ()), strict=False
+        ):
+            if (
+                real is out_obj
+                and _is_tensor(arg)
+                and _is_tensor(out_val)
+                and _exact_equal(arg, out_val)
+            ):
+                hits.append(n)
+                break
+    return hits
+
+
+def _mi_io_has_value(captured: Any, model_out: Any, val: Any) -> bool:
+    """Check ``val`` appears verbatim in the captured flow."""
+    if (
+        _is_tensor(model_out)
+        and _is_tensor(val)
+        and _exact_equal(model_out, val)
+    ):
+        return True
+    return any(
+        _is_tensor(a) and _is_tensor(val) and _exact_equal(a, val)
+        for args, _ in captured.values()
+        for a in args
+    )
+
+
+def _mi_residual_probe(
+    name_a: str,
+    name_b: str,
+    captured2: Any,
+    io2: Any,
+    ka: int,
+    kb: int,
+) -> bool:
+    """Second-probe confirmation of a multi-input residual edge."""
+    ca = captured2.get(name_a)
+    cb = captured2.get(name_b)
+    ia = io2.get(name_a)
+    if ca is None or cb is None or ia is None or ia["calls"] != 1:
+        return False
+    args_a, args_b = ca[0], cb[0]
+    if ka >= len(args_a) or kb >= len(args_b):
+        return False
+    a_in, b_in, a_out = args_a[ka], args_b[kb], ia["out"]
+    if not (
+        _is_tensor(a_in) and _is_tensor(b_in) and _is_tensor(a_out)
+    ):
+        return False
+    return bool(
+        tuple(a_in.shape) == tuple(a_out.shape)
+        and _exact_equal(b_in, a_in + a_out)
+    )
+
+
+def _mi_a_mode(
+    name_a: str,
+    name_b: str,
+    captured: Any,
+    io: Any,
+    captured2: Any,
+    io2: Any,
+    sig_a: BlockSig | None,
+    in_objs_b: tuple,
+    kb: int,
+    ka: int,
+    a_in: Any,
+    b_in: Any,
+    a_out: Any,
+    a_out_obj: Any,
+) -> str | None:
+    """Classify the A→B activation edge: ``chain`` / ``residual``.
+
+    ``chain`` — B's activation arg is literally A's output object and
+    nothing else consumed it; ``residual`` — the arg equals
+    ``a_in + a_out`` on both probes.
+    """
+    a_fans = _mi_consumers(io, captured, a_out_obj, a_out)
+    if kb < len(in_objs_b) and in_objs_b[kb] is a_out_obj:
+        # B literally consumed A's output at its activation position —
+        # chain only when nothing else did.
+        if a_fans != [name_b]:
+            return None
+        return "chain"
+    if a_fans or sig_a is None:
+        return None
+    if not (
+        tuple(a_in.shape) == tuple(a_out.shape)
+        and _exact_equal(b_in, a_in + a_out)
+        and _mi_residual_probe(name_a, name_b, captured2, io2, ka, kb)
+    ):
+        return None
+    return "residual"
+
+
+def _mi_b_mode(
+    captured: Any,
+    io: Any,
+    ib: dict,
+    b_in: Any,
+    model_out: Any,
+    model_out_obj: Any,
+) -> str | None:
+    """Classify B's output consumption: plain / ``_wrapped`` / None."""
+    b_out, b_out_obj = ib["out"], ib["out_obj"]
+    if not _is_tensor(b_out):
+        return None
+    plain_ev = bool(_mi_consumers(io, captured, b_out_obj, b_out)) or (
+        b_out_obj is model_out_obj
+        and _is_tensor(model_out)
+        and _exact_equal(model_out, b_out)
+    )
+    wrapped_ev = tuple(b_in.shape) == tuple(
+        b_out.shape
+    ) and _mi_io_has_value(captured, model_out, b_in + b_out)
+    if plain_ev == wrapped_ev:
+        return None
+    return "_wrapped" if wrapped_ev else ""
+
+
+def _mi_boundary(
+    name_a: str,
+    name_b: str,
+    captured: Any,
+    io: Any,
+    captured2: Any,
+    io2: Any,
+    nodes: dict[str, MorphismNode],
+) -> str | None:
+    """Classify A→B when the composer's single-arg check declined.
+
+    The composer's ``boundary`` requires a single positional arg on
+    both sides; a multi-input block ``B(y, cos, sin)`` returns
+    ``None`` unconditionally.  This fallback reads the same evidence
+    on B's *activation* position — ``chain`` when B's activation arg
+    is literally A's output object (consumed by B alone),
+    ``residual`` when it is ``a_in + a_out`` on both probes — and the
+    same plain/wrapped downstream check on B's output.  Context args
+    are not part of the wire: they enter B's own call site and pass
+    through a composition unchanged.
+    """
+    node_a, node_b = nodes.get(name_a), nodes.get(name_b)
+    sig_a = node_a.sig if node_a is not None else None
+    sig_b = node_b.sig if node_b is not None else None
+    if not (
+        (sig_a is not None and len(sig_a.inputs) > 1)
+        or (sig_b is not None and len(sig_b.inputs) > 1)
+    ):
+        return None  # single-input pair — the composer already spoke
+    ca = captured.get(name_a)
+    cb = captured.get(name_b)
+    ia = io.get(name_a)
+    ib = io.get(name_b)
+    if ca is None or cb is None or ia is None or ib is None:
+        return None
+    if ia["calls"] != 1 or ib["calls"] != 1:
+        return None
+    args_a, kw_a = ca
+    args_b, kw_b = cb
+    ka = _act_index(sig_a.inputs) if sig_a is not None else 0
+    kb = _act_index(sig_b.inputs) if sig_b is not None else 0
+    if kw_a or kw_b or ka >= len(args_a) or kb >= len(args_b):
+        return None
+    a_in, b_in, a_out = args_a[ka], args_b[kb], ia["out"]
+    if not (
+        _is_tensor(a_in) and _is_tensor(b_in) and _is_tensor(a_out)
+    ):
+        return None
+    a_out_obj = ia["out_obj"]
+    model = io.get("<model>", {})
+    model_out, model_out_obj = model.get("out"), model.get("out_obj")
+    if a_out_obj is model_out_obj:
+        return None  # A's output escapes the pair entirely
+    a_mode = _mi_a_mode(
+        name_a,
+        name_b,
+        captured,
+        io,
+        captured2,
+        io2,
+        sig_a,
+        ib.get("in_objs") or (),
+        kb,
+        ka,
+        a_in,
+        b_in,
+        a_out,
+        a_out_obj,
+    )
+    if a_mode is None:
+        return None
+    suffix = _mi_b_mode(
+        captured, io, ib, b_in, model_out, model_out_obj
+    )
+    if suffix is None:
+        return None
+    return a_mode + suffix
 
 
 # ---------------------------------------------------------------------------
@@ -1202,27 +1937,111 @@ def _subst(term: Any, var: Var, repl: Any) -> Any:
     return term
 
 
+def _ctx_hit(
+    host: _BlockRecord, member: _BlockRecord, j: int
+) -> Var | None:
+    """Return the host input var carrying member's context arg ``j``.
+
+    Identity, not value: the captured live objects must be the same
+    tensor, confirmed on the perturbed probe when it ran.
+    """
+    obj = member.in_objs[j]
+    host_ir = host.ir
+    if host_ir is None:
+        return None
+    for k, va in enumerate(host_ir.inputs):
+        if k >= len(host.in_objs) or host.in_objs[k] is not obj:
+            continue
+        if (
+            host.in_objs2
+            and member.in_objs2
+            and not (
+                k < len(host.in_objs2)
+                and j < len(member.in_objs2)
+                and host.in_objs2[k] is member.in_objs2[j]
+            )
+        ):
+            return None
+        return va
+    return None
+
+
+def _ctx_var_map(
+    host: _BlockRecord,
+    member: _BlockRecord,
+    member_act: int,
+) -> tuple[dict | None, str | None]:
+    """Map member's context vars onto host's input vars — by identity.
+
+    The fused joint is delivered at the host's slot: it only ever
+    sees the host's call args.  A member context input (a rope
+    ``cos``/``sin`` table, a read-only cache) is therefore expressible
+    only when the captured evidence shows the host received literally
+    the same object — the live ``in_objs`` identity on the first
+    capture, confirmed on the perturbed probe when it ran.  Returns
+    ``(mapping, None)`` or ``(None, reason)`` — an unshared context
+    input is an honest decline, never a guessed binding.
+    """
+    host_ir, mem_ir = host.ir, member.ir
+    if host_ir is None or mem_ir is None:
+        return None, "opaque node"
+    mapping: dict = {}
+    for j, vb in enumerate(mem_ir.inputs):
+        if j == member_act:
+            continue
+        if j >= len(member.in_objs):
+            return None, "context inputs not captured"
+        hit = _ctx_hit(host, member, j)
+        if hit is None:
+            return (
+                None,
+                f"context input {j} of {member.name} not shared "
+                f"by {host.name}",
+            )
+        mapping[vb] = hit
+    return mapping, None
+
+
+def _subst_ctx(term: Any, ctx_map: dict | None) -> Any:
+    """Substitute every context var of the member per *ctx_map*."""
+    for vb, va in (ctx_map or {}).items():
+        term = _subst(term, vb, va)
+    return term
+
+
 def _joint_parts(
     ira: IR,
     irb: IR,
     rec_a: _BlockRecord,
     rec_b: _BlockRecord,
     mode: str,
+    *,
+    act_a: int = 0,
+    act_b: int = 0,
+    ctx_map: dict | None = None,
 ) -> tuple[Any, Var, Any, dict, dict]:
     """Compose the pair's IRs per the boundary mode — terms, not modules.
 
     Returns ``(joint, x, mid, params, leaves)``: the joint term over
-    the shared input ``x`` (A's input variable), ``mid`` — the value B
-    reads (``A(x)`` for chains, ``x + A(x)`` for residuals) — and the
-    namespaced param/value tables (per-block ``p_*`` leaf names never
-    collide).  The ``_wrapped`` modes add the outer wrap the parent's
-    ``y + ·`` performs.
+    the shared input ``x`` (A's activation variable), ``mid`` — the
+    value B reads (``A(x)`` for chains, ``x + A(x)`` for residuals) —
+    and the namespaced param/value tables (per-block ``p_*`` leaf
+    names never collide).  The ``_wrapped`` modes add the outer wrap
+    the parent's ``y + ·`` performs.
+
+    Multi-input: ``act_a``/``act_b`` select the activation var each
+    side composes over; ``ctx_map`` (from :func:`_ctx_var_map`)
+    rebinds B's context vars to the A-input vars carrying the same
+    captured objects, so the joint is a pure function of A's inputs
+    and B's const/state inputs pass through unchanged.
     """
     pa, pb = _ns_prefix(rec_a.name), _ns_prefix(rec_b.name)
-    x, vb = ira.inputs[0], irb.inputs[0]
+    x, vb = ira.inputs[act_a], irb.inputs[act_b]
     y_a = _prefix_params(ira.root, pa)
     mid = Op.make("add", x, y_a) if mode.startswith("residual") else y_a
-    body = _subst(_prefix_params(irb.root, pb), vb, mid)
+    body = _subst(
+        _subst_ctx(_prefix_params(irb.root, pb), ctx_map), vb, mid
+    )
     joint = (
         Op.make("add", mid, body) if mode.endswith("_wrapped") else body
     )
@@ -1241,27 +2060,36 @@ def _joint_parts_window(
     irs: list[IR],
     recs: list[_BlockRecord],
     kinds: tuple[str, ...],
+    *,
+    acts: tuple[int, ...] | None = None,
+    ctx_maps: tuple[dict | None, ...] | None = None,
 ) -> tuple[Any, Var, tuple, dict, dict]:
     """Compose a ≥3-block window's IRs — the n-ary :func:`_joint_parts`.
 
     Returns ``(joint, x, mids, params, leaves)``: ``joint`` is the
-    whole window's function of the first block's input ``x``;
-    ``mids`` is the tuple of residual-*stream* nodes the later blocks
-    read (in creation order ``s_0..s_{k-2}`` — the distribute offer
-    expands them outermost-first); empty for the chain family, which
-    has no additive structure to distribute over.
+    whole window's function of the first block's activation input
+    ``x``; ``mids`` is the tuple of residual-*stream* nodes the later
+    blocks read (in creation order ``s_0..s_{k-2}`` — the distribute
+    offer expands them outermost-first); empty for the chain family,
+    which has no additive structure to distribute over.
 
     Construction is driven by ``kinds`` (one per interior boundary):
     a residual-family window accumulates the stream
     ``s_j = s_{j-1} + f_j(s_{j-1})`` every later block reads; a
     chain-family window nests ``f_j(f_{j-1}(·))``.  In both, the last
     wire's ``_wrapped`` mark decides whether the segment's value is
-    the raw last body or ``in + body``.
+    the raw last body or ``in + body``.  ``acts`` selects each
+    block's activation input position; ``ctx_maps`` rebinds each
+    member's context vars to the first block's input vars
+    (:func:`_ctx_var_map`), so the window stays a pure function of
+    the host slot's args.
     """
     pres = [_ns_prefix(r.name) for r in recs]
+    acts = acts or (0,) * len(irs)
+    ctx_maps = ctx_maps or (None,) * len(irs)
     roots = [
-        _prefix_params(ir.root, pre)
-        for ir, pre in zip(irs, pres, strict=True)
+        _subst_ctx(_prefix_params(ir.root, pre), cm)
+        for ir, pre, cm in zip(irs, pres, ctx_maps, strict=True)
     ]
     params: dict[str, Param] = {}
     leaves: dict[str, Any] = {}
@@ -1273,36 +2101,64 @@ def _joint_parts_window(
             }
         )
         leaves.update({pre + k: v for k, v in rec.leaves.items()})
-    x = irs[0].inputs[0]
-    first = _subst(roots[0], irs[0].inputs[0], x)
-    mids: list[Any] = []
+    x = irs[0].inputs[acts[0]]
+    first = _subst(roots[0], irs[0].inputs[acts[0]], x)
     if kinds[0].startswith("residual"):
-        # Stream semantics: block j >= 1 reads s_{j-1}, the running
-        # in+out sum; interior wires are residual_wrapped by the law's
-        # own grammar (the stream must flow on).
-        stream = Op.make("add", x, first)
-        mids.append(stream)
-        for j in range(1, len(irs) - 1):
-            fj = _subst(roots[j], irs[j].inputs[0], stream)
-            stream = Op.make("add", stream, fj)
-            mids.append(stream)
-        body = _subst(roots[-1], irs[-1].inputs[0], stream)
-        joint = (
-            Op.make("add", stream, body)
-            if kinds[-1].endswith("_wrapped")
-            else body
+        joint, mids = _window_residual(
+            roots, irs, acts, kinds, x, first
         )
     else:
-        cur = first
-        for j in range(1, len(irs) - 1):
-            cur = _subst(roots[j], irs[j].inputs[0], cur)
-        body = _subst(roots[-1], irs[-1].inputs[0], cur)
-        joint = (
-            Op.make("add", cur, body)
-            if kinds[-1].endswith("_wrapped")
-            else body
-        )
+        joint, mids = _window_chain(roots, irs, acts, kinds, first)
     return joint, x, tuple(mids), params, leaves
+
+
+def _window_residual(
+    roots: list,
+    irs: list[IR],
+    acts: tuple[int, ...],
+    kinds: tuple[str, ...],
+    x: Var,
+    first: Any,
+) -> tuple[Any, list]:
+    """Accumulate the residual stream — ``s_j = s_{j-1} + f_j(s_{j-1})``.
+
+    Block ``j >= 1`` reads the running in+out sum; interior wires are
+    ``residual_wrapped`` by the law's own grammar (the stream must
+    flow on).
+    """
+    stream = Op.make("add", x, first)
+    mids: list[Any] = [stream]
+    for j in range(1, len(irs) - 1):
+        fj = _subst(roots[j], irs[j].inputs[acts[j]], stream)
+        stream = Op.make("add", stream, fj)
+        mids.append(stream)
+    body = _subst(roots[-1], irs[-1].inputs[acts[-1]], stream)
+    joint = (
+        Op.make("add", stream, body)
+        if kinds[-1].endswith("_wrapped")
+        else body
+    )
+    return joint, mids
+
+
+def _window_chain(
+    roots: list,
+    irs: list[IR],
+    acts: tuple[int, ...],
+    kinds: tuple[str, ...],
+    first: Any,
+) -> tuple[Any, list]:
+    """Nest ``f_j(f_{j-1}(·))`` — the chain-family window body."""
+    cur = first
+    for j in range(1, len(irs) - 1):
+        cur = _subst(roots[j], irs[j].inputs[acts[j]], cur)
+    body = _subst(roots[-1], irs[-1].inputs[acts[-1]], cur)
+    joint = (
+        Op.make("add", cur, body)
+        if kinds[-1].endswith("_wrapped")
+        else body
+    )
+    return joint, []
 
 
 def _distribute_over(term: Any, mid: Any) -> Any:
@@ -1478,14 +2334,30 @@ def _saturate(
     return eg, eid
 
 
+def _ins_list(inputs: Iterable[Var] | None, var: Var) -> list:
+    """Return the lowering's input list — ``[var]`` in the single-input case."""
+    return list(inputs) if inputs is not None else [var]
+
+
 def _lower_term(
-    term: Any, var: Var, params: dict, leaves: dict, sink: Sink
+    term: Any,
+    var: Var,
+    params: dict,
+    leaves: dict,
+    sink: Sink,
+    inputs: Iterable[Var] | None = None,
 ) -> Any:
-    """Lower one term over one input var through the sink."""
+    """Lower one term through the sink — over ``inputs`` vars.
+
+    ``inputs`` defaults to ``[var]`` (the historical single-input
+    spelling); a multi-input joint passes the full var list so the
+    lowered module's positional binding matches the block's call.
+    """
+    ins = _ins_list(inputs, var)
     ir = IR(
         root=term,
-        inputs=[var],
-        input_names={var.name},
+        inputs=ins,
+        input_names={v.name for v in ins},
         params=params,
     )
     return sink.lower(ir, leaves)
@@ -1500,28 +2372,48 @@ def _verify_pair(
     leaves: dict,
     args: tuple,
     rtol: float,
+    inputs: Iterable[Var] | None = None,
 ) -> Any:
     """Verify the reified term against the un-rewritten joint."""
-    ref = _lower_term(ref_term, var, params, leaves, sink)
-    opt = _lower_term(opt_term, var, params, leaves, sink)
+    ref = _lower_term(ref_term, var, params, leaves, sink, inputs)
+    opt = _lower_term(opt_term, var, params, leaves, sink, inputs)
     return sink.verify(ref, opt, args, rtol=rtol)
 
 
-def _slot_filler(sink: Sink, var: Var, mode: str) -> Any:
+def _slot_filler(
+    sink: Sink,
+    var: Var,
+    mode: str,
+    inputs: Iterable[Var] | None = None,
+) -> Any:
     """Build the B-slot filler for a consumed pair: id or exact zero.
 
     Both are lowered terms — backend-neutral: ``x`` evaluates to its
     input; ``x * 0`` evaluates to a zero of the input's shape (the
     composer's ``_Zero`` uses ``zeros_like`` — equivalent on finite
-    inputs, which is what the verify gate runs).
+    inputs, which is what the verify gate runs).  ``inputs`` widens
+    the filler's call signature for multi-input slots — the context
+    args are simply ignored.
     """
     root = (
         Op.make("mul", var, Const(0))
         if mode.endswith("_wrapped")
         else var
     )
-    ir = IR(root=root, inputs=[var], input_names={var.name}, params={})
+    ins = _ins_list(inputs, var)
+    ir = IR(
+        root=root,
+        inputs=ins,
+        input_names={v.name for v in ins},
+        params={},
+    )
     return sink.lower(ir, {})
+
+
+def _rec_act(graph: MorphismGraph, name: str) -> int:
+    """Return the record's activation input index (0 when unlifted)."""
+    sig = graph.sig(name)
+    return _act_index(sig.inputs) if sig is not None else 0
 
 
 def _intra_joint(
@@ -1534,11 +2426,12 @@ def _intra_joint(
     return (
         (
             rec.ir.root,
-            rec.ir.inputs[0],
+            rec.ir.inputs[_rec_act(graph, match.nodes[0])],
             (),
             rec.ir.params,
             rec.leaves,
             rec.args,
+            tuple(rec.ir.inputs),
         ),
         None,
     )
@@ -1554,10 +2447,19 @@ def _window_joint(
         return None, "malformed window spec"
     if any(r.ir is None for r in recs):
         return None, "opaque node"
+    acts = tuple(_rec_act(graph, n) for n in match.nodes)
+    ctx_maps: list[dict | None] = []
+    for r, act_j in zip(recs[1:], acts[1:], strict=True):
+        cmap, why = _ctx_var_map(recs[0], r, act_j)
+        if cmap is None:
+            return None, why
+        ctx_maps.append(cmap)
     joint, var, mids, params, leaves = _joint_parts_window(
         [r.ir for r in recs if r.ir is not None],
         recs,
         spec.kinds,
+        acts=acts,
+        ctx_maps=(None, *ctx_maps),
     )
     return (
         (
@@ -1567,6 +2469,7 @@ def _window_joint(
             params,
             leaves,
             recs[0].args,
+            tuple(recs[0].ir.inputs) if recs[0].ir else (),
         ),
         None,
     )
@@ -1580,8 +2483,20 @@ def _pair_joint(
     rec_a, rec_b = (graph.record(n) for n in match.nodes)
     if rec_a.ir is None or rec_b.ir is None:
         return None, "opaque node"
+    act_a = _rec_act(graph, match.nodes[0])
+    act_b = _rec_act(graph, match.nodes[1])
+    ctx_map, why = _ctx_var_map(rec_a, rec_b, act_b)
+    if ctx_map is None:
+        return None, why
     term, var, mid, params, leaves = _joint_parts(
-        rec_a.ir, rec_b.ir, rec_a, rec_b, spec.mode
+        rec_a.ir,
+        rec_b.ir,
+        rec_a,
+        rec_b,
+        spec.mode,
+        act_a=act_a,
+        act_b=act_b,
+        ctx_map=ctx_map,
     )
     return (
         (
@@ -1591,6 +2506,7 @@ def _pair_joint(
             params,
             leaves,
             rec_a.args,
+            tuple(rec_a.ir.inputs),
         ),
         None,
     )
@@ -1601,12 +2517,13 @@ def _resolve_joint(
 ) -> tuple[tuple | None, str | None]:
     """Resolve a match to its joint term plus lowering context.
 
-    Returns ``((term, var, mids, params, leaves, args), None)`` —
-    the joint program over the first block's input variable, the
-    additive nodes to distribute over (already gated by
+    Returns ``((term, var, mids, params, leaves, args, inputs),
+    None)`` — the joint program over the first block's activation
+    variable, the additive nodes to distribute over (already gated by
     ``spec.distribute``, so empty unless the spec asks), the
-    namespaced param/leaf tables, and the first block's captured
-    args — or ``(None, reason)`` for an honest decline.
+    namespaced param/leaf tables, the first block's captured args,
+    and its full input-var list for lowering — or
+    ``(None, reason)`` for an honest decline.
     """
     spec = match.reify
     if spec.mode == "intra":
@@ -1646,6 +2563,8 @@ def _window_reps(
     best: Any,
     match: MorphismMatch,
     var: Var,
+    inputs: Iterable[Var],
+    graph: MorphismGraph,
     params: dict,
     leaves: dict,
     sink: Sink,
@@ -1657,6 +2576,8 @@ def _window_reps(
     add.  Each later slot's filler follows the wire INTO it: a
     wrapped consumption takes the exact-zero addend, a plain one
     the identity passthrough — same convention as the pair slots.
+    Every slot is lowered over *its own* block's input vars, so a
+    multi-input member's filler keeps its call signature.
     """
     spec = match.reify
     a_term = (
@@ -1665,10 +2586,16 @@ def _window_reps(
         else best
     )
     reps = {
-        match.nodes[0]: _lower_term(a_term, var, params, leaves, sink)
+        match.nodes[0]: _lower_term(
+            a_term, var, params, leaves, sink, inputs
+        )
     }
     for j, name in enumerate(match.nodes[1:], start=1):
-        reps[name] = _slot_filler(sink, var, spec.kinds[j - 1])
+        ir_j = graph.record(name).ir
+        ins_j = tuple(ir_j.inputs) if ir_j is not None else (var,)
+        act_j = _rec_act(graph, name)
+        var_j = ir_j.inputs[act_j] if ir_j is not None else var
+        reps[name] = _slot_filler(sink, var_j, spec.kinds[j - 1], ins_j)
     return reps
 
 
@@ -1733,7 +2660,7 @@ def _reify(
     resolved, decline = _resolve_joint(match, graph)
     if resolved is None:
         return {"status": "declined", "reason": decline}
-    term, var, mids, params, leaves, args = resolved
+    term, var, mids, params, leaves, args, inputs = resolved
 
     offers = _distribute_offers(term, mids)
     eg, eid = _saturate(
@@ -1760,7 +2687,15 @@ def _reify(
             **info,
         }
     vr = _verify_pair(
-        sink, term, best, var, params, leaves, args, verify_tol
+        sink,
+        term,
+        best,
+        var,
+        params,
+        leaves,
+        args,
+        verify_tol,
+        inputs,
     )
     info["rel_diff"] = vr.max_rel
     if not vr.passed:
@@ -1771,10 +2706,14 @@ def _reify(
         }
     if spec.mode == "intra":
         reps = {
-            match.nodes[0]: _lower_term(best, var, params, leaves, sink)
+            match.nodes[0]: _lower_term(
+                best, var, params, leaves, sink, inputs
+            )
         }
     elif spec.kinds:
-        reps = _window_reps(best, match, var, params, leaves, sink)
+        reps = _window_reps(
+            best, match, var, inputs, graph, params, leaves, sink
+        )
     else:
         a_name, b_name = match.nodes
         a_term = (
@@ -1782,9 +2721,18 @@ def _reify(
             if spec.mode.startswith("residual")
             else best
         )
+        ir_b = graph.record(b_name).ir
+        ins_b = tuple(ir_b.inputs) if ir_b is not None else (var,)
+        var_b = (
+            ir_b.inputs[_rec_act(graph, b_name)]
+            if ir_b is not None
+            else var
+        )
         reps = {
-            a_name: _lower_term(a_term, var, params, leaves, sink),
-            b_name: _slot_filler(sink, var, spec.mode),
+            a_name: _lower_term(
+                a_term, var, params, leaves, sink, inputs
+            ),
+            b_name: _slot_filler(sink, var_b, spec.mode, ins_b),
         }
     return {"status": "grafted", "reps": reps, **info}
 
@@ -1812,6 +2760,7 @@ def _reify_tie(
     leaves: dict[str, Any] = {}
     params: dict[str, Param] = {}
     vars_: dict[str, Var] = {}
+    ins_: dict[str, tuple] = {}
     eids: dict[str, int] = {}
     for r in recs:
         if r.ir is None:
@@ -1825,7 +2774,8 @@ def _reify_tie(
             }
         )
         leaves.update({pre + k: v for k, v in r.leaves.items()})
-        vars_[r.name] = r.ir.inputs[0]
+        vars_[r.name] = r.ir.inputs[_rec_act(graph, r.name)]
+        ins_[r.name] = tuple(r.ir.inputs)
     groups = share_duplicate_params(eg, leaves)
     if not groups:
         return {"status": "declined", "reason": "no_tied_values"}
@@ -1836,7 +2786,12 @@ def _reify_tie(
         # The merged param may be the *other* block's name — lower with
         # the joint tables so the shared canonical name resolves.
         opt = _lower_term(
-            extracted, vars_[r.name], params, leaves, sink
+            extracted,
+            vars_[r.name],
+            params,
+            leaves,
+            sink,
+            ins_[r.name],
         )
         vr = sink.verify(r.module, opt, r.args, rtol=verify_tol)
         rels[r.name] = vr.max_rel
@@ -1952,6 +2907,34 @@ def _arm_law_budgets(
         else:
             out.append(law)
     return tuple(out)
+
+
+def _rest_example(rec: _BlockRecord) -> Any:
+    """Return the per-block search input — the full args tuple when multi-input."""
+    return rec.args[0] if len(rec.args) == 1 else rec.args
+
+
+def _sig_dict(sig: BlockSig) -> dict[str, Any]:
+    """Serialize a signature for the stats report."""
+    return {
+        "in_projs": [w.name for w in sig.in_projs],
+        "out_proj": [w.name for w in sig.out_proj],
+        "norm": sig.norm.kind,
+        "norm_affine": sig.norm.affine,
+        "norm_pre": sig.norm.pre,
+        "act": list(sig.act),
+        "residual": sig.residual,
+        "shape": sig.shape,
+        "inputs": [
+            {
+                "index": i.index,
+                "name": i.name,
+                "kind": i.kind,
+                "role": i.role,
+            }
+            for i in sig.inputs
+        ],
+    }
 
 
 def _fallback_cost_kw(cost_fn: CostFn | None) -> dict[str, Any]:
@@ -2112,7 +3095,7 @@ def _optimize_morphisms(
             try:
                 res_s = optimizer.search(
                     rec.module,
-                    rec.example,
+                    _rest_example(rec),
                     rules=rules,
                     max_iterations=max_iterations,
                     max_enodes=max_enodes,
@@ -2125,7 +3108,7 @@ def _optimize_morphisms(
                 )
                 lr = optimizer.lower(
                     res_s,
-                    rec.example,
+                    _rest_example(rec),
                     runner=IdentityRunner(),
                     verify=False,
                     verbose=verbose,
@@ -2175,20 +3158,7 @@ def _optimize_morphisms(
         "n_blocks": len(graph.nodes),
         "n_lifted": sum(1 for n in graph.nodes if not n.opaque),
         "sigs": {
-            n.name: (
-                {
-                    "in_projs": [w.name for w in n.sig.in_projs],
-                    "out_proj": [w.name for w in n.sig.out_proj],
-                    "norm": n.sig.norm.kind,
-                    "norm_affine": n.sig.norm.affine,
-                    "norm_pre": n.sig.norm.pre,
-                    "act": list(n.sig.act),
-                    "residual": n.sig.residual,
-                    "shape": n.sig.shape,
-                }
-                if n.sig is not None
-                else None
-            )
+            n.name: (_sig_dict(n.sig) if n.sig is not None else None)
             for n in graph.nodes
         },
         "wires": [(w.src, w.dst, w.kind) for w in graph.wires],
