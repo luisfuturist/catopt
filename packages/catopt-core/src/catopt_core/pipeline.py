@@ -98,6 +98,13 @@ class SearchResult:
     are provenance — which port produced the IR, and which model the
     result optimizes.
 
+    ``task`` / ``task_tol`` carry the opt-in task-metric contract
+    (plan 0015): a :class:`~catopt_core.ports.TaskMetric` value and
+    its resolved tolerance.  They change nothing about extraction —
+    they are *delivery provenance*: :func:`lower` re-reads them so
+    the verify gate can evaluate the task metric on the verify input
+    without the caller re-passing the metric.
+
     ``eq=False``: identity semantics — a result is a handle into one
     concrete e-graph, not a value.
     """
@@ -111,6 +118,8 @@ class SearchResult:
     cost_fn: CostFn | None = None
     source: Any = None
     model: Any = None
+    task: Any = None
+    task_tol: float | None = None
 
     def alternatives(
         self, top_k: int = 8, cost_fn: CostFn | None = None

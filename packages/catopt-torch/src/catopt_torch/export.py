@@ -268,6 +268,13 @@ _BOUND_KEYS = (
     "error_bounds_honored",
 )
 
+#: Task-metric certificate keys (plan 0015) — the metric's record
+#: (``task``: name / tolerance / measured distance / verdict /
+#: ``evaluated_on``, i.e. which calibration input conditioned the
+#: certificate), which metric produced the verify verdict, and which
+#: contract accepted the delivery.
+_TASK_KEYS = ("task", "verify_metric", "accepted_by")
+
 
 def _bound_manifest(stats: dict[str, Any] | None) -> dict[str, Any]:
     """Slice the bounded-rewrite ledger out of *stats* for the manifest.
@@ -281,6 +288,20 @@ def _bound_manifest(stats: dict[str, Any] | None) -> dict[str, Any]:
     return {
         k: stats[k] for k in _BOUND_KEYS if stats.get(k) is not None
     }
+
+
+def _task_manifest(stats: dict[str, Any] | None) -> dict[str, Any]:
+    """Slice the task-metric certificate out of *stats* for the manifest.
+
+    Plan-0015 honesty: a task-gated delivery is never silent — the
+    manifest carries which metric gated acceptance, its tolerance and
+    the measured distance on the verify input.  A declared contract
+    that was never evaluated (``verify=False``) exports ``task``
+    without ``distance``/``passed`` — visibly a promise, not a proof.
+    """
+    if stats is None:
+        return {}
+    return {k: stats[k] for k in _TASK_KEYS if stats.get(k) is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +642,10 @@ def export_optimized(
         ``error_bound_total`` / ``error_bounds`` /
         ``error_bounds_honored`` — the keys are copied into the
         manifest verbatim, so an approximate delivery is never silent
-        about its error envelope.
+        about its error envelope.  The task-metric keys (``task`` /
+        ``verify_metric`` / ``accepted_by``, plan 0015) copy the same
+        way — the manifest records which task metric gated acceptance,
+        its tolerance, and the measured distance on the verify input.
 
     Returns
     -------
@@ -651,6 +675,7 @@ def export_optimized(
     }
     manifest["notes"] = _notes(fmt_c, bool(catopt_mods))
     manifest.update(_bound_manifest(stats))
+    manifest.update(_task_manifest(stats))
 
     p.parent.mkdir(parents=True, exist_ok=True)
     if fmt_c == "pt2":

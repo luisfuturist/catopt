@@ -35,6 +35,10 @@ The ports (this file)
 * :class:`VerifyResult` — the core-owned structural view of a verify
   result (``max_abs`` / ``max_rel`` / ``passed``); the torch adapter's
   ``report.VerifyReport`` satisfies it without core naming it.
+* :class:`TaskMetric` — the task-level equivalence contract (plan
+  0015): ``distance(ref_out, opt_out) -> float`` against a
+  ``tolerance``, named by ``name``; the shipped implementations are
+  in :mod:`catopt_core.metrics`.
 * :class:`Source` — the whole-graph source port,
   ``model -> (IR, leaves)``.
 * :class:`Capabilities` — the backend's declared op surface:
@@ -160,6 +164,7 @@ __all__ = [
     "Sink",
     "Source",
     "Strategy",
+    "TaskMetric",
     "TimingResult",
     "TorchBinding",
     "Verifier",
@@ -434,6 +439,50 @@ class Verifier(Protocol):
         atol: float | None = None,
     ) -> VerifyResult:
         """Compare ``ref_out`` and ``out`` under ``rtol``/``atol``."""
+        ...
+
+
+@runtime_checkable
+class TaskMetric(Protocol):
+    """A task-level equivalence metric — the certificate's task contract.
+
+    Domain port (plan 0015).  A pointwise bound (``max_rel ≤ rtol``)
+    is one statement of equivalence, but the user's real contract is
+    often *behavioural*: an LLM cares about the logits' ranking, a
+    classifier about the argmax, a retrieval model about the cosine
+    ordering of its embeddings.  A ``TaskMetric`` reduces a pair of
+    module outputs to a scalar ``distance``; ``tolerance`` is the
+    metric's default gate (the pipeline's ``task_tol`` overrides it)
+    and ``name`` is the label the stats/manifest record.
+
+    ``distance(ref_out, opt_out) -> float`` — smaller is closer;
+    ``0.0`` means indistinguishable under the task.  ``ref_out`` /
+    ``opt_out`` are whatever the lowered modules returned — a
+    tensor-like or a pytree of them — and the metric must evaluate
+    them by duck typing (``tolist`` …): core names no tensor library.
+    The shipped implementations live in :mod:`catopt_core.metrics`
+    (:class:`~catopt_core.metrics.MaxRel` restates the pointwise
+    gate itself, so ``verify_metric="max_rel"`` names the same
+    metric either way).
+
+    The metric is **calibration-conditioned**: ``distance`` is
+    evaluated on the verify input, so the certificate's equivalence
+    claim holds on that input distribution — distribution shift is
+    the honest caveat, recorded via ``evaluated_on`` in the manifest.
+    """
+
+    @property
+    def name(self) -> str:
+        """The label recorded into ``stats`` and the manifest."""
+        ...
+
+    @property
+    def tolerance(self) -> float:
+        """The metric's default gate; ``task_tol`` overrides it."""
+        ...
+
+    def distance(self, ref: Any, opt: Any) -> float:
+        """Scalar distance between the two modules' outputs."""
         ...
 
 
