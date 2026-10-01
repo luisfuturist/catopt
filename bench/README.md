@@ -172,6 +172,63 @@ searches (TypeError through ``optimize``), and ``KVLatentShare``
 cannot match stories15M's 3-input ``Block(h, cos, sin)`` at any
 budget.
 
+## vllm_compare.py — catopt vs vLLM, and through it
+
+```bash
+# all-in-one env (torch-cuda + catopt packages + vllm + transformers):
+/home/luis/vllm-probe/bin/python bench/vllm_compare.py --device cuda --quick
+
+# split envs: repo .venv runs catopt/export legs; the serving leg is
+# delegated to any interpreter that has vllm:
+.venv/bin/python bench/vllm_compare.py --device cpu \
+    --vllm-python ~/vllm-probe/bin/python --quick
+```
+
+vLLM's wins (paged KV cache, continuous batching, fused attention
+kernels) are orthogonal to catopt's compile-time structural rewrites —
+so the bench measures both AND runs the composition.  Three legs:
+
+1. **HF export (verified).** Writes the stories15M checkpoint — or
+   the catopt-*optimized* module — as a standard HF
+   `LlamaForCausalLM` directory (`config.json` + `model.safetensors`).
+   The optimized module's fused executors are split back to HF layout
+   (`fused_10` → q|k|v, `fused_11` → gate|up), and q/k rows are
+   permuted from llama2.c's interleaved RoPE to HF rotate-half (the
+   llama.cpp `permute`); a pure-torch check proves attention scores
+   are preserved (~1e-5 fp32 noise), and when `transformers` is
+   importable the exported model's logits are compared against the
+   catopt module (measured: 1.6e-5 max|Δ|).
+2. **torch decode.** Greedy decode at a FIXED context window (catopt
+   executors are shape-specialized — measured: optimizing at
+   `(1,64)` bakes `[1,64,6,48]` reshapes).  Variants
+   eager/inductor/catopt/catopt+inductor share one loop; a separate
+   untimed eager *true* decode (unbounded window, real positions —
+   vLLM-equivalent semantics) supplies reference tokens.
+3. **vLLM serve.** `LLM(model=<hf_dir>, dtype='float32',
+   enforce_eager=True)` — in-process when `import vllm` works, else
+   via `--vllm-python` subprocess, else skipped with the full
+   integration recipe in the report.  Reports init/prefill
+   (~TTFT)/decode tok/s and **token agreement vs torch eager greedy**.
+
+**Measured (RTX 2050 4GB, vllm 0.30.0+cu130, B=1 ctx=48 gen=16):**
+vLLM serves the catopt-exported HF dir at ~245 tok/s decode with
+*token-for-token* agreement (1.0) against torch eager greedy — the
+integration chain is real end-to-end.  At this size torch's KV-free
+Python decode loop (~410 tok/s fixed-window on the same GPU)
+out-serves the engine — vLLM's overhead dominates below batch/scale
+where paging and batching pay; the wins are complementary, not
+competing.  Note vLLM's `QKVParallelLinear` already performs the QKV
+fusion catopt finds — executor-level wins (eval tapes, batched
+carriers) remain torch-side; weight-level wins (folded chains) map
+cleanly through the HF checkpoint.
+
+vLLM leg needs CUDA + toolkit-less-host fixes (handled:
+`CUDA_HOME`→pip-wheel nvcc, `VLLM_USE_FLASHINFER_SAMPLER=0`).
+Probe env used for the numbers above: `uv venv ~/vllm-probe
+--python 3.12 && uv pip install --python ~/vllm-probe/bin/python vllm
+-e packages/catopt-core -e packages/catopt-orchestrator
+-e packages/catopt-carriers -e packages/catopt-torch`.
+
 ## benchkit.py — the shared harness + reports
 
 ```bash

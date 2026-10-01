@@ -66,6 +66,8 @@ DEFAULT_SUITES = [
     "laws_effect",
     "morphism_e2e",
     "bounded_e2e",
+    "structured_models",
+    "vllm_compare",
 ]
 
 
