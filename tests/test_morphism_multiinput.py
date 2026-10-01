@@ -210,6 +210,86 @@ class _RopeParallel(nn.Module):
         )
 
 
+class _StoriesAttn(nn.Module):
+    """stories15M-shaped attention block taking ``(h, cos, sin)``.
+
+    The k/v projections read the *normalised* stream — their shared
+    data operand is the ``rms_norm`` term, not the bare input var —
+    and the weights carry the llama2.c ``wk``/``wv`` names (the law
+    is invoked with ``tokens=("wk", "wv")``).  ``U`` builds both
+    projections through one shared latent basis.
+    """
+
+    def __init__(
+        self,
+        dim: int = 16,
+        U: torch.Tensor | None = None,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.rms_att = nn.Parameter(torch.ones(dim))
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        self.double()
+        if U is not None:
+            g = torch.Generator().manual_seed(seed)
+            dk = torch.randn(
+                dim, U.shape[0], generator=g, dtype=torch.float64
+            )
+            dv = torch.randn(
+                dim, U.shape[0], generator=g, dtype=torch.float64
+            )
+            with torch.no_grad():
+                self.wk.weight.copy_(dk @ U)
+                self.wv.weight.copy_(dv @ U)
+
+    def _rope(
+        self, t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        d2 = t.shape[-1] // 2
+        rot = torch.cat([-t[..., d2:], t[..., :d2]], dim=-1)
+        return t * cos + rot * sin
+
+    def forward(
+        self, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        xn = F.rms_norm(h, (h.shape[-1],), self.rms_att, 1e-5)
+        q = self._rope(self.wq(xn), cos, sin)
+        k = self._rope(self.wk(xn), cos, sin)
+        v = self.wv(xn)
+        o = F.scaled_dot_product_attention(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        ).squeeze(0)
+        return h + self.wo(o)
+
+
+class _StoriesTiny(nn.Module):
+    """One stories15M block behind shared rope-table buffers."""
+
+    def __init__(
+        self, dim: int = 16, U: torch.Tensor | None = None
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([_StoriesAttn(dim, U=U)])
+        fr = torch.randn(
+            8,
+            dim // 2,
+            generator=torch.Generator().manual_seed(21),
+            dtype=torch.float64,
+        )
+        self.register_buffer(
+            "cos", torch.cat([fr.cos(), fr.cos()], dim=-1)
+        )
+        self.register_buffer(
+            "sin", torch.cat([fr.sin(), fr.sin()], dim=-1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks[0](x, self.cos, self.sin)
+
+
 class _CacheRead(nn.Module):
     """``(x, kv_cache)``-style block — a read-only positional cache."""
 
@@ -1077,6 +1157,59 @@ def test_kv_latent_cross_multi_input():
     with torch.no_grad():
         diff = (m(x.clone()) - opt(x.clone())).abs().max().item()
     assert diff < 1e-10
+
+
+def test_kv_latent_stories_shape_intra_graft():
+    """The stories15M shape: wk/wv share the ``rms_norm`` data term.
+
+    The real-checkpoint sweep's block shape — multi-input
+    ``(h, cos, sin)``, ``wk``/``wv`` weight names, and a shared data
+    operand that is a norm *term*, not the bare input var.  With a
+    factorable k/v pair the latent grafts and verifies.
+    """
+    torch.manual_seed(0)
+    m = _StoriesTiny(U=_latent(4, 16)).eval().double()
+    x = _x()
+    opt, stats = _optimize(
+        m,
+        x,
+        laws=[K.KVLatentShare(tokens=("wk", "wv"))],
+        optimize_rest=False,
+    )
+    rep = _match(stats, "kv_latent_share")
+    assert rep["status"] == "grafted"
+    assert rep["boundary"] == "intra"
+    assert rep["factor_max_err"] < 1e-8
+    assert rep["rel_diff"] < 1e-10
+    assert stats["end_to_end"]["max_rel_diff"] < 1e-8
+    with torch.no_grad():
+        diff = (m(x.clone()) - opt(x.clone())).abs().max().item()
+    assert diff < 1e-10
+
+
+def test_kv_latent_stories_shape_fp32_declines_clean():
+    """fp32 full-rank weights decline with a reason, not a crash.
+
+    In fp32 the Gram-Schmidt sweep over-covers: rounding leaves
+    above-threshold residuals past the ambient dimension (stories15M
+    produced 570 "directions" in R^288), which used to crash
+    ``_stack_cols``'s one-hot indexing with a raw ``IndexError``.
+    The capped basis now reaches the certify gate, which declines
+    honestly — fp32 weights cannot certify at ``factor_tol=1e-8``.
+    """
+    torch.manual_seed(0)
+    m = _StoriesTiny().eval().float()
+    x = torch.randn(8, 16, generator=torch.Generator().manual_seed(0))
+    _, stats = _optimize(
+        m,
+        x,
+        laws=[K.KVLatentShare(tokens=("wk", "wv"))],
+        optimize_rest=False,
+    )
+    rep = _match(stats, "kv_latent_share")
+    assert rep["status"] == "declined"
+    assert rep["reason"] == "no certified common factor"
+    assert "error" not in rep
 
 
 def test_optimize_rest_multi_input():

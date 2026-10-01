@@ -430,7 +430,12 @@ def _gs_row_basis(mats: list[Any], tol: float) -> list[Any]:
     Modified Gram-Schmidt over the stacked rows, tolerance-gated: a
     row whose residual norm drops below ``tol * max_row_norm`` is
     already covered by the current basis — the result is the
-    certified common row space at that tolerance.
+    certified common row space at that tolerance.  The result is
+    capped at the ambient dimension: a subspace of ``R^d`` admits at
+    most ``d`` orthonormal directions, so any residual still above
+    threshold once ``d`` vectors are kept is floating-point noise —
+    and an over-complete "basis" would hand :func:`_stack_cols` a
+    rank larger than the input space its one-hot columns index.
     """
     scale = 0.0
     for m in mats:
@@ -438,15 +443,17 @@ def _gs_row_basis(mats: list[Any], tol: float) -> list[Any]:
             scale = max(scale, _fnorm(m[j]))
     thresh = tol * max(scale, 1e-12)
     basis: list[Any] = []
+    dim = 0
     for m in mats:
         for j in range(m.shape[0]):
             v = m[j]
+            dim = v.shape[-1]  # the ambient dimension
             for u in basis:
                 v = v - u * float((u * v).sum())
             n = _fnorm(v)
             if n > thresh:
                 basis.append(v / n)
-    return basis
+    return basis[:dim]
 
 
 def _stack_cols(basis: list[Any]) -> Any:
@@ -455,6 +462,9 @@ def _stack_cols(basis: list[Any]) -> Any:
     Built duck-typed: ``u[:, None] * e[None, :]`` accumulates an
     outer product per basis vector, where ``e`` is the j-th one-hot
     row — no ``cat``/``stack`` symbol, so no tensor library is named.
+    The one-hot ``e`` is carved out of a basis vector (length ``d``),
+    so this requires ``r <= d`` — guaranteed by the ambient-
+    dimension cap in :func:`_gs_row_basis`.
     """
     r = len(basis)
     u0 = basis[0]

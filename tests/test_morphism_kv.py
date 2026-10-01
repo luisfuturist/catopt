@@ -541,6 +541,19 @@ def test_gs_row_basis_and_stack_cols():
     # Full-rank input: the whole row space is recovered.
     full = torch.randn(6, 12, dtype=torch.float64)
     assert len(K._gs_row_basis([full], 1e-8)) == 6
+    # fp32 rounding leaves above-threshold residuals well past the
+    # ambient dimension — the basis caps at ``d`` so ``_stack_cols``
+    # never out-indexes its one-hot columns (the stories15M fp32
+    # weights hit this: 570 "directions" in R^288 → IndexError).
+    w32 = torch.randn(
+        24,
+        16,
+        generator=torch.Generator().manual_seed(0),
+        dtype=torch.float32,
+    )
+    b32 = K._gs_row_basis([w32], 1e-8)
+    assert len(b32) == 16
+    assert tuple(K._stack_cols(b32).shape) == (16, 16)
     # An all-zero matrix contributes nothing — empty basis.
     assert (
         K._gs_row_basis([torch.zeros(4, 8, dtype=torch.float64)], 1e-8)
