@@ -1430,7 +1430,14 @@ def _family_gate(
     leaves: dict,
     info: dict,
 ) -> dict[str, Any]:
-    """Cost-gate, shape-check, fp64-verify, emit the slot reps."""
+    """Cost-gate, shape-check, fp64-verify, emit the slot reps.
+
+    The graft record also carries ``_terms`` — the per-slot reified
+    bodies ``{name: (root, params, leaves)}`` the diagram-state search
+    (plan 0013 stage 3) writes back when composing moves: the fused
+    joint lands at the first slot and each consumed member becomes the
+    exact-zero filler its lowered rep computes.
+    """
     info["cost_before"] = dag_cost(joint, cost_fn)
     info["cost_after"] = dag_cost(best, cost_fn)
     if not info["cost_after"] < info["cost_before"]:
@@ -1466,13 +1473,25 @@ def _family_gate(
             best, x, params, leaves, sink, inputs
         )
     }
+    terms: dict[str, tuple[Any, dict, dict]] = {
+        match.nodes[0]: (best, params, leaves)
+    }
     if not intra:
         for r_, i_ in zip(recs[1:], irs[1:], strict=True):
             sig_j = graph.sig(r_.name)
             act_j = (
                 M._act_index(sig_j.inputs) if sig_j is not None else 0
             )
-            reps[r_.name] = _zero_slot(
-                sink, i_.inputs[act_j], tuple(i_.inputs)
+            var_j = i_.inputs[act_j]
+            reps[r_.name] = _zero_slot(sink, var_j, tuple(i_.inputs))
+            terms[r_.name] = (
+                Op.make("mul", var_j, Const(0)),
+                {},
+                {},
             )
-    return {"status": "grafted", "reps": reps, **info}
+    return {
+        "status": "grafted",
+        "reps": reps,
+        "_terms": terms,
+        **info,
+    }

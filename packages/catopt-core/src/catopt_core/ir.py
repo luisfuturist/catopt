@@ -28,6 +28,7 @@ __all__ = [
     "generator",
     "op_def",
     "op_repr",
+    "op_repr_dag",
 ]
 
 
@@ -209,6 +210,87 @@ def op_repr(term: Any) -> str:
             )
         return f"({term.op} {', '.join(parts)})"
     return repr(term)
+
+
+def op_repr_dag(term: Any) -> str:
+    """Compact S-expression rendering of a sharing-heavy term DAG.
+
+    ``op_repr`` renders a term as a *tree*: a multiply-referenced
+    subterm is expanded once per use site.  Terms are hash-consed
+    DAGs, and a sharing-heavy one (a morphism window joint, where
+    each residual-stream node feeds both the next ``add`` and the
+    whole next block body) tree-expands exponentially — the repr
+    itself exhausts memory before the string exists.  Here every op
+    referenced by more than one parent is emitted once as a ``#n``
+    binding in a ``let`` prelude and named at each use site, so the
+    output is linear in the number of *distinct* nodes.
+
+    Terms without sharing render exactly as ``op_repr``.
+    """
+    if not isinstance(term, Op):
+        return repr(term)
+    # Pass 1 — count parent references per distinct node (each
+    # parent arg slot is one reference; dedup the walk by node).
+    counts: dict[Op, int] = {}
+    counted: set[Op] = set()
+    todo: list[Any] = [term]
+    while todo:
+        t = todo.pop()
+        if not isinstance(t, Op) or t in counted:
+            continue
+        counted.add(t)
+        for a in t.args:
+            if isinstance(a, Op):
+                counts[a] = counts.get(a, 0) + 1
+                todo.append(a)
+    shared = {t for t, c in counts.items() if c > 1}
+    if not shared:
+        return op_repr(term)
+    # Pass 2 — iterative post-order: children render before parents,
+    # so every ``#n`` binding precedes all of its uses.
+    names: dict[Op, str] = {}
+    defs: list[str] = []
+    rendered: dict[Op, str] = {}
+    expanded: set[Op] = set()
+    work: list[tuple[Any, bool]] = [(term, False)]
+    while work:
+        t, done = work.pop()
+        if not isinstance(t, Op):
+            continue
+        if not done:
+            if t in expanded:
+                continue
+            expanded.add(t)
+            work.append((t, True))
+            work.extend(
+                (a, False)
+                for a in t.args
+                if isinstance(a, Op) and a not in expanded
+            )
+            continue
+        parts = [
+            (
+                names[a]  # shared children are already bound
+                if a in shared
+                else rendered[a]
+            )
+            if isinstance(a, Op)
+            else repr(a)
+            for a in t.args
+        ]
+        if t.attrs:
+            parts.append(
+                ", ".join(f"{k}={v}" for k, v in t.attrs.items())
+            )
+        s = f"({t.op} {', '.join(parts)})"
+        if t in shared:
+            names[t] = f"#{len(defs)}"
+            defs.append(s)
+        else:
+            rendered[t] = s
+    body = names[term] if term in shared else rendered[term]
+    bound = " ".join(f"(#{i} {d})" for i, d in enumerate(defs))
+    return f"(let ({bound}) {body})"
 
 
 # ---------------------------------------------------------------------------

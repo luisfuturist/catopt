@@ -19,12 +19,16 @@ opaque blocks are boundaries no window crosses.
 import catopt_orchestrator.morphisms as M
 import torch
 import torch.nn as nn
-from catopt_core.ir import IR, Op, Param, TensorType, Var
+from catopt_core.ir import op_repr, op_repr_dag
 from catopt_orchestrator import MorphismLaw, MorphismSearch, Optimizer
 from catopt_torch.adapters import TorchSink, TorchSource
 from catopt_torch.backend import TorchBackend
 from catopt_torch.composer import TorchComposer
-from catopt_torch.models import DeepParallel, ResidualMLP
+from catopt_torch.models import (
+    DeepParallel,
+    ParallelLinear,
+    ResidualMLP,
+)
 
 # ---------------------------------------------------------------------------
 #  Fixtures
@@ -165,6 +169,30 @@ class _MixedResidual(nn.Module):
                 _DataDependent(dim),
                 DeepParallel(dim, dim, dim),
             ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for b in self.blocks:
+            x = x + b(x)
+        return x
+
+
+class _FanoutStream(nn.Module):
+    """``x = x + b_i(x)`` over high-fanout blocks.
+
+    Each ``ParallelLinear`` block reads the stream ``n_experts``
+    times, so a depth-5 window joint references every stream node
+    ~9x per level: the ``op_repr`` *tree* expansion is ~10^3x the
+    node count — the same shape as the stories15M window whose
+    stats rendering OOMed ``_reify``.
+    """
+
+    def __init__(
+        self, dim: int = 16, depth: int = 5, n: int = 8
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            ParallelLinear(dim, n_experts=n) for _ in range(depth)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -530,6 +558,48 @@ def test_reify_window_direct_and_slot_fillers():
         # The unwrapped receiver slot is the identity passthrough.
         i = out["reps"]["blocks.2"](x)
         assert torch.equal(i, x)
+
+
+def test_reify_window_stats_render_dag_bounded():
+    """The ``joint``/``reified`` stats strings are the DAG-aware
+    rendering — on a sharing-heavy window joint the ``op_repr`` tree
+    expansion explodes (the bench-measured ``_reify`` MemoryError)."""
+    torch.manual_seed(0)
+    g = _lift(_FanoutStream().eval().double(), _x())
+    kinds = ("residual_wrapped",) * 4
+    match = M.MorphismMatch(
+        law="probe",
+        nodes=tuple(f"blocks.{i}" for i in range(5)),
+        boundary="+".join(kinds),
+        reify=M.ReifySpec(
+            mode="residual_wrapped",
+            rules="compose",
+            distribute=True,
+            kinds=kinds,
+        ),
+    )
+    resolved, why = M._window_joint(match, g)
+    assert why is None
+    joint = resolved[0]
+    # The fixture really is sharing-heavy: tree repr ~10^3x the DAG.
+    tree = op_repr(joint)
+    assert len(op_repr_dag(joint)) * 100 < len(tree)
+
+    out = M._reify(
+        match,
+        g,
+        sink=TorchSink(),
+        cost_fn=M.flops_cost,
+        verify_tol=1e-4,
+        max_iterations=8,
+        max_enodes=50_000,
+        symmetry_budget=512,
+    )
+    assert out["status"] in ("grafted", "declined")
+    # The stats path emits the bounded let-form, linear in nodes.
+    assert out["joint"] == op_repr_dag(joint)
+    assert out["joint"].startswith("(let ")
+    assert len(out["reified"]) < len(tree)
 
 
 def test_reify_window_malformed_and_opaque():

@@ -11,6 +11,7 @@ from catopt_core.ir import (
     generator,
     op_def,
     op_repr,
+    op_repr_dag,
 )
 
 
@@ -174,3 +175,87 @@ def test_unhashable_attr_values_keep_ops_distinct():
     a = Op.make("noop", "x", meta=[])
     b = Op.make("noop", "x", meta=[1])
     assert a != b
+
+
+# ---------------------------------------------------------------------------
+#  op_repr_dag — sharing-aware rendering (morphism joint stats)
+# ---------------------------------------------------------------------------
+
+
+def test_op_repr_dag_leaves_and_trees_match_op_repr():
+    """No sharing → identical output to ``op_repr`` (stats-safe)."""
+    x = Var("x", TensorType((1, 4)))
+    y = Var("y", TensorType((1, 4)))
+    terms = [
+        x,
+        Const(3),
+        Op.make("mul", x, Const(2)),
+        Op.make("add", Op.make("neg", x), Op.make("exp", y)),
+        Op.make("concat", x, y, dim=0),
+    ]
+    for t in terms:
+        assert op_repr_dag(t) == op_repr(t)
+
+
+def test_op_repr_dag_binds_shared_subterm_once():
+    """A twice-referenced op renders as one ``#n`` binding."""
+    x = Var("x", TensorType((1, 4)))
+    f = Op.make("neg", x)
+    t = Op.make("add", f, f)
+    assert op_repr(t) == "(add (neg x), (neg x))"
+    assert op_repr_dag(t) == "(let ((#0 (neg x))) (add #0, #0))"
+
+
+def test_op_repr_dag_defs_precede_uses_in_postorder():
+    """Bindings are post-ordered: a shared def may cite earlier #n."""
+    x = Var("x", TensorType((1, 4)))
+    f = Op.make("neg", x)  # shared
+    g = Op.make("add", f, f)  # shared, references f
+    t = Op.make("mul", g, g)
+    s = op_repr_dag(t)
+    assert s == "(let ((#0 (neg x)) (#1 (add #0, #0))) (mul #1, #1))"
+
+
+def test_op_repr_dag_diamond_renders_shared_once():
+    x = Var("x", TensorType((1, 4)))
+    f = Op.make("neg", x)
+    t = Op.make("add", Op.make("exp", f), Op.make("sqrt", f))
+    s = op_repr_dag(t)
+    assert s.count("(neg x)") == 1
+    assert s.count("#0") == 3  # one binding + two use sites
+
+
+def test_op_repr_dag_shared_node_keeps_attrs():
+    x = Var("x", TensorType((1, 4)))
+    f = Op.make("sum", x, axis=-1)
+    t = Op.make("add", f, f)
+    s = op_repr_dag(t)
+    assert "(#0 (sum x, axis=-1))" in s
+
+
+def test_op_repr_dag_exponential_dag_stays_linear():
+    """``t_{i+1} = add(t_i, t_i)`` — a tree repr is 2**n leaves.
+
+    The DAG repr binds each level once, so depth-64 (unrenderable as
+    a tree) stays a few-KB string and returns immediately.
+    """
+    x = Var("x", TensorType((1, 4)))
+    t: Op | Var = x
+    depth = 64
+    for _ in range(depth):
+        t = Op.make("add", t, t)
+    s = op_repr_dag(t)
+    assert s.startswith("(let ")
+    assert len(s) < 8_000
+    # every level bound exactly once, named exactly twice downstream
+    assert s.count("(add ") == depth
+
+
+def test_op_repr_dag_shared_leaf_stays_inline():
+    """Only ``Op`` nodes get bindings — Var/Param/Const leaves do not."""
+    x = Var("x", TensorType((1, 4)))
+    p = Param("W", TensorType((4, 4)))
+    t = Op.make("add", Op.make("matmul", x, p), Op.make("matmul", x, p))
+    s = op_repr_dag(t)
+    assert "(#0 (matmul x, W))" in s
+    assert s == "(let ((#0 (matmul x, W))) (add #0, #0))"

@@ -49,7 +49,7 @@ from typing import Any, Protocol, runtime_checkable
 from catopt_core import laws
 from catopt_core.cost import dag_cost, flops_cost
 from catopt_core.egraph import EGraph
-from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
+from catopt_core.ir import IR, Const, Op, Param, Var, op_repr_dag
 from catopt_core.laws import tags as _law_tags
 from catopt_core.laws.pairing import (
     _exact_equal,
@@ -2599,6 +2599,64 @@ def _window_reps(
     return reps
 
 
+def _res_stats(res: dict[str, Any]) -> dict[str, Any]:
+    """Public fields of a reify result — minus ``reps``/``_terms``.
+
+    The graft record's private ``_``-prefixed payload (the per-slot
+    reified bodies the diagram-state search writes back) is machinery,
+    not stats.
+    """
+    return {
+        k: v
+        for k, v in res.items()
+        if k != "reps" and not k.startswith("_")
+    }
+
+
+def _reify_terms(
+    match: MorphismMatch,
+    spec: ReifySpec,
+    best: Any,
+    var: Var,
+    graph: MorphismGraph,
+    params: dict,
+    leaves: dict,
+) -> dict[str, tuple]:
+    """Per-slot reified bodies for a grafted match.
+
+    Parallel to the ``reps`` construction: the first slot carries the
+    reified term (``best``, or ``best - x`` when a residual wrap puts
+    the first block's output in an additive slot); each consumed
+    member carries the filler its rep computes — the exact-zero
+    ``mul(var, 0)`` under a wrapped wire, the identity ``var`` under a
+    plain one.  The diagram-state search (plan 0013 stage 3) writes
+    these back as the members' current bodies when composing moves.
+    """
+    if spec.mode == "intra":
+        return {match.nodes[0]: (best, params, leaves)}
+    a_term = (
+        Op.make("sub", best, var)
+        if spec.mode.startswith("residual")
+        else best
+    )
+    terms: dict[str, tuple] = {match.nodes[0]: (a_term, params, leaves)}
+    for j, name in enumerate(match.nodes[1:], start=1):
+        ir_j = graph.record(name).ir
+        var_j = (
+            ir_j.inputs[_rec_act(graph, name)]
+            if ir_j is not None
+            else var
+        )
+        kind = spec.kinds[j - 1] if spec.kinds else spec.mode
+        fill = (
+            Op.make("mul", var_j, Const(0))
+            if kind.endswith("_wrapped")
+            else var_j
+        )
+        terms[name] = (fill, {}, {})
+    return terms
+
+
 def _reify(
     match: MorphismMatch,
     graph: MorphismGraph,
@@ -2677,8 +2735,12 @@ def _reify(
     info: dict[str, Any] = {
         "cost_before": base_cost,
         "cost_after": best_cost,
-        "joint": op_repr(term),
-        "reified": op_repr(best),
+        # DAG-aware reprs: a window joint shares its stream nodes
+        # across every later block body, and ``best`` can share
+        # extracted subterms — ``op_repr``'s tree expansion explodes
+        # exponentially on exactly the stats strings.
+        "joint": op_repr_dag(term),
+        "reified": op_repr_dag(best),
     }
     if not best_cost < base_cost:
         return {
@@ -2734,7 +2796,13 @@ def _reify(
             ),
             b_name: _slot_filler(sink, var_b, spec.mode, ins_b),
         }
-    return {"status": "grafted", "reps": reps, **info}
+    terms = _reify_terms(match, spec, best, var, graph, params, leaves)
+    return {
+        "status": "grafted",
+        "reps": reps,
+        "_terms": terms,
+        **info,
+    }
 
 
 def _reify_tie(
@@ -2781,6 +2849,7 @@ def _reify_tie(
         return {"status": "declined", "reason": "no_tied_values"}
     reps: dict[str, Any] = {}
     rels: dict[str, float] = {}
+    terms: dict[str, tuple] = {}
     for r in recs:
         extracted = eg.extract_best(eids[r.name], cost_fn)
         # The merged param may be the *other* block's name — lower with
@@ -2802,9 +2871,11 @@ def _reify_tie(
                 f"{vr.max_rel:.3e}",
             }
         reps[r.name] = opt
+        terms[r.name] = (extracted, params, leaves)
     return {
         "status": "grafted",
         "reps": reps,
+        "_terms": terms,
         "tied": groups,
         "rel_diff": max(rels.values()),
     }
@@ -3064,7 +3135,7 @@ def _optimize_morphisms(
         match_stats[key] = {
             "boundary": m.boundary,
             "detail": m.detail,
-            **{k: v for k, v in res.items() if k != "reps"},
+            **_res_stats(res),
         }
         if res["status"] == "grafted":
             replacements.update(res["reps"])
