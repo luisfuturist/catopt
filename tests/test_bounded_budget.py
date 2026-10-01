@@ -617,9 +617,9 @@ def test_search_budget_no_bounded_offers():
 
 
 def test_lower_verify_honored_bound():
-    """Delivered error within the accepted bound: verify widens its
-    tolerance, the bound gate holds, and each ledger entry gets the
-    measured value."""
+    """Delivered error within the propagated output bound: the bound
+    gate holds, and each ledger entry gets the measured value plus
+    its propagated ``output_bound``."""
     torch.manual_seed(13)
     model = _NearDead(scale=5.0, eps=8e-4).eval()
     xv = torch.randn(8, 32, dtype=torch.float64)
@@ -636,12 +636,25 @@ def test_lower_verify_honored_bound():
     assert low.stats["error_bounds_honored"] is True
     e = low.stats["error_bounds"][0]
     assert e["measured_max_rel"] == pytest.approx(low.verified.max_rel)
-    assert e["measured_max_rel"] <= res.stats["error_bound_total"]
+    # The weight-space bound propagated through the measured site
+    # input norm — both units ride the ledger.
+    assert e["site_input"] == "site"
+    assert e["site_input_norm"] == pytest.approx(
+        xv.abs().sum(-1).max().item()
+    )
+    assert e["output_bound"] == pytest.approx(
+        8e-4 * e["site_input_norm"]
+    )
+    assert low.verified.max_abs <= e["output_bound"]
+    assert low.stats["error_bound_output"] == pytest.approx(
+        e["output_bound"]
+    )
 
 
-def test_lower_verify_over_bound_declines():
-    """A delivery whose measured ``max_rel`` exceeds the claimed
-    bound declines — even when the (widened) tolerance would pass."""
+def test_lower_verify_measured_rel_above_weight_bound_honored():
+    """The unit fix: a measured ``max_rel`` ABOVE the weight-space
+    bound but inside the propagated output bound now delivers —
+    the old gate declined it on mismatched units."""
     torch.manual_seed(14)
     model = _NearDead(scale=1.0, eps=8e-4).eval()
     xv = torch.randn(8, 32, dtype=torch.float64)
@@ -654,11 +667,183 @@ def test_lower_verify_over_bound_declines():
         cost_fn=flops_cost,
     )
     bound = res.stats["error_bound_total"]
-    low = opt.lower(res, xv, rtol=1e-2)  # wide enough to pass loosely
-    assert low.verified.max_rel > bound  # measured exceeds the claim
-    assert low.verified.passed is False  # …so the bound gate declines
-    assert low.stats["error_bounds_honored"] is False
-    assert low.stats["error_bounds"][0]["measured_max_rel"] > bound
+    low = opt.lower(res, xv, rtol=1e-4)
+    # Measured exceeds the weight-space claim (input-norm amplified)…
+    assert low.verified.max_rel > bound
+    # …but stays within the propagated output bound — honored, so
+    # the delivery passes even though the bare rtol was tighter.
+    e = low.stats["error_bounds"][0]
+    assert low.verified.max_abs <= e["output_bound"]
+    assert low.verified.passed
+    assert low.stats["error_bounds_honored"] is True
+
+
+def test_lower_verify_over_bound_declines():
+    """A delivery whose measured error exceeds the *propagated*
+    bound declines — the gate fails closed on bound violation."""
+    stats = {
+        "error_bounds": [
+            {
+                "rule": "weight_special#0",
+                "bound": 1e-3,
+                "norm": "max_abs",
+                "output_bound": 1e-3,
+            }
+        ]
+    }
+
+    class R:
+        max_abs = 2e-3  # measured output error exceeds the bound
+        max_rel = 2e-3
+        passed = True
+
+    out = opt_mod._bound_verify(stats, R(), 1e-3, 1e-3)
+    assert out.passed is False
+    assert stats["error_bounds_honored"] is False
+    assert stats["error_bounds"][0]["measured_max_rel"] == 2e-3
+
+
+def test_lower_verify_unpropagatable_bound_declines():
+    """A bound whose norm has no propagation rule — or whose site
+    input cannot be measured — fails closed: ``output_bound`` stays
+    ``None`` and the gate declines."""
+    stats = {
+        "error_bounds": [
+            {"rule": "r#1", "bound": 1e-3, "norm": "chebyshev"},
+            {
+                "rule": "r#2",
+                "bound": 1e-3,
+                "norm": "max_abs",
+            },
+        ]
+    }
+    # Unknown norm -> no exponent -> unpropagatable; and a max_abs
+    # entry on a non-tensor input has nothing to amplify by.
+    out = opt_mod._propagate_bounds(stats, None, None, {}, None, (3.0,))
+    assert out is None
+    assert stats["error_bound_output"] is None
+    e0, e1 = stats["error_bounds"]
+    assert e0["output_bound"] is None and e0["site_input"] == "none"
+    assert e1["output_bound"] is None and e1["site_input"] == "none"
+
+    class R:
+        max_abs = 1e-6
+        max_rel = 1e-6
+        passed = True
+
+    out2 = opt_mod._bound_verify(stats, R(), 1e-3, out)
+    assert out2.passed is False
+    assert stats["error_bounds_honored"] is False
+
+
+def test_propagate_bounds_block_input_fallback():
+    """A bound rule whose witness LHS is not a projection site —
+    or whose site subterm cannot be lowered — falls back to the
+    module input's row norm, honestly recorded."""
+    eg, _eid, _src, _t = _bounded_site()
+    name, rule = next(
+        (n, r) for n, r in opt_mod._bound_rules(eg).items()
+    )
+    xv = torch.randn(8, 32, dtype=torch.float64)
+
+    # (a) Non-projection LHS — no isolable site input.
+    from catopt_core.egraph.types import Rewrite
+
+    eg._rule_objs["fake#0"] = Rewrite(
+        name="fake#0",
+        lhs=Var("x", TensorType((8, 32))),
+        rhs=rule.rhs,
+        error_bound=1e-3,
+        bound_norm="max_abs",
+    )
+    stats = {
+        "error_bounds": [
+            {"rule": "fake#0", "bound": 1e-3, "norm": "max_abs"}
+        ]
+    }
+    out = opt_mod._propagate_bounds(
+        stats, eg, None, {}, sink=None, args=(xv,)
+    )
+    amp = xv.abs().sum(-1).max().item()
+    assert out == pytest.approx(1e-3 * amp)
+    assert stats["error_bounds"][0]["site_input"] == "block_input"
+    assert stats["error_bounds"][0]["output_bound"] == pytest.approx(
+        1e-3 * amp
+    )
+
+    # (b) Site resolution works but the site subterm fails to lower —
+    # the eval failure still falls back to the input norm.
+    xv2 = _src.args[0]
+    ir = IR(root=_src, inputs=[xv2], input_names={xv2.name}, params={})
+    sink = mock.Mock()
+    sink.lower.side_effect = RuntimeError("no lowering")
+    stats2 = {
+        "error_bounds": [
+            {"rule": name, "bound": 8e-4, "norm": "max_abs"}
+        ]
+    }
+    out2 = opt_mod._propagate_bounds(
+        stats2, eg, ir, {}, sink, (xv,)
+    )
+    assert out2 == pytest.approx(8e-4 * amp)
+    assert stats2["error_bounds"][0]["site_input"] == "block_input"
+
+    # (c) The site subterm evaluates but to a non-tensor — the row
+    # norm cannot measure it, and the fallback still prices the
+    # entry.
+    mod = mock.Mock()
+    mod.forward.return_value = 3.0  # not tensor-like
+    sink2 = mock.Mock()
+    sink2.lower.return_value = mod
+    stats3 = {
+        "error_bounds": [
+            {"rule": name, "bound": 8e-4, "norm": "max_abs"}
+        ]
+    }
+    out3 = opt_mod._propagate_bounds(
+        stats3, eg, ir, {}, sink2, (xv,)
+    )
+    assert out3 == pytest.approx(8e-4 * amp)
+    assert stats3["error_bounds"][0]["site_input"] == "block_input"
+
+
+def test_bound_helper_units():
+    """``_row_norm`` / ``_rel_bound`` / ``_propagate_bounds`` edge
+    cases — non-tensor inputs, empty ledgers, degenerate reports."""
+    xv = torch.randn(4, 8, dtype=torch.float64)
+    p1 = opt_mod._row_norm(xv, 1.0)
+    p2 = opt_mod._row_norm(xv, 2.0)
+    assert p1 == pytest.approx(xv.abs().sum(-1).max().item())
+    assert p2 == pytest.approx(
+        (xv.abs() ** 2).sum(-1).sqrt().max().item()
+    )
+    assert p2 <= p1  # L2 ≤ L1 always
+    assert opt_mod._row_norm(3.5, 1.0) is None  # no .abs
+
+    class _WeirdT:
+        """Tensor-ish: ``abs`` works but ``sum`` explodes."""
+
+        def abs(self):
+            return self
+
+        def sum(self, *a):
+            raise RuntimeError("nope")
+
+    assert opt_mod._row_norm(_WeirdT(), 1.0) is None
+
+    # An empty ledger propagates to a zero output bound.
+    assert opt_mod._propagate_bounds({}, None, None, {}, None, ()) == 0.0
+
+    class R:
+        def __init__(self, max_abs, max_rel):
+            self.max_abs = max_abs
+            self.max_rel = max_rel
+
+    import math
+
+    assert math.isnan(opt_mod._rel_bound(None, R(1.0, 1.0)))
+    assert opt_mod._rel_bound(2.0, R(0.0, 0.0)) == float("inf")
+    assert opt_mod._rel_bound(2.0, R(0.5, 0.25)) == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -730,18 +915,22 @@ def test_bounded_term_reextracts_and_raises():
 
 
 def test_bounded_gate_matrix():
-    """``_bounded_gate`` = sink pass AND measured within bound."""
+    """``_bounded_gate`` = sink pass AND measured ``max|Δy|`` within
+    the propagated OUTPUT bound (absolute units — the bound is in
+    output space, not the certificate's weight space)."""
 
     class R:
-        def __init__(self, passed, max_rel):
+        def __init__(self, passed, max_abs):
             self.passed = passed
-            self.max_rel = max_rel
+            self.max_abs = max_abs
 
     assert _bounded_gate(R(True, 0.5), 0.0)
     assert not _bounded_gate(R(False, 0.0), 0.0)
     assert _bounded_gate(R(True, 0.5), 1.0)
     assert not _bounded_gate(R(True, 1.5), 1.0)
     assert not _bounded_gate(R(False, 0.5), 1.0)
+    # An unpropagatable bound (None) fails closed.
+    assert not _bounded_gate(R(True, 0.5), None)
 
 
 # ---------------------------------------------------------------------------
@@ -782,34 +971,41 @@ def test_export_manifest_carries_bound_fields(tmp_path):
     assert "error_bound_total" not in m3
 
 
+class _BoundBlock(nn.Module):
+    """One near-dead Linear — the bounded-offer block fixture."""
+
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(32, 32, bias=False).double()
+        with torch.no_grad():
+            self.lin.weight.mul_(5.0)
+            self.lin.weight[8:24] = 0.0
+            idx = torch.arange(8, 24)
+            self.lin.weight[idx, idx % 32] = 8e-4
+
+    def forward(self, t):
+        return self.lin(t)
+
+
+class _BoundStack(nn.Module):
+    """Two ``_BoundBlock`` stages — a composable stack fixture."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(*[_BoundBlock() for _ in range(2)])
+
+    def forward(self, t):
+        return self.net(t)
+
+
 def test_compositional_budget_forwards():
     """The compositional driver forwards ``error_budget`` /
-    ``detect_specials`` to each per-block search — a bounded block
-    widens its verify tolerance and honors the bound."""
+    ``detect_specials`` / ``detect_factors`` to each per-block
+    search — a bounded block's verify gates on the propagated
+    OUTPUT bound, and the ledger records it."""
     torch.manual_seed(15)
 
-    class Block(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lin = nn.Linear(32, 32, bias=False).double()
-            with torch.no_grad():
-                self.lin.weight.mul_(5.0)
-                self.lin.weight[8:24] = 0.0
-                idx = torch.arange(8, 24)
-                self.lin.weight[idx, idx % 32] = 8e-4
-
-        def forward(self, t):
-            return self.lin(t)
-
-    class Stack(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = nn.Sequential(*[Block() for _ in range(2)])
-
-        def forward(self, t):
-            return self.net(t)
-
-    model = Stack().eval()
+    model = _BoundStack().eval()
     x = torch.randn(8, 32, dtype=torch.float64)
     opt, stats = Optimizer(backend=TorchBackend()).optimize(
         model,
@@ -817,6 +1013,10 @@ def test_compositional_budget_forwards():
         strategy=Compositional(),
         error_budget=1e-3,
         detect_specials=True,
+        detect_factors=True,
+        # flop pricing selects the bounded member — the executor-aware
+        # default can honestly decline it (extra gather launches).
+        cost_fn=flops_cost,
         verbose=False,
     )
     assert stats["n_optimized"] == 2
@@ -824,4 +1024,91 @@ def test_compositional_budget_forwards():
         assert rep["status"] == "optimized"
         assert rep["stats"]["error_budget"] == 1e-3
         assert rep["stats"]["error_bound_total"] <= 1e-3
+        # The driver verifies against the propagated output bound and
+        # records the verdict on the block's ledger.
+        assert rep["stats"]["error_bounds_honored"] is True
+        e = rep["stats"]["error_bounds"][0]
+        assert e["output_bound"] == pytest.approx(
+            e["bound"] * e["site_input_norm"]
+        )
+        assert e["output_bound"] > e["bound"]
     _ = opt
+
+
+# ---------------------------------------------------------------------------
+#  Morphism lane — error_budget / detect_* forwarding (gap 2)
+# ---------------------------------------------------------------------------
+
+
+def test_morphism_search_forwards_budget_kwargs():
+    """``optimize(strategy=MorphismSearch, error_budget=,
+    detect_specials=, detect_factors=)`` reaches
+    ``_optimize_morphisms`` — forwarded to each per-block fallback
+    search, which bound-gates on the propagated output bound."""
+    from catopt_orchestrator.morphisms import MorphismSearch
+
+    torch.manual_seed(16)
+    model = _BoundStack().eval()
+    x = torch.randn(8, 32, dtype=torch.float64)
+    _mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        model,
+        x,
+        strategy=MorphismSearch(laws=[], optimize_rest=True),
+        error_budget=1e-3,
+        detect_specials=True,
+        detect_factors=True,
+        # flop pricing reaches the per-block fallback when supplied —
+        # it is what selects the bounded member over the dense form.
+        cost_fn=flops_cost,
+        verbose=False,
+    )
+    assert stats["n_blocks"] == 2
+    for rep in stats["blocks"].values():
+        assert rep["status"] == "optimized"
+        assert rep["stats"]["error_budget"] == 1e-3
+        assert 0.0 < rep["stats"]["error_bound_total"] <= 1e-3
+        assert rep["stats"]["error_bounds_honored"] is True
+
+
+def test_morphism_search_accepts_budget_without_blocks():
+    """The kwarg is accepted even when nothing needs the fallback."""
+    from catopt_orchestrator.morphisms import MorphismSearch
+
+    torch.manual_seed(17)
+    model = _BoundStack().eval()
+    x = torch.randn(8, 32, dtype=torch.float64)
+    _mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        model,
+        x,
+        strategy=MorphismSearch(laws=[], optimize_rest=False),
+        error_budget=1e-3,
+        detect_specials=True,
+    )
+    assert stats["blocks"] == {}
+
+
+def test_arm_law_budgets():
+    """``error_budget`` arms budget-aware laws left at ``None`` —
+    on a copy, never mutating the caller's law — and leaves
+    explicitly-budgeted and budget-free laws alone."""
+    from catopt_orchestrator.morphisms import (
+        WeightTie,
+        _arm_law_budgets,
+    )
+    from catopt_orchestrator.morphisms_kv import KVLatentShare
+
+    kv = KVLatentShare()
+    (armed,) = _arm_law_budgets([kv], 1e-3)
+    assert armed is not kv and armed.budget == 1e-3
+    assert kv.budget is None  # the caller's object is untouched
+
+    kv2 = KVLatentShare(budget=5e-4)
+    (out,) = _arm_law_budgets([kv2], 1e-3)
+    assert out is kv2 and out.budget == 5e-4  # explicit budget wins
+
+    tie = WeightTie()  # no budget attribute at all
+    (out2,) = _arm_law_budgets([tie], 1e-3)
+    assert out2 is tie and not hasattr(tie, "budget")
+
+    # ``None`` budget: laws pass through untouched.
+    assert _arm_law_budgets([kv], None) == (kv,)

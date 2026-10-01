@@ -24,11 +24,12 @@ Per budget cell (``--budgets``, default
   next-token KL(ref‖opt), top-1 and top-5 agreement.
 
 The morphism lane is probed too — ``KVLatentShare(budget=)`` via
-``MorphismSearch`` — and the plumbing gap is documented honestly:
-``_optimize_morphisms`` accepts no ``error_budget``/
-``detect_specials`` kwargs (they raise TypeError through
-``optimize``), and stories15M's ``Block(h, cos, sin)`` signature
-fails the law's single-input candidacy regardless.
+``MorphismSearch`` — and the forwarding is exercised end to end:
+``optimize(..., error_budget=)`` reaches ``_optimize_morphisms``,
+arms budget-less morphism laws, and gates per-block bounded
+deliveries at the propagated output bound.  Stories15M's
+``Block(h, cos, sin)`` signature still fails the law's single-input
+candidacy regardless.
 
 Usage:
     .venv/bin/python bench/bounded_e2e.py --device cpu
@@ -220,6 +221,8 @@ def _bounded_ledger(stats: dict) -> dict:
                         "rule",
                         "bound",
                         "norm",
+                        "output_bound",
+                        "site_input_norm",
                         "measured_max_rel",
                     )
                 }
@@ -291,8 +294,9 @@ def run_budget_cell(
         # search stats recorded (the driver drops ``rep["stats"]`` on
         # failure) — its delivered bounded members are invisible to
         # the offer/delivery counters above.  Recover the verdict
-        # evidence from the driver's error string, which always
-        # reports ``(accepted bound …)``.
+        # evidence from the driver's error string, which reports the
+        # *propagated* output bound as ``(accepted bound …)`` — the
+        # same output-space units as the measured rel diff.
         declines = []
         for bn, b in rec["per_block"].items():
             err = b.get("error") or ""
@@ -388,28 +392,35 @@ def run_budget_cell(
 
 def probe_morphism(model, idx, budget: float) -> dict:
     """Exercise ``MorphismSearch`` + ``KVLatentShare(budget=)`` on the
-    real model; also record the search-level plumbing gap.
+    real model; also record the ``error_budget`` kwarg plumbing.
 
     ``optimize(..., error_budget=)`` forwards through ``**kw`` — under
-    ``MorphismSearch`` it lands on ``_optimize_morphisms``, whose
-    signature has no ``error_budget``/``detect_specials`` parameter,
-    so the call raises ``TypeError``.  The law-level budget
-    (``KVLatentShare(budget=)``) DOES reach the law through
+    ``MorphismSearch`` it lands on ``_optimize_morphisms``, which arms
+    budget-aware laws left at ``budget=None`` and forwards the budget
+    to the per-block fallback searches.  The law-level budget
+    (``KVLatentShare(budget=)``) also reaches the law through
     ``laws=[...]``; the stories15M blocks are still ineligible —
     ``Block.forward(h, cos, sin)`` exports with 3 inputs, failing the
     single-input candidacy, and a sequential chain has no shared-input
     cross-block family.
     """
     rec: dict = {}
-    # 1) The plumbing gap — error_budget does not reach the strategy.
+    # 1) The plumbing — error_budget reaches the strategy and arms a
+    #    budget-less KVLatentShare (the armed copy, not the caller's
+    #    law, carries it).
     try:
+        law = K.KVLatentShare(tokens=("wk", "wv"))
         Optimizer(backend=TorchBackend()).optimize(
             model,
             idx,
-            strategy=MorphismSearch(laws=[], optimize_rest=False),
+            strategy=MorphismSearch(
+                laws=[law], optimize_rest=False
+            ),
             error_budget=budget,
+            detect_specials=True,
         )
         rec["error_budget_kw"] = "accepted"
+        rec["law_budget_armed"] = law.budget is None  # copy armed
     except TypeError as e:
         rec["error_budget_kw"] = f"TypeError: {e}"
     except Exception as e:
@@ -593,7 +604,7 @@ def run_bench(args) -> Report:
             verdict = (
                 f"bounded member delivered on {d['block']} but "
                 f"DECLINED by the bound gate: measured rel "
-                f"{d['measured_rel']:.2e} > certified bound "
+                f"{d['measured_rel']:.2e} > propagated output bound "
                 f"{d['accepted_bound']:.2e} — budget bought nothing, "
                 "cost pipeline time"
             )

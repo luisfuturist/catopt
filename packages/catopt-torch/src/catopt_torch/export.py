@@ -263,6 +263,7 @@ def _notes(fmt: str, has_catopt: bool) -> list[str]:
 _BOUND_KEYS = (
     "error_budget",
     "error_bound_total",
+    "error_bound_output",
     "error_bounds",
     "error_bounds_honored",
 )

@@ -635,40 +635,303 @@ def _error_bound_entries(cert: Any) -> list[dict]:
     ]
 
 
-def _bounded_gate(report: Any, bound: float) -> bool:
-    """Return the verify predicate under an accepted error bound.
+# ---------------------------------------------------------------------------
+#  Bound propagation — bridging the weight-space / output-space units
+# ---------------------------------------------------------------------------
+#
+# The ledger's ``bound`` is certified in *weight* space (``max_abs`` =
+# ``max|ΔW|`` for the specials' bounded members, ``frobenius`` for the
+# low-rank residual).  The verify report measures *output* space —
+# ``max|Δy|`` — and a site ``y = x·W`` amplifies the weight bound by
+# the input's contraction norm.  Comparing the two directly is a unit
+# bug (the bounded_e2e sweep measured ~2-8x output amplification on a
+# real head, declining every delivery).  ``_propagate_bounds`` bridges
+# the units honestly: per output element
+# ``|Δy_j| = |Σ_k x_k·ΔW_jk| ≤ bound · max_i‖x_i‖_p``, so each entry's
+# output bound is ``bound · amp`` with ``amp`` the *site* input's max
+# row norm — evaluated, not guessed (the witness LHS is the original
+# site expression; its data subterm is lowered through the sink and
+# run on the verify input).
 
-    ``report.passed`` is the sink's tolerance gate; the honest bound
-    gate additionally requires the measured relative error to stay
-    within the certified bound — a delivery whose measured error
-    exceeds its claimed bound declines even when the looser
-    tolerance passed.
+
+def _bound_p(bound_norm: str) -> float | None:
+    """Row-norm exponent a bound norm propagates through, or ``None``.
+
+    A per-element (``max_abs``) bound gives ``|Δy_j| ≤
+    Σ_k|x_k|·max|ΔW|`` — the row-L1 factor.  Frobenius and spectral
+    bounds give ``|Δy_j| ≤ ‖x_row‖_2·‖ΔW‖`` — the row-L2 factor.  Any
+    other norm has no stated propagation rule here: ``None`` makes the
+    gate fail closed rather than guess a bridge.
     """
-    return bool(report.passed) and (
-        bound == 0.0 or report.max_rel <= bound
+    return {"max_abs": 1.0, "frobenius": 2.0, "spectral": 2.0}.get(
+        bound_norm
     )
 
 
+def _site_data_term(rule: Any) -> Any | None:
+    """Return the data-side subterm of a bound witness's LHS.
+
+    Bounded offers witness ``site -> offered`` where ``site`` is the
+    original ``linear``/``matmul`` expression — its first argument is
+    the site input.  A non-projection LHS (e.g. a morphism-level joint
+    term) carries no isolable site.
+    """
+    lhs = getattr(rule, "lhs", None)
+    if (
+        isinstance(lhs, Op)
+        and lhs.op in ("linear", "matmul")
+        and lhs.args
+    ):
+        return lhs.args[0]
+    return None
+
+
+def _site_eval(
+    sink: Sink, ir: IR, params: dict, term: Any, args: tuple
+) -> Any:
+    """Evaluate one subterm: lower it through the sink, run on ``args``.
+
+    The subterm's ``Var`` leaves bind positionally to the module's own
+    inputs, so running it on the verify input yields the real site
+    activation — the operand the bounded weight actually contracts.
+    """
+    sub = IR(
+        root=term,
+        inputs=list(ir.inputs),
+        input_names=set(ir.input_names),
+        params=dict(ir.params),
+    )
+    mod = sink.lower(sub, params)
+    return mod.forward(*args)
+
+
+def _row_norm(t: Any, p: float) -> float | None:
+    """``max_i ‖t_i‖_p`` over the last axis — the contraction factor.
+
+    Duck-typed tensor ops (``abs`` / ``sum`` / ``max``), the same
+    convention as the pairing/factored passes — the orchestrator names
+    no tensor library.  ``None`` when the value cannot supply them.
+    """
+    abs_ = getattr(t, "abs", None)
+    if not callable(abs_):
+        return None
+    try:
+        a = abs_()
+        v = a.sum(-1) if p == 1.0 else (a * a).sum(-1) ** 0.5
+        return float(v.max())
+    except Exception:
+        return None
+
+
+def _entry_amp(
+    rule: Any,
+    p: float,
+    sink: Sink,
+    ir: IR,
+    params: dict,
+    args: tuple,
+) -> tuple[float | None, str]:
+    """One ledger entry's site-input amplification, with provenance.
+
+    Primary: evaluate the bound rule's witness-LHS data subterm on the
+    verify args — the real site input — and take its row norm.
+    Fallback: the module input's own row norm when the site input
+    cannot be isolated or evaluated (``"block_input"`` — exact for a
+    block that IS its projection site, a documented estimate deeper
+    inside one).  ``(None, "none")`` when neither measures.
+    """
+    site = _site_data_term(rule) if rule is not None else None
+    if site is not None:
+        with contextlib.suppress(Exception):
+            amp = _row_norm(_site_eval(sink, ir, params, site, args), p)
+            if amp is not None:
+                return amp, "site"
+    amps = [n for n in (_row_norm(a, p) for a in args) if n is not None]
+    return (max(amps), "block_input") if amps else (None, "none")
+
+
+def _propagate_bounds(
+    stats: dict[str, Any],
+    eg: Any,
+    ir: IR,
+    params: dict,
+    sink: Sink,
+    args: tuple,
+) -> float | None:
+    """Propagate the ledger's weight-space bounds into output units.
+
+    Each ``stats["error_bounds"]`` entry certifies ``‖ΔW‖ ≤ bound``
+    in its ``norm``; at a site ``y = x_s·W`` the delivered output
+    moves by at most ``bound · max_i‖(x_s)_i‖_p`` (``p`` from
+    :func:`_bound_p`) — so the total is in the same ``max|Δy|`` units
+    the verify report measures, not the weight-space units of the
+    certificate.  ``_entry_amp`` prices each entry's site input;
+    every entry records ``site_input_norm`` / ``site_input``
+    (``"site"`` / ``"block_input"`` / ``"none"``) and the propagated
+    ``output_bound`` — the ledger stays honest about which input
+    priced it.
+
+    Returns the summed output bound (absolute ``max|Δy|`` units),
+    stored in ``stats["error_bound_output"]``, or ``None`` when some
+    entry's norm has no propagation rule or no input norm could be
+    measured — the gate then fails closed.
+    """
+    entries = stats.get("error_bounds")
+    if not entries:
+        return 0.0
+    rules = _bound_rules(eg) if isinstance(eg, EGraph) else {}
+    out: list[dict] = []
+    total = 0.0
+    unpropagated = False
+    for e in entries:
+        e2 = dict(e)
+        amp, src = (
+            _entry_amp(rules.get(e["rule"]), p, sink, ir, params, args)
+            if (p := _bound_p(str(e.get("norm") or ""))) is not None
+            else (None, "none")
+        )
+        e2["site_input_norm"] = amp
+        e2["site_input"] = src
+        e2["output_bound"] = (
+            float(e["bound"]) * amp if amp is not None else None
+        )
+        if e2["output_bound"] is None:
+            unpropagated = True
+        else:
+            total += e2["output_bound"]
+        out.append(e2)
+    stats["error_bounds"] = out
+    stats["error_bound_output"] = None if unpropagated else total
+    return stats["error_bound_output"]
+
+
+def _bound_record(
+    stats: dict[str, Any], report: Any, output_bound: float | None
+) -> bool:
+    """Fill the ledger's measured/propagated fields; return honored.
+
+    The verify report measures ``max|Δy|`` — so the honored check is
+    ``report.max_abs ≤ output_bound``, output bound against output
+    measurement in the same units.  ``output_bound_rel`` restates each
+    entry's bound in the report's relative units for the record
+    (``max_rel = max_abs / (max|ref| + floor)``, so the denominator is
+    ``max_abs / max_rel``; ``None`` when the measurement was exact).
+    """
+    denom = (
+        report.max_abs / report.max_rel if report.max_rel > 0 else None
+    )
+    stats["error_bounds"] = [
+        {
+            **e,
+            "measured_max_rel": report.max_rel,
+            "output_bound_rel": (
+                e["output_bound"] / denom
+                if e.get("output_bound") is not None
+                and denom is not None
+                else None
+            ),
+        }
+        for e in stats.get("error_bounds", [])
+    ]
+    honored = bool(
+        output_bound is not None and report.max_abs <= output_bound
+    )
+    stats["error_bounds_honored"] = honored
+    return honored
+
+
+def _rel_bound(output_bound: float | None, report: Any) -> float:
+    """Restate an absolute output bound in the report's rel units.
+
+    For messages and records only — the gate itself compares in
+    absolute units.  ``nan`` when the bound could not be propagated
+    (fail-closed), ``inf`` when the measurement was exactly zero.
+    """
+    if output_bound is None:
+        return float("nan")
+    if report.max_rel <= 0 or report.max_abs <= 0:
+        return float("inf")
+    return output_bound * report.max_rel / report.max_abs
+
+
+def _bounded_gate(report: Any, bound: float | None) -> bool:
+    """Return the verify predicate under an accepted output bound.
+
+    ``bound`` is the propagated OUTPUT bound (absolute ``max|Δy|``
+    units, from :func:`_propagate_bounds`) — never the weight-space
+    certificate, which is in different units and must not gate the
+    measured error directly.  ``report.passed`` is the sink's
+    tolerance gate (run with ``rtol=inf`` on bounded deliveries — the
+    bound replaces the relative tolerance); the honest bound gate
+    additionally requires the measured absolute error to stay within
+    the propagated bound.  ``bound=None`` means the bound could not be
+    propagated — the gate fails closed; ``bound=0`` means no bound
+    members were delivered — the gate is the sink's verdict alone.
+    """
+    return bool(report.passed) and (
+        bound == 0.0 or (bound is not None and report.max_abs <= bound)
+    )
+
+
+def _block_bound_gate(
+    sink: Sink,
+    block: Any,
+    mod: Any,
+    inputs: Any,
+    verify_tol: float,
+    st: dict[str, Any],
+    res: Any,
+    atol: float | None = None,
+) -> tuple[Any, float | None]:
+    """Verify one delivered module, propagating any bound first.
+
+    Returns ``(report, output_bound)`` for :func:`_bounded_gate`.
+    With no delivered bound members the plain ``verify_tol`` verify
+    runs and ``output_bound`` is 0.  With them, the ledger's
+    weight-space bound propagates to output units on the block's
+    captured inputs (:func:`_propagate_bounds`), the sink verify runs
+    at ``rtol=inf`` (the propagated bound replaces the relative
+    tolerance), and the ledger gains its measured/propagated fields
+    via :func:`_bound_record` — ``output_bound`` is ``None`` when the
+    bound could not be propagated, which fails the gate closed.
+    ``inputs`` is a tensor or positional-args tuple.
+    """
+    args = inputs if isinstance(inputs, tuple) else (inputs,)
+    bound = float(st.get("error_bound_total", 0.0))
+    if bound <= 0.0:
+        return (
+            sink.verify(block, mod, args, rtol=verify_tol, atol=atol),
+            0.0,
+        )
+    out_b = _propagate_bounds(
+        st, res.eg, res.ir, dict(res.param_values), sink, args
+    )
+    report = sink.verify(block, mod, args, rtol=float("inf"), atol=atol)
+    _bound_record(st, report, out_b)
+    return report, out_b
+
+
 def _bound_verify(
-    stats: dict[str, Any], report: Any, bound_total: float
+    stats: dict[str, Any],
+    report: Any,
+    bound_total: float,
+    output_bound: float | None,
 ) -> Any:
     """Apply the honest bound gate to a verify report.
 
     No-op when ``bound_total`` is 0 (the accepted term delivers no
     bound members).  Otherwise each ``stats["error_bounds"]`` entry
-    records the measured value — the ledger is never silent — and
-    ``stats["error_bounds_honored"]`` flags the verdict: a measured
-    error exceeding the claimed bound substitutes a ``passed=False``
-    report, even when the (widened) tolerance alone passed.
+    records the measured value and its propagated bound — the ledger
+    is never silent — and ``stats["error_bounds_honored"]`` flags the
+    verdict: a measured output error exceeding the propagated bound,
+    a bound that could not be propagated (``output_bound=None``), or
+    a failing sink report substitutes a ``passed=False`` report, even
+    when the (unbounded) tolerance alone passed.
     """
     if bound_total <= 0.0:
         return report
-    stats["error_bounds"] = [
-        {**e, "measured_max_rel": report.max_rel}
-        for e in stats.get("error_bounds", [])
-    ]
-    stats["error_bounds_honored"] = bool(report.max_rel <= bound_total)
-    if report.max_rel > bound_total:
+    honored = _bound_record(stats, report, output_bound)
+    if not honored or not report.passed:
         return _BoundedVerify(
             max_abs=report.max_abs, max_rel=report.max_rel
         )
@@ -1279,10 +1542,12 @@ def search(
           delivered members are also fingerprinted directly);
         * the ledger is never silent: ``stats["error_budget"]``
           echoes the request, ``stats["error_bound_total"]`` is the
-          accepted certificate bound, and ``stats["error_bounds"]``
-          lists every bound-carrying member used (``rule`` / ``law``
-          / ``bound`` / ``norm``; ``measured_max_rel`` is filled in
-          by :func:`lower`'s verify).
+          accepted certificate bound (weight space), and
+          ``stats["error_bounds"]`` lists every bound-carrying member
+          used (``rule`` / ``law`` / ``bound`` / ``norm``); :func:`lower`
+          propagates each ``bound`` to an ``output_bound`` on the
+          verify input (:func:`_propagate_bounds`) and fills in
+          ``measured_max_rel``.
 
         Requires the reference ``EGraph`` at ``truncation_level >= 2``
         (the bound ledger reads certificates and rule-application
@@ -1479,14 +1744,19 @@ def lower(
     rtol, atol
         The equivalence tolerances, forwarded to ``sink.verify``.
         When the search ran under ``error_budget`` and accepted
-        bounded members (``stats["error_bound_total"]``), the
-        effective tolerance widens to ``max(rtol, bound)`` and the
-        *measured* ``max_rel`` must additionally stay within the
-        certified bound — a violation declines the delivery
-        (``verified.passed`` False, ``stats["error_bounds_honored"]``
-        False), even when the loose tolerance alone would pass.  Each
-        ``stats["error_bounds"]`` entry then records the measured
-        ``max_rel`` — the ledger is never silent.
+        bounded members (``stats["error_bound_total"]``), the bound
+        replaces the relative tolerance: the certificate's bound is
+        in *weight* space, so it is first propagated to output units
+        (:func:`_propagate_bounds` — ``bound · site-input norm`` per
+        entry, evaluated on ``x``), the sink verify runs at
+        ``rtol=inf``, and the *measured* ``max|Δy|`` must stay within
+        the propagated ``stats["error_bound_output"]`` — a violation
+        declines the delivery (``verified.passed`` False,
+        ``stats["error_bounds_honored"]`` False), even when the
+        relative difference was small.  Each
+        ``stats["error_bounds"]`` entry records its propagated
+        ``output_bound`` and the measured ``max_rel`` — the ledger is
+        never silent.
     verbose : bool
         Print progress.
 
@@ -1533,16 +1803,17 @@ def lower(
             print("[Verify] Checking output equivalence...")
         ref = sink.lower(result.ir, params)
         bound_total = float(stats.get("error_bound_total", 0.0))
+        # The certified bound is in weight space; the gate compares the
+        # measured output error against the *propagated* bound (same
+        # ``max|Δy|`` units).  Under a bound the sink's relative
+        # tolerance opens (rtol=inf): the bound replaces it — honoring
+        # it implies ``max_rel ≤ bound`` restated in rel units, so
+        # ``max(rtol, bound)`` semantics are preserved.
+        report, output_bound = _block_bound_gate(
+            sink, ref, optimized_module, x, rtol, stats, result, atol
+        )
         verified = _bound_verify(
-            stats,
-            sink.verify(
-                ref,
-                optimized_module,
-                x,
-                rtol=max(rtol, bound_total),
-                atol=atol,
-            ),
-            bound_total,
+            stats, report, bound_total, output_bound
         )
         if verbose:
             print(f"  Max abs diff:  {verified.max_abs:.6e}")
@@ -2487,6 +2758,7 @@ def _optimize_compositional(
     cache: dict | None = None,
     error_budget: float | None = None,
     detect_specials: bool = False,
+    detect_factors: bool = False,
     verbose: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     """Optimize a stacked/multi-block model one block at a time.
@@ -2524,11 +2796,13 @@ def _optimize_compositional(
        structure, then verifies end-to-end equivalence on
        ``example_input`` through ``sink.verify``.
 
-    ``error_budget`` / ``detect_specials`` forward to each per-block
-    :meth:`Optimizer.search` — with a budget set, a block's certified
-    bound also widens its verify tolerance (``max(verify_tol,
-    bound)``) and the measured error must honor the bound
-    (:func:`_bounded_gate`) or the block keeps its original
+    ``error_budget`` / ``detect_specials`` / ``detect_factors``
+    forward to each per-block :meth:`Optimizer.search` — with a
+    budget set, a block's certified weight-space bound propagates to
+    an output bound (:func:`_propagate_bounds`, evaluated on the
+    captured input), the sink verify runs with its relative
+    tolerance open, and the measured error must honor the propagated
+    bound (:func:`_bounded_gate`) or the block keeps its original
     implementation.
 
     ``cache`` (the :class:`Compositional` strategy resolves its
@@ -2653,16 +2927,16 @@ def _optimize_compositional(
                             verify=verbose,
                             verbose=verbose,
                         )
-                        bound2 = float(
-                            lr2.stats.get("error_bound_total", 0.0)
-                        )
-                        vh = sink.verify(
+                        vh, out2 = _block_bound_gate(
+                            sink,
                             block,
                             lr2.module,
                             args,
-                            rtol=max(verify_tol, bound2),
+                            verify_tol,
+                            lr2.stats,
+                            res2,
                         )
-                        if _bounded_gate(vh, bound2):
+                        if _bounded_gate(vh, out2):
                             opt_mod, st = lr2.module, lr2.stats
                             cache_hits += 1
                             rep["cache"] = "hit"
@@ -2701,6 +2975,7 @@ def _optimize_compositional(
                     delivers_compiled=False,
                     error_budget=error_budget,
                     detect_specials=detect_specials,
+                    detect_factors=detect_factors,
                     verbose=verbose,
                 )
                 lr = optimizer.lower(
@@ -2724,19 +2999,22 @@ def _optimize_compositional(
                 # Per-block verification on the captured input —
                 # soundness gate independent of the pipeline's own
                 # (verbose-gated) check.  Any mismatch or eval failure
-                # falls back.  Under a bounded search the gate is
-                # two-sided: the tolerance widens to the accepted
-                # bound AND the measured error must honor it.
-                bound = float(st.get("error_bound_total", 0.0))
-                vr = sink.verify(
-                    block, opt_mod, args, rtol=max(verify_tol, bound)
+                # falls back.  Under a bounded search the certified
+                # bound is in weight space, so it propagates to an
+                # output bound on the captured input first
+                # (``_propagate_bounds``) and the measured error must
+                # honor THAT — same units — while the sink's relative
+                # tolerance opens (the bound is the tolerance).
+                vr, out_b = _block_bound_gate(
+                    sink, block, opt_mod, args, verify_tol, st, res
                 )
                 rep["rel_diff"] = vr.max_rel
-                if not _bounded_gate(vr, bound):
+                if not _bounded_gate(vr, out_b):
                     raise RuntimeError(
                         f"block verification failed: "
                         f"rel diff {vr.max_rel:.3e} "
-                        f"(accepted bound {bound:.3e})"
+                        f"(accepted bound "
+                        f"{_rel_bound(out_b, vr):.3e})"
                     )
             replacements[name] = opt_mod
             rep["status"] = "optimized"

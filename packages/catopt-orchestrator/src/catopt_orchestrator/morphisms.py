@@ -1877,7 +1877,10 @@ class MorphismSearch:
     ``symmetry_budget`` (the joint e-graph bounds), and
     ``optimize_rest`` (per-block fallback for untouched blocks).
     ``optimize`` kwargs (``rules``, ``cost_fn``, ``verbose``, …)
-    forward to the per-block searches.
+    forward to the per-block searches — including ``error_budget`` /
+    ``detect_specials`` / ``detect_factors``, where ``error_budget``
+    additionally arms budget-aware morphism laws left at
+    ``budget=None`` (e.g. ``KVLatentShare``).
     """
 
     name = "morphism"
@@ -1924,6 +1927,44 @@ class MorphismSearch:
         return LowerResult(module=mod, stats=stats)
 
 
+def _arm_law_budgets(
+    laws: Iterable[MorphismLaw], error_budget: float | None
+) -> tuple[MorphismLaw, ...]:
+    """Wire ``error_budget`` into budget-aware morphism laws.
+
+    A law carrying a ``budget`` attribute left at ``None`` (e.g.
+    :class:`~catopt_orchestrator.morphisms_kv.KVLatentShare`) inherits
+    the call-time ``error_budget`` — its certified-approximate mode
+    arms; a law configured with its own budget keeps it.  Armed laws
+    are shallow copies: the caller's configured objects are never
+    mutated.  ``error_budget=None`` returns the laws untouched.
+    """
+    import copy
+
+    if error_budget is None:
+        return tuple(laws)
+    out: list[MorphismLaw] = []
+    for law in laws:
+        if getattr(law, "budget", 0.0) is None:
+            armed: Any = copy.copy(law)
+            armed.budget = error_budget
+            out.append(armed)
+        else:
+            out.append(law)
+    return tuple(out)
+
+
+def _fallback_cost_kw(cost_fn: CostFn | None) -> dict[str, Any]:
+    """Per-block search extras — forward an explicit ``cost_fn``.
+
+    An unset one stays unset so the block search keeps the
+    optimizer's own cost resolution (criteria / executor-aware
+    default); ``cost_fn`` itself only defaults to ``flops_cost`` for
+    the joint reify pricing.
+    """
+    return {} if cost_fn is None else {"cost_fn": cost_fn}
+
+
 def _optimize_morphisms(
     model: Any,
     x: Any,
@@ -1936,6 +1977,9 @@ def _optimize_morphisms(
     joint_max_iterations: int,
     joint_max_enodes: int,
     symmetry_budget: int | None,
+    error_budget: float | None = None,
+    detect_specials: bool = False,
+    detect_factors: bool = False,
     cost_fn: CostFn | None = None,
     rules: Any = None,
     max_iterations: int = 100,
@@ -1945,12 +1989,32 @@ def _optimize_morphisms(
 ) -> tuple[Any, dict[str, Any]]:
     """Lift, match, reify, recompose — the morphism pipeline.
 
+    ``error_budget`` / ``detect_specials`` / ``detect_factors``
+    forward to each untouched block's per-block
+    :meth:`Optimizer.search` (same contract as
+    :class:`~catopt_orchestrator.optimize.Compositional`), and
+    ``error_budget`` additionally arms budget-aware morphism laws
+    whose own ``budget`` is unset (:func:`_arm_law_budgets` —
+    ``KVLatentShare(budget=)``'s certified-approximate mode).  A
+    bounded per-block delivery verifies against the propagated
+    *output* bound (:func:`_propagate_bounds` — the certificate's
+    weight-space bound amplified by the measured site-input norm),
+    identical units to the measured ``max|Δy|``.
+
     Returns ``(model, stats)`` — ``stats["matches"]`` carries the
     per-match verdicts (``grafted`` / ``declined`` / ``skipped`` plus
     the cost/rel-diff record), ``stats["blocks"]`` the per-block
     fallback reports, ``stats["wires"]`` the boundary classification,
     and ``stats["end_to_end"]`` the whole-model equivalence check.
     """
+    # Local import, same convention as ``optimize_morphisms`` below:
+    # the bound helpers live in the pipeline module.
+    from catopt_orchestrator.optimize import (
+        _block_bound_gate,
+        _bounded_gate,
+        _rel_bound,
+    )
+
     t_start = time.time()
     composer = optimizer.composer
     if composer is None:
@@ -1960,8 +2024,13 @@ def _optimize_morphisms(
         )
     source = optimizer.source
     sink = optimizer.sink
+    # ``cost_fn`` prices the joint reify; the per-block fallback only
+    # inherits it when the caller supplied one — otherwise the block
+    # search keeps the optimizer's own cost resolution.
+    fallback_cost = _fallback_cost_kw(cost_fn)
     if cost_fn is None:
         cost_fn = flops_cost
+    laws = _arm_law_budgets(laws, error_budget)
 
     graph = lift_graph(
         model,
@@ -2048,7 +2117,11 @@ def _optimize_morphisms(
                     max_iterations=max_iterations,
                     max_enodes=max_enodes,
                     max_memory_mb=max_memory_mb,
+                    error_budget=error_budget,
+                    detect_specials=detect_specials,
+                    detect_factors=detect_factors,
                     verbose=verbose,
+                    **fallback_cost,
                 )
                 lr = optimizer.lower(
                     res_s,
@@ -2057,18 +2130,33 @@ def _optimize_morphisms(
                     verify=False,
                     verbose=verbose,
                 )
-                vr = sink.verify(
-                    rec.module, lr.module, rec.args, rtol=verify_tol
+                # Under a bounded search the certificate's bound is in
+                # weight space: ``_block_bound_gate`` propagates it to
+                # output units on the captured input and the gate
+                # compares measured ``max|Δy|`` against that — the same
+                # contract as the compositional driver's verify.
+                vr, out_s = _block_bound_gate(
+                    sink,
+                    rec.module,
+                    lr.module,
+                    rec.args,
+                    verify_tol,
+                    lr.stats,
+                    res_s,
                 )
                 rep["rel_diff"] = vr.max_rel
-                if not vr.passed:
+                passed = _bounded_gate(vr, out_s)
+                if not passed:
                     rep["status"] = "failed"
                     rep["reason"] = (
-                        f"block verify failed: {vr.max_rel:.3e}"
+                        f"block verify failed: {vr.max_rel:.3e} "
+                        f"(accepted bound "
+                        f"{_rel_bound(out_s, vr):.3e})"
                     )
                     continue
                 replacements[name] = lr.module
                 rep["status"] = "optimized"
+                rep["stats"] = lr.stats
             except Exception as e:
                 rep["status"] = "failed"
                 rep["error"] = f"{type(e).__name__}: {e}"
