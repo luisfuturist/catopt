@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import re
 import sys
@@ -79,6 +80,11 @@ from stories15m_bench import Stories15M, resolve_ckpt
 # run_all.py picks these up for its --quick lane.
 QUICK = {
     "budgets": "none,1e-3",
+    # On ``run_all --device cuda`` keep the compile-time search on
+    # CPU — the bounded-elide row loop is ~50x slower on GPU launch
+    # overhead and the delivered module is identical (see
+    # --optimize-device).
+    "optimize_device": "cpu",
     "seq": "64",
     "min_run_time": "0.05",
     "compile_timeout": "45.0",
@@ -255,6 +261,8 @@ def run_budget_cell(
     dev: torch.device,
     inductor_mod,
     prompts: list[torch.Tensor],
+    search_model=None,
+    search_idx: torch.Tensor | None = None,
 ) -> tuple[dict, Case]:
     """Optimize under ``budget``, verify, pack the benchkit case."""
     print(f"\n=== budget={label} ===", flush=True)
@@ -263,16 +271,41 @@ def run_budget_cell(
         "params": {"budget": label, "seq": idx.shape[-1]},
     }
 
+    # ``--optimize-device cpu`` hands the *search* a CPU-resident copy
+    # and moves the delivered module back to ``dev``.  The bounded
+    # specials analysis (``offer_weight_specials`` /
+    # ``_bounded_elide``) is a scalar per-row loop over the weight —
+    # on CUDA each ``(row - rep).abs().max()`` is a launch+sync
+    # (~250µs vs ~5µs on CPU), so the 32000-row tied head turns a
+    # ~6 min CPU search into hours.  The bounds it measures are
+    # weight-space max|ΔW| — device-invariant — so the delivered
+    # module is the same; it is re-verified on ``dev`` below.
+    sdev = (
+        torch.device(args.optimize_device)
+        if getattr(args, "optimize_device", None)
+        else dev
+    )
+    use_search_copy = sdev != dev
+    # Fresh copy per cell: the delivered module reuses unmodified
+    # submodules of the search model, so ``opt_mod.to(dev)`` below
+    # would otherwise move the shared weights out from under the
+    # next cell's search copy (mixed-device forward → RuntimeError).
+    smodel = copy.deepcopy(search_model) if use_search_copy else model
+    sidx = search_idx if use_search_copy else idx
+    rec["optimize_device"] = str(sdev)
+
     t0 = time.time()
     try:
         opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(
-            model,
-            idx,
+            smodel,
+            sidx,
             strategy=Compositional(),
             detect_specials=True,
             error_budget=budget,
             verbose=False,
         )
+        if use_search_copy and opt_mod is not None:
+            opt_mod = opt_mod.to(dev).eval()
         rec["opt_s"] = round(time.time() - t0, 1)
         rec["n_optimized"] = stats.get("n_optimized")
         rec["n_blocks"] = stats.get("n_blocks")
@@ -413,9 +446,7 @@ def probe_morphism(model, idx, budget: float) -> dict:
         Optimizer(backend=TorchBackend()).optimize(
             model,
             idx,
-            strategy=MorphismSearch(
-                laws=[law], optimize_rest=False
-            ),
+            strategy=MorphismSearch(laws=[law], optimize_rest=False),
             error_budget=budget,
             detect_specials=True,
         )
@@ -497,10 +528,21 @@ def run_bench(args) -> Report:
     torch.manual_seed(0)
     idx = torch.randint(0, cfg["vocab"], (1, seq), device=dev)
     prompts = _prompt_set(cfg["vocab"], seq, n_prompts, dev)
+
+    # Optional CPU-resident copy for the (compile-time) search — see
+    # run_budget_cell for why the bounded-elide analysis must not run
+    # its scalar row loop against CUDA tensors.
+    opt_dev = getattr(args, "optimize_device", None)
+    search_model = search_idx = None
+    if opt_dev and torch.device(opt_dev) != dev:
+        search_model = copy.deepcopy(model).to(opt_dev).eval()
+        search_idx = idx.to(opt_dev)
+
     print(
         f"bounded_e2e — {Path(ckpt_path).name} "
         f"dim={cfg['dim']} L={cfg['n_layers']} T={seq} "
-        f"device={dev} budgets={[b for b, _ in budgets]}",
+        f"device={dev} optimize_on={opt_dev or dev} "
+        f"budgets={[b for b, _ in budgets]}",
         flush=True,
     )
     t0 = time.perf_counter()
@@ -509,8 +551,6 @@ def run_bench(args) -> Report:
     inductor_mod = model
     ind_status = "disabled (--compile-timeout 0)"
     if ct > 0:
-        import copy
-
         inductor_mod2, ind_status = try_compile(
             copy.deepcopy(model), (idx,), ct
         )
@@ -542,6 +582,8 @@ def run_bench(args) -> Report:
             dev,
             inductor_mod,
             prompts,
+            search_model=search_model,
+            search_idx=search_idx,
         )
         recs.append(rec)
         cell = runner.run_case(case)
@@ -683,6 +725,17 @@ def main() -> None:
         )
     )
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument(
+        "--optimize-device",
+        default=None,
+        choices=["cpu", "cuda"],
+        help="device the compile-time optimize/search runs on "
+        "(default: same as --device).  'cpu' is recommended for CUDA "
+        "timing runs: the bounded specials analysis is a scalar "
+        "row-pair loop — ~50x slower on GPU launch overhead — and the "
+        "delivered module (weight-space bounds, re-verified on "
+        "--device) is identical.",
+    )
     ap.add_argument("--seq", type=int, default=128)
     ap.add_argument(
         "--budgets",
