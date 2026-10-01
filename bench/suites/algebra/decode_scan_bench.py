@@ -86,20 +86,24 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
-
-from catopt_torch.torch_bridge import export_to_ir
 from catopt_core.ir import IR
-from catopt_orchestrator.optimize import _lower_extracted
-
-
-from catopt_torch.adapters import TorchSink
 from catopt_orchestrator import Optimizer
-
+from catopt_orchestrator.optimize import _lower_extracted
+from catopt_torch.adapters import TorchSink
 from catopt_torch.backend import TorchBackend
+from catopt_torch.torch_bridge import export_to_ir
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -1104,8 +1108,55 @@ def run_bench(args: argparse.Namespace) -> Report:
         )
     print("-" * len(hdr))
 
+    ok = [c for c in results if c.get("verified")]
+    n_win = sum(1 for c in ok if "carrier WIN" in str(c.get("_verdict")))
+    n_loss = sum(
+        1 for c in ok if "carrier LOSS" in str(c.get("_verdict"))
+    )
+    findings = [
+        Finding(
+            claim=(
+                "the chunked scan carrier beats the best non-carrier "
+                "decode schedule"
+            ),
+            verdict=(
+                Verdict.WIN
+                if n_win and not n_loss
+                else Verdict.REGRESSION
+                if n_loss and not n_win
+                else Verdict.PARITY
+                if n_win or n_loss
+                else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"{n_win} carrier wins / {n_loss} losses across "
+                f"{len(ok)} verified cells"
+            ),
+            metric="carrier wins",
+            value=float(n_win),
+            evidence={"verified": len(ok), "losses": n_loss},
+        ),
+        Finding(
+            claim="every timed cell passes the fp32 decode gate",
+            verdict=(
+                Verdict.WIN
+                if ok and len(ok) == len(results)
+                else Verdict.INCONCLUSIVE
+            ),
+            headline=f"{len(ok)}/{len(results)} cells verified",
+            metric="verified cells",
+            value=float(len(ok)),
+        ),
+    ]
     report = Report(
-        suite="decode_scan",
+        suite="decode_scan_bench",
+        title="Carrier + CUDA-graph decode",
+        summary=(
+            "Decode sweep: chunked scan carriers (compiled / "
+            "CUDA-graphed) against eager and Inductor per-token "
+            "schedules, µs/token and tokens/s."
+        ),
+        findings=findings,
         cells=report_cells,
         env=collect_env(dev),
     )

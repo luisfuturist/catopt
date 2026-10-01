@@ -1,0 +1,485 @@
+{
+  "schema": 1,
+  "suite": "law_bench",
+  "title": "Rewrite-law effect bench",
+  "summary": "Per registered law: a synthetic term \u2192 saturate on that rule alone \u2192 extract \u2192 lower \u2192 verify, timed before/after.",
+  "env": {
+    "timestamp_utc": "2026-10-01T23:02:01+00:00",
+    "python": "3.13.9",
+    "torch": "2.14.0+cpu",
+    "torch_cuda": "none",
+    "device": "cpu",
+    "device_name": "12th Gen Intel(R) Core(TM) i5-12500H",
+    "cpu_count": 16,
+    "git_sha": "dd32485",
+    "git_dirty": true,
+    "argv": [
+      "/home/luis/Desktop/catopt/bench/__main__.py",
+      "run",
+      "law_bench",
+      "--quick",
+      "--device",
+      "cpu",
+      "--out",
+      "/tmp/benchrun",
+      "--no-plots"
+    ]
+  },
+  "provenance": {},
+  "units": {
+    "median_s": "seconds",
+    "iqr_s": "seconds"
+  },
+  "findings": [
+    {
+      "claim": "every registered law fires, is picked by extraction, and lowers to a verified term",
+      "verdict": "win",
+      "headline": "10 verified / 10 picked / 13 fired across 13 cells",
+      "metric": "verified cells",
+      "value": 10.0,
+      "evidence": {
+        "fired": 13,
+        "picked": 10
+      }
+    }
+  ],
+  "cells": [
+    {
+      "name": "id_add",
+      "params": {
+        "law": "id_add",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 1.1826691999885952e-05,
+        "after": 2.006958999982089e-06
+      },
+      "iqr_s": {
+        "before": 2.0352899946374344e-07,
+        "after": 2.2556649992111247e-08
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 23290.9213,
+        "cost_out": 0.0,
+        "before": "(add x, 0)",
+        "after": "x",
+        "max_rel": "0.000e+00"
+      }
+    },
+    {
+      "name": "double_neg",
+      "params": {
+        "law": "double_neg",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 1.6962080000212155e-05,
+        "after": 2.1006429999943066e-06
+      },
+      "iqr_s": {
+        "before": 4.681455000081765e-07,
+        "after": 4.3759499999396015e-08
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 46581.7528,
+        "cost_out": 0.0,
+        "before": "(neg (neg x))",
+        "after": "x",
+        "max_rel": "0.000e+00"
+      }
+    },
+    {
+      "name": "sub_to_add",
+      "params": {
+        "law": "sub_to_add",
+        "size": 128
+      },
+      "variants": [],
+      "median_s": {},
+      "iqr_s": {},
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "no",
+        "verified": "same",
+        "cost_in": 26236.3146,
+        "cost_out": 26236.3146,
+        "note": "member found; extraction kept the input term (RHS not cheaper under the pipeline cost model)"
+      }
+    },
+    {
+      "name": "pow_to_square",
+      "params": {
+        "law": "pow_to_square",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 0.0003055566000057297,
+        "after": 8.998950500199498e-06
+      },
+      "iqr_s": {
+        "before": 2.4307999865414093e-06,
+        "after": 2.6608225005020583e-07
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 23290.9213,
+        "cost_out": 23290.8764,
+        "before": "(pow x, 2)",
+        "after": "(square x)",
+        "max_rel": "4.671e-08"
+      }
+    },
+    {
+      "name": "silu_expand",
+      "params": {
+        "law": "silu_expand",
+        "size": 128
+      },
+      "variants": [],
+      "median_s": {},
+      "iqr_s": {},
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "no",
+        "verified": "same",
+        "cost_in": 23290.8764,
+        "cost_out": 23290.8764,
+        "note": "member found; extraction kept the input term (RHS not cheaper under the pipeline cost model)"
+      }
+    },
+    {
+      "name": "assoc_matmul_rev",
+      "params": {
+        "law": "assoc_matmul_rev",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 0.0006473046000110116,
+        "after": 0.00016274781499987513
+      },
+      "iqr_s": {
+        "before": 3.130599998257832e-05,
+        "after": 2.786159999459411e-06
+      },
+      "aux": {
+        "fired": 16,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 96443.5456,
+        "cost_out": 24110.8864,
+        "before": "(matmul (matmul (matmul (matmul x, W1), W2), W3), W4)",
+        "after": "(matmul x, (matmul W1, (matmul W2, (matmul W3, W4))))",
+        "max_rel": "6.403e-07"
+      }
+    },
+    {
+      "name": "assoc_linear",
+      "params": {
+        "law": "assoc_linear",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 0.0003248331999884613,
+        "after": 0.0001650910050011589
+      },
+      "iqr_s": {
+        "before": 3.919125015272617e-06,
+        "after": 2.3974975022156503e-06
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 48221.7728,
+        "cost_out": 24110.8864,
+        "before": "(linear (linear x, A), B)",
+        "after": "(linear x, (matmul B, A))",
+        "max_rel": "5.001e-07"
+      }
+    },
+    {
+      "name": "weight_factor_linear",
+      "params": {
+        "law": "weight_factor_linear",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 0.00035549409999475757,
+        "after": 0.0001686174399992524
+      },
+      "iqr_s": {
+        "before": 1.349140002275816e-05,
+        "after": 2.5029799985532117e-06
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 74458.0874,
+        "cost_out": 24110.8864,
+        "before": "(add (linear x, W), (linear x, W2))",
+        "after": "(linear x, (add W, W2))",
+        "max_rel": "6.475e-07"
+      }
+    },
+    {
+      "name": "right_factor_linear",
+      "params": {
+        "law": "right_factor_linear",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 0.00034954220000145143,
+        "after": 0.0001846733000002132
+      },
+      "iqr_s": {
+        "before": 9.063200013770267e-06,
+        "after": 2.2599099997932994e-06
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 74458.0874,
+        "cost_out": 50347.201,
+        "before": "(add (linear a, W), (linear b, W))",
+        "after": "(linear (add a, b), W)",
+        "max_rel": "5.340e-07"
+      }
+    },
+    {
+      "name": "linear_channel_scale",
+      "params": {
+        "law": "linear_channel_scale",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 0.00017798383999888755,
+        "after": 0.00016614893500218385
+      },
+      "iqr_s": {
+        "before": 2.143965000414019e-06,
+        "after": 1.7122750000453455e-06
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 47407.5156,
+        "cost_out": 24110.8864,
+        "before": "(linear (mul x, c), W)",
+        "after": "(linear x, (mul W, c))",
+        "max_rel": "1.699e-07"
+      }
+    },
+    {
+      "name": "parallel_mul_fuse",
+      "params": {
+        "law": "parallel_mul_fuse",
+        "size": 128
+      },
+      "variants": [],
+      "median_s": {},
+      "iqr_s": {},
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "no",
+        "verified": "same",
+        "cost_in": 74458.0874,
+        "cost_out": 74458.0874,
+        "note": "member found; extraction kept the input term (RHS not cheaper under the pipeline cost model)"
+      }
+    },
+    {
+      "name": "sdpa_fold_addmul",
+      "params": {
+        "law": "sdpa_fold_addmul",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 8.599423500299963e-05,
+        "after": 6.522840000116047e-05
+      },
+      "iqr_s": {
+        "before": 1.1587624999265256e-06,
+        "after": 2.347622499883085e-06
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 110427.236,
+        "cost_out": 20345.4382,
+        "before": "(matmul (softmax (add (mul (matmul q, (transpose k, dim0=-2, dim1=-1)), 0.25), m), dim=-1), v)",
+        "after": "(sdpa q, k, v, m, scale=0.25)",
+        "max_rel": "1.708e-07"
+      }
+    },
+    {
+      "name": "affd_lift",
+      "params": {
+        "law": "affd_lift",
+        "size": 128
+      },
+      "variants": [
+        {
+          "name": "before",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "after",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "before": 4.947185000219179e-06,
+        "after": 2.6131929998882698e-05
+      },
+      "iqr_s": {
+        "before": 1.4292949981609116e-07,
+        "after": 4.2315250084356995e-07
+      },
+      "aux": {
+        "fired": 1,
+        "rhs_member": "yes",
+        "picked": "yes",
+        "verified": "pass",
+        "cost_in": 34834.5169,
+        "cost_out": 26117.2584,
+        "before": "(add (mul a, h), x)",
+        "after": "(applyd (aff_diag a, x), h)",
+        "max_rel": "0.000e+00"
+      }
+    }
+  ]
+}

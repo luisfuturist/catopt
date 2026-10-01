@@ -98,9 +98,26 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
+from catopt_carriers.scan_lower import (
+    build_scan_plan,
+    is_scan_apply_term,
+    to_batched_scan_module,
+)
+from catopt_core.egraph import EGraph
+from catopt_core.egraph.types import _LeafRegistry
+from catopt_core.ir import IR, Op, op_repr
+from catopt_core.laws import SCAN_DIAG_LAWS, SCAN_LAWS
+from catopt_orchestrator import Optimizer
+from catopt_orchestrator.optimize import (
+    OptimizationResourceError,
+    _lower_extracted,
+)
+from catopt_torch.adapters import TorchSink
+from catopt_torch.backend import TorchBackend
+from catopt_torch.torch_bridge import export_to_ir
+
 from bench.benchkit import (
     Case,
     Finding,
@@ -110,26 +127,6 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from catopt_core.egraph import EGraph
-from catopt_core.ir import IR, Op, op_repr
-from catopt_core.laws import SCAN_DIAG_LAWS, SCAN_LAWS
-from catopt_orchestrator.optimize import OptimizationResourceError
-
-
-from catopt_orchestrator.optimize import _lower_extracted
-
-
-from catopt_torch.adapters import TorchSink
-from catopt_carriers.scan_lower import (
-    build_scan_plan,
-    is_scan_apply_term,
-    to_batched_scan_module,
-)
-from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
-from catopt_core.egraph.types import _LeafRegistry
-from catopt_orchestrator import Optimizer
-
-from catopt_torch.backend import TorchBackend
 
 _APPLY_OPS = ("apply", "applyd")
 

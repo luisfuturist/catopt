@@ -53,25 +53,18 @@ import json
 import logging
 import re
 import statistics
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import tyro
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
-from bench.benchkit import (
-    Case,
-    Finding,
-    Report,
-    Runner,
-    Variant,
-    Verdict,
-    collect_env,
+import tyro
+from catopt_carriers.trace_lift import lift_scan_to_trace
+from catopt_carriers.xcarrier import (
+    gather_apply_stack,
+    gather_applyd_stack,
+    omd_tree_lift,
 )
 from catopt_core.cost import launch_aware_cost
 from catopt_core.egraph import EGraph
@@ -84,17 +77,20 @@ from catopt_core.laws import (
     share_duplicate_params,
     tags,
 )
-from catopt_torch.torch_bridge import export_to_ir
 from catopt_core.typing import has_var_leaf
-from catopt_carriers.trace_lift import lift_scan_to_trace
-from catopt_carriers.xcarrier import (
-    gather_apply_stack,
-    gather_applyd_stack,
-    omd_tree_lift,
-)
 from catopt_orchestrator import Optimizer
-
 from catopt_torch.backend import TorchBackend
+from catopt_torch.torch_bridge import export_to_ir
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
 
 #: ``FULL`` — the whole core equational surface minus the
 #: pairing-subsumed folds — is the same search space the old
@@ -198,7 +194,7 @@ def saturate_and_extract(
     if groups:
         eg.rebuild()
         eg.run(
-            rules,
+            _RULES,
             root_eid,
             max_iterations=5,
             max_nodes=cap,
@@ -215,7 +211,7 @@ def saturate_and_extract(
     if lifts:
         eg.rebuild()
         eg.run(
-            rules,
+            _RULES,
             root_eid,
             max_iterations=5,
             max_nodes=cap,
@@ -943,7 +939,7 @@ def _md_supplement(results: list[dict], best: dict | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_bench(args: argparse.Namespace) -> Report:
+def run_bench(args) -> Report:
     """The full sweep → ``benchkit.Report`` (the run_all.py convention).
 
     ``args`` is the namespace ``main()`` parses; when driven by

@@ -40,8 +40,15 @@ dev = [
 
 [dependency-groups]
 bench = [
+    "jinja2>=3.1.6",
+    "kaleido>=1.4.0",
     "matplotlib>=3.8",
     "pandas>=2.0",
+    "plotly>=7.1.0",
+    "polars>=1.44.2",
+    "rich>=15.0.0",
+    "tabulate>=0.10.0",
+    "tyro>=1.0.16",
 ]
 # OPT-IN, TEST-ONLY differential oracle (Phase 4).  `egglog` drives a
 # second equality-saturation engine used *only* by

@@ -4,19 +4,13 @@ The missing headline number: not per-rewrite speedups but the
 optimized forward pass of a whole stacked model.
 """
 
-import sys
 import time
-from pathlib import Path
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
-from catopt_torch.models import ParallelBlock
-
 from catopt_orchestrator import Optimizer
-
 from catopt_torch.backend import TorchBackend
+from catopt_torch.models import ParallelBlock
 
 
 class MiniGPT(nn.Module):

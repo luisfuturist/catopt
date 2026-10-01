@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} — catopt bench</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --win: #3fb950; --parity: #d29922; --reg: #f85149;
+    --neg: #8b949e; --inc: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  h1 { font-size: 1.9rem; margin: 0 0 .35rem; }
+  h2 { font-size: 1.15rem; margin: 2.2rem 0 .8rem;
+    border-bottom: 1px solid var(--border); padding-bottom: .35rem; }
+  .summary { color: var(--fg); font-size: 1.02rem; margin: .4rem 0 1rem; }
+  .prov { color: var(--muted); font-size: .85rem; margin: 0 0 .2rem; }
+  .prov code { background: var(--panel); padding: .05rem .3rem;
+    border-radius: 4px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit,
+    minmax(230px, 1fr)); gap: .8rem; margin: 1rem 0; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+    border-left: 4px solid var(--muted); border-radius: 8px;
+    padding: .8rem .9rem; }
+  .card .v { font-size: .72rem; font-weight: 700; letter-spacing: .06em; }
+  .card .c { font-size: .82rem; color: var(--muted); margin: .25rem 0; }
+  .card .h { font-size: .95rem; font-weight: 600; }
+  .card .m { font-size: .8rem; color: var(--muted); margin-top: .3rem; }
+  .win { border-left-color: var(--win); } .win .v { color: var(--win); }
+  .parity { border-left-color: var(--parity); }
+  .parity .v { color: var(--parity); }
+  .regression { border-left-color: var(--reg); }
+  .regression .v { color: var(--reg); }
+  .negative { border-left-color: var(--neg); }
+  .negative .v { color: var(--neg); }
+  .inconclusive { border-left-color: var(--inc); }
+  .inconclusive .v { color: var(--inc); }
+  table { border-collapse: collapse; width: 100%; font-size: .84rem;
+    font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .4rem .55rem;
+    border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0;
+    background: var(--bg); }
+  tbody tr:hover { background: var(--panel); }
+  .fig { margin: 1rem 0; }
+  .foot { color: var(--muted); font-size: .78rem; margin-top: 2.5rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>{{ title }}</h1>
+  {% if summary %}<p class="summary">{{ summary }}</p>{% endif %}
+  <p class="prov">measured {{ env.timestamp_utc }} ·
+    git <code>{{ env.git_sha }}</code>{{ " dirty" if env.git_dirty else " clean" }}</p>
+  <p class="prov">device <code>{{ env.device }}</code> — {{ env.device_name }}
+    · torch {{ env.torch }} · cuda {{ env.torch_cuda }} · python {{ env.python }}</p>
+
+  {% if findings %}
+  <h2>Findings</h2>
+  <div class="cards">
+    {% for f in findings %}
+    <div class="card {{ f.verdict }}">
+      <div class="v">{{ f.badge }}</div>
+      <div class="c">{{ f.claim }}</div>
+      <div class="h">{{ f.headline }}</div>
+      {% if f.metric %}<div class="m">{{ f.metric }} = {{ f.value }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <h2>Results</h2>
+  <table>
+    <thead><tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>{% for c in row %}<td>{{ c }}</td>{% endfor %}</tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% for fig in figures %}
+  <div class="fig">{{ fig }}</div>
+  {% endfor %}
+
+  <p class="foot">catopt benchkit · generated {{ generated }} ·
+    {{ ncells }} cells</p>
+</div>
+</body>
+</html>

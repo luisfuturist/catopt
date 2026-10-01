@@ -44,6 +44,7 @@ explicitly scoped).  Written to ``bench/results/structure_census.json``.
     python bench/structure_census.py            # both checkpoints
     python bench/structure_census.py --ckpt ~/.cache/catopt/stories15M.bin
 """
+# ruff: noqa: RUF001 -- the multiplication sign in tables is notation.
 
 from __future__ import annotations
 
@@ -56,12 +57,10 @@ from pathlib import Path
 
 import numpy as np
 
-BENCH_DIR = Path(__file__).resolve().parent
-REPO = BENCH_DIR.parent
-sys.path.insert(0, str(BENCH_DIR))
-sys.path.insert(0, str(REPO))
+from bench.common.llama2c import load_llama2c
 
-from bench.common.llama2c import load_llama2c  # noqa: E402
+#: ``bench/`` — the results dir hangs off it.
+BENCH_DIR = Path(__file__).resolve().parents[2]
 
 DEAD_THRESHS = (0.0, 1e-4, 1e-3, 1e-2)
 BUDGETS = (1e-4, 1e-3, 1e-2)
@@ -559,7 +558,6 @@ def _low_rank_member(
 
 def _eg_site(wt, prefix="p"):
     """Fresh EGraph holding ``linear(x, W)``; return (eg, tensors)."""
-    import torch
     from catopt_core.egraph import EGraph
     from catopt_core.ir import Op, Param, TensorType, Var
 
@@ -601,7 +599,7 @@ def _run_probes(model: str, sites: list[dict]) -> list[dict]:
     # 1. Exact analysis parity on one site per layer type (the real
     # ``_dedup`` is O(o²) on byte strings — probe it on the 32k-row
     # head too; ~1 min is acceptable validation cost).
-    for lt, s in sorted(by_type.items()):
+    for _lt, s in sorted(by_type.items()):
         a = s["wn"]
         o, i = a.shape
         t0 = time.time()
@@ -664,7 +662,7 @@ def _run_probes(model: str, sites: list[dict]) -> list[dict]:
     s = by_type["qkv"]
     a = s["wn"]
     wt = torch.from_numpy(np.array(a, dtype=np.float32))
-    for b in (None,) + BUDGETS:
+    for b in (None, *BUDGETS):
         t0 = time.time()
         eg, tensors = _eg_site(wt)
         offers = offer_weight_specials(eg, tensors, budget=b)
@@ -800,7 +798,7 @@ def census_model(path: str, probes: bool) -> dict:
         )
 
     # ---- offer decisions + slack per budget --------------------------
-    budgets = ("exact",) + tuple(f"{b:g}" for b in BUDGETS)
+    budgets = ("exact", *(f"{b:g}" for b in BUDGETS))
     slack = {b: {"flops_saved": 0, "params_saved": 0, "hits": {}}
              for b in budgets}
     for s in sites:
@@ -938,7 +936,8 @@ def print_report(res: dict) -> None:
         ss = [s for s in res["sites"] if s["ltype"] == lt]
         if not ss:
             continue
-        fr = lambda k: np.median([s[k] for s in ss])
+        def fr(k, _ss=ss):
+            return np.median([s[k] for s in _ss])
         r90 = np.median(
             [s["rank"]["r90"] / s["rank"]["full"] for s in ss]
         )

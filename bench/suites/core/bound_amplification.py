@@ -46,19 +46,20 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
-import sys
 import time
 from pathlib import Path
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np
 import torch
 import torch.nn.functional as F
-from bench.benchkit import collect_env
 from catopt_core.laws.specials import _bounded_elide as _ref_elide
+
+from bench.benchkit import collect_env
 from bench.common.llama2c import load_llama2c
-from bench.suites.models.stories15m_bench import Stories15M, resolve_ckpt
+from bench.suites.models.stories15m_bench import (
+    Stories15M,
+    resolve_ckpt,
+)
 
 _THRESHOLDS = (1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1)
 _GATE_BUDGETS = (1e-4, 1e-3, 1e-2)

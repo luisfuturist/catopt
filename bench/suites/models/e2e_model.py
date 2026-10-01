@@ -53,7 +53,7 @@ packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         --device cuda
     .venv/bin/python bench/e2e_model.py --device cpu --quick
 """
-# ruff: noqa: E402, RUF003 -- ×, ·, → in
+# ruff: noqa: E402, RUF001, RUF003 -- ×, ·, → in
 # strings/docstrings are deliberate math notation; sys.path setup
 # must precede the benchkit/catopt imports (bench_omd2 convention).
 
@@ -69,17 +69,23 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
-
-from catopt_torch.report import verify_equiv
-from bench.suites.algebra.real_win_hunt import try_compile
 from catopt_orchestrator import Compositional, Optimizer
-
 from catopt_torch.backend import TorchBackend
+from catopt_torch.report import verify_equiv
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
+from bench.suites.algebra.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -773,8 +779,61 @@ def run_bench(args) -> Report:
         f"  total wall time {time.perf_counter() - t0:.1f}s", flush=True
     )
 
+    scored = [
+        (
+            c.case.name,
+            c.medians["inductor"] / c.medians["catopt+inductor"],
+        )
+        for c in cells
+        if c.medians.get("inductor") and c.medians.get("catopt+inductor")
+    ]
+    best = max(scored, key=lambda t: t[1], default=None)
+    n_verified = sum(1 for r in recs if r.get("catopt_verified"))
+    findings = [
+        Finding(
+            claim=(
+                "the composed catopt+Inductor module beats plain "
+                "Inductor end-to-end"
+            ),
+            verdict=(
+                Verdict.WIN
+                if best and best[1] > 1.03
+                else Verdict.PARITY
+                if best and best[1] > 0.97
+                else Verdict.REGRESSION
+                if best
+                else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs Inductor on {best[0]}"
+                if best
+                else "no cell measured"
+            ),
+            metric="inductor / catopt+inductor",
+            value=best[1] if best else None,
+        ),
+        Finding(
+            claim="the optimized module verifies against eager",
+            verdict=(
+                Verdict.WIN
+                if recs and n_verified == len(recs)
+                else Verdict.REGRESSION
+            ),
+            headline=f"{n_verified}/{len(recs)} cells verified",
+            metric="verified cells",
+            value=float(n_verified),
+        ),
+    ]
     report = Report(
-        suite="e2e_model", cells=cells, env=collect_env(dev)
+        suite="e2e_model",
+        title="MiniGPT end-to-end",
+        summary=(
+            "Whole-model optimize + verify: pairing fires per block and "
+            "the composed module is timed against eager and Inductor."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")

@@ -67,14 +67,12 @@ import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np
 import torch
 
-
 from bench import benchkit
-from bench.suites.models.decode_bench import BatchedStories
 from bench.common.llama2c import load_llama2c
+from bench.suites.models.decode_bench import BatchedStories
 from bench.suites.models.stories15m_bench import resolve_ckpt
 
 QUICK = {"gen": "16", "ctx": "48", "repeats": "1"}
@@ -831,8 +829,62 @@ def run_bench(args) -> benchkit.Report:
 
     notes.append(INTEGRATION_RECIPE)
     env["notes"] = notes
+    agrees = [
+        res["token_agreement_vs_torch_eager"]
+        for res in vllm_results.values()
+        if res.get("token_agreement_vs_torch_eager") is not None
+    ]
+    best_agree = max(agrees) if agrees else None
+    findings = [
+        benchkit.Finding(
+            claim=(
+                "vLLM serves the catopt-exported HF model "
+                "token-for-token like torch eager greedy"
+            ),
+            verdict=(
+                benchkit.Verdict.WIN
+                if best_agree is not None and best_agree >= 0.99
+                else benchkit.Verdict.PARITY
+                if best_agree is not None
+                else benchkit.Verdict.INCONCLUSIVE
+            ),
+            headline=(
+                f"token agreement {best_agree:.3f} vs torch eager"
+                if best_agree is not None
+                else "vLLM leg not run"
+            ),
+            metric="token agreement",
+            value=best_agree,
+        ),
+        benchkit.Finding(
+            claim=(
+                "the optimized module exports to HF without changing "
+                "the computation"
+            ),
+            verdict=(
+                benchkit.Verdict.WIN
+                if vr.passed
+                else benchkit.Verdict.REGRESSION
+            ),
+            headline=(
+                f"optimize verify rel={vr.max_rel:.2e}; RoPE "
+                f"attention-score max|Δ|={rope_d:.2e}"
+            ),
+            metric="optimize verify rel",
+            value=float(vr.max_rel),
+        ),
+    ]
     return benchkit.Report(
-        suite="vllm_compare", cells=cells, env=env
+        suite="vllm_compare",
+        title="catopt vs vLLM and through it",
+        summary=(
+            "Three legs: verified HF export, fixed-window torch decode, "
+            "and vLLM serving the exported checkpoint — with token "
+            "agreement against torch eager greedy."
+        ),
+        findings=findings,
+        cells=cells,
+        env=env,
     )
 
 

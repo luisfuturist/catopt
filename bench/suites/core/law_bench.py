@@ -48,30 +48,18 @@ honest ``no-case`` row.  ``--sizes`` is a per-case scale knob —
 usually the feature dim ``d``; attention cases derive head dims
 from it.
 """
-# ruff: noqa: RUF003 — sys.path setup precedes imports;
+# ruff: noqa: RUF002 RUF003 — ×, − in docstrings are deliberate notation;
 # math notation (→, ×) in strings is deliberate, per bench convention.
 
 from __future__ import annotations
 
 import argparse
 import math
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
-from bench.benchkit import (
-    Case,
-    Finding,
-    Report,
-    Runner,
-    Variant,
-    Verdict,
-    collect_env,
-)
 from catopt_core.cost import backend_cost, dag_cost, executor_cost_for
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import (
@@ -96,6 +84,16 @@ from catopt_orchestrator.optimize import _lower_extracted
 from catopt_torch.adapters import TorchSink
 from catopt_torch.torch_bridge import (
     IRModule,  # noqa: F401 — docstring ref
+)
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
 )
 
 _B = 512  # batch rows for the matmul/elementwise cases

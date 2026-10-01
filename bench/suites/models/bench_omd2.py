@@ -67,23 +67,11 @@ import argparse
 import signal
 import sys
 import time
-from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
-
-from catopt_core.cost import _shape_of, flops_cost
-from catopt_core.egraph import EGraph
-from catopt_core.ir import IR, Op
 from catopt_carriers.omd_lower import to_batched_omd_module
-from catopt_torch.regime import default_rules
-from catopt_torch.torch_bridge import (
-    _IR_TO_TORCH,
-    export_to_ir,
-    ir_to_torch_module,
-)
 from catopt_carriers.trace_lift import lift_scan_to_trace
 from catopt_carriers.xcarrier import (
     XC_LAWS,
@@ -91,6 +79,15 @@ from catopt_carriers.xcarrier import (
     gather_apply_stack,
     gather_applyd_stack,
     omd_tree_lift,
+)
+from catopt_core.cost import _shape_of, flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import IR, Op
+from catopt_torch.regime import default_rules
+from catopt_torch.torch_bridge import (
+    _IR_TO_TORCH,
+    export_to_ir,
+    ir_to_torch_module,
 )
 
 OMD_ROOT_OPS = ("omd_apply", "omd_applym")

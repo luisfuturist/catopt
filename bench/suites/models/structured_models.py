@@ -57,7 +57,7 @@ budget — and which offers the default cost model declines.
     .venv/bin/python bench/structured_models.py --quick
     .venv/bin/python bench/structured_models.py --variants lora_r8,pruned_f0.4
 """
-# ruff: noqa: E402, RUF003 -- ×, ·, →, −, ‖ in
+# ruff: noqa: E402, RUF001, RUF003 -- ×, ·, →, −, ‖ in
 # strings/docstrings are deliberate math notation; sys.path setup
 # must precede the benchkit/catopt imports (bounded_e2e convention).
 
@@ -73,18 +73,25 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from catopt_core.cost import flops_cost
+from catopt_orchestrator import Compositional, Optimizer
+from catopt_torch.backend import TorchBackend
+from catopt_torch.report import verify_equiv
+
 from bench.benchkit import (
     Case,
     Cell,
+    Finding,
     Report,
     Runner,
     Variant,
+    Verdict,
     collect_env,
 )
+from bench.suites.algebra.real_win_hunt import try_compile
 from bench.suites.models.bounded_e2e import (
     _bounded_ledger,
     _fwd_stmt,
@@ -92,11 +99,6 @@ from bench.suites.models.bounded_e2e import (
     _prompt_set,
     _proxy_eval,
 )
-from catopt_core.cost import flops_cost
-from catopt_orchestrator import Compositional, Optimizer
-from catopt_torch.backend import TorchBackend
-from catopt_torch.report import verify_equiv
-from bench.suites.algebra.real_win_hunt import try_compile
 from bench.suites.models.stories15m_bench import Block
 
 # run_all.py picks these up for its --quick lane.
@@ -943,8 +945,73 @@ def run_bench(args) -> Report:
         flush=True,
     )
 
+    scored = []
+    for c in cells:
+        ms = c.medians
+        cats = [
+            (n, ms[n]) for n in ms if n.startswith("catopt") and ms[n]
+        ]
+        if cats and ms.get("inductor"):
+            n, t = min(cats, key=lambda kv: kv[1])
+            scored.append((c.case.name, ms["inductor"] / t, n))
+    best = max(scored, key=lambda x: x[1], default=None)
+    delivered = [
+        c for c in cells if c.aux.get("params_delivered")
+    ]
+    findings = [
+        Finding(
+            claim=(
+                "structured-model rewrites (LoRA / pruned / low-rank) "
+                "pay off where structure exists"
+            ),
+            verdict=(
+                Verdict.WIN
+                if (best and best[1] > 1.03) or delivered
+                else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs Inductor ({best[2]}) on "
+                f"{best[0]}; {len(delivered)} cells shipped derived "
+                "params"
+                if best
+                else f"{len(delivered)} cells shipped derived params"
+            ),
+            metric="best catopt / inductor",
+            value=best[1] if best else None,
+            evidence={
+                "cells_with_delivered_params": len(delivered),
+                "cells": len(cells),
+            },
+        ),
+        Finding(
+            claim="every optimized structured model verifies within the fp32 gate",
+            verdict=(
+                Verdict.WIN
+                if cells
+                and all(c.aux.get("fresh_rel") is not None for c in cells)
+                else Verdict.INCONCLUSIVE
+            ),
+            headline=(
+                f"{sum(1 for c in cells if c.aux.get('fresh_rel') is not None)}"
+                f"/{len(cells)} cells re-verified"
+            ),
+            metric="verified cells",
+            value=float(
+                sum(1 for c in cells if c.aux.get("fresh_rel") is not None)
+            ),
+        ),
+    ]
     report = Report(
-        suite="structured_models", cells=cells, env=collect_env(dev)
+        suite="structured_models",
+        title="Structured-model families",
+        summary=(
+            "LoRA / pruned / low-rank families: which bounded and "
+            "structural rewrites the detectors offer, what extraction "
+            "delivers, and the measured payoff."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")

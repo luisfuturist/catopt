@@ -1,7 +1,7 @@
 """Batched-input verification guards.
 
 Regression coverage for the intermittent batched failure reported by
-``bench/decode_bench.py``: an optimized member carrying a reshape
+``bench/suites/models/decode_bench.py``: an optimized member carrying a reshape
 specialized to a *different* cell's ``(B, T)`` — e.g. evaluating a
 ``(16, 256, 768)`` input through a ``reshape`` attr ``(16, 128, 12,
 64)`` baked for ``T=128`` — surfaced as
@@ -44,7 +44,7 @@ from catopt_orchestrator import Compositional, Optimizer
 from catopt_torch.backend import TorchBackend
 
 # ---------------------------------------------------------------------------
-#  A batched rope-style block — mirrors bench/decode_bench.py's BatchedBlock
+#  A batched rope-style block — mirrors bench/suites/models/decode_bench.py's BatchedBlock
 # ---------------------------------------------------------------------------
 
 

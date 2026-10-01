@@ -277,11 +277,19 @@ Rules also carry tags from `catopt_core.laws.tags` (pass
 pipeline budgets (`rules.tagged(EXPANSIVE)`).  The composable `RuleSet`
 presets live in `catopt_core.laws.ruleset`.
 
-Measure it: `python bench/law_bench.py --laws <name[,name|group]>`
-`--sizes <d[,d]>` — per law: registered synthetic term → `eg.run` on
-that rule alone → extraction (pipeline cost model) → `_lower_extracted`
-→ `sink.verify` → timed before/after.  Table shows fired / rhs-member /
-picked / verified / cost & ms before→after; non-firing laws report
-honestly.  Add a builder in `LAW_CASES` keyed by rule name for new
-laws.  Gates: `uv run pytest`, `.venv/bin/ty`,
-`.venv/bin/ruff check` (packages), coverage stays 100.
+Measure it: `python -m bench run law_bench --laws <name[,name|group]>`
+(or directly `python -m bench.suites.core.law_bench --sizes <d[,d]>`) —
+per law: registered synthetic term → `eg.run` on that rule alone →
+extraction (pipeline cost model) → `_lower_extracted` → `sink.verify` →
+timed before/after.  Table shows fired / rhs-member / picked / verified /
+cost & ms before→after; non-firing laws report honestly.  Add a builder
+in `LAW_CASES` keyed by rule name for new laws.  Gates: `uv run pytest`,
+`.venv/bin/ty`, `.venv/bin/ruff check` (packages), coverage stays 100.
+
+Benchmarks are a package, not scripts: `python -m bench list` shows the
+catalog; `python -m bench run <suite>` emits JSON + Markdown + HTML +
+plotly plots (+ optional Quarto/Slidev) from one canonical `Report`;
+`python -m bench dashboard` builds the cross-suite HTML index.  Suites
+live in `bench/suites/{core,algebra,models}/` and expose
+`run_bench(args) -> Report`; shared data (checkpoint loaders) is in
+`bench/common/`.  Details in `bench/README.md`.

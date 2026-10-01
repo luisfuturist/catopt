@@ -45,26 +45,22 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
-import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np
 import torch
 import torch.nn.functional as F
+from catopt_orchestrator import Compositional, Optimizer
+from catopt_torch.backend import TorchBackend
+from catopt_torch.report import CompositionalReport, verify_equiv
 from torch.utils.benchmark import Timer
 
-from catopt_torch.report import CompositionalReport, verify_equiv
 from bench.common.llama2c import load_llama2c
 from bench.suites.models.stories15m_bench import (
     Block,
     Stories15M,
     resolve_ckpt,
 )
-from catopt_orchestrator import Compositional, Optimizer
-
-from catopt_torch.backend import TorchBackend
 
 
 # ---------------------------------------------------------------------------

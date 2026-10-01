@@ -333,7 +333,7 @@ def test_real_stories15m_checkpoint_offers_zero():
         share_duplicate_params,
     )
 
-    from bench.llama2c import load_llama2c
+    from bench.common.llama2c import load_llama2c
 
     w = load_llama2c(CKPT)
     src = {}

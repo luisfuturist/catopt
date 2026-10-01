@@ -42,7 +42,7 @@ packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         --device cuda
     .venv/bin/python bench/laws_effect.py --device cpu --quick
 """
-# ruff: noqa: E402, RUF003 -- ×, ·, → in strings/docstrings are
+# ruff: noqa: E402, RUF001, RUF003 -- ×, ·, → in strings/docstrings are
 # deliberate math notation; sys.path setup must precede the
 # benchkit/catopt imports (bench_omd2 convention).
 
@@ -57,25 +57,31 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
-
 from catopt_core.cost import flops_cost, launch_aware_cost
 from catopt_core.ir import IR, Op
+from catopt_orchestrator import Compositional, Optimizer
 from catopt_orchestrator.regime import (
     Regime,
     build_egraph,
     regime_frontier,
 )
+from catopt_torch.backend import TorchBackend
 from catopt_torch.report import verify_equiv
 from catopt_torch.torch_bridge import ir_to_torch_module
-from bench.suites.algebra.real_win_hunt import try_compile
-from catopt_orchestrator import Compositional, Optimizer
 
-from catopt_torch.backend import TorchBackend
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
+from bench.suites.algebra.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -719,8 +725,63 @@ def run_bench(args) -> Report:
         flush=True,
     )
 
+    scored = []
+    for cell in cells:
+        ms = cell.medians
+        cats = [
+            (n, ms[n]) for n in ms if n.startswith("catopt") and ms[n]
+        ]
+        if cats and ms.get("eager"):
+            n, t = min(cats, key=lambda kv: kv[1])
+            scored.append((cell.case.name, ms["eager"] / t, n))
+    best = max(scored, key=lambda x: x[1], default=None)
+    n_verified = sum(
+        1
+        for r in recs
+        if r.get("cross_verified")
+        or r.get("decode_verified")
+        or r.get("catopt_verified")
+    )
+    findings = [
+        Finding(
+            claim=(
+                "the law-driven rewrites beat eager on at least one "
+                "model family"
+            ),
+            verdict=(
+                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs eager ({best[2]}) on "
+                f"{best[0]}"
+                if best
+                else "no family beats eager"
+            ),
+            metric="best catopt / eager",
+            value=best[1] if best else None,
+        ),
+        Finding(
+            claim="every rewritten family verifies equivalent",
+            verdict=(
+                Verdict.WIN
+                if recs and n_verified == len(recs)
+                else Verdict.REGRESSION
+            ),
+            headline=f"{n_verified}/{len(recs)} families verified",
+            metric="verified families",
+            value=float(n_verified),
+        ),
+    ]
     report = Report(
-        suite="laws_effect", cells=cells, env=collect_env(dev)
+        suite="laws_effect",
+        title="Laws applied to model families",
+        summary=(
+            "Which rewrite laws actually pay off, per model family: "
+            "fires / picked / verified / measured speedup."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")

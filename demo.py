@@ -34,7 +34,7 @@ Usage:
     python demo.py --device cuda    # GPU
     python demo.py --quick          # shorter timing loop
 
-    # CUDA dev venv (see bench/results/GPU_RUN.md):
+    # CUDA dev venv (see bench/README.md for the GPU recipe):
     PYTHONPATH="packages/catopt-core/src:packages/catopt-torch/src:\
 packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python demo.py --device cuda

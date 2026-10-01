@@ -35,7 +35,7 @@ Usage:
     .venv/bin/python bench/bounded_e2e.py --device cpu
     .venv/bin/python bench/bounded_e2e.py --quick
 """
-# ruff: noqa: E402, RUF003 -- ×, ·, →, −, ‖ in
+# ruff: noqa: E402, RUF001, RUF003 -- ×, ·, →, −, ‖ in
 # strings/docstrings are deliberate math notation; sys.path setup
 # must precede the benchkit/catopt imports (bench_omd2 convention).
 
@@ -51,19 +51,10 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import catopt_orchestrator.morphisms_kv as K
 import numpy as np
 import torch
 import torch.nn.functional as F
-from bench.benchkit import (
-    Case,
-    Cell,
-    Report,
-    Runner,
-    Variant,
-    collect_env,
-)
 from catopt_orchestrator import (
     Compositional,
     MorphismSearch,
@@ -72,9 +63,23 @@ from catopt_orchestrator import (
 )
 from catopt_torch.backend import TorchBackend
 from catopt_torch.report import verify_equiv
+
+from bench.benchkit import (
+    Case,
+    Cell,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
 from bench.common.llama2c import load_llama2c
 from bench.suites.algebra.real_win_hunt import try_compile
-from bench.suites.models.stories15m_bench import Stories15M, resolve_ckpt
+from bench.suites.models.stories15m_bench import (
+    Stories15M,
+    resolve_ckpt,
+)
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -698,8 +703,63 @@ def run_bench(args) -> Report:
             )
         )
 
+    timed = [r for r in recs if not r.get("opt_error")]
+    delivered = [
+        r for r in recs if r.get("n_bounds_delivered", 0) > 0
+    ]
+    offered = [r for r in recs if r.get("n_bounded_offers", 0) > 0]
+    best = max(
+        (r.get("speedup_vs_eager") or 0.0 for r in recs), default=0.0
+    )
+    findings = [
+        Finding(
+            claim=(
+                "bounded rewrites (error_budget) buy wall-time on a "
+                "real checkpoint"
+            ),
+            verdict=(
+                Verdict.WIN
+                if delivered and best > 1.03
+                else Verdict.NEGATIVE
+                if not delivered
+                else Verdict.PARITY
+            ),
+            headline=(
+                f"{len(delivered)}/{len(timed)} budgets delivered a "
+                f"bounded member; best {best:.3f}× vs eager"
+            ),
+            metric="budgets delivering",
+            value=float(len(delivered)),
+            evidence={
+                "budgets_offered": len(offered),
+                "declined_by_gate": sum(
+                    1 for r in recs if r.get("bound_declines")
+                ),
+            },
+        ),
+        Finding(
+            claim="every budget's optimized module stays within the fp32 gate",
+            verdict=(
+                Verdict.WIN
+                if timed and len(timed) == len(recs)
+                else Verdict.INCONCLUSIVE
+            ),
+            headline=f"{len(timed)}/{len(recs)} budgets optimized cleanly",
+            metric="clean budgets",
+            value=float(len(timed)),
+        ),
+    ]
     report = Report(
-        suite="bounded_e2e", cells=cells, env=collect_env(dev)
+        suite="bounded_e2e",
+        title="Certified bounded rewrites on a checkpoint",
+        summary=(
+            "search(error_budget=B) sweep on stories15M: speedup vs "
+            "bound vs held-out KL / top-k drift — including the honest "
+            "negative when the gate declines every candidate."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")

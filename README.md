@@ -103,15 +103,15 @@ equivalent:
 
 | Regime | Result |
 |---|---|
-| Blocks with exploitable structure (`bench/real_win_hunt.py`) | **~1.1–10× vs Inductor** — unnormalized-attention reassoc ~2×, PaLM parallel blocks ~1.2×, expert-sum weight fold ~7× |
-| Carrier + CUDA-graph decode (`bench/decode_scan_bench.py`, `decode_retnet`) | **1.65–3.4× vs Inductor / best non-carrier** — chunked scan carriers amortize to zero launches |
-| Deep weight chains (`bench/reassoc_scale.py`) | 8.9–16.1× vs Inductor — a form Inductor's post-grad graph provably can't reach |
-| Morphism windows (`bench/morphism_e2e.py`) | **12.4–12.5× measured wall** on 4-block chains at GEMM-bound sizes — term flops −92% fully translates; 10.7–11.4× vs plain Inductor (the compile-time weight fold is out of its reach) |
+| Blocks with exploitable structure (`bench/suites/algebra/real_win_hunt.py`) | **~1.1–10× vs Inductor** — unnormalized-attention reassoc ~2×, PaLM parallel blocks ~1.2×, expert-sum weight fold ~7× |
+| Carrier + CUDA-graph decode (`bench/suites/algebra/decode_scan_bench.py`, `decode_retnet`) | **1.65–3.4× vs Inductor / best non-carrier** — chunked scan carriers amortize to zero launches |
+| Deep weight chains (`bench/suites/algebra/reassoc_scale.py`) | 8.9–16.1× vs Inductor — a form Inductor's post-grad graph provably can't reach |
+| Morphism windows (`bench/suites/algebra/morphism_e2e.py`) | **12.4–12.5× measured wall** on 4-block chains at GEMM-bound sizes — term flops −92% fully translates; 10.7–11.4× vs plain Inductor (the compile-time weight fold is out of its reach) |
 | Residual reassoc (`ResidualReassoc`) | term flops −66% → measured 1.3–2.2× (partial conversion — distributed adds/fillers eat headroom; +inductor recovers more) |
 | KV latent sharing (`KVLatentShare`, opt-in) | kv flops/bytes −62.5%, module params −31% — a memory/params win, NOT wall-time (compute parity, −14% at tiny sizes — reported honestly) |
 | Bounded rewrites (`error_budget=`) | certified-approximation mode: `search(..., error_budget=1e-3)` accepts rewrites whose propagated output bound fits the budget. **stories15M: 1.15–1.32× vs Inductor** (bound 1e-4→1e-2) — near-dup tied-head rows elide, KL≈0 at the tight end, bounds always recorded + verified-with-tolerance. `None` = exact only |
-| Whole model E2E (`bench/e2e_model.py`) | **~1.05× over plain Inductor** — pairing fires per block, verified fp64-exact |
-| Real trained checkpoints (stories15M/110M) | Exact mode: parity (dense weights carry ~zero bitwise structure — measured by `bench/structure_census.py`). Bounded mode: **1.15–1.32× vs Inductor** on stories15M via the collapsed tied head |
+| Whole model E2E (`bench/suites/models/e2e_model.py`) | **~1.05× over plain Inductor** — pairing fires per block, verified fp64-exact |
+| Real trained checkpoints (stories15M/110M) | Exact mode: parity (dense weights carry ~zero bitwise structure — measured by `bench/suites/core/structure_census.py`). Bounded mode: **1.15–1.32× vs Inductor** on stories15M via the collapsed tied head |
 
 This is **not** a universal speedup. Attention and GEMM-bound code is
 already optimal — expect a parity floor there — and the losses are
@@ -138,28 +138,39 @@ makes it bit-for-bit reproducible.
 
 ## Benchmarks
 
-Every claim above is a runnable script under `bench/`; details and
-per-suite flags in `bench/README.md`.
+Every claim above is a runnable suite under `bench/`.  The harness is
+a real system, not a pile of scripts:
 
-| Script | Measures |
-|---|---|
-| `reassoc_scale.py` | k-deep weight chain → 1 GEMM; dumps Inductor's post-grad graph to prove the form unreachable |
-| `search_efficiency.py` | saturation cost vs the Catalan-sized program space |
-| `real_win_hunt.py` | autotuned wins on realistic block topologies |
-| `real_linear_attn.py` | scan lift on RetNet/GLA/delta-rule blocks, CPU+CUDA |
-| `decode_scan_bench.py` | chunked decode on carriers, eager vs CUDA-graphed |
-| `decode_bench.py` | launch-bound (B,T) sweep — the falsified hypothesis, losses included |
-| `stories15m_bench.py` | real llama2.c checkpoints through `strategy=Compositional()` |
-| `e2e_model.py`, `e2e_llm.py`, `e2e_models2.py` | whole-model E2E: llama-toy, ~0.4B prefill+decode, non-decoder shapes |
-| `model_bench.py` | complete multi-block models: latency, peak memory, compile time |
-| `cost_fidelity.py` | predicted-cost vs measured-latency rank correlation |
-| `killer_demo.py` | `Autotuned` per-model lowering selection |
-| `law_bench.py` | per-rewrite-law value harness |
-| `morphism_e2e.py` | term-flops → wall-time conversion for the morphism laws |
-| `bounded_e2e.py` | `error_budget` sweep on a real checkpoint (speedup vs bound vs KL/top-k drift) |
-| `structure_census.py` | how much catopt-exploitable structure real trained weights carry |
-| `bound_amplification.py` | weight-bound → output-error propagation on real activations |
-| `run_all.py` | drives the harnessed suites, writes `bench/results/` |
+```bash
+python -m bench list                       # the catalog
+python -m bench run reassoc_scale --quick   # one suite → JSON+MD+HTML+plots
+python -m bench run-all --quick             # every harnessed suite
+python -m bench dashboard                   # cross-suite HTML index
+```
+
+Each suite states its conclusion as a typed **finding** (win / parity /
+regression / negative) with the supporting metric, so every surface —
+JSON, Markdown, the HTML dashboard, a Quarto document, Slidev assets —
+is rendered from one canonical report.  See `bench/README.md`.
+
+| Suite | Category | Measures |
+|---|---|---|
+| `reassoc_scale` | algebra | k-deep weight chain → 1 GEMM; dumps Inductor's post-grad graph to prove the form unreachable |
+| `search_efficiency` | core | saturation cost vs the Catalan-sized program space |
+| `real_win_hunt` | algebra | autotuned wins on realistic block topologies |
+| `real_linear_attn` | algebra | scan lift on RetNet/GLA/delta-rule blocks, CPU+CUDA |
+| `decode_scan_bench` | algebra | chunked decode on carriers, eager vs CUDA-graphed |
+| `decode_bench` | models | launch-bound (B,T) sweep — the falsified hypothesis, losses included |
+| `stories15m_bench` | models | real llama2.c checkpoints through `strategy=Compositional()` |
+| `e2e_model`, `e2e_llm`, `e2e_models2` | models | whole-model E2E: llama-toy, ~0.4B prefill+decode, non-decoder shapes |
+| `model_bench` | models | complete multi-block models: latency, peak memory, compile time |
+| `cost_fidelity` | core | predicted-cost vs measured-latency rank correlation |
+| `killer_demo` | algebra | `Autotuned` per-model lowering selection |
+| `law_bench` | core | per-rewrite-law value harness |
+| `morphism_e2e` | algebra | term-flops → wall-time conversion for the morphism laws |
+| `bounded_e2e` | models | `error_budget` sweep on a real checkpoint (speedup vs bound vs KL/top-k drift) |
+| `structure_census` | core | how much catopt-exploitable structure real trained weights carry |
+| `bound_amplification` | core | weight-bound → output-error propagation on real activations |
 
 ## API surface
 

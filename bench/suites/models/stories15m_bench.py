@@ -17,17 +17,15 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from catopt_orchestrator import Compositional, Optimizer
+from catopt_torch.backend import TorchBackend
 from torch.utils.benchmark import Timer
 
 from bench.common.llama2c import load_llama2c
-from catopt_orchestrator import Compositional, Optimizer
-
-from catopt_torch.backend import TorchBackend
 
 
 def cache_dir() -> Path:

@@ -62,17 +62,25 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import catopt_orchestrator.morphisms as M
 import catopt_orchestrator.morphisms_kv as K
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
 from catopt_orchestrator import MorphismSearch, Optimizer
 from catopt_torch.backend import TorchBackend
 from catopt_torch.models import DeepParallel
 from catopt_torch.report import verify_equiv
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
 from bench.suites.algebra.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane.
@@ -690,8 +698,58 @@ def run_bench(args) -> Report:
         flush=True,
     )
 
+    scored = [
+        (r["name"], r["speedup_morph_vs_eager"])
+        for r in recs
+        if r.get("speedup_morph_vs_eager")
+    ]
+    best = max(scored, key=lambda t: t[1], default=None)
+    n_verified = sum(1 for r in recs if r.get("morph_verified"))
+    findings = [
+        Finding(
+            claim=(
+                "morphism windows convert term-level flops headroom "
+                "into measured wall time"
+            ),
+            verdict=(
+                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs eager on {best[0]}"
+                if best
+                else "no cell converts to wall-time"
+            ),
+            metric="morphism / eager",
+            value=best[1] if best else None,
+            evidence={
+                "term_flops_ratio": {
+                    r["name"]: r.get("flops_ratio") for r in recs
+                }
+            },
+        ),
+        Finding(
+            claim="every morphism rewrite verifies equivalent",
+            verdict=(
+                Verdict.WIN
+                if recs and n_verified == len(recs)
+                else Verdict.REGRESSION
+            ),
+            headline=f"{n_verified}/{len(recs)} cells verified",
+            metric="verified cells",
+            value=float(n_verified),
+        ),
+    ]
     report = Report(
-        suite="morphism_e2e", cells=cells, env=collect_env(dev)
+        suite="morphism_e2e",
+        title="Morphism-window composition",
+        summary=(
+            "Term-flops → wall-time conversion for the morphism laws: "
+            "which structural rewrites actually pay off at GEMM-bound "
+            "sizes."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")

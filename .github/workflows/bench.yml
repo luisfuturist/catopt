@@ -1,0 +1,69 @@
+# Nightly benchmarks — NON-BLOCKING.
+#
+# The bench suites are heavy (some optimize whole models for minutes) and
+# machine-sensitive, so they never gate a pull request.  This workflow
+# runs them on a schedule (and on demand), publishes the JSON / Markdown /
+# HTML / plot artifacts, and reports regressions against the committed
+# `bench/baselines/`.  Every bench step is `continue-on-error` — a red
+# step is a signal to look, not a merge blocker.
+#
+# Local equivalent:
+#   python -m bench run-all --quick --device cpu
+#   python -m bench dashboard
+#   python -m bench gate
+name: bench
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # nightly, 04:17 UTC
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: "short sweeps"
+        type: boolean
+        default: true
+      suites:
+        description: "comma-separated suites (default: all harnessed)"
+        type: string
+        default: ""
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: uv sync (dev + bench groups)
+        run: uv sync --group dev --group bench
+
+      - name: Force CPU torch build
+        run: uv pip install --torch-backend cpu --reinstall torch
+
+      - name: run suites
+        continue-on-error: true
+        run: |
+          QUICK=""
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.quick }}" = "true" ]; then
+            QUICK="--quick"
+          fi
+          .venv/bin/python -m bench run-all --device cpu $QUICK \
+            --suites "${{ inputs.suites }}"
+
+      - name: dashboard
+        continue-on-error: true
+        run: .venv/bin/python -m bench dashboard
+
+      - name: regression gate
+        continue-on-error: true
+        run: .venv/bin/python -m bench gate
+
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/results/
+          retention-days: 30

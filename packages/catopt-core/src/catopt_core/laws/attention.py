@@ -5,7 +5,7 @@ graphs spell rotary position embedding as elementwise chains.  Three
 spellings have been observed in ``export_to_ir`` output:
 
 * **half-split cat** (``cat([x1·c − x2·s, x2·c + x1·s], -1)``, the
-  ``bench/e2e_model._apply_rope`` / Llama form): contiguous
+  ``bench.suites.models.e2e_model._apply_rope`` / Llama form): contiguous
   ``[0,h)`` / ``[h,2h)`` slices of the feature axis feeding a
   ``sub``/``add`` pair under one ``concat``;
 * **rotate-half add** (``x·cos + rotate_half(x)·sin``, the HF

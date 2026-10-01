@@ -30,7 +30,7 @@ packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \
         /tmp/catopt-cuda-venv/bin/python bench/killer_demo.py \
         --device cuda
 """
-# ruff: noqa: E402 -- sys.path setup must precede the benchkit/catopt
+# ruff: noqa: E402, RUF001 -- sys.path setup must precede the benchkit/catopt
 # imports (bench_omd2 / real_linear_attn convention).
 
 from __future__ import annotations
@@ -43,18 +43,31 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
-from catopt_torch.models import LinearRecurrence, MatrixChain, ResidualMLP
-
-from bench.suites.algebra.real_linear_attn import LinearAttnStack, try_compile
-from catopt_orchestrator.optimize import Autotuned
 from catopt_orchestrator import Optimizer
-
+from catopt_orchestrator.optimize import Autotuned
 from catopt_torch.autotune import TORCH_BUILDERS
 from catopt_torch.backend import TorchBackend
+from catopt_torch.models import (
+    LinearRecurrence,
+    MatrixChain,
+    ResidualMLP,
+)
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
+from bench.suites.algebra.real_linear_attn import (
+    LinearAttnStack,
+    try_compile,
+)
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -314,8 +327,56 @@ def run_bench(args) -> Report:
         flush=True,
     )
 
+    scored = [
+        (c.case.name, c.medians["eager"] / c.medians["catopt_best"])
+        for c in cells
+        if c.medians.get("eager") and c.medians.get("catopt_best")
+    ]
+    best = max(scored, key=lambda t: t[1], default=None)
+    n_verified = sum(1 for r in results if r["aux"]["verified"])
+    findings = [
+        Finding(
+            claim=(
+                "the Autotuned lowering beats eager on at least one "
+                "model"
+            ),
+            verdict=(
+                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs eager on {best[0]}"
+                if best
+                else "no model beats eager"
+            ),
+            metric="catopt_best / eager",
+            value=best[1] if best else None,
+            evidence={
+                "picks": {r["name"]: r["aux"]["pick"] for r in results}
+            },
+        ),
+        Finding(
+            claim="every model's optimized lowering verifies",
+            verdict=(
+                Verdict.WIN
+                if n_verified == len(results)
+                else Verdict.REGRESSION
+            ),
+            headline=f"{n_verified}/{len(results)} models verified",
+            metric="verified models",
+            value=float(n_verified),
+        ),
+    ]
     report = Report(
-        suite="killer_demo", cells=cells, env=collect_env(dev)
+        suite="killer_demo",
+        title="Compositional pairing demo",
+        summary=(
+            "Per-model lowering autotune (eager / generic / batched / "
+            "compiled): the fastest verified lowering is reported, "
+            "including when eager wins."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
 
     if not getattr(args, "no_artifacts", False):

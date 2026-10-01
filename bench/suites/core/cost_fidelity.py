@@ -68,11 +68,12 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
-from catopt_torch.adapters import TorchSink
-from catopt_torch.calibrate import calibrate
+from catopt_carriers.scan_lower import (
+    is_scan_apply_term,
+    to_batched_scan_module,
+)
+from catopt_core import laws
 from catopt_core.cost import (
     backend_cost,
     count_cost,
@@ -87,15 +88,27 @@ from catopt_core.cost import (
     roofline_cost,
     roofline_cost_for,
 )
-from catopt_core import laws
 from catopt_core.ir import IR, op_repr
+from catopt_orchestrator import Optimizer
+from catopt_orchestrator.optimize import (
+    OptimizationResourceError,
+    discover_alternatives,
+)
+from catopt_torch.adapters import TorchSink, TorchSource
+from catopt_torch.backend import TorchBackend
+from catopt_torch.calibrate import calibrate
 from catopt_torch.models import AttentionBlock, SwiGLU
-from catopt_orchestrator.optimize import OptimizationResourceError, discover_alternatives
-
-
-from catopt_carriers.scan_lower import is_scan_apply_term, to_batched_scan_module
-from catopt_torch.adapters import TorchSource
 from catopt_torch.torch_bridge import ir_to_torch_module
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
 from bench.suites.algebra.real_linear_attn import (
     LinearAttnStack,
     _canonical_scan_term,
@@ -103,9 +116,6 @@ from bench.suites.algebra.real_linear_attn import (
     try_compile,
 )
 from bench.suites.algebra.reassoc_scale import LinearAttnChain
-from catopt_orchestrator import Optimizer
-
-from catopt_torch.backend import TorchBackend
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {"models": "chain,retnet", "top_k": 4}
@@ -1110,8 +1120,76 @@ def run_bench(args: argparse.Namespace) -> Report:
         if dev.type == "cuda":
             torch.cuda.empty_cache()
 
+    ok = [c for c in results if c.get("metrics")]
+
+    def _median_rho(fn: str) -> float | None:
+        rhos = sorted(
+            c["metrics"][fn]["rho"]
+            for c in ok
+            if math.isfinite(c["metrics"][fn].get("rho", float("nan")))
+        )
+        return rhos[len(rhos) // 2] if rhos else None
+
+    ranked = sorted(
+        (
+            (_median_rho(fn), fn, sum(
+                1 for c in ok if c["metrics"][fn].get("pick_ok")
+            ))
+            for fn in _COST_FN_NAMES
+        ),
+        key=lambda t: (t[0] is None, -(t[0] or 0.0)),
+    )
+    best_rho, best_fn, best_picks = ranked[0] if ranked else (None, None, 0)
+    findings = [
+        Finding(
+            claim=(
+                "the pipeline cost model ranks candidates like "
+                "measured latency"
+            ),
+            verdict=(
+                Verdict.WIN
+                if best_rho and best_rho > 0.9 and best_picks == len(ok)
+                else Verdict.PARITY
+                if best_rho and best_rho > 0.5
+                else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"{best_fn}: median ρ {best_rho:.3f}, pick accuracy "
+                f"{best_picks}/{len(ok)}"
+                if best_rho is not None
+                else "no finite rank correlation measured"
+            ),
+            metric=f"median ρ ({best_fn})",
+            value=best_rho,
+            evidence={
+                "by_cost_fn": {
+                    fn: round(r, 4) for r, fn, _ in ranked if r is not None
+                }
+            },
+        ),
+        Finding(
+            claim="the cost model picks the measured-fastest candidate",
+            verdict=(
+                Verdict.WIN
+                if ok and best_picks == len(ok)
+                else Verdict.INCONCLUSIVE
+            ),
+            headline=f"{best_picks}/{len(ok)} cells pick-accurate",
+            metric="pick accuracy",
+            value=float(best_picks),
+        ),
+    ]
     report = Report(
-        suite="cost_fidelity", cells=report_cells, env=collect_env(dev)
+        suite="cost_fidelity",
+        title="Cost-model fidelity vs measured",
+        summary=(
+            "Predicted-cost vs measured-latency rank correlation (ρ) "
+            "and pick accuracy per cost function — does the search "
+            "price candidates the way the backend actually runs them?"
+        ),
+        findings=findings,
+        cells=report_cells,
+        env=collect_env(dev),
     )
 
     if not getattr(args, "no_artifacts", False):

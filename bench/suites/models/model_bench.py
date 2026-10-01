@@ -74,23 +74,29 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from bench.benchkit import Case, Report, Runner, Variant, collect_env
-from catopt_torch.models import ParallelBlock, ParallelConv
-from catopt_orchestrator.optimize import OptimizationResourceError
-
-
-
-from bench.suites.algebra.real_linear_attn import LinearAttnStack
-from bench.suites.algebra.real_win_hunt import _rel_diff, try_compile
-from catopt_orchestrator.optimize import Autotuned
 from catopt_orchestrator import Optimizer
-
+from catopt_orchestrator.optimize import (
+    Autotuned,
+    OptimizationResourceError,
+)
 from catopt_torch.autotune import TORCH_BUILDERS
 from catopt_torch.backend import TorchBackend
+from catopt_torch.models import ParallelBlock, ParallelConv
+
+from bench.benchkit import (
+    Case,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
+from bench.suites.algebra.real_linear_attn import LinearAttnStack
+from bench.suites.algebra.real_win_hunt import _rel_diff, try_compile
 
 # run_all.py picks these up for its --quick lane.  The decoder cell is
 # dropped from --quick: the paired-DAG ``dag_cost`` pass costs ~75s per
@@ -692,8 +698,61 @@ def run_bench(args) -> Report:
         f"  total wall time {time.perf_counter() - t0:.1f}s", flush=True
     )
 
+    scored = [
+        (
+            c.case.name,
+            c.medians["inductor"] / c.medians["catopt_best"],
+            c.medians["eager"] / c.medians["catopt_best"],
+        )
+        for c in cells
+        if c.medians.get("inductor") and c.medians.get("catopt_best")
+    ]
+    best = max(scored, key=lambda t: t[1], default=None)
+    n_verified = sum(1 for r in recs if r.get("verified"))
+    findings = [
+        Finding(
+            claim=(
+                "whole multi-block models beat Inductor under the "
+                "autotuned lowering"
+            ),
+            verdict=(
+                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs Inductor ({best[2]:.2f}× vs "
+                f"eager) on {best[0]}"
+                if best
+                else "no model beats Inductor"
+            ),
+            metric="catopt_best / inductor",
+            value=best[1] if best else None,
+            evidence={
+                "picks": {r["name"]: r.get("pick") for r in recs}
+            },
+        ),
+        Finding(
+            claim="every optimized model verifies equivalent",
+            verdict=(
+                Verdict.WIN
+                if recs and n_verified == len(recs)
+                else Verdict.REGRESSION
+            ),
+            headline=f"{n_verified}/{len(recs)} models verified",
+            metric="verified models",
+            value=float(n_verified),
+        ),
+    ]
     report = Report(
-        suite="model_bench", cells=cells, env=collect_env(dev)
+        suite="model_bench",
+        title="Whole-model optimize + verify",
+        summary=(
+            "Complete multi-block models: latency, peak memory and "
+            "compile time for eager / Inductor / the autotuned catopt "
+            "lowering, verified per model."
+        ),
+        findings=findings,
+        cells=cells,
+        env=collect_env(dev),
     )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")

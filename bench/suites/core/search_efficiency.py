@@ -55,6 +55,7 @@ Usage:
     .venv/bin/python bench/search_efficiency.py --depths 4,8,16 --out /tmp/se
     .venv/bin/python bench/search_efficiency.py --no-artifacts   # console only
 """
+# ruff: noqa: RUF001 -- math notation in strings/comments.
 
 from __future__ import annotations
 
@@ -62,13 +63,22 @@ import argparse
 import contextlib
 import itertools
 import math
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
+from catopt_core.cost import flops_cost
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, Param, TensorType
+from catopt_core.laws import (
+    ASSOC_MATMUL,
+    ASSOC_MATMUL_REV,
+    all_rules,
+)
+from catopt_core.meta import canonicalize, stratified_run
+from catopt_orchestrator import Optimizer
+from catopt_torch.backend import TorchBackend
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from bench.benchkit import (
     Case,
     Cell,
@@ -79,18 +89,6 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from catopt_core.cost import flops_cost
-from catopt_core.egraph import EGraph
-from catopt_core.ir import Op, Param, TensorType
-from catopt_core.meta import canonicalize, stratified_run
-from catopt_core.laws import (
-    ASSOC_MATMUL,
-    ASSOC_MATMUL_REV,
-    all_rules,
-)
-from catopt_orchestrator import Optimizer
-
-from catopt_torch.backend import TorchBackend
 
 #: Hidden dims pattern for the chain (varied so bracketings genuinely
 #: differ in FLOP cost — extraction solves the matrix-chain-ordering

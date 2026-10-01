@@ -312,7 +312,7 @@ def test_real_stories15m_checkpoint_has_no_exact_duplicates():
         share_duplicate_params,
     )
 
-    from bench.llama2c import load_llama2c
+    from bench.common.llama2c import load_llama2c
 
     w = load_llama2c(CKPT)
 

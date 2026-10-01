@@ -4,7 +4,7 @@
 carrier executors when the root is a carrier apply
 (``apply``/``applyd``/``om_apply``/``omd_apply[m]``); everything else
 goes through ``sink.lower``.  The routing matters because term-level
-cost is blind to the lowering (``bench/cost_fidelity.py``).
+cost is blind to the lowering (``bench/suites/core/cost_fidelity.py``).
 """
 
 import pytest

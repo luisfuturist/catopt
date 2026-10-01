@@ -64,7 +64,7 @@ Usage:
 packages/catopt-carriers/src:packages/catopt-orchestrator/src:." \\
         /tmp/catopt-cuda-venv/bin/python bench/e2e_llm.py --device cuda
 """
-# ruff: noqa: E402, RUF003 -- ×, ·, → in strings are deliberate math
+# ruff: noqa: E402, RUF001, RUF003 -- ×, ·, → in strings are deliberate math
 # notation; sys.path setup must precede benchkit/catopt imports.
 
 from __future__ import annotations
@@ -77,18 +77,25 @@ from pathlib import Path
 
 sys.setrecursionlimit(400_000)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from bench.benchkit import Case, Cell, Report, Runner, Variant, collect_env
-
-from catopt_torch.report import verify_equiv
-from bench.suites.algebra.real_win_hunt import try_compile
-from torch.utils.benchmark import Timer
 from catopt_orchestrator import Compositional, Optimizer
-
 from catopt_torch.backend import TorchBackend
+from catopt_torch.report import verify_equiv
+from torch.utils.benchmark import Timer
+
+from bench.benchkit import (
+    Case,
+    Cell,
+    Finding,
+    Report,
+    Runner,
+    Variant,
+    Verdict,
+    collect_env,
+)
+from bench.suites.algebra.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {
@@ -1161,7 +1168,63 @@ def run_bench(args) -> Report:
         "per-node eval overhead is included; catopt+inductor is the "
         "deployment path.",
     ]
-    report = Report(suite="e2e_llm", cells=cells, env=env)
+    scored = [
+        (
+            c.case.name,
+            c.medians["inductor"] / c.medians["catopt+inductor"],
+        )
+        for c in cells
+        if c.medians.get("inductor") and c.medians.get("catopt+inductor")
+    ]
+    best = max(scored, key=lambda t: t[1], default=None)
+    n_verified = sum(1 for c in cells if c.aux.get("catopt_verified"))
+    findings = [
+        Finding(
+            claim=(
+                "the composed catopt+Inductor LLM beats plain Inductor "
+                "end-to-end"
+            ),
+            verdict=(
+                Verdict.WIN
+                if best and best[1] > 1.05
+                else Verdict.PARITY
+                if best and best[1] > 0.97
+                else Verdict.REGRESSION
+                if best
+                else Verdict.NEGATIVE
+            ),
+            headline=(
+                f"best {best[1]:.2f}× vs Inductor on {best[0]}"
+                if best
+                else "no cell measured"
+            ),
+            metric="inductor / catopt+inductor",
+            value=best[1] if best else None,
+        ),
+        Finding(
+            claim="the optimized LLM verifies against eager",
+            verdict=(
+                Verdict.WIN
+                if cells and n_verified == len(cells)
+                else Verdict.REGRESSION
+            ),
+            headline=f"{n_verified}/{len(cells)} cells verified",
+            metric="verified cells",
+            value=float(n_verified),
+        ),
+    ]
+    report = Report(
+        suite="e2e_llm",
+        title="LLM block end-to-end",
+        summary=(
+            "Prefill + KV-cache decode on an in-repo llama-scale "
+            "model: eager / Inductor / catopt / catopt+Inductor, "
+            "verified per step."
+        ),
+        findings=findings,
+        cells=cells,
+        env=env,
+    )
     if not getattr(args, "no_artifacts", False):
         out_dir = Path(getattr(args, "out", None) or "bench/results")
         out_dir.mkdir(parents=True, exist_ok=True)

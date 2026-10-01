@@ -1,0 +1,226 @@
+{
+  "schema": 1,
+  "suite": "reassoc_scale",
+  "title": "Weight-chain reassociation vs Inductor",
+  "summary": "Deep x @ W1 @ \u2026 @ Wk chains: the e-graph finds the weights-first form (one runtime GEMM) and the post-grad FX capture proves Inductor cannot reach it.",
+  "env": {
+    "timestamp_utc": "2026-10-01T22:58:20+00:00",
+    "python": "3.13.9",
+    "torch": "2.14.0+cpu",
+    "torch_cuda": "none",
+    "device": "cpu",
+    "device_name": "12th Gen Intel(R) Core(TM) i5-12500H",
+    "cpu_count": 16,
+    "git_sha": "dd32485",
+    "git_dirty": true,
+    "argv": [
+      "/home/luis/Desktop/catopt/bench/__main__.py",
+      "run",
+      "reassoc_scale",
+      "--quick",
+      "--device",
+      "cpu",
+      "--out",
+      "/tmp/benchrun"
+    ]
+  },
+  "provenance": {},
+  "units": {
+    "median_s": "seconds",
+    "iqr_s": "seconds"
+  },
+  "findings": [
+    {
+      "claim": "catopt reaches a weight-folded form Inductor's post-grad graph cannot express",
+      "verdict": "win",
+      "headline": "4.10\u00d7 vs Inductor at (k,d,B\u00b7T)=(4,512,4096) (4.21\u00d7 vs eager)",
+      "metric": "catopt+inductor / inductor",
+      "value": 4.098600164872988,
+      "evidence": {
+        "inductor_mm": 4,
+        "catopt_mm": 1,
+        "x_vs_eager": 4.212733777147151
+      }
+    },
+    {
+      "claim": "every timed cell passes the fp32 equivalence gate",
+      "verdict": "win",
+      "headline": "2/2 cells verified",
+      "metric": "verified cells",
+      "value": 2.0,
+      "evidence": {}
+    }
+  ],
+  "cells": [
+    {
+      "name": "k2_d512_R4096",
+      "params": {
+        "k": 2,
+        "d": 512,
+        "R": 4096
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": 4294967296.0,
+          "note": "left-assoc chain: k sequential (R,d)@(d,d) GEMMs"
+        },
+        {
+          "name": "inductor",
+          "flops": 4294967296.0,
+          "note": "torch.compile original \u2014 post-grad graph still 2 left-assoc mms"
+        },
+        {
+          "name": "manual_ref",
+          "flops": 2147483648.0,
+          "note": "hand-folded W_eff \u2014 the reachable optimum (+0.27 GF fold paid once at construction)"
+        },
+        {
+          "name": "catopt",
+          "flops": 2147483648.0,
+          "note": "e-graph extraction matmul(x, W_q@W_kv1@\u2026@W_kv1) \u2014 weights-first \u2014 weight product folds to a fused param at lowering"
+        },
+        {
+          "name": "catopt_inductor",
+          "flops": 2147483648.0,
+          "note": "catopt module under the same Inductor backend"
+        }
+      ],
+      "median_s": {
+        "eager": 0.04160268600026029,
+        "inductor": 0.04012988200020118,
+        "manual_ref": 0.022928900999886537,
+        "catopt": 0.02129554799989819,
+        "catopt_inductor": 0.019390894000025582
+      },
+      "iqr_s": {
+        "eager": 0.0006083300004320336,
+        "inductor": 0.0004194940001980285,
+        "manual_ref": 0.000634662000265962,
+        "catopt": 0.001507095750184817,
+        "catopt_inductor": 0.0006910609999977169
+      },
+      "aux": {
+        "verify": {
+          "max_abs": 3.0994415283203125e-06,
+          "max_rel": 6.246465941769099e-07,
+          "allclose_fp32": true,
+          "rtol": 0.0001,
+          "atol": 1e-05
+        },
+        "inductor_proof": {
+          "post_grad_mm": 2,
+          "weight_only_mm": 0,
+          "left_assoc": true,
+          "graph_found": true,
+          "note": "2 left-assoc mms on the data spine \u2014 weights-first unreachable",
+          "mm_lines": [
+            "mm: \"f32[4096, 512][512, 1]cpu\" = torch.ops.aten.mm.default(arg1_1, arg0_1);  arg1_1 = arg0_1 = None",
+            "mm_1: \"f32[4096, 512][512, 1]cpu\" = torch.ops.aten.mm.default(mm, arg2_1);  mm = arg2_1 = None"
+          ]
+        },
+        "catopt_extraction": {
+          "weights_first": true,
+          "note": "matmul(x, W_q@W_kv1@\u2026@W_kv1) \u2014 weights-first",
+          "assoc_rule_fires": {
+            "assoc_matmul_rev": 1
+          },
+          "inductor_backend_mm": 1,
+          "pipeline_s": 0.24699664115905762
+        },
+        "extracted_root": "(matmul x, fused_2)",
+        "flops_model": {
+          "left_assoc_runtime": 4294967296,
+          "weights_first_runtime": 2147483648,
+          "weights_first_fold_once": 268435456
+        }
+      }
+    },
+    {
+      "name": "k4_d512_R4096",
+      "params": {
+        "k": 4,
+        "d": 512,
+        "R": 4096
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": 8589934592.0,
+          "note": "left-assoc chain: k sequential (R,d)@(d,d) GEMMs"
+        },
+        {
+          "name": "inductor",
+          "flops": 8589934592.0,
+          "note": "torch.compile original \u2014 post-grad graph still 4 left-assoc mms"
+        },
+        {
+          "name": "manual_ref",
+          "flops": 2147483648.0,
+          "note": "hand-folded W_eff \u2014 the reachable optimum (+0.81 GF fold paid once at construction)"
+        },
+        {
+          "name": "catopt",
+          "flops": 2147483648.0,
+          "note": "e-graph extraction matmul(x, W_q@W_kv1@\u2026@W_kv3) \u2014 weights-first \u2014 weight product folds to a fused param at lowering"
+        },
+        {
+          "name": "catopt_inductor",
+          "flops": 2147483648.0,
+          "note": "catopt module under the same Inductor backend"
+        }
+      ],
+      "median_s": {
+        "eager": 0.07720911000023989,
+        "inductor": 0.07646312399992894,
+        "manual_ref": 0.018204156000138028,
+        "catopt": 0.01832755499981431,
+        "catopt_inductor": 0.018655912000212993
+      },
+      "iqr_s": {
+        "eager": 0.0012952099998528865,
+        "inductor": 0.00035010850001526705,
+        "manual_ref": 0.0007597085000270454,
+        "catopt": 0.00030220250005186244,
+        "catopt_inductor": 0.0004678175000663032
+      },
+      "aux": {
+        "verify": {
+          "max_abs": 4.172325134277344e-06,
+          "max_rel": 7.623715033722088e-07,
+          "allclose_fp32": true,
+          "rtol": 0.0001,
+          "atol": 1e-05
+        },
+        "inductor_proof": {
+          "post_grad_mm": 4,
+          "weight_only_mm": 0,
+          "left_assoc": true,
+          "graph_found": true,
+          "note": "4 left-assoc mms on the data spine \u2014 weights-first unreachable",
+          "mm_lines": [
+            "mm: \"f32[4096, 512][512, 1]cpu\" = torch.ops.aten.mm.default(arg1_1, arg0_1);  arg1_1 = arg0_1 = None",
+            "mm_1: \"f32[4096, 512][512, 1]cpu\" = torch.ops.aten.mm.default(mm, arg2_1);  mm = arg2_1 = None",
+            "mm_2: \"f32[4096, 512][512, 1]cpu\" = torch.ops.aten.mm.default(mm_1, arg3_1);  mm_1 = arg3_1 = None",
+            "mm_3: \"f32[4096, 512][512, 1]cpu\" = torch.ops.aten.mm.default(mm_2, arg4_1);  mm_2 = arg4_1 = None"
+          ]
+        },
+        "catopt_extraction": {
+          "weights_first": true,
+          "note": "matmul(x, W_q@W_kv1@\u2026@W_kv3) \u2014 weights-first",
+          "assoc_rule_fires": {
+            "assoc_matmul_rev": 16
+          },
+          "inductor_backend_mm": 1,
+          "pipeline_s": 0.18774914741516113
+        },
+        "extracted_root": "(matmul x, fused_6)",
+        "flops_model": {
+          "left_assoc_runtime": 8589934592,
+          "weights_first_runtime": 2147483648,
+          "weights_first_fold_once": 805306368
+        }
+      }
+    }
+  ]
+}
