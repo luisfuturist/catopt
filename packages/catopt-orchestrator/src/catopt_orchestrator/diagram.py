@@ -51,10 +51,17 @@ grafts:
   do NOT fold at lowering, so materialising is a strict op-count win
   the per-member verify still gates.
 
-The driver (:class:`ContractionSearch`) is greedy/local this round —
-widest candidates claim their nodes first, declines leave the nodes
-to the ordinary per-block fallback.  Stage 3 (an e-graph over
-diagram states) is the next increment.
+The driver (:class:`ContractionSearch`) has two modes: ``"greedy"``
+— the stage-2 local pass where widest candidates claim their nodes
+first and declines leave the nodes to the ordinary per-block
+fallback — and ``"search"`` (stage 3), which explores move
+*orderings* over diagram states: a grafted move writes its members'
+reified bodies back and candidacy re-runs on the rewritten state, so
+compositions no single candidate can reach become reachable.  The
+search itself lives in
+:mod:`catopt_orchestrator.diagram_search`; every delivered
+transition still passes the move's own certified reify, and the
+whole-model ``end_to_end`` verify gates the composition.
 """
 
 from __future__ import annotations
@@ -1240,6 +1247,7 @@ def _split_member(
             "status": "declined",
             "reason": f"split verify failed: {vr.max_rel:.3e}",
         }
+    st["_term"] = (body2, params, leaves)
     return opt, {**st, "status": "grafted", "sites": len(repl)}
 
 
@@ -1261,6 +1269,7 @@ def _reify_split(
     extra = match.reify.extra or {}
     leaf_names: dict[str, tuple] = extra.get("leaf_names", {})
     reps: dict[str, Any] = {}
+    terms: dict[str, tuple] = {}
     members: dict[str, Any] = {}
     for name in match.nodes:
         rec = graph.record(name)
@@ -1276,6 +1285,9 @@ def _reify_split(
         members[name] = st
         if rep is not None:
             reps[name] = rep
+            # grafted ⇒ ``_term`` is always present (``_split_member``
+            # sets it on the verified path only)
+            terms[name] = st.pop("_term")
     info: dict[str, Any] = {"members": members}
     if not reps:
         return {
@@ -1283,7 +1295,12 @@ def _reify_split(
             "reason": "no member split",
             **info,
         }
-    return {"status": "grafted", "reps": reps, **info}
+    return {
+        "status": "grafted",
+        "reps": reps,
+        "_terms": terms,
+        **info,
+    }
 
 
 #: The default move set, in claim order: family-level structure first
@@ -1312,13 +1329,21 @@ class ContractionSearch:
     delivery discipline as :class:`MorphismSearch` (untouched blocks
     get the ordinary per-block ``optimize_rest`` pass).
 
-    Configuration: ``moves`` (the move set), ``block_pred`` (block
-    selection), ``verify_tol`` (the fp gate), ``joint_max_iterations``
-    / ``joint_max_enodes`` / ``symmetry_budget`` (the joint e-graph
-    bounds), ``optimize_rest`` (per-block fallback).  ``cost_fn``
-    prices the reified terms — ``launch_aware_cost`` by default,
-    since the fusion moves' wins are kernel-count wins pure FLOPs
-    cannot see.
+    Configuration: ``moves`` (the move set), ``mode`` —
+    ``"greedy"`` (stage-2 behaviour: candidates claimed widest-first
+    on the initial lift, the default while stage-4 verification work
+    hardens the composed path) or ``"search"`` (stage 3: best-first
+    search over diagram states — move orderings are explored, grafts
+    rewrite the member bodies and new candidates can fire on the
+    rewritten state; see
+    :mod:`catopt_orchestrator.diagram_search`) — plus
+    ``search_depth`` / ``search_states`` (the search bounds),
+    ``block_pred`` (block selection), ``verify_tol`` (the fp gate),
+    ``joint_max_iterations`` / ``joint_max_enodes`` /
+    ``symmetry_budget`` (the joint e-graph bounds), ``optimize_rest``
+    (per-block fallback).  ``cost_fn`` prices the reified terms —
+    ``launch_aware_cost`` by default, since the fusion moves' wins
+    are kernel-count wins pure FLOPs cannot see.
     """
 
     name = "contraction"
@@ -1327,6 +1352,9 @@ class ContractionSearch:
         self,
         *,
         moves: Any = None,
+        mode: str = "greedy",
+        search_depth: int = 4,
+        search_states: int = 64,
         block_pred: Any = None,
         optimize_rest: bool = True,
         verify_tol: float = 1e-4,
@@ -1335,9 +1363,17 @@ class ContractionSearch:
         symmetry_budget: int | None = 512,
     ) -> None:
         """Store the strategy configuration."""
+        if mode not in ("greedy", "search"):
+            raise ValueError(
+                f"unknown diagram-search mode {mode!r} — "
+                "expected 'greedy' or 'search'"
+            )
         self.moves = (
             tuple(moves) if moves is not None else DEFAULT_MOVES
         )
+        self.mode = mode
+        self.search_depth = int(search_depth)
+        self.search_states = int(search_states)
         self.block_pred = block_pred
         self.optimize_rest = optimize_rest
         self.verify_tol = verify_tol
@@ -1354,6 +1390,9 @@ class ContractionSearch:
             x,
             optimizer=optimizer,
             moves=self.moves,
+            mode=self.mode,
+            search_depth=self.search_depth,
+            search_states=self.search_states,
             block_pred=self.block_pred,
             optimize_rest=self.optimize_rest,
             verify_tol=self.verify_tol,
@@ -1371,6 +1410,9 @@ def _optimize_diagram(
     *,
     optimizer: Any,
     moves: tuple,
+    mode: str,
+    search_depth: int,
+    search_states: int,
     block_pred: Any,
     optimize_rest: bool,
     verify_tol: float,
@@ -1387,14 +1429,17 @@ def _optimize_diagram(
     max_memory_mb: float | None = None,
     verbose: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
-    """Lift to a diagram, apply the move set greedily, recompose.
+    """Lift to a diagram, run the move set per ``mode``, recompose.
 
-    Candidates are claimed widest-first; a grafted move consumes its
-    nodes (a declined move leaves them for the per-block fallback).
+    ``"greedy"`` claims candidates widest-first on the initial lift;
+    ``"search"`` explores orderings over diagram states
+    (:func:`catopt_orchestrator.diagram_search.search_moves`).  Either
+    way a declined move leaves its nodes for the per-block fallback.
     Returns ``(model, stats)`` — ``stats["moves"]`` carries the
     per-candidate verdicts, ``stats["edges"]`` the hyperedge
-    topology, and ``stats["end_to_end"]`` the whole-model
-    equivalence check.
+    topology, ``stats["diagram_search"]`` the mode's cost/exploration
+    record, and ``stats["end_to_end"]`` the whole-model equivalence
+    check.
     """
     t_start = time.time()
     composer = optimizer.composer
@@ -1417,8 +1462,40 @@ def _optimize_diagram(
         block_pred=block_pred,
     )
     graph = diagram.graph
-    replacements, move_stats, consumed, consumed_by, move_fires = (
-        _apply_moves(
+    if mode == "search":
+        # Lazy sibling import — the same convention ``_rest_block``
+        # uses for ``optimize``; keeps the modules acyclic.
+        from catopt_orchestrator.diagram_search import search_moves
+
+        (
+            replacements,
+            move_stats,
+            consumed,
+            consumed_by,
+            move_fires,
+            dsearch,
+        ) = search_moves(
+            moves,
+            diagram,
+            sink=sink,
+            cost_fn=cost_fn,
+            verify_tol=verify_tol,
+            joint_max_iterations=joint_max_iterations,
+            joint_max_enodes=joint_max_enodes,
+            symmetry_budget=symmetry_budget,
+            max_depth=search_depth,
+            max_states=search_states,
+            verbose=verbose,
+        )
+    else:
+        (
+            replacements,
+            move_stats,
+            consumed,
+            consumed_by,
+            move_fires,
+            dsearch,
+        ) = _apply_moves(
             moves,
             diagram,
             sink=sink,
@@ -1429,7 +1506,6 @@ def _optimize_diagram(
             symmetry_budget=symmetry_budget,
             verbose=verbose,
         )
-    )
 
     block_reports: dict[str, dict[str, Any]] = {}
     if optimize_rest:
@@ -1466,6 +1542,7 @@ def _optimize_diagram(
         block_reports,
         in_place,
     )
+    stats["diagram_search"] = dsearch
     if in_place:
         stats["end_to_end"] = {
             "skipped": "in_place",
@@ -1485,6 +1562,46 @@ def _optimize_diagram(
     return new_model, stats
 
 
+def _node_cost(graph: MorphismGraph, name: str, cost_fn: Any) -> float:
+    """Price one node's current body — ``dag_cost`` over its root."""
+    rec = graph.record(name)
+    return dag_cost(rec.ir.root, cost_fn) if rec.ir is not None else 0.0
+
+
+def _body_costs(graph: MorphismGraph, cost_fn: Any) -> dict[str, float]:
+    """Per-node reified-body costs — the state price both modes share."""
+    return {
+        n.name: _node_cost(graph, n.name, cost_fn) for n in graph.nodes
+    }
+
+
+def _graft_contrib(
+    contrib: dict[str, float], res: dict[str, Any], cost_fn: Any
+) -> None:
+    """Update per-node body costs after a grafted move, in place.
+
+    Nodes the move re-expresses (``_terms``) are repriced on their new
+    roots; a graft without ``_terms`` (a foreign ``DiagramMove``) is
+    not term-representable — its ``cost_after`` is charged to the
+    first rep and the rest booked at zero (the filler convention the
+    built-in moves use), or the old costs stand when the result
+    reports no number at all.  Heuristic only — it ranks search
+    states, never gates correctness.
+    """
+    terms = res.get("_terms") or {}
+    for name in res["reps"]:
+        term = terms.get(name)
+        if term is not None:
+            contrib[name] = dag_cost(term[0], cost_fn)
+    unpriced = [n for n in res["reps"] if n not in terms]
+    if unpriced:
+        after = res.get("cost_after")
+        if isinstance(after, (int, float)):
+            contrib[unpriced[0]] = float(after)
+            for n in unpriced[1:]:
+                contrib[n] = 0.0
+
+
 def _apply_moves(
     moves: tuple,
     diagram: Diagram,
@@ -1496,13 +1613,18 @@ def _apply_moves(
     joint_max_enodes: int,
     symmetry_budget: int | None,
     verbose: bool,
-) -> tuple[dict, dict, set, dict, dict]:
+) -> tuple[dict, dict, set, dict, dict, dict]:
     """Collect candidates and claim them greedily, widest first.
 
     A grafted move consumes its nodes — overlapping candidates skip;
     a declined move leaves its nodes for later candidates (and
     ultimately for the per-block fallback).  Reify exceptions become
     honest ``error`` declines — never silent.
+
+    The last return is the ``diagram_search`` stats record: the
+    candidate count and the reified-body cost before/after the greedy
+    pass, on the same per-node ``dag_cost`` measure the
+    ``mode="search"`` driver uses.
     """
     cands: list[tuple[DiagramMove, MorphismMatch]] = [
         (mv, m) for mv in moves for m in mv.candidates(diagram)
@@ -1516,6 +1638,8 @@ def _apply_moves(
             [(m.law, m.nodes) for _, m in cands],
         )
 
+    contrib = _body_costs(diagram.graph, cost_fn)
+    initial_cost = sum(contrib.values())
     replacements: dict[str, Any] = {}
     move_stats: dict[str, dict[str, Any]] = {}
     consumed: set[str] = set()
@@ -1539,13 +1663,28 @@ def _apply_moves(
         if res is None or res["status"] != "grafted":
             continue
         replacements.update(res["reps"])
+        _graft_contrib(contrib, res, cost_fn)
         for n in m.nodes:
             consumed.add(n)
             consumed_by[n] = m.law
         move_fires[m.law] = move_fires.get(m.law, 0) + 1
         if verbose:
             log.info("[Diagram] %s: grafted (%s)", key, m.detail)
-    return replacements, move_stats, consumed, consumed_by, move_fires
+    dsearch = {
+        "mode": "greedy",
+        "candidates": len(cands),
+        "moves_applied": sum(move_fires.values()),
+        "initial_cost": initial_cost,
+        "final_cost": sum(contrib.values()),
+    }
+    return (
+        replacements,
+        move_stats,
+        consumed,
+        consumed_by,
+        move_fires,
+        dsearch,
+    )
 
 
 def _deliver(
@@ -1642,7 +1781,7 @@ def _one_move(
     entry = {
         "boundary": m.boundary,
         "detail": m.detail,
-        **{k2: v for k2, v in res.items() if k2 != "reps"},
+        **M._res_stats(res),
     }
     return res, entry
 
