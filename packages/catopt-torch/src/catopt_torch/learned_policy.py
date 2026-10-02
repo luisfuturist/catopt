@@ -38,14 +38,28 @@ def input_vector(
     return list(features.to_vector()) + list(vec)
 
 
+#: Input width: program features plus a structural rule vector.
+_INPUT_DIM = len(DIMENSIONS) + RULE_VECTOR_LEN
+
+
 class RuleValueNet(nn.Module):
-    """Predicts a rule's cost improvement from features + rule shape."""
+    """Predicts a rule's cost improvement from features + rule shape.
+
+    Inputs are standardised by buffers fitted in
+    :func:`train_rule_value` — raw feature scales (thousands of FLOPs
+    next to 0/1 flags) otherwise starve the MLP.
+    """
+
+    mean: torch.Tensor
+    std: torch.Tensor
 
     def __init__(self, hidden: int = 32) -> None:
         """Build the MLP over ``DIMENSIONS`` + rule-vector inputs."""
         super().__init__()
+        self.register_buffer("mean", torch.zeros(_INPUT_DIM))
+        self.register_buffer("std", torch.ones(_INPUT_DIM))
         self.net = nn.Sequential(
-            nn.Linear(len(DIMENSIONS) + RULE_VECTOR_LEN, hidden),
+            nn.Linear(_INPUT_DIM, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -53,8 +67,9 @@ class RuleValueNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the predicted improvement, shape ``[batch]``."""
-        return self.net(x).squeeze(-1)
+        """Return the predicted improvement logit, shape ``[batch]``."""
+        z = (x - self.mean) / self.std
+        return self.net(z).squeeze(-1)
 
 
 class LearnedPolicy:
@@ -79,7 +94,7 @@ class LearnedPolicy:
         self.device = device
 
     def score(self, features: ProgramFeatures, action: Action) -> float:
-        """Predict the improvement of ``action`` for ``features``."""
+        """Predict the improvement logit of ``action`` for ``features``."""
         rule = self.rule_by_name[action.rule]
         x = torch.tensor(
             [input_vector(features, rule_vector(rule))],
@@ -109,12 +124,19 @@ def train_rule_value(
     lr: float = 1e-2,
     device: str | None = None,
     seed: int = 0,
+    binary: bool = True,
 ) -> nn.Module:
     """Fit a :class:`RuleValueNet` to ``samples``; return the model.
 
     ``samples`` is an iterable of
-    :class:`~catopt_core.trajectories.RuleSample`.  The device defaults
-    to CUDA when available, else CPU.
+    :class:`~catopt_core.trajectories.RuleSample`.  With ``binary``
+    (the default) the target is ``delta_cost > 0`` and the loss is
+    binary cross-entropy on the net's logit — the well-conditioned
+    signal, since most rules leave the cost unchanged and raw-delta
+    regression collapses to the mean.  With ``binary=False`` the target
+    is the raw delta under MSE.
+
+    The device defaults to CUDA when available, else CPU.
     """
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -122,12 +144,22 @@ def train_rule_value(
         [input_vector(s.features, s.rule_vector) for s in samples],
         dtype=torch.float32,
     )
-    y = torch.tensor(
-        [s.delta_cost for s in samples], dtype=torch.float32
-    )
+    if binary:
+        y = torch.tensor(
+            [1.0 if s.delta_cost > 0 else 0.0 for s in samples],
+            dtype=torch.float32,
+        )
+        loss_fn: nn.Module = nn.BCEWithLogitsLoss()
+    else:
+        y = torch.tensor(
+            [s.delta_cost for s in samples], dtype=torch.float32
+        )
+        loss_fn = nn.MSELoss()
     model = RuleValueNet(hidden).to(dev)
+    with torch.no_grad():
+        model.mean.copy_(x.mean(0))
+        model.std.copy_(x.std(0).clamp_min(1e-6))
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
     model.train()
     for _ in range(epochs):
         opt.zero_grad()

@@ -53,3 +53,11 @@ def test_train_default_device():
     samples = rule_samples(_chain(), all_rules())
     model = train_rule_value(samples, epochs=1)
     assert isinstance(model, RuleValueNet)
+
+
+def test_train_regression_head():
+    samples = rule_samples(_chain(), all_rules())
+    model = train_rule_value(
+        samples, epochs=1, binary=False, device="cpu"
+    )
+    assert isinstance(model, RuleValueNet)

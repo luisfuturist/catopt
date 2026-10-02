@@ -25,34 +25,56 @@ __all__ = ["RuleSample", "rule_samples", "rule_vector"]
 #: Buckets each op name hashes into for the structural rule encoding.
 _OP_BUCKETS = 8
 
+#: Buckets each rule side's full pattern tree hashes into.
+_TREE_BUCKETS = 16
+
 #: Length of a :func:`rule_vector`.
-RULE_VECTOR_LEN = 2 * _OP_BUCKETS + 4
+RULE_VECTOR_LEN = 2 * _OP_BUCKETS + 2 * _TREE_BUCKETS + 4
+
+
+def _stable_hash(s: str, buckets: int) -> int:
+    """Stable hash of a string into ``[0, buckets)``."""
+    h = 0
+    for i, ch in enumerate(s):
+        h = (h * 131 + ord(ch) * (i + 1)) % 1_000_003
+    return h % buckets
 
 
 def _op_bucket(name: str) -> int:
     """Stable hash of an op name into ``[0, _OP_BUCKETS)``."""
-    return (
-        sum(ord(c) * (i + 1) for i, c in enumerate(name)) % _OP_BUCKETS
-    )
+    return _stable_hash(name, _OP_BUCKETS)
+
+
+def _tree(node: Any) -> str:
+    """Render one rule side to a stable string (empty for ``None``)."""
+    return "" if node is None else op_repr(node)
 
 
 def rule_vector(rule: Any) -> tuple[float, ...]:
     """Structural encoding of a rule — its shape, not its identity.
 
-    One-hot of the LHS op's bucket, one-hot of the RHS op's bucket,
-    then LHS arity, RHS arity, and two flags (has a ``check``, has a
-    ``derive``).  A new rule is a new point in this space, so it can
-    be scored without retraining.
+    One-hot of each side's root-op bucket, one-hot of each side's
+    *full pattern-tree* hash bucket, then LHS arity, RHS arity, and
+    two flags (has a ``check``, has a ``derive``).  The tree hash
+    separates rules whose root ops coincide (e.g. several ``matmul``
+    laws); it is computed from the rule's own pattern, so a new rule
+    is still a new point in this space — scorable without retraining.
     """
     lhs = getattr(rule, "lhs", None)
     rhs = getattr(rule, "rhs", None)
-    vec = [0.0] * (2 * _OP_BUCKETS)
+    vec = [0.0] * RULE_VECTOR_LEN
     vec[_op_bucket(getattr(lhs, "op", "") or "")] = 1.0
     vec[_OP_BUCKETS + _op_bucket(getattr(rhs, "op", "") or "")] = 1.0
-    vec.append(float(len(getattr(lhs, "args", ()) or ())))
-    vec.append(float(len(getattr(rhs, "args", ()) or ())))
-    vec.append(1.0 if getattr(rule, "check", None) else 0.0)
-    vec.append(1.0 if getattr(rule, "derive", None) else 0.0)
+    base = 2 * _OP_BUCKETS
+    vec[base + _stable_hash(_tree(lhs), _TREE_BUCKETS)] = 1.0
+    vec[
+        base + _TREE_BUCKETS + _stable_hash(_tree(rhs), _TREE_BUCKETS)
+    ] = 1.0
+    tail = base + 2 * _TREE_BUCKETS
+    vec[tail] = float(len(getattr(lhs, "args", ()) or ()))
+    vec[tail + 1] = float(len(getattr(rhs, "args", ()) or ()))
+    vec[tail + 2] = 1.0 if getattr(rule, "check", None) else 0.0
+    vec[tail + 3] = 1.0 if getattr(rule, "derive", None) else 0.0
     return tuple(vec)
 
 
