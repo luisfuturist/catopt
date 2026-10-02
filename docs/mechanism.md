@@ -42,12 +42,18 @@ backend can run.  *Example: the Blelloch tree.*
 **7. Certify.**  The path original → extracted is a replayable
 certificate (a 2-cell).
 
+**8. Evaluate.**  Describe the extracted program's *characteristics*
+(torch-free `ProgramFeatures`) and, when a target is available, its
+runtime.  Evaluation is a separate dimension (ADR 0003): it **ranks**
+candidates, it never changes what is equivalent.  A profiler observes;
+it does not decide.
+
 *Shortcut:* if the structure names the target directly, **construct**
 it and skip steps 5–6.
 
 ```text
 syntax → structure(signature + axioms) → match(signature)
-       → rewrite(axioms) → saturate → extract → certify
+       → rewrite(axioms) → saturate → extract → certify → evaluate
 ```
 
 ## The split that trips people up
@@ -85,10 +91,13 @@ Two more consequences worth stating plainly:
 | Saturate | `EGraph` |
 | Extract | `extract_best`, `backend_cost` |
 | Certify | `verify_certificate` |
+| Evaluate | `catopt_core.features` (planned, ADR 0003); `Meter` / `TargetProfile` for measurements |
 
 ## See also
 
 - `project/adrs/0002-categorical-re-expression-thesis.md` — the
   thesis this pipeline implements.
+- `project/adrs/0003-evaluation-is-an-independent-dimension.md` — the
+  evaluation dimension this pipeline appends.
 - `project/plans/0014-certified-re-expression.md` — the staged
   path from proofs to delivery.

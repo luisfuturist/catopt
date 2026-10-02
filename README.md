@@ -13,6 +13,11 @@ reaches programs no op-level pattern composes to.  Every delivered
 program carries a **replayable certificate** of equivalence, re-checked
 on real terms.
 
+The engine separates four independent dimensions — semantics, search,
+evaluation and execution ([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md)):
+the search space is hardware-independent, and how a candidate actually
+runs on a target is *measured*, never assumed.
+
 The engine (`catopt-core`) is torch-free and backend-agnostic; PyTorch
 (`catopt-torch`) is the shipped reference backend.  One call runs the
 whole pipeline:
