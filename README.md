@@ -135,6 +135,23 @@ opaque boundary, never a wrong answer.  The morphism engine is the
 generality mechanism: laws target signature *classes* (any residual
 chain, any shared-projection family) rather than specific op trees.
 
+## Related work
+
+Catopt sits at the intersection of equality saturation, tensor-graph
+superoptimization, and verified rewriting.  The contribution is not new
+algebra — it is *automatic discovery + certified equivalence + per-shape
+selection*, delivered end to end.  How it relates:
+
+| Line of work | Shares | Differs |
+|---|---|---|
+| **egg / egglog** | e-graph, saturation, cost-guided extraction | catopt's laws are *categorical* (monoid carriers, traced monoidal, products), not op patterns, and it delivers a runnable module plus a certificate rather than a term.  A differential oracle cross-checks its search against egglog on a law subset (`tests/test_egglog_oracle.py`). |
+| **TASO** (tensor superoptimization) | equivalence-preserving graph rewrites, verified candidates | backtracking substitution search vs e-graph closure; catopt reaches non-local forms (scan lifts, weight folds) and ships a replayable derivation. |
+| **Tensat** | cost-based extraction over an e-graph | Tensat searches op-level tensor equivalence; catopt's laws are over algebraic structure, and extraction is bounded by the backend's `supported_ops`. |
+| **TVM / Ansor / Halide** | schedule search, cost models, target tuning | they search *schedules over a fixed algorithm*; catopt searches *across algorithms* via algebraic laws, then hands the result to a backend. |
+| **Herbie** | e-graph rewrite search | different objective (numerical accuracy, not cost); same saturation lineage. |
+| **Verified rewriting** (Alive2, CompCert) | machine-checked equivalence | catopt's certificate is per-program *derivational replay* on real terms, not a whole-compiler proof. |
+| **torch.compile / Inductor** | the baseline measured against | op-level fusion cannot express transforms across runtime parameters (weight folding, reassociation) — which is where catopt's wins live. |
+
 ## Limits
 
 - **Wins are regime-dependent** — the transform set is structural:

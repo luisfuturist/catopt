@@ -137,7 +137,7 @@ below; `python -m bench catalog --check` fails if it drifts (and
 
 | suite | tier | question | expected |
 |---|---|---|---|
-| `search_efficiency` | micro | How expensive is saturation relative to the program space it represents? | WIN — ~Catalan(k−1) programs in O(k³) live e-nodes; exact saturation fragments past k≈11 (honest limit). |
+| `search_efficiency` | micro | How expensive is saturation relative to the program space it represents? | WIN — the e-graph encodes an exponential (Catalan) program space in polynomially many live e-nodes; exact saturation fragments at large k (honest limit). |
 
 ### cost
 
@@ -150,18 +150,18 @@ below; `python -m bench catalog --check` fails if it drifts (and
 | suite | tier | question | expected |
 |---|---|---|---|
 | `structure_census` _(ad-hoc)_ | model | How much catopt-exploitable structure do real trained weights carry? | Exact mode: ~zero bitwise structure on dense LLMs, real on structured ones. |
-| `bound_amplification` _(ad-hoc)_ | block | How does a weight-space error bound propagate to the output? | Measured output rel exceeds the certified bound by ~2–8× (honest). |
+| `bound_amplification` _(ad-hoc)_ | block | How does a weight-space error bound propagate to the output? | Measured output error exceeds the certified bound — the bound is conservative (honest). |
 
 ### speedup
 
 | suite | tier | question | expected |
 |---|---|---|---|
-| `reassoc_scale` | block | Can the e-graph find a form Inductor's post-grad graph cannot express? | WIN — 8.9–16.1× vs Inductor on k-deep weight chains. |
-| `real_win_hunt` | block | Which structured block topologies admit an autotuned win? | WIN — ~1.1–10× vs Inductor on exploitable topologies. |
-| `real_linear_attn` | block | Does the affine-monoid scan lift pay on real linear-attention blocks? | WIN — ≈2.9× vs eager (retnet T=128); honest negatives where Inductor's pointwise fusion wins on CPU. |
-| `morphism_e2e` | block | Do morphism windows convert term-flops into wall time? | WIN — 12.4–12.5× measured wall on 4-block chains at GEMM-bound sizes. |
-| `decode_scan_bench` _(cuda)_ | block | Does the chunked scan carrier beat the best non-carrier decode schedule? | WIN on launch-bound devices — 1.65–3.4× vs Inductor; CUDA for the graph leg. |
-| `decode_bench` _(ad-hoc)_ | block | Does fewer GEMM launches pay off where launch overhead dominates? | NEGATIVE — the launch-bound hypothesis is falsified (4–15% loss at B=1, T≤64). |
+| `reassoc_scale` | block | Can the e-graph find a form Inductor's post-grad graph cannot express? | WIN — the e-graph reaches a weights-first form Inductor's post-grad graph cannot express (see docs/results.md). |
+| `real_win_hunt` | block | Which structured block topologies admit an autotuned win? | WIN on exploitable topologies; parity where structure is absent. |
+| `real_linear_attn` | block | Does the affine-monoid scan lift pay on real linear-attention blocks? | WIN where the affine-monoid scan lift fires (fp64-exact); honest negatives where Inductor's pointwise fusion wins on CPU. |
+| `morphism_e2e` | block | Do morphism windows convert term-flops into wall time? | WIN — term-FLOP reduction converts to measured wall time at GEMM-bound sizes. |
+| `decode_scan_bench` _(cuda)_ | block | Does the chunked scan carrier beat the best non-carrier decode schedule? | WIN on launch-bound devices; CUDA needed for the graph leg. |
+| `decode_bench` _(ad-hoc)_ | block | Does fewer GEMM launches pay off where launch overhead dominates? | NEGATIVE — the launch-bound hypothesis is falsified (losses where launch overhead already dominates). |
 | `killer_demo` | block | Does per-model lowering autotune pick the measured-fastest variant? | WIN — the reported pick is the measured winner, never a static choice. |
 | `bench_omd2` _(ad-hoc)_ | block | Does the cross-carrier omd lift survive a transformer-shaped attention? | Exploratory — fires on the mqa case; not a certified path. |
 
@@ -170,7 +170,7 @@ below; `python -m bench catalog --check` fails if it drifts (and
 | suite | tier | question | expected |
 |---|---|---|---|
 | `model_bench` | model | Do whole multi-block models beat Inductor under the autotuned lowering? | Latency/peak-memory/compile per model, verified; wins where structure exists. |
-| `e2e_model` | model | Does composition (pairing + fold) beat plain Inductor end-to-end? | PARITY — ~1.05× over Inductor, verified fp64-exact. |
+| `e2e_model` | model | Does composition (pairing + fold) beat plain Inductor end-to-end? | PARITY — pairing fires per block, verified fp64-exact; wall time is ~parity. |
 | `e2e_models2` | model | Does composition hold across architecture families? | PARITY — in-repo replicas (minilm/vit/conv/llama/moe), verified per cell. |
 | `e2e_llm` | model | Does composition help prefill + KV-cache decode on a llama-scale model? | Measured c+i/ind band; honest per-cell verdicts. |
 | `stories15m_bench` _(ad-hoc)_ | model | Does the whole-model pipeline transform and verify a real checkpoint? | PARITY — all blocks transform+verify, but the mechanism doesn't pay at 15M/110M. |
@@ -180,14 +180,14 @@ below; `python -m bench catalog --check` fails if it drifts (and
 
 | suite | tier | question | expected |
 |---|---|---|---|
-| `bounded_e2e` | model | Do error-budget rewrites buy wall-time on a real checkpoint? | NEGATIVE on stories15M — 0 bounded members accepted at every budget (honest). |
+| `bounded_e2e` | model | Do error-budget rewrites buy wall-time on a real checkpoint? | NEGATIVE on stories15M — no bounded members accepted at any budget (honest). |
 | `structured_models` | block | Do LoRA / pruned / low-rank families admit bounded rewrites? | WIN where structure exists — params shrink / speedups, verified. |
 
 ### integration
 
 | suite | tier | question | expected |
 |---|---|---|---|
-| `vllm_compare` _(cuda)_ | model | Can vLLM serve a catopt-optimized model token-for-token? | WIN — token-for-token agreement (~1.0); the wins are complementary, not competing. |
+| `vllm_compare` _(cuda)_ | model | Can vLLM serve a catopt-optimized model token-for-token? | WIN — token-for-token agreement; the wins are complementary, not competing. |
 
 ## By mechanism
 

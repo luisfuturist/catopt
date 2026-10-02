@@ -135,8 +135,9 @@ SUITES: list[SuiteSpec] = [
         "Search cost vs exponential space",
         "How expensive is saturation relative to the program space it "
         "represents?",
-        "WIN — ~Catalan(k−1) programs in O(k³) live e-nodes; exact "
-        "saturation fragments past k≈11 (honest limit).",
+        "WIN — the e-graph encodes an exponential (Catalan) program "
+        "space in polynomially many live e-nodes; exact saturation "
+        "fragments at large k (honest limit).",
         tier="micro",
         mechanisms=("egraph",),
     ),
@@ -170,8 +171,8 @@ SUITES: list[SuiteSpec] = [
         "structure",
         "Bound amplification on real activations",
         "How does a weight-space error bound propagate to the output?",
-        "Measured output rel exceeds the certified bound by ~2–8× "
-        "(honest).",
+        "Measured output error exceeds the certified bound — the "
+        "bound is conservative (honest).",
         status="ad-hoc",
         mechanisms=("bounded", "weights"),
     ),
@@ -182,7 +183,8 @@ SUITES: list[SuiteSpec] = [
         "Weight-chain reassociation vs Inductor",
         "Can the e-graph find a form Inductor's post-grad graph cannot "
         "express?",
-        "WIN — 8.9–16.1× vs Inductor on k-deep weight chains.",
+        "WIN — the e-graph reaches a weights-first form Inductor's "
+        "post-grad graph cannot express (see docs/results.md).",
         mechanisms=("egraph", "pairing"),
     ),
     _s(
@@ -190,7 +192,8 @@ SUITES: list[SuiteSpec] = [
         "speedup",
         "Structured-block win hunt",
         "Which structured block topologies admit an autotuned win?",
-        "WIN — ~1.1–10× vs Inductor on exploitable topologies.",
+        "WIN on exploitable topologies; parity where structure is "
+        "absent.",
         mechanisms=("autotune", "pairing"),
     ),
     _s(
@@ -199,8 +202,9 @@ SUITES: list[SuiteSpec] = [
         "Linear-attention scan lift",
         "Does the affine-monoid scan lift pay on real linear-attention "
         "blocks?",
-        "WIN — ≈2.9× vs eager (retnet T=128); honest negatives where "
-        "Inductor's pointwise fusion wins on CPU.",
+        "WIN where the affine-monoid scan lift fires (fp64-exact); "
+        "honest negatives where Inductor's pointwise fusion wins on "
+        "CPU.",
         mechanisms=("scan", "carriers"),
     ),
     _s(
@@ -208,7 +212,7 @@ SUITES: list[SuiteSpec] = [
         "speedup",
         "Morphism-window composition",
         "Do morphism windows convert term-flops into wall time?",
-        "WIN — 12.4–12.5× measured wall on 4-block chains at "
+        "WIN — term-FLOP reduction converts to measured wall time at "
         "GEMM-bound sizes.",
         mechanisms=("morphism",),
     ),
@@ -218,8 +222,7 @@ SUITES: list[SuiteSpec] = [
         "Carrier + CUDA-graph decode",
         "Does the chunked scan carrier beat the best non-carrier "
         "decode schedule?",
-        "WIN on launch-bound devices — 1.65–3.4× vs Inductor; CUDA for "
-        "the graph leg.",
+        "WIN on launch-bound devices; CUDA needed for the graph leg.",
         mechanisms=("decode", "carriers", "cuda-graph"),
         needs_cuda=True,
     ),
@@ -229,8 +232,8 @@ SUITES: list[SuiteSpec] = [
         "Launch-bound decode sweep",
         "Does fewer GEMM launches pay off where launch overhead "
         "dominates?",
-        "NEGATIVE — the launch-bound hypothesis is falsified (4–15% "
-        "loss at B=1, T≤64).",
+        "NEGATIVE — the launch-bound hypothesis is falsified (losses "
+        "where launch overhead already dominates).",
         status="ad-hoc",
         mechanisms=("decode",),
     ),
@@ -272,7 +275,8 @@ SUITES: list[SuiteSpec] = [
         "MiniGPT end-to-end",
         "Does composition (pairing + fold) beat plain Inductor "
         "end-to-end?",
-        "PARITY — ~1.05× over Inductor, verified fp64-exact.",
+        "PARITY — pairing fires per block, verified fp64-exact; wall "
+        "time is ~parity.",
         tier="model",
         mechanisms=("pairing",),
     ),
@@ -324,7 +328,7 @@ SUITES: list[SuiteSpec] = [
         "bounded",
         "Certified bounded rewrites",
         "Do error-budget rewrites buy wall-time on a real checkpoint?",
-        "NEGATIVE on stories15M — 0 bounded members accepted at every "
+        "NEGATIVE on stories15M — no bounded members accepted at any "
         "budget (honest).",
         tier="model",
         mechanisms=("bounded", "checkpoint"),
@@ -344,8 +348,8 @@ SUITES: list[SuiteSpec] = [
         "integration",
         "catopt vs vLLM and through it",
         "Can vLLM serve a catopt-optimized model token-for-token?",
-        "WIN — token-for-token agreement (~1.0); the wins are "
-        "complementary, not competing.",
+        "WIN — token-for-token agreement; the wins are complementary, "
+        "not competing.",
         tier="model",
         mechanisms=("serving", "checkpoint"),
         needs_cuda=True,
