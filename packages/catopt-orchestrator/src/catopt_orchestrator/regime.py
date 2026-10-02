@@ -73,7 +73,6 @@ from :mod:`catopt_torch.calibrate` — which defaults its cost model to
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -93,7 +92,9 @@ from catopt_core.ir import IR, Const, Op, Param, Var, op_repr
 from catopt_core.laws import RuleSet
 from catopt_core.ports import ExecutorSpec
 from catopt_core.profile import TargetProfile, load_profile
-from catopt_core.typing import _INVALID, _numel, _shape_of
+from catopt_core.typing import INVALID, numel, shape_of
+
+from catopt_orchestrator.carriers import get_carriers
 
 __all__ = [
     "EXECUTORS",
@@ -134,15 +135,15 @@ def footprint_cost(term: Any, memo: dict | None = None) -> float:
     if key in memo:
         return memo[key]
     if isinstance(term, (Var, Param, Const)):
-        out = float(_numel(_shape_of(term)))
+        out = float(numel(shape_of(term)))
     elif not isinstance(term, Op):
         out = 0.0
     else:
-        shape = _shape_of(term)
-        if shape == _INVALID:
+        shape = shape_of(term)
+        if shape == INVALID:
             out = _INVALID_COST
         else:
-            own = 0.0 if term.op in _VIEW_OPS else float(_numel(shape))
+            own = 0.0 if term.op in _VIEW_OPS else float(numel(shape))
             out = (
                 sum(footprint_cost(ch, memo) for ch in term.args) + own
             )
@@ -211,36 +212,31 @@ def register_regime_backend(
 
 
 def _is_scan_apply(term: Any) -> bool:
-    """Probe the scan carrier's root — resolved at call time.
+    """Probe the scan carrier's root via the registered machinery.
 
-    ``catopt_carriers`` is optional from this module's perspective:
-    the probe defers so importing the regime machinery never loads a
-    backend.
+    Carriers arrive through :mod:`catopt_orchestrator.carriers`; a
+    process without them simply probes ``False``.
     """
-    from catopt_carriers.scan_lower import is_scan_apply_term
-
-    return is_scan_apply_term(term)
+    m = get_carriers()
+    return bool(m is not None and m.is_scan_root(term))
 
 
 def _is_om_apply(term: Any) -> bool:
-    """Probe the om carrier's root — resolved at call time."""
-    from catopt_carriers.om_lower import is_om_apply_term
-
-    return is_om_apply_term(term)
+    """Probe the om carrier's root via the registered machinery."""
+    m = get_carriers()
+    return bool(m is not None and m.is_om_root(term))
 
 
 def _scan_plan(term: Any) -> Any:
-    """Build the batched-scan plan — resolved at call time."""
-    from catopt_carriers.scan_lower import build_scan_plan
-
-    return build_scan_plan(term)
+    """Build the batched-scan plan via the registered machinery."""
+    m = get_carriers()
+    return None if m is None else m.scan_plan(term)
 
 
 def _om_plan(term: Any) -> Any:
-    """Build the batched-om plan — resolved at call time."""
-    from catopt_carriers.om_lower import build_om_plan
-
-    return build_om_plan(term)
+    """Build the batched-om plan via the registered machinery."""
+    m = get_carriers()
+    return None if m is None else m.om_plan(term)
 
 
 def _auto_executor(term: Any) -> str:
@@ -960,7 +956,7 @@ def regime_frontier(
 
 
 def _carrier_search() -> RuleSet:
-    """Return the carrier-search rule set — resolved at call time.
+    """Return the carrier-search rule set.
 
     The ``CARRIER_SEARCH`` preset: the core scan monoids plus the
     carrier-package decode / om / trace families (the historical
@@ -968,37 +964,24 @@ def _carrier_search() -> RuleSet:
     cross-carrier seam set (:func:`_xc_rules`) is a *separate*
     bounded tier, deliberately not folded in.
 
-    ``catopt_carriers`` is a *different* package — its law modules
-    are consulted lazily so importing the regime machinery never
-    loads a tensor library.  Carriers that are absent (partial
-    install, or a process where torch is unavailable) simply
-    contribute no laws — the e-graph then only ever reaches the
-    core scan families.
+    The carrier families arrive through
+    :mod:`catopt_orchestrator.carriers`; a process without carriers
+    (partial install, or torch unavailable) contributes no laws — the
+    e-graph then only ever reaches the core scan families.
     """
     laws = core_laws.CARRIER_SEARCH
-    with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.decode_geom import DECODE_GEOM_RULES
-        from catopt_carriers.decode_laws import DECODE_RULES
-
-        laws = laws + DECODE_RULES + DECODE_GEOM_RULES
-    with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.om import OM_RULES
-
-        laws = laws + OM_RULES
-    with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.trace import TRACE_RULES
-
-        laws = laws + TRACE_RULES
+    m = get_carriers()
+    if m is not None:
+        laws = laws + m.rules()
     return laws
 
 
 def _xc_rules() -> RuleSet:
     """Return the cross-carrier seam rule set — empty when absent."""
-    with contextlib.suppress(ModuleNotFoundError):
-        from catopt_carriers.xcarrier import XC_RULES
-
-        return XC_RULES
-    return RuleSet("xc", ())
+    m = get_carriers()
+    if m is None:
+        return RuleSet("xc", ())
+    return m.xc_rules()
 
 
 def default_rules() -> RuleSet:
@@ -1049,14 +1032,10 @@ def build_egraph(
     # Non-local lifts: recurrences -> trace(F), stacks of same-state
     # carrier applications -> one application, om trees over scanned
     # values -> the deferred omd carrier.  Witnessed, replayable.
-    try:
-        from catopt_carriers.trace_lift import lift_scan_to_trace
-        from catopt_carriers.xcarrier import (
-            gather_apply_stack,
-            gather_applyd_stack,
-            omd_tree_lift,
-        )
-    except ModuleNotFoundError:
+    # Resolved through the carrier registry; a backend process without
+    # carriers runs the plain core saturation.
+    m = get_carriers()
+    if m is None:
 
         def _lifts() -> list:
             return []
@@ -1065,12 +1044,7 @@ def build_egraph(
     else:
 
         def _lifts() -> list:
-            return (
-                lift_scan_to_trace(eg)
-                + gather_applyd_stack(eg)
-                + gather_apply_stack(eg)
-                + omd_tree_lift(eg)
-            )
+            return m.regime_lifts(eg)
 
         xc_laws = _xc_rules()
 

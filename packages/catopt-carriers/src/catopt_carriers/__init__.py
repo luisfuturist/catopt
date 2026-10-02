@@ -27,6 +27,15 @@ materialises **lazily**: the law modules import their backend
 
 from typing import Any
 
+from catopt_orchestrator.carriers import register_carriers
+
+from catopt_carriers.machinery import build_machinery
+
+# Install the carrier machinery with the neutral orchestrator (the
+# edge inversion: carriers -> orchestrator, never the reverse).  The
+# value holds only thunks, so this loads no tensor library.
+register_carriers(build_machinery())
+
 __all__ = [
     "CARRIERS",
     "DECODE_GEOM_RULES",

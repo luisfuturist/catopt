@@ -312,6 +312,7 @@ version = "0.1.0.dev0"
 source = { editable = "packages/catopt-carriers" }
 dependencies = [
     { name = "catopt-core" },
+    { name = "catopt-orchestrator" },
     { name = "catopt-torch" },
     { name = "torch" },
 ]
@@ -319,6 +320,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-orchestrator", editable = "packages/catopt-orchestrator" },
     { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "torch", specifier = ">=2.0" },
 ]

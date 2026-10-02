@@ -80,7 +80,7 @@ from catopt_core.ir import Op
 from catopt_core.laws import R as _R
 from catopt_core.laws import RuleSet
 from catopt_core.laws import tags as _tags
-from catopt_core.typing import _broadcast
+from catopt_core.typing import broadcast
 
 
 def R(name: str, lhs, rhs, **kw) -> Rewrite:
@@ -1010,9 +1010,9 @@ def _check_binary_cat(bound: dict) -> bool:
     )
     cat_shape = (*xs[:axis], merged, *xs[axis + 1 :])
     return (
-        _broadcast(cs, xs) == xs
-        and _broadcast(cs, ys) == ys
-        and _broadcast(cs, cat_shape) == cat_shape
+        broadcast(cs, xs) == xs
+        and broadcast(cs, ys) == ys
+        and broadcast(cs, cat_shape) == cat_shape
     )
 
 

@@ -45,7 +45,7 @@ from catopt_core.cost import (
     param_bytes_cost_for,
 )
 from catopt_core.ir import Op, Var
-from catopt_core.typing import _INVALID, _numel, _shape_of
+from catopt_core.typing import INVALID, numel, shape_of
 
 if TYPE_CHECKING:
     from catopt_core.ports import CostFn
@@ -302,9 +302,9 @@ class _PeakBytesCost:
         is provably ill-typed (the ``_INVALID_COST`` convention:
         such a member must never win extraction).
         """
-        if _shape_of(v, memo) is _INVALID:
+        if shape_of(v, memo) is INVALID:
             return _INVALID_COST
-        return float(_numel(_shape_of(v, memo))) * 4.0
+        return float(numel(shape_of(v, memo))) * 4.0
 
     def __call__(self, term: Any, memo: dict | None = None) -> float:
         memo = {} if memo is None else memo

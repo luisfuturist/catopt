@@ -8,15 +8,18 @@ The delivery runners split by backend (plan 0007): the backend-neutral
 :class:`TorchCompileRunner` lives here; and the CUDA-device-coupled
 :class:`CudaGraphRunner` lives in :mod:`catopt_cuda`.
 
-This module re-exports the whole runner surface so the historical
-``catopt_orchestrator.runners`` path (and ``from catopt_torch.runners import …``)
-resolves every name — ``CudaGraphRunner`` is optional: a partial
-install without :mod:`catopt_cuda` simply lacks it.
+This module re-exports the neutral runner surface so the historical
+``catopt_orchestrator.runners`` path (and ``from catopt_torch.runners
+import …``) resolves it.  :class:`CudaGraphRunner` is deliberately NOT
+re-exported: it lives in :mod:`catopt_cuda`, and importing it here
+would make ``catopt_torch`` depend on ``catopt_cuda`` (which in turn
+depends on ``catopt_torch``), a cycle.  Import it from its home::
+
+    from catopt_cuda import CudaGraphRunner
 """
 
 from __future__ import annotations
 
-from contextlib import suppress
 from typing import Any, cast
 
 import torch
@@ -27,12 +30,8 @@ from catopt_orchestrator.runners import (
     runner_candidate,
 )
 
-with suppress(ModuleNotFoundError):  # catopt-cuda not installed
-    from catopt_cuda import CudaGraphRunner
-
 __all__ = [
     "ChainedRunner",
-    "CudaGraphRunner",
     "IdentityRunner",
     "Runner",
     "TorchCompileRunner",

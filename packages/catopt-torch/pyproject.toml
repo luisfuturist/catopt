@@ -8,6 +8,15 @@ version = "0.1.0dev"
 description = "PyTorch adapters for catopt: torch.export bridge, executors, model zoo, reports."
 requires-python = ">=3.11"
 dependencies = ["catopt-core", "catopt-orchestrator", "torch>=2.0"]
+# `catopt-carriers` is a deliberate *optional* runtime dependency: the
+# torch sink builds its carrier executor table from the carrier
+# lowerings (`catopt_torch.adapters._executor_specs`) under a
+# `try/except ModuleNotFoundError`, degrading to the trace + generic
+# table without them.  It is not declared here because `catopt-carriers`
+# already depends on `catopt-torch` (its law modules carry
+# `TORCH_BINDINGS`), and a declared cycle is not installable.  The
+# `dependency layers` import-linter contract groups the two as one
+# mutually-dependent backend layer instead.
 
 [tool.setuptools.packages.find]
 where = ["src"]

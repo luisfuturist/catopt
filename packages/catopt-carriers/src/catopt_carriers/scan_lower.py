@@ -44,10 +44,10 @@ from typing import Any, cast
 import torch
 from catopt_core.ir import IR, Op, Param, Var
 from catopt_core.typing import (
-    _INVALID,
-    _broadcast,
-    _matmul_shape,
-    _shape_of,
+    INVALID,
+    broadcast,
+    matmul_shape,
+    shape_of,
 )
 from catopt_torch.executors import (
     BatchedExecutorBase,
@@ -243,32 +243,32 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
     """
     if not leaves:
         return False
-    a0 = cast("tuple", _shape_of(leaves[0].args[0]))
-    b0 = cast("tuple", _shape_of(leaves[0].args[1]))
+    a0 = cast("tuple", shape_of(leaves[0].args[0]))
+    b0 = cast("tuple", shape_of(leaves[0].args[1]))
     if leaves[0].op == "aff_diag":
         if not (_concrete_tuple(a0) and _concrete_tuple(b0)):
             return False
-        eff = _broadcast(a0, b0)
-        if eff is _INVALID:
+        eff = broadcast(a0, b0)
+        if eff is INVALID:
             return False
         for leaf in leaves[1:]:
-            a = _shape_of(leaf.args[0])
-            b = _shape_of(leaf.args[1])
+            a = shape_of(leaf.args[0])
+            b = shape_of(leaf.args[1])
             if not (_concrete_tuple(a) and _concrete_tuple(b)):
                 return False
-            eff = _broadcast(eff, a)
-            if eff is _INVALID:
+            eff = broadcast(eff, a)
+            if eff is INVALID:
                 return False
-            eff = _broadcast(eff, b)
-            if eff is _INVALID:
+            eff = broadcast(eff, b)
+            if eff is INVALID:
                 return False
         return True
     ok = (
         _concrete_tuple(a0)
         and _concrete_tuple(b0)
         and len(a0) >= 2
-        and _matmul_shape(a0, a0) == a0
-        and _matmul_shape(a0, b0) == b0
+        and matmul_shape(a0, a0) == a0
+        and matmul_shape(a0, b0) == b0
         # vector-b (*P, d) or column-b (…, d, 1) — the signatures
         # _leaf_homogeneous packs and the level matmuls close over.
         # A shared (d,d) map may broadcast into a batched (B,d,1) b.
@@ -280,10 +280,7 @@ def _leaf_shapes_consistent(leaves: list[Op]) -> bool:
     if not ok:
         return False
     for leaf in leaves[1:]:
-        if (
-            _shape_of(leaf.args[0]) != a0
-            or _shape_of(leaf.args[1]) != b0
-        ):
+        if shape_of(leaf.args[0]) != a0 or shape_of(leaf.args[1]) != b0:
             return False
     return True
 
@@ -331,7 +328,10 @@ def _leaf_b_gather(leaves: list[Op]):
         return None
     parts = cast("list[tuple]", parts)
     base0, dim0 = parts[0][0], parts[0][1]
-    if any(p[0] is not base0 or p[1] != dim0 for p in parts):
+    # ``==`` not ``is``: ``Op.make`` returns the first interned node,
+    # whose args hold the original value-equal leaves, so identity is
+    # not a stable test for "same base term" (weak intern table).
+    if any(p[0] != base0 or p[1] != dim0 for p in parts):
         return None
     return (base0, dim0, [p[2] for p in parts])
 
@@ -402,7 +402,7 @@ def build_scan_plan(root: Any) -> dict | None:
         )
         for leaf in leaves
     )
-    b0s = _shape_of(leaves[0].args[1])
+    b0s = shape_of(leaves[0].args[1])
     column_state = bool(
         not diag
         and isinstance(b0s, tuple)

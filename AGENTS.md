@@ -5,9 +5,11 @@ Categorical optimization of neural-network computation graphs
 live under `packages/` (`catopt-core` — the torch-free engine;
 `catopt-torch` — PyTorch adapters; `catopt-carriers` — carrier
 laws/executors; `catopt-cuda` — the CUDA-graph runner;
-`catopt-orchestrator` — the backend-neutral pipeline). The `catopt`
-façade is gone (plan 0008): `import catopt` fails and every name
-lives at its real package path — `catopt_core.egraph`,
+`catopt-orchestrator` — the backend-neutral pipeline). The optional
+`catopt-native` package — the PyO3/Rust search engine, excluded from
+the uv workspace and built with maturin — is opt-in via `engine=`.
+The `catopt` façade is gone (plan 0008): `import catopt` fails and
+every name lives at its real package path — `catopt_core.egraph`,
 `catopt_torch.adapters`, `catopt_orchestrator.optimize`,
 `catopt_cuda.CudaGraphRunner`, … Tests in
 `tests/`. The dev virtualenv is `.venv/` (uv-managed).
@@ -232,6 +234,22 @@ Extraction is priced through
 search only selects forms the backend can lower.  A new backend
 implements `Sink`; nothing in `catopt-core` changes.
 
+Carrier machinery is the second half of the boundary.  The
+orchestrator's carrier-aware passes (batched plan builders, non-local
+lifts, carrier rule sets, carrier-root probes) reach the torch-coupled
+`catopt_carriers` package through the `register_carriers` seam
+(`catopt_orchestrator.carriers`), never by importing it: the carrier
+package registers a `CarrierMachinery` value — all thunks, so
+registration loads no tensor library — when it is imported.  Without a
+registration the passes degrade to their carrier-free defaults.  The
+resulting package graph is pinned by the import-linter `dependency
+layers` contract: `catopt_cuda` above `catopt_torch`/`catopt_carriers`
+(one mutually-dependent backend layer — the carriers' law modules
+carry `TORCH_BINDINGS`, and the torch sink builds its executor table
+from the carrier lowerings), above `catopt_orchestrator`, above
+`catopt_native`, above `catopt_core`.  `catopt_torch` does not depend
+on `catopt_cuda`; import `CudaGraphRunner` from `catopt_cuda`.
+
 ## Conventions
 
 - Line length 72 (ruff). E501/B008/SIM108 intentionally ignored — see
@@ -255,6 +273,16 @@ implements `Sink`; nothing in `catopt-core` changes.
   installs the CPU wheel (`uv pip install --torch-backend cpu
   --reinstall torch`) for determinism; the CUDA-graph tests no longer
   require it locally.
+- Four independent dimensions (ADR 0003): **semantics / search /
+  evaluation / execution**.  No layer answers another's question — a
+  cost model must not change semantics, a policy must not decide
+  equivalence, a profiler must not run on the target.  Feasibility
+  (`supported_ops`, hard) and performance ranking (soft) stay
+  distinct.
+- "Profile" means one thing: a measured target
+  (`catopt_core.profile.TargetProfile`).  Static characterization of
+  a *program* is `ProgramFeatures` (a future `catopt_core.features`),
+  never called a "profile".
 
 ## Adding a rewrite law
 

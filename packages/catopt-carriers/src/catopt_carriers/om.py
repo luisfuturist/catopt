@@ -85,7 +85,7 @@ def _vshape(t: Any):
     Metavariable bindings resolve through ``EGraph``'s representative
     member (``_min_term``/``any_term``), which may be a CARRIER member:
     ``applyd``/``apply``/the om family report a *convention* shape
-    under ``catopt_core.typing._shape_of`` (the state slot, the map's linear
+    under ``catopt_core.typing.shape_of`` (the state slot, the map's linear
     part — ``()`` when the slot resolves to a scalar member), not the
     tensor value the e-class denotes.  Judging side conditions on
     convention shapes vetoed legal rewrites — observed: ``om_lift``
@@ -113,9 +113,9 @@ def _dim_eq(a: Any, b: Any) -> bool:
 
 
 def _broadcast_ok(a, b) -> bool:
-    from catopt_core.typing import _INVALID, _broadcast
+    from catopt_core.typing import INVALID, broadcast
 
-    return _broadcast(a, b) is not _INVALID
+    return broadcast(a, b) is not INVALID
 
 
 # ---------------------------------------------------------------------------
@@ -703,10 +703,10 @@ def _check_cat_pair(bound: dict) -> int | None:
         return None
     if not all(_dim_eq(b1[i], b2[i]) for i in range(rb) if i != db):
         return None
-    from catopt_core.typing import _INVALID, _broadcast
+    from catopt_core.typing import INVALID, broadcast
 
-    ba, bb = _broadcast(a1, b1), _broadcast(a2, b2)
-    if ba is _INVALID or bb is _INVALID:
+    ba, bb = broadcast(a1, b1), broadcast(a2, b2)
+    if ba is INVALID or bb is INVALID:
         return None
     if not all(
         _dim_eq(ba[i], bb[i]) for i in range(ro) if i != oa
@@ -861,7 +861,7 @@ OM_MASK_LAWS: list[Rewrite] = [
 #      The causal bad-mask of an x-shaped score matrix: on x's last two
 #      dims, out[...,t,j] = (j + off > t) — strict upper triangle
 #      shifted ``off`` keys right, broadcast back to x's full shape.
-#      Rank-preserving so ``typing._shape_of`` reads it through the default
+#      Rank-preserving so ``typing.shape_of`` reads it through the default
 #      case — which is what lets masked_fill_cat_slice derive split
 #      sizes for n-ary concats.  Semantics follow torch's is_causal:
 #      lower-LEFT triangular, i.e. j ≤ t, so a T_q=1 decode row sees
@@ -1173,16 +1173,16 @@ def _check_sdpa_mask_cat(bound: dict) -> bool:
     k1, k2 = k1s[-2], k2s[-2]
     if not (isinstance(k1, int) and isinstance(k2, int)):
         return False  # can't derive split sizes
-    from catopt_core.typing import _INVALID, _broadcast
+    from catopt_core.typing import INVALID, broadcast
 
-    bb = _broadcast(qs[:-2], k1s[:-2])
+    bb = broadcast(qs[:-2], k1s[:-2])
     if (
-        bb is _INVALID
+        bb is INVALID
     ):  # pragma: no cover — _check_sdpa_cat already proved this broadcast
         return False
     scores = (*tuple(bb), qs[-2], k1 + k2)
-    b = _broadcast(scores, ms)
-    if b is _INVALID or not isinstance(b, tuple) or not b:
+    b = broadcast(scores, ms)
+    if b is INVALID or not isinstance(b, tuple) or not b:
         return False
     # Broadcast-compatible mask whose key-axis extent is Tk or 1.
     return b[-1] == k1 + k2

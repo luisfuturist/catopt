@@ -163,7 +163,10 @@ def test_leaf_b_gather():
     ]
     g = _leaf_b_gather(leaves)
     assert g is not None
-    assert g[0] is base and g[1] == 0 and g[2] == [0, 1, 2, 3]
+    # ``==`` not ``is``: terms are hash-consed with a weak intern
+    # table, so a value-equal base from an earlier test may be the
+    # live representative — identity is not stable across test order.
+    assert g[0] == base and g[1] == 0 and g[2] == [0, 1, 2, 3]
     # different bases → None
     leaves[1] = Op.make(
         "aff",

@@ -24,10 +24,10 @@ exec .venv/bin/python -m pytest -q -p no:cacheprovider \
     tests/test_interning.py \
     tests/test_attrs.py \
     tests/test_typing.py \
-    tests/test_cov2_typing.py \
-    tests/test_cov2_cost.py \
-    tests/test_cov2_egraph.py \
-    tests/test_cov2_meta.py \
+    tests/test_typing_edges.py \
+    tests/test_cost_edge_cases.py \
+    tests/test_egraph_internals.py \
+    tests/test_meta_edges.py \
     tests/test_meta.py \
     tests/test_rules.py \
     tests/test_property_ir.py \
@@ -43,22 +43,22 @@ exec .venv/bin/python -m pytest -q -p no:cacheprovider \
     tests/test_reports.py \
     tests/test_executor_base.py \
     tests/test_optimize_routing.py \
-    tests/test_cov2_models.py \
+    tests/test_model_blocks_lowering.py \
     tests/test_om_monoid.py \
     tests/test_om_mask.py \
     tests/test_om_stream.py \
     tests/test_om_batched.py \
-    tests/test_cov_om_lower.py \
-    tests/test_cov_scan_lower.py \
-    tests/test_cov2_om.py \
-    tests/test_cov2_xcarrier.py \
+    tests/test_om_lower_edges.py \
+    tests/test_scan_lower_edges.py \
+    tests/test_om_guard_branches.py \
+    tests/test_xcarrier_guards.py \
     tests/test_scan_batched.py \
     tests/test_backend_cost.py \
     tests/test_registries.py \
     tests/test_partial_install.py \
     tests/test_logging.py \
-    tests/test_cov2_bridge.py \
-    tests/test_cov3_tail.py \
+    tests/test_torch_bridge_edges.py \
+    tests/test_optimize_compositional_edges.py \
     tests/test_truncation.py \
     tests/test_unit_lift.py \
     tests/test_exact_corner.py \
@@ -69,16 +69,16 @@ exec .venv/bin/python -m pytest -q -p no:cacheprovider \
     tests/test_synthesis_guards.py \
     tests/test_synthesis_seeds.py \
     tests/test_rulecache.py \
-    tests/test_cov_rulecache.py \
+    tests/test_rulecache_codec.py \
     tests/test_typecheck_smoke.py \
     tests/test_struct_real.py \
     tests/test_e2e_pipeline.py \
     tests/test_compositional.py \
     tests/test_hybrid.py \
     tests/test_om_causal.py \
-    tests/test_cov2_regime.py \
+    tests/test_regime_edges.py \
     tests/test_regime.py \
-    tests/test_cov2_laws.py \
+    tests/test_laws_rewrite_edges.py \
     tests/test_mask_chunk.py \
     tests/test_trace.py \
     tests/test_trace_lift.py \

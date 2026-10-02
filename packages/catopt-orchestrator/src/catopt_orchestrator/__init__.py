@@ -24,6 +24,11 @@ with their backends (:class:`catopt_torch.runners.TorchCompileRunner`,
 from catopt_core.pipeline import Backend, LowerResult, SearchResult
 from catopt_core.ports import Criterion, Runner
 
+from catopt_orchestrator.carriers import (
+    CarrierMachinery,
+    get_carriers,
+    register_carriers,
+)
 from catopt_orchestrator.criteria import (
     Blend,
     CompiledCriterion,
@@ -94,6 +99,7 @@ __all__ = [
     "Backend",
     "Blend",
     "BlockSig",
+    "CarrierMachinery",
     "ChainedRunner",
     "CompiledCriterion",
     "Compositional",
@@ -136,12 +142,14 @@ __all__ = [
     "default_rules",
     "diagram_of_graph",
     "discover_alternatives",
+    "get_carriers",
     "lift_diagram",
     "lift_graph",
     "lower",
     "optimize_diagram",
     "optimize_morphisms",
     "peak_bytes_cost",
+    "register_carriers",
     "runner_candidate",
     "search",
     "structural_key",

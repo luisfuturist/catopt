@@ -83,6 +83,7 @@ from catopt_core.ports import (
     TaskMetric,
 )
 
+from catopt_orchestrator.carriers import get_carriers
 from catopt_orchestrator.criteria import (
     Criteria,
     Criterion,
@@ -254,27 +255,16 @@ def _default_cost_fn() -> CostFn:
 
 
 def _carrier_plans() -> dict[str, Callable]:
-    """Carrier-apply root ops → (batched plan builder) — deferred.
+    """Carrier-apply root ops → (batched plan builder).
 
     A term rooted at one of these lowers through the level-batched
-    executor.  The builders are carrier-package machinery (torch
-    executors); they resolve at call time so the orchestrator never
-    imports a backend, and a partial install simply yields an empty
-    map (no carrier upgrades).
+    executor.  The builders arrive through
+    :mod:`catopt_orchestrator.carriers` (the carrier package registers
+    them), so the orchestrator never imports a backend; a process
+    without carriers simply yields an empty map (no carrier upgrades).
     """
-    try:
-        from catopt_carriers.om_lower import build_om_plan
-        from catopt_carriers.omd_lower import build_omd_plan
-        from catopt_carriers.scan_lower import build_scan_plan
-    except ModuleNotFoundError:
-        return {}
-    return {
-        "apply": build_scan_plan,
-        "applyd": build_scan_plan,
-        "om_apply": build_om_plan,
-        "omd_apply": build_omd_plan,
-        "omd_applym": build_omd_plan,
-    }
+    m = get_carriers()
+    return {} if m is None else m.plans()
 
 
 def _delivered_cost(
@@ -1302,10 +1292,11 @@ def _resolve_cost_fn(
 
 #: The composed default rule set — ``catopt_core.laws.DEFAULT`` plus
 #: the carrier-package ``CARRIERS`` preset.  Composed **once,
-#: lazily**: ``catopt_carriers`` is a different, torch-coupled
-#: package, so reaching into it here at import time would break the
-#: orchestrator's backend-neutral contract; a partial install simply
-#: contributes the core default.  Subsumed- and symmetry-tagged
+#: lazily**: the carrier preset arrives through
+#: :mod:`catopt_orchestrator.carriers` (the carrier package registers
+#: it), so the orchestrator imports no backend; a process without
+#: carriers simply contributes the core default.  Subsumed- and
+#: symmetry-tagged
 #: rules are excluded by the *preset*, not by a filter in this module
 #: — the ``_SUBSUMED`` hidden list and the ``ruleset: str`` switch
 #: are gone (plan 0009).
@@ -1319,10 +1310,9 @@ def default_rules() -> RuleSet:
         from catopt_core import laws
 
         rs = laws.DEFAULT
-        with contextlib.suppress(ModuleNotFoundError):
-            from catopt_carriers import CARRIERS
-
-            rs = rs + CARRIERS
+        m = get_carriers()
+        if m is not None:
+            rs = rs + m.preset()
         _DEFAULT_RULES = replace(
             rs,
             name="default_rules",
@@ -1513,11 +1503,12 @@ def _carrier_lifts(
     detect_headshare: bool = False,
     error_budget: float | None = None,
 ) -> list:
-    """Run the non-local carrier/tying lifts, carriers lazily resolved.
+    """Run the non-local carrier/tying lifts.
 
-    ``catopt_carriers`` machinery (the carrier lifts) resolves at call
-    time; the weight-tying lifts are core.  A partial install without
-    carriers contributes only the tying passes.  ``detect_factors``
+    The carrier lifts arrive through
+    :mod:`catopt_orchestrator.carriers`; the weight-tying lifts are
+    core.  A process without carriers contributes only the tying
+    passes.  ``detect_factors``
     arms the opt-in low-rank detection offers of
     :func:`catopt_core.laws.factored.offer_low_rank_factors`;
     ``detect_specials`` arms the opt-in weight-structure offers of
@@ -1527,26 +1518,8 @@ def _carrier_lifts(
     sharing of
     :func:`catopt_core.laws.headshare.share_duplicate_attention_heads`.
     """
-    try:
-        from catopt_carriers.trace_lift import (
-            lift_scan_to_applyd,
-            lift_scan_to_trace,
-        )
-        from catopt_carriers.xcarrier import (
-            gather_apply_stack,
-            gather_applyd_stack,
-            omd_tree_lift,
-        )
-    except ModuleNotFoundError:
-        carrier: list = []
-    else:
-        carrier = (
-            lift_scan_to_applyd(eg)
-            + lift_scan_to_trace(eg)
-            + gather_applyd_stack(eg)
-            + gather_apply_stack(eg)
-            + omd_tree_lift(eg)
-        )
+    m = get_carriers()
+    carrier: list = [] if m is None else m.lifts(eg)
     return (
         carrier
         + share_duplicate_params(eg, source_tensors)

@@ -135,6 +135,11 @@ root_packages = [
     "catopt_orchestrator",
     "catopt_cuda",
 ]
+# `catopt_native` is deliberately NOT a root package: it is an optional
+# maturin/cargo build outside the uv workspace, so `uv sync` (and CI)
+# uninstall it — a missing root package is a hard import-linter error.
+# It is listed as an *optional* layer below, so it is checked when
+# present and skipped when absent.
 # Required so the "core imports no tensor library" contract can forbid
 # the external torch/numpy packages.
 include_external_packages = true
@@ -168,6 +173,31 @@ forbidden_modules = ["torch", "catopt_torch", "catopt_cuda"]
 # boundary test (sys.modules stays torch-free after
 # `import catopt_orchestrator`) is the gate that pins the laziness.
 allow_indirect_imports = true
+
+# The dependency *layers*: the graph must be acyclic apart from the
+# backend family, which is a single mutually-dependent component.
+# `catopt_torch` and `catopt_carriers` are one layer: the carrier
+# package is a torch-backend extension (its law modules carry
+# `TORCH_BINDINGS`, and the torch sink builds its executor table from
+# the carrier lowerings), so the two are genuinely bidirectional and
+# must not be split across layers.  `catopt_cuda` sits above them (it
+# depends on `catopt_torch`).  `catopt_orchestrator` sits below the
+# whole backend family: the backend packages depend on it, and it
+# reaches carrier machinery only through the `register_carriers` seam
+# (`catopt_orchestrator.carriers`), never by importing them.
+# `catopt_native` is a peer of core (it implements the Engine port
+# over the same IR) and is checked to stay above core only.
+[[tool.importlinter.contracts]]
+name = "dependency layers"
+type = "layers"
+# `:` marks non-independent (mutually importable) siblings.
+layers = [
+    "catopt_cuda",
+    "catopt_torch : catopt_carriers",
+    "catopt_orchestrator",
+    "(catopt_native)",
+    "catopt_core",
+]
 
 [tool.ruff]
 target-version = "py311"

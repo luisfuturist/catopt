@@ -90,7 +90,7 @@ def _specialize_causal(
     keep-mask.  Dropping the materialised mask unlocks the fused
     flash/mem-efficient kernels.
     """
-    from catopt_core.typing import _shape_of as _so
+    from catopt_core.typing import shape_of as _so
 
     if memo is None:
         memo = {}

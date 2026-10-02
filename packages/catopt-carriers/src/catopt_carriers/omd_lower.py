@@ -235,7 +235,10 @@ def _part_gather(leaves: list, argidx: int):
             return None
         parts.append(p)
     base0, dim0 = parts[0][0], parts[0][1]
-    if any(p[0] is not base0 or p[1] != dim0 for p in parts):
+    # ``==`` not ``is``: ``Op.make`` returns the first interned node,
+    # whose args hold the original value-equal leaves, so identity is
+    # not a stable test for "same base term" (weak intern table).
+    if any(p[0] != base0 or p[1] != dim0 for p in parts):
         return None
     return (base0, dim0, [p[2] for p in parts])
 

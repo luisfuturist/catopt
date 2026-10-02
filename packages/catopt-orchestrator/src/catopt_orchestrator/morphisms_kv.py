@@ -69,7 +69,7 @@ from catopt_core.ir import (
 )
 from catopt_core.laws.pairing import _exact_equal, _is_tensor
 from catopt_core.ports import CostFn, Sink
-from catopt_core.typing import _shape_of, has_var_leaf
+from catopt_core.typing import has_var_leaf, shape_of
 
 import catopt_orchestrator.morphisms as M
 
@@ -923,7 +923,7 @@ def _kv_numbers(
     (an unfactored q-section of a ``qkv`` node persists on both
     sides and cancels).
     """
-    dshape = _shape_of(data)
+    dshape = shape_of(data)
     tok = 1
     if isinstance(dshape, tuple):
         for dd in dshape[:-1]:

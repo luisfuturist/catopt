@@ -7,7 +7,7 @@ name = "catopt-carriers"
 version = "0.1.0dev"
 description = "Semantic carriers for catopt (om/omd/scan/trace lifts and executors)."
 requires-python = ">=3.11"
-dependencies = ["catopt-core", "catopt-torch", "torch>=2.0"]
+dependencies = ["catopt-core", "catopt-torch", "catopt-orchestrator", "torch>=2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

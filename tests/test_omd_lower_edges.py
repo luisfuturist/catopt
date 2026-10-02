@@ -135,7 +135,10 @@ def test_part_gather():
         for i in range(3)
     ]
     g = _part_gather(leaves, 0)
-    assert g is not None and g[0] is base and g[2] == [0, 1, 2]
+    # ``==`` not ``is``: terms are hash-consed with a weak intern
+    # table, so a value-equal base from an earlier test may be the
+    # live representative — identity is not stable across test order.
+    assert g is not None and g[0] == base and g[2] == [0, 1, 2]
     # non-leaf op in the leaf list → None
     leaves_bad = [*leaves[:1], _v("z", 4)]
     assert _part_gather(leaves_bad, 0) is None

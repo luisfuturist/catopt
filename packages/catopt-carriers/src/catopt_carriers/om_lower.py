@@ -208,7 +208,10 @@ def _sliced_gather(parts: list) -> tuple | None:
     dim0n = dim0 % rank
     for i, p in enumerate(parts):
         base, kind, dim, idx, n, part = p
-        if base is not base0 or kind != kind0 or dim % rank != dim0n:
+        # ``==`` not ``is``: ``Op.make`` returns the first interned
+        # node, whose args hold the original value-equal leaves, so
+        # identity is not a stable test for "same base term".
+        if base != base0 or kind != kind0 or dim % rank != dim0n:
             return None
         if idx != i:
             return None

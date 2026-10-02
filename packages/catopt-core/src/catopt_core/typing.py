@@ -51,6 +51,21 @@ from typing import Any, cast
 from catopt_core.attrs import attr_of, is_positional_attr
 from catopt_core.ir import Const, Op, Param, Var
 
+#: The public shape-inference surface.  The underscore-prefixed names
+#: above/below are the implementation; these are the stable spellings
+#: other packages import (``catopt_core.cost`` re-exports the
+#: underscore ones for its own back-compat).  ``INVALID`` is the
+#: ill-typed sentinel, distinct from ``None`` (unknown).
+__all__ = [
+    "INVALID",
+    "broadcast",
+    "has_var_leaf",
+    "matmul_shape",
+    "numel",
+    "register_shape_rule",
+    "shape_of",
+]
+
 # ---------------------------------------------------------------------------
 # Shape inference (lightweight)
 # ---------------------------------------------------------------------------
@@ -1334,3 +1349,16 @@ register_shape_rule("bdiag", _bdiag_shape)
 register_shape_rule("parl", _bdiag_shape)
 register_shape_rule("eye", _eye_shape)
 register_shape_rule("cswap", _cswap_shape)
+
+
+# ---------------------------------------------------------------------------
+# Public spellings — the underscore names above are the implementation;
+# these are the stable names other packages import.  ``catopt_core.cost``
+# re-exports the underscore ones for its own back-compat.
+# ---------------------------------------------------------------------------
+
+INVALID = _INVALID
+broadcast = _broadcast
+matmul_shape = _matmul_shape
+numel = _numel
+shape_of = _shape_of
