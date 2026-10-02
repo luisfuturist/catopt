@@ -1,5 +1,12 @@
 # TODO
 
+## Active
+
+- [ ] ADR 0003 (evaluation as an independent dimension) — **accepted,
+      in force** (follow-ups landed).  Companion plan:
+      `project/plans/0016-evaluation-dimension.md` (stages 0–12,
+      benchmarks last).  Next: stage 0 recon.
+
 ## Deferred
 
 - [ ] `paper/` — a short paper-style write-up of the research claim:
