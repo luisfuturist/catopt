@@ -1185,19 +1185,25 @@ def test_optimizer_default_untouched_on_distinct_heads():
 # ---------------------------------------------------------------------------
 
 from catopt_core.laws.headshare import (  # noqa: E402
+    _bias_sources,
+    _bounds,
     _cls_shape,
     _const_along,
     _h_concat,
     _h_cut,
     _h_dimop,
     _h_gather,
+    _h_perm,
     _h_proj,
     _h_split,
+    _h_squeeze,
     _h_stack,
+    _h_unsq,
     _heads_merge,
     _heads_regroup,
     _interpret,
     _merge_one,
+    _merge_sites,
     _piece_select,
     _prod,
     _site_regroup,
@@ -1956,3 +1962,250 @@ def test_shape_none_class_declines():
         "p_v": _dup_rows(_w(2), (0, 1)),
     }
     assert share_duplicate_attention_heads(eg, tensors) == []
+
+
+# ---------------------------------------------------------------------------
+#  Remaining decline/edge branches — resolver corner cases
+# ---------------------------------------------------------------------------
+
+
+def test_bias_source_nonuniform_param_vetoes():
+    """A bias leaf that is neither ``(o,)`` nor all-ones vetoes."""
+    x = Var("x", _t(B, T, I))
+    w = Param("p_w", _t(H * D, I))
+    eg = EGraph()
+    ctx = _Ctx(
+        eg,
+        {
+            "p_w": _w(),
+            "p_b2": torch.randn(2, 2, dtype=torch.float64),
+            "p_b5": torch.randn(5, dtype=torch.float64),
+        },
+    )
+    # a 2-D bias is neither per-output nor uniform → None (veto)
+    b2 = eg.add_term(Param("p_b2", _t(2, 2)))
+    assert _bias_sources(ctx, b2, H * D) is None
+    # a 1-D bias of the wrong width — same veto
+    b5 = eg.add_term(Param("p_b5", _t(5)))
+    assert _bias_sources(ctx, b5, H * D) is None
+    # … and the enclosing linear site declines with it
+    lin = eg.add_term(
+        Op.make("linear", x, w, Param("p_b2", _t(2, 2)),
+                validate=False)
+    )
+    assert _resolve(ctx, lin) == ()
+
+
+def test_bare_leaf_enode_and_proj_edge_arms():
+    """Attr-less ``leaf`` and wrong-arity/non-matrix ``_h_proj`` arms."""
+    x = Var("x", _t(B, T, I))
+    w3d = Param("p_3d", _t(2, 2, 2))
+    eg = EGraph()
+    ctx = _Ctx(
+        eg, {"p_3d": torch.randn(2, 2, 2, dtype=torch.float64)}
+    )
+    # a leaf enode carrying no attrs contributes no site
+    bare = eg.add_enode("leaf", (), {})
+    assert _resolve(ctx, bare) == ()
+    # matmul is a 2-argument site — a 3-child enode misses both arms
+    le = eg.add_term(x)
+    assert _h_proj(
+        ctx, ENode("matmul", (le, le, le), ()), (B, T, I)
+    ) == []
+    # a weight param whose tensor is not a matrix is skipped
+    t = eg.add_term(Op.make("linear", x, w3d, validate=False))
+    assert _resolve(ctx, t) == ()
+
+
+def test_axis_handler_none_shapes_and_bad_permute_dims():
+    """Shapeless classes and non-permutation dims fail closed."""
+    x = Var("x", _t(B, T, I))
+    w = Param("p_w", _t(H * D, I))
+    eg = EGraph()
+    ctx = _Ctx(eg, {"p_w": _w()})
+    le = eg.add_term(Op.make("linear", x, w))
+    # permute dims that are not a list of ints → no axis map
+    for dims in (("a", "b"), "nope"):
+        en = ENode("permute", (le,), (("dims", dims),))
+        assert _h_perm(ctx, en, (B, T, I)) == []
+    # every axis-op handler declines a class with no inferred shape
+    tr = ENode("transpose", (le,), (("dim0", 0), ("dim1", 1)))
+    assert _h_perm(ctx, tr, None) == []
+    un = ENode("unsqueeze", (le,), (("dim", 0),))
+    assert _h_unsq(ctx, un, None) == []
+    sq = ENode("squeeze", (le,), (("dim", 0),))
+    assert _h_squeeze(ctx, sq, None) == []
+    cat = ENode("concat", (le, le), (("dim", 0),))
+    assert _h_concat(ctx, cat, None) == []
+    assert _h_concat(ctx, cat, ()) == []
+
+
+def test_squeeze_on_head_axis_and_uneven_head_chunk():
+    """Cuts on the head axis that are not contiguous blocks decline."""
+    x = Var("x", _t(B, T, I))
+    q = Param("p_q", _t(H * D, I))
+    eg = EGraph()
+    ctx = _Ctx(eg, {"p_q": _w()})
+    # squeezing the head axis itself is not head-safe
+    sq = eg.add_term(
+        Op.make("squeeze", _chain(x, q), dim=1, validate=False)
+    )
+    assert _resolve(ctx, sq) == ()
+    # a head-axis chunk that does not split evenly has no span
+    ck = eg.add_term(
+        Op.make(
+            "chunk", _chain(x, q), chunks=3, dim=1, index=0,
+            validate=False,
+        )
+    )
+    assert _resolve(ctx, ck) == ()
+
+
+def test_expand_growing_feature_axis_declines():
+    """A site may not grow its flat feature axis — blocks would mix."""
+    eg = EGraph()
+    ctx = _Ctx(
+        eg, {"p_1": torch.randn(B, T, 1, dtype=torch.float64)}
+    )
+    e = eg.add_term(
+        Op.make(
+            "expand",
+            Param("p_1", _t(B, T, 1)),
+            shape=(B, T, 4),
+            validate=False,
+        )
+    )
+    assert _resolve(ctx, e) == ()
+
+
+def test_index_select_off_feature_axis_keeps_site():
+    """Gathering a leading axis of a flat-feature site is head-safe."""
+    x = Var("x", _t(B, T, I))
+    q = Param("p_q", _t(H * D, I))
+    eg = EGraph()
+    ctx = _Ctx(eg, {"p_q": _w()})
+    g = eg.add_term(
+        Op.make(
+            "index_select", Op.make("linear", x, q), dim=0, index=(0,)
+        )
+    )
+    st = _resolve(ctx, g)
+    assert st[0][0] == "s" and st[0][1] == (1, T, H * D)
+
+
+def test_bounds_rejects_unknown_extent():
+    """Slice/narrow bounds need a concrete integer extent."""
+    node = ENode("slice", (), ())
+    assert _bounds({"dim": -1}, node, None) is None
+    assert _bounds({"dim": -1}, node, "x") is None
+
+
+def test_elemwise_heads_misaligned_under_broadcast():
+    """Head axes landing on different parent axes cannot merge."""
+    x = Var("x", _t(B, T, I))
+    x3 = Var("x3", _t(H, I))
+    q, k, v = (Param(f"p_{n}", _t(H * D, I)) for n in "qkv")
+    w3 = Param("p_w3", _t(T * D, I))
+    # (H,T,D) heads at axis 1 — broadcast against (B,H,T,D) shifts it
+    # onto the parent's T axis, so _merge_one finds no common axis.
+    h3 = Op.make(
+        "reshape", Op.make("linear", x3, w3), shape=(H, T, D)
+    )
+    mul = Op.make("mul", _chain(x, q), h3)
+    eg = EGraph()
+    mc = eg.add_term(mul)
+    eg.add_term(Op.make("sdpa", mul, _chain(x, k), _chain(x, v)))
+    ctx = _Ctx(eg, {"p_q": _w(), "p_w3": _w(5, T, D)})
+    assert _resolve(ctx, mc) == ()
+    tensors = {
+        "p_q": _dup_rows(_w(), (0, 1)),
+        "p_k": _dup_rows(_w(1), (0, 1)),
+        "p_v": _dup_rows(_w(2), (0, 1)),
+        "p_w3": _w(5, T, D),
+    }
+    assert share_duplicate_attention_heads(eg, tensors) == []
+
+
+def test_width_one_left_site_merges_right_sources():
+    """``mul((…,1) site, full site)`` — the wide site alone keys."""
+    x = Var("x", _t(B, T, I))
+    q, k, v = (Param(f"p_{n}", _t(H * D, I)) for n in "qkv")
+    p1 = Param("p_1", _t(B, T, 1))
+    scaled = Op.make(
+        "transpose",
+        Op.make(
+            "reshape",
+            Op.make("mul", p1, Op.make("linear", x, q)),
+            shape=(B, T, H, D),
+        ),
+        dim0=1,
+        dim1=2,
+    )
+    eg, _ = _graph(
+        Op.make("sdpa", scaled, _chain(x, k), _chain(x, v))
+    )
+    tensors = {
+        "p_q": _dup_rows(_w(), (0, 1)),
+        "p_k": _dup_rows(_w(1), (0, 1)),
+        "p_v": _dup_rows(_w(2), (0, 1)),
+        "p_1": torch.randn(B, T, 1, dtype=torch.float64),
+    }
+    offers = share_duplicate_attention_heads(eg, tensors)
+    assert len(offers) == 1
+    assert offers[0]["index_map"] == (0, 0, 1, 2)
+
+
+def test_concat_offhead_sig_count_mismatch_skips():
+    """Off-axis concat of different head counts cannot merge sigs."""
+    x = Var("x", _t(B, T, I))
+    q = Param("p_q", _t(H * D, I))
+    w2 = Param("p_w2", _t(2 * D, I))
+    eg = EGraph()
+    ctx = _Ctx(eg, {"p_q": _w(), "p_w2": _w(9, 2, D)})
+    c4 = eg.add_term(_chain(x, q))
+    c2 = eg.add_term(
+        Op.make(
+            "transpose",
+            Op.make(
+                "reshape",
+                Op.make("linear", x, w2),
+                shape=(B, T, 2, D),
+            ),
+            dim0=1,
+            dim1=2,
+        )
+    )
+    en = ENode("concat", (c4, c2), (("dim", 0),))
+    assert _h_concat(ctx, en, (2 * B, H, T, D)) == []
+
+
+def test_stack_busy_piece_and_resolve_busy_class():
+    """Cycle guards: a busy piece vetoes ``stack``; a busy class → ()."""
+    x = Var("x", _t(B, T, I))
+    w = Param("p_w", _t(I, D))
+    eg = EGraph()
+    ctx = _Ctx(eg, {"p_w": _w(3, 1, D)})
+    pe = eg.add_term(Op.make("matmul", x, w))
+    ctx.busy.add(eg.find(pe))
+    en = ENode("stack", (pe,), (("dim", 0),))
+    assert _h_stack(ctx, en, (1, B, T, D)) == []
+    # _resolve on a busy class it has never memoised — the DFS-cycle arm
+    pz = eg.add_term(Param("p_z", _t(1)))
+    ctx.busy.add(eg.find(pz))
+    assert _resolve(ctx, pz) == ()
+    assert eg.find(pz) not in ctx.memo
+
+
+def test_merge_sites_incompatible_widths_decline():
+    """Sites of different non-uniform widths cannot share blocks."""
+    x = Var("x", _t(B, T, I))
+    eg = EGraph()
+    ctx = _Ctx(eg, {})
+    xe = eg.add_term(x)
+    pe = eg.add_term(Param("p", _t(B, T, I)))
+    node = ENode("mul", (xe, pe), ())
+    s4 = ("s", (B, T, 4), (("p_a", "vec", 0),), frozenset())
+    s8 = ("s", (B, T, 8), (("p_b", "vec", 0),), frozenset())
+    # w0 != w1, neither width-1 — the pair is dropped by every arm
+    assert _merge_sites(ctx, node, (B, T, I), (s4,), (s8,)) == []
+    assert _merge_sites(ctx, node, (B, T, I), (s8,), (s4,)) == []

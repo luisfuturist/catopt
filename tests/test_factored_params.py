@@ -729,9 +729,14 @@ def test_kv_latent_stays_factored_flops():
     reified = out["reified"]
     assert "p_kv_latent_ut" in reified
     # Factored spelling: matmul(C, D_i) — NOT matmul(x, matmul(U, D_i)).
-    assert (
-        "(matmul (matmul x, p_kv_latent_ut), p_kv_latent_d" in reified
-    )
+    # Under op_repr_dag the shared latent is bound once as ``#n``;
+    # each recovery references it: ``(matmul #n, p_kv_latent_d…)``.
+    import re as _re
+
+    binding = _re.search(r"\(#\d+ \(matmul x, p_kv_latent_ut\)\)", reified)
+    assert binding is not None
+    latent = binding.group(0).split(" ")[0][1:]
+    assert f"(matmul {latent}, p_kv_latent_d" in reified
     assert "(matmul p_kv_latent_ut, p_kv_latent_d" not in reified
 
 
@@ -743,9 +748,16 @@ def test_kv_latent_linear_sites_stay_factored():
     out = _reify(m, g, flops_cost)
     assert out["status"] == "grafted"
     reified = out["reified"]
-    assert (
-        "(linear (matmul x, p_kv_latent_ut), p_kv_latent_d" in reified
+    import re as _re
+
+    # DAG form: the latent ``matmul x, p_kv_latent_ut`` is bound as
+    # ``#n``; recoveries consume it: ``(linear #n, p_kv_latent_d…)``.
+    binding = _re.search(
+        r"\(#\d+ \(matmul x, p_kv_latent_ut\)\)", reified
     )
+    assert binding is not None
+    latent = binding.group(0).split(" ")[0][1:]
+    assert f"(linear {latent}, p_kv_latent_d" in reified
     # No param-only composition member selected anywhere.
     assert "matmul p_kv_latent" not in reified
 
