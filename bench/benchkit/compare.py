@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+#: Verdict keywords the registry's ``expects`` prose may advertise.
+_VERDICT_WORDS = (
+    "WIN",
+    "PARITY",
+    "NEGATIVE",
+    "REGRESSION",
+    "INCONCLUSIVE",
+)
 
 
 @dataclass
@@ -40,7 +50,9 @@ def compare_baseline(
             continue
         for variant, now_s in cell["median_s"].items():
             base_s = base["median_s"].get(variant)
-            if not base_s:
+            # A ledger record read back through polars carries ``None``
+            # for variants a cell did not time (e.g. under ``--quick``).
+            if not base_s or not now_s:
                 continue
             ratio = now_s / base_s
             if ratio > 1 + threshold:
@@ -54,3 +66,47 @@ def compare_baseline(
                     )
                 )
     return regressions
+
+
+def expected_verdict(expects: str) -> str | None:
+    """The verdict keyword a registry ``expects`` string advertises.
+
+    ``None`` when the prose names no verdict (e.g. a coverage map or an
+    exploratory suite), in which case no consistency check applies.
+    """
+    for word in _VERDICT_WORDS:
+        if re.search(rf"\b{word}\b", expects):
+            return word
+    return None
+
+
+def expectation_gaps(baselines_dir: str | Path) -> list[str]:
+    """Baselines whose findings contradict the registry's stated verdict.
+
+    Advisory, not a hard gate: a suite's ``expects`` prose states the
+    intended outcome, while a pinned baseline is one measurement.  A gap
+    means the two disagree — the drift this harness exists to surface.
+    """
+    from bench import registry
+
+    gaps: list[str] = []
+    for path in sorted(Path(baselines_dir).glob("*.json")):
+        try:
+            spec = registry.get(path.stem)
+        except KeyError:
+            gaps.append(f"{path.stem}: not in the registry")
+            continue
+        payload = json.loads(path.read_text())
+        present = {
+            f["verdict"].upper() for f in payload.get("findings", [])
+        }
+        if not present:
+            gaps.append(f"{path.stem}: baseline states no finding")
+            continue
+        want = expected_verdict(spec.expects)
+        if want and want not in present:
+            gaps.append(
+                f"{path.stem}: expects {want}, baseline has "
+                f"{', '.join(sorted(present))}"
+            )
+    return gaps

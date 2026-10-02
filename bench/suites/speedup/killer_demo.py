@@ -154,7 +154,17 @@ def run_cell(
     model = model.to(device).eval()
     x = x.to(device)
 
-    opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Autotuned(candidates, n_calls=n_calls, warmup=at_warmup, verbose=verbose, builders=TORCH_BUILDERS))
+    opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        model,
+        x,
+        strategy=Autotuned(
+            candidates,
+            n_calls=n_calls,
+            warmup=at_warmup,
+            verbose=verbose,
+            builders=TORCH_BUILDERS,
+        ),
+    )
 
     at = stats["autotune"]
     cand_recs = at["candidates"]
@@ -341,7 +351,9 @@ def run_bench(args) -> Report:
                 "model"
             ),
             verdict=(
-                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+                Verdict.WIN
+                if best and best[1] > 1
+                else Verdict.NEGATIVE
             ),
             headline=(
                 f"best {best[1]:.2f}× vs eager on {best[0]}"

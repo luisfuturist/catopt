@@ -1,6 +1,7 @@
 """``python -m bench`` — the unified benchmark CLI.
 
     python -m bench list
+    python -m bench catalog --check
     python -m bench run reassoc_scale --device cpu --quick
     python -m bench run-all --quick
     python -m bench report bench/results/reassoc_scale.json
@@ -54,10 +55,12 @@ class ListConfig:
 
 @dataclass
 class CatalogConfig:
-    """Emit the suite catalog as Markdown (docs generated from the registry)."""
+    """Emit, sync, or check the registry-generated suite catalog."""
 
     out: Path | None = None
     mechanisms: bool = False
+    write: bool = False
+    check: bool = False
 
 
 @dataclass
@@ -115,6 +118,14 @@ class DashboardConfig:
     results: Path = Path("bench/results")
     out: Path | None = None
     title: str = "catopt benchmarks"
+
+
+@dataclass
+class ResultsConfig:
+    """Render the pinned baselines into one results document."""
+
+    baselines: Path = Path("bench/baselines")
+    out: Path = Path("docs/results.md")
 
 
 @dataclass
@@ -250,6 +261,8 @@ def _run_one(
             f"{name}.run_bench returned {type(report).__name__}, "
             "not a benchkit.Report"
         )
+    # Flag quick runs so `gate`/`compare` never treat them as canonical.
+    report.provenance["quick"] = bool(quick)
     return report
 
 
@@ -280,15 +293,28 @@ def cmd_list(cfg: ListConfig) -> int:
 
 
 def cmd_catalog(cfg: CatalogConfig) -> int:
-    """Emit the generated catalog Markdown."""
-    from bench.benchkit.render.catalog import (
-        render_catalog_markdown,
-        render_mechanisms_markdown,
-    )
+    """Emit, sync, or check the registry-generated catalog Markdown."""
+    from bench.benchkit.render import catalog as _catalog
 
-    md = render_catalog_markdown()
+    if cfg.check:
+        if _catalog.readme_synced():
+            _console().print("[green]catalog in sync[/green]")
+            return 0
+        _console().print(
+            "[red]catalog drift[/red] — run "
+            "`python -m bench catalog --write`"
+        )
+        return 1
+    if cfg.write:
+        path = _catalog.write_readme()
+        _console().print(f"  [dim]→[/dim] {path}")
+        return 0
+    md = _catalog.render_catalog_markdown()
     if cfg.mechanisms:
-        md += "\n## By mechanism\n\n" + render_mechanisms_markdown()
+        md += (
+            "\n## By mechanism\n\n"
+            + _catalog.render_mechanisms_markdown()
+        )
     if cfg.out:
         Path(cfg.out).write_text(md)
         _console().print(f"  [dim]→[/dim] {cfg.out}")
@@ -375,6 +401,17 @@ def cmd_dashboard(cfg: DashboardConfig) -> int:
     return 0
 
 
+def cmd_results(cfg: ResultsConfig) -> int:
+    """Render the pinned baselines into one results document."""
+    from bench.benchkit.render.results import render_results_doc
+
+    out = Path(cfg.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_results_doc(cfg.baselines))
+    _console().print(f"  [dim]→[/dim] {out}")
+    return 0
+
+
 def cmd_compare(cfg: CompareConfig) -> int:
     """Compare the latest ledger run against the pinned baseline."""
     from bench.benchkit.compare import compare_baseline
@@ -386,6 +423,12 @@ def cmd_compare(cfg: CompareConfig) -> int:
     rec = _ledger.latest(cfg.suite)
     if rec is None:
         _console().print(f"[red]no ledger entry[/red] for {cfg.suite}")
+        return 1
+    if rec.get("provenance", {}).get("quick"):
+        _console().print(
+            f"[yellow]{cfg.suite}: latest ledger run was --quick[/yellow] "
+            "— not comparable to a canonical baseline"
+        )
         return 1
     regressions = compare_baseline(rec, base, cfg.threshold)
     if not regressions:
@@ -409,24 +452,64 @@ def cmd_compare(cfg: CompareConfig) -> int:
 
 
 def cmd_gate(cfg: GateConfig) -> int:
-    """Fail if any baselined suite regressed."""
-    from bench.benchkit.compare import compare_baseline
+    """Fail if any baselined suite regressed; never pass vacuously."""
+    from bench.benchkit.compare import (
+        compare_baseline,
+        expectation_gaps,
+    )
+
+    baselines = sorted(Path(cfg.baselines).glob("*.json"))
+    if not baselines:
+        _console().print(
+            "[yellow]no baselines pinned[/yellow] — nothing to gate"
+        )
+        return 0
 
     bad = 0
-    for base in sorted(Path(cfg.baselines).glob("*.json")):
+    checked = 0
+    skipped: list[str] = []
+    quick: list[str] = []
+    for base in baselines:
         rec = _ledger.latest(base.stem, cfg.out / "ledger.jsonl")
         if rec is None:
+            skipped.append(base.stem)
             continue
+        if rec.get("provenance", {}).get("quick"):
+            quick.append(base.stem)
+            continue
+        checked += 1
         regressions = compare_baseline(rec, base, cfg.threshold)
         if regressions:
             bad += 1
             _console().print(
                 f"[red]{base.stem}[/red]: {len(regressions)} regressions"
             )
+    if skipped:
+        _console().print(
+            "[yellow]no ledger run to compare:[/yellow] "
+            + ", ".join(skipped)
+        )
+    if quick:
+        _console().print(
+            "[yellow]latest run was --quick (not comparable):[/yellow] "
+            + ", ".join(quick)
+        )
+    for gap in expectation_gaps(cfg.baselines):
+        _console().print(f"[yellow]expectation gap:[/yellow] {gap}")
+    if checked == 0:
+        _console().print(
+            "[yellow]gate: nothing compared[/yellow] — no baselined "
+            "suite has a canonical (non-quick) ledger run"
+        )
+        return 0
     if bad:
-        _console().print(f"[red]gate failed[/red] — {bad} suite(s)")
+        _console().print(
+            f"[red]gate failed[/red] — {bad}/{checked} suite(s) regressed"
+        )
         return 1
-    _console().print("[green]gate passed[/green]")
+    _console().print(
+        f"[green]gate passed[/green] — {checked} suite(s) compared"
+    )
     return 0
 
 
@@ -438,6 +521,7 @@ Command = (
     | Annotated[RunAllConfig, tyro.conf.subcommand("run-all")]
     | Annotated[ReportConfig, tyro.conf.subcommand("report")]
     | Annotated[DashboardConfig, tyro.conf.subcommand("dashboard")]
+    | Annotated[ResultsConfig, tyro.conf.subcommand("results")]
     | Annotated[CompareConfig, tyro.conf.subcommand("compare")]
     | Annotated[GateConfig, tyro.conf.subcommand("gate")]
 )
@@ -449,6 +533,7 @@ _DISPATCH = {
     RunAllConfig: cmd_run_all,
     ReportConfig: cmd_report,
     DashboardConfig: cmd_dashboard,
+    ResultsConfig: cmd_results,
     CompareConfig: cmd_compare,
     GateConfig: cmd_gate,
 }
@@ -460,7 +545,8 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     if not argv:
         _console().print(
-            "usage: python -m bench {list,run,run-all,report,compare,gate}"
+            "usage: python -m bench {list,catalog,run,run-all,report,"
+            "dashboard,results,compare,gate}"
         )
         return 2
     cmd = tyro.cli(Command, args=argv)

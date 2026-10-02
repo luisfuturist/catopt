@@ -889,7 +889,14 @@ def run_cell(
     elif opt_max_t >= T:
         t0 = time.time()
         try:
-            opt64, ostats = Optimizer(backend=TorchBackend()).optimize(m64, x64, max_iterations=32, max_enodes=300_000, verify=False, verbose=False)
+            opt64, ostats = Optimizer(backend=TorchBackend()).optimize(
+                m64,
+                x64,
+                max_iterations=32,
+                max_enodes=300_000,
+                verify=False,
+                verbose=False,
+            )
 
             cell["opt_pipeline_s"] = time.time() - t0
             cell["opt_nonlocal_lifts"] = ostats.get("nonlocal_lifts")
@@ -983,9 +990,7 @@ def run_cell(
     # -- inductor baselines --------------------------------------------
     # torch.compile mutates module.forward — compile a deepcopy so
     # the later eager timing on m32 stays honest.
-    cm32, status = try_compile(
-        copy.deepcopy(m32), x32, compile_timeout
-    )
+    cm32, status = try_compile(copy.deepcopy(m32), x32, compile_timeout)
     cell["inductor_status"] = status
     print(f"  inductor: {status}", flush=True)
     copt32, status = (

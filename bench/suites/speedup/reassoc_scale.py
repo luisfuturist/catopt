@@ -603,7 +603,14 @@ def run_cell(
     # -- catopt ----------------------------------------------------------
     t0 = time.time()
     try:
-        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=64, max_enodes=200_000, verify=False, verbose=False)
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(
+            m,
+            x,
+            max_iterations=64,
+            max_enodes=200_000,
+            verify=False,
+            verbose=False,
+        )
 
     except Exception as e:  # honest failure path — do not fake the win
         print(f"  catopt FAILED: {type(e).__name__}: {e}")

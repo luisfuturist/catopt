@@ -309,8 +309,6 @@ def main():
     if args.device == "cuda":
         torch.cuda.empty_cache()
 
-
-
     rows = []
     gemm_evidence = None
     for B in batches:
@@ -327,7 +325,9 @@ def main():
                 with torch.no_grad():
                     ref = model(idx)
                 t_opt = time.time()
-                opt, rep = Optimizer(backend=TorchBackend()).optimize(model, idx, strategy=Compositional(), verbose=False)
+                opt, rep = Optimizer(backend=TorchBackend()).optimize(
+                    model, idx, strategy=Compositional(), verbose=False
+                )
 
                 t_opt = time.time() - t_opt
                 with torch.no_grad():

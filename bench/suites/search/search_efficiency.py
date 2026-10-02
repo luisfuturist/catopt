@@ -351,7 +351,6 @@ def measure_e2e(k: int, device: str) -> dict[str, Any]:
     (``symmetry_budget=2048``) — the same pipeline a user gets."""
     import torch
 
-
     dims = chain_dims(k)
     model = torch.nn.Sequential(
         *[
@@ -361,7 +360,9 @@ def measure_e2e(k: int, device: str) -> dict[str, Any]:
     ).to(device)
     x = torch.randn(4, dims[0], device=device)
     t0 = time.perf_counter()
-    opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(model, x, verify=False, verbose=False)
+    opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        model, x, verify=False, verbose=False
+    )
 
     wall = time.perf_counter() - t0
     with torch.no_grad():

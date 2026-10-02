@@ -704,9 +704,7 @@ def run_bench(args) -> Report:
         )
 
     timed = [r for r in recs if not r.get("opt_error")]
-    delivered = [
-        r for r in recs if r.get("n_bounds_delivered", 0) > 0
-    ]
+    delivered = [r for r in recs if r.get("n_bounds_delivered", 0) > 0]
     offered = [r for r in recs if r.get("n_bounded_offers", 0) > 0]
     best = max(
         (r.get("speedup_vs_eager") or 0.0 for r in recs), default=0.0

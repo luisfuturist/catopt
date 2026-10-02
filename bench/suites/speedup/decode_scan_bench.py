@@ -387,7 +387,14 @@ def run_cell(
     step_src64 = None
     t0 = time.time()
     try:
-        step_opt64, sstats = Optimizer(backend=TorchBackend()).optimize(step64, (x64[0], h0_64), max_iterations=32, max_enodes=max_enodes, verify=False, verbose=False)
+        step_opt64, sstats = Optimizer(backend=TorchBackend()).optimize(
+            step64,
+            (x64[0], h0_64),
+            max_iterations=32,
+            max_enodes=max_enodes,
+            verify=False,
+            verbose=False,
+        )
 
         cell["step_opt_s"] = time.time() - t0
         cell["step_lowering"] = sstats.get("lowering")
@@ -417,7 +424,16 @@ def run_cell(
     chunk_src64 = None
     t0 = time.time()
     try:
-        chunk_opt64, cstats = Optimizer(backend=TorchBackend()).optimize(chunk64, (x64[:C], h0_64), max_iterations=32, max_enodes=max_enodes, verify=False, verbose=False)
+        chunk_opt64, cstats = Optimizer(
+            backend=TorchBackend()
+        ).optimize(
+            chunk64,
+            (x64[:C], h0_64),
+            max_iterations=32,
+            max_enodes=max_enodes,
+            verify=False,
+            verbose=False,
+        )
 
         cell["chunk_opt_s"] = time.time() - t0
         cell["chunk_lowering"] = cstats.get("lowering")
@@ -1109,7 +1125,9 @@ def run_bench(args: argparse.Namespace) -> Report:
     print("-" * len(hdr))
 
     ok = [c for c in results if c.get("verified")]
-    n_win = sum(1 for c in ok if "carrier WIN" in str(c.get("_verdict")))
+    n_win = sum(
+        1 for c in ok if "carrier WIN" in str(c.get("_verdict"))
+    )
     n_loss = sum(
         1 for c in ok if "carrier LOSS" in str(c.get("_verdict"))
     )

@@ -300,7 +300,13 @@ def _decode_cell(args, dev: torch.device) -> tuple[dict, Case]:
     # -- main path (optimize_model / ALL_RULES): does it see these? ----
     t0 = time.time()
     try:
-        opt_m, st_m = Optimizer(backend=TorchBackend()).optimize(model, args_t, max_iterations=max_it, verify=False, verbose=False)
+        opt_m, st_m = Optimizer(backend=TorchBackend()).optimize(
+            model,
+            args_t,
+            max_iterations=max_it,
+            verify=False,
+            verbose=False,
+        )
 
         rec["main_opt_s"] = round(time.time() - t0, 2)
         rec["fires_main_decode"] = _fires_for(
@@ -428,7 +434,13 @@ def _cross_cell(args, dev: torch.device) -> tuple[dict, Case]:
 
     # -- block-only pass (the pre-change behaviour) ---------------------
     t0 = time.time()
-    opt_b, _rep_b = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(max_cross_pairs=0), verbose=False, max_iterations=max_it)
+    opt_b, _rep_b = Optimizer(backend=TorchBackend()).optimize(
+        model,
+        x,
+        strategy=Compositional(max_cross_pairs=0),
+        verbose=False,
+        max_iterations=max_it,
+    )
 
     rec["opt_blocks_s"] = round(time.time() - t0, 2)
     rec["blocks_census"] = _module_census(opt_b)
@@ -439,7 +451,13 @@ def _cross_cell(args, dev: torch.device) -> tuple[dict, Case]:
 
     # -- with the cross-block pair pass --------------------------------
     t0 = time.time()
-    opt_c, rep_c = Optimizer(backend=TorchBackend()).optimize(model, x, strategy=Compositional(max_cross_pairs=8), verbose=False, max_iterations=max_it)
+    opt_c, rep_c = Optimizer(backend=TorchBackend()).optimize(
+        model,
+        x,
+        strategy=Compositional(max_cross_pairs=8),
+        verbose=False,
+        max_iterations=max_it,
+    )
 
     rec["opt_cross_s"] = round(time.time() - t0, 2)
     cp = (
@@ -563,7 +581,9 @@ def _layout_cell(args, dev: torch.device) -> tuple[dict, Case]:
 
     t0 = time.time()
     try:
-        opt_m, st_m = Optimizer(backend=TorchBackend()).optimize(model, x, max_iterations=max_it, verify=False, verbose=False)
+        opt_m, st_m = Optimizer(backend=TorchBackend()).optimize(
+            model, x, max_iterations=max_it, verify=False, verbose=False
+        )
 
         rec["opt_s"] = round(time.time() - t0, 2)
         rec["fires_layout"] = _fires_for(
@@ -749,11 +769,12 @@ def run_bench(args) -> Report:
                 "model family"
             ),
             verdict=(
-                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+                Verdict.WIN
+                if best and best[1] > 1
+                else Verdict.NEGATIVE
             ),
             headline=(
-                f"best {best[1]:.2f}× vs eager ({best[2]}) on "
-                f"{best[0]}"
+                f"best {best[1]:.2f}× vs eager ({best[2]}) on {best[0]}"
                 if best
                 else "no family beats eager"
             ),

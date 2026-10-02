@@ -559,7 +559,14 @@ def _catopt(mod: nn.Module, example, args, rec: dict):
     verbose = bool(getattr(args, "verbose", False))
     t0 = time.time()
     try:
-        opt, rep = Optimizer(backend=TorchBackend()).optimize(mod, example, strategy=Compositional(verify_tol=verify_tol), verbose=verbose, max_iterations=max_iter, max_enodes=max_en)
+        opt, rep = Optimizer(backend=TorchBackend()).optimize(
+            mod,
+            example,
+            strategy=Compositional(verify_tol=verify_tol),
+            verbose=verbose,
+            max_iterations=max_iter,
+            max_enodes=max_en,
+        )
 
     except Exception as e:
         rec["opt_s"] = round(time.time() - t0, 2)
@@ -1174,7 +1181,8 @@ def run_bench(args) -> Report:
             c.medians["inductor"] / c.medians["catopt+inductor"],
         )
         for c in cells
-        if c.medians.get("inductor") and c.medians.get("catopt+inductor")
+        if c.medians.get("inductor")
+        and c.medians.get("catopt+inductor")
     ]
     best = max(scored, key=lambda t: t[1], default=None)
     n_verified = sum(1 for c in cells if c.aux.get("catopt_verified"))

@@ -198,10 +198,10 @@ def main():
         f"device={args.device} — logits {tuple(ref.shape)}"
     )
 
-
-
     t0 = time.time()
-    opt, rep = Optimizer(backend=TorchBackend()).optimize(m, idx, strategy=Compositional(), verbose=False)
+    opt, rep = Optimizer(backend=TorchBackend()).optimize(
+        m, idx, strategy=Compositional(), verbose=False
+    )
 
     pipeline = time.time() - t0
     with torch.no_grad():

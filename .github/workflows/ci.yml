@@ -18,10 +18,10 @@
 #   * CPU torch — the lockfile resolves a CUDA wheel on Linux, but four
 #     tests assume a CPU build (and CUDA-graph capture is flaky on CI);
 #     force the CPU wheel before running anything.
-#   * ruff check packages tools — lint (line length 72, etc.).
-#     Scoped to shipped source; tests/ + bench/ carry pre-existing
-#     isort drift under the pinned ruff.
-#   * ruff format --check packages tools — formatting.
+#   * ruff check packages tools bench — lint (line length 72, etc.).
+#     Shipped source plus the bench harness; tests/ still carries
+#     pre-existing isort drift under the pinned ruff.
+#   * ruff format --check packages tools bench — formatting.
 #   * ty check — the typecheck ratchet ([tool.ty.src] include/exclude in
 #     pyproject.toml scope it to packages/).  0 errors.
 #   * vulture — dead-code scan ([tool.vulture] paths + min-confidence).
@@ -65,10 +65,10 @@ jobs:
         run: uv pip install --torch-backend cpu --reinstall torch
 
       - name: ruff check
-        run: .venv/bin/ruff check packages tools
+        run: .venv/bin/ruff check packages tools bench
 
       - name: ruff format --check
-        run: .venv/bin/ruff format --check packages tools
+        run: .venv/bin/ruff format --check packages tools bench
 
       - name: ty check
         run: .venv/bin/ty check

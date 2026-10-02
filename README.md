@@ -1,235 +1,164 @@
 # catopt
 
-Certified-equivalent program search over neural computation graphs —
-it finds faster programs the compiler can't express, proves they're
-equivalent (or, under `error_budget=`, certifies a proven
-approximation bound), and hands them to a backend to run. The engine
-and orchestrator are backend-agnostic (no torch imports); PyTorch is
-the shipped reference backend — `catopt_torch` implements the ports.
+[![ci](https://github.com/luisfuturist/catopt/actions/workflows/ci.yml/badge.svg)](https://github.com/luisfuturist/catopt/actions/workflows/ci.yml)
+![python](https://img.shields.io/badge/python-3.11%2B-blue)
+![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
+
+**A program optimizer's reachable set is bounded by its semantic
+language, not its search strategy.**  Tensor-level compilers rewrite
+*ops*; catopt rewrites over *algebraic structure* — monoid carriers,
+traced-monoidal fixpoints, products as `⟨f₁,…,f_k⟩ = (×fᵢ)∘Δ` — so it
+reaches programs no op-level pattern composes to.  Every delivered
+program carries a **replayable certificate** of equivalence, re-checked
+on real terms.
+
+The engine (`catopt-core`) is torch-free and backend-agnostic; PyTorch
+(`catopt-torch`) is the shipped reference backend.  One call runs the
+whole pipeline:
 
 ```python
 from catopt_orchestrator import Optimizer
 from catopt_torch import TorchBackend
 
-opt, stats = Optimizer(backend=TorchBackend()).optimize(model, example_input)
-out = opt(x)        # same function as model(x), verified rtol=1e-4
+opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x)
+out = opt(x)        # the same function as model(x) — verified, not spot-checked
 ```
 
-One call runs the whole pipeline: the backend's `Source` lifts the
-model to a typed IR (torch: `torch.export`), equality saturation
-enumerates equivalent programs, a cost model extracts the cheapest
-one the backend can execute, the lowered module is checked against
-the original, and you get back a `torch.nn.Module` plus a stats dict (`stats["rule_fires"]`,
-`stats["lowering"]`, `stats["runner"]`, …).
+## The transformation it found
+
+`(Q·Kᵀ)·V → Q·(Kᵀ·V)`: the intermediate goes from T×T to d×d — an
+asymptotic change (O(T²d) → O(Td²)), not a tuning.  Catopt found and
+justified it from associativity plus a shape-aware cost model.  **There
+is no hand-written "reassociate attention" rule.**
+
+```mermaid
+flowchart TB
+  subgraph B["(Q·Kᵀ)·V — O(T²d)"]
+    direction LR
+    bq[Q] --> bm["Q·Kᵀ"]
+    bk[K] --> bm
+    bm --> bo["(Q·Kᵀ)·V"]
+    bv[V] --> bo
+  end
+  subgraph A["Q·(Kᵀ·V) — O(Td²)"]
+    direction LR
+    ak[K] --> an["Kᵀ·V"]
+    av[V] --> an
+    aq[Q] --> ao["Q·(Kᵀ·V)"]
+    an --> ao
+  end
+```
+
+The novelty is not the algebra — it is that the optimizer *discovered*
+and *certified* it, and delivers it end to end, without an
+attention-specific rule.
+
+## The idea in three steps
+
+1. **Lift.**  The model *and its weights* export into one typed term
+   (torch: `torch.export`); parameters are ordinary leaves.
+2. **Search.**  Equality saturation closes that term under equational
+   *and* categorical laws — associativity, homomorphism, the traced
+   monoidal axioms, the product law — enumerating the equivalence class
+   rather than applying a fixed pass list.
+3. **Prove and deliver.**  A cost model extracts the cheapest
+   representative the backend can actually lower; the derivation is
+   verified; you get back a runnable `torch.nn.Module` plus a stats dict
+   (`stats["rule_fires"]`, `stats["lowering"]`, `stats["runner"]`, …).
+
+→ The conceptual pipeline is in [`docs/mechanism.md`](docs/mechanism.md);
+the thesis it implements is
+[ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md).
 
 ## Quickstart
 
 ```bash
 uv sync                 # dev env — all workspace members editable
-python demo.py          # 60-second end-to-end run on CPU
+python demo.py          # ~60-second end-to-end run on CPU
 ```
 
-### Choose how the result is delivered
+`demo.py` walks one gated projection block through the whole pipeline:
+the e-graph search, the certificate replayed through the standalone
+verifier, the extracted op tree, and a synced median race against eager
+and `torch.compile`.  It re-execs under `PYTHONHASHSEED=0`, so the
+search, extraction and certificate are bit-for-bit reproducible.
 
-```python
-from catopt_cuda import CudaGraphRunner
-from catopt_orchestrator import (
-    Autotuned, ChainedRunner, Compositional, Optimizer,
-)
-from catopt_torch import TorchBackend, TorchCompileRunner
-from catopt_torch.autotune import TORCH_BUILDERS
+## What it finds — and what it doesn't
 
-opt = Optimizer(backend=TorchBackend())
+The measured picture is generated from the pinned baselines — see
+[`docs/results.md`](docs/results.md) for magnitudes, hardware and
+provenance.  The verdicts:
 
-opt_mod, stats = opt.optimize(model, x, runner=TorchCompileRunner())
-# torch.compile wraps the delivered module (stats["compiled"])
+| Regime | Verdict | Why |
+|---|---|---|
+| Deep weight chains (`reassoc_scale`) | **WIN** | the e-graph reaches a weights-first form Inductor's post-grad graph provably cannot express |
+| Shared-input projections / gated blocks (`real_win_hunt`, `killer_demo`) | **WIN** | pairing fuses k projections into one GEMM + split views |
+| Linear-attention scan lift (`real_linear_attn`) | **WIN** | the affine-monoid scan lift fires and verifies fp64-exact |
+| Morphism windows (`morphism_e2e`) | **WIN** | term-FLOP reduction converts to wall time at GEMM-bound sizes |
+| Whole-model E2E (`e2e_model`, `e2e_models2`) | **PARITY** | pairing fires per block and verifies fp64-exact, but wall time is ~parity |
+| Real trained checkpoints, exact mode (`structure_census`) | **PARITY** | dense weights carry ~zero exploitable bitwise structure |
+| Launch-bound decode (`decode_bench`) | **NEGATIVE** | fewer launches don't pay where launch overhead already dominates — the hypothesis is falsified |
+| Bounded rewrites on a real checkpoint (`bounded_e2e`) | **NEGATIVE** | `error_budget=` rewrites buy nothing on stories15M at any budget |
 
-opt_mod, stats = opt.optimize(model, x, runner=CudaGraphRunner())
-# captures the executor into a CUDA graph (stats["cuda_graph"]) —
-# compile-free; works without Inductor
-
-opt_mod, stats = opt.optimize(
-    model, x,
-    runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
-)
-# runners compose left-to-right; the Runner protocol is duck-typed,
-# so your own runner drops in
-
-opt_mod, stats = opt.optimize(
-    model, x, strategy=Autotuned(builders=TORCH_BUILDERS),
-)
-# re-lowers the same extracted term through each candidate executor
-# ("generic", "batched", "torch_compile", "cuda_graph"), verifies
-# each, times them on the real input, returns the measured winner
-
-opt_mod, stats = opt.optimize(model, x, strategy=Compositional())
-# multi-block models: optimizes each block against its captured real
-# input, recomposes with per-block + end-to-end verification and
-# automatic fallback (stats["blocks"], stats["end_to_end"])
-```
-
-### Steer what "cheapest" means
-
-```python
-from catopt_orchestrator import LatencyCriterion, MemoryCriterion
-
-opt_mod, stats = Optimizer(backend=TorchBackend()).optimize(
-    model, x,
-    criteria=LatencyCriterion() * 0.7 + MemoryCriterion("peak") * 0.3,
-)
-# or the shorthand: criteria={"latency": 1.0, "memory": 0.5}
-```
-
-## What it does
-
-- **e-graph semantic search** — model *and* weights export into one
-  term; saturation enumerates the equivalence class. Shared-input
-  projections pair into one GEMM + split views (`pair` product law),
-  weight chains fold weights-first, recurrences reassociate.
-- **certified transforms** — every extracted program carries a
-  replayable derivation `original → optimized`;
-  `verify_certificate` rechecks each step standalone. Non-local
-  passes lift recurrences into carrier forms the tensor IR can't
-  reach: parallel scans, streaming softmax, closed-form resolvents.
-- **measured or priced selection** — extraction is priced per-backend
-  (`sink.supported_ops` bounds the search to executable forms), or
-  measured end-to-end by the `Autotuned` strategy, which reports
-  the winner honestly — including when it loses.
-
-## When it helps — honest numbers
-
-Measured on the dev box (RTX 2050 / CPU), all rows verified
-equivalent:
-
-| Regime | Result |
-|---|---|
-| Blocks with exploitable structure (`bench/suites/algebra/real_win_hunt.py`) | **~1.1–10× vs Inductor** — unnormalized-attention reassoc ~2×, PaLM parallel blocks ~1.2×, expert-sum weight fold ~7× |
-| Carrier + CUDA-graph decode (`bench/suites/algebra/decode_scan_bench.py`, `decode_retnet`) | **1.65–3.4× vs Inductor / best non-carrier** — chunked scan carriers amortize to zero launches |
-| Deep weight chains (`bench/suites/algebra/reassoc_scale.py`) | 8.9–16.1× vs Inductor — a form Inductor's post-grad graph provably can't reach |
-| Morphism windows (`bench/suites/algebra/morphism_e2e.py`) | **12.4–12.5× measured wall** on 4-block chains at GEMM-bound sizes — term flops −92% fully translates; 10.7–11.4× vs plain Inductor (the compile-time weight fold is out of its reach) |
-| Residual reassoc (`ResidualReassoc`) | term flops −66% → measured 1.3–2.2× (partial conversion — distributed adds/fillers eat headroom; +inductor recovers more) |
-| KV latent sharing (`KVLatentShare`, opt-in) | kv flops/bytes −62.5%, module params −31% — a memory/params win, NOT wall-time (compute parity, −14% at tiny sizes — reported honestly) |
-| Bounded rewrites (`error_budget=`) | certified-approximation mode: `search(..., error_budget=1e-3)` accepts rewrites whose propagated output bound fits the budget. **stories15M: 1.15–1.32× vs Inductor** (bound 1e-4→1e-2) — near-dup tied-head rows elide, KL≈0 at the tight end, bounds always recorded + verified-with-tolerance. `None` = exact only |
-| Whole model E2E (`bench/suites/models/e2e_model.py`) | **~1.05× over plain Inductor** — pairing fires per block, verified fp64-exact |
-| Real trained checkpoints (stories15M/110M) | Exact mode: parity (dense weights carry ~zero bitwise structure — measured by `bench/suites/core/structure_census.py`). Bounded mode: **1.15–1.32× vs Inductor** on stories15M via the collapsed tied head |
-
-This is **not** a universal speedup. Attention and GEMM-bound code is
+This is **not a universal speedup**.  Attention- and GEMM-bound code is
 already optimal — expect a parity floor there — and the losses are
-measured too: launch-bound decode cells (B=1, T≤64) lose 4–15% and a
-batch-8 flat decode cell lands at ~0.56× vs Inductor. The wins live
-where structure exists: shared-input projections, foldable weight
-chains, unnormalized attention, recurrences.
+measured too.  The wins live where structure exists: shared-input
+projections, foldable weight chains, unnormalized attention,
+recurrences.
 
-## Demo
+## Verification is the point
 
-```bash
-python demo.py                 # CPU
-python demo.py --device cuda   # GPU (needs CUDA torch)
-python demo.py --quick         # shorter timing loop
+Discovery is cheap; pricing is hard; proof is what keeps it honest.
+Every extracted program ships with an ordered, replayable derivation
+`original → optimized`, and `verify_certificate` re-checks
+*derivational equivalence* on real terms (fp64) — not numerical
+spot-checks:
+
+```python
+from catopt_core.egraph import verify_certificate
+
+verify_certificate(ir.root, cert, strict=True)   # replay every step
 ```
 
-One command on a gated projection block (PaLM-style gates + a 10-deep
-value chain): the e-graph search, the certificate replayed through
-the standalone verifier, the extracted op tree, and a synced median
-race vs eager and `torch.compile`. **~2.1× on CPU, ~2.6× on an RTX
-2050** — from two transforms Inductor structurally cannot do
-(projection concat + weight-first fold). `PYTHONHASHSEED=0` re-exec
-makes it bit-for-bit reproducible.
+It has caught a false-proof matcher bug, a shape misinference that
+fabricated a 1.98× "win", a well-typed but wrong program, and a
+launch-time-vs-execution timing bug — all regression-tested.
 
-## Benchmarks
+## Generality — the honest split
 
-Every claim above is a runnable suite under `bench/`.  The harness is
-a real system, not a pile of scripts:
-
-```bash
-python -m bench list                       # the catalog
-python -m bench run reassoc_scale --quick   # one suite → JSON+MD+HTML+plots
-python -m bench run-all --quick             # every harnessed suite
-python -m bench dashboard                   # cross-suite HTML index
-```
-
-Each suite states its conclusion as a typed **finding** (win / parity /
-regression / negative) with the supporting metric, so every surface —
-JSON, Markdown, the HTML dashboard, a Quarto document, Slidev assets —
-is rendered from one canonical report.  See `bench/README.md`.
-
-Suites are organized by **intent** — the question each answers;
-`bench/registry.py` is the source of truth and `bench/README.md`
-carries the generated catalog with expected verdicts.
-
-| intent | suites |
-|---|---|
-| correctness | `law_bench`, `laws_effect`, `morphism_coverage` |
-| search | `search_efficiency` |
-| cost | `cost_fidelity` |
-| structure | `structure_census`, `bound_amplification` |
-| speedup | `reassoc_scale`, `real_win_hunt`, `real_linear_attn`, `morphism_e2e`, `decode_scan_bench`, `decode_bench`, `killer_demo`, `bench_omd2` |
-| e2e | `model_bench`, `e2e_model`, `e2e_models2`, `e2e_llm`, `stories15m_bench`, `bench_e2e` |
-| bounded | `bounded_e2e`, `structured_models` |
-| integration | `vllm_compare` |
-
-## API surface
-
-The orchestration surface lives in `catopt_orchestrator`
-(backend-neutral — it imports no torch); the torch ports, runners
-and autotune candidate builders live in `catopt_torch` /
-`catopt_cuda`; the engine itself is `catopt_core`.
-
-| Name | Signature / role |
-|---|---|
-| `Optimizer` | `(backend=..., source=..., sink=..., composer=..., meter=..., criteria=..., runner=...)` — the configured entry point; `.optimize(model, x, **kw)` → `(module, stats)`, plus `.search` / `.lower` / `.discover` phase verbs |
-| `Monolithic` / `Compositional` / `Autotuned` / `MorphismSearch` | the `strategy=` argument of `Optimizer.optimize`: whole-model search (default), per-block + recompose (`block_pred=`, `verify_tol=`, `cache=` replays structurally-identical blocks — N identical blocks cost ~1 search + N−1 verified replays, `max_cross_pairs=` re-judges adjacent pairs jointly), measured autotune (`candidates=`, `budget_s=`, `profile=` persists measured corrections, `builders=TORCH_BUILDERS`), or block-signature algebra (`optimize_morphisms` — lifts each block to a `BlockSig`, rewrites the tiny morphism graph with `WindowCompose`/`ResidualReassoc`/`NormCascade`/`WeightTie`/`KVLatentShare`/opt-in `CrossBlockCSE`, reifies into certified term rewrites) |
-| `search` / `lower` | the phase verbs: `model -> SearchResult`, `SearchResult -> LowerResult` — re-lower one search under different runners |
-| `discover_alternatives` | `(model, x, *, source, ...)` → `SearchResult` — enumerate the equivalence frontier (`.alternatives(top_k)`, `.certificate()`) |
-| `export_optimized` / `load_optimized` | `catopt_torch.export` — `(model, opt, path, fmt="module"|"safetensors"|"state_dict"|"torchscript", …)`; `.pt2` roundtrips run standalone, no catopt at inference |
-| Rule sets | `search(..., rules=DEFAULT)` — composable `RuleSet` algebra (`FULL - SYMMETRY`, `WITH_LAYOUT`, presets in `catopt_core.laws.ruleset`) |
-| Engines | `search(..., engine=NativeEngine())` — the pure-Python engine is the default/reference; `catopt-native` (PyO3/Rust) is an explicit opt-in (~17× on match-bound closures) |
-| Detection passes | `search(..., detect_factors=True)` — certified low-rank weight factoring; `detect_specials=True` — exact dead/diag/dup/block-diag weight elision; `error_budget=` — certified bounded approximations (bound ledger + output-propagated verify) |
-| Criteria | `LatencyCriterion`, `FlopsCriterion`, `DepthCriterion`, `MemoryCriterion("weights"|"peak"|"combined")`, `CompiledCriterion` — compose with `*` / `+`, or pass `{"axis": weight}` dicts |
-| Runners | `IdentityRunner` (default), `TorchCompileRunner()`, `CudaGraphRunner()`, `ChainedRunner([...])` — duck-typed `Runner` protocol |
-| Ports | `Source` / `Sink` (`catopt_core.ports`; torch impls `catopt_torch.adapters.TorchSource`/`TorchSink`, bundled as `TorchBackend`) — a new backend implements `Sink`; the engine never imports it |
-| Verification | `catopt_core.egraph.verify_certificate` — replays the derivation shipped with every extracted program |
-
-## Generality — honest split
-
-The **framework** is general: e-graph saturation, verification,
-cost extraction, backends, strategies, runners and rule sets are
-all pluggable and model-agnostic. What is **narrow** is the *law
-library*: like every rule-based optimizer (Halide, TASO, verified
-compilers), catopt finds the structures its laws describe — an
-unmatched block is an opaque boundary, never a wrong answer. The
-morphism engine is the generality mechanism: laws target signature
-*classes* (any residual chain, any shared-projection family)
-rather than specific op trees, so coverage grows at the right
-level of abstraction.
+The **framework** is general: e-graph saturation, verification, cost
+extraction, backends, strategies, runners and rule sets are all
+pluggable and model-agnostic.  What is **narrow** is the *law library*:
+like every rule-based optimizer (Halide, TASO, verified compilers),
+catopt finds the structures its laws describe — an unmatched block is an
+opaque boundary, never a wrong answer.  The morphism engine is the
+generality mechanism: laws target signature *classes* (any residual
+chain, any shared-projection family) rather than specific op trees.
 
 ## Limits
 
 - **Wins are regime-dependent** — the transform set is structural:
-  pairing, folds, reassociation, carrier lifts. If the model is
-  already dense-GEMM-bound with no shared structure, expect parity.
-- **Search is compile-time work** — seconds per block; monolithic
-  eqsat slows past ~8 blocks, which is why the `Compositional`
-  strategy exists.
-- **Inference only** — weight folding destroys per-layer gradients;
-  no backward-graph rewriting.
-- **Coverage gaps** — `matmul`+bias and grouped convs aren't
-  pairable; reassociation needs unnormalized attention; masks must
-  arrive materialized.
-- **Dev-box numbers** — RTX 2050 (4 GB) / CPU; `calibrate()`
-  re-targets the cost model, but magnitudes don't extrapolate to
-  datacenter hardware.
+  pairing, folds, reassociation, carrier lifts.  A model that is already
+  dense-GEMM-bound with no shared structure should expect parity.
+- **Search is compile-time work** — seconds per block; monolithic eqsat
+  slows past ~8 blocks, which is why the `Compositional` strategy exists.
+- **Inference only** — weight folding destroys per-layer gradients; no
+  backward-graph rewriting.
+- **Coverage gaps** — `matmul`+bias and grouped convs aren't pairable;
+  reassociation needs unnormalized attention; masks must arrive
+  materialized.
+- **Dev-box numbers** — measured on an RTX 2050 (4 GB) / CPU.
+  `calibrate()` re-targets the cost model, but magnitudes do not
+  extrapolate to datacenter hardware.
 
 ## Install
 
 Python ≥3.11 (developed on 3.13), `torch>=2.0`, `numpy>=1.24`.
-uv-workspace monorepo: `packages/catopt-core` (zero-dependency
-engine), `catopt-torch` (PyTorch adapters), `catopt-carriers`
-(scan/attention carriers), `catopt-cuda` (the CUDA-graph runner),
-`catopt-orchestrator` (the backend-neutral pipelines). The `catopt`
-façade is gone — import the domain packages directly. Optional:
-`packages/catopt-native` is the PyO3/Rust search engine (build with
-maturin; opt-in via `engine=` — never auto-detected).
+uv-workspace monorepo: `packages/catopt-core` (zero-dependency engine),
+`catopt-torch` (PyTorch adapters), `catopt-carriers` (scan/attention
+carriers), `catopt-cuda` (the CUDA-graph runner), `catopt-orchestrator`
+(the backend-neutral pipelines).  There is no `catopt` façade package —
+import the domain packages directly.
 
 ```bash
 uv sync                                  # everything, editable
@@ -242,8 +171,38 @@ pip install -e packages/catopt-core -e packages/catopt-torch \
 pip install -e packages/catopt-core      # engine only, zero deps
 ```
 
-## Depth
+Optional: `packages/catopt-native` is the PyO3/Rust search engine
+(build with maturin; opt-in via `engine=` — never auto-detected).
 
-- `bench/README.md` — per-suite protocols and expected verdicts.
-- `AGENTS.md` — repo layout, verification commands, the port
-  contracts.
+## Benchmarks
+
+Every claim above is a runnable suite under `bench/`, and the harness is
+a system rather than a pile of scripts: each suite states its conclusion
+as a typed **finding** (`win` / `parity` / `regression` / `negative` /
+`inconclusive`), and every surface — JSON, Markdown, HTML, plots,
+Quarto, Slidev — is rendered from one canonical `Report`.
+
+```bash
+python -m bench list                        # the catalog
+python -m bench run reassoc_scale           # one suite → JSON+MD+HTML+plots
+python -m bench run-all                     # every harnessed suite
+python -m bench results                     # regenerate docs/results.md
+python -m bench dashboard                   # cross-suite HTML index
+```
+
+Suites are organized by **intent** — the question each answers.
+`bench/registry.py` is the single source of truth; `bench/README.md`
+carries the generated catalog with expected verdicts.  Per-suite
+protocols, flags and expected outcomes: [`bench/README.md`](bench/README.md).
+
+## Docs
+
+| Doc | What it is |
+|---|---|
+| [`docs/mechanism.md`](docs/mechanism.md) | the conceptual pipeline — syntax → structure → search → certificate |
+| [`docs/results.md`](docs/results.md) | measured results, generated from the pinned baselines |
+| [`docs/api.md`](docs/api.md) | the API surface — `Optimizer`, strategies, runners, criteria, ports |
+| [`bench/README.md`](bench/README.md) | the benchmark harness and its suite catalog |
+| [`project/RESEARCH_WRITEUP.md`](project/RESEARCH_WRITEUP.md) | the claim, the verified results, the honest negatives |
+| [`project/REPORT.md`](project/REPORT.md) | the research report — weights as programs, the ε axis, what was falsified |
+| [`AGENTS.md`](AGENTS.md) | repo layout, verification commands, port contracts |

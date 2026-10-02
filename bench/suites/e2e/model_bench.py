@@ -443,7 +443,14 @@ def run_cell(
     # -- fp64 pipeline: the production search + verify -----------------
     t0 = time.time()
     try:
-        del64, st64 = Optimizer(backend=TorchBackend()).optimize(model64, x64_or_t, max_iterations=max_iterations, max_enodes=max_enodes, verify=False, verbose=False)
+        del64, st64 = Optimizer(backend=TorchBackend()).optimize(
+            model64,
+            x64_or_t,
+            max_iterations=max_iterations,
+            max_enodes=max_enodes,
+            verify=False,
+            verbose=False,
+        )
 
         del64 = del64.to(dev).eval()
         with torch.no_grad():
@@ -494,7 +501,22 @@ def run_cell(
 
     best = None
     try:
-        best, st32 = Optimizer(backend=TorchBackend()).optimize(model32, x32_or_t, strategy=Autotuned(candidates, budget_s=budget_s, n_calls=n_calls, warmup=at_warmup, rtol=1e-4, atol=atol_v, verbose=verbose, builders=TORCH_BUILDERS), max_iterations=max_iterations, max_enodes=max_enodes)
+        best, st32 = Optimizer(backend=TorchBackend()).optimize(
+            model32,
+            x32_or_t,
+            strategy=Autotuned(
+                candidates,
+                budget_s=budget_s,
+                n_calls=n_calls,
+                warmup=at_warmup,
+                rtol=1e-4,
+                atol=atol_v,
+                verbose=verbose,
+                builders=TORCH_BUILDERS,
+            ),
+            max_iterations=max_iterations,
+            max_enodes=max_enodes,
+        )
 
         at = st32["autotune"]
         rec["lowering32"] = st32.get("lowering")
@@ -716,7 +738,9 @@ def run_bench(args) -> Report:
                 "autotuned lowering"
             ),
             verdict=(
-                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+                Verdict.WIN
+                if best and best[1] > 1
+                else Verdict.NEGATIVE
             ),
             headline=(
                 f"best {best[1]:.2f}× vs Inductor ({best[2]:.2f}× vs "

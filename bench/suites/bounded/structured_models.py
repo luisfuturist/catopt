@@ -955,9 +955,7 @@ def run_bench(args) -> Report:
             n, t = min(cats, key=lambda kv: kv[1])
             scored.append((c.case.name, ms["inductor"] / t, n))
     best = max(scored, key=lambda x: x[1], default=None)
-    delivered = [
-        c for c in cells if c.aux.get("params_delivered")
-    ]
+    delivered = [c for c in cells if c.aux.get("params_delivered")]
     findings = [
         Finding(
             claim=(
@@ -988,7 +986,9 @@ def run_bench(args) -> Report:
             verdict=(
                 Verdict.WIN
                 if cells
-                and all(c.aux.get("fresh_rel") is not None for c in cells)
+                and all(
+                    c.aux.get("fresh_rel") is not None for c in cells
+                )
                 else Verdict.INCONCLUSIVE
             ),
             headline=(
@@ -997,7 +997,11 @@ def run_bench(args) -> Report:
             ),
             metric="verified cells",
             value=float(
-                sum(1 for c in cells if c.aux.get("fresh_rel") is not None)
+                sum(
+                    1
+                    for c in cells
+                    if c.aux.get("fresh_rel") is not None
+                )
             ),
         ),
     ]

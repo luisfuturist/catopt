@@ -158,3 +158,31 @@ def test_runner_times_a_call() -> None:
     )
     assert cells[0].medians["mm"] > 0
     assert cells[0].iqr["mm"] >= 0
+
+
+def test_catalog_readme_in_sync() -> None:
+    """The README's generated block must match the registry."""
+    from bench.benchkit.render import catalog as _catalog
+
+    readme = REPO / "bench/README.md"
+    assert _catalog.readme_synced(readme), (
+        "bench/README.md catalog drifted — run "
+        "`python -m bench catalog --write`"
+    )
+
+
+def test_pinned_baselines_state_findings() -> None:
+    """A pinned baseline is not golden unless it states a verdict."""
+    for path in sorted((REPO / "bench/baselines").glob("*.json")):
+        payload = json.loads(path.read_text())
+        assert payload["findings"], f"{path.name} states no finding"
+
+
+def test_expected_verdict_parses_registry_prose() -> None:
+    from bench.benchkit.compare import expected_verdict
+
+    assert expected_verdict("WIN - 8.9-16.1x vs Inductor") == "WIN"
+    assert expected_verdict("NEGATIVE on stories15M - 0 accepted") == (
+        "NEGATIVE"
+    )
+    assert expected_verdict("Coverage map - matches/fires") is None

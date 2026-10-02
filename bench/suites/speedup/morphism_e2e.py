@@ -712,7 +712,9 @@ def run_bench(args) -> Report:
                 "into measured wall time"
             ),
             verdict=(
-                Verdict.WIN if best and best[1] > 1 else Verdict.NEGATIVE
+                Verdict.WIN
+                if best and best[1] > 1
+                else Verdict.NEGATIVE
             ),
             headline=(
                 f"best {best[1]:.2f}× vs eager on {best[0]}"

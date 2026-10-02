@@ -409,7 +409,10 @@ def run_cell(
     t0 = time.time()
     try:
         res = discover_alternatives(
-            m64, x64, source=TorchSource(), rules=_RULESET_CHOICES[args.ruleset]
+            m64,
+            x64,
+            source=TorchSource(),
+            rules=_RULESET_CHOICES[args.ruleset],
         )
     except Exception as e:
         cell["error"] = f"discover: {type(e).__name__}: {e}"
@@ -426,7 +429,11 @@ def run_cell(
     cell["rule_fires"] = dict(
         list(
             sorted(
-                ((k, v) for k, v in res.stats["rule_fires"].items() if v),
+                (
+                    (k, v)
+                    for k, v in res.stats["rule_fires"].items()
+                    if v
+                ),
                 key=lambda kv: -kv[1],
             )
         )[:12]
@@ -490,7 +497,14 @@ def run_cell(
     if do_opt:
         t0 = time.time()
         try:
-            opt64, _ostats = Optimizer(backend=TorchBackend()).optimize(m64, x64, max_iterations=32, max_enodes=300_000, verify=False, verbose=False)
+            opt64, _ostats = Optimizer(backend=TorchBackend()).optimize(
+                m64,
+                x64,
+                max_iterations=32,
+                max_enodes=300_000,
+                verify=False,
+                verbose=False,
+            )
 
             cell["opt_s"] = round(time.time() - t0, 2)
             cell["opt_root"] = getattr(
@@ -1132,14 +1146,18 @@ def run_bench(args: argparse.Namespace) -> Report:
 
     ranked = sorted(
         (
-            (_median_rho(fn), fn, sum(
-                1 for c in ok if c["metrics"][fn].get("pick_ok")
-            ))
+            (
+                _median_rho(fn),
+                fn,
+                sum(1 for c in ok if c["metrics"][fn].get("pick_ok")),
+            )
             for fn in _COST_FN_NAMES
         ),
         key=lambda t: (t[0] is None, -(t[0] or 0.0)),
     )
-    best_rho, best_fn, best_picks = ranked[0] if ranked else (None, None, 0)
+    best_rho, best_fn, best_picks = (
+        ranked[0] if ranked else (None, None, 0)
+    )
     findings = [
         Finding(
             claim=(
@@ -1163,7 +1181,9 @@ def run_bench(args: argparse.Namespace) -> Report:
             value=best_rho,
             evidence={
                 "by_cost_fn": {
-                    fn: round(r, 4) for r, fn, _ in ranked if r is not None
+                    fn: round(r, 4)
+                    for r, fn, _ in ranked
+                    if r is not None
                 }
             },
         ),

@@ -174,7 +174,9 @@ def hf_state_dict(
                 return sd[n].detach().cpu().float()
         raise KeyError(f"none of {names} in state_dict")
 
-    out["model.embed_tokens.weight"] = pick("emb.weight", "emb.p_weight")
+    out["model.embed_tokens.weight"] = pick(
+        "emb.weight", "emb.p_weight"
+    )
     out["lm_head.weight"] = pick("head.weight", "head.p_weight")
     out["model.norm.weight"] = pick("rms_final")
     for i in range(cfg["n_layers"]):
@@ -380,7 +382,9 @@ def torch_decode_leg(
         ("catopt", opt),
     ]
     try:
-        variants.append(("inductor", torch.compile(model, dynamic=True)))
+        variants.append(
+            ("inductor", torch.compile(model, dynamic=True))
+        )
         variants.append(
             ("catopt+inductor", torch.compile(opt, dynamic=True))
         )
@@ -451,16 +455,16 @@ def _vllm_leg_payload(hf_dir: str, args) -> dict:
     import vllm  # noqa: F401 — import failure is the caller's signal
     from vllm import LLM, SamplingParams
 
-    cfg = json.loads(Path(hf_dir, "catopt_export.manifest.json")
-                     .read_text())["config"]
+    cfg = json.loads(
+        Path(hf_dir, "catopt_export.manifest.json").read_text()
+    )["config"]
     B, gen = args.batch, args.gen
     prompts = getattr(args, "prompt_ids", None)
     if prompts is None:
         torch.manual_seed(args.seed)
-        prompts = (
-            torch.randint(1, cfg["vocab_size"], (B, args.prompt_len))
-            .tolist()
-        )
+        prompts = torch.randint(
+            1, cfg["vocab_size"], (B, args.prompt_len)
+        ).tolist()
     else:
         prompts = [list(p) for p in prompts]
     # The tokenizer is ensured inside the leg so a --vllm-python
@@ -494,7 +498,9 @@ def _vllm_leg_payload(hf_dir: str, args) -> dict:
     gen_times, toks = [], None
     for _ in range(reps):
         t0 = time.time()
-        outn = llm.generate(prompts, sampling_params=spn, use_tqdm=False)
+        outn = llm.generate(
+            prompts, sampling_params=spn, use_tqdm=False
+        )
         gen_times.append(time.time() - t0)
         if toks is None:
             toks = [o.outputs[0].token_ids for o in outn]
@@ -646,8 +652,12 @@ def load_model_and_cfg(ckpt: str, device: str):
     dim, hidden, L, nh = (int(hdr[i]) for i in range(4))
     vocab, seq = w["token_embedding"].shape[0], int(hdr[6])
     cfg = dict(
-        dim=dim, hidden=hidden, n_layers=L, n_heads=nh,
-        vocab=vocab, seq_len=seq,
+        dim=dim,
+        hidden=hidden,
+        n_layers=L,
+        n_heads=nh,
+        vocab=vocab,
+        seq_len=seq,
     )
     return BatchedStories(w, cfg).eval().to(device), cfg
 
@@ -697,7 +707,7 @@ def run_bench(args) -> benchkit.Report:
     opt, rep, vr, _ref, opt_s = optimize_once(model, idx0, device)
     notes.append(
         f"optimize: {opt_s:.1f}s, verify rel={vr.max_rel:.2e}, "
-        f"{rep.get('n_optimized','?')}/{rep.get('n_blocks','?')} blocks"
+        f"{rep.get('n_optimized', '?')}/{rep.get('n_blocks', '?')} blocks"
     )
     if not vr.passed:
         notes.append("catopt leg FAILED verify — catopt rows skipped")
@@ -709,7 +719,8 @@ def run_bench(args) -> benchkit.Report:
         or Path(args.out or ".") / "hf_stories15m"
     )
     rope_d = verify_rope_conversion(
-        model.blocks[0].wq.weight, model.blocks[0].wk.weight,
+        model.blocks[0].wq.weight,
+        model.blocks[0].wk.weight,
         cfg["n_heads"],
     )
     notes.append(f"rope permute attention-score max|Δ|={rope_d:.2e}")
@@ -804,7 +815,7 @@ def run_bench(args) -> benchkit.Report:
             agree_s = f" token_agree={agree:.2f}"
         notes.append(
             f"vllm[{tag}]: mode={res.get('mode')} "
-            f"decode_tok/s={res.get('decode_tok_per_s','—')}"
+            f"decode_tok/s={res.get('decode_tok_per_s', '—')}"
             + agree_s
             + (f" reason={res['reason']}" if res.get("reason") else "")
         )
@@ -899,15 +910,26 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--min-run-time", type=float, default=0.05)
-    ap.add_argument("--out", default=str(Path(__file__).parent / "results"))
+    ap.add_argument(
+        "--out", default=str(Path(__file__).parent / "results")
+    )
     ap.add_argument("--hf-out", default=None)
-    ap.add_argument("--vllm-python", default=None,
-                    help="interpreter with vllm installed, for the "
-                    "serving leg when this env lacks it")
-    ap.add_argument("--enforce-eager", action="store_true", default=True)
+    ap.add_argument(
+        "--vllm-python",
+        default=None,
+        help="interpreter with vllm installed, for the "
+        "serving leg when this env lacks it",
+    )
+    ap.add_argument(
+        "--enforce-eager", action="store_true", default=True
+    )
     ap.add_argument("--gpu-frac", type=float, default=0.6)
-    ap.add_argument("--repeats", type=int, default=3,
-                    help="vLLM gen repeats — best-of for tok/s")
+    ap.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="vLLM gen repeats — best-of for tok/s",
+    )
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--plots", default=None)
     # internal: run ONLY the vllm leg (invoked as subprocess)

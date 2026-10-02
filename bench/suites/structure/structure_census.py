@@ -85,7 +85,15 @@ def header(path: str) -> dict:
     """Read the 7-int32 llama2.c header."""
     with open(path, "rb") as f:
         h = np.frombuffer(f.read(28), dtype=np.int32)
-    keys = ("dim", "hidden", "n_layers", "n_heads", "n_kv", "vocab", "seq")
+    keys = (
+        "dim",
+        "hidden",
+        "n_layers",
+        "n_heads",
+        "n_kv",
+        "vocab",
+        "seq",
+    )
     return dict(zip(keys, (int(v) for v in h), strict=True))
 
 
@@ -160,7 +168,9 @@ def build_sites(w: dict, cfg: dict) -> list[dict]:
                 {
                     "name": f"{nm}_{li}",
                     "ltype": lt,
-                    "wn": np.asarray(w[nm][li], np.float32).reshape(shape),
+                    "wn": np.asarray(w[nm][li], np.float32).reshape(
+                        shape
+                    ),
                     "gemm": True,
                     "shared": False,
                 }
@@ -279,9 +289,7 @@ def _bounded_elide_np(a: np.ndarray, budget: float) -> dict:
             hi = bisect.bisect_right(
                 rep_sorted, (float(row[0]) + budget, 1 << 62)
             )
-            for cand in sorted(
-                rep_sorted[j][1] for j in range(lo, hi)
-            ):
+            for cand in sorted(rep_sorted[j][1] for j in range(lo, hi)):
                 d = float(np.abs(rep_mat[cand] - row).max())
                 if d <= budget:
                     pos = cand
@@ -465,7 +473,9 @@ def _special_members(an: dict, bnd: dict | None) -> list[dict]:
     elide_bounded + block_diag may coexist)."""
     o, i = an["o"], an["i"]
     if an["ident"]:
-        return [{"kind": "identity", "flops": 0, "params": 0, "bound": 0.0}]
+        return [
+            {"kind": "identity", "flops": 0, "params": 0, "bound": 0.0}
+        ]
     if an["diag"]:
         return [
             {"kind": "diagonal", "flops": o, "params": o, "bound": 0.0}
@@ -500,7 +510,9 @@ def _special_members(an: dict, bnd: dict | None) -> list[dict]:
                 }
             )
     if an["blocks"]:
-        p = sum((r1 - r0) * (c1 - c0) for r0, r1, c0, c1 in an["blocks"])
+        p = sum(
+            (r1 - r0) * (c1 - c0) for r0, r1, c0, c1 in an["blocks"]
+        )
         ms.append(
             {
                 "kind": "block_diag",
@@ -756,7 +768,9 @@ def census_model(path: str, probes: bool) -> dict:
     cfg = header(path)
     w = load_llama2c(path)
     sites = build_sites(w, cfg)
-    n_stored = sum(int(np.asarray(v).size) for k, v in w.items() if k != "_tail")
+    n_stored = sum(
+        int(np.asarray(v).size) for k, v in w.items() if k != "_tail"
+    )
     tail = w.get("_tail")
     freq = cfg["seq"] * (cfg["dim"] // cfg["n_heads"])
     if tail is not None and tail.size > freq:
@@ -799,8 +813,10 @@ def census_model(path: str, probes: bool) -> dict:
 
     # ---- offer decisions + slack per budget --------------------------
     budgets = ("exact", *(f"{b:g}" for b in BUDGETS))
-    slack = {b: {"flops_saved": 0, "params_saved": 0, "hits": {}}
-             for b in budgets}
+    slack = {
+        b: {"flops_saved": 0, "params_saved": 0, "hits": {}}
+        for b in budgets
+    }
     for s in sites:
         if not s["gemm"]:
             s["offers"] = {}
@@ -887,7 +903,8 @@ def census_model(path: str, probes: bool) -> dict:
         c["dense_flops_per_token"] = s.get("dense_flops", 0)
         c["low_rank"] = s["low_rank"]
         c["offers_exact"] = [
-            {k: v for k, v in m.items()} for m in s["offers"].get("exact", [])
+            {k: v for k, v in m.items()}
+            for m in s["offers"].get("exact", [])
         ]
         for b in BUDGETS:
             c[f"offers@{b:g}"] = [
@@ -936,8 +953,10 @@ def print_report(res: dict) -> None:
         ss = [s for s in res["sites"] if s["ltype"] == lt]
         if not ss:
             continue
+
         def fr(k, _ss=ss):
             return np.median([s[k] for s in _ss])
+
         r90 = np.median(
             [s["rank"]["r90"] / s["rank"]["full"] for s in ss]
         )
@@ -959,9 +978,13 @@ def print_report(res: dict) -> None:
         f"{'params%gemm':>12}  hits"
     )
     for tag, sl in res["slack"].items():
-        hits = ", ".join(
-            f"{k}×{v}" for k, v in sorted(sl["hits_by_kind"].items())
-        ) or "—"
+        hits = (
+            ", ".join(
+                f"{k}×{v}"
+                for k, v in sorted(sl["hits_by_kind"].items())
+            )
+            or "—"
+        )
         print(
             f"{tag:>8} {sl['flops_saved_pct']:>7.3f}% "
             f"{sl['params_saved_pct_of_stored']:>13.3f}% "

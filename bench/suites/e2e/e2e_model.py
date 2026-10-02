@@ -460,7 +460,14 @@ def run_cell(
     opt_c = None
     t0 = time.time()
     try:
-        opt_c, rep = Optimizer(backend=TorchBackend()).optimize(model, ex, strategy=Compositional(), verbose=verbose, max_iterations=max_iterations, max_enodes=max_enodes)
+        opt_c, rep = Optimizer(backend=TorchBackend()).optimize(
+            model,
+            ex,
+            strategy=Compositional(),
+            verbose=verbose,
+            max_iterations=max_iterations,
+            max_enodes=max_enodes,
+        )
 
         rec["opt_s"] = round(time.time() - t0, 2)
         rec["n_blocks"] = rep["n_blocks"]
@@ -516,7 +523,16 @@ def run_cell(
                 )
                 ex64 = a64 if len(a64) > 1 else a64[0]
                 t64 = time.time()
-                opt64, rep64 = Optimizer(backend=TorchBackend()).optimize(m64, ex64, strategy=Compositional(), verbose=False, max_iterations=max_iterations, max_enodes=max_enodes)
+                opt64, rep64 = Optimizer(
+                    backend=TorchBackend()
+                ).optimize(
+                    m64,
+                    ex64,
+                    strategy=Compositional(),
+                    verbose=False,
+                    max_iterations=max_iterations,
+                    max_enodes=max_enodes,
+                )
 
                 rec["opt64_s"] = round(time.time() - t64, 2)
                 rec["n64_optimized"] = rep64["n_optimized"]
@@ -543,8 +559,14 @@ def run_cell(
     if do_full:
 
         def _full():
-            return Optimizer(backend=TorchBackend()).optimize(copy.deepcopy(model), ex, max_iterations=max_iterations, max_enodes=max_enodes, verify=False, verbose=False)
-
+            return Optimizer(backend=TorchBackend()).optimize(
+                copy.deepcopy(model),
+                ex,
+                max_iterations=max_iterations,
+                max_enodes=max_enodes,
+                verify=False,
+                verbose=False,
+            )
 
         out, dt, err = _sig_guarded(_full, full_timeout)
         rec["opt_full_s"] = round(dt, 2)
@@ -785,7 +807,8 @@ def run_bench(args) -> Report:
             c.medians["inductor"] / c.medians["catopt+inductor"],
         )
         for c in cells
-        if c.medians.get("inductor") and c.medians.get("catopt+inductor")
+        if c.medians.get("inductor")
+        and c.medians.get("catopt+inductor")
     ]
     best = max(scored, key=lambda t: t[1], default=None)
     n_verified = sum(1 for r in recs if r.get("catopt_verified"))

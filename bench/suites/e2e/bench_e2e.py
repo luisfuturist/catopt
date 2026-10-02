@@ -72,7 +72,14 @@ def main():
 
         t0 = time.perf_counter()
         print("  optimizing...", flush=True)
-        opt, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=8, max_enodes=200_000, verify=False, verbose=False)
+        opt, stats = Optimizer(backend=TorchBackend()).optimize(
+            m,
+            x,
+            max_iterations=8,
+            max_enodes=200_000,
+            verify=False,
+            verbose=False,
+        )
 
         opt = opt.to(dev).eval()
         pipe_s = time.perf_counter() - t0

@@ -603,9 +603,7 @@ def _rope_rh_half(t: Op, c: Any, s: Any, h: int, dim: int = 3) -> Op:
     x1 = Op.make("slice", t, dim=dim, start=0, end=h)
     x2 = Op.make("slice", t, dim=dim, start=h, end=_RIPE_END)
     rot = Op.make("concat", Op.make("neg", x2), x1, dim=-1)
-    return Op.make(
-        "add", Op.make("mul", t, c), Op.make("mul", rot, s)
-    )
+    return Op.make("add", Op.make("mul", t, c), Op.make("mul", rot, s))
 
 
 def _c_rope_scale(d: int, dev: torch.device):
@@ -663,9 +661,7 @@ def _c_mm_absorb_folded(d: int, dev: torch.device):
     t = Op.make(
         "linear",
         x,
-        Op.make(
-            "matmul", Op.make("transpose", r, dim0=-2, dim1=-1), w
-        ),
+        Op.make("matmul", Op.make("transpose", r, dim0=-2, dim1=-1), w),
     )
     return t, env, [x]
 
@@ -707,9 +703,7 @@ def _c_mm_absorb_bias_folded(d: int, dev: torch.device):
     t = Op.make(
         "linear",
         x,
-        Op.make(
-            "matmul", Op.make("transpose", r, dim0=-2, dim1=-1), w
-        ),
+        Op.make("matmul", Op.make("transpose", r, dim0=-2, dim1=-1), w),
         Op.make("matmul", bb, r),
     )
     return t, env, [x]
@@ -1148,7 +1142,9 @@ def run_bench(args: argparse.Namespace) -> Report:
     _print_table(cells)
     n_fired = sum(1 for c in cases if c.aux.get("fired"))
     n_picked = sum(1 for c in cases if c.aux.get("picked") == "yes")
-    n_verified = sum(1 for c in cases if c.aux.get("verified") == "pass")
+    n_verified = sum(
+        1 for c in cases if c.aux.get("verified") == "pass"
+    )
     n_fail = sum(1 for c in cases if c.aux.get("verified") == "FAIL")
     verdict = (
         Verdict.REGRESSION

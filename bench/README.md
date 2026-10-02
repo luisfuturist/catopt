@@ -35,18 +35,19 @@ bench/
     stats.py      # formatting + polars flattening
     env.py        # provenance (torch/python/git/device)
     ledger.py     # append-only run ledger + baselines
-    compare.py    # regression comparison
-    render/       # markdown · html · plots · quarto · slidev · dashboard
+    compare.py    # regression + expectation comparison
+    render/       # markdown · html · plots · quarto · slidev · dashboard · catalog
     templates/    # jinja2 sources for the HTML surfaces
-  suites/{core,algebra,models}/        # the benchmarks
+  suites/{correctness,search,cost,structure,speedup,e2e,bounded,integration}/
   common/                              # llama2c.py loader, fetch.py
   baselines/                           # committed golden results
   results/                             # working output (gitignored)
 ```
 
-Suites live under `suites/` grouped by category and expose
-`run_bench(args) -> Report`.  They never time anything themselves —
-they describe `Case`/`Variant` data and hand it to `Runner`.
+Suites live under `suites/<intent>/` (the directory is the intent)
+and expose `run_bench(args) -> Report`.  They never time anything
+themselves — they describe `Case`/`Variant` data and hand it to
+`Runner`.
 
 ## The Report model
 
@@ -55,10 +56,10 @@ A suite states its conclusion as typed `Finding`s, not console text:
 ```python
 Finding(
     claim="catopt reaches a weight-folded form Inductor cannot express",
-    verdict=Verdict.WIN,                 # win|parity|regression|negative|inconclusive
-    headline="8.93× vs Inductor at (k,d,B·T)=(8,512,4096)",
+    verdict=Verdict.WIN,  # win|parity|regression|negative|inconclusive
+    headline="N× vs Inductor at (k,d,B·T)=(…)",  # measured, not hardcoded
     metric="catopt+inductor / inductor",
-    value=8.93,
+    value=...,  # from the timed cells
     evidence={"inductor_mm": 8, "catopt_mm": 1},
 )
 ```
@@ -101,19 +102,27 @@ Downloads `stories15M.bin` / `stories110M.bin` into
 
 ## Adding a suite
 
-1. Add a module under `suites/<category>/` exposing
+1. Add a module under `suites/<intent>/` exposing
    `run_bench(args) -> Report` and (optionally) `QUICK = {...}`.
-2. Register it in `bench/registry.py` with a `SuiteSpec`.
+2. Register it in `bench/registry.py` with a `SuiteSpec` (intent,
+   question, expected verdict).
 3. Add a builder in `LAW_CASES` if it is a law bench.
+4. Regenerate the catalog: `python -m bench catalog --write`.
 
 Gates: `uv run pytest` (the harness has `tests/test_benchkit.py`),
-`.venv/bin/ruff check`, `.venv/bin/ruff format --check`.
+`.venv/bin/ruff check packages tools bench`, and
+`.venv/bin/ruff format --check packages tools bench`.  `bench/` is
+linted and formatted but **not** type-checked (`[tool.ty.src] include`
+is `packages` only) and sits outside the 100% coverage floor — it is
+measurement code, not a shipped API.
 
 ## Suite catalog
 
 Generated from `bench/registry.py` — the registry is the single
 source of truth for each suite's intent, question and expected
-verdict (`python -m bench catalog`).
+verdict.  `python -m bench catalog --write` regenerates the block
+below; `python -m bench catalog --check` fails if it drifts (and
+`tests/test_benchkit.py` enforces the same in CI).
 
 <!-- BEGIN GENERATED CATALOG -->
 ### correctness

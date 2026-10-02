@@ -94,7 +94,9 @@ def bounded_elide_fast(wn: torch.Tensor, budget: float) -> dict:
     keep_mask = cmax > budget
     keep = keep_mask.nonzero().flatten().tolist()
     bound = (
-        float(cmax[~keep_mask].max()) if bool((~keep_mask).any()) else 0.0
+        float(cmax[~keep_mask].max())
+        if bool((~keep_mask).any())
+        else 0.0
     )
     rmax = wn.abs().amax(1)
     dead = rmax <= budget
@@ -130,7 +132,11 @@ def bounded_elide_fast(wn: torch.Tensor, budget: float) -> dict:
                     break
         pos = -1
         if cand:
-            d = (torch.stack([rep_rows[p] for p in cand]) - row).abs().amax(1)
+            d = (
+                (torch.stack([rep_rows[p] for p in cand]) - row)
+                .abs()
+                .amax(1)
+            )
             hit = (d <= budget).nonzero().flatten().tolist()
             if hit:
                 k = min(hit, key=lambda k: cand[k])
@@ -268,7 +274,9 @@ def _load(path: str, device: torch.device):
     return Stories15M(w, cfg).eval().to(device), cfg
 
 
-def _prompts(vocab: int, seq: int, n: int, device) -> list[torch.Tensor]:
+def _prompts(
+    vocab: int, seq: int, n: int, device
+) -> list[torch.Tensor]:
     """Seeded random + one periodic prompt (bounded_e2e convention —
     no tokenizer ships with the checkpoint)."""
     g = torch.Generator().manual_seed(20260927)
@@ -287,8 +295,15 @@ def capture_inputs(
     got: dict[str, list[torch.Tensor]] = {n: [] for n in sites}
     hooks = []
     for n, mod in sites.items():
+
         def hook(_m, args, _n=n):
-            got[_n].append(args[0].detach().reshape(-1, args[0].shape[-1]).float().cpu())
+            got[_n].append(
+                args[0]
+                .detach()
+                .reshape(-1, args[0].shape[-1])
+                .float()
+                .cpu()
+            )
 
         hooks.append(mod.register_forward_pre_hook(hook))
     with torch.no_grad():
@@ -319,9 +334,7 @@ def _p999(dy: torch.Tensor) -> float:
     """99.9th |Δy| percentile (samples if over torch.quantile's cap)."""
     flat = dy.abs().flatten()
     if flat.numel() > (1 << 22):
-        flat = flat[
-            torch.randperm(flat.numel())[: 1 << 22]
-        ]
+        flat = flat[torch.randperm(flat.numel())[: 1 << 22]]
     return float(flat.quantile(0.999))
 
 
@@ -393,9 +406,7 @@ def measure_site(
     return rows, stats
 
 
-def head_drift(
-    wn: torch.Tensor, x: torch.Tensor, taus
-) -> list[dict]:
+def head_drift(wn: torch.Tensor, x: torch.Tensor, taus) -> list[dict]:
     """Final-loss proxy at the tied head: KL + top-k on real inputs.
 
     Two variants per threshold: ``full`` (the member the pass would
@@ -420,7 +431,9 @@ def head_drift(
         }
         for kind, wp in variants.items():
             if wp is None:
-                recs.append({"tau": tau, "kind": kind, "offered": False})
+                recs.append(
+                    {"tau": tau, "kind": kind, "offered": False}
+                )
                 continue
             lp = F.log_softmax(_matmul_chunked(x, wp), dim=-1)
             kl = (p_ref * (lr - lp)).sum(-1)
@@ -496,10 +509,15 @@ def run(args) -> dict:
         )
         out["checkpoints"][tag] = {
             "path": str(ckpt),
-            **{k: cfg[k] for k in ("dim", "hidden", "n_layers", "vocab")},
+            **{
+                k: cfg[k]
+                for k in ("dim", "hidden", "n_layers", "vocab")
+            },
         }
         sites = _site_map(model, cfg)
-        weights = {n: m.weight.detach().float().cpu() for n, m in sites.items()}
+        weights = {
+            n: m.weight.detach().float().cpu() for n, m in sites.items()
+        }
         # Replica validation — once, on this checkpoint's weights.
         for v in validate_replica(weights):
             v["checkpoint"] = tag
@@ -696,9 +714,7 @@ def main() -> None:
     # the shipped L1 propagation is conservative ~10x (so certified
     # deliveries now pass), but the gate is vacuous as a quality
     # guard — τ=1e-1 passes while top-1 collapses.
-    head_rows = [
-        s for s in out["sites"] if s["site"] == "head"
-    ]
+    head_rows = [s for s in out["sites"] if s["site"] == "head"]
     for s in head_rows:
         off = [c for c in s["cells"] if c.get("offered")]
         if not off:
@@ -706,7 +722,8 @@ def main() -> None:
         drift = {
             d["tau"]: d
             for d in out["head_drift"]
-            if d["checkpoint"] == s["checkpoint"] and d["kind"] == "full"
+            if d["checkpoint"] == s["checkpoint"]
+            and d["kind"] == "full"
         }
         loose = off[-1]
         loose_d = drift.get(loose["tau"], {})
