@@ -1,0 +1,999 @@
+{
+  "schema": 1,
+  "suite": "bounded_e2e",
+  "title": "Certified bounded rewrites on a checkpoint",
+  "summary": "search(error_budget=B) sweep on stories15M: speedup vs bound vs held-out KL / top-k drift \u2014 including the honest negative when the gate declines every candidate.",
+  "env": {
+    "timestamp_utc": "2026-10-02T01:00:43+00:00",
+    "python": "3.13.9",
+    "torch": "2.14.0+cpu",
+    "torch_cuda": "none",
+    "device": "cpu",
+    "device_name": "12th Gen Intel(R) Core(TM) i5-12500H",
+    "cpu_count": 16,
+    "git_sha": "b63355d",
+    "git_dirty": true,
+    "argv": [
+      "/home/luis/Desktop/catopt/bench/__main__.py",
+      "run",
+      "bounded_e2e",
+      "--device",
+      "cpu",
+      "--out",
+      "/tmp/canon2",
+      "--no-plots",
+      "--no-html"
+    ]
+  },
+  "provenance": {
+    "quick": false
+  },
+  "units": {
+    "median_s": "seconds",
+    "iqr_s": "seconds"
+  },
+  "findings": [
+    {
+      "claim": "bounded rewrites (error_budget) buy wall-time on a real checkpoint",
+      "verdict": "win",
+      "headline": "4/5 budgets delivered a bounded member; best 1.322\u00d7 vs eager",
+      "metric": "budgets delivering",
+      "value": 4.0,
+      "evidence": {
+        "budgets_offered": 4,
+        "declined_by_gate": 0
+      }
+    },
+    {
+      "claim": "every budget's optimized module stays within the fp32 gate",
+      "verdict": "win",
+      "headline": "5/5 budgets optimized cleanly",
+      "metric": "clean budgets",
+      "value": 5.0,
+      "evidence": {}
+    }
+  ],
+  "cells": [
+    {
+      "name": "budget=none",
+      "params": {
+        "budget": "none",
+        "seq": 128
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "inductor",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "catopt",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "eager": 0.04782756700114987,
+        "inductor": 0.045913556999948923,
+        "catopt": 0.047656746000939165
+      },
+      "iqr_s": {
+        "eager": 0.00046920999920985196,
+        "inductor": 0.0002503969972167397,
+        "catopt": 0.0005270790006761672
+      },
+      "aux": {
+        "name": "budget=none",
+        "params": {
+          "budget": "none",
+          "seq": 128
+        },
+        "optimize_device": "cpu",
+        "opt_s": 17.4,
+        "n_optimized": 8,
+        "n_blocks": 8,
+        "cache": {
+          "hits": 5,
+          "misses": 3,
+          "fallbacks": 0
+        },
+        "e2e": {
+          "max_abs_diff": 0.0,
+          "max_rel_diff": 0.0
+        },
+        "per_block": {
+          "emb": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.5,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.0": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.6,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.1": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.2": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.3": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.4": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.5": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "head": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 12.2,
+            "bound_total": null,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          }
+        },
+        "n_special_offers": 0,
+        "n_bounded_offers": 0,
+        "n_bounds_delivered": 0,
+        "bound_total_max": 0.0,
+        "fresh_rel": 0.0,
+        "fresh_passed": true,
+        "proxy": {
+          "mean_kl": 0.0,
+          "max_kl": 0.0,
+          "top1_agree": 1.0,
+          "top5_in": 1.0,
+          "max_abs_logit": 0.0,
+          "n_positions": 640
+        },
+        "ms_eager": 0.04782756700114987,
+        "ms_inductor": 0.045913556999948923,
+        "ms_catopt": 0.047656746000939165,
+        "speedup_vs_eager": 1.0035844033540884,
+        "speedup_vs_inductor": 0.9634219885479406,
+        "verdict": "no bounded offer even qualified \u2014 no weight is within budget of a structural special"
+      }
+    },
+    {
+      "name": "budget=1e-4",
+      "params": {
+        "budget": "1e-4",
+        "seq": 128
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "inductor",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "catopt",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "eager": 0.05323949900048319,
+        "inductor": 0.04655714699947566,
+        "catopt": 0.04935957399902691
+      },
+      "iqr_s": {
+        "eager": 0.0014703755018672382,
+        "inductor": 0.0015984179972292623,
+        "catopt": 0.0011989654994977172
+      },
+      "aux": {
+        "name": "budget=1e-4",
+        "params": {
+          "budget": "1e-4",
+          "seq": 128
+        },
+        "optimize_device": "cpu",
+        "opt_s": 452.6,
+        "n_optimized": 8,
+        "n_blocks": 8,
+        "cache": {
+          "hits": 5,
+          "misses": 3,
+          "fallbacks": 0
+        },
+        "e2e": {
+          "max_abs_diff": 0.0009882450103759766,
+          "max_rel_diff": 5.688349269330689e-05
+        },
+        "per_block": {
+          "emb": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.3,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.0": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.5,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.1": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.2": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.3": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.4": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.5": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "head": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 5.688349269330689e-05,
+            "error": null,
+            "time_s": 445.1,
+            "bound_total": 2.364814281463623e-05,
+            "bounds": [
+              {
+                "rule": "weight_special#5",
+                "bound": 2.364814281463623e-05,
+                "norm": "max_abs",
+                "output_bound": 0.03869175067302422,
+                "site_input_norm": 1636.143310546875,
+                "measured_max_rel": 5.688349269330689e-05
+              }
+            ],
+            "specials_offered": [
+              {
+                "param": "p_weight",
+                "kind": "elide_bounded",
+                "error_bound": 2.364814281463623e-05
+              }
+            ],
+            "bounds_honored": true
+          }
+        },
+        "n_special_offers": 1,
+        "n_bounded_offers": 1,
+        "n_bounds_delivered": 1,
+        "bound_total_max": 2.364814281463623e-05,
+        "fresh_rel": 4.977673479619482e-05,
+        "fresh_passed": true,
+        "proxy": {
+          "mean_kl": -1.077529077520012e-06,
+          "max_kl": 4.9594284064369276e-05,
+          "top1_agree": 1.0,
+          "top5_in": 1.0,
+          "max_abs_logit": 0.0015254020690917969,
+          "n_positions": 640
+        },
+        "ms_eager": 0.05323949900048319,
+        "ms_inductor": 0.04655714699947566,
+        "ms_catopt": 0.04935957399902691,
+        "speedup_vs_eager": 1.0786053178160082,
+        "speedup_vs_inductor": 0.9432242466353844,
+        "verdict": "1 bounded members, bound 2.36e-05, speedup 1.079x, KL -1.08e-06"
+      }
+    },
+    {
+      "name": "budget=1e-3",
+      "params": {
+        "budget": "1e-3",
+        "seq": 128
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "inductor",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "catopt",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "eager": 0.05018946299969684,
+        "inductor": 0.048128235999683966,
+        "catopt": 0.041332925999086
+      },
+      "iqr_s": {
+        "eager": 0.0006028480001987191,
+        "inductor": 0.00017235199993592687,
+        "catopt": 0.0005957820030744188
+      },
+      "aux": {
+        "name": "budget=1e-3",
+        "params": {
+          "budget": "1e-3",
+          "seq": 128
+        },
+        "optimize_device": "cpu",
+        "opt_s": 356.9,
+        "n_optimized": 8,
+        "n_blocks": 8,
+        "cache": {
+          "hits": 5,
+          "misses": 3,
+          "fallbacks": 0
+        },
+        "e2e": {
+          "max_abs_diff": 0.11743414402008057,
+          "max_rel_diff": 0.006759522388855351
+        },
+        "per_block": {
+          "emb": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.4,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.0": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 4.0,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.1": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.5,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.2": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.2,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.3": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.2,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.4": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.5": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "head": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.006759522388855351,
+            "error": null,
+            "time_s": 348.3,
+            "bound_total": 0.0009999144822359085,
+            "bounds": [
+              {
+                "rule": "weight_special#5",
+                "bound": 0.0009999144822359085,
+                "norm": "max_abs",
+                "output_bound": 1.6360033912292238,
+                "site_input_norm": 1636.143310546875,
+                "measured_max_rel": 0.006759522388855351
+              }
+            ],
+            "specials_offered": [
+              {
+                "param": "p_weight",
+                "kind": "elide_bounded",
+                "error_bound": 0.0009999144822359085
+              }
+            ],
+            "bounds_honored": true
+          }
+        },
+        "n_special_offers": 1,
+        "n_bounded_offers": 1,
+        "n_bounds_delivered": 1,
+        "bound_total_max": 0.0009999144822359085,
+        "fresh_rel": 0.006790873643222583,
+        "fresh_passed": false,
+        "proxy": {
+          "mean_kl": 5.8475548030401114e-06,
+          "max_kl": 5.918855458730832e-05,
+          "top1_agree": 1.0,
+          "top5_in": 1.0,
+          "max_abs_logit": 0.1190800666809082,
+          "n_positions": 640
+        },
+        "ms_eager": 0.05018946299969684,
+        "ms_inductor": 0.048128235999683966,
+        "ms_catopt": 0.041332925999086,
+        "speedup_vs_eager": 1.214273168098641,
+        "speedup_vs_inductor": 1.1644042814861022,
+        "verdict": "1 bounded members, bound 1.00e-03, speedup 1.214x, KL 5.85e-06"
+      }
+    },
+    {
+      "name": "budget=3e-3",
+      "params": {
+        "budget": "3e-3",
+        "seq": 128
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "inductor",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "catopt",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "eager": 0.04113519500060647,
+        "inductor": 0.03916600050069974,
+        "catopt": 0.03335013900050399
+      },
+      "iqr_s": {
+        "eager": 0.0008032669993554009,
+        "inductor": 0.00032801049974295893,
+        "catopt": 0.0012831945005018497
+      },
+      "aux": {
+        "name": "budget=3e-3",
+        "params": {
+          "budget": "3e-3",
+          "seq": 128
+        },
+        "optimize_device": "cpu",
+        "opt_s": 227.7,
+        "n_optimized": 8,
+        "n_blocks": 8,
+        "cache": {
+          "hits": 5,
+          "misses": 3,
+          "fallbacks": 0
+        },
+        "e2e": {
+          "max_abs_diff": 0.3607311248779297,
+          "max_rel_diff": 0.020763723662450283
+        },
+        "per_block": {
+          "emb": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.2,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.0": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.2,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.1": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.2": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.3": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.4": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.5": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "head": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.020763723662450283,
+            "error": null,
+            "time_s": 220.8,
+            "bound_total": 0.0029997825622558594,
+            "bounds": [
+              {
+                "rule": "weight_special#5",
+                "bound": 0.0029997825622558594,
+                "norm": "max_abs",
+                "output_bound": 4.908074172330089,
+                "site_input_norm": 1636.143310546875,
+                "measured_max_rel": 0.020763723662450283
+              }
+            ],
+            "specials_offered": [
+              {
+                "param": "p_weight",
+                "kind": "elide_bounded",
+                "error_bound": 0.0029997825622558594
+              }
+            ],
+            "bounds_honored": true
+          }
+        },
+        "n_special_offers": 1,
+        "n_bounded_offers": 1,
+        "n_bounds_delivered": 1,
+        "bound_total_max": 0.0029997825622558594,
+        "fresh_rel": 0.0226738941468024,
+        "fresh_passed": false,
+        "proxy": {
+          "mean_kl": 6.501974712591618e-05,
+          "max_kl": 0.00020665681222453713,
+          "top1_agree": 1.0,
+          "top5_in": 1.0,
+          "max_abs_logit": 0.39759373664855957,
+          "n_positions": 640
+        },
+        "ms_eager": 0.04113519500060647,
+        "ms_inductor": 0.03916600050069974,
+        "ms_catopt": 0.03335013900050399,
+        "speedup_vs_eager": 1.2334339895850162,
+        "speedup_vs_inductor": 1.1743879238436716,
+        "verdict": "1 bounded members, bound 3.00e-03, speedup 1.233x, KL 6.50e-05"
+      }
+    },
+    {
+      "name": "budget=1e-2",
+      "params": {
+        "budget": "1e-2",
+        "seq": 128
+      },
+      "variants": [
+        {
+          "name": "eager",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "inductor",
+          "flops": null,
+          "note": ""
+        },
+        {
+          "name": "catopt",
+          "flops": null,
+          "note": ""
+        }
+      ],
+      "median_s": {
+        "eager": 0.053652863999559486,
+        "inductor": 0.05071466600020358,
+        "catopt": 0.04057024000030651
+      },
+      "iqr_s": {
+        "eager": 0.0008455989996036806,
+        "inductor": 0.00028618249962164555,
+        "catopt": 0.0006344649991660845
+      },
+      "aux": {
+        "name": "budget=1e-2",
+        "params": {
+          "budget": "1e-2",
+          "seq": 128
+        },
+        "optimize_device": "cpu",
+        "opt_s": 157.7,
+        "n_optimized": 8,
+        "n_blocks": 8,
+        "cache": {
+          "hits": 5,
+          "misses": 3,
+          "fallbacks": 0
+        },
+        "e2e": {
+          "max_abs_diff": 1.4378125667572021,
+          "max_rel_diff": 0.08276065123198757
+        },
+        "per_block": {
+          "emb": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 3.0,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.0": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 2.9,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.1": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.2": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.3": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.4": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "blocks.5": {
+            "status": "optimized",
+            "cache": "hit",
+            "rel_diff": 0.0,
+            "error": null,
+            "time_s": 0.1,
+            "bound_total": 0.0,
+            "bounds": [],
+            "specials_offered": [],
+            "bounds_honored": null
+          },
+          "head": {
+            "status": "optimized",
+            "cache": "miss",
+            "rel_diff": 0.08276065123198757,
+            "error": null,
+            "time_s": 151.1,
+            "bound_total": 0.009999886155128479,
+            "bounds": [
+              {
+                "rule": "weight_special#5",
+                "bound": 0.009999886155128479,
+                "norm": "max_abs",
+                "output_bound": 16.36124683894377,
+                "site_input_norm": 1636.143310546875,
+                "measured_max_rel": 0.08276065123198757
+              }
+            ],
+            "specials_offered": [
+              {
+                "param": "p_weight",
+                "kind": "elide_bounded",
+                "error_bound": 0.009999886155128479
+              }
+            ],
+            "bounds_honored": true
+          }
+        },
+        "n_special_offers": 1,
+        "n_bounded_offers": 1,
+        "n_bounds_delivered": 1,
+        "bound_total_max": 0.009999886155128479,
+        "fresh_rel": 0.08074912172973428,
+        "fresh_passed": false,
+        "proxy": {
+          "mean_kl": 0.000711094297003001,
+          "max_kl": 0.0030438390094786882,
+          "top1_agree": 1.0,
+          "top5_in": 1.0,
+          "max_abs_logit": 2.1795692443847656,
+          "n_positions": 640
+        },
+        "ms_eager": 0.053652863999559486,
+        "ms_inductor": 0.05071466600020358,
+        "ms_catopt": 0.04057024000030651,
+        "speedup_vs_eager": 1.3224684891968628,
+        "speedup_vs_inductor": 1.250045994300759,
+        "verdict": "1 bounded members, bound 1.00e-02, speedup 1.322x, KL 7.11e-04"
+      }
+    },
+    {
+      "name": "morphism_probe",
+      "params": {
+        "budget": "kv:0.01",
+        "seq": 128
+      },
+      "variants": [],
+      "median_s": {},
+      "iqr_s": {},
+      "aux": {
+        "error_budget_kw": "accepted",
+        "law_budget_armed": true,
+        "kv_budget": 0.01,
+        "opt_s": 13.3,
+        "n_blocks": 8,
+        "n_lifted": 8,
+        "n_rewritten": 0,
+        "matches": {
+          "kv_latent_share:blocks.0": {
+            "status": "declined",
+            "reason": "no_improvement",
+            "detail": "blocks.0: shared-data kv projections",
+            "error": null
+          },
+          "kv_latent_share:blocks.1": {
+            "status": "declined",
+            "reason": "no_improvement",
+            "detail": "blocks.1: shared-data kv projections",
+            "error": null
+          },
+          "kv_latent_share:blocks.2": {
+            "status": "declined",
+            "reason": "no_improvement",
+            "detail": "blocks.2: shared-data kv projections",
+            "error": null
+          },
+          "kv_latent_share:blocks.3": {
+            "status": "declined",
+            "reason": "no_improvement",
+            "detail": "blocks.3: shared-data kv projections",
+            "error": null
+          },
+          "kv_latent_share:blocks.4": {
+            "status": "declined",
+            "reason": "no_improvement",
+            "detail": "blocks.4: shared-data kv projections",
+            "error": null
+          },
+          "kv_latent_share:blocks.5": {
+            "status": "declined",
+            "reason": "no_improvement",
+            "detail": "blocks.5: shared-data kv projections",
+            "error": null
+          }
+        },
+        "end_to_end": {
+          "max_abs_diff": 0.0,
+          "max_rel_diff": 0.0
+        }
+      }
+    }
+  ]
+}

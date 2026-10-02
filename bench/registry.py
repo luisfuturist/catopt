@@ -328,8 +328,9 @@ SUITES: list[SuiteSpec] = [
         "bounded",
         "Certified bounded rewrites",
         "Do error-budget rewrites buy wall-time on a real checkpoint?",
-        "NEGATIVE on stories15M — no bounded members accepted at any "
-        "budget (honest).",
+        "WIN — error-budget rewrites deliver bounded members and a "
+        "measured wall-time win vs Inductor on stories15M (see "
+        "docs/results.md).",
         tier="model",
         mechanisms=("bounded", "checkpoint"),
     ),

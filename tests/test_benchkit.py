@@ -171,6 +171,19 @@ def test_catalog_readme_in_sync() -> None:
     )
 
 
+def test_results_doc_in_sync() -> None:
+    """docs/results.md must match the pinned baselines."""
+    from bench.benchkit.render.results import render_results_doc
+
+    doc = REPO / "docs/results.md"
+    assert doc.exists(), (
+        "docs/results.md missing — run `python -m bench results`"
+    )
+    assert doc.read_text() == render_results_doc(
+        REPO / "bench/baselines"
+    ), "docs/results.md drifted — run `python -m bench results`"
+
+
 def test_pinned_baselines_state_findings() -> None:
     """A pinned baseline is not golden unless it states a verdict."""
     for path in sorted((REPO / "bench/baselines").glob("*.json")):

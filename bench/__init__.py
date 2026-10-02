@@ -4,8 +4,9 @@ Layout:
 
 * ``bench.benchkit`` — the harness: timing, provenance, findings, and
   the renderers (Markdown / HTML dashboard / Quarto / Slidev).
-* ``bench.suites`` — the benchmarks themselves, grouped by category
-  (``core`` / ``algebra`` / ``models``).
+* ``bench.suites`` — the benchmarks themselves, grouped by intent
+  (``correctness`` / ``speedup`` / ``e2e`` / …; the directory is the
+  intent).
 * ``bench.registry`` — the suite catalog the CLI drives.
 * ``bench.cli`` — ``python -m bench``.
 

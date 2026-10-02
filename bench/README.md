@@ -180,7 +180,7 @@ below; `python -m bench catalog --check` fails if it drifts (and
 
 | suite | tier | question | expected |
 |---|---|---|---|
-| `bounded_e2e` | model | Do error-budget rewrites buy wall-time on a real checkpoint? | NEGATIVE on stories15M — no bounded members accepted at any budget (honest). |
+| `bounded_e2e` | model | Do error-budget rewrites buy wall-time on a real checkpoint? | WIN — error-budget rewrites deliver bounded members and a measured wall-time win vs Inductor on stories15M (see docs/results.md). |
 | `structured_models` | block | Do LoRA / pruned / low-rank families admit bounded rewrites? | WIN where structure exists — params shrink / speedups, verified. |
 
 ### integration

@@ -7,6 +7,32 @@ it measured, and the machine it measured on.  The full
 per-suite reports (timings, plots, raw metrics) are produced by
 `python -m bench report <baseline.json>`.
 
+## Certified bounded rewrites
+
+*Do error-budget rewrites buy wall-time on a real checkpoint?*
+
+**Expected** — WIN — error-budget rewrites deliver bounded members and a measured wall-time win vs Inductor on stories15M (see docs/results.md).
+
+| verdict | finding | headline |
+|---|---|---|
+| **WIN** | bounded rewrites (error_budget) buy wall-time on a real checkpoint | 4/5 budgets delivered a bounded member; best 1.322× vs eager |
+| **WIN** | every budget's optimized module stays within the fp32 gate | 5/5 budgets optimized cleanly |
+
+Measured 2026-10-02T01:00:43+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git `b63355d` (dirty)) — baseline [`bench/baselines/bounded_e2e.json`](../bench/baselines/bounded_e2e.json).
+
+## MiniGPT end-to-end
+
+*Does composition (pairing + fold) beat plain Inductor end-to-end?*
+
+**Expected** — PARITY — pairing fires per block, verified fp64-exact; wall time is ~parity.
+
+| verdict | finding | headline |
+|---|---|---|
+| **WIN** | the composed catopt+Inductor module beats plain Inductor end-to-end | best 1.03× vs Inductor on tiny_llama@4x256 |
+| **WIN** | the optimized module verifies against eager | 5/5 cells verified |
+
+Measured 2026-10-02T00:47:33+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git `f1e5d1a` (dirty)) — baseline [`bench/baselines/e2e_model.json`](../bench/baselines/e2e_model.json).
+
 ## Compositional pairing demo
 
 *Does per-model lowering autotune pick the measured-fastest variant?*
@@ -32,11 +58,24 @@ Measured 2026-10-02T00:19:09+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git 
 
 Measured 2026-10-02T00:18:07+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git `ba38bd9` (dirty)) — baseline [`bench/baselines/law_bench.json`](../bench/baselines/law_bench.json).
 
+## Morphism-window composition
+
+*Do morphism windows convert term-flops into wall time?*
+
+**Expected** — WIN — term-FLOP reduction converts to measured wall time at GEMM-bound sizes.
+
+| verdict | finding | headline |
+|---|---|---|
+| **WIN** | morphism windows convert term-level flops headroom into measured wall time | best 14.83× vs eager on chain_x4@4096x128 |
+| **WIN** | every morphism rewrite verifies equivalent | 14/14 cells verified |
+
+Measured 2026-10-02T00:40:26+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git `f1e5d1a` (dirty)) — baseline [`bench/baselines/morphism_e2e.json`](../bench/baselines/morphism_e2e.json).
+
 ## Weight-chain reassociation vs Inductor
 
 *Can the e-graph find a form Inductor's post-grad graph cannot express?*
 
-**Expected** — WIN — 8.9–16.1× vs Inductor on k-deep weight chains.
+**Expected** — WIN — the e-graph reaches a weights-first form Inductor's post-grad graph cannot express (see docs/results.md).
 
 | verdict | finding | headline |
 |---|---|---|
