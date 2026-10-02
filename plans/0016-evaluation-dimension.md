@@ -57,11 +57,10 @@ no new suppression is added to pass a gate.
 
 Map the current boundaries and find violations of the four dimensions.
 
-- Deliverable: a short internal note (`project/retros/` or a plan
-  appendix) listing every place a layer answers another's question —
-  e.g. a cost model that reads torch types, a strategy that times
-  inline, a profiler that runs on the target.
-- Gate: the note exists and each finding has a disposition.
+- Deliverable: `project/retros/four-dimension-recon.md` — every place
+  a layer answers another's question, each with a disposition
+  (landed).
+- Gate: the note exists and each finding has a disposition.  [done]
 - Risk: none; this is measurement.
 
 ### 1 — Boundaries
