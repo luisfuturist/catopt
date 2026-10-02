@@ -43,12 +43,18 @@ class Action:
 
 @dataclass
 class GameState:
-    """The board: an e-graph plus the search cursor."""
+    """The board: an e-graph plus the search cursor.
+
+    ``features`` (a :class:`~catopt_core.features.ProgramFeatures` or
+    ``None``) is the static description a learned policy reads; the
+    engine itself never needs it.
+    """
 
     eg: Any
     root_eid: int
     iteration: int = 0
     best_cost: float | None = None
+    features: Any = None
 
 
 class RuleBook:
