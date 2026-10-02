@@ -13,6 +13,7 @@ label plus a list of child e-class IDs.  The e-graph itself (see
 from __future__ import annotations
 
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, cast
 
@@ -212,6 +213,53 @@ def op_repr(term: Any) -> str:
     return repr(term)
 
 
+def _dag_shared(root: Op) -> set[Op]:
+    """Ops inside ``root`` referenced by more than one parent slot."""
+    counts: dict[Op, int] = {}
+    counted: set[Op] = set()
+    todo = [root]
+    while todo:
+        t = todo.pop()
+        if t in counted:
+            continue
+        counted.add(t)
+        for a in t.args:
+            if isinstance(a, Op):
+                counts[a] = counts.get(a, 0) + 1
+                todo.append(a)
+    return {t for t, c in counts.items() if c > 1}
+
+
+def _dag_postorder(root: Op) -> list[Op]:
+    """Every op in ``root``'s DAG, children before parents, deduped."""
+    order: list[Op] = []
+    expanded: set[Op] = set()
+    work: list[tuple[Op, bool]] = [(root, False)]
+    while work:
+        t, done = work.pop()
+        if done:
+            order.append(t)
+            continue
+        if t in expanded:
+            continue
+        expanded.add(t)
+        work.append((t, True))
+        work.extend(
+            (a, False)
+            for a in t.args
+            if isinstance(a, Op) and a not in expanded
+        )
+    return order
+
+
+def _sexp(t: Op, arg_repr: Callable[[Any], str]) -> str:
+    """Render one node's ``(op arg, …, k=v)`` s-expression."""
+    parts = [arg_repr(a) for a in t.args]
+    if t.attrs:
+        parts.append(", ".join(f"{k}={v}" for k, v in t.attrs.items()))
+    return f"({t.op} {', '.join(parts)})"
+
+
 def op_repr_dag(term: Any) -> str:
     """Compact S-expression rendering of a sharing-heavy term DAG.
 
@@ -229,68 +277,30 @@ def op_repr_dag(term: Any) -> str:
     """
     if not isinstance(term, Op):
         return repr(term)
-    # Pass 1 — count parent references per distinct node (each
-    # parent arg slot is one reference; dedup the walk by node).
-    counts: dict[Op, int] = {}
-    counted: set[Op] = set()
-    todo: list[Any] = [term]
-    while todo:
-        t = todo.pop()
-        if not isinstance(t, Op) or t in counted:
-            continue
-        counted.add(t)
-        for a in t.args:
-            if isinstance(a, Op):
-                counts[a] = counts.get(a, 0) + 1
-                todo.append(a)
-    shared = {t for t, c in counts.items() if c > 1}
+    shared = _dag_shared(term)
     if not shared:
         return op_repr(term)
-    # Pass 2 — iterative post-order: children render before parents,
-    # so every ``#n`` binding precedes all of its uses.
     names: dict[Op, str] = {}
     defs: list[str] = []
     rendered: dict[Op, str] = {}
-    expanded: set[Op] = set()
-    work: list[tuple[Any, bool]] = [(term, False)]
-    while work:
-        t, done = work.pop()
-        if not isinstance(t, Op):
-            continue
-        if not done:
-            if t in expanded:
-                continue
-            expanded.add(t)
-            work.append((t, True))
-            work.extend(
-                (a, False)
-                for a in t.args
-                if isinstance(a, Op) and a not in expanded
-            )
-            continue
-        parts = [
-            (
-                names[a]  # shared children are already bound
-                if a in shared
-                else rendered[a]
-            )
-            if isinstance(a, Op)
-            else repr(a)
-            for a in t.args
-        ]
-        if t.attrs:
-            parts.append(
-                ", ".join(f"{k}={v}" for k, v in t.attrs.items())
-            )
-        s = f"({t.op} {', '.join(parts)})"
+    # Post-order emits every ``#n`` binding before all of its uses.
+    for t in _dag_postorder(term):
+        s = _sexp(
+            t,
+            lambda a: (
+                (names[a] if a in shared else rendered[a])
+                if isinstance(a, Op)
+                else repr(a)
+            ),
+        )
         if t in shared:
             names[t] = f"#{len(defs)}"
             defs.append(s)
         else:
             rendered[t] = s
-    body = names[term] if term in shared else rendered[term]
     bound = " ".join(f"(#{i} {d})" for i, d in enumerate(defs))
-    return f"(let ({bound}) {body})"
+    # The root is no node's child, so it is never a shared binding.
+    return f"(let ({bound}) {rendered[term]})"
 
 
 # ---------------------------------------------------------------------------

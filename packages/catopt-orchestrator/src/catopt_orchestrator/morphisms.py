@@ -30,7 +30,9 @@ cannot be certified is a decline, never a graft.
 
 Signature coverage, explicitly: signatures recognise ``linear`` /
 ``matmul`` projections with param-only weights, ``layer_norm`` and
-RMS/diagonal-scale norms, known activation ops, and the residual
+RMS/diagonal-scale norms (the pointwise ``x·rms⁻¹·w`` chain and the
+fused ``rms_norm`` op alike), ``embedding`` gather-source weights as
+tying candidates, known activation ops, and the residual
 ``x + f(x)`` spine.  Attention internals (``sdpa``), carrier ops, and
 everything else flow through untouched — they make the block richer,
 not opaque.  Only blocks whose *export itself* fails (or that never
@@ -121,8 +123,9 @@ class NormSig:
     """The block's normalisation / diagonal-scale signature.
 
     ``kind`` ∈ ``{"none", "layer_norm", "rms", "diag"}`` — a LayerNorm
-    op, an RMS-style ``x · rms⁻¹ · w`` pattern, or a bare diagonal
-    (elementwise gain) map.  ``affine`` records a *learnable* gain
+    op, an RMS-style ``x · rms⁻¹ · w`` pattern (either spelling: the
+    pointwise ``mul`` chain or the fused ``rms_norm`` op), or a bare
+    diagonal (elementwise gain) map.  ``affine`` records a *learnable* gain
     (a ``Param`` inside the scale term — a ``Const`` scalar scale is a
     diagonal map but not affine).  ``pre`` is True when the norm sits
     on the path from the block input to an in-projection — the
@@ -500,6 +503,11 @@ class BlockSig:
       activation and the rest classify ``const_table`` /
       read-only ``state`` — rope ``(x, cos, sin)`` blocks and
       cache-carrying ``(x, kv_cache)`` blocks included.
+    * ``tables`` — weights of *table* ops (the ``W`` operand of
+      ``embedding(W, idx)``): param-only gather sources the block
+      reads as a lookup, not a projection.  They are signature terms
+      for tying (``WeightTie`` — the classic emb↔head share) but
+      never projection endpoints.
     """
 
     in_projs: tuple[WeightRef, ...]
@@ -509,6 +517,7 @@ class BlockSig:
     residual: bool
     shape: tuple
     inputs: tuple[InputSig, ...] = ()
+    tables: tuple[WeightRef, ...] = ()
 
 
 def _iter_ops(term: Any) -> list[Op]:
@@ -616,20 +625,55 @@ def _has_rsqrt(term: Any) -> bool:
     )
 
 
+def _rms_entry(n: Op) -> tuple[Op, str, bool] | None:
+    """One fused ``rms_norm(x, w)`` node as an ``(n, "rms", affine)`` entry.
+
+    ``None`` when the node has no operands or its subject is var-free
+    (compile-time data, not a stream norm); affine iff the weight
+    operand (``args[1]``) is present and param-only.
+    """
+    if not n.args or not has_var_leaf(n.args[0]):
+        return None
+    return (n, "rms", len(n.args) > 1 and _param_only(n.args[1]))
+
+
+def _table_refs(root: Any, memo: dict) -> tuple[WeightRef, ...]:
+    """Weights of table ops — ``embedding(W, idx)``'s gather source.
+
+    A param-only ``args[0]`` is a stored table the block reads as a
+    lookup — a signature term for tying (``WeightTie`` sees the
+    emb↔head share through it), never a projection endpoint.
+    """
+    return tuple(
+        _weight_ref(n.args[0], memo)
+        for n in _iter_ops(root)
+        if n.op == "embedding" and n.args and _param_only(n.args[0])
+    )
+
+
 def _norm_nodes(root: Any) -> list[tuple[Op, str, bool]]:
     """Normalisation/diagonal nodes: ``(node, kind, affine)`` triples.
 
     ``layer_norm`` ops are affine when they carry a weight arg; a
     ``mul`` whose one side holds the ``rsqrt`` core is an RMS node
-    (affine iff the other side is param-only); any other ``mul`` with
-    exactly one var side and a scalar/rank-1 param-only other side is a
-    bare diagonal (affine iff the gain contains a ``Param``).
+    (affine iff the other side is param-only); the fused ``rms_norm``
+    op — ``rms_norm(x, w)`` ≡ ``x·rms⁻¹·w`` (llama2.c's spelling) — is
+    the same RMS signature with the gain folded into the op's second
+    operand (affine iff that operand is param-only); any other ``mul``
+    with exactly one var side and a scalar/rank-1 param-only other side
+    is a bare diagonal (affine iff the gain contains a ``Param``).
     """
     out: list[tuple[Op, str, bool]] = []
     for n in _iter_ops(root):
         if n.op == "layer_norm":
             affine = len(n.args) > 1 and _param_only(n.args[1])
             out.append((n, "layer_norm", affine))
+        elif n.op == "rms_norm":
+            # Fused RMS norm — the weight operand (when present and
+            # param-only) is the affine gain.
+            rms = _rms_entry(n)
+            if rms is not None:
+                out.append(rms)
         elif n.op == "mul" and len(n.args) >= 2:
             a, b = n.args[0], n.args[1]
             ra, rb = _has_rsqrt(a), _has_rsqrt(b)
@@ -684,6 +728,7 @@ def block_signature(
     out_refs = tuple(
         _weight_ref(w, memo) for n, _, w in projs if n not in inside
     )
+    tbl_refs = _table_refs(root, memo)
     norm_nodes = _norm_nodes(root)
     # Pre-norm: the norm node sits on the path into an in-projection.
     in_scope: set = set()
@@ -717,6 +762,7 @@ def block_signature(
         residual=_residual_spine(root, inputs[act_idx : act_idx + 1]),
         shape=(i_shp, o_shp),
         inputs=input_sigs,
+        tables=tbl_refs,
     )
 
 
@@ -1644,7 +1690,10 @@ class WeightTie:
     same node — duplicated branch weights inside one block) carrying
     weights with equal shapes, plus an equal name stem for the
     cross-block case (a shared ``nn.Parameter`` exports under the same
-    leaf name in both blocks).  Reify interns the involved blocks'
+    leaf name in both blocks).  The candidate set is a block's
+    projection refs *plus* its table weights — ``embedding``'s gather
+    source is how the tied emb/head pair (llama2.c ``wcls``) becomes
+    visible.  Reify interns the involved blocks'
     terms into one e-graph and runs :func:`share_duplicate_params` —
     the value-exact pass decides whether the candidate tie is real; a
     shape+name coincidence that does not share *values* declines.
@@ -1659,7 +1708,9 @@ class WeightTie:
             (n.name, s) for n in graph.nodes if (s := n.sig) is not None
         ]
         for name, sig in lifted:
-            refs = tuple(dict.fromkeys(sig.in_projs + sig.out_proj))
+            refs = tuple(
+                dict.fromkeys(sig.in_projs + sig.out_proj + sig.tables)
+            )
             if len(refs) > 1 and any(
                 x.shape is not None and x.shape == y.shape
                 for i, x in enumerate(refs)
@@ -1678,8 +1729,8 @@ class WeightTie:
                 )
         for i, (name_a, sa) in enumerate(lifted):
             for name_b, sb in lifted[i + 1 :]:
-                refs_a = sa.in_projs + sa.out_proj
-                refs_b = sb.in_projs + sb.out_proj
+                refs_a = sa.in_projs + sa.out_proj + sa.tables
+                refs_b = sb.in_projs + sb.out_proj + sb.tables
                 if any(
                     weights_tied(wa, wb)
                     for wa in refs_a
@@ -2298,6 +2349,7 @@ def _saturate(
     max_enodes: int,
     symmetry_budget: int | None,
     offers: list | None = None,
+    node_offers: list | None = None,
 ) -> tuple[EGraph, int]:
     """One joint e-graph: intern, offer constructed members, saturate.
 
@@ -2309,12 +2361,25 @@ def _saturate(
     the pair verify gates the assertion.  A third element, when
     present, is a kwargs dict for the witness (``note`` /
     ``error_bound`` / ``bound_norm`` — the KV-latent offer certifies
-    its factorisation residual).  Returns ``(eg, root_eid)``.
+    its factorisation residual).  ``node_offers`` are
+    ``(node, expanded, law_text)`` subterm equalities merged into the
+    node's own e-class — the fused-norm unfold that lets the
+    diagonal-naturality laws see a gain the fused op carries as an
+    operand.  Returns ``(eg, root_eid)``.
     """
     eg = EGraph()
     eid = eg.add_term(term)
     for offered in offers or ():
         _witness_offer(eg, eid, term, offered)
+    for node, expanded, law_text in node_offers or ():
+        eg._offer_witness(
+            eg.add_term(node),
+            rhs_term=expanded,
+            lhs_term=node,
+            provenance="morphism_reify",
+            law=law_text,
+            note="morphism-level subterm expansion",
+        )
     if len(rules):
         budgets = (
             {
@@ -2533,6 +2598,41 @@ def _resolve_joint(
     return _pair_joint(match, graph)
 
 
+def _norm_unfolds(term: Any) -> list[tuple[Op, Any, str]]:
+    """``(node, expanded, law)`` offers unfusing weighted norm ops.
+
+    ``rms_norm(x, w)`` ≡ ``rms_norm(x) ∘ w`` — the fused op carries the
+    affine gain as an operand, so no ``mul`` node exists for the
+    diagonal-naturality laws (``linear_channel_scale``) to see.  The
+    unfused member is the fused kernel's internal gain pass spelled
+    pointwise: an exact equality asserted at morphism level, offered
+    into the norm node's own e-class, and gated by the pair verify —
+    the same witness ritual as :func:`_distribute_offers`, addressed
+    at the subterm rather than the joint root.
+    """
+    out: list[tuple[Op, Any, str]] = []
+    for n in _iter_ops(term):
+        if (
+            n.op == "rms_norm"
+            and len(n.args) >= 2
+            and _param_only(n.args[1])
+        ):
+            out.append(
+                (
+                    n,
+                    Op.make(
+                        "mul",
+                        Op.make("rms_norm", n.args[0], **n.attrs),
+                        n.args[1],
+                    ),
+                    "rms_norm(x, w) = rms_norm(x) ∘ w — the fused "
+                    "op's gain pass spelled pointwise; morphism-level "
+                    "assertion, gated by the pair verify",
+                )
+            )
+    return out
+
+
 def _distribute_offers(term: Any, mids: tuple) -> list:
     """Build the constructed bilinear steps, progressive over each mid.
 
@@ -2728,6 +2828,11 @@ def _reify(
         max_enodes=max_enodes,
         symmetry_budget=symmetry_budget,
         offers=offers,
+        # The scale recipe folds diagonal gains into weights — unfuse
+        # the fused-norm spellings so their gain operand is reachable.
+        node_offers=(
+            _norm_unfolds(term) if spec.rules == "scale" else None
+        ),
     )
     best = eg.extract_best(eid, cost_fn)
     base_cost = dag_cost(term, cost_fn)
@@ -2990,6 +3095,7 @@ def _sig_dict(sig: BlockSig) -> dict[str, Any]:
     return {
         "in_projs": [w.name for w in sig.in_projs],
         "out_proj": [w.name for w in sig.out_proj],
+        "tables": [w.name for w in sig.tables],
         "norm": sig.norm.kind,
         "norm_affine": sig.norm.affine,
         "norm_pre": sig.norm.pre,

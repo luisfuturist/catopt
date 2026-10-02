@@ -276,6 +276,11 @@ def _flops_of(term: Op, memo: dict | None = None) -> float:
     if term.op == "inv":
         # n×n inverse ≈ 2·n³ = 2·n_out^1.5 FLOPs.
         return float(2 * max(n_out, 1) ** 1.5)
+    if term.op == "rms_norm":
+        # aten.rms_norm(x, normalized_shape, weight, eps): the weight
+        # operand is an in-kernel Hadamard gain — one extra
+        # elementwise pass over the output vs the weightless form.
+        return float((2 if len(term.args) > 1 else 1) * n_out)
     return float(_OP_FLOPS.get(term.op, 1) * n_out)
 
 
