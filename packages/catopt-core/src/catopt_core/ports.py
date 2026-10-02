@@ -135,7 +135,7 @@ Deliberate non-fits
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -155,7 +155,10 @@ __all__ = [
     "ExecutorSpec",
     "Meter",
     "OpRegistry",
+    "PerformanceModel",
     "PlannedExecutor",
+    "Policy",
+    "Profiler",
     "RuleLike",
     "RuleSetLike",
     "RuleSetProvider",
@@ -804,6 +807,64 @@ class Strategy(Protocol):
         self, model: Any, x: Any, *, optimizer: Any, **kw: Any
     ) -> LowerResult:
         """Run the policy end to end; return the lower record."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+#  The four dimensions — evaluation, search policy, performance (ADR 0003)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class Profiler(Protocol):
+    """Static observation of a program — the evaluation dimension.
+
+    ``profile(program) -> ProgramFeatures``.  Core names ``Any`` for
+    the return so this module stays dependency-light; the concrete
+    type lives in :mod:`catopt_core.features`
+    (:class:`~catopt_core.features.StaticProfiler` is the reference
+    implementation).  A profiler *observes*; it never runs the program
+    on a target (ADR 0003).
+    """
+
+    def profile(self, program: Any) -> Any:
+        """Return the static features of ``program``."""
+        ...
+
+
+@runtime_checkable
+class Policy(Protocol):
+    """An in-search action selector — the game's player.
+
+    ``choose(state, actions) -> action`` picks among the legal actions
+    the search offers at ``state``.  Distinct from :class:`Strategy`
+    (the whole-pipeline policy): a ``Policy`` only *orders* moves the
+    law library already licenses, so it can never change what is
+    certified (ADR 0003 invariant 5).  ``RandomPolicy`` /
+    ``GreedyPolicy`` / ``BeamPolicy`` and a learned policy are the
+    interchangeable values.
+    """
+
+    name: str
+
+    def choose(self, state: Any, actions: Sequence[Any]) -> Any:
+        """Pick one of ``actions`` for ``state``."""
+        ...
+
+
+@runtime_checkable
+class PerformanceModel(Protocol):
+    """Predicts runtime from program features and a hardware target.
+
+    ``predict(features, hardware) -> float`` (predicted seconds).
+    It *ranks* candidates; it may never prune the semantic space
+    (ADR 0003 invariant 8).  Analytical first, learned later.
+    """
+
+    name: str
+
+    def predict(self, features: Any, hardware: Any = None) -> float:
+        """Predict the runtime (seconds) of ``features`` on hardware."""
         ...
 
 
