@@ -4,6 +4,24 @@ Status: draft.  Depends on ADR 0003 (the four-dimension decision) and
 the seams it reuses (plan 0006 `Strategy`, 0007 backend ports, 0010
 `Engine`).  Amends nothing; it stages what ADR 0003 decides.
 
+## Landed so far
+
+| Stage | State | Where |
+|---|---|---|
+| 0 recon | done | `project/retros/four-dimension-recon.md` |
+| 1 boundaries | done | `catopt_core.ports`: `Profiler` / `Policy` / `PerformanceModel` |
+| 2 profiling | done | `catopt_core.features` (`ProgramFeatures`, `StaticProfiler`) |
+| 3 one GPU backend | partial | `catopt_core.failures` taxonomy + `Meter` contract; one CUDA backend |
+| 4 evaluation | done | `catopt_core.pareto` (`CostVector`, `frontier`, `best`) |
+| 5 game API | done | `catopt_core.game` (`Action` / `GameState` / `RuleBook` / `transition` / `Evaluator`) |
+| 6 policies | done | `catopt_core.policies` (random / existing / greedy / beam-score) |
+| 7 learned policy | done | `catopt_core.trajectories` + `catopt_torch.learned_policy` + `tools/train_search_policy.py` |
+| 8 performance model | done | `catopt_core.perf_model` (`AnalyticalPerformanceModel`) |
+| 9–12 | not started | API / docs / tests / benchmarks |
+
+Stage 7's measured result and findings:
+`project/retros/stage7-learned-policy-results.md`.
+
 ## Goal
 
 Make evaluation a first-class, pluggable dimension so the engine
