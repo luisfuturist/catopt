@@ -223,6 +223,7 @@ protocols, flags and expected outcomes: [`bench/README.md`](bench/README.md).
 | Doc | What it is |
 |---|---|
 | [`docs/mechanism.md`](docs/mechanism.md) | the conceptual pipeline — syntax → structure → search → certificate |
+| [`docs/evaluation.md`](docs/evaluation.md) | the evaluation dimension — features, frontier, policies, learned policy |
 | [`docs/results.md`](docs/results.md) | measured results, generated from the pinned baselines |
 | [`docs/api.md`](docs/api.md) | the API surface — `Optimizer`, strategies, runners, criteria, ports |
 | [`bench/README.md`](bench/README.md) | the benchmark harness and its suite catalog |

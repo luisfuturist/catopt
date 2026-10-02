@@ -25,3 +25,11 @@ skips:
   # This is a local, deliberate pattern — see the report for the inline
   # `# nosec B112` alternative if a future edit wants per-site suppression.
   - B112
+  # B311 random -------------------------------------------------------------
+  # policies.py:40 seeds a `random.Random` for the search policy's
+  # exploration (RandomPolicy).  It is a reproducibility knob for a
+  # heuristic search, not a security primitive: nothing here protects a
+  # secret or a token, and the generator is never used to make a
+  # security decision.  A cryptographically strong source would only
+  # make the search non-reproducible.
+  - B311
