@@ -65,9 +65,6 @@ the compositional cache can re-verify byte equality against a
 replayed block's own tensors via :func:`headshare_keys_hold`.
 """
 
-# ruff: noqa: RUF003 -- comments/docstrings use
-# mathematical notation (≡, ·) deliberately.
-
 from typing import Any
 
 from catopt_core.attrs import attr_of
@@ -101,11 +98,37 @@ _PROV = "head_share"
 #: head/feature axes positional and uniform.
 _PASSTHRU = frozenset(
     {
-        "contiguous", "alias", "to", "type_as", "float", "dropout",
-        "clone", "detach", "detach_", "copy",
-        "neg", "square", "sqrt", "rsqrt", "exp", "exp2", "expm1",
-        "sigmoid", "silu", "tanh", "gelu", "relu", "abs", "sign",
-        "sin", "cos", "log", "floor", "ceil", "round", "reciprocal",
+        "contiguous",
+        "alias",
+        "to",
+        "type_as",
+        "float",
+        "dropout",
+        "clone",
+        "detach",
+        "detach_",
+        "copy",
+        "neg",
+        "square",
+        "sqrt",
+        "rsqrt",
+        "exp",
+        "exp2",
+        "expm1",
+        "sigmoid",
+        "silu",
+        "tanh",
+        "gelu",
+        "relu",
+        "abs",
+        "sign",
+        "sin",
+        "cos",
+        "log",
+        "floor",
+        "ceil",
+        "round",
+        "reciprocal",
         "erf",
     }
 )
@@ -152,7 +175,7 @@ def _rank(st: tuple) -> int:
 
 
 def _bcast_axes(st: tuple) -> frozenset:
-    """The provably-broadcast axes of a resolution state."""
+    """Return the provably-broadcast axes of a resolution state."""
     return st[3] if st[0] == "s" else st[4]
 
 
@@ -177,12 +200,12 @@ def _src_params(ctx: _Ctx, cid: int) -> list[tuple[str, Any]]:
 
 
 def _heads_of(states: tuple) -> list:
-    """The ``("h", ...)`` states among *states*."""
+    """Return the ``("h", ...)`` states among *states*."""
     return [s for s in states if s[0] == "h"]
 
 
 def _sites_of(states: tuple) -> list:
-    """The ``("s", ...)`` states among *states*."""
+    """Return the ``("s", ...)`` states among *states*."""
     return [s for s in states if s[0] == "s"]
 
 
@@ -231,7 +254,7 @@ def _bcast_of(ctx: _Ctx, node: Any, rp: int) -> frozenset:
 
 
 def _bias_sources(ctx: _Ctx, b_c: int, o: int) -> list | None:
-    """Sources for a ``linear`` bias — [] for uniform, None to veto.
+    """Return sources for a ``linear`` bias — [] uniform, None veto.
 
     A scalar ``Const`` or all-dims-1 bias adds the same value to every
     head block — feature-uniform, contributes nothing.  A 1-D ``(o,)``
@@ -258,7 +281,7 @@ def _bias_sources(ctx: _Ctx, b_c: int, o: int) -> list | None:
 
 
 def _h_leaf(ctx: _Ctx, node: Any, shape: Any) -> list:
-    """A Param leaf is a feature-space site (last-dim blocks)."""
+    """Return site entries for a Param leaf (feature-space, last dim)."""
     if not node.attrs:
         return []
     leaf = _LeafRegistry.decode(node.attrs[0][1])
@@ -378,7 +401,7 @@ def _heads_merge(st: tuple, out: tuple) -> tuple | None:
 
 
 def _heads_regroup(st: tuple, out: tuple) -> tuple | None:
-    """Generic head-preserving reshape — the ``(A, h, B)`` block rule.
+    """Rewrite a generic head-preserving reshape — the ``(A, h, B)`` rule.
 
     A reshape is head-safe whenever the output splits as ``(A', h, B')``
     with ``prod(A') == prod(A)`` and ``prod(B') == prod(B)``: row-major
@@ -448,7 +471,9 @@ def _axis_perm(node: Any, r: int) -> tuple | None:
         ):
             return None
         f = tuple(d % r for d in dims)
-        return f if len(f) == r and sorted(f) == list(range(r)) else None
+        return (
+            f if len(f) == r and sorted(f) == list(range(r)) else None
+        )
     src = attr_of(a, "source")
     dst = attr_of(a, "destination")
     src = src if isinstance(src, (tuple, list)) else (src,)
@@ -487,8 +512,10 @@ def _h_perm(ctx: _Ctx, node: Any, shape: Any) -> list:
 
 
 def _remap_bcast(bcast: frozenset, dn: int) -> frozenset:
-    """Axis set after dropping axis *dn* — the inverse of
-    :func:`_shift_bcast`."""
+    """Return the axis set after dropping axis *dn*.
+
+    The inverse of :func:`_shift_bcast`.
+    """
     return frozenset(a - (a > dn) for a in bcast if a != dn)
 
 
@@ -510,14 +537,10 @@ def _h_unsq(ctx: _Ctx, node: Any, shape: Any) -> list:
         dn = d % (r + 1)
         if st[0] == "s":
             if dn <= r - 1:  # the feature axis must stay last
-                res.append(
-                    ("s", shape, st[2], _shift_bcast(st[3], dn))
-                )
+                res.append(("s", shape, st[2], _shift_bcast(st[3], dn)))
         else:
             ha = st[1] + (dn <= st[1])
-            res.append(
-                ("h", ha, shape, st[3], _shift_bcast(st[4], dn))
-            )
+            res.append(("h", ha, shape, st[3], _shift_bcast(st[4], dn)))
     return res
 
 
@@ -534,14 +557,10 @@ def _h_squeeze(ctx: _Ctx, node: Any, shape: Any) -> list:
         dn = d % r
         if st[0] == "s":
             if dn != r - 1:
-                res.append(
-                    ("s", shape, st[2], _remap_bcast(st[3], dn))
-                )
+                res.append(("s", shape, st[2], _remap_bcast(st[3], dn)))
         elif dn != st[1]:
             ha = st[1] - (dn < st[1])
-            res.append(
-                ("h", ha, shape, st[3], _remap_bcast(st[4], dn))
-            )
+            res.append(("h", ha, shape, st[3], _remap_bcast(st[4], dn)))
     return res
 
 
@@ -619,7 +638,9 @@ def _bounds(a: dict, node: Any, extent: Any) -> tuple[int, int] | None:
     return None if hi <= lo else (lo, hi)
 
 
-def _part_span(node: Any, a: dict, extent: Any) -> tuple[int, int] | None:
+def _part_span(
+    node: Any, a: dict, extent: Any
+) -> tuple[int, int] | None:
     """``(lo, width)`` of section ``index`` for split/chunk."""
     idx = a.get("index")
     if not isinstance(extent, int) or not isinstance(idx, int):
@@ -671,8 +692,7 @@ def _h_cut(ctx: _Ctx, node: Any, shape: Any) -> list:
                 sp = _bounds(dict(node.attrs), node, len(st[3]))
                 if sp is not None:
                     res.append(
-                        ("h", st[1], shape, st[3][sp[0] : sp[1]],
-                         st[4])
+                        ("h", st[1], shape, st[3][sp[0] : sp[1]], st[4])
                     )
         else:
             ha = st[1] - (node.op == "select" and dn < st[1])
@@ -710,8 +730,13 @@ def _h_split(ctx: _Ctx, node: Any, shape: Any) -> list:
             sp = _part_span(node, a, len(st[3]))
             if sp is not None:
                 res.append(
-                    ("h", st[1], shape, st[3][sp[0] : sp[0] + sp[1]],
-                     st[4])
+                    (
+                        "h",
+                        st[1],
+                        shape,
+                        st[3][sp[0] : sp[0] + sp[1]],
+                        st[4],
+                    )
                 )
         else:
             res.append(("h", st[1], shape, st[3], st[4]))
@@ -736,11 +761,8 @@ def _h_gather(ctx: _Ctx, node: Any, shape: Any) -> list:
                 res.append(("s", shape, st[2], st[3]))
         elif dn != st[1]:
             res.append(("h", st[1], shape, st[3], st[4]))
-        elif (
-            isinstance(idx, (tuple, list))
-            and all(
-                isinstance(i, int) and 0 <= i < len(st[3]) for i in idx
-            )
+        elif isinstance(idx, (tuple, list)) and all(
+            isinstance(i, int) and 0 <= i < len(st[3]) for i in idx
         ):
             bc = frozenset(x for x in st[4] if x != st[1])
             res.append(
@@ -792,7 +814,9 @@ def _merge_one(
         s1 = s1 * len(h0[3])
     if len(s1) != len(h0[3]):
         return None
-    sigs = tuple(_merge_entry(a, b) for a, b in zip(h0[3], s1))
+    sigs = tuple(
+        _merge_entry(a, b) for a, b in zip(h0[3], s1, strict=True)
+    )
     return ("h", ha0, shape, sigs, _bcast_of(ctx, node, rp))
 
 
@@ -851,8 +875,12 @@ def _merge_sites(
             w1 = s1[1][-1] if s1[1] else None
             if w0 == w1:
                 out.append(
-                    ("s", shape,
-                     tuple(dict.fromkeys(s0[2] + s1[2])), bc)
+                    (
+                        "s",
+                        shape,
+                        tuple(dict.fromkeys(s0[2] + s1[2])),
+                        bc,
+                    )
                 )
             elif w1 == 1:
                 out.append(("s", shape, s0[2], bc))
@@ -896,7 +924,8 @@ def _h_concat(ctx: _Ctx, node: Any, shape: Any) -> list:
                 out.append(("h", dn, shape, h0[3] + h1[3], bc))
             elif len(h0[3]) == len(h1[3]):
                 sigs = tuple(
-                    _merge_entry(a, b) for a, b in zip(h0[3], h1[3])
+                    _merge_entry(a, b)
+                    for a, b in zip(h0[3], h1[3], strict=True)
                 )
                 bc = _bcast_of(ctx, node, rp)
                 out.append(("h", dn, shape, sigs, bc))
@@ -1238,9 +1267,7 @@ def share_duplicate_attention_heads(
     return offers
 
 
-def headshare_keys_hold(
-    sites: Any, name_of: Any, tensors: Any
-) -> bool:
+def headshare_keys_hold(sites: Any, name_of: Any, tensors: Any) -> bool:
     """Re-verify recorded head equality on a replayed block's values.
 
     *sites* is the list of ``recheck`` records (``{"imap", "keys"}``,
