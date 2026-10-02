@@ -3,6 +3,7 @@
 [![ci](https://github.com/luisfuturist/catopt/actions/workflows/ci.yml/badge.svg)](https://github.com/luisfuturist/catopt/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
 **A program optimizer's reachable set is bounded by its semantic
 language, not its search strategy.**  Tensor-level compilers rewrite
@@ -98,7 +99,7 @@ provenance.  The verdicts:
 | Whole-model E2E (`e2e_model`, `e2e_models2`) | **PARITY** | pairing fires per block and verifies fp64-exact, but wall time is ~parity |
 | Real trained checkpoints, exact mode (`structure_census`) | **PARITY** | dense weights carry ~zero exploitable bitwise structure |
 | Launch-bound decode (`decode_bench`) | **NEGATIVE** | fewer launches don't pay where launch overhead already dominates — the hypothesis is falsified |
-| Bounded rewrites on a real checkpoint (`bounded_e2e`) | **NEGATIVE** | `error_budget=` rewrites buy nothing on stories15M at any budget |
+| Bounded rewrites on a real checkpoint (`bounded_e2e`) | **WIN (bounded)** | `error_budget=` delivers **1.15–1.32× vs Inductor** on stories15M via certified elision of near-duplicate tied-head rows — bounds propagate to outputs, verified-with-tolerance, KL≈0 at τ=1e-4 |
 
 This is **not a universal speedup**.  Attention- and GEMM-bound code is
 already optimal — expect a parity floor there — and the losses are
