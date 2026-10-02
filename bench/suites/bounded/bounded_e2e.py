@@ -75,11 +75,11 @@ from bench.benchkit import (
     collect_env,
 )
 from bench.common.llama2c import load_llama2c
-from bench.suites.algebra.real_win_hunt import try_compile
-from bench.suites.models.stories15m_bench import (
+from bench.suites.e2e.stories15m_bench import (
     Stories15M,
     resolve_ckpt,
 )
+from bench.suites.speedup.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {

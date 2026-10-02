@@ -56,7 +56,7 @@ from catopt_torch.report import CompositionalReport, verify_equiv
 from torch.utils.benchmark import Timer
 
 from bench.common.llama2c import load_llama2c
-from bench.suites.models.stories15m_bench import (
+from bench.suites.e2e.stories15m_bench import (
     Block,
     Stories15M,
     resolve_ckpt,

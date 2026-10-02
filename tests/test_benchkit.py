@@ -133,11 +133,15 @@ def test_compare_detects_regression(tmp_path: Path) -> None:
 
 def test_registry_lookup() -> None:
     spec = registry.get("reassoc_scale")
-    assert spec.category == "algebra"
-    assert registry.get("bench.suites.algebra.reassoc_scale.py") is spec
+    assert spec.intent == "speedup"
+    assert spec.module == "bench.suites.speedup.reassoc_scale"
+    assert registry.get("bench.suites.speedup.reassoc_scale.py") is spec
     with pytest.raises(KeyError):
         registry.get("does_not_exist")
     assert registry.harnessed()
+    # every suite's intent is a declared category with a stated question
+    assert {s.intent for s in registry.SUITES} <= set(registry.INTENTS)
+    assert all(s.question and s.expects for s in registry.SUITES)
 
 
 def test_runner_times_a_call() -> None:

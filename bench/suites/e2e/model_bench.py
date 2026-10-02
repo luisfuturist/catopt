@@ -95,8 +95,8 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from bench.suites.algebra.real_linear_attn import LinearAttnStack
-from bench.suites.algebra.real_win_hunt import _rel_diff, try_compile
+from bench.suites.speedup.real_linear_attn import LinearAttnStack
+from bench.suites.speedup.real_win_hunt import _rel_diff, try_compile
 
 # run_all.py picks these up for its --quick lane.  The decoder cell is
 # dropped from --quick: the paired-DAG ``dag_cost`` pass costs ~75s per

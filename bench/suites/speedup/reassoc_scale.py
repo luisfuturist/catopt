@@ -38,8 +38,8 @@ Per cell (k, d, R):
 
 Usage:
     python -m bench run reassoc_scale --device cpu
-    python -m bench.suites.algebra.reassoc_scale --device cuda --dims 256,512,1024
-    python -m bench.suites.algebra.reassoc_scale --depths 4,8 --rows 16384
+    python -m bench.suites.speedup.reassoc_scale --device cuda --dims 256,512,1024
+    python -m bench.suites.speedup.reassoc_scale --depths 4,8 --rows 16384
     python -m bench run reassoc_scale --device cpu --quick
 """
 # ruff: noqa: RUF001 RUF002 RUF003 -- ×, ·, −, ² in strings/docstrings
@@ -1211,7 +1211,7 @@ def run_bench(args) -> Report:
 
 @dataclass
 class Config:
-    """reassoc_scale knobs (``python -m bench.suites.algebra.reassoc_scale``)."""
+    """reassoc_scale knobs (``python -m bench.suites.speedup.reassoc_scale``)."""
 
     device: str = "cpu"
     depths: str | None = None  # default 2,4,8,16
@@ -1225,7 +1225,7 @@ class Config:
 
 
 def main() -> None:
-    """Direct entry: ``python -m bench.suites.algebra.reassoc_scale``."""
+    """Direct entry: ``python -m bench.suites.speedup.reassoc_scale``."""
     cfg = tyro.cli(Config)
     cfg.no_artifacts = not cfg.artifacts
     run_bench(cfg)

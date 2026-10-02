@@ -109,13 +109,13 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from bench.suites.algebra.real_linear_attn import (
+from bench.suites.speedup.real_linear_attn import (
     LinearAttnStack,
     _canonical_scan_term,
     _rel_diff,
     try_compile,
 )
-from bench.suites.algebra.reassoc_scale import LinearAttnChain
+from bench.suites.speedup.reassoc_scale import LinearAttnChain
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {"models": "chain,retnet", "top_k": 4}

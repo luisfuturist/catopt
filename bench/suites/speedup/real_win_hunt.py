@@ -117,7 +117,7 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from bench.suites.algebra.decode_scan_bench import (
+from bench.suites.speedup.decode_scan_bench import (
     ChunkedStep,
     DecodeStep,
 )

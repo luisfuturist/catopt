@@ -21,16 +21,20 @@ _ENV = Environment(
     lstrip_blocks=True,
 )
 
-_CATEGORY_ORDER = ("core", "algebra", "models", "infra", "other")
 
-
-def _category(suite: str) -> str:
+def _intent(suite: str) -> str:
     try:
         from bench import registry
 
-        return registry.get(suite).category
+        return registry.get(suite).intent
     except Exception:
         return "other"
+
+
+def _intent_order() -> tuple[str, ...]:
+    from bench import registry
+
+    return (*registry.INTENTS, "other")
 
 
 def build_dashboard(
@@ -56,7 +60,7 @@ def build_dashboard(
         page = outdir / f"{report.suite}.html"
         if not page.exists():
             report.to_html(page)
-        buckets.setdefault(_category(report.suite), []).append(
+        buckets.setdefault(_intent(report.suite), []).append(
             {
                 "suite": report.suite,
                 "title": report.title or report.suite,
@@ -75,7 +79,7 @@ def build_dashboard(
 
     env = reports[0].env if reports else {}
     groups = [
-        (cat, buckets[cat]) for cat in _CATEGORY_ORDER if cat in buckets
+        (cat, buckets[cat]) for cat in _intent_order() if cat in buckets
     ]
     html = _ENV.get_template("dashboard.html.j2").render(
         title=title,

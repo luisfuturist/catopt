@@ -96,8 +96,8 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from bench.suites.algebra.real_win_hunt import try_compile
-from bench.suites.models.e2e_model import TinyLlama
+from bench.suites.e2e.e2e_model import TinyLlama
+from bench.suites.speedup.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane (~1 cell per model,
 # embedder + the MoE fold question; ≤ ~60 s GPU incl. compiles).

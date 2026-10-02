@@ -72,8 +72,8 @@ import torch
 
 from bench import benchkit
 from bench.common.llama2c import load_llama2c
-from bench.suites.models.decode_bench import BatchedStories
-from bench.suites.models.stories15m_bench import resolve_ckpt
+from bench.suites.e2e.stories15m_bench import resolve_ckpt
+from bench.suites.speedup.decode_bench import BatchedStories
 
 QUICK = {"gen": "16", "ctx": "48", "repeats": "1"}
 

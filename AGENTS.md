@@ -289,7 +289,12 @@ in `LAW_CASES` keyed by rule name for new laws.  Gates: `uv run pytest`,
 Benchmarks are a package, not scripts: `python -m bench list` shows the
 catalog; `python -m bench run <suite>` emits JSON + Markdown + HTML +
 plotly plots (+ optional Quarto/Slidev) from one canonical `Report`;
-`python -m bench dashboard` builds the cross-suite HTML index.  Suites
-live in `bench/suites/{core,algebra,models}/` and expose
-`run_bench(args) -> Report`; shared data (checkpoint loaders) is in
-`bench/common/`.  Details in `bench/README.md`.
+`python -m bench dashboard` builds the cross-suite HTML index;
+`python -m bench catalog` emits the docs.  Suites live in
+`bench/suites/<intent>/` and expose `run_bench(args) -> Report`; shared
+data (checkpoint loaders) is in `bench/common/`.  `bench/registry.py`
+is the source of truth for a suite's **intent** (the question it
+answers), its `question`/`expects`, `tier`, `status`, controlled
+`mechanisms` and `needs_cuda` — the README tables and the dashboard
+grouping are generated from it, so they cannot drift.  Details in
+`bench/README.md`.

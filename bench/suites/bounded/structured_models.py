@@ -91,15 +91,15 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from bench.suites.algebra.real_win_hunt import try_compile
-from bench.suites.models.bounded_e2e import (
+from bench.suites.bounded.bounded_e2e import (
     _bounded_ledger,
     _fwd_stmt,
     _load_stories,
     _prompt_set,
     _proxy_eval,
 )
-from bench.suites.models.stories15m_bench import Block
+from bench.suites.e2e.stories15m_bench import Block
+from bench.suites.speedup.real_win_hunt import try_compile
 
 # run_all.py picks these up for its --quick lane.
 QUICK = {

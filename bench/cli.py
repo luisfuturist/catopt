@@ -48,7 +48,16 @@ class _Lax:
 class ListConfig:
     """List the benchmark catalog."""
 
-    category: str | None = None
+    intent: str | None = None
+    mechanism: str | None = None
+
+
+@dataclass
+class CatalogConfig:
+    """Emit the suite catalog as Markdown (docs generated from the registry)."""
+
+    out: Path | None = None
+    mechanisms: bool = False
 
 
 @dataclass
@@ -245,26 +254,46 @@ def _run_one(
 
 
 def cmd_list(cfg: ListConfig) -> int:
-    """Print the catalog."""
+    """Print the catalog, grouped by intent."""
     rows = []
     for s in registry.SUITES:
-        if cfg.category and s.category != cfg.category:
+        if cfg.intent and s.intent != cfg.intent:
+            continue
+        if cfg.mechanism and cfg.mechanism not in s.mechanisms:
             continue
         rows.append(
             [
+                s.intent,
                 s.name,
-                s.category,
+                s.tier,
                 s.status,
                 "cuda" if s.needs_cuda else "",
-                ", ".join(s.tags),
-                s.title,
+                ", ".join(s.mechanisms),
             ]
         )
     _print_table(
-        "catopt bench suites",
-        ["suite", "category", "status", "needs", "tags", "title"],
+        "catopt bench suites (by intent)",
+        ["intent", "suite", "tier", "status", "needs", "mechanisms"],
         rows,
     )
+    return 0
+
+
+def cmd_catalog(cfg: CatalogConfig) -> int:
+    """Emit the generated catalog Markdown."""
+    from bench.benchkit.render.catalog import (
+        render_catalog_markdown,
+        render_mechanisms_markdown,
+    )
+
+    md = render_catalog_markdown()
+    if cfg.mechanisms:
+        md += "\n## By mechanism\n\n" + render_mechanisms_markdown()
+    if cfg.out:
+        Path(cfg.out).write_text(md)
+        _console().print(f"  [dim]→[/dim] {cfg.out}")
+    else:
+        print(md)
     return 0
 
 
@@ -404,6 +433,7 @@ def cmd_gate(cfg: GateConfig) -> int:
 #: The subcommand union — tyro turns each into a flat-flag subcommand.
 Command = (
     Annotated[ListConfig, tyro.conf.subcommand("list")]
+    | Annotated[CatalogConfig, tyro.conf.subcommand("catalog")]
     | Annotated[RunConfig, tyro.conf.subcommand("run")]
     | Annotated[RunAllConfig, tyro.conf.subcommand("run-all")]
     | Annotated[ReportConfig, tyro.conf.subcommand("report")]
@@ -414,6 +444,7 @@ Command = (
 
 _DISPATCH = {
     ListConfig: cmd_list,
+    CatalogConfig: cmd_catalog,
     RunConfig: cmd_run,
     RunAllConfig: cmd_run_all,
     ReportConfig: cmd_report,

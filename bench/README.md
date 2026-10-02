@@ -16,8 +16,8 @@ python -m bench compare reassoc_scale       # vs the pinned baseline
 Run any suite directly with its own typed flags:
 
 ```bash
-python -m bench.suites.algebra.reassoc_scale --depths 4,8 --rows 16384
-python -m bench.suites.core.law_bench --laws assoc --sizes 256
+python -m bench.suites.speedup.reassoc_scale --depths 4,8 --rows 16384
+python -m bench.suites.correctness.law_bench --laws assoc --sizes 256
 ```
 
 `--quick` shrinks a sweep (the per-suite `QUICK` dict, applied by the
@@ -109,25 +109,94 @@ Downloads `stories15M.bin` / `stories110M.bin` into
 Gates: `uv run pytest` (the harness has `tests/test_benchkit.py`),
 `.venv/bin/ruff check`, `.venv/bin/ruff format --check`.
 
-## Suite catalog — protocols and expected verdicts
+## Suite catalog
 
-| Suite | Expected verdict |
+Generated from `bench/registry.py` — the registry is the single
+source of truth for each suite's intent, question and expected
+verdict (`python -m bench catalog`).
+
+<!-- BEGIN GENERATED CATALOG -->
+### correctness
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `law_bench` | micro | Does each registered rewrite law fire, get picked by extraction, and lower to a verified term? | WIN — every registered law fires/picks/verifies; non-firing laws report honestly. |
+| `laws_effect` | block | Do the law families pay off at runtime on realistic model families? | WIN on launch-bound families; honest negatives where Inductor's fused pointwise kernel wins on CPU. |
+| `morphism_coverage` | model | Which morphism laws match and fire on real checkpoints? | Coverage map — matches/fires per law, declines with reasons. |
+
+### search
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `search_efficiency` | micro | How expensive is saturation relative to the program space it represents? | WIN — ~Catalan(k−1) programs in O(k³) live e-nodes; exact saturation fragments past k≈11 (honest limit). |
+
+### cost
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `cost_fidelity` | micro | Does the pipeline cost model rank candidates like measured latency? | High rank correlation (ρ) and pick accuracy — term-level cost tracks the backend. |
+
+### structure
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `structure_census` _(ad-hoc)_ | model | How much catopt-exploitable structure do real trained weights carry? | Exact mode: ~zero bitwise structure on dense LLMs, real on structured ones. |
+| `bound_amplification` _(ad-hoc)_ | block | How does a weight-space error bound propagate to the output? | Measured output rel exceeds the certified bound by ~2–8× (honest). |
+
+### speedup
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `reassoc_scale` | block | Can the e-graph find a form Inductor's post-grad graph cannot express? | WIN — 8.9–16.1× vs Inductor on k-deep weight chains. |
+| `real_win_hunt` | block | Which structured block topologies admit an autotuned win? | WIN — ~1.1–10× vs Inductor on exploitable topologies. |
+| `real_linear_attn` | block | Does the affine-monoid scan lift pay on real linear-attention blocks? | WIN — ≈2.9× vs eager (retnet T=128); honest negatives where Inductor's pointwise fusion wins on CPU. |
+| `morphism_e2e` | block | Do morphism windows convert term-flops into wall time? | WIN — 12.4–12.5× measured wall on 4-block chains at GEMM-bound sizes. |
+| `decode_scan_bench` _(cuda)_ | block | Does the chunked scan carrier beat the best non-carrier decode schedule? | WIN on launch-bound devices — 1.65–3.4× vs Inductor; CUDA for the graph leg. |
+| `decode_bench` _(ad-hoc)_ | block | Does fewer GEMM launches pay off where launch overhead dominates? | NEGATIVE — the launch-bound hypothesis is falsified (4–15% loss at B=1, T≤64). |
+| `killer_demo` | block | Does per-model lowering autotune pick the measured-fastest variant? | WIN — the reported pick is the measured winner, never a static choice. |
+| `bench_omd2` _(ad-hoc)_ | block | Does the cross-carrier omd lift survive a transformer-shaped attention? | Exploratory — fires on the mqa case; not a certified path. |
+
+### e2e
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `model_bench` | model | Do whole multi-block models beat Inductor under the autotuned lowering? | Latency/peak-memory/compile per model, verified; wins where structure exists. |
+| `e2e_model` | model | Does composition (pairing + fold) beat plain Inductor end-to-end? | PARITY — ~1.05× over Inductor, verified fp64-exact. |
+| `e2e_models2` | model | Does composition hold across architecture families? | PARITY — in-repo replicas (minilm/vit/conv/llama/moe), verified per cell. |
+| `e2e_llm` | model | Does composition help prefill + KV-cache decode on a llama-scale model? | Measured c+i/ind band; honest per-cell verdicts. |
+| `stories15m_bench` _(ad-hoc)_ | model | Does the whole-model pipeline transform and verify a real checkpoint? | PARITY — all blocks transform+verify, but the mechanism doesn't pay at 15M/110M. |
+| `bench_e2e` _(ad-hoc)_ | model | Does a MiniGPT optimize and verify at all? | Smoke — sanity only; use the rigorous sweeps for numbers. |
+
+### bounded
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `bounded_e2e` | model | Do error-budget rewrites buy wall-time on a real checkpoint? | NEGATIVE on stories15M — 0 bounded members accepted at every budget (honest). |
+| `structured_models` | block | Do LoRA / pruned / low-rank families admit bounded rewrites? | WIN where structure exists — params shrink / speedups, verified. |
+
+### integration
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `vllm_compare` _(cuda)_ | model | Can vLLM serve a catopt-optimized model token-for-token? | WIN — token-for-token agreement (~1.0); the wins are complementary, not competing. |
+
+## By mechanism
+
+| mechanism | suites |
 |---|---|
-| `reassoc_scale` | Deep `x @ W1 @ … @ Wk` chains: the e-graph finds the weights-first form (one runtime GEMM); the post-grad FX capture **proves Inductor can't reach it**. Measured 8.93× vs Inductor at (k,d,B·T)=(8,512,4096), 16.12× at k=16. |
-| `search_efficiency` | The e-graph encodes an exponential (Catalan) program space in O(k³) live e-nodes. Honest about the limits: exact saturation fragments past k≈11; production uses `rule_budgets`/`canonicalize`. |
-| `real_linear_attn` | RetNet/GLA/delta-rule blocks: the affine-monoid scan lift fires and verifies fp64-exact. Measured retnet T=128 ≈ 2.9× vs eager; honest negatives where Inductor's fused pointwise kernel wins on CPU. |
-| `real_win_hunt` | Autotuned wins on realistic block topologies (~1.1–10× vs Inductor). |
-| `decode_scan_bench` | Carrier + CUDA-graph decode: chunked scan carriers amortize to zero launches (1.65–3.4× vs Inductor / best non-carrier). Needs CUDA for the graph leg. |
-| `decode_bench` | The launch-bound hypothesis is **falsified**: launch-bound cells (B=1, T≤64) lose 4–15%; large cells land at parity. Losses included. |
-| `model_bench` / `e2e_model` / `e2e_llm` / `e2e_models2` | Whole-model E2E: llama-toy, ~0.4B prefill+decode, non-decoder shapes; ~1.05× over plain Inductor, pairing fires per block, verified fp64-exact. |
-| `cost_fidelity` | Predicted-cost vs measured-latency rank correlation (ρ); term-level cost tracks the backend. |
-| `killer_demo` | `Autotuned` per-model lowering selection (eager/generic/batched/compiled), verified. |
-| `law_bench` | Per-rewrite-law value harness: fired / rhs-member / picked / verified / cost & ms before→after. |
-| `morphism_e2e` | Term-flops → wall-time conversion for the morphism laws (12.4–12.5× measured wall on 4-block chains). |
-| `bounded_e2e` | `error_budget` sweep on a real checkpoint. Measured: bounded rewrites buy **nothing** on stories15M (0 accepted at every budget) — the honest negative. |
-| `structured_models` | Structured-model families (LoRA / pruned / low-rank): bounded rewrites where structure exists. |
-| `vllm_compare` | catopt vs vLLM and through it: HF export verified (~1.6e-5 max|Δ|), vLLM serves the exported dir token-for-token. Needs CUDA. |
-| `structure_census` | How much catopt-exploitable structure real trained weights carry (ad-hoc). |
-| `bound_amplification` | Weight-bound → output-error propagation on real activations (ad-hoc). |
-| `stories15m_bench` | Real llama2.c checkpoints through `strategy=Compositional()` — parity at these sizes (ad-hoc). |
-| `bench_e2e` / `bench_omd2` | Quick whole-model smoke / omd executor on an attention stack (ad-hoc research). |
+| laws | `law_bench`, `laws_effect` |
+| egraph | `search_efficiency`, `reassoc_scale` |
+| cost | `cost_fidelity` |
+| pairing | `reassoc_scale`, `real_win_hunt`, `killer_demo`, `model_bench`, `e2e_model`, `e2e_models2`, `e2e_llm`, `stories15m_bench`, `bench_e2e` |
+| autotune | `real_win_hunt`, `killer_demo`, `model_bench` |
+| morphism | `morphism_coverage`, `morphism_e2e` |
+| scan | `real_linear_attn` |
+| carriers | `real_linear_attn`, `decode_scan_bench`, `bench_omd2` |
+| decode | `decode_scan_bench`, `decode_bench` |
+| cuda-graph | `decode_scan_bench` |
+| omd | `bench_omd2` |
+| bounded | `bound_amplification`, `bounded_e2e`, `structured_models` |
+| weights | `structure_census`, `bound_amplification` |
+| checkpoint | `morphism_coverage`, `stories15m_bench`, `bounded_e2e`, `vllm_compare` |
+| serving | `vllm_compare` |
+<!-- END GENERATED CATALOG -->

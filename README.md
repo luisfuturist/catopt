@@ -153,24 +153,20 @@ regression / negative) with the supporting metric, so every surface —
 JSON, Markdown, the HTML dashboard, a Quarto document, Slidev assets —
 is rendered from one canonical report.  See `bench/README.md`.
 
-| Suite | Category | Measures |
-|---|---|---|
-| `reassoc_scale` | algebra | k-deep weight chain → 1 GEMM; dumps Inductor's post-grad graph to prove the form unreachable |
-| `search_efficiency` | core | saturation cost vs the Catalan-sized program space |
-| `real_win_hunt` | algebra | autotuned wins on realistic block topologies |
-| `real_linear_attn` | algebra | scan lift on RetNet/GLA/delta-rule blocks, CPU+CUDA |
-| `decode_scan_bench` | algebra | chunked decode on carriers, eager vs CUDA-graphed |
-| `decode_bench` | models | launch-bound (B,T) sweep — the falsified hypothesis, losses included |
-| `stories15m_bench` | models | real llama2.c checkpoints through `strategy=Compositional()` |
-| `e2e_model`, `e2e_llm`, `e2e_models2` | models | whole-model E2E: llama-toy, ~0.4B prefill+decode, non-decoder shapes |
-| `model_bench` | models | complete multi-block models: latency, peak memory, compile time |
-| `cost_fidelity` | core | predicted-cost vs measured-latency rank correlation |
-| `killer_demo` | algebra | `Autotuned` per-model lowering selection |
-| `law_bench` | core | per-rewrite-law value harness |
-| `morphism_e2e` | algebra | term-flops → wall-time conversion for the morphism laws |
-| `bounded_e2e` | models | `error_budget` sweep on a real checkpoint (speedup vs bound vs KL/top-k drift) |
-| `structure_census` | core | how much catopt-exploitable structure real trained weights carry |
-| `bound_amplification` | core | weight-bound → output-error propagation on real activations |
+Suites are organized by **intent** — the question each answers;
+`bench/registry.py` is the source of truth and `bench/README.md`
+carries the generated catalog with expected verdicts.
+
+| intent | suites |
+|---|---|
+| correctness | `law_bench`, `laws_effect`, `morphism_coverage` |
+| search | `search_efficiency` |
+| cost | `cost_fidelity` |
+| structure | `structure_census`, `bound_amplification` |
+| speedup | `reassoc_scale`, `real_win_hunt`, `real_linear_attn`, `morphism_e2e`, `decode_scan_bench`, `decode_bench`, `killer_demo`, `bench_omd2` |
+| e2e | `model_bench`, `e2e_model`, `e2e_models2`, `e2e_llm`, `stories15m_bench`, `bench_e2e` |
+| bounded | `bounded_e2e`, `structured_models` |
+| integration | `vllm_compare` |
 
 ## API surface
 

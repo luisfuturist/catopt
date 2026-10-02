@@ -64,7 +64,7 @@ from bench.benchkit import (
     Verdict,
     collect_env,
 )
-from bench.suites.algebra.real_linear_attn import (
+from bench.suites.speedup.real_linear_attn import (
     LinearAttnStack,
     try_compile,
 )
