@@ -65,7 +65,7 @@ from catopt_core.ir import (
     Param,
     TensorType,
     Var,
-    op_repr,
+    op_repr_dag,
 )
 from catopt_core.laws.pairing import _exact_equal, _is_tensor
 from catopt_core.ports import CostFn, Sink
@@ -1384,8 +1384,8 @@ def _reify_family(
     )
     best = eg.extract_best(eid, cost_fn)
     info: dict[str, Any] = {
-        "joint": op_repr(joint),
-        "reified": op_repr(best),
+        "joint": op_repr_dag(joint),
+        "reified": op_repr_dag(best),
         "latent_rank": r,
         "d_in": d_in,
         "n_kv_sites": len(sites),

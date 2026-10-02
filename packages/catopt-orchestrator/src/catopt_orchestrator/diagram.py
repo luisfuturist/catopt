@@ -73,7 +73,7 @@ from dataclasses import replace as _dc_replace
 from typing import Any, Protocol, runtime_checkable
 
 from catopt_core.cost import dag_cost, launch_aware_cost
-from catopt_core.ir import Op, Param, TensorType, op_repr
+from catopt_core.ir import Op, Param, TensorType, op_repr_dag
 from catopt_core.laws.pairing import (
     _exact_equal,
     _is_tensor,
@@ -687,7 +687,7 @@ def _reify_merge(
         symmetry_budget=symmetry_budget,
     )
     groups = pair_shared_input_linears(eg) + pair_shared_input_convs(eg)
-    info: dict[str, Any] = {"joint": op_repr(joint)}
+    info: dict[str, Any] = {"joint": op_repr_dag(joint)}
     if not groups:
         return {
             "status": "declined",
@@ -728,7 +728,7 @@ def _reify_merge(
     else:
         info["paired_extract"] = False
         info["paired_delta"] = fc - base
-    info["reified"] = op_repr(best)
+    info["reified"] = op_repr_dag(best)
     return K._family_gate(
         match,
         prep["recs"],

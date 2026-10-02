@@ -53,7 +53,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from catopt_core.ir import Op, Param, op_repr
+from catopt_core.ir import Op, Param, op_repr_dag
 from catopt_core.laws.pairing import _exact_equal, _is_tensor
 from catopt_core.ports import CostFn, Sink
 from catopt_core.typing import has_var_leaf
@@ -370,8 +370,8 @@ def _reify_cse(
     )
     best = eg.extract_best(eid, cost_fn)
     info: dict[str, Any] = {
-        "joint": op_repr(joint),
-        "reified": op_repr(best),
+        "joint": op_repr_dag(joint),
+        "reified": op_repr_dag(best),
         "shared_sites": sum(len(m) for m in shares.values()),
         "shared_ops": sorted(
             {p.op for m in shares.values() for p in m.values()}
