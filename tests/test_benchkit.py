@@ -74,6 +74,36 @@ def test_report_json_roundtrip(tmp_path: Path) -> None:
     assert payload["cells"][0]["median_s"]["catopt"] == 2e-4
 
 
+def test_baseline_projection_drops_the_live_spread(
+    tmp_path: Path,
+) -> None:
+    """A pinned baseline keeps the gated median, not the live spread.
+
+    ``compare`` / ``gate`` read ``median_s`` only, and the timing
+    contract (``catopt_core.timing``) can move the IQR under a frozen
+    baseline — so a baseline records exactly what it gates on.  The
+    spread stays in every live report.
+    """
+    report = _report()
+    full = report.to_dict()
+    assert "iqr_s" in full["cells"][0]
+
+    base = report.to_baseline_dict()
+    assert "iqr_s" not in base["cells"][0]
+    assert base["units"] == {"median_s": "seconds"}
+    # every gated value survives the projection untouched
+    assert base["cells"][0]["median_s"] == full["cells"][0]["median_s"]
+
+    path = tmp_path / "toy.json"
+    report.to_baseline(path)
+    payload = json.loads(path.read_text())
+    assert "iqr_s" not in payload["cells"][0]
+    # the projection round-trips: the absent spread defaults to empty
+    back = Report.from_json(path)
+    assert back.cells[0].iqr == {}
+    assert back.cells[0].medians == full["cells"][0]["median_s"]
+
+
 def test_markdown_is_readable(tmp_path: Path) -> None:
     path = tmp_path / "toy.md"
     _report().to_markdown(path, speedup_vs="eager")

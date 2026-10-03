@@ -38,7 +38,7 @@ def _columns_and_rows(
         row += [str(cell.case.params.get(k, "—")) for k in keys]
         for n in names:
             row.append(
-                fmt_pm(cell.medians[n], cell.iqr.get(n, 0.0))
+                fmt_pm(cell.medians[n], cell.iqr.get(n))
                 if n in cell.medians
                 else "—"
             )

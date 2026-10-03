@@ -27,8 +27,7 @@
   },
   "provenance": {},
   "units": {
-    "median_s": "seconds",
-    "iqr_s": "seconds"
+    "median_s": "seconds"
   },
   "findings": [
     {
@@ -93,13 +92,6 @@
         "manual_ref": 0.02605876800043916,
         "catopt": 0.027360934000171255,
         "catopt_inductor": 0.047623766999095096
-      },
-      "iqr_s": {
-        "eager": 0.0032811272508297407,
-        "inductor": 0.015524929999628512,
-        "manual_ref": 0.0008913582505556406,
-        "catopt": 0.002132163999704062,
-        "catopt_inductor": 0.013191874000767712
       },
       "aux": {
         "verify": {
@@ -178,13 +170,6 @@
         "catopt": 0.11783874799948535,
         "catopt_inductor": 0.14776142000027903
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.0,
-        "catopt": 0.003537229000357911,
-        "catopt_inductor": 0.01683279900043999
-      },
       "aux": {
         "verify": {
           "max_abs": 3.337860107421875e-06,
@@ -262,13 +247,6 @@
         "catopt": 0.4605855520003388,
         "catopt_inductor": 1.111239943998953
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.0,
-        "catopt": 0.0,
-        "catopt_inductor": 0.0
-      },
       "aux": {
         "verify": {
           "max_abs": 3.5762786865234375e-06,
@@ -345,13 +323,6 @@
         "manual_ref": 0.06431469349899999,
         "catopt": 0.06753061200106458,
         "catopt_inductor": 0.02946838700063381
-      },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.0009528669993414951,
-        "catopt": 0.000252172500040615,
-        "catopt_inductor": 0.009629226250581269
       },
       "aux": {
         "verify": {
@@ -432,13 +403,6 @@
         "catopt": 0.19576119649991597,
         "catopt_inductor": 0.12956394400043791
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.019375028000467864,
-        "catopt": 0.010078199499730545,
-        "catopt_inductor": 0.001607908000551106
-      },
       "aux": {
         "verify": {
           "max_abs": 4.291534423828125e-06,
@@ -518,13 +482,6 @@
         "catopt": 0.555329487000563,
         "catopt_inductor": 0.5202333110009931
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.0,
-        "catopt": 0.0,
-        "catopt_inductor": 0.0
-      },
       "aux": {
         "verify": {
           "max_abs": 4.291534423828125e-06,
@@ -603,13 +560,6 @@
         "manual_ref": 0.06539460600015445,
         "catopt": 0.06295322450023377,
         "catopt_inductor": 0.0700151699984417
-      },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.005775195249043463,
-        "catopt": 0.0026933717504107335,
-        "catopt_inductor": 0.0002065210001092055
       },
       "aux": {
         "verify": {
@@ -695,13 +645,6 @@
         "catopt": 0.28249205199972494,
         "catopt_inductor": 0.29027629000120214
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.006185995500345598,
-        "catopt": 0.0,
-        "catopt_inductor": 0.0
-      },
       "aux": {
         "verify": {
           "max_abs": 5.4836273193359375e-06,
@@ -786,13 +729,6 @@
         "catopt": 0.45551795800020045,
         "catopt_inductor": 0.48861760399995546
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.0,
-        "catopt": 0.0,
-        "catopt_inductor": 0.0
-      },
       "aux": {
         "verify": {
           "max_abs": 5.7220458984375e-06,
@@ -876,13 +812,6 @@
         "manual_ref": 0.02586596099899907,
         "catopt": 0.02567193600043538,
         "catopt_inductor": 0.02665080799943098
-      },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.002656692499840574,
-        "catopt": 0.01139638449967606,
-        "catopt_inductor": 0.0003146567501062236
       },
       "aux": {
         "verify": {
@@ -976,13 +905,6 @@
         "catopt": 0.11659227249947435,
         "catopt_inductor": 0.11653913150075823
       },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.000316125499921327,
-        "catopt": 0.0001937534998432966,
-        "catopt_inductor": 0.0005363684995245421
-      },
       "aux": {
         "verify": {
           "max_abs": 7.510185241699219e-06,
@@ -1074,13 +996,6 @@
         "manual_ref": 0.45755446499970276,
         "catopt": 0.45820284799992805,
         "catopt_inductor": 0.43333883800005424
-      },
-      "iqr_s": {
-        "eager": 0.0,
-        "inductor": 0.0,
-        "manual_ref": 0.0,
-        "catopt": 0.0,
-        "catopt_inductor": 0.0
       },
       "aux": {
         "verify": {

@@ -78,6 +78,37 @@ class Report:
             json.dumps(self.to_dict(), indent=2, default=str) + "\n"
         )
 
+    def to_baseline_dict(self) -> dict:
+        """The baseline projection — the payload minus the live spread.
+
+        A pinned baseline is a *regression reference*: ``compare`` /
+        ``gate`` read ``median_s`` only, so the recorded spread
+        (``iqr_s``) buys the reference nothing.  It is also the one
+        field the timing contract can move under a frozen baseline —
+        :mod:`catopt_core.timing` defines the IQR as
+        :func:`statistics.quantiles` (exclusive), while the oldest
+        baselines were recorded under torch's inclusive quantiles, so
+        their stored ``iqr_s`` no longer matches what the harness
+        reports.  Re-pinning would fix the spread but move the medians
+        too (a real re-baseline); instead a baseline records only the
+        quantity it gates on.  The spread stays in every *live* report
+        (:meth:`to_dict`), where the renderers show ``median ± IQR``.
+        """
+        payload = self.to_dict()
+        payload["units"] = {"median_s": "seconds"}
+        for cell in payload["cells"]:
+            cell.pop("iqr_s", None)
+        return payload
+
+    def to_baseline(self, path: str | Path) -> None:
+        """Write the baseline projection (see ``to_baseline_dict``)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.to_baseline_dict(), indent=2, default=str)
+            + "\n"
+        )
+
     def to_dataframe(self):
         """Flatten cells to a ``polars.DataFrame``."""
         return to_dataframe(self.cells)
@@ -117,7 +148,7 @@ class Report:
                 Cell(
                     case,
                     rec["median_s"],
-                    rec["iqr_s"],
+                    rec.get("iqr_s", {}),
                     rec.get("aux", {}),
                 )
             )

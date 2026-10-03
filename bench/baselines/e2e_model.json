@@ -29,8 +29,7 @@
     "quick": false
   },
   "units": {
-    "median_s": "seconds",
-    "iqr_s": "seconds"
+    "median_s": "seconds"
   },
   "findings": [
     {
@@ -97,14 +96,6 @@
         "catopt+inductor": 0.018365955000263057,
         "catopt_full": 0.021603875499749847,
         "catopt_full+ind": 0.0183679839992692
-      },
-      "iqr_s": {
-        "eager": 0.003281607250301022,
-        "inductor": 0.0001880844993138453,
-        "catopt": 0.004720466000435408,
-        "catopt+inductor": 0.00024434400074824225,
-        "catopt_full": 0.00010864900059459615,
-        "catopt_full+ind": 0.0001765870010785875
       },
       "aux": {
         "name": "tiny_llama@4x64",
@@ -316,14 +307,6 @@
         "catopt_full": 0.04491628299911099,
         "catopt_full+ind": 0.0394229470002756
       },
-      "iqr_s": {
-        "eager": 0.0005220279999775812,
-        "inductor": 0.00019997199888166506,
-        "catopt": 0.0004189549999864539,
-        "catopt+inductor": 0.0003738769992196467,
-        "catopt_full": 0.0010720399986894336,
-        "catopt_full+ind": 0.00033557349979673745
-      },
       "aux": {
         "name": "tiny_llama@4x128",
         "params": {
@@ -533,14 +516,6 @@
         "catopt+inductor": 0.09162115099934454,
         "catopt_full": 0.12272290750115644,
         "catopt_full+ind": 0.0962698180010193
-      },
-      "iqr_s": {
-        "eager": 0.0005121459998917999,
-        "inductor": 0.0011969799998041708,
-        "catopt": 0.0005225204995440436,
-        "catopt+inductor": 0.0006211415002326248,
-        "catopt_full": 0.00035695750011655036,
-        "catopt_full+ind": 0.0004989709996152669
       },
       "aux": {
         "name": "tiny_llama@4x256",
@@ -752,14 +727,6 @@
         "catopt_full": 0.12288333200012858,
         "catopt_full+ind": 0.09513200600122218
       },
-      "iqr_s": {
-        "eager": 0.0003765934998227749,
-        "inductor": 0.00037227649954729713,
-        "catopt": 0.0006063535001885612,
-        "catopt+inductor": 0.00044047450046491576,
-        "catopt_full": 0.00032680500044079963,
-        "catopt_full+ind": 0.0028118615000494174
-      },
       "aux": {
         "name": "tiny_llama@8x128",
         "params": {
@@ -970,14 +937,6 @@
         "catopt+inductor": 0.007120334001228912,
         "catopt_full": 0.007360323999819229,
         "catopt_full+ind": 0.006894975499562861
-      },
-      "iqr_s": {
-        "eager": 0.00015338349840021692,
-        "inductor": 0.00016772575145296287,
-        "catopt": 0.00036592974993254757,
-        "catopt+inductor": 0.0001968199994735187,
-        "catopt_full": 0.00041259800127591006,
-        "catopt_full+ind": 0.00012140799981352757
       },
       "aux": {
         "name": "conv_attn@4x16",

@@ -29,8 +29,7 @@
     "quick": false
   },
   "units": {
-    "median_s": "seconds",
-    "iqr_s": "seconds"
+    "median_s": "seconds"
   },
   "findings": [
     {
@@ -102,12 +101,6 @@
         "inductor": 3.263299913669471e-05,
         "morphism": 7.998251000572056e-06,
         "morphism+inductor": 2.3296999643207528e-05
-      },
-      "iqr_s": {
-        "eager": 3.061847500248406e-06,
-        "inductor": 1.2185999366920441e-05,
-        "morphism": 1.98592625110905e-06,
-        "morphism+inductor": 1.8970004020957276e-06
       },
       "aux": {
         "name": "chain_x2@8x16",
@@ -185,12 +178,6 @@
         "morphism": 0.0005001485000320826,
         "morphism+inductor": 0.0002308805005668546
       },
-      "iqr_s": {
-        "eager": 0.0011233756500132579,
-        "inductor": 0.003183069749866263,
-        "morphism": 8.065454994721233e-05,
-        "morphism+inductor": 4.572001671476755e-06
-      },
       "aux": {
         "name": "chain_x2@1024x64",
         "params": {
@@ -267,12 +254,6 @@
         "morphism": 0.002665624000655953,
         "morphism+inductor": 0.0027006890004486195
       },
-      "iqr_s": {
-        "eager": 0.00035720849973586155,
-        "inductor": 0.0003747087516785541,
-        "morphism": 6.242599920369685e-05,
-        "morphism+inductor": 6.800074925195077e-05
-      },
       "aux": {
         "name": "chain_x2@4096x128",
         "params": {
@@ -348,12 +329,6 @@
         "inductor": 4.828899909625761e-05,
         "morphism": 1.065851100065629e-05,
         "morphism+inductor": 2.61329996646964e-05
-      },
-      "iqr_s": {
-        "eager": 9.408999903826013e-07,
-        "inductor": 1.880000127130188e-06,
-        "morphism": 3.052515012313971e-07,
-        "morphism+inductor": 1.1219985935895238e-06
       },
       "aux": {
         "name": "chain_x4@8x16",
@@ -443,12 +418,6 @@
         "morphism": 0.00018764828000712442,
         "morphism+inductor": 0.00021665299937012605
       },
-      "iqr_s": {
-        "eager": 7.409040008496967e-05,
-        "inductor": 6.175399903440848e-05,
-        "morphism": 1.1567349974938982e-06,
-        "morphism+inductor": 5.7969991758000106e-06
-      },
       "aux": {
         "name": "chain_x4@1024x64",
         "params": {
@@ -536,12 +505,6 @@
         "inductor": 0.035265617999357346,
         "morphism": 0.0028015821999360924,
         "morphism+inductor": 0.0027510609997989377
-      },
-      "iqr_s": {
-        "eager": 0.0010779289987112861,
-        "inductor": 0.00015344224993896205,
-        "morphism": 1.6559525147385838e-05,
-        "morphism+inductor": 5.935600165685173e-05
       },
       "aux": {
         "name": "chain_x4@4096x128",
@@ -631,12 +594,6 @@
         "morphism": 0.00011195102500096255,
         "morphism+inductor": 3.742600165423937e-05
       },
-      "iqr_s": {
-        "eager": 3.438556499986589e-05,
-        "inductor": 6.467999810411129e-06,
-        "morphism": 3.111052501481032e-06,
-        "morphism+inductor": 2.2045005607651547e-06
-      },
       "aux": {
         "name": "resid_x3@8x16",
         "params": {
@@ -712,12 +669,6 @@
         "inductor": 0.002100704999975278,
         "morphism": 0.0009655034999013878,
         "morphism+inductor": 0.0007585269995615818
-      },
-      "iqr_s": {
-        "eager": 1.5565600142508542e-05,
-        "inductor": 0.00010136400123883504,
-        "morphism": 1.4314200052467619e-05,
-        "morphism+inductor": 1.556999995955266e-05
       },
       "aux": {
         "name": "resid_x3@1024x64",
@@ -795,12 +746,6 @@
         "morphism": 0.014746376499715552,
         "morphism+inductor": 0.011148749500534905
       },
-      "iqr_s": {
-        "eager": 0.000267223999799171,
-        "inductor": 0.0005018470010327292,
-        "morphism": 0.0005645465012094064,
-        "morphism+inductor": 0.0007953697504490265
-      },
       "aux": {
         "name": "resid_x3@4096x128",
         "params": {
@@ -876,12 +821,6 @@
         "inductor": 0.00017528100033814553,
         "morphism": 0.00015376843999547417,
         "morphism+inductor": 4.229700061841868e-05
-      },
-      "iqr_s": {
-        "eager": 3.827784985332977e-06,
-        "inductor": 4.11999826610554e-06,
-        "morphism": 1.5305650003938224e-06,
-        "morphism+inductor": 2.9142506718926597e-06
       },
       "aux": {
         "name": "resid_x4@8x16",
@@ -959,12 +898,6 @@
         "morphism": 0.0013021448000472447,
         "morphism+inductor": 0.0009350635009468533
       },
-      "iqr_s": {
-        "eager": 0.00019527050062606577,
-        "inductor": 0.004000649001682177,
-        "morphism": 2.4266350010293536e-05,
-        "morphism+inductor": 5.281524954625638e-05
-      },
       "aux": {
         "name": "resid_x4@1024x64",
         "params": {
@@ -1041,12 +974,6 @@
         "morphism": 0.02016075249957794,
         "morphism+inductor": 0.014497685000605998
       },
-      "iqr_s": {
-        "eager": 0.0024081000010482967,
-        "inductor": 0.05761554500168131,
-        "morphism": 0.005184537499644648,
-        "morphism+inductor": 0.0008491620001223055
-      },
       "aux": {
         "name": "resid_x4@4096x128",
         "params": {
@@ -1122,12 +1049,6 @@
         "inductor": 6.822599971201271e-05,
         "morphism": 7.381332001386909e-05,
         "morphism+inductor": 8.415699994657189e-05
-      },
-      "iqr_s": {
-        "eager": 1.882494989331458e-06,
-        "inductor": 2.769249476841651e-06,
-        "morphism": 1.952440015884349e-06,
-        "morphism+inductor": 2.8127487894380465e-06
       },
       "aux": {
         "name": "kv_x2@8x16",
@@ -1223,12 +1144,6 @@
         "inductor": 0.0029456199990818277,
         "morphism": 0.0029406719986582175,
         "morphism+inductor": 0.002938196499599144
-      },
-      "iqr_s": {
-        "eager": 0.0002048863499112489,
-        "inductor": 9.14370011741994e-05,
-        "morphism": 9.425150074093835e-05,
-        "morphism+inductor": 0.00015939125114527997
       },
       "aux": {
         "name": "kv_x2@512x64",

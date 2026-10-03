@@ -27,8 +27,7 @@
   },
   "provenance": {},
   "units": {
-    "median_s": "seconds",
-    "iqr_s": "seconds"
+    "median_s": "seconds"
   },
   "findings": [
     {
@@ -83,11 +82,6 @@
         "inductor": 2.1599000319838524e-05,
         "catopt_best": 3.586057000575238e-05
       },
-      "iqr_s": {
-        "eager": 9.037883749897446e-05,
-        "inductor": 1.1337483556417283e-06,
-        "catopt_best": 2.661020007508339e-06
-      },
       "aux": {
         "pick": "eager",
         "verified": true,
@@ -123,11 +117,6 @@
         "eager": 4.356839498541376e-05,
         "inductor": 6.233549902390223e-05,
         "catopt_best": 4.142211999351275e-05
-      },
-      "iqr_s": {
-        "eager": 7.403385500310833e-05,
-        "inductor": 0.0001035554992085963,
-        "catopt_best": 5.773700013378413e-07
       },
       "aux": {
         "pick": "generic",
@@ -165,11 +154,6 @@
         "inductor": 3.332899905217346e-05,
         "catopt_best": 5.862829000761849e-06
       },
-      "iqr_s": {
-        "eager": 2.39783000779427e-07,
-        "inductor": 1.9385006453376263e-06,
-        "catopt_best": 1.8559949967311713e-07
-      },
       "aux": {
         "pick": "batched",
         "verified": true,
@@ -205,11 +189,6 @@
         "eager": 0.0004153083000346669,
         "inductor": 7.13775007170625e-05,
         "catopt_best": 0.0004083965499376063
-      },
-      "iqr_s": {
-        "eager": 1.5257299946824776e-05,
-        "inductor": 0.00011047399948438397,
-        "catopt_best": 0.000317933600035758
       },
       "aux": {
         "pick": "eager",

@@ -14,8 +14,15 @@ def fmt_ms(seconds: float) -> str:
     return f"{seconds * 1e3:.4g}"
 
 
-def fmt_pm(median: float, iqr: float) -> str:
-    """``median ± IQR`` in milliseconds."""
+def fmt_pm(median: float, iqr: float | None = None) -> str:
+    """``median ± IQR`` in milliseconds.
+
+    With no recorded spread (``iqr is None`` — e.g. a pinned baseline,
+    which carries no ``iqr_s``) this is just the median: an unknown
+    spread is left blank, never rendered as a false ``± 0``.
+    """
+    if iqr is None:
+        return fmt_ms(median)
     return f"{fmt_ms(median)} ± {fmt_ms(iqr)}"
 
 

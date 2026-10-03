@@ -51,9 +51,15 @@ def latest(report_suite: str, path: str | Path = DEFAULT_LEDGER):
 
 
 def write_baseline(report: Report, outdir: str | Path) -> Path:
-    """Pin a report as the golden baseline for its suite."""
+    """Pin a report as the golden baseline for its suite.
+
+    Writes the *baseline projection* (``Report.to_baseline``) — the
+    canonical payload minus the live-only spread — so a pinned
+    reference carries exactly the quantity ``compare`` / ``gate``
+    reads and nothing the timing contract can later invalidate.
+    """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     path = outdir / f"{report.suite}.json"
-    report.to_json(path)
+    report.to_baseline(path)
     return path

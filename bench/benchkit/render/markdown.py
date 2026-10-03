@@ -67,9 +67,7 @@ def _timing_table(report: Report) -> list[str]:
         row += [str(cell.case.params.get(k, "—")) for k in keys]
         for n in names:
             if n in cell.medians:
-                row.append(
-                    fmt_pm(cell.medians[n], cell.iqr.get(n, 0.0))
-                )
+                row.append(fmt_pm(cell.medians[n], cell.iqr.get(n)))
             else:
                 row.append("—")
         lines.append("| " + " | ".join(row) + " |")

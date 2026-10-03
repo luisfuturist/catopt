@@ -3,6 +3,7 @@
     python -m bench list
     python -m bench catalog --check
     python -m bench run reassoc_scale --device cpu --quick
+    python -m bench run reassoc_scale --device cpu --pin
     python -m bench run-all --quick
     python -m bench report bench/results/reassoc_scale.json
     python -m bench compare reassoc_scale --baseline bench/baselines
@@ -79,6 +80,8 @@ class RunConfig:
     html: bool = True
     slidev: bool = False
     ledger: bool = True
+    pin: bool = False
+    baselines: Path = Path("bench/baselines")
 
 
 @dataclass
@@ -325,6 +328,12 @@ def cmd_catalog(cfg: CatalogConfig) -> int:
 
 def cmd_run(cfg: RunConfig) -> int:
     """Run one suite."""
+    if cfg.pin and cfg.quick:
+        _console().print(
+            "[red]refusing to pin a --quick run[/red] — a golden "
+            "baseline must be canonical"
+        )
+        return 1
     try:
         report = _run_one(
             cfg.suite,
@@ -340,6 +349,10 @@ def cmd_run(cfg: RunConfig) -> int:
         return 1
     _findings_summary(report)
     written = _emit(report, cfg)
+    if cfg.pin:
+        written.append(
+            str(_ledger.write_baseline(report, cfg.baselines))
+        )
     for p in written:
         _console().print(f"  [dim]→[/dim] {p}")
     return 0
