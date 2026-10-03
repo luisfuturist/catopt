@@ -33,6 +33,17 @@ from catopt_core.ir import Op
 logger = logging.getLogger("catopt_core.egraph.core")
 
 
+def _policy_name(policy: Any) -> str | None:
+    """Name the schedule policy for ``stats`` — ``None`` when unset.
+
+    An unset policy reports ``None`` rather than being absent, so the
+    stats dict has one stable shape.
+    """
+    if policy is None:
+        return None
+    return str(getattr(policy, "name", type(policy).__name__))
+
+
 class EGraph(_ExtractMixin, _ProofMixin):
     """The equality-saturation data structure.
 
@@ -1454,6 +1465,41 @@ class EGraph(_ExtractMixin, _ProofMixin):
 
     # -- saturation --
 
+    def _scheduled(
+        self,
+        ordered: list[Rewrite],
+        policy: Any,
+        root_eid: int,
+        iteration: int,
+    ) -> list[Rewrite]:
+        """Order one iteration's rules — the policy decides when given.
+
+        A policy may only *reorder*: every rule is still returned, so
+        the fixed point is unchanged (ADR 0003 invariant 5).  An action
+        outside the offered set leaves the remainder in declared order,
+        so no rule is ever dropped.
+        """
+        if policy is None:
+            return ordered
+        from catopt_core.game import Action, GameState
+
+        state = GameState(self, root_eid, iteration)
+        remaining = list(ordered)
+        out: list[Rewrite] = []
+        while remaining:
+            offered = [Action(r.name, root_eid) for r in remaining]
+            pick = policy.choose(state, offered)
+            name = getattr(pick, "rule", pick)
+            idx = next(
+                (i for i, r in enumerate(remaining) if r.name == name),
+                None,
+            )
+            if idx is None:
+                out.extend(remaining)
+                break
+            out.append(remaining.pop(idx))
+        return out
+
     def run(
         self,
         rules: Iterable[Rewrite],
@@ -1464,6 +1510,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         stop: str = "fixed_point",
         patience: int = 3,
         cost_fn: Any = None,
+        policy: Any = None,
     ) -> dict[str, Any]:
         """Run equality saturation until a fixed point.
 
@@ -1510,6 +1557,15 @@ class EGraph(_ExtractMixin, _ProofMixin):
         ``"max_nodes"`` / ``"max_iterations"``) and, under
         ``"improving"``, ``stats["improved"]`` counts the iterations
         that lowered the extracted cost.
+
+        ``policy`` (optional) is a
+        :class:`~catopt_core.ports.Policy` the schedule consults once
+        per iteration.  It may only *reorder* the rules: every rule
+        still runs, so the fixed point — and therefore the
+        certificate — is unchanged (ADR 0003 invariant 5).  A policy
+        that returns something outside the offered set has the
+        remainder left in declared order, so no rule is ever dropped.
+        The chosen ordering is recorded in ``stats["policy"]``.
         """
         if stop not in ("fixed_point", "improving"):
             raise ValueError(
@@ -1541,7 +1597,9 @@ class EGraph(_ExtractMixin, _ProofMixin):
             # fixed point is unchanged, the schedule is tighter.
             search = sorted({self.find(e) for e in self._dirty})
             self._dirty.clear()
-            for rule in ordered:
+            for rule in self._scheduled(
+                ordered, policy, root_eid, iteration
+            ):
                 budget = budgets.get(rule.name)
                 if budget is not None:
                     remaining = budget - spent[rule.name]
@@ -1634,6 +1692,7 @@ class EGraph(_ExtractMixin, _ProofMixin):
         }
         if stop == "improving":
             stats["improved"] = improved
+        stats["policy"] = _policy_name(policy)
         return stats
 
     # -- extraction --

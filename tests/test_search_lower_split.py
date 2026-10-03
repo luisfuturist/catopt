@@ -23,8 +23,17 @@ from catopt_core.ports import Capabilities, Sink, Strategy
 from catopt_orchestrator.optimize import Autotuned
 
 
-from catopt_orchestrator import Compositional, LatencyCriterion, MemoryCriterion, Monolithic, OptimizationResourceError, Optimizer, discover_alternatives, lower, search
-
+from catopt_orchestrator import (
+    Compositional,
+    LatencyCriterion,
+    MemoryCriterion,
+    Monolithic,
+    OptimizationResourceError,
+    Optimizer,
+    discover_alternatives,
+    lower,
+    search,
+)
 
 
 from catopt_orchestrator.runners import ChainedRunner
@@ -71,6 +80,26 @@ def _make():
     return _MLP().eval(), torch.randn(2, 8)
 
 
+def test_search_accepts_a_policy_and_records_it():
+    """A policy reorders the schedule; the reach is unchanged."""
+    from catopt_core.policies import GreedyPolicy
+
+    m, x = _make()
+    plain = search(m, x, source=TorchSource(), max_iterations=3)
+    policed = search(
+        m,
+        x,
+        source=TorchSource(),
+        max_iterations=3,
+        policy=GreedyPolicy(),
+    )
+    assert plain.stats["policy"] is None
+    assert policed.stats["policy"] == "greedy"
+    # every rule still ran, so the closure is the same size
+    assert plain.stats["n_enodes"] == policed.stats["n_enodes"]
+    assert plain.stats["n_classes"] == policed.stats["n_classes"]
+
+
 def _opt() -> Optimizer:
     return Optimizer(source=TorchSource(), sink=TorchSink())
 
@@ -86,6 +115,7 @@ def test_capabilities_sink_strategy_conformance():
     assert isinstance(sink, Sink)
     assert isinstance(NumpySink(), Capabilities)
     assert isinstance(NumpySink(), Sink)
+
     # Capabilities alone is not a Sink — lower/verify are absent.
     class OnlyCaps:
         @property
@@ -111,7 +141,10 @@ def test_capabilities_sink_strategy_conformance():
 def test_search_returns_search_result():
     m, x = _make()
     res = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
         max_iterations=3,
     )
     assert isinstance(res, SearchResult)
@@ -142,13 +175,21 @@ def test_specialize_causal_opt_out():
     m = EagerAttention(dim=64, n_heads=2, block_size=16).eval()
     x = torch.randn(1, 8, 64)
     on = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
-        rules=CATEGORICAL, max_iterations=4,
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
+        rules=CATEGORICAL,
+        max_iterations=4,
     )
     assert on.stats.get("causal_specialized") is True
     off = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
-        rules=CATEGORICAL, max_iterations=4,
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
+        rules=CATEGORICAL,
+        max_iterations=4,
         specialize_causal=False,
     )
     assert "causal_specialized" not in off.stats
@@ -168,7 +209,10 @@ def test_search_requires_source():
 def test_search_result_alternatives_and_certificate():
     m, x = _make()
     res = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
         max_iterations=3,
     )
     alts = res.alternatives(top_k=4)
@@ -216,7 +260,10 @@ def test_search_result_flops_fallback():
 def test_lower_returns_lower_result_and_unpacks():
     m, x = _make()
     res = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
         max_iterations=3,
     )
     lr = lower(res, x, sink=TorchSink())
@@ -236,7 +283,10 @@ def test_lower_returns_lower_result_and_unpacks():
 def test_lower_verify_off_and_silent():
     m, x = _make()
     res = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
         max_iterations=3,
     )
     lr = lower(res, x, sink=TorchSink(), verify=False)
@@ -275,7 +325,10 @@ def test_lower_verifies_hand_built_result():
 def test_lower_runner_applied_and_recorded():
     m, x = _make()
     res = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
         max_iterations=3,
     )
     lr = lower(res, x, sink=TorchSink(), runner=TorchCompileRunner())
@@ -287,7 +340,10 @@ def test_one_search_many_deliveries():
     """The seam's raison d'être: two runners, one search."""
     m, x = _make()
     res = search(
-        m, x, source=TorchSource(), capabilities=TorchSink(),
+        m,
+        x,
+        source=TorchSource(),
+        capabilities=TorchSink(),
         max_iterations=3,
     )
     eager = lower(res, x, sink=TorchSink())
@@ -453,8 +509,9 @@ def test_optimize_strategy_autotuned():
     lr = Optimizer(backend=TorchBackend()).optimize(
         m,
         x,
-        strategy=Autotuned(candidates=("generic",), n_calls=2,
-                           warmup=0),
+        strategy=Autotuned(
+            candidates=("generic",), n_calls=2, warmup=0
+        ),
         max_iterations=3,
         verbose=False,
     )
@@ -469,7 +526,9 @@ def test_optimize_strategy_autotuned():
 
 def test_optimize_model_wrapper_parity():
     m, x = _make()
-    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        m, x, max_iterations=3, verify=False, verbose=False
+    )
 
     assert stats["runner"] == "identity"
     assert stats["lowering"] == "generic"
@@ -480,7 +539,9 @@ def test_optimize_model_wrapper_parity():
 
 def test_optimize_model_verbose_verifies_and_prints(capsys):
     m, x = _make()
-    Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=1, verify=True, verbose=True)
+    Optimizer(backend=TorchBackend()).optimize(
+        m, x, max_iterations=1, verify=True, verbose=True
+    )
 
     out = capsys.readouterr().out
     assert "[Verify] Checking output equivalence..." in out
@@ -489,7 +550,10 @@ def test_optimize_model_verbose_verifies_and_prints(capsys):
 
 def test_wrappers_chained_runner_names():
     m, x = _make()
-    _, stats = Optimizer(backend=TorchBackend(), runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()])).optimize(m, x, max_iterations=3, verify=False, verbose=False)
+    _, stats = Optimizer(
+        backend=TorchBackend(),
+        runner=ChainedRunner([TorchCompileRunner(), CudaGraphRunner()]),
+    ).optimize(m, x, max_iterations=3, verify=False, verbose=False)
 
     assert stats["runner"] == ["torch_compile", "cuda_graph"]
     assert stats["compiled"] is True
@@ -499,7 +563,13 @@ def test_optimize_compositional_wrapper_parity():
     torch.manual_seed(0)
     m = _Stack().eval()
     x = torch.randn(2, 8)
-    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Compositional(max_cross_pairs=0), max_iterations=3, verbose=False)
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        m,
+        x,
+        strategy=Compositional(max_cross_pairs=0),
+        max_iterations=3,
+        verbose=False,
+    )
 
     assert stats["n_blocks"] == 2
     with torch.no_grad():
@@ -508,7 +578,18 @@ def test_optimize_compositional_wrapper_parity():
 
 def test_optimize_model_autotuned_wrapper_parity():
     m, x = _make()
-    mod, stats = Optimizer(backend=TorchBackend()).optimize(m, x, strategy=Autotuned(("generic",), n_calls=2, warmup=0, verbose=False, builders=TORCH_BUILDERS), max_iterations=3)
+    mod, stats = Optimizer(backend=TorchBackend()).optimize(
+        m,
+        x,
+        strategy=Autotuned(
+            ("generic",),
+            n_calls=2,
+            warmup=0,
+            verbose=False,
+            builders=TORCH_BUILDERS,
+        ),
+        max_iterations=3,
+    )
 
     assert stats["autotune"]["winner"] == "generic"
     with torch.no_grad():
@@ -519,8 +600,14 @@ def test_optimize_model_resource_error_still_raises():
     """The OOM adapter still wraps the wrapper."""
     m, x = _make()
     with pytest.raises(OptimizationResourceError):
-        Optimizer(backend=TorchBackend()).optimize(m, x, max_iterations=3, max_enodes=1, verify=False, verbose=False)
-
+        Optimizer(backend=TorchBackend()).optimize(
+            m,
+            x,
+            max_iterations=3,
+            max_enodes=1,
+            verify=False,
+            verbose=False,
+        )
 
 
 def test_discover_alternatives_returns_search_result():

@@ -982,7 +982,11 @@ class Engine(Protocol):
       stop, patience, cost_fn) -> stats`` — equality saturation under
       the given schedule; the stats dict carries ``iterations``,
       ``n_enodes``, ``n_classes``, ``rule_budgets``,
-      ``budget_suspended``, ``stop``.
+      ``budget_suspended``, ``stop``.  An engine *may* also accept an
+      optional ``policy`` — an in-search action ordering consulted per
+      iteration, which may only reorder and never drop a rule.  It is
+      not part of this port: the orchestrator passes it only to
+      engines that take it, so an engine without it still conforms.
     * ``extract_best(eid, cost_fn, **kw) -> term`` — greedy
       minimum-cost member extraction (``overrides`` / ``bans`` /
       ``fusion_epsilon`` ride in ``**kw`` like ``EGraph``'s signature).

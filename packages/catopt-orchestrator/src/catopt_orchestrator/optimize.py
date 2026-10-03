@@ -1706,6 +1706,16 @@ def _select_best_term(
     return best_term
 
 
+def _policy_kwargs(policy: Any) -> dict[str, Any]:
+    """Return the engine kwargs a policy implies.
+
+    Only the reference engine schedules through a policy today, so it
+    is passed conditionally: an engine that does not take ``policy``
+    keeps conforming to the ``Engine`` port.
+    """
+    return {} if policy is None else {"policy": policy}
+
+
 @_oom_to_resource_error
 def search(
     model: Any,
@@ -1736,6 +1746,7 @@ def search(
     error_budget: float | None = None,
     task: TaskMetric | None = None,
     task_tol: float | None = None,
+    policy: Any = None,
 ) -> SearchResult:
     """Run the search phase: ``model -> SearchResult``.
 
@@ -1908,6 +1919,11 @@ def search(
     task_tol : float, optional
         Override the metric's own ``tolerance``; required when the
         metric declares none.
+    policy : Policy, optional
+        An in-search action ordering consulted once per saturation
+        iteration (``EGraph.run(..., policy=...)``).  It may only
+        *reorder* the rules, so the fixed point and the certificate are
+        unchanged; the name is recorded in ``stats["policy"]``.
     verbose : bool
         Print progress.
 
@@ -1969,6 +1985,7 @@ def search(
     # ``None`` = unbounded: the run loop wants a concrete watermark.
     run_cap = max_enodes if max_enodes is not None else sys.maxsize
 
+    run_kw = _policy_kwargs(policy)
     stats: dict[str, Any] = eg.run(
         rules,
         root_eid,
@@ -1978,6 +1995,7 @@ def search(
         stop=stop,
         patience=patience,
         cost_fn=cost_fn,
+        **run_kw,
     )
     # Which saturation core ran — the reference engine needs no marker,
     # engines declare ``engine_name`` ("native", ...).
