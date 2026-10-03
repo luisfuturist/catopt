@@ -97,6 +97,47 @@ verifier, the extracted op tree, and a synced median race against eager
 and `torch.compile`.  It re-execs under `PYTHONHASHSEED=0`, so the
 search, extraction and certificate are bit-for-bit reproducible.
 
+## The four dimensions, in the API
+
+Semantics, search, evaluation and execution are separate — and each is
+reached from a real call, not a promise:
+
+| Dimension | Reach it with |
+|---|---|
+| semantics | `verify_certificate(ir.root, cert, strict=True)` — every delivered program ships a replayable derivation |
+| search | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned / RL) orders the rules each iteration |
+| evaluation | `criteria=PredictedCriterion(model)` prices extraction through a `PerformanceModel`; `SearchResult.frontier({...})` returns the non-dominated set; `StaticProfiler` describes a program without running it |
+| execution | the `Sink` / `Runner` / `Meter` ports — and `catopt_core.failures` classifies what went wrong |
+
+```python
+from catopt_core.perf_model import AnalyticalPerformanceModel
+from catopt_core.policies import GreedyPolicy
+from catopt_orchestrator import Optimizer, PredictedCriterion
+from catopt_torch import TorchBackend
+
+opt = Optimizer(backend=TorchBackend())
+mod, stats = opt.optimize(
+    model, x,
+    criteria=PredictedCriterion(AnalyticalPerformanceModel()),  # a model picks the program
+    policy=GreedyPolicy(),                                      # a policy picks the order
+)
+stats["criteria"], stats["policy"]      # {'predicted': 1.0}, 'greedy'
+```
+
+A policy may only **reorder** — every rule still runs, so the fixed
+point and the certificate are unchanged (a random player reaches the
+identical equivalence class).  A model may only **rank** — feasibility
+(`supported_ops`) still decides what is reachable at all.
+
+Train a policy on your own programs:
+
+```bash
+python tools/train_search_policy.py --device cuda   # supervised rule value
+python tools/train_rl_policy.py     --device cuda   # REINFORCE over the search env
+```
+
+→ [`docs/evaluation.md`](docs/evaluation.md) for the whole dimension.
+
 ## What it finds — and what it doesn't
 
 The measured picture is generated from the pinned baselines — see
