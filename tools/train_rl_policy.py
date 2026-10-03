@@ -8,6 +8,7 @@ Plan 0016 stage 7, the RL half.  Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import random
 import statistics
 from typing import Any
@@ -77,6 +78,8 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=6)
     ap.add_argument("--hidden", type=int, default=64)
     args = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     dev = (
         ("cuda" if torch.cuda.is_available() else "cpu")

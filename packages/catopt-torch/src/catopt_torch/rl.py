@@ -13,6 +13,7 @@ certificate still decides correctness (ADR 0003 invariant 5).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch
@@ -24,6 +25,8 @@ from torch import nn
 from torch.distributions import Categorical
 
 __all__ = ["PolicyNet", "RLPolicy", "state_vector", "train_reinforce"]
+
+logger = logging.getLogger(__name__)
 
 #: State width: the feature vector plus the episode progress.
 _STATE_DIM = len(DIMENSIONS) + 1
@@ -191,8 +194,9 @@ def train_reinforce(
         loss.backward()
         opt.step()
         if log_every and (ep + 1) % log_every == 0:
-            print(
-                f"episode {ep + 1}: mean return "
-                f"{float(returns.mean()):.4f}"
+            logger.info(
+                "episode %d: mean return %.4f",
+                ep + 1,
+                float(returns.mean()),
             )
     return model.eval()
