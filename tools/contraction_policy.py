@@ -49,19 +49,19 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import bisect
 import functools
 import heapq
 import math
 import random
 import statistics
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from itertools import count
 from typing import Any
 
 import contraction_scale as cs
+import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Categorical
@@ -93,6 +93,27 @@ def _merge_ts(
     return [t for k, t in enumerate(ts) if k not in (a, b)] + [merged]
 
 
+def _bits(mk: int) -> Iterator[int]:
+    """Yield the set bit positions of a non-negative mask, low to high."""
+    while mk:
+        low = mk & -mk
+        yield low.bit_length() - 1
+        mk ^= low
+
+
+#: Cached strict-upper-triangle index arrays, keyed by matrix size.
+_TRIU: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _triu(m: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return cached ``(row, col)`` index arrays of the upper triangle."""
+    r = _TRIU.get(m)
+    if r is None:
+        r = np.triu_indices(m, 1)
+        _TRIU[m] = r
+    return r
+
+
 class ContractionGame:
     """One contraction episode: the remaining tensors and the cost so far.
 
@@ -100,6 +121,18 @@ class ContractionGame:
     the unordered index pairs; ``step`` contracts one pair and charges
     the classic pairwise cost.  ``greedy_ref`` (the full-network greedy
     cost) anchors the scale-free features and the RL critic.
+
+    Every tensor is mirrored as an integer bitmask over the instance's
+    index labels, and the pairwise quantities the features need — the
+    ``log2`` intersection size and the intersection cardinality of each
+    tensor pair — are maintained **incrementally** across steps: a
+    contraction recomputes only the row/column of the freshly merged
+    tensor, not the whole ``O(m^2)`` table.  The feature matrices are
+    then assembled with NumPy in one shot.  The values are exactly the
+    ``math.fsum`` exactly-rounded sums the scalar implementation used
+    (``fsum`` is order-independent), so the feature vectors are
+    bit-identical and a policy trained on the old features stays valid;
+    only the cost changes.
     """
 
     def __init__(
@@ -117,35 +150,78 @@ class ContractionGame:
         self.ts = [frozenset(t) for t in tensors]
         self.n0 = int(n0 if n0 is not None else len(self.ts))
         self.cost = float(cost)
-        self._refresh()
+        labels = sorted({i for t in self.ts for i in t})
+        self._bit = {lab: p for p, lab in enumerate(labels)}
+        self._log_bit = [self.log[lab] for lab in labels]
+        self._lsize_cache: dict[int, float] = {}
+        self._rebuild()
 
     @property
     def done(self) -> bool:
         """Return whether only one tensor remains."""
         return len(self.ts) <= 1
 
-    def _lsize(self, t: frozenset[int]) -> float:
-        """Return ``log2`` of the element count of a tensor."""
-        return math.fsum(self.log[i] for i in t)
+    def _mask_of(self, t: frozenset[int]) -> int:
+        """Return the bitmask of an index set."""
+        mk = 0
+        for lab in t:
+            mk |= 1 << self._bit[lab]
+        return mk
+
+    def _lsize_mask(self, mk: int) -> float:
+        """Return the exactly-rounded ``log2`` volume of a bitmask."""
+        r = self._lsize_cache.get(mk)
+        if r is None:
+            r = math.fsum(self._log_bit[p] for p in _bits(mk))
+            self._lsize_cache[mk] = r
+        return r
+
+    def _rebuild(self) -> None:
+        """Build the mask and pairwise caches from the tensor list."""
+        self._masks = [self._mask_of(t) for t in self.ts]
+        self._lsize = [self._lsize_mask(mk) for mk in self._masks]
+        self._ranks = [len(t) for t in self.ts]
+        m = len(self._masks)
+        inter = np.zeros((m, m), dtype=np.float64)
+        count = np.zeros((m, m), dtype=np.int64)
+        for i in range(m):
+            inter[i, i] = self._lsize[i]
+            count[i, i] = self._ranks[i]
+            for j in range(i + 1, m):
+                both = self._masks[i] & self._masks[j]
+                v = self._lsize_mask(both)
+                inter[i, j] = inter[j, i] = v
+                c = both.bit_count()
+                count[i, j] = count[j, i] = c
+        self._inter = inter
+        self._icount = count
+        self._refresh()
 
     def _refresh(self) -> None:
-        """Recompute the cached pair statistics for the current state."""
-        self.lsize = [self._lsize(t) for t in self.ts]
-        self.ranks = [len(t) for t in self.ts]
-        pairs: list[tuple[int, int]] = []
-        ul: list[float] = []
-        for a in range(len(self.ts)):
-            for b in range(a + 1, len(self.ts)):
-                pairs.append((a, b))
-                inter = self._lsize(self.ts[a] & self.ts[b])
-                ul.append(self.lsize[a] + self.lsize[b] - inter)
-        self.pairs = pairs
-        self.union_sorted = sorted(ul)
-        self.l_min = min(ul) if ul else 0.0
-        self.spread = (max(ul) - self.l_min) if ul else 0.0
+        """Recompute the cached state summary for the current state."""
+        self.lsize = self._lsize
+        self.ranks = self._ranks
+        m = len(self._masks)
+        ia, ib = _triu(m)
+        self._ia = ia
+        self._ib = ib
+        self.pairs = list(zip(ia.tolist(), ib.tolist(), strict=True))
+        self._ls = np.asarray(self._lsize, dtype=np.float64)
+        self._rk = np.asarray(self._ranks, dtype=np.float64)
+        inter = self._inter[ia, ib]
+        ul = self._ls[ia] + self._ls[ib] - inter
+        self._inter_u = inter
+        self._cnt_u = self._icount[ia, ib]
+        self._ul = ul
+        self.union_sorted = np.sort(ul)
+        self.l_min = float(ul.min()) if ul.size else 0.0
+        self.spread = (float(ul.max()) - self.l_min) if ul.size else 0.0
         self.mean_rank = (
-            statistics.fmean(self.ranks) if self.ranks else 0.0
+            math.fsum(self._ranks) / len(self._ranks)
+            if self._ranks
+            else 0.0
         )
+        self._feat: np.ndarray | None = None
 
     def state_features(self) -> list[float]:
         """Return the scale-free description of the current state."""
@@ -161,37 +237,89 @@ class ContractionGame:
             self.l_min / den,
         ]
 
-    def pair_features(self, a: int, b: int) -> list[float]:
-        """Return the scale-free description of the ``(a, b)`` action."""
-        inter = self.ts[a] & self.ts[b]
-        l_inter = self._lsize(inter)
-        l_union = self.lsize[a] + self.lsize[b] - l_inter
-        l_diff = l_union - l_inter
+    def _build_feat(self) -> np.ndarray:
+        """Assemble the ``[n_pairs, _PAIR_DIM]`` feature matrix.
+
+        Every column is the same IEEE arithmetic the scalar feature
+        builder applied (subtract ``l_min``, divide by the spread
+        denominator, divide the ranks by four), so the result is
+        bit-identical; the normalisation is done in place only to avoid
+        temporary arrays.
+        """
+        ul = self._ul
+        inter = self._inter_u
+        count = self._cnt_u
+        ls = self._ls
+        rk = self._rk
+        ia, ib = self._ia, self._ib
         den = self.spread + 1.0
         n_pairs = max(len(self.pairs), 1)
-        pct = bisect.bisect_left(self.union_sorted, l_union) / n_pairs
-        return [
-            (l_union - self.l_min) / den,
-            (self.lsize[a] - self.l_min) / den,
-            (self.lsize[b] - self.l_min) / den,
-            (l_diff - self.l_min) / den,
-            (l_inter - self.l_min) / den,
-            self.ranks[a] / 4.0,
-            self.ranks[b] / 4.0,
-            len(inter) / max(len(self.ts[a] | self.ts[b]), 1),
-            pct,
-        ]
+        feat = np.empty((ul.shape[0], _PAIR_DIM), dtype=np.float64)
+        feat[:, 0] = ul
+        feat[:, 1] = ls[ia]
+        feat[:, 2] = ls[ib]
+        feat[:, 3] = ul - inter
+        feat[:, 4] = inter
+        feat[:, :5] -= self.l_min
+        feat[:, :5] /= den
+        feat[:, 5] = rk[ia]
+        feat[:, 6] = rk[ib]
+        feat[:, 5:7] /= 4.0
+        feat[:, 7] = count / np.maximum(rk[ia] + rk[ib] - count, 1.0)
+        feat[:, 8] = np.searchsorted(self.union_sorted, ul) / n_pairs
+        return feat
+
+    def pair_feature_matrix(self) -> np.ndarray:
+        """Return the ``[n_pairs, _PAIR_DIM]`` features, ``pairs`` order."""
+        feat = self._feat
+        if feat is None:
+            feat = self._build_feat()
+            self._feat = feat
+        return feat
 
     def all_pair_features(self) -> list[list[float]]:
         """Return one feature vector per legal action, in ``pairs`` order."""
-        return [self.pair_features(a, b) for a, b in self.pairs]
+        return self.pair_feature_matrix().tolist()
+
+    def _advance(self, a: int, b: int) -> None:
+        """Contract ``(a, b)`` in the maintained caches, then refresh."""
+        masks = self._masks
+        m = len(masks)
+        keep = [k for k in range(m) if k != a and k != b]
+        new_ts = self.ts[a] ^ self.ts[b]
+        new_mask = masks[a] ^ masks[b]
+        new_lsize = self._lsize_mask(new_mask)
+        k = len(keep)
+        row_i = np.empty(k, dtype=np.float64)
+        row_c = np.empty(k, dtype=np.int64)
+        for pos, j in enumerate(keep):
+            both = new_mask & masks[j]
+            row_i[pos] = self._lsize_mask(both)
+            row_c[pos] = both.bit_count()
+        idx = np.asarray(keep, dtype=np.intp)
+        inter = np.empty((k + 1, k + 1), dtype=np.float64)
+        count = np.empty((k + 1, k + 1), dtype=np.int64)
+        inter[:k, :k] = self._inter[np.ix_(idx, idx)]
+        inter[k, k] = new_lsize
+        inter[:k, k] = row_i
+        inter[k, :k] = row_i
+        count[:k, :k] = self._icount[np.ix_(idx, idx)]
+        count[k, k] = len(new_ts)
+        count[:k, k] = row_c
+        count[k, :k] = row_c
+        self._inter = inter
+        self._icount = count
+        self.ts = [self.ts[j] for j in keep] + [new_ts]
+        self._masks = [masks[j] for j in keep] + [new_mask]
+        self._lsize = [self._lsize[j] for j in keep] + [new_lsize]
+        self._ranks = [self._ranks[j] for j in keep] + [len(new_ts)]
+        self._refresh()
 
     def step(self, a: int, b: int) -> float:
         """Contract pair ``(a, b)``; charge and return its cost."""
         c = cs.pair_cost(self.ts[a], self.ts[b], self.sizes)
         self.cost += c
-        self.ts = _merge_ts(self.ts, a, b)
-        self._refresh()
+        self._advance(a, b)
         return c
 
 
@@ -258,13 +386,13 @@ def _batch_inputs(
     games: list[ContractionGame], device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stack every game's state and pair features into batched tensors."""
-    sf = torch.tensor(
-        [g.state_features() for g in games],
+    sf = torch.as_tensor(
+        np.stack([g.state_features() for g in games]),
         dtype=torch.float32,
         device=device,
     )
-    pf = torch.tensor(
-        [g.all_pair_features() for g in games],
+    pf = torch.as_tensor(
+        np.stack([g.pair_feature_matrix() for g in games]),
         dtype=torch.float32,
         device=device,
     )
