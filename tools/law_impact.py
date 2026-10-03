@@ -357,6 +357,38 @@ def _model_cases() -> list[tuple[str, Any, Any]]:
                 torch.randn(2, 4, 8, dtype=torch.float64),
             ),
         ),
+        ("MoEMLP", M.MoEMLP(d, 32, 3).eval().double(), t),
+        ("GegluMLP", M.GegluMLP(d, 2).eval().double(), t),
+        (
+            "GatedResidualBlock",
+            M.GatedResidualBlock(d).eval().double(),
+            t,
+        ),
+        (
+            "ResNetBlock",
+            M.ResNetBlock(8).eval().double(),
+            img,
+        ),
+        (
+            "DepthwiseConvBlock",
+            M.DepthwiseConvBlock(8).eval().double(),
+            img,
+        ),
+        (
+            "ManualSoftmaxAttention",
+            M.ManualSoftmaxAttention(d).eval().double(),
+            seq,
+        ),
+        (
+            "PositionalEmbedding",
+            M.PositionalEmbedding(64, d).eval().double(),
+            seq,
+        ),
+        (
+            "KernelizedAttention",
+            M.KernelizedAttention(d).eval().double(),
+            seq,
+        ),
         ("SelectiveSSM", S.SelectiveSSM(8, 8, 4).eval().double(), st),
         ("DiagDenseSSM", S.DiagDenseSSM(8, 8, 4).eval().double(), st),
         ("DiagonalSSM", S.DiagonalSSM(8, 8, 4).eval().double(), st),

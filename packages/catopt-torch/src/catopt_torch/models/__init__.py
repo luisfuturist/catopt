@@ -596,3 +596,214 @@ class LinearRecurrence(nn.Module):
         for t in range(self.steps):
             h = self.A @ h + x[t]
         return h
+
+
+class MoEMLP(nn.Module):
+    """Soft Mixture-of-Experts feed-forward (router + expert dispatch).
+
+    The Mixtral/Switch product structure, exported honestly: a router
+    scores every expert (``softmax(linear(x))``), all expert outputs are
+    stacked (``stack``), and the dispatch is a weighted combination
+    (``mul(unsqueeze(w), stack)`` then ``sum`` over the expert axis).
+
+    Dense-softmax ("soft") MoE is used rather than top-k gating so the
+    whole dispatch stays inside the differentiable graph — this is the
+    form inference stacks actually fuse into grouped GEMMs.
+    """
+
+    def __init__(
+        self, dim: int, hidden: int | None = None, n_experts: int = 4
+    ) -> None:
+        """Initialise the router and ``n_experts`` expert projections."""
+        super().__init__()
+        h = hidden or dim * 2
+        self.router = nn.Linear(dim, n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(dim, h, bias=False),
+                nn.SiLU(),
+                nn.Linear(h, dim, bias=False),
+            )
+            for _ in range(n_experts)
+        )
+        self.n_experts = n_experts
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Dispatch ``x`` through the weighted expert mixture."""
+        w = torch.softmax(self.router(x), dim=-1)  # (B, E)
+        outs = torch.stack(
+            [e(x) for e in self.experts], dim=1
+        )  # (B, E, d)
+        return (w.unsqueeze(-1) * outs).sum(dim=1)
+
+
+class GegluMLP(nn.Module):
+    """GEGLU feed-forward: ``down(gelu(gate(x)) * up(x))``.
+
+    The PaLM/Gemma MLP — same product structure as :class:`SwiGLU` but
+    with ``gelu`` instead of ``silu``.  Having both in the corpus lets
+    the census tell apart shape-level opportunities (the gate product)
+    from op-level ones (which activation is bound).
+    """
+
+    def __init__(self, dim: int, hidden_mult: int = 4) -> None:
+        """Initialise gate/up/down projections."""
+        super().__init__()
+        h = dim * hidden_mult
+        self.gate = nn.Linear(dim, h, bias=False)
+        self.up = nn.Linear(dim, h, bias=False)
+        self.down = nn.Linear(h, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the GEGLU activation and output projection."""
+        return self.down(F.gelu(self.gate(x)) * self.up(x))
+
+
+class GatedResidualBlock(nn.Module):
+    """Highway/GRU-style gated residual: ``x + sigmoid(g(x)) * (h(x) - x)``.
+
+    Real pattern — highway networks, gated residual adapters, LSTM-free
+    recurrence blocks.  The gate product ``sigmoid * sub`` and the
+    residual ``add`` are the sharing/absorption shapes a corpus-aware
+    law proposer must see.
+    """
+
+    def __init__(self, dim: int) -> None:
+        """Initialise the transform and gate projections."""
+        super().__init__()
+        self.h_proj = nn.Linear(dim, dim)
+        self.g_proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the gated residual transform."""
+        return x + torch.sigmoid(self.g_proj(x)) * (self.h_proj(x) - x)
+
+
+class ResNetBlock(nn.Module):
+    """ResNet basic block: ``relu(bn(conv(relu(bn(conv(x))))) + x)``.
+
+    The canonical vision residual — conv2d + batch_norm + relu plus the
+    skip ``add``.  Exports the ``batch_norm`` / ``relu`` op family the
+    corpus previously lacked, and produces ``add(·, relu)`` /
+    ``batch_norm(conv2d)`` shapes.
+    """
+
+    def __init__(self, channels: int = 16) -> None:
+        """Initialise both convolutions and batch norms."""
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            channels, channels, 3, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(
+            channels, channels, 3, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the residual conv block."""
+        y = F.relu(self.bn1(self.conv1(x)))
+        y = self.bn2(self.conv2(y))
+        return F.relu(y + x)
+
+
+class DepthwiseConvBlock(nn.Module):
+    """MobileNet-style depthwise-separable conv: ``relu(pw(dw(x)))``.
+
+    A 3x3 depthwise conv (``groups=channels``) followed by a 1x1
+    pointwise projection — the efficiency pattern behind MobileNet and
+    modern CNN stems.  Depthwise ``conv2d`` carries a ``groups`` attr,
+    so it registers as a distinct conv shape from the dense convs
+    already in the corpus.
+    """
+
+    def __init__(self, channels: int = 16) -> None:
+        """Initialise the depthwise and pointwise convolutions."""
+        super().__init__()
+        self.dw = nn.Conv2d(
+            channels,
+            channels,
+            3,
+            padding=1,
+            groups=channels,
+            bias=False,
+        )
+        self.pw = nn.Conv2d(channels, channels, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the depthwise-separable block."""
+        return F.relu(self.pw(self.dw(x)))
+
+
+class ManualSoftmaxAttention(nn.Module):
+    """Attention with the softmax spelled as ``exp / sum`` — pre-kernel form.
+
+    Legacy transformer code normalises scores manually
+    (``exp(s) / sum(exp(s))``) rather than calling ``softmax`` — the
+    same math the fused kernel replaced.  Exporting it adds ``exp`` /
+    ``sum`` / ``div`` reduction shapes to the corpus, which is exactly
+    the vocabulary a softmax-recognition law would need.
+    """
+
+    def __init__(self, dim: int = 16) -> None:
+        """Initialise the Q/K/V/output projections."""
+        super().__init__()
+        self.dim = dim
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run attention with manual exp/sum normalisation."""
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        s = q @ k.transpose(-2, -1) / math.sqrt(self.dim)
+        e = torch.exp(s)
+        a = e / e.sum(dim=-1, keepdim=True)
+        return self.out_proj(a @ v)
+
+
+class PositionalEmbedding(nn.Module):
+    """Learned positional embedding added to token features (BERT stem).
+
+    ``x + emb(arange(T))`` — the encoder input stage of BERT/GPT-style
+    stacks.  Exports ``arange`` and ``embedding``, two ops the corpus
+    did not previously contain, plus the ``add(·, embedding)`` shape a
+    fold-into-lookup law would target.
+    """
+
+    def __init__(self, max_len: int = 64, dim: int = 16) -> None:
+        """Initialise the position embedding table."""
+        super().__init__()
+        self.emb = nn.Embedding(max_len, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add learned position embeddings to the input."""
+        pos = torch.arange(x.shape[1], device=x.device)
+        return x + self.emb(pos)
+
+
+class KernelizedAttention(nn.Module):
+    """Linear-transformer kernel attention: ``phi(Q) @ (phi(K)T @ V)``.
+
+    The Katharopoulos/Performer feature map ``phi(x) = elu(x) + 1``
+    keeps the attention scores positive while letting associativity do
+    the O(T^2 d) to O(T d^2) reorder — the rewrite the linear-attention
+    literature is built on, expressed with a positive feature map rather
+    than identity.  Exports ``elu`` alongside the bracketed matmuls.
+    """
+
+    def __init__(self, dim: int = 16) -> None:
+        """Initialise the Q/K/V projections."""
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run kernelized attention ``phi(Q) @ (phi(K)T @ V)``."""
+        phi_q = F.elu(self.q_proj(x)) + 1
+        phi_k = F.elu(self.k_proj(x)) + 1
+        return phi_q @ (phi_k.transpose(-2, -1) @ self.v_proj(x))
