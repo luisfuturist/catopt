@@ -1,0 +1,123 @@
+device: cuda  (torch 2.14.0+cu130)
+
+== training on real models ==
+  train swiglu           rules= 51 improving=  0
+  train rmsnorm          rules= 51 improving=  1
+  train attention        rules= 51 improving=  0
+  train transformer      rules= 51 improving=  2
+  train residual_mlp     rules= 51 improving=  0
+  train parallel_linear  rules= 51 improving=  1
+  train deep_parallel    rules= 51 improving=  1
+  train norm_linear      rules= 51 improving=  2
+  train matrix_chain     rules= 51 improving=  1
+  train gqa              rules= 51 improving=  0
+  total samples: 510
+
+== held-out race — fixed point ==
+  swiglu*:
+    default  enodes=    11 classes=    10 iters=  2 stop=fixed_point  cost=      557568.0 ms=   37.6
+    learned  enodes=    11 classes=    10 iters=  2 stop=fixed_point  cost=      557568.0 ms=   65.7
+    random   enodes=    12 classes=    10 iters=  2 stop=fixed_point  cost=      557568.0 ms=   33.8
+  attention*:
+    default  enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   46.7
+    learned  enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   55.5
+    random   enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   41.8
+  transformer*:
+    default  enodes=    50 classes=    45 iters=  3 stop=fixed_point  cost=    73368048.0 ms=  137.5
+    learned  enodes=    50 classes=    45 iters=  2 stop=fixed_point  cost=    73368048.0 ms=  162.5
+    random   enodes=    51 classes=    45 iters=  3 stop=fixed_point  cost=    73368048.0 ms=  134.5
+  deep_transformer*:
+    default  enodes=    97 classes=    87 iters=  3 stop=fixed_point  cost=   689675904.0 ms=  154.2
+    learned  enodes=    97 classes=    87 iters=  2 stop=fixed_point  cost=   689675904.0 ms=  194.8
+    random   enodes=    99 classes=    87 iters=  3 stop=fixed_point  cost=   689675904.0 ms=  156.6
+  deep_parallel*:
+    default  enodes=    20 classes=    14 iters=  4 stop=fixed_point  cost=      244224.0 ms=   25.3
+    learned  enodes=    20 classes=    14 iters=  4 stop=fixed_point  cost=      244224.0 ms=   77.2
+    random   enodes=    20 classes=    14 iters=  4 stop=fixed_point  cost=      244224.0 ms=   23.2
+  matrix_chain*:
+    default  enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   20.4
+    learned  enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   51.2
+    random   enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   18.1
+
+== held-out race — bounded (max_iterations=1) ==
+  swiglu*:
+    default  enodes=    11 classes=    10 iters=  1 stop=max_iterations cost=      557568.0 ms=   31.9
+    learned  enodes=    11 classes=    10 iters=  1 stop=max_iterations cost=      557568.0 ms=   44.8
+    random   enodes=    12 classes=    10 iters=  1 stop=max_iterations cost=      557568.0 ms=   34.0
+  attention*:
+    default  enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   42.0
+    learned  enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   55.3
+    random   enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   42.9
+  transformer*:
+    default  enodes=    48 classes=    45 iters=  1 stop=max_iterations cost=    73368048.0 ms=  131.4
+    learned  enodes=    50 classes=    45 iters=  1 stop=max_iterations cost=    73368048.0 ms=  151.0
+    random   enodes=    49 classes=    45 iters=  1 stop=max_iterations cost=    73368048.0 ms=  134.8
+  deep_transformer*:
+    default  enodes=    93 classes=    87 iters=  1 stop=max_iterations cost=   689675904.0 ms=  149.7
+    learned  enodes=    97 classes=    87 iters=  1 stop=max_iterations cost=   689675904.0 ms=  171.4
+    random   enodes=    95 classes=    87 iters=  1 stop=max_iterations cost=   689675904.0 ms=  155.6
+  deep_parallel*:
+    default  enodes=    12 classes=    10 iters=  1 stop=max_iterations cost=      244224.0 ms=   22.8
+    learned  enodes=    15 classes=    12 iters=  1 stop=max_iterations cost=      244224.0 ms=   36.2
+    random   enodes=    15 classes=    12 iters=  1 stop=max_iterations cost=      244224.0 ms=   21.9
+  matrix_chain*:
+    default  enodes=    13 classes=    10 iters=  1 stop=max_iterations cost=      253440.0 ms=   16.2
+    learned  enodes=    13 classes=    10 iters=  1 stop=max_iterations cost=      253440.0 ms=   30.2
+    random   enodes=    13 classes=    10 iters=  1 stop=max_iterations cost=      253440.0 ms=   20.6
+
+== held-out saturation only (EGraph.run) — fixed point ==
+  swiglu*:
+    default  enodes=    79 classes=    31 iters=  6 stop=fixed_point  cost=      336384.0 ms=    6.9
+    learned  enodes=    79 classes=    31 iters=  5 stop=fixed_point  cost=      336384.0 ms=  124.6
+    random   enodes=    87 classes=    31 iters=  6 stop=fixed_point  cost=      336384.0 ms=    8.8
+  attention*:
+    default  enodes=    31 classes=    30 iters=  2 stop=fixed_point  cost=     3981312.0 ms=    1.7
+    learned  enodes=    31 classes=    30 iters=  2 stop=fixed_point  cost=     3981312.0 ms=   47.7
+    random   enodes=    31 classes=    30 iters=  2 stop=fixed_point  cost=     3981312.0 ms=    2.3
+  transformer*:
+    default  enodes=  2209 classes=   276 iters=  9 stop=fixed_point  cost=    36379632.0 ms=  250.1
+    learned  enodes=  3493 classes=   276 iters= 10 stop=fixed_point  cost=    36379632.0 ms=  675.6
+    random   enodes=  2736 classes=   276 iters= 11 stop=fixed_point  cost=    36379632.0 ms=  410.2
+  deep_transformer*:
+    default  enodes=  4835 classes=   567 iters=  9 stop=fixed_point  cost=   333201024.0 ms=  749.3
+    learned  enodes=  6587 classes=   567 iters= 10 stop=fixed_point  cost=   333201024.0 ms= 1124.8
+    random   enodes=  5855 classes=   567 iters= 11 stop=fixed_point  cost=   333201024.0 ms= 1252.1
+  deep_parallel*:
+    default  enodes=    27 classes=    14 iters=  4 stop=fixed_point  cost=      244224.0 ms=    3.0
+    learned  enodes=    24 classes=    14 iters=  4 stop=fixed_point  cost=      244224.0 ms=   93.9
+    random   enodes=    27 classes=    14 iters=  5 stop=fixed_point  cost=      244224.0 ms=    4.4
+  matrix_chain*:
+    default  enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=    1.4
+    learned  enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   69.5
+    random   enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=    2.7
+
+== held-out race — lazy (stop='improving') ==
+  swiglu*:
+    default  enodes=    11 classes=    10 iters=  2 stop=fixed_point  cost=      557568.0 ms=   35.1
+    learned  enodes=    11 classes=    10 iters=  2 stop=fixed_point  cost=      557568.0 ms=   61.3
+    random   enodes=    12 classes=    10 iters=  2 stop=fixed_point  cost=      557568.0 ms=   35.0
+  attention*:
+    default  enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   43.1
+    learned  enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   57.6
+    random   enodes=    18 classes=    18 iters=  1 stop=fixed_point  cost=     9289728.0 ms=   43.0
+  transformer*:
+    default  enodes=    50 classes=    45 iters=  3 stop=fixed_point  cost=    73368048.0 ms=  137.2
+    learned  enodes=    50 classes=    45 iters=  2 stop=fixed_point  cost=    73368048.0 ms=  170.5
+    random   enodes=    51 classes=    45 iters=  3 stop=fixed_point  cost=    73368048.0 ms=  143.4
+  deep_transformer*:
+    default  enodes=    97 classes=    87 iters=  3 stop=fixed_point  cost=   689675904.0 ms=  174.9
+    learned  enodes=    97 classes=    87 iters=  2 stop=fixed_point  cost=   689675904.0 ms=  206.0
+    random   enodes=    99 classes=    87 iters=  3 stop=fixed_point  cost=   689675904.0 ms=  177.5
+  deep_parallel*:
+    default  enodes=    20 classes=    14 iters=  3 stop=improving    cost=      244224.0 ms=   26.0
+    learned  enodes=    20 classes=    14 iters=  3 stop=improving    cost=      244224.0 ms=   70.9
+    random   enodes=    20 classes=    14 iters=  3 stop=improving    cost=      244224.0 ms=   25.8
+  matrix_chain*:
+    default  enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   18.8
+    learned  enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   77.5
+    random   enodes=    15 classes=    10 iters=  3 stop=fixed_point  cost=       73728.0 ms=   22.0
+
+== safety ==
+  certificate replays for 6/6 models: OK
+  random policy == default partition (equivalence class): OK (6)
+  saturation partition identical (default/learned/random): OK (6)
