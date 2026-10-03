@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 from catopt_torch.calibrate import TargetProfile, shape_bucket
 from catopt_core.cost import fused_cost_for
+from catopt_core.failures import FailureClass
 from catopt_core.ir import Op, Param, TensorType, Var
+from catopt_core.ports import TimingResult
 from catopt_orchestrator.autotune import CandidateUnavailableError
 
 
@@ -232,6 +234,92 @@ def test_time_failed_candidate_excluded():
     cands = stats["autotune"]["candidates"]
     assert cands["flaky"]["status"] == "time_failed"
     assert stats["autotune"]["winner"] == "generic"
+
+
+# ---------------------------------------------------------------------------
+# Classified failures — the FailureClass rides alongside the stage status
+# ---------------------------------------------------------------------------
+
+
+class _RaisingMeter:
+    """A Meter whose ``time`` always raises (the port's escape hatch)."""
+
+    def time(
+        self, runnable, inputs, *, warmup=5, n_calls=30, timeout_s=None
+    ):
+        raise RuntimeError("device not available")
+
+
+class _FailingMeter:
+    """A Meter that returns a pre-classified failure result."""
+
+    def __init__(self, failure):
+        self.failure = failure
+
+    def time(
+        self, runnable, inputs, *, warmup=5, n_calls=30, timeout_s=None
+    ):
+        return TimingResult(
+            median_s=float("nan"),
+            iqr_s=0.0,
+            n_calls=0,
+            failure=self.failure,
+        )
+
+
+def test_build_and_verify_failures_are_classified():
+    """A stage-only status also records WHY — the FailureClass."""
+    m, x = _make()
+
+    def oom(ctx):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 1 GiB")
+
+    def vboom(ctx):
+        class W(nn.Module):
+            def forward(self, x):
+                raise RuntimeError("device-side assert triggered")
+
+        return W()
+
+    _mod, stats = _autotune(
+        m,
+        x,
+        candidates=("generic", ("oom", oom), ("vboom", vboom)),
+    )
+    c = stats["autotune"]["candidates"]
+    assert c["oom"]["status"] == "build_failed"
+    assert c["oom"]["failure"] is FailureClass.OOM
+    assert c["vboom"]["status"] == "verify_error"
+    assert c["vboom"]["failure"] is FailureClass.KERNEL
+    # a completed candidate records no failure bucket
+    assert "failure" not in c["generic"]
+
+
+def test_meter_exception_is_classified_time_failed():
+    """A meter that raises is classified, not swallowed."""
+    m, x = _make()
+    _mod, stats = _autotune(
+        m, x, candidates=("generic",), meter=_RaisingMeter()
+    )
+    rec = stats["autotune"]["candidates"]["generic"]
+    assert rec["status"] == "time_failed"
+    assert rec["failure"] is FailureClass.UNAVAILABLE
+    assert stats["autotune"]["fallback"] is True
+
+
+def test_meter_failure_result_is_recorded():
+    """A meter that returns a classified failure never counts as timed."""
+    m, x = _make()
+    _mod, stats = _autotune(
+        m,
+        x,
+        candidates=("generic",),
+        meter=_FailingMeter(FailureClass.OOM),
+    )
+    rec = stats["autotune"]["candidates"]["generic"]
+    assert rec["status"] == "time_failed"
+    assert rec["failure"] is FailureClass.OOM
+    assert stats["autotune"]["fallback"] is True
 
 
 def test_fallback_when_everything_fails():

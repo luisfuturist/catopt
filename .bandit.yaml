@@ -33,3 +33,16 @@ skips:
   # security decision.  A cryptographically strong source would only
   # make the search non-reproducible.
   - B311
+  # B404 / B603 / B607 subprocess -------------------------------------------
+  # calibrate.py's `_git_sha` (plan 0016 stage 3) runs the fixed command
+  # `git rev-parse HEAD` — a literal argument list, no shell, no
+  # user-influenced input — to stamp the measured profile's provenance
+  # with the checkout's commit.  It mirrors the identical, already-
+  # reviewed probe in bench/benchkit/env.py `_git_state`, which the scan
+  # does not reach because bench/ is excluded.  B404 (the import), B603
+  # (no shell=True) and B607 (the bare `git` name resolves via PATH) are
+  # all the benign shape of a fixed, non-injectable command; the probe is
+  # best-effort and any failure yields no git_sha rather than an error.
+  - B404
+  - B603
+  - B607

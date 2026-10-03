@@ -97,6 +97,7 @@ from catopt_core.cost import (
     executor_cost_for,
     fused_cost_for,
 )
+from catopt_core.failures import FailureClass, classify
 from catopt_core.ir import IR, Op, Param, TensorType, Var
 from catopt_core.ports import (
     ExecutorSpec,
@@ -555,10 +556,17 @@ def _autotuned_impl(
         pipeline stats dict plus ``stats["autotune"]``:
         ``winner``, ``winner_median_s``, per-candidate records
         (``status``/``median_s``/``iqr_s``/``verified``/``max_rel``/
-        ``model_ns``/``predicted_ns``/``error``), ``fallback``,
-        ``shape_bucket``, ``predicted_ns``/``predicted_winner``,
+        ``model_ns``/``predicted_ns``/``error``/``failure``),
+        ``fallback``, ``shape_bucket``,
+        ``predicted_ns``/``predicted_winner``,
         ``measured_ns``/``profile`` (only with ``profile=``),
         ``search_s``, ``elapsed_s``.
+
+        A failed candidate records its :class:`FailureClass` under
+        ``failure`` (plan 0016 stage 3) alongside the stage-only
+        ``status`` — a ``build_failed``/``verify_error``/``time_failed``
+        record names *why* (OOM / timeout / kernel / unavailable / …)
+        rather than only *where* it stopped.
 
     """
     t_start = time.monotonic()
@@ -705,6 +713,7 @@ def _autotuned_impl(
             continue
         except Exception as e:
             rec["status"] = "build_failed"
+            rec["failure"] = classify(e)
             rec["error"] = f"{type(e).__name__}: {e}"
             continue
 
@@ -716,6 +725,7 @@ def _autotuned_impl(
             )
         except Exception as e:
             rec["status"] = "verify_error"
+            rec["failure"] = classify(e)
             rec["error"] = f"{type(e).__name__}: {e}"
             continue
         rec["verified"] = vr.passed
@@ -726,15 +736,24 @@ def _autotuned_impl(
             continue
 
         # -- (d) time through the meter port -------------------------
+        # A stage-only status hides WHY a run failed: the meter's own
+        # classified ``failure`` (OOM / timeout / kernel / …) and any
+        # exception the meter itself raises both land in ``failure``,
+        # so OOM vs timeout vs device-absent stay distinguishable.
         try:
             timing = meter.time(
                 mod, example_input, n_calls=n_calls, warmup=warmup
             )
-            med, iqr = timing.median_s, timing.iqr_s
         except Exception as e:
             rec["status"] = "time_failed"
+            rec["failure"] = classify(e)
             rec["error"] = f"{type(e).__name__}: {e}"
             continue
+        if timing.failure != FailureClass.OK:
+            rec["status"] = "time_failed"
+            rec["failure"] = timing.failure
+            continue
+        med, iqr = timing.median_s, timing.iqr_s
         rec["status"] = "timed"
         rec["median_s"] = med
         rec["iqr_s"] = iqr

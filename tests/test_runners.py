@@ -18,6 +18,8 @@ from catopt_orchestrator.autotune import AutotuneContext, CandidateUnavailableEr
 from catopt_orchestrator.runners import ChainedRunner, IdentityRunner, Runner, runner_candidate
 
 from catopt_cuda import CudaGraphRunner
+from catopt_cuda.runners import _capture_failure_class
+from catopt_core.failures import FailureClass
 from catopt_torch.runners import TorchCompileRunner
 
 from catopt_torch.adapters import TorchSink
@@ -226,6 +228,24 @@ def test_cuda_graph_runner_drops_on_failed_capture():
     assert out is mod
     assert stats["cuda_graph"] is False
     assert mod.dropped
+    # the reason is no longer swallowed (plan 0016 stage 3)
+    assert stats["cuda_graph_failure"] is FailureClass.UNKNOWN
+
+
+def test_capture_failure_class_classifies():
+    """The capture-failure classifier buckets by exception type/text
+    without needing a CUDA device."""
+    assert (
+        _capture_failure_class(RuntimeError("CUDA out of memory"))
+        is FailureClass.OOM
+    )
+    assert (
+        _capture_failure_class(RuntimeError("no CUDA device present"))
+        is FailureClass.UNAVAILABLE
+    )
+    assert (
+        _capture_failure_class(TimeoutError()) is FailureClass.TIMEOUT
+    )
 
 
 # ------------------------------------------------------------------

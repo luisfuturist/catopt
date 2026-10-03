@@ -10,6 +10,13 @@ torch package imports no CUDA-specific machinery.
 stats) -> module``.  Only batched executors expose
 ``capture_cuda_graph``; generic ``IRModule``s and compiled wrappers
 degrade quietly.
+
+A capture that raises still degrades gracefully — the module drops its
+partial graph and delivery continues — but the reason is no longer
+swallowed (plan 0016 stage 3): the exception is classified through
+:func:`catopt_core.failures.classify` and recorded under
+``stats["cuda_graph_failure"]``, so an OOM capture is distinguishable
+from a kernel fault or a missing device.
 """
 
 from __future__ import annotations
@@ -17,8 +24,14 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
+from catopt_core.failures import FailureClass, classify
 
 __all__ = ["CudaGraphRunner"]
+
+
+def _capture_failure_class(exc: BaseException) -> FailureClass:
+    """Classify a failed CUDA-graph capture into a ``FailureClass``."""
+    return classify(exc)
 
 
 class CudaGraphRunner:
@@ -68,6 +81,9 @@ class CudaGraphRunner:
                 )
                 capture(*xs)
                 stats["cuda_graph"] = True
-            except Exception:  # pragma: no cover — CUDA-only
+            except Exception as exc:  # pragma: no cover — CUDA-only
+                stats["cuda_graph_failure"] = _capture_failure_class(
+                    exc
+                )
                 cast(Any, module).drop_cuda_graph()
         return module

@@ -27,8 +27,10 @@ import contextlib
 import logging
 import platform
 import statistics
+import subprocess
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import torch
 from catopt_core.profile import (
@@ -97,6 +99,56 @@ _FALLBACK_GRAPH_OVERHEAD_US = 80.0
 #: fixed cost (``nn.Module.__call__``, env setup) amortises to noise,
 #: short enough that the module builds instantly.
 _DISPATCH_PROBE_OPS = 100
+
+#: Checkout root above this package — ``packages/catopt-torch/src/
+#: catopt_torch/calibrate.py`` is four levels down.  Used only by the
+#: best-effort provenance probe; absent for a non-editable install.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _git_sha() -> str | None:
+    """Best-effort ``git rev-parse HEAD``; ``None`` when unavailable.
+
+    Provenance only — never raises.  A non-editable install (no
+    ``.git`` above the package) or a missing/failing ``git`` yields
+    ``None`` so a provenance gap never breaks calibration.
+    """
+    if not (_REPO_ROOT / ".git").exists():
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(_REPO_ROOT),
+        )
+    except Exception:
+        return None
+    return out.stdout.strip() or None
+
+
+def _provenance(dtype: torch.dtype) -> dict:
+    """Best-effort provenance for a profile's ``meta``.
+
+    The dtype, torch version and platform the measurement ran on plus
+    the reproducibility/identity fields plan 0016 stage 3 asks for:
+    the CUDA runtime version (``"none"`` on a CPU build), the git HEAD
+    sha (absent when git metadata is unavailable) and the torch RNG
+    seed in force.  Every field is gathered without raising, so an
+    exotic environment degrades the record rather than the run.
+    """
+    meta: dict = {
+        "dtype": str(dtype).replace("torch.", ""),
+        "torch": torch.__version__,
+        "platform": platform.platform(),
+        "torch_cuda": torch.version.cuda or "none",
+        "seed": torch.initial_seed(),
+    }
+    sha = _git_sha()
+    if sha is not None:
+        meta["git_sha"] = sha
+    return meta
 
 
 @contextlib.contextmanager
@@ -548,7 +600,11 @@ def calibrate(
     """Measure the roofline constants of ``device``.
 
     ``device`` defaults to cuda if available, else cpu.  Returns a
-    :class:`~catopt_core.profile.TargetProfile`.
+    :class:`~catopt_core.profile.TargetProfile` whose ``meta`` records
+    best-effort provenance — dtype, torch/CUDA version, platform, the
+    git HEAD sha and the RNG seed — so a measured constant is never
+    quoted without the context that produced it (a provenance gap
+    never breaks the run).
 
     Six micro-benchmarks, sized so the whole run takes a few seconds:
 
@@ -689,11 +745,7 @@ def calibrate(
         launch_us=launch * 1e6,
         device=str(dev),
         measured_at=datetime.now(UTC).isoformat(timespec="seconds"),
-        meta={
-            "dtype": str(dtype).replace("torch.", ""),
-            "torch": torch.__version__,
-            "platform": platform.platform(),
-        },
+        meta=_provenance(dtype),
         dispatch_us=dispatch_us,
         leaf_eval_us=leaf_eval_us,
         op_kernel_ns=op_kernels,

@@ -53,7 +53,9 @@ The ports (this file)
   uses: module-tree block selection, hooked input capture, grafting
   and parameter-sharing clones.
 * :class:`Meter` / :class:`TimingResult` — the timing port the
-  autotuned strategy uses: ``time(runnable, inputs) -> (median, iqr)``.
+  autotuned strategy uses: ``time(runnable, inputs) -> (median, iqr)``,
+  with optional provenance (``device`` / ``warmup``) and a classified
+  ``failure`` bucket (plan 0016 stage 3).
 * :class:`Runner` — the delivery transform port,
   ``apply(module, example_input, stats) -> module``.
 * :class:`Criterion` — one cost-model selection axis,
@@ -138,6 +140,8 @@ import inspect
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from catopt_core.failures import FailureClass
 
 if TYPE_CHECKING:
     from catopt_core.ir import IR, Op
@@ -675,16 +679,30 @@ class Composer(Protocol):
 
 @dataclass(frozen=True)
 class TimingResult:
-    """One :class:`Meter` measurement — median wall time + spread.
+    """One :class:`Meter` measurement — median wall time + provenance.
 
     ``median_s`` is the median seconds of one forward;
     ``iqr_s`` the interquartile spread (0 when fewer than 4 samples);
     ``n_calls`` the number of timed calls the measurement ran.
+
+    The trailing fields are optional provenance (plan 0016 stage 3).
+    ``device`` names where the run happened (``"cuda:0"`` / ``"cpu"``;
+    ``None`` when the meter cannot tell), ``warmup`` the untimed calls
+    that preceded the timed block, and ``failure`` the classified
+    outcome: :attr:`FailureClass.OK` for a completed measurement, or a
+    genuine bucket (OOM / timeout / kernel / nonfinite / unavailable /
+    unknown) when the meter caught a failure — ``median_s`` is then
+    ``NaN``, the companion :func:`catopt_core.failures.is_nonfinite`
+    check a consumer gates on.  All three default, so a measurement
+    that carries no provenance constructs exactly as before.
     """
 
     median_s: float
     iqr_s: float
     n_calls: int
+    device: str | None = None
+    warmup: int = 0
+    failure: FailureClass = FailureClass.OK
 
 
 @runtime_checkable
@@ -696,6 +714,13 @@ class Meter(Protocol):
     ``warmup`` untimed calls first, then ``n_calls`` timed forwards;
     the median decides.  Device synchronisation is the adapter's
     business (``torch.cuda.synchronize`` on CUDA inputs).
+
+    ``timeout_s`` is an optional wall-clock budget: a meter that can
+    enforce it reports :attr:`FailureClass.TIMEOUT` rather than
+    hanging forever, and every returned :class:`TimingResult` carries
+    its ``device`` / ``warmup`` provenance and a ``failure`` bucket
+    (plan 0016 stage 3) so a failure is classified, not a bare
+    traceback.
     """
 
     def time(
@@ -705,6 +730,7 @@ class Meter(Protocol):
         *,
         warmup: int = 5,
         n_calls: int = 30,
+        timeout_s: float | None = None,
     ) -> TimingResult:
         """Time ``runnable(*inputs)``; return median + IQR seconds."""
         ...

@@ -295,7 +295,9 @@ class FakeComposer:
 class FakeMeter:
     """``Meter`` — a fixed deterministic measurement."""
 
-    def time(self, runnable, inputs, *, warmup=5, n_calls=30):
+    def time(
+        self, runnable, inputs, *, warmup=5, n_calls=30, timeout_s=None
+    ):
         args = inputs if isinstance(inputs, tuple) else (inputs,)
         runnable(*args)
         return TimingResult(median_s=0.001, iqr_s=0.0, n_calls=n_calls)

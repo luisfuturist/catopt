@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import time
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -232,6 +233,63 @@ def test_measure_leaf_eval_returns_per_leaf_overhead():
 
 
 # ---------------------------------------------------------------------------
+# provenance — _git_sha / _provenance
+# ---------------------------------------------------------------------------
+
+
+def _fake_run(stdout: str):
+    """A subprocess.run stand-in returning *stdout*."""
+    return lambda *a, **k: types.SimpleNamespace(stdout=stdout)
+
+
+def test_git_sha_reads_head(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(C, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(C.subprocess, "run", _fake_run("abc123\n"))
+    assert C._git_sha() == "abc123"
+
+
+def test_git_sha_none_without_repo(monkeypatch, tmp_path):
+    # no .git above the package → git is never invoked
+    monkeypatch.setattr(C, "_REPO_ROOT", tmp_path)
+    assert C._git_sha() is None
+
+
+def test_git_sha_none_on_subprocess_failure(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(C, "_REPO_ROOT", tmp_path)
+
+    def boom(*a, **k):
+        raise FileNotFoundError("git not installed")
+
+    monkeypatch.setattr(C.subprocess, "run", boom)
+    assert C._git_sha() is None
+
+
+def test_git_sha_none_on_empty_stdout(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(C, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(C.subprocess, "run", _fake_run("\n"))
+    assert C._git_sha() is None
+
+
+def test_provenance_records_environment(monkeypatch):
+    monkeypatch.setattr(C, "_git_sha", lambda: "deadbeef")
+    meta = C._provenance(torch.float64)
+    assert meta["dtype"] == "float64"
+    assert meta["torch"] == torch.__version__
+    assert meta["torch_cuda"] == (torch.version.cuda or "none")
+    assert isinstance(meta["seed"], int)
+    assert meta["git_sha"] == "deadbeef"
+    assert "platform" in meta
+
+
+def test_provenance_omits_git_sha_when_absent(monkeypatch):
+    monkeypatch.setattr(C, "_git_sha", lambda: None)
+    assert "git_sha" not in C._provenance(torch.float32)
+
+
+# ---------------------------------------------------------------------------
 # _verbose_ctx
 # ---------------------------------------------------------------------------
 
@@ -289,6 +347,17 @@ def test_calibrate_cpu_named_and_saved(tmp_path, monkeypatch):
     assert p.name == "ci-cpu2"
     assert (tmp_path / "ci-cpu2.json").exists()
     assert load_profile("ci-cpu2") == p
+
+
+def test_calibrate_meta_carries_provenance(monkeypatch):
+    """The measured profile's meta records the stage-3 provenance."""
+    monkeypatch.setattr(C, "_git_sha", lambda: "a" * 40)
+    p = calibrate(device="cpu", quick=True)
+    assert p.meta["git_sha"] == "a" * 40
+    assert p.meta["torch_cuda"] == (torch.version.cuda or "none")
+    assert isinstance(p.meta["seed"], int)
+    # and it round-trips through JSON
+    assert TargetProfile.from_json(p.to_json()).meta == p.meta
 
 
 def test_calibrate_cuda_branch_monkeypatched(monkeypatch, caplog):
