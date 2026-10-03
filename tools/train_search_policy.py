@@ -1,10 +1,13 @@
-"""Pretrain and post-train a search policy, then predict a program.
+"""Train a supervised search policy on a multi-family mixture.
 
-Plan 0016 stage 7 (ADR 0003).  Pretraining data is generated on
-synthetic small programs; post-training fine-tunes on a small real
-torch model exported to IR.  The trained policy then predicts which
-rule improves a held-out program, and the engine confirms the
-prediction against the best and mean rule.
+Plan 0016 stage 7 (ADR 0003).  The policy is a ``RuleValueNet`` over
+(program features ⊕ structural rule vector).  Training data is a
+mixture of three families (matmul chains, elementwise duplication, a
+linear/relu block — see :mod:`families`).  The trained policy then
+picks one rule per held-out program and is scored **per family**: the
+mean rank of its pick (1 = best) and its hit rate (a strictly-improving
+rule).  ``--train-families chain`` reproduces the one-family baseline
+the mixture is compared against.
 
 Usage::
 
@@ -14,90 +17,62 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import random
-import statistics
-from typing import Any
 
+import families
 import torch
-from catopt_core.egraph import EGraph
 from catopt_core.features import compute_features
-from catopt_core.game import Action, Evaluator, GameState
-from catopt_core.ir import Op, TensorType, Var
+from catopt_core.game import Action, GameState
 from catopt_core.laws import all_rules
-from catopt_core.trajectories import RuleSample, rule_samples
+from catopt_core.trajectories import rule_samples
 from catopt_torch.learned_policy import LearnedPolicy, train_rule_value
-from torch import nn
 
 
-def _v(name: str, *shape: int) -> Var:
-    return Var(name, TensorType(tuple(shape)))
-
-
-def _chain(d: int, k: int, m: int) -> Op:
-    """Build the expensive bracketing ``a·(b·c)``."""
-    a, b, c = _v("a", d, k), _v("b", k, m), _v("c", m, d)
-    return Op.make("matmul", a, Op.make("matmul", b, c))
-
-
-def synthetic_programs(n: int, seed: int) -> list[Op]:
-    """Small random matmul chains — the pretraining family."""
-    rng = random.Random(seed)
-    return [
-        _chain(
-            rng.choice([2, 3, 4]),
-            rng.choice([2, 3, 4]),
-            rng.choice([2, 3, 4]),
+def _parse_families(spec: str) -> list[str]:
+    """Parse a comma-separated family list; reject unknown names."""
+    fams = [s.strip() for s in spec.split(",") if s.strip()]
+    bad = [f for f in fams if f not in families.FAMILIES]
+    if bad:
+        raise SystemExit(
+            f"unknown families {bad}; pick from {families.FAMILIES}"
         )
-        for _ in range(n)
-    ]
+    return fams
 
 
-def small_model_programs(n: int, seed: int) -> list[Op]:
-    """Post-training data: small real torch models exported to IR."""
-    from catopt_torch.adapters import TorchSource
+def _pick(
+    policy: LearnedPolicy, term: object, actions: list[Action]
+) -> str:
+    """Return the policy's rule choice for a bare program."""
+    state = GameState(None, 0, features=compute_features(term))
+    return policy.choose(state, actions).rule
 
-    progs: list[Op] = []
-    for i in range(n):
-        torch.manual_seed(seed + i)
-        model = nn.Sequential(
-            nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 8)
+
+def _table(rows: list[tuple[str, dict]]) -> None:
+    """Print the per-family rank / hit-rate table."""
+    head = (
+        f"{'family':<8} {'n':>3} {'mean_rank':>9} "
+        f"{'hit_rate':>8} {'mean_delta':>11}"
+    )
+    print(head)
+    print("-" * len(head))
+    for fam, s in rows:
+        print(
+            f"{fam:<8} {s['n']:>3} {s['mean_rank']:>9.2f} "
+            f"{s['hit_rate']:>8.2f} {s['mean_delta']:>11.1f}"
         )
-        ir, _ = TorchSource().to_ir(model, torch.randn(4, 8))
-        progs.append(ir.root)
-    return progs
-
-
-def _samples(programs: list[Op], rules: Any) -> list[RuleSample]:
-    out: list[RuleSample] = []
-    for p in programs:
-        out.extend(rule_samples(p, rules))
-    return out
-
-
-def _cost(term: Any) -> float:
-    eg = EGraph()
-    return Evaluator().evaluate(GameState(eg, eg.add_term(term)))
-
-
-def _rule_deltas(term: Any, rules: Any, before: float) -> list[float]:
-    """Return the cost improvement each rule alone gives."""
-    out: list[float] = []
-    for r in rules:
-        eg = EGraph()
-        root = eg.add_term(term)
-        eg.apply_rule(r, root)
-        out.append(before - Evaluator().evaluate(GameState(eg, root)))
-    return out
 
 
 def main() -> None:
-    """Run pretrain, post-train, then predict on a held-out program."""
+    """Train on the mixture, then score the policy per family."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="auto")
-    ap.add_argument("--pretrain", type=int, default=40)
-    ap.add_argument("--posttrain", type=int, default=6)
-    ap.add_argument("--epochs", type=int, default=300)
-    ap.add_argument("--hidden", type=int, default=32)
+    ap.add_argument(
+        "--train-families", default=",".join(families.FAMILIES)
+    )
+    ap.add_argument("--per-family", type=int, default=60)
+    ap.add_argument("--eval", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=3000)
+    ap.add_argument("--hidden", type=int, default=96)
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     dev = (
@@ -105,54 +80,40 @@ def main() -> None:
         if args.device == "auto"
         else args.device
     )
+    train_fams = _parse_families(args.train_families)
     print(f"device: {dev}  (torch {torch.__version__})")
+    print(f"train families: {','.join(train_fams)}")
 
     rules = all_rules()
     by_name = {r.name: r for r in rules}
+    actions = [Action(r.name) for r in rules]
 
-    pre = _samples(synthetic_programs(args.pretrain, 0), rules)
-    print(f"pretrain samples: {len(pre)}")
-    model = train_rule_value(
-        pre, epochs=args.epochs, device=dev, hidden=args.hidden
+    progs = families.mixture_programs(
+        train_fams, args.per_family, args.seed
     )
-
-    post = _samples(small_model_programs(args.posttrain, 1), rules)
-    print(f"posttrain samples: {len(post)} (+{len(pre)} replay)")
-    # Replay the pretraining family: post-training on a different family
-    # alone causes catastrophic forgetting (measured: the chain pick
-    # drops from rank 1 to rank 2).
+    samples = [s for p in progs for s in rule_samples(p, rules)]
+    print(f"train programs: {len(progs)}  samples: {len(samples)}")
     model = train_rule_value(
-        pre + post,
+        samples,
         epochs=args.epochs,
-        device=dev,
         hidden=args.hidden,
-        seed=1,
+        device=dev,
+        seed=args.seed,
     )
-
-    held = _chain(3, 5, 2)
-    before = _cost(held)
-    feats = compute_features(held)
-    by_rule = {
-        r.name: d
-        for r, d in zip(
-            rules, _rule_deltas(held, rules, before), strict=True
-        )
-    }
     policy = LearnedPolicy(model, by_name, device=dev)
-    pick = policy.choose(
-        GameState(None, 0, features=feats),
-        [Action(r.name) for r in rules],
-    )
-    ordered = sorted(by_rule, key=by_rule.__getitem__, reverse=True)
-    print(f"held-out cost before: {before:.0f}")
-    print(
-        f"policy picks: {pick.rule}  (delta {by_rule[pick.rule]:+.0f})"
-    )
-    print(
-        f"best delta: {max(by_rule.values()):+.0f}; "
-        f"mean {statistics.mean(by_rule.values()):+.0f}"
-    )
-    print(f"picked rank: {ordered.index(pick.rule) + 1}/{len(ordered)}")
+
+    print()
+    rows = []
+    for fam in families.FAMILIES:
+        held = families.family_programs(
+            fam, args.eval, args.seed + 100, held_out=True
+        )
+        scores = [
+            families.score_pick(p, rules, _pick(policy, p, actions))
+            for p in held
+        ]
+        rows.append((fam, families.summarize(scores)))
+    _table(rows)
 
 
 if __name__ == "__main__":
