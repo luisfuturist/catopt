@@ -6,7 +6,11 @@ from catopt_core.game import Action, GameState
 from catopt_core.ir import Op, TensorType, Var
 from catopt_core.laws import all_rules
 from catopt_core.ports import Policy
-from catopt_core.trajectories import RULE_VECTOR_LEN, rule_samples
+from catopt_core.trajectories import (
+    RULE_VECTOR_LEN,
+    rule_samples,
+    rule_vector,
+)
 from catopt_torch.learned_policy import (
     LearnedPolicy,
     RuleValueNet,
@@ -53,6 +57,44 @@ def test_train_default_device():
     samples = rule_samples(_chain(), all_rules())
     model = train_rule_value(samples, epochs=1)
     assert isinstance(model, RuleValueNet)
+
+
+def test_rule_vectors_are_cached():
+    rules = all_rules()
+    net = RuleValueNet(hidden=4)
+    pol = LearnedPolicy(
+        net, {r.name: r for r in rules}, device="cpu"
+    )
+    assert set(pol._rule_vecs) == {r.name for r in rules}
+    assert pol._rule_vecs[rules[0].name] == rule_vector(rules[0])
+
+
+def test_scores_batches_and_matches_score():
+    rules = all_rules()
+    net = RuleValueNet(hidden=8)
+    pol = LearnedPolicy(
+        net, {r.name: r for r in rules}, device="cpu"
+    )
+    f = compute_features(_chain())
+    acts = [Action(r.name) for r in rules]
+    vals = pol.scores(f, acts)
+    assert len(vals) == len(acts)
+    for a, v in zip(acts, vals, strict=True):
+        assert abs(pol.score(f, a) - v) < 1e-4
+
+
+def test_choose_is_argmax_of_scores():
+    rules = all_rules()
+    net = RuleValueNet(hidden=8)
+    pol = LearnedPolicy(
+        net, {r.name: r for r in rules}, device="cpu"
+    )
+    f = compute_features(_chain())
+    acts = [Action(r.name) for r in rules]
+    vals = pol.scores(f, acts)
+    best = max(range(len(acts)), key=lambda i: vals[i])
+    st = GameState(None, 0, features=f)
+    assert pol.choose(st, acts).rule == acts[best].rule
 
 
 def test_train_regression_head():

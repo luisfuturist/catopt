@@ -92,27 +92,68 @@ class LearnedPolicy:
         self.model = model.to(device).eval()
         self.rule_by_name = dict(rule_by_name)
         self.device = device
+        # The structural rule vectors are static, so compute them once:
+        # the engine consults ``choose`` O(n_rules) times per iteration,
+        # and rebuilding every vector per call would put pure-Python
+        # encoding work on the search's critical path.
+        self._rule_vecs = {
+            name: rule_vector(rule)
+            for name, rule in self.rule_by_name.items()
+        }
+
+    def features_of(self, state: Any) -> ProgramFeatures:
+        """Return the program features the policy scores against.
+
+        The base policy reads them straight off the state
+        (``state.features``); a subclass that is consulted by the
+        engine — whose ``GameState`` carries no features — overrides
+        this to derive them (see
+        :class:`catopt_torch.graph_policy.GraphFeaturePolicy`).
+        """
+        return state.features
 
     def score(self, features: ProgramFeatures, action: Action) -> float:
         """Predict the improvement logit of ``action`` for ``features``."""
-        rule = self.rule_by_name[action.rule]
         x = torch.tensor(
-            [input_vector(features, rule_vector(rule))],
+            [input_vector(features, self._rule_vecs[action.rule])],
             dtype=torch.float32,
             device=self.device,
         )
         with torch.no_grad():
             return float(self.model(x).item())
 
-    def choose(self, state: Any, actions: Sequence[Action]) -> Action:
-        """Return the highest-scoring action."""
+    def scores(
+        self, features: ProgramFeatures, actions: Sequence[Action]
+    ) -> list[float]:
+        """Predict every action's logit in ONE forward pass.
+
+        The engine consults ``choose`` once per rule per iteration, so
+        scoring action-by-action would pay a device round-trip (and a
+        host sync) for each — on a GPU host that dominates the search
+        it is meant to speed up.  Batching the offered set into a
+        single forward keeps the decision cost off the critical path.
+        """
         acts = list(actions)
+        x = torch.tensor(
+            [
+                input_vector(features, self._rule_vecs[a.rule])
+                for a in acts
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.no_grad():
+            out = self.model(x)
+        return [float(v) for v in out]
+
+    def choose(self, state: Any, actions: Sequence[Action]) -> Action:
+        """Return the highest-scoring action (first wins a tie)."""
+        acts = list(actions)
+        vals = self.scores(self.features_of(state), acts)
         best_i = 0
-        best_s: float | None = None
-        for i, a in enumerate(acts):
-            s = self.score(state.features, a)
-            if best_s is None or s > best_s:
-                best_s, best_i = s, i
+        for i in range(1, len(vals)):
+            if vals[i] > vals[best_i]:
+                best_i = i
         return acts[best_i]
 
 
