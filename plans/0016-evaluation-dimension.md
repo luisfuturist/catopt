@@ -27,6 +27,132 @@ Stage 7's measured results:
 `project/retros/stage7-multifamily-results.md` (the three-family
 mixture, scored per family).
 
+## Measured results
+
+What measuring the landed stages showed.  Every number is
+reproducible from the named retro; ratios are to the exact optimum
+where one exists, to best-found otherwise (an upper bound on the
+optimum, so the measured gaps are conservative).
+
+### Contraction ordering — the precondition
+
+`project/retros/contraction-precondition.md`.  Tensor-contraction
+ordering is a space where the one-step greedy cost-model oracle is
+*provably* suboptimal, so a learned `Policy` has something to win.
+
+* classic matrix chains — greedy loses **66.7 %** of instances
+  (mean 2.77×, worst 15.3×);
+* general tensor networks — greedy loses **71.7 %** (mean 2.09×,
+  worst 23.0×);
+* catopt **e-graph** rule space (`assoc_matmul` over `Var` leaves,
+  the priced spelling) — the one-step oracle loses **53.3 %**
+  (worst 8.75×); saturation reaches exactly the DP optimum on
+  **60/60** chains (`contraction-ladder.md`);
+* catopt **diagram** move space — **no headroom**: `search_moves`
+  ties greedy on **4/4** chains.  The window reify folds the chain
+  into one morphism and the composed weight is a param-only subtree
+  priced at 0, so ordering has no cost signal there.
+
+### Contraction ordering — expressible but not priceable
+
+`project/retros/contraction-cost-signal.md` asks the harder
+prerequisite: can the *diagram* space price an order at all?
+
+* **No.**  All 6 bracketings are reachable in the root e-class, but
+  every one prices at **0** under `flops_cost` / `launch_aware_cost`
+  / `count_cost`; extraction breaks the tie by member order and
+  picks a suboptimal bracketing on **37/40** chains (worst 10.7×).
+* **Billing the fold is unsound** — measured blast radius **31 test
+  failures across 15 files** — and it would *misprices runtime*: the
+  folded weight is materialised once at compile time, so steady-state
+  runtime is one GEMM whatever the order.  The discount is correct.
+* The order signal lives in the **`Var`-leaf e-graph rule space**,
+  which prices it directly.  Verdict: contraction ordering is **out
+  of scope for the diagram move space** (a fusion space).
+
+### Contraction ordering at scale — the gate
+
+`project/retros/contraction-scale.md` tests the other end, where the
+exact DP is intractable.
+
+* **Equality saturation dies at n ≈ 12** (assoc) / **n ≈ 8** (AC):
+  the e-class member count is **Catalan**, so the fixed point is
+  reached only for n ≤ 12 and n = 13 does not finish in 200 s.  The
+  exact subset DP reaches **n ≈ 18** — saturation is *dominated* by
+  the DP, so there is no scale where it is the right tool.
+* **Greedy is materially worse at scale**: **13.3× mean / 28× worst**
+  above best-found at n = 60 (2.3× at n = 20/40; the n = 30 draw is
+  mild at 1.15×).  Best-found is an upper bound, so greedy is *at
+  least* 13× off optimal at n = 60.
+* **Controls validate the players** against the DP at n = 8–16:
+  bounded best-first `search` reaches 1.01–1.09× (1.55× on one hard
+  draw); `one-step` hits the optimum at n = 8.
+* The headroom is above **greedy**, not above saturation.  The real
+  baselines are `search` (n ≤ 30) and `restart` (n ≤ 60), already
+  1.00–1.04× best-found.
+
+### Coordination — the hand-written pairing heuristic
+
+`project/retros/coordination-optimality.md` asks whether the shipped
+`extract_paired` / `_select_best_term` policy is optimal.
+
+* **Near-optimal.**  Under the shipped default model it is at the
+  optimum on **92.2 %** of enumerable draws (naive greedy: 37.3 %);
+  under `count_cost` it is optimal on **100 %**.
+* The residual gap is **one kernel dispatch** on ~10 % of draws
+  (max rel 4.76 % under the default model, 0.35 % under
+  `launch_aware`; `flops_cost` carries no coordination signal).
+* The gap is an **all-or-nothing artefact**: `_select_best_term`
+  compares only *two* terms (greedy vs force-*every*-group), so it
+  cannot fuse one group while declining another.  The fix is a
+  **per-group decision** (a `{0,1}^G` vector, `G` ≤ 3 here) — not
+  ML — and its ceiling is a few dispatches.
+
+### Learned contraction ordering — the decisive test
+
+`project/retros/contraction-policy.md` trains a REINFORCE policy on
+n = 8–12 with a greedy-completion critic and generalises to
+n = 20/30/40 with no large-n data.
+
+* **beats `greedy` decisively** — **0.41–0.69×** its cost at every
+  scale and seed;
+* **ties bounded `search`** — **0.93–1.09×** (seed-dependent);
+* **comparable to `restart`** as one rollout — 0.78–1.03×;
+* **beats `restart` only with restarts on both sides** —
+  **0.73–0.87×** (64 sampled rollouts vs 64 randomised-greedy);
+* **imitation generalises worse** — trained on the exact DP optimum,
+  it degrades monotonically (`imitation / restart`: 1.10 → 2.25 →
+  **5.72** at seed 0, n = 20 → 30 → 40);
+* controls: the policy is **1.12–1.18×** the true optimum at
+  n = 8–12 — a genuine player, not a random ordering.
+
+Two silently-corrupting RL bugs were found and fixed: the REINFORCE
+loss multiplied `logps` (step-major) against `advantages`
+(episode-major) — a *permuted* gradient — and un-standardised
+advantages diverge (one catastrophic move dominates).  With both
+fixed the policy improves monotonically (1.24 → 1.14 → 1.09).
+
+The honest headline: **a learned contraction-ordering policy is a
+viable player, not a new regime** — as a single rollout it does not
+beat the best cheap player.
+
+### The other measured negatives
+
+* **RL collapses on a multi-family mixture**
+  (`stage7-multifamily-results.md`): the supervised
+  per-`(features, rule)` classifier does not dilute (rank 1.00 on
+  all three families); RL still collapses `chain` to the floor after
+  the diagnosed reward-scale bug was fixed — a shared-net
+  **winner-take-all** under a sparse reward, not a scale bias.
+* **A model-backed criterion cannot steer extraction**
+  (`eval-axis-selection.md`): `PredictedCriterion` prices a form by
+  the *whole* subtree, but `extract_best` recovers a local cost by
+  the **additive** marginal `c(t) − Σc(children)`, so a
+  non-additive criterion is mis-ranked or collapses to bit-identical
+  values.  Measured: pluggable evaluation changes the extracted
+  program in **0/7** families, and `SearchResult.frontier` yields
+  **0 genuine** trade-offs over 7 families × 21 axis pairs.
+
 ## Wiring — what actually consumes each port
 
 The stages landed modules; this is what makes them *operational*
@@ -45,6 +171,29 @@ had no consumer anywhere in `packages/`, with every gate green — no
 existing gate catches an unconsumed port.
 
 ## Known gaps
+
+**Settled by measurement — do not re-open.**
+
+* **Contraction ordering in the diagram move space is out of scope.**
+  The composed weight is param-only, so the shipped runtime models
+  price every bracketing at 0; the fold discount is *correct* for
+  runtime (billing it is unsound — 31 test failures) and the diagram
+  space is a **fusion** space.  The order signal lives in the
+  `Var`-leaf e-graph rule space, which prices it directly
+  (`contraction-cost-signal.md`).
+* **Equality saturation is the wrong tool for contraction ordering.**
+  It is exponential in the e-class member count (Catalan) and dies at
+  n ≈ 12 (assoc) / n ≈ 8 (AC), below the exact subset DP's n ≈ 18.
+  The small-board "saturation = optimum" result was a tiny-space
+  artefact (`contraction-scale.md`).
+* **The coordination heuristic is near-optimal.**  The shipped
+  `extract_paired` / `_select_best_term` policy is at the optimum on
+  ~92 % of enumerable draws; the residual is exactly one kernel
+  dispatch on ~10 %, an all-or-nothing group-policy artefact.  It is
+  a per-group decision, not an ML problem
+  (`coordination-optimality.md`).
+
+**Open.**
 
 1. **`Engine` / `Policy` is under-specified.**  The `Engine` port says
    an engine *"may"* accept `policy`, so a caller cannot tell.
@@ -71,6 +220,14 @@ existing gate catches an unconsumed port.
    true roofline argmin is target-invariant in 7/7.  Either the model
    criterion is confined to post-hoc ranking, or extraction needs a
    dense (non-marginal) pricing path for non-additive criteria.
+4. **Beating the strong cheap heuristics at scale** — the decisive
+   open thread.  The learned contraction-ordering policy crushes
+   greedy (0.41–0.69×) but only *ties* bounded `search` (0.93–1.09×)
+   and beats `restart` only when both sides get restarts (0.73–0.87×).
+   The headroom `contraction-scale.md` measured is above *greedy*; the
+   strong cheap players already capture most of it.  Sketched in the
+   open thread below — not yet its own plan file, because the
+   direction is still a choice.
 
 ## Contingent spike — growing the law library
 
@@ -78,6 +235,12 @@ If the headroom hunt comes back empty (every space measured is small
 enough for saturation to close it, so a policy can only tie), the
 remaining direction is to widen the **action space** rather than the
 search:
+
+**The condition was tested and not met.**  The headroom hunt
+(`contraction-scale.md`) found a space where saturation *breaks*
+(n ≥ 12) and greedy is materially worse — so the remaining direction
+is beating the cheap players, not widening the action space.  The
+spike below stays contingent on a *future* empty result.
 
 * Today a `Policy` acts on **2-cells** — it chooses which *known* law
   to fire, so reach is the library's closure.  ADR 0002 frames the
@@ -99,6 +262,42 @@ search:
 * This is a **design spike, not a stage** — it changes what an action
   *is*, and it is the step that would turn "search a fixed library"
   into "search that grows its own library".
+
+## Open thread — beating the cheap heuristics at scale
+
+The decisive test (`contraction-policy.md`) leaves one question open:
+the learned policy *ties* the best cheap player, so is there a regime
+where learning beats `search` / `restart` outright?  A plan is
+warranted for this thread, but the direction is still a choice, so it
+stays a **sketch** inside plan 0016 — promote it to its own plan file
+only once a direction is picked.
+
+Candidate directions, each falsifiable:
+
+1. **Compute-equal comparison.**  The policy rollout and `restart`
+   were matched in *rollout count*, not per-step cost; a learned
+   rollout is the more expensive one.  Measure wall-clock at an equal
+   budget before claiming a win.
+2. **A learned critic / state-conditioned policy.**  The RL critic is
+   the hand-built greedy completion; a learned value baseline — or
+   the supervised per-`(features, rule)` classifier, which did *not*
+   dilute — may close the `search` gap.  The mixture collapse is a
+   shared-net winner-take-all, so a state-conditioned head is the
+   natural next architecture.
+3. **The per-group coordination decision.**  The ~10 % residual is a
+   `{0,1}^G` fuse-or-not vector, not a search problem; it is a small,
+   deterministic fix to `_select_best_term` and needs no ML.  This is
+   the shovel-ready direction.
+4. **A new regime, not a better player.**  The measured headroom is
+   above greedy; the strong cheap players already capture most of it.
+   If a learned policy cannot dominate them at equal cost, the honest
+   conclusion is that contraction ordering is *solved by cheap
+   heuristics*, and the evaluation dimension's value is elsewhere
+   (the coordination decision, the additivity seam, the mixture).
+
+Acceptance for any direction: beat the *best cheap player*
+(`search` / `restart`) at an **equal wall-clock budget** on
+n = 20/30/40 with a seed-robust margin — or record the negative.
 
 ## Goal
 

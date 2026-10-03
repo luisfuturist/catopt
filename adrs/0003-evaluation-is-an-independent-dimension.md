@@ -292,6 +292,16 @@ Benchmarks are deliberately last.
   target-invariant in 7/7).  A `PerformanceModel` ranks *candidates*,
   not *nodes*; treating it as a cost function is a category error this
   seam does not prevent.
+- **A cost model prices only the axis its substrate runs.**  The
+  diagram move space reifies a matrix chain as a param-only weight
+  product, folded once at compile time, so a *runtime* cost model
+  prices every bracketing at 0: the order choice is expressible but
+  not priceable there.  Billing the fold to manufacture a signal is
+  unsound (31 test failures) and misprices runtime.  The honest
+  disposition is *out of scope* for that substrate; the order signal
+  lives in the `Var`-leaf e-graph rule space, which prices it
+  directly.  Widening a runtime model to answer a question its
+  substrate does not run is the four-dimension mistake in miniature.
 
 ## Follow-ups (mandatory)
 
