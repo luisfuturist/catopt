@@ -183,6 +183,39 @@ SILU_MUL_FORM = R(
 
 
 # ---------------------------------------------------------------------------
+#  View-op naturality — elementwise mul through `select`
+# ---------------------------------------------------------------------------
+
+# `select` is a stride view (torch.select) — the same kind of free
+# re-layout as `transpose`.  Elementwise `mul` commutes with it: the
+# product of two slices is the slice of the product.  This is the
+# `select` analogue of the layout family's `transpose_pull_mul`, but
+# unlike that bidirectional transpose pair it is single-direction and
+# term-local, so it does not generate a saturation closure and belongs
+# in the default set rather than the opt-in LAYOUT_RULES (see the
+# ALL_RULES note below).
+#
+# The shared `dim`/`index` attribute metavariables force both operand
+# selects to read the same index along the same axis, so the matcher
+# enforces the precondition structurally — a mismatched dim/index
+# simply does not match, and no `check` hook is needed.
+SELECT_MUL = R(
+    "select_mul",
+    Op.make(
+        "mul",
+        Op.make("select", "u", dim="D", index="I"),
+        Op.make("select", "v", dim="D", index="I"),
+    ),
+    Op.make("select", Op.make("mul", "u", "v"), dim="D", index="I"),
+    law="mul commutes with select: sel(u) ⊙ sel(v) = sel(u ⊙ v) — the "
+    "elementwise product of two slices is the slice of the product "
+    "(naturality of the elementwise action over the select view).  "
+    "Removes one dispatched op per site.",
+    tags=_SIM,
+)
+
+
+# ---------------------------------------------------------------------------
 #  Distributivity / naturality (the categorical insight)
 # ---------------------------------------------------------------------------
 
@@ -1113,6 +1146,7 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     SQUARE_EXPAND,
     POW_TO_SQUARE,
     SQUARE_TO_POW,
+    SELECT_MUL,
 ]
 
 #: Rules that implement the categorical insight: distributivity and naturality.

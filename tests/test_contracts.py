@@ -402,6 +402,11 @@ _LAW_SPECS: dict[str, dict] = {
     "square_expand": {"x": (2, 3)},
     "pow_to_square": {"x": (2, 3)},
     "square_to_pow": {"x": (2, 3)},
+    # select(u, dim, index) removes `dim`; both selects share dim/index
+    "select_mul": {
+        "shapes": {"u": (3, 4, 5), "v": (3, 4, 5)},
+        "attrs": {"$attr:D": 1, "$attr:I": 2},
+    },
     # ---- CATEGORICAL_RULES: matmul/linear algebra ----
     "distribute_matmul_over_add": {
         "W": (4, 3),

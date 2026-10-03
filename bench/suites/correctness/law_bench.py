@@ -158,6 +158,19 @@ def _silu_mul(d: int, dev: torch.device):
     return Op.make("mul", Op.make("silu", g), u), env, [g, u]
 
 
+def _c_select_mul(d: int, dev: torch.device):
+    """mul(select(u,1,i), select(v,1,i)) — the SSM step's B_t ⊙ x_t."""
+    b, t = 4, 3
+    u, v = _v("u", b, t, d), _v("v", b, t, d)
+    env = {"u": _r(dev, b, t, d), "v": _r(dev, b, t, d)}
+    term = Op.make(
+        "mul",
+        Op.make("select", u, dim=1, index=1),
+        Op.make("select", v, dim=1, index=1),
+    )
+    return term, env, [u, v]
+
+
 # -- matmul / linear family ------------------------------------------------
 
 
@@ -811,6 +824,7 @@ LAW_CASES: dict[str, Any] = {
     "square_expand": _c_square,
     "square_to_pow": _c_square,
     "pow_to_square": _c_pow,
+    "select_mul": _c_select_mul,
     # CATEGORICAL_RULES — bilinearity / merges
     "distribute_matmul_over_add": _c_distribute,
     "factor_matmul": _c_factor,
