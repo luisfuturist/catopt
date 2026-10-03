@@ -235,8 +235,26 @@ def _view_node(view_op: str, leaf: Any, keys: list[str]) -> Any:
     return Op.make(view_op, leaf, **{k: f"V_{k}" for k in keys})
 
 
+def _vocab_sets(vocab: str) -> tuple[tuple, tuple]:
+    """Return ``(pointwise, views)`` for the requested vocabulary.
+
+    ``"hand"`` is the two hand-written tuples below; ``"derived"``
+    classifies every corpus op by property (``tools/law_vocab.py``),
+    so the generator's op alphabet is machine-derived too.
+    """
+    if vocab == "derived":
+        import law_vocab
+
+        v = law_vocab.derive_vocabulary()
+        return v.pointwise, v.views
+    return _POINTWISE, _VIEW_OPS
+
+
 def _census_naturality(
-    census_op: dict, terms: list[Any]
+    census_op: dict,
+    terms: list[Any],
+    pointwise: tuple = _POINTWISE,
+    views: tuple = _VIEW_OPS,
 ) -> list[Proposal]:
     """Mechanically derive view-naturality candidates from the census.
 
@@ -249,13 +267,15 @@ def _census_naturality(
     This is the census -> propose step done by machine: the shape
     comes from ``law_shape_census``'s op-tuple counts, not a hand-
     written schema list.  The truth oracle (not this generator)
-    decides whether each candidate is sound.
+    decides whether each candidate is sound.  The op alphabet is the
+    ``pointwise`` / ``views`` pair — hand-written by default, or
+    property-derived (``--vocab derived``).
     """
     out: list[Proposal] = []
     for op, kids in census_op:
-        if op not in _POINTWISE or len(kids) != 2:
+        if op not in pointwise or len(kids) != 2:
             continue
-        if kids[0] != kids[1] or kids[0] not in _VIEW_OPS:
+        if kids[0] != kids[1] or kids[0] not in views:
             continue
         g = kids[0]
         keys = _view_attrs(terms, g)
@@ -277,11 +297,14 @@ def _census_naturality(
     return out
 
 
-def propose(census_op: dict, terms: list[Any]) -> list[Proposal]:
+def propose(
+    census_op: dict, terms: list[Any], vocab: str = "hand"
+) -> list[Proposal]:
     """Collect, unify and de-duplicate every proposer's candidates.
 
     Three sources feed the pool: the **census** generator (view
-    naturality over the frequent op-tuples), the shape-aware schemas
+    naturality over the frequent op-tuples, using the requested op
+    *vocab*), the shape-aware schemas
     (``law_shape_proposal.schemas``), and the algebraic grammar
     (``law_proposal.schema_candidates``, abstracted to patterns with
     its concrete instance retained for the oracles).  De-dup is by
@@ -289,9 +312,10 @@ def propose(census_op: dict, terms: list[Any]) -> list[Proposal]:
     duplicate's provenance is merged into ``sources``, so a candidate
     reachable from the census generator is recorded as such.
     """
+    pointwise, views = _vocab_sets(vocab)
     by_key: dict = {}
     pool = [
-        *_census_naturality(census_op, terms),
+        *_census_naturality(census_op, terms, pointwise, views),
         *_shape_aware(),
         *_grammar(),
     ]
@@ -586,13 +610,18 @@ def _search_rules(holdout: str | None) -> list[Rewrite]:
     return [r for r in ALL_RULES if r.name not in names]
 
 
-def run_pipeline(holdout: str | None = None) -> dict:
+def run_pipeline(
+    holdout: str | None = None, vocab: str = "hand"
+) -> dict:
     """Run census -> propose -> verify -> measure -> rank.
 
     ``holdout`` is a comma-separated list of library rule names to
     remove from the search rule set (the library used for duplicate
     detection, derivability, and the reach baseline) — the held-out
-    rediscovery test.
+    rediscovery test.  ``vocab`` selects the generator's op alphabet:
+    ``"hand"`` (the ``_POINTWISE`` / ``_VIEW_OPS`` tuples) or
+    ``"derived"`` (property-classified over the corpus by
+    ``tools/law_vocab.py``).
     """
     base_rules = _search_rules(holdout)
     lib = [lp._key(r.lhs, r.rhs) for r in base_rules]
@@ -605,7 +634,7 @@ def run_pipeline(holdout: str | None = None) -> dict:
     bench, _be = _bench_cases()
     models, _me = model_cases()
     real_terms = [c.term for c in [*bench, *models]]
-    proposals = propose(census_op, real_terms)
+    proposals = propose(census_op, real_terms, vocab)
     sink = _sink()
     cost_fn = _cost_fn(sink)
 
@@ -625,6 +654,7 @@ def run_pipeline(holdout: str | None = None) -> dict:
     ranked = rank(evs)
     return {
         "holdout": holdout,
+        "vocab": vocab,
         "n_search_rules": len(base_rules),
         "n_bench": len(bench),
         "n_models": len(models),
@@ -722,6 +752,7 @@ def _print_report(result: dict, top: int) -> None:
         f"   search rule set: {result['n_search_rules']} rules"
         + (f" (held out: {ho})" if ho else " (ALL_RULES)")
     )
+    print(f"   op vocabulary: {result.get('vocab', 'hand')}")
     print(
         f"   corpus: {result['n_bench']} bench + "
         f"{result['n_models']} models"
@@ -810,6 +841,7 @@ def _dump_json(path: str, result: dict) -> None:
     ranked: list[Evidence] = result["ranked"]
     payload = {
         "holdout": result["holdout"],
+        "vocab": result.get("vocab", "hand"),
         "n_search_rules": result["n_search_rules"],
         "n_bench": result["n_bench"],
         "n_models": result["n_models"],
@@ -859,9 +891,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", help="write machine-readable results")
     parser.add_argument("--top", type=int, default=_DEFAULT_TOP)
+    parser.add_argument(
+        "--vocab",
+        choices=("hand", "derived"),
+        default="hand",
+        help="the generator's op alphabet: hand-written tuples "
+        "(default) or property-classified over the corpus "
+        "(tools/law_vocab.py)",
+    )
     args = parser.parse_args(argv)
 
-    result = run_pipeline(args.holdout)
+    result = run_pipeline(args.holdout, args.vocab)
     _print_report(result, args.top)
     if args.json:
         _dump_json(args.json, result)
