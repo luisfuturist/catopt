@@ -49,6 +49,16 @@ def test_step_improves_and_rewards():
     assert env.progress > 0.0
 
 
+def test_reward_is_the_improvement_of_that_step():
+    """The reward is aligned to the step that produced it."""
+    env = SearchEnv(_chain(), all_rules(), horizon=6, patience=5)
+    env.reset()
+    before = env.cost
+    r = env.step("assoc_matmul")
+    assert r.reward == (before - r.cost) / before
+    assert env.cost == r.cost
+
+
 def test_patience_stops_the_episode():
     env = SearchEnv(_chain(), all_rules(), horizon=10, patience=1)
     env.reset()
