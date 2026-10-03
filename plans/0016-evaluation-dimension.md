@@ -11,16 +11,18 @@ the seams it reuses (plan 0006 `Strategy`, 0007 backend ports, 0010
 | 0 recon | done | `project/retros/four-dimension-recon.md` |
 | 1 boundaries | done | `catopt_core.ports`: `Profiler` / `Policy` / `PerformanceModel` |
 | 2 profiling | done | `catopt_core.features` (`ProgramFeatures`, `StaticProfiler`) |
-| 3 one GPU backend | partial | `catopt_core.failures` taxonomy + `Meter` contract; one CUDA backend |
+| 3 one GPU backend | done | `catopt_core.failures` taxonomy + `TimingResult` provenance/`timeout_s` + classified `TorchMeter`/autotune/CUDA-runner failures + `calibrate` provenance; one CUDA backend |
 | 4 evaluation | done | `catopt_core.pareto` (`CostVector`, `frontier`, `best`) |
 | 5 game API | done | `catopt_core.game` (`Action` / `GameState` / `RuleBook` / `transition` / `Evaluator`) |
 | 6 policies | done | `catopt_core.policies` (random / existing / greedy / beam-score) |
-| 7 learned policy | done | `catopt_core.trajectories` + `catopt_torch.learned_policy` + `tools/train_search_policy.py` |
+| 7 learned policy | done | supervised: `catopt_core.trajectories` + `catopt_torch.learned_policy` + `tools/train_search_policy.py`; **RL**: `catopt_core.search_env` + `catopt_torch.rl` + `tools/train_rl_policy.py` |
 | 8 performance model | done | `catopt_core.perf_model` (`AnalyticalPerformanceModel`) |
-| 9–12 | not started | API / docs / tests / benchmarks |
+| 9–11 | done | `docs/evaluation.md`; property tests |
+| 12 benchmarks | done | `bench/suites/evaluation/policy_value.py` |
 
-Stage 7's measured result and findings:
-`project/retros/stage7-learned-policy-results.md`.
+Stage 7's measured results:
+`project/retros/stage7-learned-policy-results.md` (supervised) and
+`project/retros/stage7-rl-results.md` (RL).
 
 ## Goal
 
