@@ -29,10 +29,14 @@ single-player contraction game.
   target and the **achieved (normalised) episode cost** is the value
   target.  Search improves the net; the net improves search.
 
-The state/action features are **unchanged** — ``ContractionGame``'s
-``state_features`` / ``pair_feature_matrix`` are called exactly as the
-throughput retro left them, so the new net is a fair successor of the
-old one on the same inputs.
+The state/action features are the ``ContractionGame`` features
+(``state_features`` / ``pair_feature_matrix``) plus one appended column:
+the board's ``log2(greedy_ref)`` (see :func:`_sf`).  That column exists
+because the value target is normalised by ``greedy_ref``, which is *not*
+otherwise observable to the net — without it the same remaining cost
+gets a different label on every board and the value head cannot fit it
+(``contraction-value-head.md`` measures the rank collapse: 0.51 -> 0.89
+once the normaliser is observable).
 
 Usage::
 
@@ -60,8 +64,27 @@ from torch.nn import functional as F
 
 __all__ = ["main"]
 
-#: State feature width (unchanged).
-_STATE_DIM = cp._STATE_DIM
+#: State feature width: the game's own features plus the board scale.
+_STATE_DIM = cp._STATE_DIM + 1
+
+
+def _sf(game: cp.ContractionGame) -> list[float]:
+    """State features plus the board's ``log2`` greedy reference.
+
+    The value target is normalised by the board's greedy reference
+    (``value_unit="ref"``), which is *not* one of the game's features —
+    so the net cannot observe the very scale it is asked to predict
+    against, and the same remaining cost gets a different label on every
+    board.  Appending ``log2(ref)`` makes the normaliser observable and
+    the regression target consistent across boards, while keeping the
+    target scale-free (so it generalises to larger ``n``).
+    """
+    ref = game.greedy_ref
+    return [
+        *game.state_features(),
+        math.log2(ref) if ref > 0 else 0.0,
+    ]
+
 
 #: Pair feature width (unchanged).
 _PAIR_DIM = cp._PAIR_DIM
@@ -76,6 +99,23 @@ _NOISE_EPS = 0.25
 #: Clamp on the raw value output before ``expm1`` (an untrained head can
 #: emit anything; the log-space target lives in ``[0, ~5]``).
 _VALUE_CLAMP = 20.0
+
+#: Value-target normalisation.  ``"ref"`` divides the remaining cost by
+#: the *board's* greedy reference (the original choice); ``"abs"`` keeps
+#: it absolute.  The board reference is unobservable to the net, so
+#: ``"ref"`` makes the regression target inconsistent across boards —
+#: the same remaining cost gets a different label on every board, and
+#: the net cannot undo it.  The search always works in
+#: ``remaining / ref`` units, so every unit is inverted back to that.
+_VALUE_UNITS = ("ref", "abs")
+
+
+def _invert_value(raw: float, unit: str, ref: float) -> float:
+    """Invert a value-head output to the search's ``remaining / ref``."""
+    if unit == "abs":
+        return math.expm1(raw) / ref if ref > 0 else 0.0
+    return math.expm1(raw)
+
 
 #: One collected training sample: state features, pair features, the
 #: search's visit distribution and the cost already paid at that state.
@@ -159,7 +199,7 @@ def _fit_norm_dual(
                 tensors, sizes, cs.greedy(tensors, sizes)
             )
             while not g.done:
-                states.append(g.state_features())
+                states.append(_sf(g))
                 pairs.extend(g.all_pair_features())
                 g.step(*g.pairs[0])
     s = torch.tensor(states, dtype=torch.float32)
@@ -197,6 +237,7 @@ def _expand_many(
     device: str,
     *,
     use_net_value: bool,
+    value_unit: str = "ref",
 ) -> None:
     """Expand a batch of nodes in one net forward.
 
@@ -215,7 +256,7 @@ def _expand_many(
         return
     widths = [len(nd.game.pairs) for nd in live]
     width = max(widths)
-    sf = np.stack([nd.game.state_features() for nd in live])
+    sf = np.stack([_sf(nd.game) for nd in live])
     pf = np.zeros((len(live), width, _PAIR_DIM), dtype=np.float64)
     for i, nd in enumerate(live):
         m = nd.game.pair_feature_matrix()
@@ -233,13 +274,13 @@ def _expand_many(
         e = np.exp(row - row.max())
         nd.priors = e / e.sum()
         if use_net_value:
-            # The value head predicts the normalised *remaining* cost in
-            # log space (see ``train_search``); the search works in linear
-            # cost units, so invert here.
+            # The value head predicts the *remaining* cost in log space
+            # under ``value_unit`` (see ``train_search``); the search
+            # works in ``remaining / ref`` units, so invert here.
             raw = min(
                 max(float(value_np[i]), -_VALUE_CLAMP), _VALUE_CLAMP
             )
-            nd.value = math.expm1(raw)
+            nd.value = _invert_value(raw, value_unit, nd.ref)
         else:
             nd.value = cs.greedy(nd.game.ts, nd.game.sizes) / nd.ref
         nd.n = np.zeros(k, dtype=np.float64)
@@ -327,6 +368,7 @@ def _simulate_locked(
     device: str,
     *,
     use_net_value: bool = True,
+    value_unit: str = "ref",
 ) -> None:
     """Run one PUCT simulation for each root, batching the leaf evals."""
     walks = [_descend(root) for root in roots]
@@ -335,6 +377,7 @@ def _simulate_locked(
         [leaf for _p, leaf in walks],
         device,
         use_net_value=use_net_value,
+        value_unit=value_unit,
     )
     for path, leaf in walks:
         _backup(path, _leaf_value(leaf))
@@ -363,6 +406,7 @@ def puct_episodes(
     device: str,
     noise_seeds: list[int | None] | None = None,
     use_net_value: bool = True,
+    value_unit: str = "ref",
     collect: bool = False,
 ) -> list[tuple[list[tuple[int, int]], float, list[_Sample]]]:
     """Play one PUCT episode per instance, in lockstep.
@@ -380,7 +424,13 @@ def puct_episodes(
         _Node(cp.ContractionGame(tensors, sizes, ref), ref)
         for tensors, sizes, ref in instances
     ]
-    _expand_many(model, roots, device, use_net_value=use_net_value)
+    _expand_many(
+        model,
+        roots,
+        device,
+        use_net_value=use_net_value,
+        value_unit=value_unit,
+    )
     if noise_seeds is not None:
         for root, nseed in zip(roots, noise_seeds, strict=True):
             if nseed is not None:
@@ -395,6 +445,7 @@ def puct_episodes(
                 model,
                 device,
                 use_net_value=use_net_value,
+                value_unit=value_unit,
             )
         fresh: list[_Node] = []
         for i in active:
@@ -411,7 +462,7 @@ def puct_episodes(
             if collect:
                 samples[i].append(
                     (
-                        root.game.state_features(),
+                        _sf(root.game),
                         root.game.pair_feature_matrix().tolist(),
                         pi.tolist(),
                         root.game.cost,
@@ -427,7 +478,11 @@ def puct_episodes(
             roots[i] = child
         if fresh:
             _expand_many(
-                model, fresh, device, use_net_value=use_net_value
+                model,
+                fresh,
+                device,
+                use_net_value=use_net_value,
+                value_unit=value_unit,
             )
         active = [i for i in active if not roots[i].terminal]
     return [
@@ -446,6 +501,7 @@ def puct_episode(
     device: str,
     noise_seed: int | None = None,
     use_net_value: bool = True,
+    value_unit: str = "ref",
     collect: bool = False,
 ) -> tuple[list[tuple[int, int]], float, list[_Sample]]:
     """Play one episode by PUCT; return ``(order, cost, samples)``."""
@@ -456,6 +512,7 @@ def puct_episode(
         device=device,
         noise_seeds=[noise_seed],
         use_net_value=use_net_value,
+        value_unit=value_unit,
         collect=collect,
     )[0]
 
@@ -467,6 +524,7 @@ def _puct_prior(
     device: str,
     *,
     use_net_value: bool = True,
+    value_unit: str = "ref",
 ) -> tuple[float, float]:
     """Warm per-simulation seconds for the PUCT player on this board.
 
@@ -477,7 +535,7 @@ def _puct_prior(
     ref = cs.greedy(tensors, sizes)
     inst = (tensors, sizes, ref)
     steps = max(len(tensors) - 1, 1)
-    kw = {"use_net_value": use_net_value}
+    kw = {"use_net_value": use_net_value, "value_unit": value_unit}
     puct_episodes(model, [inst] * 8, sims=4, device=device, **kw)
     t0 = time.perf_counter()
     puct_episodes(model, [inst], sims=8, device=device, **kw)
@@ -501,6 +559,7 @@ def puct_best_order(
     per_sim: float,
     per_sim_b1: float,
     use_net_value: bool = True,
+    value_unit: str = "ref",
     batch_episodes: int = 8,
 ) -> tuple[list[tuple[int, int]], float, int, int]:
     """Anytime PUCT: best episode found within ``budget`` seconds.
@@ -547,6 +606,7 @@ def puct_best_order(
             device=device,
             noise_seeds=seeds,
             use_net_value=use_net_value,
+            value_unit=value_unit,
         )
         for order, cost, _ in results:
             if cost < best_cost:
@@ -598,6 +658,7 @@ def train_search(
     hidden: int = 64,
     lr: float = 1e-3,
     value_coef: float = 1.0,
+    value_unit: str = "ref",
     device: str = "cuda",
     seed: int = 0,
     log_every: int = 0,
@@ -612,13 +673,19 @@ def train_search(
     of the analytic greedy-completion critic, and the loop in which search
     teaches the net and the net sharpens search.
 
-    The value target is ``log1p(remaining / greedy_ref)`` with
-    ``remaining = episode_cost - cost_so_far``.  The remaining cost is
+    The value target is ``log1p(remaining / scale)`` with
+    ``remaining = episode_cost - cost_so_far`` and ``scale`` set by
+    ``value_unit`` (see :data:`_VALUE_UNITS`): the *board's* greedy
+    reference (``"ref"``, the original) or nothing (``"abs"``).  The
+    remaining cost is
     *path-independent* (a function of the state's tensor multiset alone),
     so it is far easier to fit — and to discriminate siblings by — than
     the total episode cost, which is dominated by the path.  The log
-    makes the regression scale-free (the raw ratio spans 0.1-100+) and
-    the search inverts it with ``expm1``.
+    makes the regression scale-free and the search inverts it with
+    ``expm1``.  ``"ref"`` is *not* scale-free across boards: the board
+    reference is unobservable to the net, so the same remaining cost
+    gets a different label on every board and the net cannot undo it —
+    ``contraction_value_probe`` measures the resulting rank collapse.
     """
     torch.manual_seed(seed)
     rng = random.Random(seed)
@@ -638,7 +705,12 @@ def train_search(
             insts.append((tensors, sizes, ref))
             refs.append(ref)
         results = puct_episodes(
-            model, insts, sims=sims, device=device, collect=True
+            model,
+            insts,
+            sims=sims,
+            device=device,
+            value_unit=value_unit,
+            collect=True,
         )
         samples: list[_Sample] = []
         targets: list[float] = []
@@ -648,8 +720,9 @@ def train_search(
             for s, p, dist, paid in data:
                 samples.append((s, p, dist, paid))
                 remaining = max(cost - paid, 0.0)
+                scale = ref if value_unit == "ref" else 1.0
                 targets.append(
-                    math.log1p(remaining / ref) if ref > 0 else 0.0
+                    math.log1p(remaining / scale) if scale > 0 else 0.0
                 )
         model.train()
         last = 0.0
@@ -696,6 +769,7 @@ class _AzCfg:
     budget: float
     seed: int
     batch_episodes: int = 8
+    value_unit: str = "ref"
 
 
 def _run_az_board(
@@ -743,6 +817,7 @@ def _run_az_board(
         seed=cfg.seed,
         per_sim=cfg.per_sim,
         per_sim_b1=cfg.per_sim_b1,
+        value_unit=cfg.value_unit,
         batch_episodes=cfg.batch_episodes,
     )
     out["puct"] = ce._res(tensors, sizes, e, order, secs, sims)
@@ -819,6 +894,7 @@ def _measure_az(
     *,
     puct_analytic: bool,
     batch_episodes: int,
+    value_unit: str = "ref",
 ) -> list[tuple[float, int, list[dict[str, ce._Res]]]]:
     """Run every player on every board once; return the raw results."""
     data: list[tuple[float, int, list[dict[str, ce._Res]]]] = []
@@ -828,10 +904,20 @@ def _measure_az(
             for k in range(instances):
                 tensors, sizes = ce.random_bond_network(n, seed + k)
                 b1, b8 = _puct_prior(
-                    models["az"], tensors, sizes, device
+                    models["az"],
+                    tensors,
+                    sizes,
+                    device,
+                    value_unit=value_unit,
                 )
                 cfg = _AzCfg(
-                    sims, b8, b1, budget, seed + k, batch_episodes
+                    sims,
+                    b8,
+                    b1,
+                    budget,
+                    seed + k,
+                    batch_episodes,
+                    value_unit,
                 )
                 boards.append(
                     _run_az_board(
@@ -974,13 +1060,25 @@ def _verdict_az(
 
 
 def _warm_az(
-    scales: tuple[int, ...], model: DualHeadNet, device: str
+    scales: tuple[int, ...],
+    model: DualHeadNet,
+    device: str,
+    *,
+    value_unit: str = "ref",
 ) -> None:
     """Warm the net's kernels before any board is timed."""
     for n in scales:
         tensors, sizes = ce.random_bond_network(n, 0)
         ref = cs.greedy(tensors, sizes)
-        puct_episode(model, tensors, sizes, ref, sims=4, device=device)
+        puct_episode(
+            model,
+            tensors,
+            sizes,
+            ref,
+            sims=4,
+            device=device,
+            value_unit=value_unit,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1037,6 +1135,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also run PUCT with the analytic greedy-completion value",
     )
+    ap.add_argument(
+        "--value-unit",
+        default="ref",
+        choices=_VALUE_UNITS,
+        help="value-target scale: 'ref' (board greedy ref, the original) "
+        "or 'abs' (absolute remaining cost)",
+    )
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
 
@@ -1073,6 +1178,7 @@ def main(argv: list[str] | None = None) -> int:
                 sims=args.sims,
                 epochs=args.epochs,
                 hidden=args.hidden,
+                value_unit=args.value_unit,
                 device=dev,
                 seed=args.seed,
             )
@@ -1087,7 +1193,7 @@ def main(argv: list[str] | None = None) -> int:
     budgets = tuple(
         1e-3 * float(x) for x in args.budgets.split(",") if x.strip()
     )
-    _warm_az(scales, models["az"], dev)
+    _warm_az(scales, models["az"], dev, value_unit=args.value_unit)
     eval_sims = args.eval_sims or args.sims
     data = _measure_az(
         budgets,
@@ -1099,6 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
         eval_sims,
         puct_analytic=args.puct_analytic,
         batch_episodes=args.batch_episodes,
+        value_unit=args.value_unit,
     )
     _ladder_az(data, args.puct_analytic)
     _pairwise_az(data, puct_analytic=args.puct_analytic)
