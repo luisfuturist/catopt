@@ -19,6 +19,11 @@ The *data* half — the profile type, persistence, buckets and
 correction math — lives in torch-free :mod:`catopt_core.profile`
 (plan 0007 split) and is re-exported here so the historical import
 paths (``catopt_torch.calibrate.TargetProfile`` and friends) keep working.
+
+Every probe reduces its timed samples through the one timing
+contract, :mod:`catopt_core.timing` (median + IQR), so calibration
+and the :class:`~catopt_core.ports.Meter` port agree on what a
+measurement's summary number is.
 """
 
 from __future__ import annotations
@@ -26,7 +31,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import platform
-import statistics
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -53,6 +57,7 @@ from catopt_core.profile import (
     save_profile,
     shape_bucket,
 )
+from catopt_core.timing import median
 
 __all__ = [
     "PROFILE_DIR_ENV",
@@ -278,7 +283,8 @@ def _timed_median(
 
     Median-of-reps instead of a single timed block: Python-side eval
     overhead is noise-dominated at this scale, so a GC pause or
-    scheduler blip must not set the constant.
+    scheduler blip must not set the constant.  The reduction is
+    :func:`catopt_core.timing.median` — the one timing contract.
     """
     times = []
     for _ in range(reps):
@@ -288,7 +294,7 @@ def _timed_median(
             fn()
         _sync(dev)
         times.append(time.perf_counter() - t0)
-    return statistics.median(times)
+    return median(times)
 
 
 def _measure_dispatch(

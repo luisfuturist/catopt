@@ -2,6 +2,11 @@
 
 ``Runner`` is deliberately the *only* place that times anything: suites
 describe ``Case``/``Variant`` data and never call a clock themselves.
+
+The per-cell median/IQR are reduced through the one timing contract,
+:mod:`catopt_core.timing`, so the harness reports the same summary
+statistics as the production :class:`~catopt_core.ports.Meter` port;
+``torch.utils.benchmark`` only supplies the raw per-call samples.
 """
 
 from __future__ import annotations
@@ -9,6 +14,7 @@ from __future__ import annotations
 import gc
 
 import torch
+from catopt_core.timing import iqr, median
 from torch.utils.benchmark import Timer
 
 from bench.benchkit.model import Case, Cell
@@ -76,8 +82,9 @@ class Runner:
             meas = timer.blocked_autorange(
                 min_run_time=self.min_run_time
             )
-            medians[v.name] = meas.median
-            iqrs[v.name] = meas.iqr
+            times = meas.times
+            medians[v.name] = median(times)
+            iqrs[v.name] = iqr(times)
             # Timed stmts close over the cell's model + input tensors;
             # a Cell kept for the report would hold that GPU working
             # set for the rest of the sweep.  Timing is the only

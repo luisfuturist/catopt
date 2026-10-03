@@ -683,7 +683,10 @@ class TimingResult:
 
     ``median_s`` is the median seconds of one forward;
     ``iqr_s`` the interquartile spread (0 when fewer than 4 samples);
-    ``n_calls`` the number of timed calls the measurement ran.
+    ``n_calls`` the number of timed calls the measurement ran.  These
+    three follow the one timing contract,
+    :mod:`catopt_core.timing` — the median/IQR reduction and the
+    warmup/call-count semantics every measurement path shares.
 
     The trailing fields are optional provenance (plan 0016 stage 3).
     ``device`` names where the run happened (``"cuda:0"`` / ``"cpu"``;

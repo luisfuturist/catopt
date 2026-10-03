@@ -6,6 +6,10 @@ then ``n_calls`` timed forwards, median + IQR of wall seconds.
 CUDA inputs end every timed call in ``torch.cuda.synchronize`` so the
 measured time includes the GPU tail.
 
+The warmup/call-count semantics and the median/IQR reduction are
+:mod:`catopt_core.timing`'s one contract — the meter only owns the
+device-specific timed loop.
+
 Plan 0016 stage 3 gives the measurement provenance and a classified
 outcome: the returned :class:`~catopt_core.ports.TimingResult` carries
 the input ``device`` and the ``warmup`` count, and a call that raises
@@ -16,13 +20,13 @@ the input ``device`` and the ``warmup`` count, and a call that raises
 
 from __future__ import annotations
 
-import statistics
 import time
 from typing import Any
 
 import torch
 from catopt_core.failures import FailureClass, classify
 from catopt_core.ports import TimingResult
+from catopt_core.timing import iqr, median, warmup_calls
 
 __all__ = ["TorchMeter"]
 
@@ -83,8 +87,7 @@ class TorchMeter:
         args = _input_args(inputs)
         is_cuda = _input_is_cuda(inputs)
         device = _input_device(inputs)
-        n_warm = max(warmup, 0)
-        calls = max(n_calls, 1)
+        n_warm, calls = warmup_calls(warmup, n_calls)
 
         def call() -> None:
             with torch.no_grad():
@@ -123,15 +126,9 @@ class TorchMeter:
                 warmup=n_warm,
                 failure=classify(exc),
             )
-        med = statistics.median(times)
-        if len(times) >= 4:
-            q1, _, q3 = statistics.quantiles(times, n=4)
-            iqr = q3 - q1
-        else:
-            iqr = 0.0
         return TimingResult(
-            median_s=med,
-            iqr_s=iqr,
+            median_s=median(times),
+            iqr_s=iqr(times),
             n_calls=calls,
             device=device,
             warmup=n_warm,
