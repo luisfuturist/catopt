@@ -21,6 +21,21 @@ instances and loses by exactly **one kernel dispatch** on the rest
 everything enumerated.  The gap is an *all-or-nothing* artefact, not a
 search-coverage one.
 
+> **Fixed (later).**  The all-or-nothing artefact is gone: the group
+> decision is now **per-group** (commit `ab14439`), so the extractor
+> can fuse a profitable group while declining an unprofitable one.
+> Measured on this family: **92.2 % → 100 % at the optimum**,
+> 4 instances improved, **0 regressions**; widening
+> (`--instances 120 --space-cap 16384`): 79 → 85 at-opt, 6 improved,
+> 0 worse.  The numbers below are the *pre-fix* baseline and are kept
+> as the record of what the gap was.
+>
+> One correction the fix surfaced: this retro's "1-3 groups" holds for
+> *this probe family*, but a real model feeds `extract_paired` **~90
+> groups** (a 4-block MiniGPT through `_reify_merge`).  The exhaustive
+> branch is therefore capped at G ≤ 3, with a bounded fallback above
+> it that can never be worse than the old all-forced term.
+
 Reproduce: `.venv/bin/python tools/coordination_probe.py`
 (~80 s, CPU-only, seeded, no torch).  `--instances N --space-cap C`
 widen the sweep.
