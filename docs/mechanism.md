@@ -91,7 +91,7 @@ Two more consequences worth stating plainly:
 | Saturate | `EGraph` |
 | Extract | `extract_best`, `backend_cost` |
 | Certify | `verify_certificate` |
-| Evaluate | `catopt_core.features` (planned, ADR 0003); `Meter` / `TargetProfile` for measurements |
+| Evaluate | `catopt_core.features` (`ProgramFeatures`, `StaticProfiler`) · `SearchResult.frontier` · `PredictedCriterion`; `Meter` / `TargetProfile` for measurements |
 
 ## See also
 
