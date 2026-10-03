@@ -521,12 +521,12 @@ def _run_board(
     order, secs, rolls = our_restart_order(tensors, sizes, budget, seed)
     out["our-restart"] = _res(tensors, sizes, e, order, secs, rolls)
 
-    for model in models.values():
+    for name, model in models.items():
         prior = _policy_prior(model, tensors, sizes, device)
         order, secs, rolls = policy_best_order(
             model, tensors, sizes, ref, budget, device, prior, seed
         )
-        out["learned"] = _res(tensors, sizes, e, order, secs, rolls)
+        out[name] = _res(tensors, sizes, e, order, secs, rolls)
 
     t0 = time.perf_counter()
     order = oe_greedy_order(e)
@@ -555,7 +555,6 @@ def _run_board(
 _PLAYERS = (
     "our-greedy",
     "our-restart",
-    "learned",
     "oe-greedy",
     "oe-rand-greedy",
     "oe-optimal",
@@ -563,8 +562,13 @@ _PLAYERS = (
 
 
 def _players(models: dict[str, Any]) -> tuple[str, ...]:
-    """Return the players to report, dropping ``learned`` if untrained."""
-    return tuple(p for p in _PLAYERS if p != "learned" or models)
+    """Return the players to report, with learned models in place."""
+    out: list[str] = []
+    for p in _PLAYERS:
+        out.append(p)
+        if p == "our-restart":
+            out.extend(models)
+    return tuple(out)
 
 
 def _num(v: float, width: int, fmt: str = ".3f") -> str:
@@ -758,7 +762,7 @@ def _pairwise_table(
         "(mean; <1 = learned wins) =="
     )
     head = (
-        f"  {'ms':>6} {'n':>3} "
+        f"  {'ms':>6} {'n':>3} {'player':>15} "
         + " ".join(f"{'our/' + c:>16}" for c in cols)
         + " "
         + " ".join(f"{'oe/' + c:>16}" for c in cols)
@@ -775,27 +779,28 @@ def _pairwise_table(
         )
 
     for budget, n, boards in data:
-        our_r: dict[str, list[float]] = {c: [] for c in cols}
-        oe_r: dict[str, list[float]] = {c: [] for c in cols}
-        for d in boards:
-            learned = d["learned"]
-            for c in cols:
-                our_r[c].append(
-                    learned.our / d[c].our
-                    if d[c].our < float("inf")
-                    else float("nan")
-                )
-                oe_r[c].append(
-                    learned.oe / d[c].oe
-                    if d[c].oe < float("inf")
-                    else float("nan")
-                )
-        print(
-            f"  {1e3 * budget:>6.0f} {n:>3} "
-            + " ".join(_cell(our_r[c]) for c in cols)
-            + " "
-            + " ".join(_cell(oe_r[c]) for c in cols)
-        )
+        for name in models:
+            our_r: dict[str, list[float]] = {c: [] for c in cols}
+            oe_r: dict[str, list[float]] = {c: [] for c in cols}
+            for d in boards:
+                learned = d[name]
+                for c in cols:
+                    our_r[c].append(
+                        learned.our / d[c].our
+                        if d[c].our < float("inf")
+                        else float("nan")
+                    )
+                    oe_r[c].append(
+                        learned.oe / d[c].oe
+                        if d[c].oe < float("inf")
+                        else float("nan")
+                    )
+            print(
+                f"  {1e3 * budget:>6.0f} {n:>3} {name:>15} "
+                + " ".join(_cell(our_r[c]) for c in cols)
+                + " "
+                + " ".join(_cell(oe_r[c]) for c in cols)
+            )
 
 
 def _real_section(
@@ -812,8 +817,9 @@ def _real_section(
     ]
     head = (
         f"  {'case':>18} {'ops':>4} {'our-greedy':>11} "
-        f"{'our-restart':>12} {'learned':>9} {'oe-greedy':>10} "
-        f"{'oe-optimal':>11} {'verified':>9}"
+        f"{'our-restart':>12} "
+        + " ".join(f"{name:>12}" for name in models)
+        + f" {'oe-greedy':>10} {'oe-optimal':>11} {'verified':>9}"
     )
     print(head)
     print("-" * len(head))
@@ -825,12 +831,14 @@ def _real_section(
         orders = [r.order for r in found.values() if r.order]
         ok = _verify_real(e, orders)
         opt_cost = oe_cost_of_order(e, opt) if opt else float("nan")
-        learned_oe = found["learned"].oe if models else float("nan")
+        learned = " ".join(
+            f"{found[name].oe:>12.4g}" for name in models
+        )
         print(
             f"  {label:>18} {len(tensors):>4} "
             f"{found['our-greedy'].oe:>11.4g} "
             f"{found['our-restart'].oe:>12.4g} "
-            f"{learned_oe:>9.4g} "
+            f"{learned} "
             f"{found['oe-greedy'].oe:>10.4g} "
             f"{opt_cost:>11.4g} "
             f"{('yes' if ok else 'NO'):>9}"
@@ -893,6 +901,16 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated per-instance budgets (ms)",
     )
     ap.add_argument("--trainer", default="rl", choices=("rl", "none"))
+    ap.add_argument(
+        "--train-scales",
+        default="8,10,12",
+        help="comma-separated n the 'learned' policy trains on",
+    )
+    ap.add_argument(
+        "--compare-scales",
+        default="",
+        help="comma-separated n for a second 'learned-scale' policy",
+    )
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
 
@@ -903,19 +921,43 @@ def main(argv: list[str] | None = None) -> int:
         f"device: {dev}  (torch {torch.__version__}, "
         f"opt_einsum {oe.__version__})"
     )
+    base_ns = tuple(
+        int(x) for x in args.train_scales.split(",") if x.strip()
+    )
+    cmp_ns = tuple(
+        int(x) for x in args.compare_scales.split(",") if x.strip()
+    )
 
     models: dict[str, Any] = {}
     if args.trainer != "none":
-        t0 = time.perf_counter()
         with _on_family(random_bond_network):
-            models["rl"] = cp.train_rl(
+            t0 = time.perf_counter()
+            models["learned"] = cp.train_rl(
+                ns=base_ns,
                 iterations=args.iterations,
                 batch=args.batch,
                 hidden=args.hidden,
                 device=dev,
                 seed=args.seed,
             )
-        print(f"trained rl in {time.perf_counter() - t0:.1f}s")
+            print(
+                f"trained learned ({base_ns}) in "
+                f"{time.perf_counter() - t0:.1f}s"
+            )
+            if cmp_ns:
+                t0 = time.perf_counter()
+                models["learned-scale"] = cp.train_rl(
+                    ns=cmp_ns,
+                    iterations=args.iterations,
+                    batch=args.batch,
+                    hidden=args.hidden,
+                    device=dev,
+                    seed=args.seed,
+                )
+                print(
+                    f"trained learned-scale ({cmp_ns}) in "
+                    f"{time.perf_counter() - t0:.1f}s"
+                )
 
     scales = tuple(int(x) for x in args.scales.split(",") if x.strip())
     control = tuple(

@@ -652,32 +652,133 @@ def dp_optimal_order(
     return f[(1 << n) - 1], merges, xor
 
 
-def _imitation_dataset(
-    ns: tuple[int, ...], per_n: int, rng: random.Random
+def _dp_index_order(
+    tensors: Any, sizes: dict[int, int]
+) -> list[tuple[int, int]]:
+    """Return a DP-optimal order as current-position index pairs."""
+    _cost, merges, _xor = dp_optimal_order(tensors, sizes)
+    cur = [1 << i for i in range(len(tensors))]
+    order: list[tuple[int, int]] = []
+    for mask_l, mask_r in merges:
+        a = cur.index(mask_l)
+        b = cur.index(mask_r)
+        order.append((min(a, b), max(a, b)))
+        cur = [m for k, m in enumerate(cur) if k not in (a, b)] + [
+            mask_l | mask_r
+        ]
+    return order
+
+
+def _random_greedy_order(
+    tensors: Any,
+    sizes: dict[int, int],
+    rng: random.Random,
+    top_k: int,
+) -> list[tuple[int, int]]:
+    """One randomised-greedy episode as current-position index pairs."""
+    ts = [frozenset(t) for t in tensors]
+    order: list[tuple[int, int]] = []
+    while len(ts) > 1:
+        cands = sorted(
+            (cs.pair_cost(ts[a], ts[b], sizes), a, b)
+            for a, b in cs._pairs(ts)
+        )
+        _c, a, b = cands[rng.randrange(min(top_k, len(cands)))]
+        order.append((a, b))
+        ts = _merge_ts(ts, a, b)
+    return order
+
+
+def _order_cost(
+    tensors: Any, sizes: dict[int, int], order: list[tuple[int, int]]
+) -> float:
+    """Replay an index-pair order and sum the pairwise cost."""
+    ts = [frozenset(t) for t in tensors]
+    total = 0.0
+    for a, b in order:
+        total += cs.pair_cost(ts[a], ts[b], sizes)
+        ts = _merge_ts(ts, a, b)
+    return total
+
+
+def _restart_order(
+    tensors: Any,
+    sizes: dict[int, int],
+    rng: random.Random,
+    restarts: int,
+    top_k: int,
+) -> list[tuple[int, int]]:
+    """Best-of-``restarts`` randomised-greedy order (the cheap teacher)."""
+    best = _random_greedy_order(tensors, sizes, rng, 1)
+    best_cost = _order_cost(tensors, sizes, best)
+    for _ in range(restarts):
+        order = _random_greedy_order(tensors, sizes, rng, top_k)
+        cost = _order_cost(tensors, sizes, order)
+        if cost < best_cost:
+            best, best_cost = order, cost
+    return best
+
+
+def _make_teacher(
+    kind: str, dp_max: int, restarts: int, top_k: int
+) -> Callable[
+    [Any, dict[int, int], random.Random], list[tuple[int, int]]
+]:
+    """Build a teacher: exact DP where affordable, else best-of-restart.
+
+    The DP is ``O(3^n)`` and so only affordable to ``dp_max``; beyond it
+    the teacher falls back to a multi-restart best-of — the strongest
+    cheap player available at that scale.  ``kind="dp"`` uses the DP up
+    to ``dp_max`` and the restart fallback above; ``kind="restart"``
+    uses the restart best-of at every scale.
+    """
+
+    def _teacher(
+        tensors: Any, sizes: dict[int, int], rng: random.Random
+    ) -> list[tuple[int, int]]:
+        if kind == "dp" and len(tensors) <= dp_max:
+            return _dp_index_order(tensors, sizes)
+        return _restart_order(tensors, sizes, rng, restarts, top_k)
+
+    return _teacher
+
+
+def _replay_samples(
+    tensors: Any,
+    sizes: dict[int, int],
+    order: list[tuple[int, int]],
+    n0: int,
 ) -> list[tuple[ContractionGame, tuple[int, int]]]:
-    """Build ``(state, optimal action)`` samples from DP-optimal orders."""
+    """Turn a teacher's index-pair order into ``(state, action)`` samples."""
+    ref = cs.greedy(tensors, sizes)
+    ts = [frozenset(t) for t in tensors]
+    acc = 0.0
+    out: list[tuple[ContractionGame, tuple[int, int]]] = []
+    for a, b in order:
+        game = ContractionGame(ts, sizes, ref, n0=n0, cost=acc)
+        out.append((game, (min(a, b), max(a, b))))
+        acc += cs.pair_cost(ts[a], ts[b], sizes)
+        ts = _merge_ts(ts, a, b)
+    return out
+
+
+def _imitation_dataset(
+    ns: tuple[int, ...],
+    per_n: int,
+    rng: random.Random,
+    teacher: Callable[
+        [Any, dict[int, int], random.Random], list[tuple[int, int]]
+    ],
+) -> list[tuple[ContractionGame, tuple[int, int]]]:
+    """Build ``(state, teacher action)`` samples from teacher orders."""
     data: list[tuple[ContractionGame, tuple[int, int]]] = []
     for n0 in ns:
         for _ in range(per_n):
             tensors, sizes = cs.random_network(
                 n0, rng.randrange(1 << 30)
             )
-            _cost, merges, xor = dp_optimal_order(tensors, sizes)
-            ref = cs.greedy(tensors, sizes)
-            cur = [1 << i for i in range(n0)]
-            acc = 0.0
-            for mask_l, mask_r in merges:
-                a = cur.index(mask_l)
-                b = cur.index(mask_r)
-                state = [xor[m] for m in cur]
-                game = ContractionGame(
-                    state, sizes, ref, n0=n0, cost=acc
-                )
-                data.append((game, (min(a, b), max(a, b))))
-                acc += cs.pair_cost(xor[mask_l], xor[mask_r], sizes)
-                cur = [
-                    m for k, m in enumerate(cur) if k not in (a, b)
-                ] + [mask_l | mask_r]
+            order = teacher(tensors, sizes, rng)
+            data.extend(_replay_samples(tensors, sizes, order, n0))
     return data
 
 
@@ -691,17 +792,28 @@ def train_imitation(
     lr: float = 3e-3,
     device: str = "cuda",
     seed: int = 0,
+    teacher: str = "dp",
+    dp_max: int = 14,
+    restarts: int = 64,
+    top_k: int = 3,
 ) -> nn.Module:
-    """Train a :class:`PairPolicyNet` to imitate the DP-optimal action.
+    """Train a :class:`PairPolicyNet` to imitate a teacher's action.
 
-    The label is the optimal pair at each state along a DP-optimal
-    order; the loss is a masked cross-entropy over the legal pairs.
+    The label is the teacher's pair at each state along its order; the
+    loss is a masked cross-entropy over the legal pairs.  ``teacher``
+    is ``"dp"`` (the exact subset DP up to ``dp_max``, the strongest
+    signal where it is affordable, falling back to a multi-restart
+    best-of beyond it) or ``"restart"`` (the multi-restart best-of at
+    every scale).  The teacher is the only thing that scales with ``n``
+    — the features, the net and the loss are unchanged.
     """
     torch.manual_seed(seed)
     rng = random.Random(seed)
     model = PairPolicyNet(hidden).to(device)
     _fit_norm(model, ns, rng, device)
-    data = _imitation_dataset(ns, per_n, rng)
+    data = _imitation_dataset(
+        ns, per_n, rng, _make_teacher(teacher, dp_max, restarts, top_k)
+    )
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     for _ in range(epochs):
         rng.shuffle(data)
@@ -1490,6 +1602,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--instances", type=int, default=3)
     ap.add_argument(
+        "--train-scales",
+        default="8,10,12",
+        help="comma-separated n the policies are trained on",
+    )
+    ap.add_argument(
+        "--teacher",
+        default="dp",
+        choices=("dp", "restart"),
+        help="imitation teacher: exact DP (to --dp-max) or restart",
+    )
+    ap.add_argument(
+        "--dp-max",
+        type=int,
+        default=14,
+        help="largest n the imitation DP teacher runs at",
+    )
+    ap.add_argument(
         "--scales",
         default="20,30,40",
         help="comma-separated n at scale",
@@ -1516,11 +1645,16 @@ def main(argv: list[str] | None = None) -> int:
     if dev == "auto":
         dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {dev}  (torch {torch.__version__})")
+    train_ns = tuple(
+        int(x) for x in args.train_scales.split(",") if x.strip()
+    )
+    print(f"train scales: {train_ns}  (teacher: {args.teacher})")
 
     models: dict[str, nn.Module] = {}
     if args.trainer in ("rl", "both"):
         t0 = time.perf_counter()
         models["rl"] = train_rl(
+            ns=train_ns,
             iterations=args.iterations,
             batch=args.batch,
             hidden=args.hidden,
@@ -1532,11 +1666,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.trainer in ("imitation", "both"):
         t0 = time.perf_counter()
         models["imitation"] = train_imitation(
+            ns=train_ns,
             per_n=args.per_n,
             epochs=args.epochs,
             hidden=args.hidden,
             device=dev,
             seed=args.seed,
+            teacher=args.teacher,
+            dp_max=args.dp_max,
         )
         print(f"trained imitation in {time.perf_counter() - t0:.1f}s")
 
