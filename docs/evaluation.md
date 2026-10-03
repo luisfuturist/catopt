@@ -79,6 +79,16 @@ roofline prediction `max(compute, memory) + launch overhead` from
 features and a target.  It **ranks**; it never prunes the semantic
 space.  A learned model is one more conforming value.
 
+The model criterion is an **approximate in-search axis**, not a
+faithful target chooser: extraction recovers a node's cost by an
+*additive* marginal, exact only for an additive cost function, so a
+whole-subtree prediction is either mis-ranked or collapses to
+bit-identical values.  Measured in
+[`eval-axis-selection.md`](../project/retros/eval-axis-selection.md):
+a different target changes the extracted program in **0/7** families.
+Use a `PerformanceModel` for post-hoc ranking; a dense (non-marginal)
+pricing path is the open fix.
+
 ## Failures — `catopt_core.failures`
 
 `FailureClass` (`OK` / `OOM` / `TIMEOUT` / `KERNEL` / `NONFINITE` /

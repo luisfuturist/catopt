@@ -118,7 +118,7 @@ from catopt_torch import TorchBackend
 opt = Optimizer(backend=TorchBackend())
 mod, stats = opt.optimize(
     model, x,
-    criteria=PredictedCriterion(AnalyticalPerformanceModel()),  # a model picks the program
+    criteria=PredictedCriterion(AnalyticalPerformanceModel()),  # a model prices extraction
     policy=GreedyPolicy(),                                      # a policy picks the order
 )
 stats["criteria"], stats["policy"]      # {'predicted': 1.0}, 'greedy'
