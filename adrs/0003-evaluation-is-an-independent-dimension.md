@@ -302,6 +302,18 @@ Benchmarks are deliberately last.
   lives in the `Var`-leaf e-graph rule space, which prices it
   directly.  Widening a runtime model to answer a question its
   substrate does not run is the four-dimension mistake in miniature.
+- **A learned policy is coupled to the *semantics* of its features.**
+  The `Profiler` is the boundary between the evaluation and search
+  dimensions, and that boundary is *load-bearing*: changing what
+  `ProgramFeatures` means silently changes every policy trained on it.
+  Measured: the view/fold-aware traffic correction in
+  `catopt_core.features` — a fix that was right — re-introduced a
+  family collapse in an RL policy whose documented benefit had
+  previously been recorded, with no change to the RL code
+  (`stage7-multifamily-results.md`).  So a feature change is not a
+  local edit: it invalidates learned artifacts downstream, and any
+  change to `ProgramFeatures` must be treated as a change to every
+  policy trained on it — re-train, or version the feature contract.
 
 ## Follow-ups (mandatory)
 
