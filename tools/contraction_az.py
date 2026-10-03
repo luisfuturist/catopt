@@ -236,7 +236,9 @@ def _expand_many(
             # The value head predicts the normalised *remaining* cost in
             # log space (see ``train_search``); the search works in linear
             # cost units, so invert here.
-            raw = min(max(float(value_np[i]), -_VALUE_CLAMP), _VALUE_CLAMP)
+            raw = min(
+                max(float(value_np[i]), -_VALUE_CLAMP), _VALUE_CLAMP
+            )
             nd.value = math.expm1(raw)
         else:
             nd.value = cs.greedy(nd.game.ts, nd.game.sizes) / nd.ref
@@ -275,9 +277,13 @@ def _select(node: _Node) -> int:
     children.
     """
     n = node.n
-    assert n is not None and node.priors is not None and node.w is not None
+    assert (
+        n is not None and node.priors is not None and node.w is not None
+    )
     tot = float(n.sum())
-    q = np.where(n > 0, node.w / np.maximum(n, 1.0), _total_estimate(node))
+    q = np.where(
+        n > 0, node.w / np.maximum(n, 1.0), _total_estimate(node)
+    )
     u = _C_PUCT * node.priors * math.sqrt(tot + 1.0) / (1.0 + n)
     return int(np.argmax(-q + u))
 
@@ -397,8 +403,10 @@ def puct_episodes(
             counts = root.n
             total = float(counts.sum())
             pi = counts / total if total > 0 else root.priors
-            a = int(np.argmax(counts)) if total > 0 else int(
-                np.argmax(root.priors)
+            a = (
+                int(np.argmax(counts))
+                if total > 0
+                else int(np.argmax(root.priors))
             )
             if collect:
                 samples[i].append(
@@ -566,7 +574,7 @@ def _pack_az(
     sf: list[list[float]] = []
     pf: list[list[list[float]]] = []
     pi: list[list[float]] = []
-    for (s, p, dist, _c) in samples:
+    for s, p, dist, _c in samples:
         pad = width - len(p)
         sf.append(s)
         pf.append(p + [[0.0] * _PAIR_DIM] * pad)
@@ -634,8 +642,10 @@ def train_search(
         )
         samples: list[_Sample] = []
         targets: list[float] = []
-        for (_order, cost, data), ref in zip(results, refs, strict=True):
-            for (s, p, dist, paid) in data:
+        for (_order, cost, data), ref in zip(
+            results, refs, strict=True
+        ):
+            for s, p, dist, paid in data:
                 samples.append((s, p, dist, paid))
                 remaining = max(cost - paid, 0.0)
                 targets.append(
@@ -654,7 +664,9 @@ def train_search(
                     device,
                 )
                 logits, value = model(s, p)
-                pol = -(pi * F.log_softmax(logits, dim=-1)).sum(-1).mean()
+                pol = (
+                    -(pi * F.log_softmax(logits, dim=-1)).sum(-1).mean()
+                )
                 val = F.mse_loss(value, v)
                 loss = pol + value_coef * val
                 opt.zero_grad()
@@ -815,7 +827,9 @@ def _measure_az(
             boards = []
             for k in range(instances):
                 tensors, sizes = ce.random_bond_network(n, seed + k)
-                b1, b8 = _puct_prior(models["az"], tensors, sizes, device)
+                b1, b8 = _puct_prior(
+                    models["az"], tensors, sizes, device
+                )
                 cfg = _AzCfg(
                     sims, b8, b1, budget, seed + k, batch_episodes
                 )
@@ -880,9 +894,7 @@ def _pairwise_az(
     """Print PUCT-vs-current and PUCT-vs-opt_einsum ratios."""
     cols = ["current", "oe-greedy", "oe-rand-greedy"]
     print()
-    print(
-        "== 3. pairwise ratio (mean; <1 = PUCT wins) =="
-    )
+    print("== 3. pairwise ratio (mean; <1 = PUCT wins) ==")
     head = (
         f"  {'ms':>6} {'n':>3} "
         + " ".join(f"{'our/' + c:>16}" for c in cols)
@@ -994,7 +1006,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--instances", type=int, default=3)
     ap.add_argument(
-        "--scales", default="20,30,40", help="comma-separated n at scale"
+        "--scales",
+        default="20,30,40",
+        help="comma-separated n at scale",
     )
     ap.add_argument(
         "--budgets",
@@ -1014,7 +1028,9 @@ def main(argv: list[str] | None = None) -> int:
         help="load a saved PUCT net instead of training one",
     )
     ap.add_argument(
-        "--save", default="", help="save the trained PUCT net state dict"
+        "--save",
+        default="",
+        help="save the trained PUCT net state dict",
     )
     ap.add_argument(
         "--puct-analytic",
@@ -1040,7 +1056,9 @@ def main(argv: list[str] | None = None) -> int:
             device=dev,
             seed=args.seed,
         )
-        print(f"trained current policy in {time.perf_counter() - t0:.1f}s")
+        print(
+            f"trained current policy in {time.perf_counter() - t0:.1f}s"
+        )
         if args.load:
             az = DualHeadNet(args.hidden).to(dev)
             az.load_state_dict(torch.load(args.load, map_location=dev))
@@ -1058,7 +1076,9 @@ def main(argv: list[str] | None = None) -> int:
                 device=dev,
                 seed=args.seed,
             )
-            print(f"trained PUCT net in {time.perf_counter() - t0:.1f}s")
+            print(
+                f"trained PUCT net in {time.perf_counter() - t0:.1f}s"
+            )
     if args.save:
         torch.save(models["az"].state_dict(), args.save)
         print(f"saved PUCT net to {args.save}")
