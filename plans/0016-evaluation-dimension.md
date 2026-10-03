@@ -21,8 +21,10 @@ the seams it reuses (plan 0006 `Strategy`, 0007 backend ports, 0010
 | 12 benchmarks | done | `bench/suites/evaluation/policy_value.py` |
 
 Stage 7's measured results:
-`project/retros/stage7-learned-policy-results.md` (supervised) and
-`project/retros/stage7-rl-results.md` (RL).
+`project/retros/stage7-learned-policy-results.md` (supervised),
+`project/retros/stage7-rl-results.md` (RL), and
+`project/retros/stage7-multifamily-results.md` (the three-family
+mixture, scored per family).
 
 ## Goal
 
