@@ -72,6 +72,34 @@ existing gate catches an unconsumed port.
    criterion is confined to post-hoc ranking, or extraction needs a
    dense (non-marginal) pricing path for non-additive criteria.
 
+## Contingent spike — growing the law library
+
+If the headroom hunt comes back empty (every space measured is small
+enough for saturation to close it, so a policy can only tie), the
+remaining direction is to widen the **action space** rather than the
+search:
+
+* Today a `Policy` acts on **2-cells** — it chooses which *known* law
+  to fire, so reach is the library's closure.  ADR 0002 frames the
+  e-graph + certificate machinery as a higher category (1-cells =
+  programs, 2-cells = rewrites, 3-cells = coherences); the two levels
+  above the policy are unused.
+* A policy could instead **propose an equality** (a lemma, a derived
+  rule, a chosen coherence) and let the referee verify it.  The
+  striking part: `verify_certificate` replays a derivation and has no
+  notion of "library vs proposal", so propose-then-verify needs **no
+  change to the safety story** — reach grows, soundness is preserved
+  by construction.
+* The hard part is verification cost.  Proving a proposed equality is
+  as hard as the search itself (undecidable in general here); a
+  numeric check is *evidence, not proof*.  So the design is a
+  **spectrum**: propose → numeric check → admit as a conjecture under
+  the existing enrichment (`error_budget`, the lax case) → upgrade to
+  a proof if a derivation is found.
+* This is a **design spike, not a stage** — it changes what an action
+  *is*, and it is the step that would turn "search a fixed library"
+  into "search that grows its own library".
+
 ## Goal
 
 Make evaluation a first-class, pluggable dimension so the engine
