@@ -33,9 +33,17 @@ out = opt(x)        # the same function as model(x) — verified, not spot-check
 ## The transformation it found
 
 `(Q·Kᵀ)·V → Q·(Kᵀ·V)`: the intermediate goes from T×T to d×d — an
-asymptotic change (O(T²d) → O(Td²)), not a tuning.  Catopt found and
-justified it from associativity plus a shape-aware cost model.  **There
-is no hand-written "reassociate attention" rule.**
+asymptotic change (O(T²d) → O(Td²)), not a tuning.
+
+**Reassociation itself is not the novelty.**  Matrix-chain
+parenthesization is a compiler optimization from 1975 (Sethi–Ullman),
+and any optimizer that reassociates can reach this shape.  What catopt
+adds is that nobody wrote *this* transform down: the e-graph derives it
+from associativity plus a shape-aware cost model, the certificate
+proves it, and the pipeline delivers it end to end.  **There is no
+hand-written "reassociate attention" rule** — the attention-specific
+laws that do exist (`laws/attention.py`) are *folds* into `sdpa`, not
+this reassociation.
 
 ```mermaid
 flowchart TB
