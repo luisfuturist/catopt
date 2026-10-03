@@ -1706,14 +1706,29 @@ def _select_best_term(
     return best_term
 
 
-def _policy_kwargs(policy: Any) -> dict[str, Any]:
+def _policy_kwargs(policy: Any, engine: Any) -> dict[str, Any]:
     """Return the engine kwargs a policy implies.
 
-    Only the reference engine schedules through a policy today, so it
-    is passed conditionally: an engine that does not take ``policy``
-    keeps conforming to the ``Engine`` port.
+    The ``Engine`` port says an engine *may* accept ``policy``, so a
+    caller cannot tell from the port alone.  A policy is therefore
+    passed only to an engine whose ``run`` declares the parameter;
+    anything else gets a clear error naming the engine, rather than a
+    bare ``TypeError`` from a missing keyword deep inside the call.
     """
-    return {} if policy is None else {"policy": policy}
+    if policy is None:
+        return {}
+    try:
+        accepts = "policy" in inspect.signature(engine.run).parameters
+    except (TypeError, ValueError):
+        # A run() with no introspectable signature (an exotic callable)
+        # cannot be confirmed to take a policy.
+        accepts = False
+    if not accepts:
+        raise TypeError(
+            f"engine {type(engine).__name__} does not accept a policy: "
+            "its run() has no 'policy' parameter"
+        )
+    return {"policy": policy}
 
 
 @_oom_to_resource_error
@@ -1985,7 +2000,7 @@ def search(
     # ``None`` = unbounded: the run loop wants a concrete watermark.
     run_cap = max_enodes if max_enodes is not None else sys.maxsize
 
-    run_kw = _policy_kwargs(policy)
+    run_kw = _policy_kwargs(policy, eg)
     stats: dict[str, Any] = eg.run(
         rules,
         root_eid,

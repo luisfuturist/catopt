@@ -122,6 +122,38 @@ def test_search_result_frontier_is_non_dominated():
     assert winner in front
 
 
+class _NoPolicyEngine:
+    """An engine shaped like the native one: ``run()`` takes no policy."""
+
+    def run(self, rules, root_eid, max_iterations=100):
+        """Return empty stats — never actually run."""
+        return {}
+
+
+class _OpaqueEngine:
+    """An engine whose ``run`` has no introspectable signature."""
+
+    run = dict.get
+
+
+def test_policy_kwargs_go_only_to_engines_that_take_them():
+    """A policy-less engine gets a clear error, not a bare TypeError."""
+    from catopt_core.policies import GreedyPolicy
+    from catopt_orchestrator.optimize import _policy_kwargs
+
+    policy = GreedyPolicy()
+    # no policy asked for: no kwargs, whatever the engine
+    assert _policy_kwargs(None, _NoPolicyEngine()) == {}
+    # a policy-less engine is named in the error
+    with pytest.raises(TypeError, match="does not accept a policy"):
+        _policy_kwargs(policy, _NoPolicyEngine())
+    # an un-introspectable run() cannot be confirmed either
+    with pytest.raises(TypeError, match="does not accept a policy"):
+        _policy_kwargs(policy, _OpaqueEngine())
+    # the reference engine accepts it
+    assert _policy_kwargs(policy, EGraph()) == {"policy": policy}
+
+
 def _opt() -> Optimizer:
     return Optimizer(source=TorchSource(), sink=TorchSink())
 
