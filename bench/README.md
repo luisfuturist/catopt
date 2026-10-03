@@ -145,6 +145,12 @@ below; `python -m bench catalog --check` fails if it drifts (and
 |---|---|---|---|
 | `cost_fidelity` | micro | Does the pipeline cost model rank candidates like measured latency? | High rank correlation (ρ) and pick accuracy — term-level cost tracks the backend. |
 
+### evaluation
+
+| suite | tier | question | expected |
+|---|---|---|---|
+| `policy_value` | micro | Does a learned search policy pick better rules than random, declaration-order, or a cost-model greedy? | NEGATIVE vs the cost-model greedy — the learned policy ranks rules better than random/declaration-order but does not match the evaluator greedy (associativity-direction confusion). |
+
 ### structure
 
 | suite | tier | question | expected |
@@ -196,6 +202,7 @@ below; `python -m bench catalog --check` fails if it drifts (and
 | laws | `law_bench`, `laws_effect` |
 | egraph | `search_efficiency`, `reassoc_scale` |
 | cost | `cost_fidelity` |
+| policy | `policy_value` |
 | pairing | `reassoc_scale`, `real_win_hunt`, `killer_demo`, `model_bench`, `e2e_model`, `e2e_models2`, `e2e_llm`, `stories15m_bench`, `bench_e2e` |
 | autotune | `real_win_hunt`, `killer_demo`, `model_bench` |
 | morphism | `morphism_coverage`, `morphism_e2e` |

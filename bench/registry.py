@@ -26,6 +26,7 @@ INTENTS = (
     "correctness",
     "search",
     "cost",
+    "evaluation",
     "structure",
     "speedup",
     "e2e",
@@ -38,6 +39,7 @@ MECHANISMS = (
     "laws",
     "egraph",
     "cost",
+    "policy",
     "pairing",
     "autotune",
     "morphism",
@@ -152,6 +154,19 @@ SUITES: list[SuiteSpec] = [
         "tracks the backend.",
         tier="micro",
         mechanisms=("cost",),
+    ),
+    # -- evaluation: which candidate does the player pick? --------------
+    _s(
+        "policy_value",
+        "evaluation",
+        "Learned search policy vs heuristics",
+        "Does a learned search policy pick better rules than random, "
+        "declaration-order, or a cost-model greedy?",
+        "NEGATIVE vs the cost-model greedy — the learned policy ranks "
+        "rules better than random/declaration-order but does not match "
+        "the evaluator greedy (associativity-direction confusion).",
+        tier="micro",
+        mechanisms=("policy",),
     ),
     # -- structure: what structure do real weights carry? ---------------
     _s(
