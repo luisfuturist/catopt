@@ -100,6 +100,28 @@ def test_search_accepts_a_policy_and_records_it():
     assert plain.stats["n_classes"] == policed.stats["n_classes"]
 
 
+def test_search_result_frontier_is_non_dominated():
+    """`frontier` keeps the landscape; `best` is the scalar view."""
+    from catopt_core.cost import flops_cost, param_bytes_cost
+    from catopt_core.pareto import best, dominates
+
+    m, x = _make()
+    res = search(m, x, source=TorchSource(), max_iterations=3)
+    front = res.frontier(
+        {"flops": flops_cost, "memory": param_bytes_cost}
+    )
+    assert front
+    assert all(v.dims == ("flops", "memory") for v, _ in front)
+    # nothing in the returned set dominates anything else in it
+    for vec, _term in front:
+        assert not any(
+            dominates(other, vec) for other, _ in front
+        )
+    # the scalar view picks one of them
+    winner = best(front, key=lambda p: p[0], weights={"flops": 1.0})
+    assert winner in front
+
+
 def _opt() -> Optimizer:
     return Optimizer(source=TorchSource(), sink=TorchSink())
 

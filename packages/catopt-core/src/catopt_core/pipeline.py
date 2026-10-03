@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from catopt_core.egraph import Certificate, EGraph
     from catopt_core.ir import IR
+    from catopt_core.pareto import CostVector
     from catopt_core.ports import (
         Composer,
         CostFn,
@@ -82,6 +83,19 @@ class Backend:
     sink: Sink
     composer: Composer
     meter: Meter
+
+
+def _cost_vector(
+    dims: tuple[str, ...], cost_fns: Mapping[str, CostFn], term: Any
+) -> CostVector:
+    """Price one term on every axis into a :class:`CostVector`."""
+    from catopt_core.cost import dag_cost
+    from catopt_core.pareto import CostVector
+
+    return CostVector(
+        dims,
+        tuple(float(dag_cost(term, fn)) for fn in cost_fns.values()),
+    )
 
 
 @dataclass(eq=False)
@@ -142,6 +156,38 @@ class SearchResult:
 
             cf = flops_cost
         return self.eg.extract_alternatives(self.root_eid, cf, top_k)
+
+    def frontier(
+        self,
+        cost_fns: Mapping[str, CostFn],
+        candidates: int = 32,
+        top_k: int = 8,
+    ) -> list[tuple[CostVector, Any]]:
+        """Return the non-dominated members of the root class.
+
+        ``cost_fns`` maps an axis name (``"flops"``, ``"memory"``, …)
+        to a :class:`~catopt_core.ports.CostFn`.  Every candidate member
+        is priced on every axis into a
+        :class:`~catopt_core.pareto.CostVector`, and the non-dominated
+        ones come back — the landscape is kept rather than scalarised
+        early.  For the scalar view, feed these to
+        :func:`catopt_core.pareto.best`.
+
+        ``candidates`` bounds how many class members are priced (the
+        root class can be astronomically large); ``top_k`` bounds the
+        returned frontier.
+        """
+        from catopt_core.cost import flops_cost
+        from catopt_core.pareto import pareto_frontier
+
+        base = self.cost_fn if self.cost_fn is not None else flops_cost
+        alts = self.alternatives(top_k=candidates, cost_fn=base)
+        dims = tuple(cost_fns)
+        priced = [
+            (_cost_vector(dims, cost_fns, term), term)
+            for _cost, term in alts
+        ]
+        return pareto_frontier(priced, key=lambda p: p[0])[:top_k]
 
     def certificate(self, a: Any, b: Any = None) -> Certificate:
         """Build a proof-carrying derivation ``a`` -> ``b``.
