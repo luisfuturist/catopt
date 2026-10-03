@@ -53,9 +53,13 @@ existing gate catches an unconsumed port.
    instead of working or declining clearly.  Latent: `catopt-native`
    is not installed here, so no test covers it.  Needs a capability
    declaration or a guarded call.
-2. **RL collapses on the multi-family mixture** — measured; the fix
-   (a per-episode standardized advantage in place of a single
-   running-mean baseline) is in flight.
+2. **RL collapses on the multi-family mixture** — measured.  The
+   baseline fix landed (a per-episode standardized advantage in
+   place of a single running-mean baseline): it solves `dup` and
+   keeps `linear`, but `chain` still collapses — a shared-net
+   winner-take-all under a sparse reward, not a reward-scale bias
+   (see `retros/stage7-multifamily-results.md`).  A denser or
+   state-conditioned signal is still needed.
 
 ## Goal
 

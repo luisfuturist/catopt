@@ -17,8 +17,14 @@ training help, or dilute?" gets numbers instead of a guess.
   table.  `--train-families chain` reproduces the one-family baseline.
 * `tools/train_rl_policy.py` — same mixture default, plus a per-family
   race table (random / declaration / greedy / RL / no-op).
-* **No package code changed.**  `catopt_core.trajectories.rule_vector`
-  is untouched (its structural encoding is load-bearing).
+* `catopt_torch/rl.py` — **the REINFORCE baseline fix** (this
+  revision): the single running-mean baseline over returns is
+  replaced by a **per-episode standardized advantage**.  The
+  advantage is now shift- and scale-invariant, so one family's
+  reward scale cannot bias another's.  `train_reinforce` /
+  `RLPolicy` are unchanged for callers.
+* `catopt_core.trajectories.rule_vector` is untouched (its structural
+  encoding is load-bearing).
 
 The three families, each with a guaranteed strictly-improving rule
 (so a "hit" is a real find, not a coin flip):
@@ -109,7 +115,26 @@ linear        3515.0      3515.0       868.0      3515.0      3515.0
 The RL player matches the one-step greedy oracle on chains (780.8 =
 780.8) and does nothing on the other two.  Stable across seeds.
 
-Mixture, default (`chain,dup,linear`, 20/family = 60 programs):
+Mixture, default (`chain,dup,linear`, 20/family = 60 programs).
+
+### The baseline bug (before the fix)
+
+A single **running-mean baseline over returns**
+(`baseline = 0.98 * baseline + 0.02 * returns.mean()`), so one scalar
+serves every family.  The env's reward is the *normalized* improvement
+`(before − after) / before` (`catopt_core.search_env`), whose best
+achievable value differs sharply by family:
+
+| family | mean best normalized reward | typical before |
+|---|---|---|
+| chain  | 0.106 | ~792 |
+| dup    | 0.312 | ~75 |
+| linear | 0.757 | ~3916 |
+
+The scalar baseline therefore sits *between* the families: the loud
+`linear` steps get a large positive advantage and the quiet
+`chain`/`dup` steps a **negative** one — so their *correct* rule is
+pushed *away*.  The mixture collapses onto `linear`:
 
 ```text
 family     n mean_rank hit_rate  mean_delta
@@ -123,39 +148,68 @@ dup            116.4       116.4        81.1       116.4       116.4
 linear        3515.0      3515.0       868.0       868.0      3515.0
 ```
 
-**Verdict: the RL policy dilutes catastrophically.**  It collapses
-onto the `linear` family — matching greedy there (868.0 = 868.0) but
-doing *nothing* on `chain` and `dup` (its pick ties the no-op floor).
-The collapse is not a data-scarcity effect: 60/family (180 programs)
-collapses the same way, seeds 0–2.
+It matches greedy on `linear` (868.0 = 868.0) and does *nothing* on
+`chain`/`dup` (its pick ties the no-op floor).  Not a data-scarcity
+effect: 60/family (180 programs) collapses the same way, seeds 0–2.
 
-### Why — the reward scale is not comparable across families
+### The fix (after) — a per-episode standardized advantage
 
-The env's reward is the *normalized* improvement
-`(before − after) / before` (`catopt_core.search_env`).  The best
-achievable normalized reward differs sharply by family:
+`catopt_torch.rl._advantage` now **standardizes each episode's
+returns** (zero mean, unit variance) before the policy-gradient
+update, replacing the single running mean.  Because standardization
+is shift- *and* scale-invariant, the family reward scale drops out
+entirely: within an episode the best action always scores positive
+and the worst negative, whatever the family.  It needs **no family
+label** — the env stays family-blind, and the public API
+(`train_reinforce`, `RLPolicy`) is unchanged.
 
-| family | mean best normalized reward | typical before |
-|---|---|---|
-| chain  | 0.106 | ~792 |
-| dup    | 0.312 | ~75 |
-| linear | 0.757 | ~3916 |
+```text
+family     n mean_rank hit_rate  mean_delta
+chain      8     26.50     0.00         0.0
+dup        8      1.00     1.00        35.2
+linear     8      1.00     1.00      2647.0
 
-REINFORCE here uses a single **running-mean** baseline over all
-families, so the high-reward `linear` steps get a large positive
-advantage and the low-reward `chain`/`dup` steps a negative one — the
-policy is pushed to always play the `linear` rule.  Two-family probes
-confirm the mechanism (20/family, seed 0/1/2):
+family        random declaration      greedy          rl       no-op
+chain          875.8       875.8       780.8       875.8       875.8
+dup            116.4       116.4        81.1        81.1       116.4
+linear        3515.0      3515.0       868.0       868.0      3515.0
+```
 
-| training families | result |
-|---|---|
-| `chain,dup`    | both learned (seed 0, 2); collapses onto `dup` at seed 1 |
-| `chain,linear` | collapses onto `linear` (all seeds) |
-| `dup,linear`   | both learned at seed 0; collapses onto `linear` (seeds 1, 2) |
+The fix lands `dup` (rank 26.5 → 1.00, hit 0 → 1.00) and keeps
+`linear`, now matching greedy on both — and the winner is **no longer
+the loudest family**.  Across seeds 0–2 `dup` is solved every seed and
+`linear` two of three.
 
-The collapse tracks the reward ordering, not the family *identity*:
-whenever the highest-reward family is present, the policy tends to
-collapse onto it.
+### The residual — a winner-take-all, not a scale bias
+
+`chain` still collapses (rank 26.5).  The *scale* bias is gone, but
+the collapse survives as a **winner-take-all race** of the shared
+policy net:
+
+* The trained net's rule ranking is nearly *state-independent*: for a
+  `chain` state it orders `assoc_linear_bias > square_expand >
+  linear_channel_scale > assoc_matmul` — the **same order** it gives a
+  `linear` state.  It separates `dup` (reuse ~0.09) but conflates
+  `chain` with `linear` (reuse ~0.95 both), so `chain` inherits
+  `linear`'s pick.
+* Controls that change the baseline or the conditioning do **not**
+  break the tie (2000 episodes, seeds 0–2): a per-state running-mean
+  baseline keyed by root op; a per-state mean+scale baseline; input
+  standardization; entropy bonuses 0.02–3.0; step-reward instead of
+  discounted returns-to-go; `patience` 6; shuffled program order;
+  `hidden` 256; and 12k episodes.  Each still solves exactly one or
+  two families.  `chain`, `dup` and `linear` are each learnable
+  **alone** (rank 1.00), so it is mixture interference, not capacity.
+* The reward is sparse: a `chain` episode samples ~2 of 51 rules
+  before `patience` ends it, so the single paying rule is hit in ~2%
+  of episodes.  Whichever family's signal first pushes the net to a
+  near-deterministic preference wins the race, and the others stop
+  being explored.
+
+So the diagnosed *scale* bug is fixed; the mixture still collapses
+for a second, orthogonal reason (shared-net winner-take-all under a
+sparse reward).  The supervised policy does not suffer this because
+its per-`(features, rule)` target is dense.
 
 ## Honest verdict
 
@@ -165,15 +219,17 @@ collapse onto it.
   improvement, not a trade.  Dilution is real but confined to a
   very-low-data regime (≤5 programs/family, 500 epochs), where the
   smallest-signal family (`chain`) loses first.
-* **RL: multi-family training dilutes badly** with the current
-  objective.  A single running-mean baseline over families whose
-  normalized rewards differ ~7× makes the policy collapse onto the
-  highest-reward family.  The mixture default is therefore *honest
-  but bad* for RL today.
-* The fix is a **per-family (or per-state) baseline / reward
-  normalization** — REINFORCE's baseline must be conditioned on
-  something that makes the families comparable.  That is future work;
-  the mixture remains the default so the failure is visible and
+* **RL: the diagnosed baseline bug is fixed, but the mixture still
+  collapses.**  A per-episode standardized advantage removes the
+  reward-scale domination — `dup` is now solved (26.5 → 1.00) and
+  `linear` stays solved, and the winner is no longer the loudest
+  family.  But `chain` still collapses to the floor: the shared net
+  converges to a near-global rule preference before the sparsest
+  family's signal accumulates (a winner-take-all, not a scale bias).
+  Fixing *that* needs a denser or state-conditioned signal — the
+  supervised policy, or a value baseline trained on the same mixture —
+  not a better scalar baseline.
+* The mixture remains the default so the failure is visible and
   measurable, not hidden behind a one-family demo.
 
 ## Reproduce
