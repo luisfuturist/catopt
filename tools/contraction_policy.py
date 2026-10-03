@@ -31,20 +31,34 @@ networks (n = 8-12) where many episodes are affordable, then tested on
 * ``imitation`` — supervised on the exact DP-optimal contraction order
   (``dp`` is affordable at n = 8-12), the strongest available signal.
 
+The results above match the *rollout count* (1 vs 1, 64 vs 64), not the
+*work*: a learned rollout pays a forward pass per step, a
+randomised-greedy rollout pays a heuristic scan.  ``--mode time`` closes
+that gap: every player gets the **same wall-clock budget** per instance
+(``--budgets`` ms) and the tool reports quality, rollouts and decisions
+at that budget, plus the measured per-decision cost of a policy forward
+pass against a heuristic scan.  It is the falsification half of the
+result — reported as measured, including a negative.
+
 Usage::
 
     python tools/contraction_policy.py [--trainer rl] [--seed 0]
+    python tools/contraction_policy.py --mode time --budgets 50,200,1000
 """
 
 from __future__ import annotations
 
 import argparse
 import bisect
+import functools
+import heapq
 import math
 import random
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import count
 from typing import Any
 
 import contraction_scale as cs
@@ -811,6 +825,495 @@ def _verdict(
 
 
 # ---------------------------------------------------------------------------
+#  Equal wall-clock: the anytime players
+# ---------------------------------------------------------------------------
+
+#: Largest lockstep batch the anytime policy will sample in one pass.
+_MAX_BATCH = 128
+
+
+@dataclass
+class _Any:
+    """One anytime player's result: best cost, work done, wall time."""
+
+    cost: float
+    rollouts: int
+    decisions: int
+    secs: float
+
+
+def _all_pairs(ts: list[frozenset[int]]) -> list[tuple[int, int]]:
+    """Return every unordered pair of tensor positions."""
+    return [
+        (a, b) for a in range(len(ts)) for b in range(a + 1, len(ts))
+    ]
+
+
+def _state_key(ts: list[frozenset[int]]) -> tuple:
+    """Return a canonical, order-independent key for a state."""
+    return tuple(sorted(tuple(sorted(t)) for t in ts))
+
+
+def _sync(device: str) -> None:
+    """Synchronise the device when it is a CUDA device."""
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def anytime_greedy(
+    tensors: Any, sizes: dict[int, int], budget: float
+) -> _Any:
+    """One deterministic greedy episode (extra budget cannot help it)."""
+    t0 = time.perf_counter()
+    c = cs.greedy(tensors, sizes)
+    return _Any(
+        c, 1, max(len(tensors) - 1, 0), time.perf_counter() - t0
+    )
+
+
+def anytime_restart(
+    tensors: Any,
+    sizes: dict[int, int],
+    budget: float,
+    *,
+    top_k: int = 3,
+    seed: int = 0,
+) -> _Any:
+    """Best of as many randomised-greedy episodes as fit in ``budget``."""
+    rng = random.Random(seed)
+    steps = max(len(tensors) - 1, 0)
+    t0 = time.perf_counter()
+    best = cs.greedy(tensors, sizes)
+    rollouts = 1
+    decisions = steps
+    while time.perf_counter() - t0 < budget:
+        c = cs.greedy(tensors, sizes, rng=rng, top_k=top_k)
+        rollouts += 1
+        decisions += steps
+        if c < best:
+            best = c
+    return _Any(best, rollouts, decisions, time.perf_counter() - t0)
+
+
+def anytime_search(
+    tensors: Any, sizes: dict[int, int], budget: float
+) -> _Any:
+    """Best-first search, deadline-bounded inside the expansion loop.
+
+    Identical to ``contraction_scale.search`` except the wall-clock
+    deadline is checked before each child is priced, so a tight budget
+    bounds the overshoot to a single greedy completion.  The first
+    complete state found is returned; if none is found the greedy cost
+    is the honest fallback.
+    """
+    start = [frozenset(t) for t in tensors]
+    seq = count()
+    heap = [(cs.greedy(start, sizes), 0.0, next(seq), start)]
+    seen = {_state_key(start)}
+    best = float("inf")
+    expansions = 0
+    complete = 0
+    t0 = time.perf_counter()
+    hit = False
+    while heap and not hit:
+        _prio, cost, _seq, ts = heapq.heappop(heap)
+        if len(ts) == 1:
+            best = min(best, cost)
+            complete += 1
+            continue
+        expansions += 1
+        for a, b in _all_pairs(ts):
+            if time.perf_counter() - t0 >= budget:
+                hit = True
+                break
+            c = cs.pair_cost(ts[a], ts[b], sizes)
+            nts = _merge_ts(ts, a, b)
+            k = _state_key(nts)
+            if k in seen:
+                continue
+            seen.add(k)
+            nc = cost + c
+            heapq.heappush(
+                heap,
+                (nc + cs.greedy(nts, sizes), nc, next(seq), nts),
+            )
+    if best == float("inf"):
+        best = cs.greedy(tensors, sizes)
+    return _Any(best, complete, expansions, time.perf_counter() - t0)
+
+
+def anytime_policy(
+    model: nn.Module,
+    tensors: Any,
+    sizes: dict[int, int],
+    greedy_ref: float,
+    budget: float,
+    *,
+    per_prior: float,
+    device: str,
+    temperature: float = _TEMP,
+    seed: int = 0,
+) -> _Any:
+    """Sample policy rollouts in lockstep until ``budget`` is spent.
+
+    ``per_prior`` is the measured per-rollout cost (from the decision
+    section) used to size the first lockstep batch to a small slice of
+    the budget; every later batch is sized from the *actual* elapsed
+    time, so the loop fills the remaining budget and stops once the next
+    rollout would not fit.  A small first slice keeps the first batch
+    from overrunning when the GPU's measured throughput drifts.  Nothing
+    is timed outside the budget — the policy gets the same wall-clock as
+    every other player.
+    """
+    torch.manual_seed(seed)
+    steps = max(len(tensors) - 1, 0)
+    per = max(per_prior, 1e-6)
+    batch = max(1, min(_MAX_BATCH, int(0.25 * budget / per)))
+    t0 = time.perf_counter()
+    best = float("inf")
+    rollouts = 0
+    while True:
+        costs = run_policy_batch(
+            model,
+            tensors,
+            sizes,
+            greedy_ref,
+            samples=batch,
+            greedy=False,
+            temperature=temperature,
+            device=device,
+        )
+        rollouts += batch
+        best = min(best, min(costs))
+        elapsed = time.perf_counter() - t0
+        per = elapsed / rollouts
+        remaining = budget - elapsed
+        if remaining < per:
+            break
+        batch = max(1, min(_MAX_BATCH, int(remaining / per)))
+    return _Any(
+        best, rollouts, rollouts * steps, time.perf_counter() - t0
+    )
+
+
+def _warm_policy(
+    scales: tuple[int, ...], model: nn.Module, device: str
+) -> None:
+    """Warm the policy's kernels and allocator across batch shapes.
+
+    A laptop GPU cools between the CPU-bound heuristic players, and a
+    fresh batch shape can trigger a one-off allocation, so the first
+    timed policy batch is otherwise severalfold slow.  Running the shapes
+    the anytime policy will actually use, once, before any board is
+    timed, removes that artefact from every player's budget.
+    """
+    for n in scales:
+        tensors, sizes = cs.random_network(n, 0)
+        ref = cs.greedy(tensors, sizes)
+        for samples in (1, 8, 32, _MAX_BATCH):
+            run_policy_batch(
+                model,
+                tensors,
+                sizes,
+                ref,
+                samples=samples,
+                greedy=False,
+                temperature=_TEMP,
+                device=device,
+            )
+
+
+def _time_players(
+    tensors: Any,
+    sizes: dict[int, int],
+    models: dict[str, nn.Module],
+    device: str,
+    budget: float,
+    seed: int,
+    per_prior: float,
+) -> dict[str, _Any]:
+    """Run every anytime player on one board under a wall-clock budget."""
+    ref = cs.greedy(tensors, sizes)
+    out = {
+        "greedy": anytime_greedy(tensors, sizes, budget),
+        "restart": anytime_restart(tensors, sizes, budget, seed=seed),
+        "search": anytime_search(tensors, sizes, budget),
+    }
+    for name, model in models.items():
+        out[name] = anytime_policy(
+            model,
+            tensors,
+            sizes,
+            ref,
+            budget,
+            per_prior=per_prior,
+            device=device,
+            seed=seed,
+        )
+    return out
+
+
+def _bench(
+    fn: Callable[[], Any], *, reps: int, warm: int, device: str
+) -> float:
+    """Return the mean wall seconds per call of ``fn`` on ``device``."""
+    for _ in range(warm):
+        fn()
+    _sync(device)
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    _sync(device)
+    return (time.perf_counter() - t0) / reps
+
+
+def _scan_state(
+    ts: list[frozenset[int]],
+    sizes: dict[int, int],
+    pairs: list[tuple[int, int]],
+) -> list[float]:
+    """Price every pair of one state — the sweep a greedy step pays."""
+    return [cs.pair_cost(ts[a], ts[b], sizes) for a, b in pairs]
+
+
+def _descend(
+    game: ContractionGame, target: int, sizes: dict[int, int]
+) -> None:
+    """Advance ``game`` by cheapest-pair steps down to ``target`` tensors."""
+    while len(game.ts) > target:
+        _c, a, b = min(
+            (cs.pair_cost(game.ts[x], game.ts[y], sizes), x, y)
+            for x, y in game.pairs
+        )
+        game.step(a, b)
+
+
+def _decision_section(
+    scales: tuple[int, ...],
+    models: dict[str, nn.Module],
+    device: str,
+    *,
+    reps: int = 200,
+) -> dict[int, float]:
+    """Measure the per-decision cost of a forward pass vs a scan.
+
+    One mid-game state per scale: the heuristic scan is the Python
+    ``pair_cost`` sweep a greedy step pays; the policy forward scores
+    every pair of the state in one MLP pass (batch 1 and batch 64).  The
+    per-rollout rows compare a full policy rollout against a full
+    randomised-greedy episode, the honest unit the two players trade in.
+    Returns ``{n: per-rollout seconds}`` for the anytime policy to size
+    its first lockstep batch.
+    """
+    print()
+    print("== per-decision cost: policy forward vs heuristic scan ==")
+    print(
+        f"  {'n':>3} {'pairs':>6} {'scan us':>9} {'fwd1 us':>9} "
+        f"{'fwd64 us':>9} {'pol/roll ms':>12} {'restart/roll ms':>15}"
+    )
+    print("-" * 70)
+    model = next(iter(models.values()))
+    priors: dict[int, float] = {}
+    for n in scales:
+        tensors, sizes = cs.random_network(n, 0)
+        ref = cs.greedy(tensors, sizes)
+        mid = max(len(tensors) // 2, 4)
+        g = ContractionGame(tensors, sizes, ref)
+        _descend(g, mid, sizes)
+        pairs = list(g.pairs)
+        scan = _bench(
+            functools.partial(_scan_state, g.ts, sizes, pairs),
+            reps=reps,
+            warm=20,
+            device=device,
+        )
+        sf1, pf1 = _batch_inputs([g], device)
+        fwd1 = _bench(
+            functools.partial(_logits, model, sf1, pf1),
+            reps=reps,
+            warm=20,
+            device=device,
+        )
+        games = [
+            ContractionGame(tensors, sizes, ref)
+            for _ in range(_RESTARTS)
+        ]
+        for gg in games:
+            _descend(gg, mid, sizes)
+        sf64, pf64 = _batch_inputs(games, device)
+        fwd64 = _bench(
+            functools.partial(_logits, model, sf64, pf64),
+            reps=max(reps // 4, 20),
+            warm=10,
+            device=device,
+        )
+        roll = (
+            _bench(
+                functools.partial(
+                    run_policy_batch,
+                    model,
+                    tensors,
+                    sizes,
+                    ref,
+                    samples=_RESTARTS,
+                    greedy=False,
+                    temperature=_TEMP,
+                    device=device,
+                ),
+                reps=5,
+                warm=2,
+                device=device,
+            )
+            / _RESTARTS
+        )
+        rng = random.Random(0)
+        rest = _bench(
+            functools.partial(
+                cs.greedy, tensors, sizes, rng=rng, top_k=3
+            ),
+            reps=20,
+            warm=5,
+            device=device,
+        )
+        print(
+            f"  {n:>3} {len(pairs):>6} {1e6 * scan:>9.1f} "
+            f"{1e6 * fwd1:>9.1f} {1e6 * fwd64:>9.1f} "
+            f"{1e3 * roll:>12.3f} {1e3 * rest:>15.3f}"
+        )
+        priors[n] = roll
+    return priors
+
+
+def _time_section(
+    budgets: tuple[float, ...],
+    scales: tuple[int, ...],
+    instances: int,
+    seed: int,
+    models: dict[str, nn.Module],
+    device: str,
+    priors: dict[int, float],
+) -> list[tuple[float, int, dict[str, list[float]], dict[str, _Any]]]:
+    """Measure every anytime player at equal wall-clock per instance.
+
+    Per ``(budget, scale)`` the table reports, mean over seeds: the cost
+    ratio to that instance's best-found, the number of completed
+    rollouts, the number of decisions (action choices / state
+    expansions) and the actual wall time — so the reader can see who got
+    more rollouts and who paid more per decision.  Returns the raw rows.
+    """
+    players = ["greedy", "restart", "search", *models]
+    rows: list[
+        tuple[float, int, dict[str, list[float]], dict[str, _Any]]
+    ] = []
+    if models:
+        _warm_policy(scales, next(iter(models.values())), device)
+    for budget in budgets:
+        print()
+        print(
+            "== equal wall-clock: "
+            f"{1e3 * budget:.0f} ms per instance =="
+        )
+        print(
+            f"  {'n':>3} {'player':>8} {'ratio-best':>11} "
+            f"{'rollouts':>9} {'decisions':>10} {'ms':>8}"
+        )
+        print("-" * 56)
+        for n in scales:
+            ratios: dict[str, list[float]] = {p: [] for p in players}
+            work: dict[str, list[_Any]] = {p: [] for p in players}
+            for k in range(instances):
+                tensors, sizes = cs.random_network(n, seed + k)
+                found = _time_players(
+                    tensors,
+                    sizes,
+                    models,
+                    device,
+                    budget,
+                    seed + k,
+                    priors[n],
+                )
+                best = min(r.cost for r in found.values())
+                for p, r in found.items():
+                    ratios[p].append(r.cost / best)
+                    work[p].append(r)
+            for p in players:
+                print(
+                    f"  {n:>3} {p:>8} "
+                    f"{statistics.fmean(ratios[p]):>11.3f} "
+                    f"{statistics.fmean([r.rollouts for r in work[p]]):>9.1f} "
+                    f"{statistics.fmean([r.decisions for r in work[p]]):>10.1f} "
+                    f"{1e3 * statistics.fmean([r.secs for r in work[p]]):>8.1f}"
+                )
+            rows.append((budget, n, ratios, work))
+    return rows
+
+
+def _time_pairs(
+    rows: list[
+        tuple[float, int, dict[str, list[float]], dict[str, _Any]]
+    ],
+) -> None:
+    """Print learned-vs-cheap pairwise ratios at equal wall-clock."""
+    print()
+    print(
+        "== equal wall-clock: pairwise cost ratio "
+        "(mean over seeds; <1 = learned wins) =="
+    )
+    cols: list[str] = []
+    for learned in ("rl", "imitation"):
+        for base in ("greedy", "restart", "search"):
+            cols.append(f"{learned}/{base}")
+    head = f"{'ms':>6} {'n':>3} " + " ".join(f"{c:>18}" for c in cols)
+    print(head)
+    print("-" * len(head))
+    for budget, n, ratios, _work in rows:
+        cells = []
+        for learned in ("rl", "imitation"):
+            for base in ("greedy", "restart", "search"):
+                lv = ratios.get(learned)
+                bv = ratios.get(base)
+                if lv and bv:
+                    m = statistics.fmean(
+                        a / b
+                        for a, b in zip(lv, bv, strict=True)
+                        if b > 0
+                    )
+                    cells.append(f"{m:>18.3f}")
+                else:
+                    cells.append(f"{'-':>18}")
+        print(f"{1e3 * budget:>6.0f} {n:>3} " + " ".join(cells))
+
+
+def _time_verdict(
+    rows: list[
+        tuple[float, int, dict[str, list[float]], dict[str, _Any]]
+    ],
+) -> None:
+    """Print the honest equal-compute verdict from the measured rows."""
+    print()
+    print("== equal-compute verdict ==")
+    for budget, n, ratios, work in rows:
+        cheap = [
+            (statistics.fmean(ratios[p]), p)
+            for p in ("search", "restart")
+            if p in ratios
+        ]
+        cheap.sort()
+        best_cheap, best_name = cheap[0]
+        cells = (
+            f"  {1e3 * budget:>5.0f}ms n={n:>2}: "
+            f"best cheap {best_name} {best_cheap:.3f}"
+        )
+        for name in ratios:
+            if name in ("search", "restart", "greedy"):
+                continue
+            r = statistics.fmean(ratios[name])
+            w = statistics.fmean([x.rollouts for x in work[name]])
+            cells += f"  | {name} {r:.3f} ({w:.0f} roll)"
+        print(cells)
+
+
+# ---------------------------------------------------------------------------
 #  Entry point
 # ---------------------------------------------------------------------------
 
@@ -840,6 +1343,17 @@ def main(argv: list[str] | None = None) -> int:
         "--device",
         default="auto",
         help="auto|cpu|cuda (auto prefers cuda)",
+    )
+    ap.add_argument(
+        "--mode",
+        default="rollout",
+        choices=("rollout", "time", "both"),
+        help="rollout: match rollout count; time: equal wall-clock",
+    )
+    ap.add_argument(
+        "--budgets",
+        default="50,200,1000",
+        help="comma-separated per-instance wall-clock budgets (ms)",
     )
     args = ap.parse_args(argv)
 
@@ -873,8 +1387,29 @@ def main(argv: list[str] | None = None) -> int:
 
     _control_table((8, 10, 12), args.instances, models, dev)
     scales = tuple(int(x) for x in args.scales.split(",") if x.strip())
-    rows = _scale_table(scales, args.instances, args.seed, models, dev)
-    _verdict(rows)
+    if args.mode in ("time", "both"):
+        budgets = tuple(
+            1e-3 * float(x)
+            for x in args.budgets.split(",")
+            if x.strip()
+        )
+        priors = _decision_section(scales, models, dev)
+        rows = _time_section(
+            budgets,
+            scales,
+            args.instances,
+            args.seed,
+            models,
+            dev,
+            priors,
+        )
+        _time_pairs(rows)
+        _time_verdict(rows)
+    if args.mode in ("rollout", "both"):
+        rows = _scale_table(
+            scales, args.instances, args.seed, models, dev
+        )
+        _verdict(rows)
     return 0
 
 
