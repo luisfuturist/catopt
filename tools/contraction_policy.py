@@ -161,6 +161,33 @@ class ContractionGame:
         """Return whether only one tensor remains."""
         return len(self.ts) <= 1
 
+    def clone(self) -> ContractionGame:
+        """Return an independent copy that shares the size caches.
+
+        The pairwise intersection tables are copied, so a ``step`` on
+        the clone cannot touch the original.  A tree search expands a
+        child per simulation this way, paying one incremental ``step``
+        instead of a full ``O(m^2)`` rebuild — the feature values are
+        unchanged, only the construction cost.
+        """
+        g = ContractionGame.__new__(ContractionGame)
+        g.sizes = self.sizes
+        g.log = self.log
+        g.greedy_ref = self.greedy_ref
+        g.n0 = self.n0
+        g.cost = self.cost
+        g._bit = self._bit
+        g._log_bit = self._log_bit
+        g._lsize_cache = self._lsize_cache
+        g.ts = list(self.ts)
+        g._masks = list(self._masks)
+        g._lsize = list(self._lsize)
+        g._ranks = list(self._ranks)
+        g._inter = self._inter.copy()
+        g._icount = self._icount.copy()
+        g._refresh()
+        return g
+
     def _mask_of(self, t: frozenset[int]) -> int:
         """Return the bitmask of an index set."""
         mk = 0
