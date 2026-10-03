@@ -185,6 +185,20 @@ SUITES: list[SuiteSpec] = [
         tier="micro",
         mechanisms=("cost",),
     ),
+    _s(
+        "contraction_ladder",
+        "evaluation",
+        "Contraction-ordering ladder",
+        "Do the non-learned contraction-ordering players reach the "
+        "exact DP optimum — does greedy lose, and does anything close "
+        "the gap?",
+        "NEGATIVE for greedy — the one-step oracle and the classic "
+        "network greedy lose on most hard instances; saturation ties "
+        "the DP optimum on every chain, so the learned-policy "
+        "headroom is search cost, not quality.",
+        tier="micro",
+        mechanisms=("egraph", "cost"),
+    ),
     # -- structure: what structure do real weights carry? ---------------
     _s(
         "structure_census",
