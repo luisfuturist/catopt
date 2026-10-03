@@ -18,9 +18,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from catopt_core.cost import _flops_of
+from catopt_core.cost import _VIEW_OPS, _flops_of
 from catopt_core.ir import Op, Param, _dag_postorder
-from catopt_core.typing import _numel, _shape_of
+from catopt_core.typing import _numel, _shape_of, has_var_leaf
 
 __all__ = [
     "DIMENSIONS",
@@ -52,8 +52,10 @@ class ProgramFeatures:
 
     * ``flops`` — arithmetic operations (the cost model's per-op
       weights).
-    * ``bytes_read`` / ``bytes_written`` — element traffic across the
-      whole DAG, fp32.
+    * ``bytes_read`` / ``bytes_written`` — **runtime** element traffic,
+      fp32.  View ops (`_VIEW_OPS`) and subtrees with no data input
+      (folded at compile time) are excluded, so the numbers agree with
+      the built-in cost models rather than billing phantom traffic.
     * ``temporary_bytes`` — bytes materialised by non-root nodes (the
       intermediates a fused backend could elide).
     * ``depth`` — longest op chain (the critical path, in ops).
@@ -176,11 +178,19 @@ def compute_features(
     nodes = _dag_postorder(term)
     for node in nodes:
         out_elems = _elems(_shape_of(node, memo))
-        written += out_elems * itemsize
-        if node is not term:
-            temp += out_elems * itemsize
+        # Runtime memory traffic only.  A view op owns no storage (its
+        # output aliases an operand's), and a subtree with no data input
+        # is folded at compile time — neither writes nor reads anything
+        # when the program runs.  The built-in cost models are
+        # view/fold-aware (`_VIEW_OPS`, `has_var_leaf`); billing these
+        # as traffic makes the profiler disagree with them.
+        runtime = node.op not in _VIEW_OPS and has_var_leaf(node, memo)
+        if runtime:
+            written += out_elems * itemsize
+            if node is not term:
+                temp += out_elems * itemsize
+            read += _read_bytes(node, memo, itemsize)
         flops += _flops_of(node, memo)
-        read += _read_bytes(node, memo, itemsize)
         n_params += _param_leaves(node)
         depth_memo[node] = _depth(node, depth_memo)
     return _assemble(

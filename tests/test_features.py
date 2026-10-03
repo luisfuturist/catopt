@@ -90,6 +90,38 @@ def test_static_profiler_conforms_and_scales_with_itemsize():
     assert StaticProfiler(itemsize=8).profile(t).bytes_written == 32.0
 
 
+def test_view_ops_bill_no_traffic():
+    """A transpose owns no storage — it must not be billed as a write."""
+    x = _v("x", 4, 8)
+    f = compute_features(Op.make("transpose", x))
+    assert f.bytes_written == 0.0
+    assert f.bytes_read == 0.0
+    assert compute_features(Op.make("reshape", x)).bytes_written == 0.0
+
+
+def test_param_only_subtrees_bill_no_traffic():
+    """A param-only chain folds at compile time — no runtime traffic."""
+    a = Param("a", TensorType((4, 4)))
+    b = Param("b", TensorType((4, 4)))
+    f = compute_features(Op.make("matmul", a, b))
+    assert f.bytes_written == 0.0
+    assert f.bytes_read == 0.0
+    assert f.flops > 0.0  # the arithmetic is still described
+
+
+def test_mixed_program_bills_only_the_runtime_half():
+    """add(transpose(x), y): the view itself is free, its reader is not."""
+    x = _v("x", 4, 8)
+    y = _v("y", 8, 4)
+    f = compute_features(Op.make("add", Op.make("transpose", x), y))
+    # the add's output is 32 elements, fp32
+    assert f.bytes_written == 32 * 4
+    # the add reads both operands (32 + 32 elements); the transpose
+    # node itself reads and writes nothing
+    assert f.bytes_read == 64 * 4
+    assert compute_features(Op.make("transpose", x)).bytes_read == 0.0
+
+
 def test_new_port_negatives():
     assert not isinstance(object(), Profiler)
     assert not isinstance(object(), Policy)
