@@ -272,6 +272,17 @@ Benchmarks are deliberately last.
   (100% coverage), and free of dead code (`vulture`).
 - The road to a learned performance model is opened without changing
   the semantic contract — the central invariant the project protects.
+- **A port is not done until something reaches it.**  Four of these
+  ports shipped typed, tested and green while *no code in
+  `packages/` consumed them* — and every gate passed, because no gate
+  catches an unconsumed port.  "Wired" is a deliverable of its own;
+  see plan 0016's Wiring table.
+- **`Engine` / `Policy` needs a capability declaration.**  This ADR
+  says an engine *may* accept a policy, so a caller cannot tell: a
+  policy-less engine (the shape `NativeEngine` has) raises a bare
+  `TypeError` rather than declining clearly.  Either the port gains an
+  explicit capability flag or the call is guarded — left open here,
+  tracked in plan 0016's Known gaps.
 
 ## Follow-ups (mandatory)
 

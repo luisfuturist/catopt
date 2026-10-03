@@ -1,8 +1,9 @@
 # Plan 0016 — evaluation as an independent dimension
 
-Status: draft.  Depends on ADR 0003 (the four-dimension decision) and
-the seams it reuses (plan 0006 `Strategy`, 0007 backend ports, 0010
-`Engine`).  Amends nothing; it stages what ADR 0003 decides.
+Status: landed — stages 0–12, with the gaps named below.  Depends on
+ADR 0003 (the four-dimension decision) and the seams it reuses (plan
+0006 `Strategy`, 0007 backend ports, 0010 `Engine`).  Amends nothing;
+it stages what ADR 0003 decides.
 
 ## Landed so far
 
@@ -11,7 +12,7 @@ the seams it reuses (plan 0006 `Strategy`, 0007 backend ports, 0010
 | 0 recon | done | `project/retros/four-dimension-recon.md` |
 | 1 boundaries | done | `catopt_core.ports`: `Profiler` / `Policy` / `PerformanceModel` |
 | 2 profiling | done | `catopt_core.features` (`ProgramFeatures`, `StaticProfiler`) |
-| 3 one GPU backend | done | `catopt_core.failures` taxonomy + `TimingResult` provenance/`timeout_s` + classified `TorchMeter`/autotune/CUDA-runner failures + `calibrate` provenance; one CUDA backend |
+| 3 one GPU backend | done | `catopt_core.failures` taxonomy + `TimingResult` provenance/`timeout_s` + classified `TorchMeter`/autotune/CUDA-runner failures + `calibrate` provenance; **one timing contract** — `catopt_core.timing` (warmup/n_calls, median, IQR) is what `TorchMeter`, `calibrate` and `benchkit.Runner` all reduce through; one CUDA backend |
 | 4 evaluation | done | `catopt_core.pareto` (`CostVector`, `frontier`, `best`) |
 | 5 game API | done | `catopt_core.game` (`Action` / `GameState` / `RuleBook` / `transition` / `Evaluator`) |
 | 6 policies | done | `catopt_core.policies` (random / existing / greedy / beam-score) |
@@ -25,6 +26,36 @@ Stage 7's measured results:
 `project/retros/stage7-rl-results.md` (RL), and
 `project/retros/stage7-multifamily-results.md` (the three-family
 mixture, scored per family).
+
+## Wiring — what actually consumes each port
+
+The stages landed modules; this is what makes them *operational*
+rather than merely tested:
+
+| Port / module | Consumed by |
+|---|---|
+| `Policy` | `EGraph.run(..., policy=)` — consulted once per iteration; `search(...)` and `Optimizer.optimize(...)` thread it through |
+| `pareto` | `SearchResult.frontier(cost_fns)` — the non-dominated set over named axes |
+| `Profiler` + `PerformanceModel` | `PredictedCriterion` — pass it as `criteria=` |
+| `failures` | `TorchMeter`, `autotune`, the CUDA runner |
+| `timing` | `TorchMeter`, `calibrate`, `benchkit.Runner` |
+
+**The lesson: tested is not wired.**  Until this pass four of those
+had no consumer anywhere in `packages/`, with every gate green — no
+existing gate catches an unconsumed port.
+
+## Known gaps
+
+1. **`Engine` / `Policy` is under-specified.**  The `Engine` port says
+   an engine *"may"* accept `policy`, so a caller cannot tell.
+   `search` passes `policy` whenever it is set, so a policy-less
+   engine (the shape `NativeEngine` has) raises a bare `TypeError`
+   instead of working or declining clearly.  Latent: `catopt-native`
+   is not installed here, so no test covers it.  Needs a capability
+   declaration or a guarded call.
+2. **RL collapses on the multi-family mixture** — measured; the fix
+   (a per-episode standardized advantage in place of a single
+   running-mean baseline) is in flight.
 
 ## Goal
 
