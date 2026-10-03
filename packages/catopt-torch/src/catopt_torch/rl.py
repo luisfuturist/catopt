@@ -4,7 +4,7 @@ Plan 0016 stage 7, the RL half (ADR 0003).  Where
 :mod:`catopt_torch.learned_policy` is *supervised* on one-step
 trajectories, this is a full RL player: it samples a rule, applies it
 to the e-graph, and is updated from the reward that step produced
-(REINFORCE with a running-mean baseline).
+(REINFORCE with a per-episode standardized advantage).
 
 The action encoding is structural (``rule_vector``), so an unseen rule
 is still scorable.  The policy only *orders* legal moves — the
@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 #: State width: the feature vector plus the episode progress.
 _STATE_DIM = len(DIMENSIONS) + 1
+
+#: Returns whose spread is below this carry no advantage signal.
+_EPS = 1e-12
 
 
 def state_vector(
@@ -147,6 +150,28 @@ def _rollout(
     return logps, torch.tensor(returns, dtype=torch.float32, device=dev)
 
 
+def _advantage(returns: torch.Tensor) -> torch.Tensor:
+    """Return the scale-free advantage of one episode's returns.
+
+    REINFORCE needs a baseline, and a single *running mean* over a
+    mixture of program families is dominated by the family with the
+    largest normalized reward — the env's reward is
+    ``(before - after) / before``, so a chain pays ~0.1 and a fused
+    linear ~0.75 — which collapses the policy onto that family.
+    Centering and scaling each episode's returns instead makes the
+    advantage comparable across families with **no family label**:
+    within an episode the best action always scores positive and the
+    worst negative, whatever the family's reward scale.  An episode
+    with no spread (nothing improved) yields a zero advantage — no
+    signal, rather than a spurious one.
+    """
+    centered = returns - float(returns.mean())
+    std = float(returns.std(unbiased=False))
+    if std <= _EPS:
+        return centered
+    return centered / std
+
+
 def train_reinforce(
     programs: Any,
     rules: Any,
@@ -165,7 +190,10 @@ def train_reinforce(
 
     ``programs`` is a cycle of starting programs; each episode samples
     rules, applies them, and updates on the discounted reward with a
-    running-mean baseline.  The device defaults to CUDA when available.
+    per-episode standardized advantage (see :func:`_advantage`), so the
+    advantage is comparable across program families rather than
+    dominated by the loudest one.  The device defaults to CUDA when
+    available.
     """
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -177,7 +205,6 @@ def train_reinforce(
         dtype=torch.float32,
         device=dev,
     )
-    baseline = 0.0
     for ep in range(episodes):
         env = SearchEnv(
             programs[ep % len(programs)],
@@ -188,8 +215,8 @@ def train_reinforce(
         logps, returns = _rollout(
             model, env, rule_vecs, names, dev, gamma
         )
-        baseline = 0.98 * baseline + 0.02 * float(returns.mean())
-        loss = -(torch.stack(logps) * (returns - baseline)).sum()
+        adv = _advantage(returns)
+        loss = -(torch.stack(logps) * adv).sum()
         opt.zero_grad()
         loss.backward()
         opt.step()

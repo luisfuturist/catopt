@@ -12,6 +12,7 @@ from catopt_core.trajectories import RULE_VECTOR_LEN
 from catopt_torch.rl import (
     PolicyNet,
     RLPolicy,
+    _advantage,
     state_vector,
     train_reinforce,
 )
@@ -76,3 +77,24 @@ def test_train_reinforce_default_device_and_logging(caplog):
             log_every=1,
         )
     assert any("episode" in r.getMessage() for r in caplog.records)
+
+
+def test_advantage_standardizes_within_episode():
+    """The best step scores positive, the rest negative, mean 0."""
+    adv = _advantage(torch.tensor([0.4, 0.0, 0.0]))
+    assert abs(float(adv.mean())) < 1e-6
+    assert abs(float(adv.std(unbiased=False)) - 1.0) < 1e-5
+    assert float(adv[0]) > 0.0
+    assert float(adv[1]) < 0.0
+
+
+def test_advantage_is_scale_invariant():
+    """A family's reward scale cannot dominate the advantage."""
+    r = torch.tensor([0.1, 0.0, 0.0])
+    assert torch.allclose(_advantage(r), _advantage(r * 7.0))
+
+
+def test_advantage_flat_returns_have_no_signal():
+    """An episode with no improvement yields a zero advantage."""
+    adv = _advantage(torch.zeros(3))
+    assert torch.allclose(adv, torch.zeros(3))
