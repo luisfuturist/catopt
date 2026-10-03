@@ -3,6 +3,7 @@
 # ruff: noqa: RUF002 — math notation in comments
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -13,6 +14,7 @@ from catopt_core.cost import (
     _local_roofline,
     _memo_dispatch,
     _profile_constants,
+    dag_cost,
     fusion_member_key,
 )
 from catopt_core.egraph.types import (
@@ -36,6 +38,22 @@ logger = logging.getLogger("catopt_core.egraph.extract")
 #: billed.  (The e-class level check approximates the per-arg Const
 #: rules — see the function for the exact contract.)
 _FOLDABLE_OPS = _FOLDABLE_ELEMWISE | {"matmul", "concat"}
+
+#: Largest number of pairing groups for which
+#: :meth:`_ExtractMixin.extract_paired` enumerates every ``{0,1}^G``
+#: fuse/decline subset (``2**G`` extractions).  The coordination space
+#: is small in practice (measured 1-3, the whole gap lives there), so
+#: the exhaustive decision is exact for every measured instance; beyond
+#: the cap the per-group decision degrades to the bounded
+#: :meth:`_ExtractMixin._greedy_paired` pass.
+_PAIRING_EXHAUSTIVE_MAX = 3
+
+#: Extraction budget for the :meth:`_ExtractMixin._greedy_paired`
+#: fallback: at most this many single-group removals are tried on top of
+#: the all-groups-forced baseline.  Keeps the fallback cheap when a graph
+#: has many pairing groups (a saturated transformer block can reach ~90,
+#: where an O(G) sweep would cost ~90 extractions).
+_PAIRING_GREEDY_BUDGET = 4
 
 
 class _ExtractMixin:
@@ -763,30 +781,128 @@ class _ExtractMixin:
     def extract_paired(
         self, root_eid: int, cost_fn, groups: list[dict[int, Any]]
     ) -> Any:
-        """Extract with pairing groups forced to share their fused GEMM.
+        """Extract with the pairing-group decision made *per group*.
 
         Per-class greedy extraction cannot express the product law's
         non-local choice: member class C_i containing both
         ``linear(x, W_i)`` and ``split_i(fused)`` sees the split's
         subtree cost as the FULL fused GEMM, which always loses locally.
-        The fused form only wins when *all* members take it — and
-        additionally when every consumer class routes through the member
-        classes rather than a specialized-fusion alternative (e.g. an
-        ``sdpa`` enode built over rule-introduced ``chunk`` terms).
+        The fused form only wins when *all* members of a group take it —
+        and additionally when every consumer class routes through the
+        member classes rather than a specialized-fusion alternative
+        (e.g. an ``sdpa`` enode built over rule-introduced ``chunk``
+        terms).
 
-        So: (1) each member class is overridden to its split enode;
-        (2) every other class with multiple enodes is overridden to an
-        enode whose descendants reach a member class, when one exists —
-        steering consumers through the shared GEMM.  The caller compares
-        true DAG cost against the greedy term and keeps the winner.
+        A single "force every group" decision is *all-or-nothing*: when
+        one group's fusion is unprofitable (an ``add``-consumed group
+        gains a weight-merge bypass from ``WEIGHT_FACTOR_LINEAR``) and
+        another's is profitable, forcing both is a net loss while
+        forcing neither misses the profitable one.  So this enumerates
+        the per-group decision ``{0,1}^G`` — every **non-empty** subset
+        of groups is forced through :meth:`_paired_subset_term` (which
+        also steers consumers through the forced members) and the
+        cheapest true DAG-cost term wins.  The empty subset is left to
+        the caller's greedy-vs-forced comparison, so ``extract_paired``
+        keeps meaning "the best *coordinated* term".
+
+        ``G`` is small in practice (measured 1-3), so ``2**G`` is
+        enumerated exhaustively up to ``_PAIRING_EXHAUSTIVE_MAX``;
+        beyond the cap the per-group decision degrades to the bounded
+        :meth:`_greedy_paired` pass.  The result is never worse than the
+        all-groups-forced term the previous all-or-nothing policy
+        returned — that term is always one of the candidates.
         """
-        member_over: dict[int, Any] = {}
-        member_classes: set[int] = set()
+        per_group: list[dict[int, Any]] = []
         for g in groups:
+            over: dict[int, Any] = {}
             for cid, enode in g.items():
-                cid = self.find(cid)
-                member_over.setdefault(cid, enode)
-                member_classes.add(cid)
+                over.setdefault(self.find(cid), enode)
+            per_group.append(over)
+        n = len(per_group)
+        if n == 0:
+            return self.extract_best(root_eid, cost_fn)
+        memo = self._cost_memo_for(cost_fn)
+        best: tuple[float, Any] = (float("inf"), None)
+        if n <= _PAIRING_EXHAUSTIVE_MAX:
+            for r in range(1, n + 1):
+                for comb in itertools.combinations(range(n), r):
+                    best = self._score_paired(
+                        root_eid, cost_fn, per_group, comb, memo, best
+                    )
+        else:
+            best = self._greedy_paired(
+                root_eid, cost_fn, per_group, memo, best
+            )
+        return best[1]
+
+    def _score_paired(
+        self,
+        root_eid: int,
+        cost_fn,
+        per_group: list[dict[int, Any]],
+        comb: tuple[int, ...],
+        memo: dict,
+        best: tuple[float, Any],
+    ) -> tuple[float, Any]:
+        """Force *comb*'s groups; keep the cheaper of *best* and it."""
+        merged: dict[int, Any] = {}
+        for i in comb:
+            merged.update(per_group[i])
+        term = self._paired_subset_term(root_eid, cost_fn, merged)
+        cost = (
+            dag_cost(term, cost_fn, memo=memo)
+            if term is not None
+            else float("inf")
+        )
+        if cost < best[0]:
+            return (cost, term)
+        return best
+
+    def _greedy_paired(
+        self,
+        root_eid: int,
+        cost_fn,
+        per_group: list[dict[int, Any]],
+        memo: dict,
+        best: tuple[float, Any],
+    ) -> tuple[float, Any]:
+        """Bounded per-group fallback for large ``G``.
+
+        Starts from the all-groups-forced decision — the previous
+        all-or-nothing policy, so the result can never be worse than it
+        — then tries single-group removals for the first
+        ``_PAIRING_GREEDY_BUDGET`` groups, keeping the best.  Constant
+        extraction cost, so the ``{0,1}^G`` decision stays cheap past
+        ``_PAIRING_EXHAUSTIVE_MAX`` (a saturated transformer block can
+        reach ``G`` ~90, where an O(G) sweep would cost ~90 extractions
+        against the 2 the previous policy spent).
+        """
+        n = len(per_group)
+        best = self._score_paired(
+            root_eid, cost_fn, per_group, tuple(range(n)), memo, best
+        )
+        for i in range(min(n, _PAIRING_GREEDY_BUDGET)):
+            cand = tuple(j for j in range(n) if j != i)
+            if not cand:
+                continue  # keep >=1 group: the empty set is the caller's
+            best = self._score_paired(
+                root_eid, cost_fn, per_group, cand, memo, best
+            )
+        return best
+
+    def _paired_subset_term(
+        self, root_eid: int, cost_fn, member_over: dict[int, Any]
+    ) -> Any:
+        """Force *member_over*'s members to their splits and steer.
+
+        The forced extraction for one group-subset: (1) each member
+        class is overridden to its split enode; (2) every other class
+        with multiple enodes is overridden to an enode whose
+        descendants reach a member class, when one exists — steering
+        consumers through the shared GEMM.  The caller prices the true
+        DAG cost against the alternatives.
+        """
+        member_classes: set[int] = set(member_over)
 
         # descendant e-class sets, memoized, cycle-guarded
         desc_cache: dict[int, frozenset] = {}

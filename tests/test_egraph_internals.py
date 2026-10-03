@@ -9,9 +9,12 @@ branches in the split modules:
   classes with NO acyclic member), ``extract_alternatives`` leaf-skip /
   failed-forced-member / repr-dedup / top-k, ``diverse_classes`` sketch
   arms, bounded-extraction ban rounds (unlocatable RHS, already-banned,
-  no-progress), and ``extract_paired`` steering (member-routing
+  no-progress), ``extract_paired`` steering (member-routing
   overrides, unreachable/cyclic children priced inf, descendant cycles,
-  non-memo cost functions).
+  non-memo cost functions) and its per-group fuse/decline decision
+  (exhaustive ``{0,1}^G`` subsets, the unextractable-subset + bounded
+  drop-one-group fallback arms, and the four suboptimal draws of
+  ``tools/coordination_probe.py``).
 - ``proof.py`` — ``_oldest_term``/``_app_for_member``/``_resolve_subst``
   failure arms, ``_connect`` budget stubs + expansion fallbacks +
   congruence/edge/stub strategy, ``_edge_path`` exhaustion and
@@ -53,7 +56,7 @@ Everything is deterministic (small graphs, no RNG).
 import pytest
 
 from catopt_core import laws as R
-from catopt_core.cost import count_cost, dag_cost
+from catopt_core.cost import count_cost, dag_cost, executor_cost_for
 from catopt_core.egraph import (
     Certificate,
     CertificateVerificationError,
@@ -449,6 +452,186 @@ def test_extract_paired_empty_groups_is_greedy():
     got = eg.extract_paired(root, count_cost, [{}])
     want = eg.extract_best(root, count_cost)
     assert op_repr(got) == op_repr(want)
+
+
+def test_extract_paired_no_groups_is_greedy():
+    """An empty group list has no coordinated choice -> greedy."""
+    eg, _src, root, _groups = _pairing_graph()
+    got = eg.extract_paired(root, count_cost, [])
+    want = eg.extract_best(root, count_cost)
+    assert op_repr(got) == op_repr(want)
+
+
+def test_extract_paired_unextractable_subset_returns_none():
+    """A forced subset with no extractable member prices at +inf and is
+    skipped; when every subset is unextractable the result is None."""
+    eg = EGraph()
+    cid = _self_loop(eg)
+    node = next(iter(eg._classes[cid].nodes))
+    assert eg.extract_paired(cid, count_cost, [{cid: node}]) is None
+
+
+# --- per-group coordination (tools/coordination_probe.py) ----------------
+
+
+def _lin(x: str, w: str) -> Op:
+    """A ``linear`` projection over a fixed (2, 4) input."""
+    return Op.make(
+        "linear",
+        Var(x, TensorType((2, 4))),
+        Param(w, TensorType((8, 4))),
+    )
+
+
+def _chain(op: str, *members: Op) -> Op:
+    """Left-fold *members* under *op*."""
+    t = members[0]
+    for m in members[1:]:
+        t = Op.make(op, t, m)
+    return t
+
+
+def _pairing_instance(src: Op):
+    """Saturate *src* then run the pairing pass (the probe's flow)."""
+    eg = EGraph()
+    root = eg.add_term(src)
+    eg.run(R.ALL_RULES, root, max_iterations=2, max_nodes=3000)
+    groups = pair_shared_input_linears(eg)
+    assert groups, "expected pairing groups"
+    eg.rebuild()
+    eg.run(R.ALL_RULES, root, max_iterations=1, max_nodes=3000)
+    return eg, root, groups
+
+
+# The four draws of the seeded random family (coordination_probe.py
+# seeds 12/17/25/35) on which the previous all-or-nothing coordination
+# policy was suboptimal, as their source terms, paired with the true
+# coordination optimum under the shipped default executor model.
+_COORD_CASES = [
+    (
+        35,
+        87011.50561797753,
+        Op.make(
+            "mul",
+            _chain("sub", _lin("x0", "W0_0"), _lin("x0", "W0_1")),
+            _chain("add", _lin("x1", "W1_0"), _lin("x1", "W1_1")),
+        ),
+    ),
+    (
+        25,
+        156620.49438202247,
+        Op.make(
+            "add",
+            Op.make(
+                "mul",
+                _chain("add", _lin("x0", "W0_0"), _lin("x0", "W0_1")),
+                _chain("sub", _lin("x1", "W1_0"), _lin("x1", "W1_1")),
+            ),
+            _chain("sub", _lin("x2", "W2_0"), _lin("x2", "W2_1")),
+        ),
+    ),
+    (
+        12,
+        182724.808988764,
+        Op.make(
+            "add",
+            Op.make(
+                "mul",
+                _chain("sub", _lin("x0", "W0_0"), _lin("x0", "W0_1")),
+                _chain(
+                    "sub",
+                    _lin("x1", "W1_0"),
+                    _lin("x1", "W1_1"),
+                    _lin("x1", "W1_2"),
+                ),
+            ),
+            _chain("add", _lin("x2", "W2_0"), _lin("x2", "W2_1")),
+        ),
+    ),
+    (
+        17,
+        182724.80898876404,
+        Op.make(
+            "sub",
+            Op.make(
+                "sub",
+                Op.make(
+                    "mul",
+                    _lin("x0", "W0_0"),
+                    _lin("x0", "W0_1"),
+                ),
+                _chain("add", _lin("x1", "W1_0"), _lin("x1", "W1_1")),
+            ),
+            _chain(
+                "sub",
+                _lin("x2", "W2_0"),
+                _lin("x2", "W2_1"),
+                _lin("x2", "W2_2"),
+            ),
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("optimum", "src"),
+    [(c[1], c[2]) for c in _COORD_CASES],
+    ids=[f"seed{c[0]}" for c in _COORD_CASES],
+)
+def test_extract_paired_per_group_reaches_optimum(optimum, src):
+    """The per-group decision reaches the coordination optimum on the
+    four draws the all-or-nothing policy declined: it fuses the
+    profitable group while leaving the unprofitable one greedy."""
+    eg, root, groups = _pairing_instance(src)
+    cf = executor_cost_for(lowering="generic")
+    greedy = dag_cost(eg.extract_best(root, cf), cf)
+    paired = dag_cost(eg.extract_paired(root, cf, groups), cf)
+    # shipped = min(greedy, coordinated) — now the coordination optimum
+    assert min(greedy, paired) == pytest.approx(optimum, rel=1e-9)
+    # forcing every group was strictly worse than greedy here, so the
+    # old all-or-nothing policy declined and shipped the greedy term
+    assert paired < greedy
+    # never worse than the old all-or-nothing term (all groups forced)
+    member_over: dict = {}
+    for g in groups:
+        for cid, enode in g.items():
+            member_over.setdefault(eg.find(cid), enode)
+    old = dag_cost(eg._paired_subset_term(root, cf, member_over), cf)
+    assert paired <= old + 1e-9
+
+
+def test_extract_paired_fuses_profitable_declines_unprofitable():
+    """Seed 35 (the minimal mix): the ``sub`` group fuses into one
+    shared GEMM while the ``add`` group keeps its
+    ``WEIGHT_FACTOR_LINEAR`` weight-merge bypass — the per-group
+    decision the all-or-nothing policy could not express."""
+    eg, root, groups = _pairing_instance(_COORD_CASES[0][2])
+    cf = executor_cost_for(lowering="generic")
+    rep = op_repr(eg.extract_paired(root, cf, groups))
+    assert "split" in rep  # sub group fused
+    assert "(add W1_0, W1_1)" in rep  # add group's weight-merge kept
+    assert "concat W1_0" not in rep  # add group NOT fused
+
+
+def test_extract_paired_greedy_fallback(monkeypatch):
+    """Past the exhaustive cap the per-group decision degrades to the
+    bounded drop-one-group pass (and keeps >=1 group)."""
+    monkeypatch.setattr(
+        "catopt_core.egraph.extract._PAIRING_EXHAUSTIVE_MAX", 0
+    )
+    # n=1: no non-empty removal -> the keep->=1 guard fires
+    eg, _src, root, groups = _pairing_graph()
+    assert "split" in op_repr(
+        eg.extract_paired(root, count_cost, groups)
+    )
+    # n=2: the pass drops each single group and keeps the best — here
+    # dropping the unprofitable add group recovers the optimum
+    eg2, root2, groups2 = _pairing_instance(_COORD_CASES[0][2])
+    cf = executor_cost_for(lowering="generic")
+    got = eg2.extract_paired(root2, cf, groups2)
+    assert dag_cost(got, cf) == pytest.approx(
+        87011.50561797753, rel=1e-9
+    )
 
 
 # ===========================================================================
