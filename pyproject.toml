@@ -65,6 +65,19 @@ bench = [
 oracle = [
     "egglog>=14.0; python_version >= '3.12'",
 ]
+# OPT-IN field-baseline group.  `opt_einsum` ships the *standard*
+# contraction-ordering players (`greedy`, the exact `optimal` DP) used
+# by tools/contraction_einsum.py to falsify the learned policy against a
+# third-party yardstick instead of our own hand-built baselines.  It is
+# deliberately NOT in `dev`: nothing under packages/ imports it, the
+# tool self-skips (a `SystemExit` with a `uv sync --group einsum` hint)
+# when the group is absent, and the default env stays unchanged.  Pinned
+# to a release published > 7 days before this change (3.4.0, 2024-09-26),
+# bounded below 4 so the lockfile cannot drift to an untested major.
+#   uv sync --group einsum && .venv/bin/python tools/contraction_einsum.py
+einsum = [
+    "opt_einsum>=3.4.0,<4",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=5.0",
