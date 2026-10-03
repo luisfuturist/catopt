@@ -85,6 +85,38 @@ space.  A learned model is one more conforming value.
 `UNAVAILABLE` / `UNKNOWN`) and `classify(exc)` give measurement
 failures a taxonomy instead of an ambiguous crash.
 
+## Wiring — what actually consumes these
+
+The ports are not decoration; each is reached from a real call:
+
+| Port / module | Consumed by |
+|---|---|
+| `Policy` | `EGraph.run(..., policy=)` — the schedule consults it once per iteration; `search(..., policy=...)` threads it through |
+| `Profiler` + `PerformanceModel` | `PredictedCriterion` — pass it as `criteria=` to price extraction by predicted runtime |
+| `pareto` | `SearchResult.frontier(cost_fns)` — the non-dominated set over named axes |
+
+```python
+from catopt_core.cost import flops_cost, param_bytes_cost
+from catopt_core.perf_model import AnalyticalPerformanceModel
+from catopt_core.policies import GreedyPolicy
+from catopt_orchestrator import PredictedCriterion
+from catopt_orchestrator.optimize import search
+
+res = search(
+    model, x,
+    source=TorchSource(),
+    criteria=PredictedCriterion(AnalyticalPerformanceModel()),
+    policy=GreedyPolicy(),
+)
+res.stats["criteria"]   # {'predicted': 1.0}
+res.stats["policy"]     # 'greedy'
+res.frontier({"flops": flops_cost, "memory": param_bytes_cost})
+```
+
+A policy may only *reorder* — every rule still runs, so the fixed point
+and the certificate are unchanged.  A model may only *rank* — the
+feasibility bound (`supported_ops`) is still what decides reach.
+
 ## The rule
 
 Evaluation is an independent dimension: a profiler **observes**, a
