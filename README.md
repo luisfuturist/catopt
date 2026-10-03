@@ -11,16 +11,40 @@ language, not its search strategy.**  Tensor-level compilers rewrite
 traced-monoidal fixpoints, products as `⟨f₁,…,f_k⟩ = (×fᵢ)∘Δ` — so it
 reaches programs no op-level pattern composes to.  Every delivered
 program carries a **replayable certificate** of equivalence, re-checked
-on real terms.
+on real terms.  The engine separates four independent dimensions —
+semantics, search, evaluation and execution
+([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md))
+— and how a candidate actually runs on a target is *measured*, never
+assumed.
 
-The engine separates four independent dimensions — semantics, search,
-evaluation and execution ([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md)):
-the search space is hardware-independent, and how a candidate actually
-runs on a target is *measured*, never assumed.
+## Game
 
-The engine (`catopt-core`) is torch-free and backend-agnostic; PyTorch
-(`catopt-torch`) is the shipped reference backend.  One call runs the
-whole pipeline:
+catopt is, structurally, **a game**.
+
+**Rules.**  The rewrite laws are *derived from category theory*, not
+enumerated as op patterns: associativity of composition, the unit and
+interchange laws, the traced-monoidal axioms, products, and monoid
+carriers.  A rewrite is a **2-cell**; a law *about* rewrites is a
+**3-cell** (coherence); the e-graph is the **higher-categorical board**
+those cells live on ([ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md)).
+
+**Moves.**  Applying a law — a rewrite.
+
+**Board.**  The e-graph: every program *known equal* to yours, in one
+place.  The board is the whole equivalence class, not one term.
+
+**Referee.**  The **certificate**.  `verify_certificate` replays the
+derivation on real terms, so whatever the player does, the output is
+provably the same function.  **This is the differentiator.**  egglog has
+proof-carrying rewriting and Catlab / AlgebraicJulia does categorical
+rewriting, but the *combination* — derived laws + machine-checked
+replay + a learned player + a compiler IR — is the claim.
+
+**Score.**  A pluggable, per-target cost model.  Evaluation is an
+independent dimension ([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md)),
+so the score never decides semantics.
+
+One call runs the whole game:
 
 ```python
 from catopt_orchestrator import Optimizer
@@ -29,6 +53,113 @@ from catopt_torch import TorchBackend
 opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x)
 out = opt(x)        # the same function as model(x) — verified, not spot-checked
 ```
+
+The game pays off concretely on attention: from associativity alone, the
+board reaches `(Q·Kᵀ)·V → Q·(Kᵀ·V)`, turning an O(T²d) intermediate into
+an O(Td²) one — a transform **nobody wrote down** (the details are
+[below](#the-transformation-it-found)).
+
+## RL Player
+
+The player is a **`Policy`**, and it may only **reorder legal moves**.
+It can never change equivalence: a random player reaches the *identical*
+equivalence class, and the certificate still replays.  That safety
+property — a policy that cannot make a program wrong — is what makes a
+learned player admissible at all.
+
+It is trained on real models (`catopt_torch.models`) through the
+trajectory encoding in `catopt_core.trajectories`, and on the
+contraction game in `tools/contraction_policy.py`.
+
+**The expectation: outperform humans.**  "Humans" here means the
+hand-written heuristics and rule orderings — the `greedy`, `search` and
+`restart` players, and the engine's declaration order.
+
+**The measured reality — not an overclaim.**
+
+- The learned contraction policy **beats our own players at equal
+  wall-clock**: `restart` at every scale and budget (0.65–0.90×),
+  `search` decisively (0.36–0.73×), and `greedy` likewise — it wins with
+  ~4× *fewer* rollouts, because one learned rollout is a far better
+  per-step chooser ([contraction-policy-compute.md](project/retros/contraction-policy-compute.md)).
+- It **beats `opt_einsum`'s staged greedy** at n = 20 (0.85–0.88×,
+  seed-stable) and n = 30 (0.83–0.90× at ≥ 200 ms), and — after the
+  rollout-throughput fix — on **3 of 4 seeds at n = 40**
+  ([contraction-policy-einsum.md](project/retros/contraction-policy-einsum.md),
+  [contraction-policy-throughput.md](project/retros/contraction-policy-throughput.md)).
+- But it **loses to `opt_einsum`'s randomised greedy at n = 40**
+  (~1.8× across four seeds), and the loss does not move: **quality
+  saturates with rollout count** — 6× more rollouts bought only ~10% of
+  quality ([contraction-policy-throughput.md](project/retros/contraction-policy-throughput.md)).
+
+The sharpest negative is structural.  In catopt's *own* e-graph,
+reordering rules **cannot change the extracted cost**: the fixed point
+is order-invariant, so a learned policy and a random policy reach the
+*same* cost — measured identical on every held-out model, with the same
+equivalence-class partition.  The training signal on real models is
+nearly empty too: only **1.6%** of `(program, rule)` samples are
+improving ([stage7-policy-wiring-results.md](project/retros/stage7-policy-wiring-results.md)).
+
+So the player's value can only live where the choice is **not**
+order-invariant — contraction ordering, extraction / coordination, and
+law proposal.  The `Policy` seam is a real lever there; it is not a
+lever for extraction quality inside the shipped e-graph.
+
+## Player Finds
+
+The payoff: what the player has already found, shipped.
+
+**`select_mul`** — a law the machine **proposed**, the certificate
+**verified**, and the corpus **measured**:
+
+```
+mul(select(u, dim=D, index=I), select(v, dim=D, index=I))
+    -> select(mul(u, v), dim=D, index=I)
+```
+
+- **True** on all 24 real sites — the two selects always carry the same
+  `dim` and `index`, and the shared attribute metavariables make the
+  matcher enforce that structurally (no `check` hook needed).
+- **New** — no library rule does this.
+- **Fires 24× across 5 real models** (SelectiveSSM, DiagDenseSSM,
+  DiagonalSSM, HybridBlock, TwoLayerHybrid).
+- **Drops the extracted cost 17–26%** (SelectiveSSM 6.787e5 → 5.569e5;
+  TwoLayerHybrid 1.192e6 → 9.484e5), the certificate replaying and the
+  lowered before/after modules passing `sink.verify`.
+- **Now in `DEFAULT`.**
+
+The mechanism is dispatch count: `mul(select, select)` is four dispatched
+ops (`linear`, `select`, `select`, `mul`) and the RHS is three, so the
+law removes exactly one dispatched op per site.  The gain holds across
+`d_inner ∈ {8…256}` — it is an op-count reduction, not a size artefact.
+Source: [law-shape-aware.md](project/retros/law-shape-aware.md).
+
+**The pipeline that found it.**  `tools/law_pipeline.py` runs the loop
+end to end — census → propose → verify (BOTH oracles: derivability *and*
+numeric truth) → measure (fires, cost, certificate, closure safety) →
+ranked ship / no-ship ([law-pipeline.md](project/retros/law-pipeline.md)):
+
+- **Validated by held-out rediscovery.**  With `select_mul` — and only
+  it — removed from the rule set, the pipeline re-proposes it, verifies
+  it, measures it, and ranks it **#1 of 35**, shippable.  The winner is
+  **census-generated** (from the corpus's frequent `mul(select, select)`
+  op-tuple), independently of the hand-written schema that first named
+  it, and the verdict is stable across runs.
+- **Run for real: 0 further shippable.**  On the current library and
+  corpus the honest output is "nothing else clears the bar".
+
+**The safety demonstration.**  `reshape_transpose` fires 23× and
+cost-lowers on a real model — yet it is **numerically FALSE** (reshape
+then transpose is not transpose then reshape).  A cost-only proposer
+would have shipped it; the numeric oracle rejects it.  The truth oracle,
+not the generator, is what makes the pool trustworthy.
+
+**Still honest.**  The generator's op tables (`_POINTWISE` / `_VIEW_OPS`)
+are still human-authored — that is the remaining boundary.  The pipeline
+validates the judgment chain and the census → propose step; it does not
+yet show the op *vocabulary* is machine-invented.
+
+---
 
 ## The transformation it found
 
@@ -105,7 +236,7 @@ reached from a real call, not a promise:
 | Dimension | Reach it with |
 |---|---|
 | semantics | `verify_certificate(ir.root, cert, strict=True)` — every delivered program ships a replayable derivation |
-| search | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned / RL) orders the rules each iteration |
+| search | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned / RL) orders the rules each iteration — see [RL Player](#rl-player) |
 | evaluation | `criteria=PredictedCriterion(model)` prices extraction through a `PerformanceModel`; `SearchResult.frontier({...})` returns the non-dominated set; `StaticProfiler` describes a program without running it |
 | execution | the `Sink` / `Runner` / `Meter` ports — and `catopt_core.failures` classifies what went wrong |
 
