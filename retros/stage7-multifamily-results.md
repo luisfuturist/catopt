@@ -180,6 +180,28 @@ The fix lands `dup` (rank 26.5 → 1.00, hit 0 → 1.00) and keeps
 the loudest family**.  Across seeds 0–2 `dup` is solved every seed and
 `linear` two of three.
 
+> **Correction (later audit) — this table is stale at HEAD.**  An
+> audit for a *different* RL bug class found no bug in the shipped
+> code (the step/return alignment is correct, and `_advantage` always
+> standardizes — now pinned by six mutation-verified tests), but
+> re-running this measurement deterministically at HEAD reproduces the
+> **"before"** table above (`chain 26.50`, `dup 26.50`,
+> `linear 1.00`), not this one.
+>
+> The cause is **not** the reward baseline: it is
+> `catopt_core.features` changing after `b16f358` — the view/fold-aware
+> traffic accounting (`:178-196`, commit `ecfbf50`) altered the RL
+> policy's **state input**.  Reverting `features.py` to `b16f358`
+> reproduces this "after" table **exactly** (`dup 1.00/1.00`).  So the
+> per-episode standardization fix is intact and correct; its
+> documented *benefit* simply does not survive the feature change.
+>
+> The lesson is architectural, not numerical: **a policy is coupled to
+> the semantics of its features**, so a correctness fix elsewhere can
+> silently invalidate a learned policy.  Any change to
+> `ProgramFeatures` must be treated as a change to every learned
+> policy trained on it.
+
 ### The residual — a winner-take-all, not a scale bias
 
 `chain` still collapses (rank 26.5).  The *scale* bias is gone, but
