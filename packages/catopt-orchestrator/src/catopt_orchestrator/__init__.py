@@ -37,6 +37,7 @@ from catopt_orchestrator.criteria import (
     FlopsCriterion,
     LatencyCriterion,
     MemoryCriterion,
+    PredictedCriterion,
     criteria_cost,
     peak_bytes_cost,
 )
@@ -130,6 +131,7 @@ __all__ = [
     "NormSig",
     "OptimizationResourceError",
     "Optimizer",
+    "PredictedCriterion",
     "ReifySpec",
     "ReorderCompose",
     "Runner",

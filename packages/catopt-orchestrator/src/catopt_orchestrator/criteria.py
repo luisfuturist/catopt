@@ -70,6 +70,7 @@ __all__ = [
     "FlopsCriterion",
     "LatencyCriterion",
     "MemoryCriterion",
+    "PredictedCriterion",
     "criteria_cost",
     "peak_bytes_cost",
 ]
@@ -206,6 +207,59 @@ class LatencyCriterion(_Composable):
     def cost_fn(self, profile: Any = None) -> CostFn:
         """Build the delivered-latency cost model."""
         return executor_cost_for(profile, lowering="generic")
+
+
+class PredictedCriterion(_Composable):
+    """Predicted runtime from a ``PerformanceModel`` — the model axis.
+
+    Wraps a :class:`~catopt_core.ports.PerformanceModel` (and, for the
+    features it reads, a :class:`~catopt_core.ports.Profiler` —
+    :class:`~catopt_core.features.StaticProfiler` by default) into the
+    ``Criterion`` seam, so extraction can be priced by *predicted*
+    seconds instead of a built-in roofline.  ``hardware`` overrides the
+    target handed to the model; ``None`` passes the calibration
+    profile through.
+
+    Non-additive inside extraction — a prediction is a function of the
+    whole subtree, so pricing a deep term costs a feature walk per
+    node.  Opt in when you want a model to steer selection; the
+    built-in axes stay cheaper.
+    """
+
+    name = "predicted"
+    charges_shape = True
+
+    def __init__(
+        self,
+        model: Any,
+        profiler: Any = None,
+        hardware: Any = None,
+    ) -> None:
+        """Bind the model, an optional profiler, and an optional target."""
+        self.model = model
+        self.profiler = profiler
+        self.hardware = hardware
+
+    def cost_fn(self, profile: Any = None) -> CostFn:
+        """Build the prediction-backed cost model."""
+        from catopt_core.features import StaticProfiler
+
+        profiler = (
+            self.profiler
+            if self.profiler is not None
+            else StaticProfiler()
+        )
+        model = self.model
+        hardware = (
+            self.hardware if self.hardware is not None else profile
+        )
+
+        def _cost(term: Any, memo: dict | None = None) -> float:
+            return float(
+                model.predict(profiler.profile(term), hardware)
+            )
+
+        return _cost
 
 
 class FlopsCriterion(_Composable):
