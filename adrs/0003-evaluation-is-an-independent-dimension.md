@@ -283,6 +283,15 @@ Benchmarks are deliberately last.
   `TypeError` rather than declining clearly.  Either the port gains an
   explicit capability flag or the call is guarded — left open here,
   tracked in plan 0016's Known gaps.
+- **The `Criterion` seam assumes additivity.**  Extraction recovers a
+  node's local cost from its children's totals, which is exact only
+  for an *additive* cost function.  A model-backed criterion predicts
+  over the whole subtree, so it cannot steer extraction — measured: no
+  target changes the extracted program (`python -m bench run
+  eval_axis`, 0/7 families; the true roofline argmin is
+  target-invariant in 7/7).  A `PerformanceModel` ranks *candidates*,
+  not *nodes*; treating it as a cost function is a category error this
+  seam does not prevent.
 
 ## Follow-ups (mandatory)
 

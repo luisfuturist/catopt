@@ -60,6 +60,17 @@ existing gate catches an unconsumed port.
    winner-take-all under a sparse reward, not a reward-scale bias
    (see `retros/stage7-multifamily-results.md`).  A denser or
    state-conditioned signal is still needed.
+3. **`PredictedCriterion` cannot steer extraction.**  `extract_best`
+   recovers a node's local cost by subtracting its children's costs —
+   exact only for an *additive* cost function.  A `PerformanceModel`
+   prediction is a function of the whole subtree, so the marginal is
+   either mis-ranked (`swiglu`) or collapses to bit-identical values
+   for forms whose true predictions differ by 25 % (`linattn`).
+   Measured by `python -m bench run eval_axis`: pluggable evaluation
+   does **not** change the extracted program (0/7 families), and the
+   true roofline argmin is target-invariant in 7/7.  Either the model
+   criterion is confined to post-hoc ranking, or extraction needs a
+   dense (non-marginal) pricing path for non-additive criteria.
 
 ## Goal
 
