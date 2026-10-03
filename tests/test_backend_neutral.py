@@ -709,6 +709,37 @@ def test_carrier_helpers_degrade_without_carriers(monkeypatch):
     assert eg is not None and ir is not None
 
 
+def test_carrier_registry_absent_paths(monkeypatch):
+    """The ``get_carriers() is None`` arms, exercised in-process.
+
+    ``catopt_carriers`` installs its machinery at import, so the
+    carrier-free arms are otherwise reachable only in a backend-free
+    process (the subprocess proof above).  Neutralising the registry
+    directly drives the same arms here — real coverage of the
+    fallbacks, not a spawned interpreter the tracer never sees.
+    """
+    import catopt_orchestrator.carriers as C
+    import catopt_orchestrator.optimize as O
+    import catopt_orchestrator.regime as R
+
+    monkeypatch.setattr(C, "_MACHINERY", None)
+
+    # ``_carrier_search`` composes the core preset alone.
+    assert len(R._carrier_search()) == len(R.core_laws.CARRIER_SEARCH)
+    # ``_xc_rules`` degrades to an empty seam set.
+    assert len(R._xc_rules()) == 0
+    # ``build_egraph`` runs the plain core tier: no lifts, no XC.
+    _eg, _root, _ir, _src, stats = R.build_egraph(
+        _ListModel(), [1.0, 2.0], source=FakeSource(), rules=[], xc=True
+    )
+    assert "nonlocal_lifts" not in stats
+    assert "xc_rounds" not in stats
+    # The pipeline default composes without the carrier preset.  The
+    # composed set is cached, so reset it (monkeypatch restores it).
+    monkeypatch.setattr(O, "_DEFAULT_RULES", None)
+    assert len(O.default_rules()) == len(R.core_laws.DEFAULT)
+
+
 def test_register_regime_backend_executors_only():
     import catopt_orchestrator.regime as R
 
