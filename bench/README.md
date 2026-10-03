@@ -150,6 +150,7 @@ below; `python -m bench catalog --check` fails if it drifts (and
 | suite | tier | question | expected |
 |---|---|---|---|
 | `policy_value` | micro | Does a learned search policy pick better rules than random, declaration-order, or a cost-model greedy? | NEGATIVE vs the cost-model greedy — the learned policy ranks rules better than random/declaration-order but does not match the evaluator greedy (associativity-direction confusion). |
+| `eval_axis` | micro | Does plugging a different evaluator in change the program the engine extracts, and does the equivalence class expose a genuine multi-axis trade-off? | NEGATIVE on all three: an accurate profiler kills the bandwidth story (the bandwidth pick never differs from the launch pick), the root-class frontier yields ties and float noise only, and the residual target-sensitivity is the additive marginal decomposition of the non-additive PredictedCriterion — the true roofline value ranks the same form first under every target (7/7). |
 
 ### structure
 
@@ -201,7 +202,7 @@ below; `python -m bench catalog --check` fails if it drifts (and
 |---|---|
 | laws | `law_bench`, `laws_effect` |
 | egraph | `search_efficiency`, `reassoc_scale` |
-| cost | `cost_fidelity` |
+| cost | `cost_fidelity`, `eval_axis` |
 | policy | `policy_value` |
 | pairing | `reassoc_scale`, `real_win_hunt`, `killer_demo`, `model_bench`, `e2e_model`, `e2e_models2`, `e2e_llm`, `stories15m_bench`, `bench_e2e` |
 | autotune | `real_win_hunt`, `killer_demo`, `model_bench` |

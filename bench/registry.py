@@ -168,6 +168,23 @@ SUITES: list[SuiteSpec] = [
         tier="micro",
         mechanisms=("policy",),
     ),
+    _s(
+        "eval_axis",
+        "evaluation",
+        "Evaluation-axis selection",
+        "Does plugging a different evaluator in change the program the "
+        "engine extracts, and does the equivalence class expose a "
+        "genuine multi-axis trade-off?",
+        "NEGATIVE on all three: an accurate profiler kills the "
+        "bandwidth story (the bandwidth pick never differs from the "
+        "launch pick), the root-class frontier yields ties and float "
+        "noise only, and the residual target-sensitivity is the "
+        "additive marginal decomposition of the non-additive "
+        "PredictedCriterion — the true roofline value ranks the same "
+        "form first under every target (7/7).",
+        tier="micro",
+        mechanisms=("cost",),
+    ),
     # -- structure: what structure do real weights carry? ---------------
     _s(
         "structure_census",

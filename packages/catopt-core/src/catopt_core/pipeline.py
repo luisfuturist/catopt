@@ -176,6 +176,16 @@ class SearchResult:
         ``candidates`` bounds how many class members are priced (the
         root class can be astronomically large); ``top_k`` bounds the
         returned frontier.
+
+        Scope — the candidate set is the **root class** only
+        (:meth:`alternatives` forces one root enode at a time), so a
+        distinction that lives *inside* a child e-class — a per-subtree
+        associativity or fusion choice under the root — is invisible
+        here.  That is deliberate: the frontier is a bounded discovery
+        surface over the top-level shapes, not a whole-graph search.
+        When a sub-class trade-off matters, widen the surface
+        explicitly (e.g. price a :meth:`EGraph.diverse_classes` union)
+        rather than expecting this method to see it.
         """
         from catopt_core.cost import flops_cost
         from catopt_core.pareto import pareto_frontier
