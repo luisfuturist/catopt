@@ -27,7 +27,12 @@ This tool is that end-to-end runnable: **one entry point** that
    ``--holdout`` names).
 4. **measure** — fires the rule alone over every real model
    (``law_impact._probe``: fires, cost delta, lowered-module
-   ``sink.verify``) and, for any candidate that fires, saturates each
+   ``sink.verify``) and audits every merged fire for *well-typedness*
+   (:func:`_typed_probe` — a fire whose instantiated RHS does not
+   shape-resolve, or does not evaluate, minted a member that does
+   not denote; it counts in ``fires_ill_typed``, and a cost drop
+   whose extraction picked an ill-typed member is suppressed, not
+   paid).  Then, for any candidate that fires, it saturates each
    model under the search rule set with and without the rule
    (``law_impact._saturate`` / ``_cert_ok``): end-to-end cost delta,
    certificate replay, and a **closure-safety** check — the enode
@@ -72,15 +77,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from catopt_core.cost import dag_cost
-from catopt_core.egraph import Rewrite
+from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.egraph.terms import _term_instantiate, _term_match
 from catopt_core.ir import Const, Op, op_repr
 from catopt_core.laws import ALL_RULES
+from catopt_core.typing import _shape_of
 
 # Sibling tools own every stage; reuse them, never duplicate.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -89,6 +96,8 @@ import law_evidence as ev_store
 import law_proposal as lp
 import law_view_oracle as lvo
 from law_impact import (
+    _FIRING_ITERS,
+    _FIRING_NODES,
     TermCase,
     _bench_cases,
     _cert_ok,
@@ -587,6 +596,18 @@ class Evidence:
 
     The properties ``truth`` and ``shippable`` are the verdict; every
     field above them is raw evidence, so the report can show *why*.
+
+    ``fires`` is the e-graph's merged-application count
+    (``rule_fires``), split by the typedness audit into
+    ``fires_typed`` + ``fires_ill_typed``: a fire whose instantiated
+    RHS does not shape-resolve or does not evaluate minted a member
+    that cannot denote.  ``changed`` / ``paid`` count only cases
+    whose extracted winner is well-typed — a cost drop produced by
+    an ill-typed member is suppressed into ``paid_ill_typed`` (and
+    the case named in ``ill_typed_cases``), since cost-dropping an
+    invalid program is not evidence the law pays.  ``reach_ill``
+    counts saturation rows where the with-rule cost drop was
+    likewise suppressed.
     """
 
     proposal: Proposal
@@ -600,12 +621,17 @@ class Evidence:
     witness: tuple[str, ...] = ()
     relation: str = "new"
     fires: int = 0
+    fires_typed: int = 0
+    fires_ill_typed: int = 0
     fire_cases: tuple[str, ...] = ()
+    ill_typed_cases: tuple[str, ...] = ()
     changed: int = 0
     paid: int = 0
+    paid_ill_typed: int = 0
     verify_fail: int = 0
     reach: tuple[dict, ...] = ()
     cost_drop: float = 0.0
+    reach_ill: int = 0
     cert_fail: int = 0
     closure_ratio: float = 1.0
     # The view/index oracle's verdict for view-family candidates
@@ -633,6 +659,7 @@ class Evidence:
             self.truth
             and self.relation == "new"
             and self.fires > 0
+            and self.fires_ill_typed == 0
             and self.paid > 0
             and self.verify_fail == 0
             and self.cert_fail == 0
@@ -662,7 +689,29 @@ class Evidence:
         if self.fires == 0:
             return "no firing on a real model"
         if self.paid == 0:
-            return "fires but never lowers cost"
+            if self.paid_ill_typed:
+                return (
+                    "pays only on ill-typed sites "
+                    f"({self.paid_ill_typed} suppressed, "
+                    f"{self.fires_ill_typed}/{self.fires} fires "
+                    "ill-typed)"
+                )
+            if self.fires_typed == 0:
+                return (
+                    "every fire mints an ill-typed member "
+                    f"({self.fires_ill_typed}/{self.fires})"
+                )
+            return "fires but never lowers cost" + (
+                f" ({self.fires_ill_typed}/{self.fires} fires "
+                "ill-typed)"
+                if self.fires_ill_typed
+                else ""
+            )
+        if self.fires_ill_typed:
+            return (
+                "mints ill-typed members on real sites "
+                f"({self.fires_ill_typed}/{self.fires} fires)"
+            )
         if self.verify_fail:
             return "lowered modules differ"
         if self.cert_fail:
@@ -673,6 +722,220 @@ class Evidence:
 # ---------------------------------------------------------------------------
 #  Measurement — firing, cost delta, certificate, closure safety
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+#  Typedness audit — a fire is evidence only if the minted RHS denotes
+# ---------------------------------------------------------------------------
+#
+# ``eg.rule_fires`` counts every application that merged — it says
+# nothing about whether the instantiated RHS was well-typed.  The
+# view/index candidates mint members like ``mul(u, v)`` on bindings
+# where ``u``/``v`` do not broadcast, or ``add(u, v)`` where the
+# bound ``u`` evaluates to a *tuple* (``getitem`` over
+# ``topk``/``var_mean``): the member enters the e-class anyway, the
+# cost model prices it (an unknown shape falls back to ~free — see
+# ``cost/basic.py``), extraction can pick it, and the probe would
+# record a cost drop on a program that does not denote.  The audit
+# below re-runs the lone rule on a proof-tracking e-graph (the
+# default truncation level already records every application and
+# merge) and classifies each merged fire by shape-resolving — and,
+# when an input env is buildable, evaluating — the instantiated RHS.
+
+
+def _bad_subterms(term: Any, memo: dict | None = None) -> frozenset:
+    """Return the subterms of *term* that do not shape-resolve.
+
+    A subterm is bad when ``catopt_core.typing._shape_of`` raises,
+    returns ``_INVALID`` or ``None``, or returns a shape carrying a
+    non-int/negative dim.  The walk is per-subterm, not root-only:
+    ``None`` (unknown) is a wildcard inside ``_broadcast``, so a bad
+    inner node does not always propagate to the root.  ``memo`` is a
+    shared ``_shape_of`` cache — extracted terms are DAGs.
+    """
+    if not isinstance(term, Op):
+        return frozenset()
+    memo = {} if memo is None else memo
+    bad: set = set()
+    for sub in _iter_subterms(term):
+        try:
+            s = _shape_of(sub, memo)
+        except Exception:
+            bad.add(sub)
+            continue
+        if not isinstance(s, tuple) or any(
+            not isinstance(d, int) or d < 0 for d in s
+        ):
+            bad.add(sub)
+    return frozenset(bad)
+
+
+def _evals(term: Any) -> bool | None:
+    """Return whether *term* fp64-evaluates; ``None`` = cannot tell.
+
+    The eval leg exists because shape inference cannot see every
+    invalid member: ``transpose``/``select``/``unsqueeze`` attrs are
+    ``%``-normalised inside the shape rules, so an out-of-range axis
+    shape-checks fine and only fails at evaluation — and a
+    tuple-valued operand (``topk``/``var_mean`` under ``getitem``)
+    reports a tensor-looking shape but fails at eval.  ``None``
+    means a leaf carried a non-int dim, so no env exists and the
+    shape verdict stands alone.
+    """
+    try:
+        env = lvo._env_for(term)
+    except Exception:
+        return None
+    if env is None:
+        return None
+    ok, _ = lvo._eval(term, env)
+    return ok
+
+
+def _term_typed(term: Any) -> bool:
+    """Return whether every subterm shape-resolves and term evaluates."""
+    if _bad_subterms(term):
+        return False
+    return _evals(term) is not False
+
+
+def _pick_ill_typed(best: Any, *refs: Any) -> bool:
+    """Return whether the pick *best* carries a minted bad member.
+
+    A bad subterm already present in a *refs* term (the input, or the
+    base-ruleset extraction) is not this candidate's mint and does
+    not count.  When no shape-bad subterm is new, eval decides:
+    *best* failing to evaluate where a reference evaluates cleanly
+    means the picked member does not denote (an attr the shape rules
+    ``%``-normalised into range, a tuple operand read as a tensor).
+    If every reference also fails to evaluate, the invalidity is
+    ambient — not attributable to this rule — and the pick stands.
+    """
+    new_bad = _bad_subterms(best)
+    for ref in refs:
+        new_bad -= _bad_subterms(ref)
+    if new_bad:
+        return True
+    return _evals(best) is False and any(
+        _evals(r) is True for r in refs
+    )
+
+
+def _subst_key(subst: Any) -> tuple:
+    """Return a hashable normal form of a fired binding.
+
+    Application records carry the substitution as a dict while
+    merge-log edges freeze it as a sorted ``(key, value)`` tuple;
+    values are e-class ids and attribute values, repr-normalised so
+    either form keys the same multiset when an unhashable attr value
+    shows up.
+    """
+    items = subst.items() if isinstance(subst, dict) else subst
+    return tuple(sorted((k, repr(v)) for k, v in items))
+
+
+def _app_typed(eg: Any, proposal: Proposal, app: dict) -> bool:
+    """Return whether the application's instantiated RHS is well-typed.
+
+    The recorded substitution maps metavariables to e-class ids;
+    ``eg._any_term_cached`` resolves each to the same minimum-size
+    member the rule's own ``check``/``derive`` hooks saw, and the RHS
+    instantiates at term level exactly as ``EGraph._instantiate``
+    minted it at enode level — including the ``derive``-produced
+    ``$attr:`` bindings, which the application record carries.  A
+    binding that no longer resolves, or an instantiation that
+    raises, cannot be certified typed and counts as ill-typed,
+    never silently as typed.
+    """
+    bound: dict = {}
+    for k, v in app["subst"].items():
+        if k.startswith("$attr:"):
+            bound[k] = v
+            continue
+        term = eg._any_term_cached(v)
+        if term is None:
+            return False
+        bound[k] = term
+    try:
+        rhs = _term_instantiate(proposal.rhs, bound)
+    except Exception:
+        return False
+    return _term_typed(rhs)
+
+
+@dataclass(frozen=True)
+class _TypedAudit:
+    """The typedness split of a lone rule's firing on one case."""
+
+    fires: int = 0
+    typed: int = 0
+    ill: int = 0
+    pick_ill: bool = False
+
+
+def _typed_probe(
+    case: TermCase, proposal: Proposal, cost_fn: Any
+) -> _TypedAudit:
+    """Re-fire the candidate on a tracked e-graph; audit the fires.
+
+    ``_probe`` reports the firing *count* and the cost delta; this
+    pass classifies each merged application.  The audit rebuilds the
+    identical run (one rule, same bounds — ``EGraph`` at the default
+    truncation level records every application and every merge), so
+    ``audit.fires`` equals the probe's count.  Aligning the recorded
+    applications to the rule's ``merge_log`` edges by frozen binding
+    recovers which applications merged: an application is recorded
+    when it merged *or minted enodes*, but only merges count as
+    fires, and within one binding the merged applications form a
+    prefix — once a merge lands, a later same-binding application
+    finds the classes already joined and can never merge again.
+
+    The pick check asks whether the extracted winner denotes: a cost
+    drop produced by an ill-typed member is not evidence the law
+    pays.  This second saturation runs only on cases the probe
+    reported firing, so the audit adds one bounded lone-rule run per
+    firing (case, proposal) pair — nothing when the rule did not
+    fire.
+    """
+    rule = proposal.as_rule()
+    eg = EGraph()
+    root = eg.add_term(case.term)
+    eg.run(
+        [rule],
+        root,
+        max_iterations=_FIRING_ITERS,
+        max_nodes=_FIRING_NODES,
+    )
+    fires = eg.rule_fires.get(rule.name, 0)
+    typed = ill = 0
+    if fires:
+        merges = Counter(
+            _subst_key(e.subst)
+            for e in eg.merge_log
+            if e.rule == rule.name
+        )
+        seen: Counter = Counter()
+        for app in eg.applications:
+            if app["rule"] != rule.name:
+                continue
+            key = _subst_key(app["subst"])
+            seen[key] += 1
+            if seen[key] > merges.get(key, 0):
+                # Recorded for enode creation without a merge —
+                # ``rule_fires`` does not count it either.
+                continue
+            if _app_typed(eg, proposal, app):
+                typed += 1
+            else:
+                ill += 1
+    pick_ill = False
+    if fires:
+        best = eg.extract_best(root, cost_fn)
+        if best is not None and best != case.term:
+            pick_ill = _pick_ill_typed(best, case.term)
+    return _TypedAudit(
+        fires=fires, typed=typed, ill=ill, pick_ill=pick_ill
+    )
 
 
 def _reach_row(
@@ -704,6 +967,18 @@ def _reach_row(
         dag_cost(base_best, cost_fn) if base_best else float("inf")
     )
     add_cost = dag_cost(add_best, cost_fn) if add_best else float("inf")
+    # A drop only counts when the cheaper extraction denotes — an
+    # ill-typed member minted by the candidate can look arbitrarily
+    # cheap (an unknown shape falls back to ~free), so a with-rule
+    # extraction carrying a bad subterm neither the input nor the
+    # base extraction had is suppressed rather than accrued.
+    add_typed = True
+    if (
+        add_best is not None
+        and base_cost not in (0.0, float("inf"))
+        and add_cost < base_cost
+    ):
+        add_typed = not _pick_ill_typed(add_best, case.term, base_best)
     return {
         "model": case.name,
         "base_enodes": base_stats["n_enodes"],
@@ -711,6 +986,7 @@ def _reach_row(
         "base_cost": base_cost,
         "add_cost": add_cost,
         "changed": add_best != base_best,
+        "add_typed": add_typed,
         "new_fires": fires,
         "base_cert": _cert_ok(base_eg, case.term, base_best, cost_fn),
         "add_cert": _cert_ok(add_eg, case.term, add_best, cost_fn),
@@ -757,22 +1033,44 @@ def _fire(
     cost_fn: Any,
     ev: Evidence,
 ) -> None:
-    """Fire *proposal* alone over every model; fill the firing fields."""
+    """Fire *proposal* alone over every model; fill the firing fields.
+
+    ``_probe`` measures fires, the cost delta and the lowered-module
+    verify; ``_typed_probe`` audits whether each merged fire minted
+    a well-typed member and whether the extracted winner denotes.
+    ``ev.fires`` still counts every merged fire — the split into
+    ``fires_typed`` / ``fires_ill_typed`` makes it honest — but a
+    case whose cheaper extraction is ill-typed contributes neither
+    ``changed`` nor ``paid`` (a cost drop on a program that does not
+    denote is not evidence), nor a ``verify_fail`` (the lowering was
+    doomed, not disagreeing); the suppressed drop is recorded in
+    ``paid_ill_typed`` so the inflation stays visible.
+    """
     rule = proposal.as_rule()
     cases: list[str] = []
+    ill_cases: list[str] = []
     for case in models:
         f = _probe(case, rule, sink, cost_fn)
-        if f.verified in ("FAIL", "error"):
-            ev.verify_fail += 1
         if not f.fires:
             continue
         ev.fires += f.fires
         cases.append(case.name)
+        audit = _typed_probe(case, proposal, cost_fn)
+        ev.fires_typed += audit.typed
+        ev.fires_ill_typed += audit.ill
+        if audit.pick_ill:
+            ill_cases.append(case.name)
+            if f.paid:
+                ev.paid_ill_typed += 1
+            continue
+        if f.verified in ("FAIL", "error"):
+            ev.verify_fail += 1
         if f.changed:
             ev.changed += 1
         if f.paid:
             ev.paid += 1
     ev.fire_cases = tuple(cases)
+    ev.ill_typed_cases = tuple(ill_cases)
 
 
 def _reach(
@@ -793,7 +1091,10 @@ def _reach(
     for r in rows:
         base, add = r["base_cost"], r["add_cost"]
         if base not in (0.0, float("inf")) and add < base:
-            drops.append((base - add) / base)
+            if r["add_typed"]:
+                drops.append((base - add) / base)
+            else:
+                ev.reach_ill += 1
         if r["base_enodes"]:
             ratios.append(r["add_enodes"] / r["base_enodes"])
         if r["add_cert"] != "pass":
@@ -893,10 +1194,16 @@ def measure(
 def _evidence_from_row(proposal: Proposal, row: dict) -> Evidence:
     """Reconstruct the measured record a cached verdict row carries.
 
-    Two fields are not restored: ``match_term`` is not serializable
-    and ``reach``'s per-model rows are only read as aggregates
-    (``cost_drop`` / ``cert_fail`` / ``closure_ratio``, all stored).
-    Everything the ranking, the report, the JSON dump and the
+    Some fields are not restored: ``match_term`` is not
+    serializable, ``reach``'s per-model rows are only read as
+    aggregates (``cost_drop`` / ``cert_fail`` / ``closure_ratio``,
+    all stored), and the typedness audit's ``fires_typed`` /
+    ``fires_ill_typed`` / ``paid_ill_typed`` / ``ill_typed_cases`` /
+    ``reach_ill`` have no columns in the (frozen) verdict schema —
+    a cached row restores them at their defaults, so a cache-served
+    candidate under-reports its ill-typed evidence while the gates
+    it affects (``fires``, gated ``paid``) still round-trip.
+    Everything else the ranking, the report, the JSON dump and the
     admission emitter consume round-trips verbatim — the emitter
     binds its test substitutions from ``fire_cases``' live model
     terms, not ``match_term``.
@@ -1166,7 +1473,7 @@ def _row(i: int, ev: Evidence) -> str:
     return (
         f"{i:>4} {ev.proposal.name:<26} {ev.proposal.family:<18} "
         f"{ev.census_sites:>6} {true:>4} {ev.relation:<9} "
-        f"{ev.matches:>5} {ev.fires:>5} "
+        f"{ev.matches:>5} {ev.fires:>5} {ev.fires_ill_typed:>4} "
         f"{ev.paid:>4} {ev.cost_drop * 100:>6.1f} "
         f"{'pass' if ev.cert_fail == 0 else 'FAIL':>4} "
         f"{ev.closure_ratio:>6.2f}x {verdict:>4}"
@@ -1178,8 +1485,8 @@ def _table(ranked: list[Evidence], top: int) -> str:
     head = (
         f"{'rank':>4} {'candidate':<26} {'family':<18} "
         f"{'census':>6} {'true':>4} {'rel':<9} {'match':>5} "
-        f"{'fires':>5} {'paid':>4} {'drop%':>6} {'cert':>4} "
-        f"{'enode':>7} {'ship':>4}"
+        f"{'fires':>5} {'ill':>4} {'paid':>4} {'drop%':>6} "
+        f"{'cert':>4} {'enode':>7} {'ship':>4}"
     )
     lines = [head, "-" * len(head)]
     for i, ev in enumerate(ranked[:top], start=1):
@@ -1222,9 +1529,13 @@ def _print_report(result: dict, top: int) -> None:
             )
         print(line)
     ship = [e for e in ranked if e.shippable]
+    ill = [e for e in ranked if e.fires_ill_typed]
     print(
         f"   firing on a real model: "
-        f"{sum(1 for e in ranked if e.fires)}; "
+        f"{sum(1 for e in ranked if e.fires)} "
+        f"({len(ill)} mint ill-typed members, "
+        f"{sum(e.fires_ill_typed for e in ranked)} ill-typed fires, "
+        f"{sum(e.paid_ill_typed for e in ranked)} suppressed pays); "
         f"shippable: {len(ship)}"
     )
     vres = [e for e in ranked if e.view_verdict]
@@ -1253,7 +1564,8 @@ def _print_report(result: dict, top: int) -> None:
             f"  #{i} {ev.proposal.name} [{ev.proposal.family}] — "
             f"true={ev.num_true} new={ev.relation} "
             f"census={ev.census_sites} match={ev.matches} "
-            f"fires={ev.fires} paid={ev.paid} "
+            f"fires={ev.fires} ill={ev.fires_ill_typed} "
+            f"paid={ev.paid} "
             f"drop={ev.cost_drop * 100:.1f}% cert=pass "
             f"enode={ev.closure_ratio:.2f}x"
         )
@@ -1338,11 +1650,16 @@ def _dump_json(path: str, result: dict) -> None:
                 "witness": list(ev.witness),
                 "relation": ev.relation,
                 "fires": ev.fires,
+                "fires_typed": ev.fires_typed,
+                "fires_ill_typed": ev.fires_ill_typed,
                 "fire_cases": list(ev.fire_cases),
+                "ill_typed_cases": list(ev.ill_typed_cases),
                 "changed": ev.changed,
                 "paid": ev.paid,
+                "paid_ill_typed": ev.paid_ill_typed,
                 "verify_fail": ev.verify_fail,
                 "cost_drop": ev.cost_drop,
+                "reach_ill": ev.reach_ill,
                 "cert_fail": ev.cert_fail,
                 "closure_ratio": ev.closure_ratio,
                 "view_verdict": ev.view_verdict,
