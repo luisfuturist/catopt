@@ -303,8 +303,8 @@ def _census_naturality(
     comes from ``law_shape_census``'s op-tuple counts, not a hand-
     written schema list.  The truth oracle (not this generator)
     decides whether each candidate is sound.  The op alphabet is the
-    ``pointwise`` / ``views`` pair — hand-written by default, or
-    property-derived (``--vocab derived``).
+    ``pointwise`` / ``views`` pair — property-derived by default
+    (``tools/law_vocab.py``), or hand-written (``--vocab hand``).
     """
     out: list[Proposal] = []
     for op, kids in census_op:
@@ -538,7 +538,7 @@ def _pattern_recognition(census_op: dict) -> list[Proposal]:
 
 
 def propose(
-    census_op: dict, terms: list[Any], vocab: str = "hand"
+    census_op: dict, terms: list[Any], vocab: str = "derived"
 ) -> list[Proposal]:
     """Collect, unify and de-duplicate every proposer's candidates.
 
@@ -908,7 +908,7 @@ def _search_rules(holdout: str | None) -> list[Rewrite]:
 
 def run_pipeline(
     holdout: str | None = None,
-    vocab: str = "hand",
+    vocab: str = "derived",
     evidence_db: str | None = None,
     use_cache: bool = False,
 ) -> dict:
@@ -1278,10 +1278,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--vocab",
         choices=("hand", "derived"),
-        default="hand",
-        help="the generator's op alphabet: hand-written tuples "
-        "(default) or property-classified over the corpus "
-        "(tools/law_vocab.py)",
+        default="derived",
+        help="the generator's op alphabet: property-classified over "
+        "the corpus (default, tools/law_vocab.py) or the "
+        "hand-written tuples",
     )
     parser.add_argument(
         "--emit-admission",
