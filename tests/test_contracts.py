@@ -398,6 +398,7 @@ _LAW_SPECS: dict[str, dict] = {
     "double_neg": {"a": (2, 3)},
     "sub_to_add": {"a": (2, 3), "b": (2, 3)},
     "silu_expand": {"x": (2, 3)},
+    "silu_fold": {"x": (2, 3)},
     "silu_mul_form": {"g": (2, 3), "u": (2, 3)},
     "square_expand": {"x": (2, 3)},
     "pow_to_square": {"x": (2, 3)},

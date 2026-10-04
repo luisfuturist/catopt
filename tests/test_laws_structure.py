@@ -44,6 +44,7 @@ PUBLIC_NAMES = [
     "DOUBLE_NEG",
     "SUB_TO_ADD",
     "SILU_EXPAND",
+    "SILU_FOLD",
     "SILU_MUL_FORM",
     "SQUARE_EXPAND",
     "POW_TO_SQUARE",
@@ -183,27 +184,28 @@ def test_laws_exports_every_rewrite():
 
     found = _iter_module_rules(laws)
     assert all(isinstance(r, Rewrite) for r in found)
-    # 53 tensor (assoc_linear_rev + select_mul + softmax_fold)
+    # 54 tensor (assoc_linear_rev + select_mul + softmax_fold
+    # + silu_fold)
     # + 6 dense-scan + 16 diagonal-scan + 77 layout + 37 attention
     # rewrites.
-    assert len(found) == 189
+    assert len(found) == 190
 
 
 def test_all_rules_count_unchanged():
     # The default set excludes LAYOUT_RULES (opt-in — closure-cost
-    # regression documented in laws.tensor); WITH_LAYOUT keeps 130.
-    assert len(laws.all_rules()) == 53
+    # regression documented in laws.tensor); WITH_LAYOUT keeps 131.
+    assert len(laws.all_rules()) == 54
     assert laws.all_rules() == laws.ALL_RULES
     assert len(laws.ALL_RULES) == (
         len(laws.SIMPLIFICATION_RULES) + len(laws.CATEGORICAL_RULES)
     )
-    assert len(laws.ALL_RULES_WITH_LAYOUT) == 130
+    assert len(laws.ALL_RULES_WITH_LAYOUT) == 131
     # each call returns a fresh list, not the shared ALL_RULES object
     assert laws.all_rules() is not laws.ALL_RULES
 
 
 def test_collections_split_by_domain():
-    assert len(laws.SIMPLIFICATION_RULES) == 15
+    assert len(laws.SIMPLIFICATION_RULES) == 16
     assert len(laws.CATEGORICAL_RULES) == 38
     assert len(laws.SCAN_LAWS) == 6
     assert len(laws.SCAN_DIAG_LAWS) == 16

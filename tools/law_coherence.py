@@ -11,7 +11,7 @@ of shipped laws, does ``A`` (possibly among the other rules) derive
 ``B``?  Do they commute?  Are they the same 2-cell twice?
 
 This tool builds that catalogue over ``catopt_core.laws.ALL_RULES``
-(53 rules; ``--with-layout`` adds the 77 opt-in ``LAYOUT_RULES``).
+(54 rules; ``--with-layout`` adds the 77 opt-in ``LAYOUT_RULES``).
 Every verdict is measured by the shipped machinery — ``EGraph``
 saturation on a per-law concrete instance — never asserted:
 
@@ -647,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--with-layout",
         action="store_true",
-        help="include the 77 opt-in LAYOUT_RULES (130-rule universe)",
+        help="include the 77 opt-in LAYOUT_RULES (131-rule universe)",
     )
     ap.add_argument(
         "--json", metavar="PATH", help="write the raw catalogue as JSON"

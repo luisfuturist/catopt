@@ -832,6 +832,9 @@ LAW_CASES: dict[str, Any] = {
     "double_neg": _one_var(lambda x: Op.make("neg", Op.make("neg", x))),
     "sub_to_add": _xy_op("sub"),
     "silu_expand": _one_var(lambda x: Op.make("silu", x)),
+    "silu_fold": _one_var(
+        lambda x: Op.make("mul", x, Op.make("sigmoid", x))
+    ),
     "silu_mul_form": _silu_mul,
     "square_expand": _c_square,
     "square_to_pow": _c_square,

@@ -181,6 +181,35 @@ SILU_MUL_FORM = R(
     tags=_SIM,
 )
 
+# The definitional inverse of SILU_EXPAND — the manual-silu fold (the
+# ``softmax_fold`` analogue for the activation): ``x·σ(x)`` IS silu
+# spelled by hand.  The shared ``x`` metavariable is the whole
+# precondition — the matcher binds both mul operands to the same
+# e-class, so ``mul(x, σ(y))`` never fires — and no check/derive is
+# needed.
+#
+# Beyond folding a hand-spelled kernel to one dispatch, this is the
+# missing 3-cell of the coherence catalogue
+# (project/retros/law-coherence-catalogue.md §4): expanding ``silu``
+# inside ``mul`` destroys the ``swiglu_fuse`` redex, and nothing
+# rebuilt it — ``silu_expand × swiglu_fuse`` and
+# ``silu_mul_form × swiglu_fuse`` were the library's two divergent
+# critical pairs.  The fold transports the expansion back into the
+# gate — ``mul((g·σg), u) → mul(silu(g), u)`` — restoring the fuse
+# path, so both one-step reducts rejoin under the library.  Inverse
+# pairs are kept deliberately (eqsat needs both directions
+# reachable); it is term-local and adds at most one member per
+# e-class, so it does not grow the closure.
+SILU_FOLD = R(
+    "silu_fold",
+    Op.make("mul", "x", Op.make("sigmoid", "x")),
+    Op.make("silu", "x"),
+    law="The manual-silu fold: x · σ(x) = silu(x) — the definitional "
+    "inverse of silu_expand, and the mediating 3-cell of the "
+    "silu_expand/silu_mul_form × swiglu_fuse critical pairs.",
+    tags=_SIM,
+)
+
 
 # ---------------------------------------------------------------------------
 #  View-op naturality — elementwise mul through `select`
@@ -1197,6 +1226,7 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     DOUBLE_NEG,
     SUB_TO_ADD,
     SILU_EXPAND,
+    SILU_FOLD,
     SILU_MUL_FORM,
     SQUARE_EXPAND,
     POW_TO_SQUARE,
