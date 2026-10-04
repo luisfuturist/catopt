@@ -1,0 +1,1067 @@
+"""Second-tier tests for ``catopt_discovery.oracle``.
+
+``test_law_view_oracle.py`` pins the headline verdicts; this file
+covers the machinery underneath — the tri-state evaluator's error
+rows, the attribute/leaf binding domains, the instance enumerator's
+skip and veto paths, the mechanical guard features one by one, the
+real-match sweep's check/derive/dedup paths, the ``ill-formed`` /
+``unproven`` verdicts and the ``--json`` driver.
+
+One honest limitation is pinned rather than fixed: a *nested*
+view-under-view candidate (``transpose(transpose(u,...),...)``)
+crashes ``_attr_domains`` — ``_operand_shape`` delegates to
+``catopt_core.typing._shape_of``, which raises ``TypeError`` on
+unresolved attr metavariables instead of reporting a non-int dim.
+The oracle is single-level-view only, as its docstring's candidate
+family implies; the ``pytest.raises`` test documents the boundary.
+"""
+
+import json
+
+import pytest
+import torch
+from catopt_core.egraph.terms import _term_instantiate
+from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_discovery import oracle as vo
+
+
+def _p(op: str, *args, **attrs) -> Op:
+    return Op.make(op, *args, **attrs)
+
+
+def _v(name: str, *shape: int) -> Var:
+    return Var(name, TensorType(tuple(shape)))
+
+
+# ---------------------------------------------------------------------------
+#  Tri-state evaluation
+# ---------------------------------------------------------------------------
+
+
+def test_eval_instance_env_err():
+    """A leaf with non-int dims cannot build an env."""
+    x = Var("x", TensorType((None, 4)))
+    outcome, note = vo.eval_instance(_p("mul", x, x), _p("mul", x, x))
+    assert outcome == "env-err"
+    assert "non-int" in note
+
+
+def test_eval_instance_lhs_err_and_both_err():
+    x = _v("x", 2, 3)
+    outcome, _ = vo.eval_instance(_p("frobnicate", x), x)
+    assert outcome == "lhs-err"
+    outcome, _ = vo.eval_instance(
+        _p("frobnicate", x), _p("frobnicate", x)
+    )
+    assert outcome == "both-err"
+
+
+def test_env_for_builds_randn_per_leaf():
+    x, y = _v("x", 2), _v("y", 3, 1)
+    env = vo._env_for(_p("add", x, y))
+    assert env is not None
+    assert {leaf.name for leaf in env} == {"x", "y"}
+    # A leaf type of ``None`` reports the empty shape — no dims to
+    # check — so the env is built, not vetoed.
+    bare = Var("b", None)
+    assert vo._env_for(bare) is not None
+
+
+def test_leaf_metavars_order_dedup_and_non_str():
+    pat = _p("mul", _p("add", "A", Const(1)), "A")
+    assert vo._leaf_metavars(pat) == ["A"]
+    assert vo._leaf_metavars(_p("add", "A", "B")) == ["A", "B"]
+    # A Var/Const leaf is neither a metavar nor an Op — ignored.
+    assert vo._leaf_metavars(_p("add", "A", _v("x", 2))) == ["A"]
+    assert vo._leaf_metavars("A") == ["A"]
+
+
+def test_parents_maps_metavars_to_parent_ops():
+    pat = _p(
+        "mul", _p("select", "U", dim="D", index="I"), "U"
+    )
+    parents = vo._parents(pat)
+    assert parents["U"] == {"select", "mul"}
+
+
+def test_small_helpers():
+    t = torch.zeros(2)
+    assert vo._as_tensor(t) is t
+    assert vo._as_tensor(3.0) is None
+    x = _v("x", 2, 2)
+    # ``_view_call`` applies the torch binding; an op outside the
+    # table is an honest KeyError.
+    assert vo._view_call(
+        _p("unsqueeze", x, dim=0), torch.zeros(2, 2)
+    ).shape == (1, 2, 2)
+    with pytest.raises(KeyError):
+        vo._view_call(_p("frobnicate", x), torch.zeros(2, 2))
+    assert vo._bcast_to(torch.zeros(2), (3, 2)) is not None
+    assert vo._bcast_to(torch.zeros(2, 3), (2,)) is None
+
+
+# ---------------------------------------------------------------------------
+#  Attribute domains
+# ---------------------------------------------------------------------------
+
+
+def test_dims_norm_shape_numel():
+    assert vo._dims(0) == []
+    assert vo._dims(2) == [-2, -1, 0, 1]
+    assert vo._norm(-1, 3) == 2
+    assert vo._norm(5, 0) == 5
+    assert vo._shape_numel((2, 3, 4)) == 24
+    assert vo._shape_numel(()) == 1
+
+
+def test_reshape_targets_same_numel_deduped():
+    for s in vo._reshape_targets((2, 3, 4)):
+        assert vo._shape_numel(s) == 24
+    assert len(vo._reshape_targets((2, 3, 4))) <= 7
+    # rank >= 3 merges the leading dims; the trailing merge falls
+    # past the 7-entry cap for this shape.
+    assert (6, 4) in vo._reshape_targets((2, 3, 4))
+    assert (2, 12) not in vo._reshape_targets((2, 3, 4))
+    # rank >= 2 with an even first dim splits it.
+    assert (2, 2, 2, 3) in vo._reshape_targets((4, 2, 3))
+
+
+@pytest.mark.parametrize(
+    "op, keys, shape, want",
+    [
+        ("getitem", ("index",), (4,), "nonempty"),
+        ("select", ("dim", "index"), (), "empty"),
+        ("select", ("dim", "index"), (4,), "nonempty"),
+        ("slice", ("dim", "start", "end"), (), "empty"),
+        ("slice", ("dim", "start", "end"), (4,), "nonempty"),
+        ("slice", ("dim", "start", "end", "step"), (4,), "nonempty"),
+        ("unsqueeze", ("dim",), (2, 3), "nonempty"),
+        ("squeeze", ("dim",), (1, 3), "nonempty"),
+        ("transpose", ("dim0", "dim1"), (), "empty"),
+        ("transpose", ("dim0", "dim1"), (2, 3), "nonempty"),
+        ("reshape", ("shape",), (2, 4), "nonempty"),
+        ("view", ("shape",), (2, 4), "nonempty"),
+        ("expand", ("shape",), (1, 4), "nonempty"),
+        ("broadcast_to", ("shape",), (), "nonempty"),
+        ("chunk", ("chunks", "dim", "index"), (4, 4), "nonempty"),
+        ("split", ("sizes", "dim", "index"), (4, 4), "nonempty"),
+        ("narrow", ("dim", "start", "length"), (4,), "nonempty"),
+        ("permute", ("dim",), (2, 3), "nonempty"),
+        ("unbind", ("dim", "index"), (4, 4), "nonempty"),
+        ("movedim", ("source", "destination"), (4,), "empty"),
+        ("movedim", ("source", "destination"), (2, 3), "nonempty"),
+        ("flatten", ("start_dim", "end_dim"), (2, 3), "nonempty"),
+        ("mystery", ("x",), (4,), "none"),
+    ],
+)
+def test_attr_options(op, keys, shape, want):
+    opts = vo._attr_options(op, keys, shape)
+    if want == "none":
+        assert opts is None
+    elif want == "empty":
+        assert opts == []
+    else:
+        assert opts
+        for o in opts:
+            assert set(o) <= set(keys)
+
+
+def test_attr_options_inner_vetoes():
+    """Per-key inner conditions of the attr tables."""
+    # slice over a non-int extent skips that axis (``continue``).
+    opts = vo._attr_options(
+        "slice", ("dim", "start", "end"), (4, "x")
+    )
+    assert opts and all(o["dim"] != -1 for o in opts)
+    # chunk needs extent >= chunks; a (1,)-shaped operand admits
+    # chunks=1 only.
+    opts = vo._attr_options(
+        "chunk", ("chunks", "dim", "index"), (1,)
+    )
+    assert opts and all(o["chunks"] == 1 for o in opts)
+    # split needs extent >= 2.
+    assert (
+        vo._attr_options("split", ("sizes", "dim", "index"), (1,))
+        == []
+    )
+    # narrow over a non-int extent emits no option.
+    assert (
+        vo._attr_options(
+            "narrow", ("dim", "start", "length"), ("x",)
+        )
+        == []
+    )
+    # permute at rank 0 has no non-empty permutation.
+    assert vo._attr_options("permute", ("dim",), ()) == []
+
+
+def test_operand_shape_kinds():
+    assert vo._operand_shape(_v("x", 2, 3)) == (2, 3)
+    p = Param("w", TensorType((4,)))
+    assert vo._operand_shape(p) == (4,)
+    assert vo._operand_shape(Const(0.5)) == ()
+    # A compound term with an unresolved attr metavariable falls back
+    # to the first tensor leaf's declared shape.
+    u = _v("u", 2, 4)
+    t = _p("reshape", u, shape="S1")
+    assert vo._operand_shape(t) == (2, 4)
+    # No tensor leaf at all -> () — an op the shape inference does
+    # not know falls to the walk, which finds only Consts.
+    assert vo._operand_shape(_p("add", Const(1), Const(2))) == ()
+    assert (
+        vo._operand_shape(_p("frobnicate", _p("neg", Const(1))))
+        == ()
+    )
+    # ``_shape_of`` may raise on unresolved attrs — that currently
+    # propagates (see the nested-view boundary test below).
+    u2 = _v("u2", 2, 4)
+    nested = _p("transpose", u2, dim0="A", dim1="B")
+    with pytest.raises(TypeError):
+        vo._operand_shape(nested)
+
+
+def test_nested_view_candidate_crashes_honestly():
+    """A view-under-view candidate raises in ``_attr_domains``.
+
+    The oracle's candidate family is single-level views; a nested
+    one reaches ``_operand_shape`` on the outer node's bound operand
+    — still carrying the inner node's unresolved attr metavariables —
+    and ``_shape_of`` raises ``TypeError`` rather than reporting a
+    non-int dim.  Pinned as the honest current boundary.
+    """
+    with pytest.raises(TypeError):
+        vo.synthesize(
+            _p(
+                "transpose",
+                _p("transpose", "U", dim0="A", dim1="B"),
+                dim0="A",
+                dim1="B",
+            ),
+            "U",
+        )
+
+
+def test_tuple_sources_and_leaf_bindings():
+    srcs = vo._tuple_sources("U")
+    assert {t.op for t in srcs} == {"topk", "var_mean", "cummax"}
+    got = vo._leaf_bindings("U", {"getitem"}, ())
+    assert got[:3] == srcs
+    # a getitem-parent metavar also gets the shape bank, no scalar.
+    kinds = [vo._bind_desc(t) for t in got]
+    assert not any(k.startswith("Const") for k in kinds)
+    # a free operand gets the scalar Var first and a Const literal.
+    free = vo._leaf_bindings("V", set(), ((9, 9),))
+    assert isinstance(free[0], Var) and free[0].typ.shape == ()
+    assert Const(0.5) in free
+    assert any(
+        isinstance(t, Var) and t.typ.shape == (9, 9) for t in free
+    )
+    # a viewed (non-getitem) metavar gets no Const option.
+    viewed = vo._leaf_bindings("U", {"select"}, ())
+    assert not any(isinstance(t, Const) for t in viewed)
+
+
+def test_viewed_bindings_and_derived_free_shapes():
+    parents = {"U": {"select"}, "V": set()}
+    gens = list(vo._viewed_bindings(["U", "V"], parents))
+    assert gens and all(set(g) == {"U"} for g in gens)
+    derived = vo._derived_free_shapes([(2, 3)], [(2, 3, 1)])
+    assert (2, 3) in derived and (2, 3, 1) in derived
+    # the single-axis-1 insertions of each shape are in the bank;
+    # (2,3,1) was already derived as an insertion, so its own
+    # insertions are not re-expanded.
+    assert (1, 2, 3) in derived
+    assert (2, 3, 1, 1) not in derived
+
+
+def test_attr_domains_groups_and_vetoes():
+    node = _p("select", "U", dim="D", index="I")
+    # A fabricated node with no str attrs is skipped (not a group).
+    plain = _p("select", "U", dim=0, index=0)
+    domains = vo._attr_domains([plain, node], {"U": _v("u", 4)})
+    assert len(domains) == 1
+    assert domains[0][0] is node
+    # an op the oracle cannot instantiate vetoes the whole binding.
+    bad = _p("frobnicate", "U", axis="A")
+    assert vo._attr_domains([bad], {"U": _v("u", 4)}) is None
+    # a node with no args instantiates nothing — shape () falls to
+    # the rank-0 domain (getitem stays bindable, select vetoes).
+    bare_sel = _p("select", dim="D", index="I")
+    assert vo._attr_domains([bare_sel], {}) is None
+
+
+def test_attr_domains_shared_names_resolve_once():
+    """Two nodes over the same metavar names form ONE group."""
+    a = _p("select", "U", dim="D", index="I")
+    b = _p("select", "V", dim="D", index="I")
+    domains = vo._attr_domains(
+        [a, b], {"U": _v("u", 4), "V": _v("v", 4)}
+    )
+    assert len(domains) == 1
+
+
+# ---------------------------------------------------------------------------
+#  synthesize — enumeration, skip and veto paths
+# ---------------------------------------------------------------------------
+
+
+def test_synthesize_reshape_exercises_targets():
+    insts = vo.synthesize(
+        _p("mul", _p("reshape", "U", shape="S"), "V"),
+        _p("mul", "U", "V"),
+        limit=200,
+    )
+    assert insts
+    assert all(i.origin == "synth" for i in insts)
+    assert {i.outcome for i in insts} <= {
+        "equal",
+        "unequal",
+        "lhs-err",
+        "rhs-err",
+        "both-err",
+        "env-err",
+    }
+    # the reshape no-op feature was computed on tensor u.
+    assert any(
+        dict(i.feats).get("rs:noop") is True for i in insts
+    )
+
+
+def test_synthesize_conflicting_shared_attrs_are_skipped():
+    """Two nodes sharing *part* of an attr-name set collide.
+
+    ``select(u, dim=A, index=B)`` and ``unsqueeze(v, dim=A)`` form
+    two groups (names ``A|B`` and ``A``); when their option draws
+    disagree on ``A`` the combo is skipped — the survivors all keep
+    ``A`` consistent.
+    """
+    insts = vo.synthesize(
+        _p(
+            "add",
+            _p("select", "U", dim="A", index="B"),
+            _p("unsqueeze", "V", dim="A"),
+        ),
+        _p("add", "U", "V"),
+        limit=160,
+    )
+    assert insts
+    for i in insts:
+        binds = dict(i.binds)
+        assert "$attr:A" in binds and "$attr:B" in binds
+
+
+def test_synthesize_unbound_attr_metavar_leaks_literal():
+    """An attr metavar no option dict produces is NOT a veto.
+
+    ``_term_instantiate`` leaves an unbound attr metavariable in
+    place — the minted instance carries ``extra=E`` verbatim (the
+    matcher never sees it; only the eval does).  Honest pin of the
+    current behavior: it is not flagged ill-formed.
+    """
+    insts = vo.synthesize(
+        _p(
+            "add",
+            _p("getitem", "U", index="I", extra="E"),
+            "V",
+        ),
+        _p("add", "U", "V"),
+        limit=50,
+    )
+    assert insts
+    assert all("extra=E" in i.lhs_repr for i in insts)
+
+
+def test_synthesize_respects_limit():
+    insts = vo.synthesize(
+        _p("mul", "U", "V"), _p("add", "U", "V"), limit=3
+    )
+    assert 0 < len(insts) <= 3
+
+
+def test_synthesize_tuple_producers_bind_u():
+    insts = vo.synthesize(
+        _p("add", _p("getitem", "U", index="I"), "V"),
+        _p("getitem", _p("add", "U", "V"), index="I"),
+        limit=160,
+    )
+    assert insts
+    # at least one binding made U tuple-valued.
+    assert any(dict(i.feats).get("u_tuple") is True for i in insts)
+
+
+# ---------------------------------------------------------------------------
+#  Mechanical guard features — direct calls
+# ---------------------------------------------------------------------------
+
+
+def _feats(lhs_pat, rhs_pat, subst, outcome="equal"):
+    lhs_i = _term_instantiate(lhs_pat, subst)
+    rhs_i = (
+        _term_instantiate(rhs_pat, subst)
+        if isinstance(rhs_pat, Op)
+        else subst.get(rhs_pat, rhs_pat)
+    )
+    return vo._features(lhs_pat, rhs_pat, subst, lhs_i, rhs_i, outcome)
+
+
+def test_features_env_none():
+    x = Var("x", TensorType((None,)))
+    subst = {"U": x, "V": _v("v", 4)}
+    feats = _feats(
+        _p("mul", _p("select", "U", dim="D", index="I"), "V"),
+        _p("mul", "U", "V"),
+        subst,
+    )
+    assert feats == {}
+
+
+def test_features_no_view_nodes():
+    # ``v`` in the feature block is the first free metavar — here U
+    # (a (1,1) tensor): scalar-shaped but not 0-dim.
+    subst = {"U": _v("u", 1, 1), "V": _v("v", 2, 2)}
+    feats = _feats(_p("mul", "U", "V"), _p("mul", "V", "U"), subst)
+    assert feats["u_tuple"] is False
+    assert feats["v_scalar"] is False
+    assert feats["v_uniform"] is True
+    assert not any(k.startswith("id:") for k in feats)
+
+
+def test_features_mixed_literal_and_metavar_attrs():
+    """A view node may mix a literal attr with a metavariable."""
+    insts = vo.synthesize(
+        _p(
+            "mul",
+            _p("select", "U", dim=0, index="I"),
+            "V",
+        ),
+        _p(
+            "select",
+            _p("mul", "U", "V"),
+            dim=0,
+            index="I",
+        ),
+        limit=80,
+    )
+    assert insts
+    assert all("dim=0" in i.lhs_repr for i in insts)
+
+
+def test_features_u_eval_failure():
+    # U bound to a term that cannot evaluate -> u is None -> early
+    # return with only the shape/leaf features.
+    v = _v("v", 2, 2)
+    subst = {"U": _p("frobnicate", v), "V": v}
+    feats = _feats(
+        _p("mul", _p("select", "U", dim="D", index="I"), "V"),
+        _p("mul", "U", "V"),
+        subst,
+    )
+    assert feats["u_tuple"] is False
+    assert feats["u_shape"] == "?"
+    assert "id:out_shape_eq" not in feats
+
+
+def test_features_tuple_u_skips_tensor_noops():
+    w = _v("w", 2, 4)
+    subst = {
+        "U": _p("topk", w, k=2),
+        "V": _v("v", 4),
+        "$attr:I": 0,
+    }
+    feats = _feats(
+        _p("add", _p("getitem", "U", index="I"), "V"),
+        _p("getitem", _p("add", "U", "V"), index="I"),
+        subst,
+    )
+    assert feats["u_tuple"] is True
+    # tuple u skips the no-op/covering block and the id/w family.
+    assert "tr:noop" not in feats
+
+
+def test_features_tr_noop_literal_and_metavar():
+    u, v = _v("u", 2, 3), _v("v", 1)
+    lhs = _p("mul", _p("transpose", "U", dim0=0, dim1="D"), "V")
+    rhs = _p("mul", "U", "V")
+    subst = {"U": u, "V": v, "$attr:D": 0}
+    feats = _feats(lhs, rhs, subst)
+    assert feats["tr:noop"] is True
+    subst = {"U": u, "V": v, "$attr:D": 1}
+    feats = _feats(lhs, rhs, subst)
+    assert feats["tr:noop"] is False
+
+
+def test_features_rs_noop_and_sl_full_and_ck_single():
+    u, v = _v("u", 2, 3), _v("v", 2, 3)
+    rhs = _p("mul", "U", "V")
+    base = {"U": u, "V": v}
+    f = _feats(
+        _p("mul", _p("reshape", "U", shape="S"), "V"),
+        rhs,
+        {**base, "$attr:S": (2, 3)},
+    )
+    assert f["rs:noop"] is True
+    f = _feats(
+        _p("mul", _p("reshape", "U", shape="S"), "V"),
+        rhs,
+        {**base, "$attr:S": (6,)},
+    )
+    assert f["rs:noop"] is False
+    f = _feats(
+        _p(
+            "mul",
+            _p("slice", "U", dim="D", start="S0", end="E"),
+            "V",
+        ),
+        rhs,
+        {**base, "$attr:D": 0, "$attr:S0": 0, "$attr:E": 2},
+    )
+    assert f["sl:full"] is True
+    f = _feats(
+        _p(
+            "mul",
+            _p("slice", "U", dim="D", start="S0", end="E"),
+            "V",
+        ),
+        rhs,
+        {**base, "$attr:D": 0, "$attr:S0": 1, "$attr:E": 2},
+    )
+    assert f["sl:full"] is False
+    f = _feats(
+        _p(
+            "mul",
+            _p("chunk", "U", chunks="C", dim="D", index="I"),
+            "V",
+        ),
+        rhs,
+        {**base, "$attr:C": 1, "$attr:D": 0, "$attr:I": 0},
+    )
+    assert f["ck:single"] is True
+    f = _feats(
+        _p(
+            "mul",
+            _p("chunk", "U", chunks="C", dim="D", index="I"),
+            "V",
+        ),
+        rhs,
+        {**base, "$attr:C": 2, "$attr:D": 0, "$attr:I": 0},
+    )
+    assert f["ck:single"] is False
+
+
+def test_features_unsq_d_in_pad_bound():
+    u, v = _v("u", 3), _v("v", 3, 2)
+    feats = _feats(
+        _p("mul", _p("unsqueeze", "U", dim="D"), "V"),
+        _p("mul", "U", "V"),
+        {"U": u, "V": v, "$attr:D": 0},
+    )
+    assert feats["unsq:d_in_pad"] is True
+    feats = _feats(
+        _p("mul", _p("unsqueeze", "U", dim="D"), "V"),
+        _p("mul", "U", "V"),
+        {"U": u, "V": v, "$attr:D": 1},
+    )
+    assert feats["unsq:d_in_pad"] is False
+
+
+def test_features_non_uv_metavar_skips_shape_feats():
+    subst = {
+        "U": _v("u", 2, 3),
+        "W": _v("w", 2, 3),
+        "$attr:D": 0,
+        "$attr:I": 0,
+    }
+    feats = _feats(
+        _p("mul", _p("select", "U", dim="D", index="I"), "W"),
+        _p("mul", "U", "W"),
+        subst,
+    )
+    # W is not a U/V feature metavar — only u's shape is recorded.
+    assert "u_shape" in feats and "w_shape" not in feats
+
+
+def test_features_non_int_dim_attrs_skip_noop():
+    """A bound attr metavariable that is not an int defeats the
+    no-op checks without failing."""
+    u, v = _v("u", 2, 3), _v("v", 2, 3)
+    rhs = _p("mul", "U", "V")
+    feats = _feats(
+        _p("mul", _p("transpose", "U", dim0="A", dim1="B"), "V"),
+        rhs,
+        {"U": u, "V": v, "$attr:A": 0, "$attr:B": (0,)},
+    )
+    assert "tr:noop" not in feats
+    feats = _feats(
+        _p(
+            "mul",
+            _p("slice", "U", dim="D", start="S0", end="E"),
+            "V",
+        ),
+        rhs,
+        {
+            "U": u,
+            "V": v,
+            "$attr:D": (0,),
+            "$attr:S0": 0,
+            "$attr:E": 2,
+        },
+    )
+    assert "sl:full" not in feats
+    feats = _feats(
+        _p("mul", _p("unsqueeze", "U", dim="D"), "V"),
+        rhs,
+        {"U": u, "V": v, "$attr:D": (0,)},
+    )
+    assert "unsq:d_in_pad" not in feats
+
+
+def test_features_rhs_neither_family():
+    """An RHS that is neither the pointwise op nor the view op gets
+    no id/w features."""
+    u, v = _v("u", 2, 3), _v("v", 2, 3)
+    feats = _feats(
+        _p("mul", _p("transpose", "U", dim0="A", dim1="B"), "V"),
+        _p("add", "U", "V"),
+        {"U": u, "V": v, "$attr:A": 0, "$attr:B": 1},
+    )
+    assert not any(
+        k.startswith("id:") or k.startswith("w:") for k in feats
+    )
+
+
+def test_features_g_out_eval_failure():
+    # The view node cannot evaluate ("view" is not bound) so g_out
+    # is None — no family features are attempted.
+    u, v = _v("u", 2, 3), _v("v", 2, 3)
+    feats = _feats(
+        _p("mul", _p("view", "U", shape="S"), "V"),
+        _p("view", _p("mul", "U", "V"), shape="S"),
+        {"U": u, "V": v, "$attr:S": (6,)},
+    )
+    assert "w:v_commutes_view" not in feats
+
+
+def test_feats_id_broadcast_failure():
+    g_u = torch.zeros(3, 1)
+    feats = vo._feats_id(
+        torch.randn(3), g_u, torch.randn(5)
+    )
+    assert feats == {}
+    # incompatible broadcast grids -> no pairing feature at all
+    u_t, v_t = torch.randn(2, 3), torch.randn(5)
+    assert vo._feats_id(u_t, torch.randn(2, 3), v_t) == {}
+
+
+def test_feats_w_view_call_raises():
+    node = _p("view", "U", shape=(6,))
+    feats = vo._feats_w(
+        node, torch.randn(2, 3), torch.randn(1), torch.randn(6)
+    )
+    assert feats == {}
+
+
+# ---------------------------------------------------------------------------
+#  sweep_real — check / derive / dedup / u_kind paths
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_real_skips_and_vetoes():
+    u, v = _v("u", 3), _v("v", 3)
+    lhs_pat = _p("mul", _p("unsqueeze", "U", dim="A_dim"), "V")
+    match = _p("mul", _p("unsqueeze", u, dim=1), v)
+    # a term that does not match the pattern is skipped silently.
+    insts = vo.sweep_real(
+        "t", lhs_pat, _p("mul", "U", "V"), [_p("add", u, v), match]
+    )
+    assert len(insts) == 1
+    # a check that vetoes and a check that raises both skip.
+    assert (
+        vo.sweep_real(
+            "t",
+            lhs_pat,
+            _p("mul", "U", "V"),
+            [match],
+            check=lambda bound: False,
+        )
+        == []
+    )
+    assert (
+        vo.sweep_real(
+            "t",
+            lhs_pat,
+            _p("mul", "U", "V"),
+            [match],
+            check=lambda bound: 1 / 0,
+        )
+        == []
+    )
+    # a derive returning None, or raising, skips the match.
+    assert (
+        vo.sweep_real(
+            "t",
+            lhs_pat,
+            _p("mul", "U", "V"),
+            [match],
+            derive=lambda bound: None,
+        )
+        == []
+    )
+    assert (
+        vo.sweep_real(
+            "t",
+            lhs_pat,
+            _p("mul", "U", "V"),
+            [match],
+            derive=lambda bound: 1 / 0,
+        )
+        == []
+    )
+
+
+def test_sweep_real_derive_supplies_and_instantiate_fails():
+    u, v = _v("u", 3), _v("v", 3)
+    match = _p("mul", _p("unsqueeze", u, dim=1), v)
+    lhs_pat = _p("mul", _p("unsqueeze", "U", dim="A_dim"), "V")
+    # derive fills an extra binding the RHS needs.
+    insts = vo.sweep_real(
+        "t",
+        lhs_pat,
+        _p("mul", "U", _p("unsqueeze", "V", dim="A_d2")),
+        [match],
+        derive=lambda bound: {"$attr:A_d2": 1},
+    )
+    assert len(insts) == 1
+    # an RHS metavar the binding never supplies fails instantiation.
+    assert (
+        vo.sweep_real(
+            "t", lhs_pat, _p("mul", "U", "W"), [match]
+        )
+        == []
+    )
+
+
+def test_sweep_real_check_passes_through():
+    u, v = _v("u", 3), _v("v", 3)
+    match = _p("mul", _p("unsqueeze", u, dim=1), v)
+    insts = vo.sweep_real(
+        "t",
+        _p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        _p("mul", "U", "V"),
+        [match],
+        check=lambda bound: True,
+    )
+    assert len(insts) == 1
+
+
+def test_sweep_real_u_term_eval_failure():
+    """A bound U that cannot evaluate records an empty kind."""
+    u, v = _v("u", 4), _v("v", 4)
+    match = _p("mul", _p("frobnicate", u), v)
+    insts = vo.sweep_real(
+        "t", _p("mul", "U", "V"), "V", [match]
+    )
+    assert len(insts) == 1
+    assert insts[0].outcome == "lhs-err"
+    assert dict(insts[0].feats)["u_kind"] == ""
+
+
+def test_sweep_real_dedups_identical_pairs():
+    u, v = _v("u", 3), _v("v", 3)
+    match = _p("mul", _p("unsqueeze", u, dim=1), v)
+    insts = vo.sweep_real(
+        "t",
+        _p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        _p("mul", "U", "V"),
+        [match, match],
+    )
+    assert len(insts) == 1
+
+
+def test_sweep_real_u_kind_and_env_none():
+    w = _v("w", 2, 4)
+    v = _v("v", 4)
+    # tuple-valued U under getitem -> u_kind "tuple".
+    match_t = _p(
+        "add", _p("getitem", _p("topk", w, k=2), index=0), v
+    )
+    insts = vo.sweep_real(
+        "t",
+        _p("add", _p("getitem", "U", index="I"), "V"),
+        _p("add", "U", "V"),
+        [match_t],
+    )
+    assert dict(insts[0].feats)["u_kind"] == "tuple"
+    # tensor U -> "tensor".
+    u = _v("u", 4)
+    match_x = _p("add", _p("getitem", u, index=0), v)
+    insts = vo.sweep_real(
+        "t",
+        _p("add", _p("getitem", "U", index="I"), "V"),
+        _p("add", "U", "V"),
+        [match_x],
+    )
+    assert dict(insts[0].feats)["u_kind"] == "tensor"
+    # a pattern without "U" records an empty kind.
+    insts = vo.sweep_real(
+        "t", _p("add", "P", "Q"), _p("add", "Q", "P"), [match_x]
+    )
+    assert dict(insts[0].feats)["u_kind"] == ""
+    # a match whose leaves carry non-int dims env-errs and skips the
+    # kind probe.
+    bad = Var("b", TensorType((None,)))
+    match_bad = _p("mul", bad, v)
+    insts = vo.sweep_real(
+        "t", _p("mul", "U", "V"), _p("mul", "V", "U"), [match_bad]
+    )
+    assert insts[0].outcome == "env-err"
+    assert dict(insts[0].feats)["u_kind"] == ""
+
+
+# ---------------------------------------------------------------------------
+#  Verdicts — the rows the headline file did not hit
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_true_when_every_instance_agrees():
+    v = vo.verify_view_candidate(
+        "id_mul_one",
+        _p("mul", "U", Const(1)),
+        "U",
+        [],
+        synth_limit=120,
+    )
+    assert v.verdict == "true"
+    assert v.synth_equal > 0
+    assert v.synth_unequal == 0
+    assert v.witness
+
+
+def test_verdict_ill_formed_when_rhs_cannot_denote():
+    """reshape to a wrong numel: the target never evaluates."""
+    v = vo.verify_view_candidate(
+        "ill",
+        _p("mul", _p("reshape", "U", shape="S"), "V"),
+        _p("reshape", _p("mul", "U", "V"), shape=(999,)),
+        [],
+        synth_limit=120,
+    )
+    assert v.verdict == "ill-formed"
+    assert v.synth_equal == 0 and v.synth_unequal == 0
+    assert v.synth_rhs_err > 0
+    assert "does not denote" in v.note
+
+
+def test_verdict_conditional_rhs_welltypedness():
+    """Equal everywhere it is typed; tuple U mints an ill-typed RHS."""
+    v = vo.verify_view_candidate(
+        "sub_gi",
+        _p(
+            "sub",
+            _p("getitem", "U", index="I"),
+            _p("getitem", "U", index="I"),
+        ),
+        _p("getitem", _p("sub", "U", "U"), index="I"),
+        [],
+        synth_limit=120,
+    )
+    assert v.verdict == "conditional"
+    assert v.synth_unequal == 0
+    assert v.synth_equal > 0 and v.synth_rhs_err > 0
+    assert "well-typedness" in v.guard
+
+
+def test_verdict_unproven_when_nothing_evaluates():
+    """Instances exist but every LHS errors — still 'unproven'."""
+    u = _v("u", 4)
+    v = _v("v", 4)
+    match = _p("mul", _p("frobnicate", u, axis="A_axis"), v)
+    verdict = vo.verify_view_candidate(
+        "frob",
+        _p("mul", _p("frobnicate", "U", axis="A_axis"), "V"),
+        _p("mul", "U", "V"),
+        [match],
+    )
+    assert verdict.verdict == "unproven"
+    assert verdict.n_real == 1
+    assert verdict.real_lhs_err == 1
+    assert verdict.note == "no evaluable instance"
+
+
+def test_verdict_counts_real_matches():
+    """Real matches feed the counters, the witness and the note.
+
+    ``unsqueeze(u, 0)`` is broadcast-transparent (equal wherever it
+    types); ``unsqueeze(u, 1)`` against a column-shaped v disagrees.
+    """
+    u, v = _v("u", 3), _v("v", 4, 3)
+    eq_match = _p("mul", _p("unsqueeze", u, dim=0), v)
+    w = _v("w", 3, 1)
+    neq_match = _p("mul", _p("unsqueeze", u, dim=1), w)
+    rerr_match = _p(
+        "mul", _p("unsqueeze", u, dim=1), _v("y", 3, 2)
+    )
+    verdict = vo.verify_view_candidate(
+        "t",
+        _p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        _p("mul", "U", "V"),
+        [eq_match, neq_match, rerr_match],
+        synth_limit=80,
+    )
+    assert verdict.n_real == 3
+    assert verdict.real_equal == 1
+    assert verdict.real_unequal == 1
+    assert verdict.real_rhs_err == 1
+    assert verdict.verdict == "conditional"
+    assert verdict.witness and verdict.counterexample
+
+
+def test_verdict_true_from_real_only():
+    """An attr op outside the option table kills synthesis; a real
+    match still carries the verdict."""
+    u = _v("u", 4, 4)
+    match = _p("softmax", u, dim=-1)
+    verdict = vo.verify_view_candidate(
+        "t",
+        _p("softmax", "U", dim="D"),
+        _p("softmax", "U", dim="D"),
+        [match],
+    )
+    assert verdict.verdict == "true"
+    assert verdict.n_synth == 0
+    assert verdict.real_equal == 1
+    assert verdict.witness
+
+
+def test_verdict_false_counterexample_from_real():
+    """The real sweep supplies the counterexample when nothing
+    synthesizes."""
+    u = _v("u", 4, 4)
+    match = _p("softmax", u, dim=-1)
+    verdict = vo.verify_view_candidate(
+        "t",
+        _p("softmax", "U", dim="D"),
+        _p("mul", "U", Const(2)),
+        [match],
+    )
+    assert verdict.verdict == "false"
+    assert verdict.real_unequal == 1
+    assert verdict.counterexample
+
+
+# ---------------------------------------------------------------------------
+#  _separating_feature — fabricated instance sets
+# ---------------------------------------------------------------------------
+
+
+def _inst(outcome: str, feats: dict, tag: str = "") -> vo.Instance:
+    return vo.Instance(
+        origin="synth",
+        outcome=outcome,
+        lhs_repr=f"l{tag}",
+        rhs_repr=f"r{tag}",
+        binds=(("t", tag),),
+        feats=tuple(sorted(feats.items())),
+    )
+
+
+def test_separating_feature_single():
+    insts = [
+        _inst("equal", {"a": True}, "1"),
+        _inst("equal", {"a": True}, "2"),
+        _inst("unequal", {"a": False}, "3"),
+        _inst("unequal", {}, "4"),  # absent counts as False
+    ]
+    assert vo._separating_feature(insts) == "a"
+
+
+def test_separating_feature_conjunction():
+    insts = [
+        _inst("equal", {"a": True, "b": True}, "1"),
+        _inst("equal", {"a": True, "b": True}, "2"),
+        _inst("unequal", {"a": True, "b": False}, "3"),
+        _inst("unequal", {"a": False, "b": True}, "4"),
+    ]
+    assert vo._separating_feature(insts) == "a ∧ b"
+
+
+def test_separating_feature_none_and_no_evaluable():
+    insts = [
+        _inst("equal", {"a": True}, "1"),
+        _inst("unequal", {"a": True}, "2"),
+    ]
+    assert vo._separating_feature(insts) == ""
+    assert vo._separating_feature([_inst("rhs-err", {}, "1")]) == ""
+
+
+# ---------------------------------------------------------------------------
+#  Driver — _run / _table / main
+# ---------------------------------------------------------------------------
+
+
+def test_run_driver(monkeypatch):
+    """``_run`` filters proposals to the view family and verdicts
+    them — here over a one-proposal corpus."""
+    from catopt_discovery import pipeline as pl
+    from catopt_discovery.impact import TermCase
+
+    u = _v("u", 3, 1)
+    case = TermCase("bench", "t", _p("mul", u, Const(1)), (u,), (), {})
+    proposal = pl.Proposal(
+        name="mul_sel",
+        family="t",
+        lhs=_p(
+            "mul",
+            _p("select", "U", dim="A_dim", index="A_index"),
+            "V",
+        ),
+        rhs=_p("mul", "U", "V"),
+    )
+    monkeypatch.setattr(
+        "catopt_discovery.census.run_census",
+        lambda top: {"op_tuples": []},
+    )
+    monkeypatch.setattr(
+        "catopt_discovery.impact._bench_cases", lambda: ([case], [])
+    )
+    monkeypatch.setattr(
+        "catopt_discovery.impact.model_cases", lambda: ([], [])
+    )
+    monkeypatch.setattr(
+        "catopt_discovery.intake.load_cases", lambda: []
+    )
+    monkeypatch.setattr(
+        pl,
+        "propose",
+        lambda census_op, terms, vocab: [
+            proposal,
+            # a non-view proposal is filtered out by _run.
+            pl.Proposal(
+                name="plain",
+                family="t",
+                lhs=_p("mul", "U", Const(1)),
+                rhs="U",
+            ),
+        ],
+    )
+    verdicts = vo._run()
+    assert [v.name for v in verdicts] == ["mul_sel"]
+    assert verdicts[0].verdict in ("false", "conditional", "true")
+    text = vo._table(verdicts)
+    assert "mul_sel" in text and "verdict" in text
+
+
+def test_main_json(monkeypatch, tmp_path, capsys):
+    verdict = vo.ViewVerdict(name="t", verdict="true", note="ok")
+    monkeypatch.setattr(vo, "_run", lambda: [verdict])
+    out = tmp_path / "o.json"
+    rc = vo.main(["--json", str(out)])
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    assert payload[0]["name"] == "t"
+    assert payload[0]["verdict"] == "true"
+    printed = capsys.readouterr().out
+    assert "view/index candidate resolution" in printed
+    assert "wrote" in printed
+    # without --json nothing is written; the table still prints.
+    rc = vo.main([])
+    assert rc == 0
