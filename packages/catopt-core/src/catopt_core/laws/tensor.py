@@ -216,6 +216,61 @@ SELECT_MUL = R(
 
 
 # ---------------------------------------------------------------------------
+#  Kernel recognition — the manual-softmax fold
+# ---------------------------------------------------------------------------
+
+
+# The SECOND machine-discovered law admitted to the library (after
+# select_mul) — proposed by the law pipeline's pattern-recognition
+# pass, which scanned the model census for composed-then-reduced
+# chains and recognised ``div(exp(·), sum(exp(·)))`` as softmax
+# spelled by hand (see project/retros/law-proposer-extensions.md).
+# It IS the definition of softmax — which is the point: a corpus that
+# spells the kernel by hand gets the kernel back, folded to one
+# dispatched op, with a certificate.
+#
+# Unlike select_mul the precondition is NOT structural: the sum's
+# `keepdim` must be True (a dropped dim broadcasts wrongly — or not
+# at all — against the numerator) and the reduce must cover exactly
+# one axis (softmax has no multi-axis image).  `check` carries that
+# side condition; `derive` translates the sum's `dim` tuple `(-1,)`
+# to softmax's scalar `dim=-1` (the RHS attr the LHS does not carry
+# verbatim).  Single-direction and term-local, so it does not grow
+# the closure and belongs in the default set.
+def _check_sum_keepdim(bound) -> bool:
+    """Guard the softmax fold: keepdim and a single reduce axis."""
+    dims = bound.get("$attr:RD")
+    if bound.get("$attr:RK") is not True:
+        return False
+    return isinstance(dims, int) or (
+        isinstance(dims, tuple) and len(dims) == 1
+    )
+
+
+def _derive_softmax_dim(bound) -> dict:
+    """Unwrap ``sum``'s ``dim`` tuple into ``softmax``'s scalar dim."""
+    dims = bound.get("$attr:RD")
+    return {"$attr:SD": dims[0] if isinstance(dims, tuple) else dims}
+
+
+SOFTMAX_FOLD = R(
+    "softmax_fold",
+    Op.make(
+        "div",
+        Op.make("exp", "u"),
+        Op.make("sum", Op.make("exp", "u"), dim="RD", keepdim="RK"),
+    ),
+    Op.make("softmax", "u", dim="SD"),
+    law="exp(u) / Σ exp(u) = softmax(u): the manual normalization fold "
+    "— a composed-then-reduced chain IS the kernel's definition.  "
+    "Folds div+exp+sum to one dispatched op.",
+    check=_check_sum_keepdim,
+    derive=_derive_softmax_dim,
+    tags=_SIM,
+)
+
+
+# ---------------------------------------------------------------------------
 #  Distributivity / naturality (the categorical insight)
 # ---------------------------------------------------------------------------
 
@@ -1147,6 +1202,7 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     POW_TO_SQUARE,
     SQUARE_TO_POW,
     SELECT_MUL,
+    SOFTMAX_FOLD,
 ]
 
 #: Rules that implement the categorical insight: distributivity and naturality.

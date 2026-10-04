@@ -171,6 +171,18 @@ def _c_select_mul(d: int, dev: torch.device):
     return term, env, [u, v]
 
 
+def _c_softmax_fold(d: int, dev: torch.device):
+    """div(exp(u), sum(exp(u),-1,keepdim)) — softmax spelled by hand."""
+    b = 4
+    u = _v("u", b, d)
+    env = {"u": _r(dev, b, d)}
+    e = Op.make("exp", u)
+    term = Op.make(
+        "div", e, Op.make("sum", e, dim=(-1,), keepdim=True)
+    )
+    return term, env, [u]
+
+
 # -- matmul / linear family ------------------------------------------------
 
 
@@ -825,6 +837,7 @@ LAW_CASES: dict[str, Any] = {
     "square_to_pow": _c_square,
     "pow_to_square": _c_pow,
     "select_mul": _c_select_mul,
+    "softmax_fold": _c_softmax_fold,
     # CATEGORICAL_RULES — bilinearity / merges
     "distribute_matmul_over_add": _c_distribute,
     "factor_matmul": _c_factor,

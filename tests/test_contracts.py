@@ -407,6 +407,12 @@ _LAW_SPECS: dict[str, dict] = {
         "shapes": {"u": (3, 4, 5), "v": (3, 4, 5)},
         "attrs": {"$attr:D": 1, "$attr:I": 2},
     },
+    # check requires keepdim + a single-axis reduce; derive unwraps
+    # the sum's dim tuple into softmax's scalar dim
+    "softmax_fold": {
+        "shapes": {"u": (2, 3)},
+        "attrs": {"$attr:RD": (-1,), "$attr:RK": True},
+    },
     # ---- CATEGORICAL_RULES: matmul/linear algebra ----
     "distribute_matmul_over_add": {
         "W": (4, 3),
