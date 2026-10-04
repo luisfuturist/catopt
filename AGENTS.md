@@ -19,7 +19,10 @@ every name lives at its real package path — `catopt_core.egraph`,
 Run these before finishing any change; all must pass.
 
 ```sh
-uv run pytest                 # full test suite (pytest-xdist enabled)
+uv run pytest                 # full test suite (~7.5 min, single-process —
+                              # pytest-xdist is installed but the suite runs
+                              # serially; see the note below before enabling
+                              # `-n` on this suite)
 .venv/bin/ty check            # typecheck — 0 errors required (warnings OK)
 .venv/bin/ruff check          # lint
 .venv/bin/ruff format --check # formatting
@@ -31,6 +34,19 @@ uv run pytest                 # full test suite (pytest-xdist enabled)
 coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_orchestrator,catopt_cuda -m pytest tests/ -q
 coverage report -m                                              # coverage (fail_under=100)
 ```
+
+> **Parallel-warning (measured, not theoretical).**  Do *not* run this
+> suite — with or without coverage — under `pytest -n auto` on
+> low-RAM machines.  The suite is single-process by design: the
+> torch.compile-heavy tests (`test_torch_integration` &c.) spawn an
+> inductor pool of **16 compile workers per pytest process**, so
+> `-n N` multiplies the fan-out to ~`16·N` subprocesses.  On an 11 GB /
+> 16-core host, `-n auto` OOM-froze the machine; even `-n 3` drove
+> memory to 10.2 GB near the suite's tail.  The coverage gate is a
+> commit-time check (~20-25 min serial under tracing); for iteration
+> use a scoped `coverage run -m pytest tests/test_<file>.py`.
+> If a bigger machine needs it anyway, cap both fan-outs:
+> `TORCHINDUCTOR_COMPILE_THREADS=2 pytest -n 2 --cov=...` — untested.
 
 Manual-stage gates (not run on every commit — network/slower):
 
