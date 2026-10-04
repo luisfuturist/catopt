@@ -928,6 +928,43 @@ def test_batched_scan_latency_dense_and_leaf_edges():
     assert _leaf_gather_base([g_leaves[0], one_arg]) is None
 
 
+def test_batched_scan_helpers_value_equality():
+    """``_leaf_*`` helpers compare terms by VALUE, not identity.
+
+    ``Var``/``Param`` leaves are not hash-consed — only ``Op`` is,
+    and through a *weak* intern table — so an extracted term can
+    hold equal-but-distinct leaf objects (observed: the same
+    ``apply`` term priced the per-leaf fallback instead of the
+    gather path after a ``torch.compile`` run perturbed intern-table
+    lifetimes, doubling its delivered price and flipping the carrier
+    upgrade).  ``Op(...)`` constructed directly bypasses interning
+    to stand in for that state.
+    """
+    from catopt_core.cost import _leaf_gather_base, _leaf_shared_a
+
+    d = 4
+    xa, xb = _v("xg", 8, d), _v("xg", 8, d)
+    assert xa == xb and xa is not xb
+    pa, pb = _p("pg", d, d), _p("pg", d, d)
+    assert pa == pb and pa is not pb
+    sel = lambda base, i: Op(  # noqa: E731 — non-interned selects
+        "select", (base,), {"dim": 0, "index": i}
+    )
+    g_leaves = [
+        Op.make(
+            "aff_diag",
+            pa if i < 2 else pb,
+            sel(xa if i < 2 else xb, i),
+        )
+        for i in range(4)
+    ]
+    assert _leaf_gather_base(g_leaves) == xa
+    assert _leaf_shared_a(g_leaves)
+    # a genuinely different base still declines.
+    bad = Op.make("aff_diag", pa, sel(_v("zg", 8, d), 0))
+    assert _leaf_gather_base([g_leaves[0], bad]) is None
+
+
 def test_batched_scan_profile_fallbacks():
     """None / dict-without-leaf_eval profiles use the conservative
     4*dispatch leaf-eval fallback; a dict WITH leaf_eval_us uses it."""

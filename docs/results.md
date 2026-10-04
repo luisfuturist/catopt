@@ -86,11 +86,10 @@ Measured 2026-10-02T00:22:06+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git 
 
 ## Tooling-level measurements (hand-maintained)
 
-The sections above are generated from the pinned baselines —
-`python -m bench results` rewrites this file.  The rows below are
-*not* generated: the measurements live in `tools/` and are recorded
-in the retros, not in `bench/baselines/` — re-append this section
-after regenerating.
+This file is appended verbatim to `docs/results.md` by
+`bench results` / `render_results_doc` — edit it here, never in the
+generated file.  These measurements live in `tools/` and are
+recorded in the retros, not in `bench/baselines/`.
 
 All measured on the dev box (RTX 2050 / i5-12500H, fp64 — same
 hardware class as the baselines); magnitudes do not extrapolate to
@@ -122,4 +121,3 @@ Two reconciliation notes:
   member) — so the README's "1.15–1.32× vs Inductor" is not the
   pinned baseline's literal column: the 1.32 is vs eager and the
   vs-Inductor delivered range tops out at 1.25 on this baseline.
-

@@ -27,7 +27,13 @@ def render_results_doc(
     baselines_dir: str | Path,
     title: str = "catopt — measured results",
 ) -> str:
-    """Render every pinned baseline as one Markdown document."""
+    """Render every pinned baseline as one Markdown document.
+
+    ``docs/results_tooling.md``, if present, is appended verbatim —
+    the conventional place for hand-maintained measurements that do
+    not come from pinned baselines (editing it there keeps the
+    generated file reproducible).
+    """
     from bench import registry
     from bench.benchkit.report import Report
 
@@ -66,4 +72,10 @@ def render_results_doc(
                 "",
             ]
         lines += [_provenance(report.env, path.name), ""]
-    return "\n".join(lines) + "\n"
+    body = "\n".join(lines).rstrip() + "\n"
+    trailer = (
+        Path(__file__).resolve().parents[3] / "docs" / "results_tooling.md"
+    )
+    if trailer.exists():
+        body += "\n" + trailer.read_text().rstrip() + "\n"
+    return body

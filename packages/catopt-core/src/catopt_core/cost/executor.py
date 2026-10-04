@@ -289,7 +289,7 @@ def _leaf_shared_a(leaves: list) -> bool:
         if not getattr(leaf, "args", None) or not leaf.args:
             return False
         a = leaf.args[0]
-        if a is a0 or (
+        if a == a0 or (
             isinstance(a, Param)
             and isinstance(a0, Param)
             and a.name == a0.name
@@ -322,7 +322,11 @@ def _leaf_gather_base(leaves: list) -> Any | None:
             return None
         if base is None:
             base, dim = b.args[0], d
-        elif b.args[0] is not base or d != dim:
+        # ``==`` not ``is`` — like ``scan_lower._leaf_b_gather``:
+        # equal-but-distinct ``Var`` leaves are possible since only
+        # ``Op`` (not ``Var``/``Param``) is hash-consed and the weak
+        # intern table can drop an earlier instance.
+        elif b.args[0] != base or d != dim:
             return None
     return base
 
