@@ -760,10 +760,14 @@ def _cswap_torch(*a, **kw) -> torch.Tensor:
 def _eye_torch(*a, **kw) -> torch.Tensor:
     d = int(kw.get("dim", kw.get("d", 1)))
     m = kw.get("m")
+    dt = kw.get("dtype")
+    if dt is not None and not isinstance(dt, torch.dtype):
+        # Exported terms record the dtype's short name ("float64").
+        dt = getattr(torch, str(dt).split(".")[-1])
     return torch.eye(
         d,
         int(m) if m is not None else d,
-        dtype=torch.get_default_dtype(),
+        dtype=dt if dt is not None else torch.get_default_dtype(),
     )
 
 

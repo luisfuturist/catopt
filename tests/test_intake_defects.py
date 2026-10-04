@@ -161,3 +161,219 @@ def test_sink_verify_tuple_output_modules():
     lowered = ir_to_torch_module(ir, param_values=tensors)
     vr = TorchSink().verify(model, lowered, feed)
     assert vr.passed, vr
+
+
+# ---------------------------------------------------------------------------
+#  Round 2 — in-place writes threaded like copy_, dropped dtype casts
+# ---------------------------------------------------------------------------
+
+
+class _SliceFill(torch.nn.Module):
+    def forward(self, x):
+        y = x.clone()
+        y[:, :4] = 0.0
+        return y
+
+
+class _FillWhole(torch.nn.Module):
+    def forward(self, x):
+        y = x.clone()
+        y.fill_(0.5)
+        return y
+
+
+class _FillSelect(torch.nn.Module):
+    def forward(self, x):
+        y = x.clone()
+        y[0].fill_(0.0)
+        return y
+
+
+class _ZeroInit(torch.nn.Module):
+    def forward(self, x):
+        y = x.clone()
+        y.zero_()
+        return y
+
+
+class _MaskedFillInplace(torch.nn.Module):
+    def forward(self, x):
+        y = x.clone()
+        y.masked_fill_(x > 0, 0.0)
+        return y
+
+
+class _MaskedFillTensor(torch.nn.Module):
+    def forward(self, x, v):
+        y = x.clone()
+        y.masked_fill_(x > 0, v)
+        return y
+
+
+class _OneHotMatmul(torch.nn.Module):
+    def forward(self, idx):
+        oh = torch.nn.functional.one_hot(idx, 16).to(torch.float64)
+        return oh @ torch.eye(16, dtype=torch.float64)
+
+
+class _TakeAlong(torch.nn.Module):
+    def forward(self, x):
+        idx = x.argsort(dim=-1, descending=True)[..., :4]
+        return x.take_along_dim(idx, dim=-1)
+
+
+class _Rsub(torch.nn.Module):
+    def forward(self, x):
+        return 1.0 - torch.sigmoid(x)
+
+
+class _Gammaln(torch.nn.Module):
+    def forward(self, x):
+        return torch.special.gammaln(x.abs() + 1.0)
+
+
+class _InfixBitwise(torch.nn.Module):
+    def forward(self, x, y):
+        return ((x & y) | (x | y)).to(torch.float64)
+
+
+def test_fill_tensor_through_slice_view():
+    """``y[:, :4] = 0`` — ``fill_.Tensor`` through a ``slice`` view.
+
+    Functionalisation spells a slice write as ``fill_(slice, lifted
+    0-dim)``; the mutation threader must scatter the broadcast value
+    onto the viewed base, not orphan the write.
+    """
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_SliceFill(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "slice_scatter" in ops and "broadcast_to" in ops
+    assert vr.passed, vr
+
+
+def test_fill_scalar_whole_tensor():
+    """``y.fill_(0.5)`` — ``fill_.Scalar`` on a whole tensor."""
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_FillWhole(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "full" in ops and "copy" in ops
+    assert vr.passed, vr
+
+
+def test_fill_scalar_through_select_view():
+    """``y[0].fill_(0)`` — ``fill_.Scalar`` through ``select``."""
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_FillSelect(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "select_scatter" in ops and "full" in ops
+    assert vr.passed, vr
+
+
+def test_zero_inplace_is_a_fill():
+    """``y.zero_()`` — the zero-arg spelling of an in-place fill."""
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_ZeroInit(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "zeros" in ops and "copy" in ops
+    assert vr.passed, vr
+
+
+def test_masked_fill_inplace_scalar():
+    """``masked_fill_.Scalar`` — mints the functional masked_fill."""
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_MaskedFillInplace(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "masked_fill" in ops
+    assert vr.passed, vr
+
+
+def test_masked_fill_inplace_tensor_value():
+    """``masked_fill_.Tensor`` — the tensor-valued fill spelling."""
+    feed = (
+        torch.randn(4, 16, dtype=torch.float64),
+        torch.randn((), dtype=torch.float64),
+    )
+    ir, vr = _export_lower_verify(_MaskedFillTensor(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "masked_fill" in ops
+    assert vr.passed, vr
+
+
+def test_to_positional_dtype_cast():
+    """``to``'s positional ScalarType must survive to the binding.
+
+    ``one_hot(...)`` returns int64; the ``.to(torch.float64)`` cast is
+    positional in ``aten.to.dtype`` and used to drop silently — the
+    lowered ``matmul`` then saw long vs float and died.  Now the dtype
+    lands as an attr and the binding applies the real cast (the
+    carrier ``eye`` binding honours it too).
+    """
+    feed = (torch.randint(0, 16, (4, 8)),)
+    ir, vr = _export_lower_verify(_OneHotMatmul(), feed)
+    tos = [t for t in _ops_of(ir.root) if t.op == "to"]
+    assert tos and all(t.attrs.get("dtype") == "float64" for t in tos)
+    assert vr.passed, vr
+
+
+def test_to_no_dtype_is_identity():
+    """A ``to`` term without a recorded dtype stays an identity."""
+    x = Op.make("full", shape=(2, 3), dtype="float64")
+
+    def lower(term):
+        mod = ir_to_torch_module(
+            IR(root=term, inputs=[], input_names=set(), params={})
+        )
+        return mod()
+
+    out = lower(Op.make("to", x))
+    assert out.shape == (2, 3) and out.dtype == torch.float64
+
+
+def test_take_along_dim_positional_dim():
+    """aten ``take_along_dim(t, indices, dim)`` puts dim at arg 2.
+
+    The schema declared position 1 (``gather``'s layout); the exported
+    int landed as an unschema'd ``arg2`` and died at ``Op.make``.
+    """
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_TakeAlong(), feed)
+    tas = [t for t in _ops_of(ir.root) if t.op == "take_along_dim"]
+    assert tas and all(t.attrs.get("dim") == -1 for t in tas)
+    assert vr.passed, vr
+
+
+def test_rsub_scalar_canonicalises_and_lowers():
+    """``1 - x`` exports as ``rsub.Scalar`` — canonicalised + bound."""
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_Rsub(), feed)
+    assert any(t.op == "rsub" for t in _ops_of(ir.root))
+    assert vr.passed, vr
+
+
+def test_special_gammaln_canonicalises():
+    """``torch.special.gammaln`` exports as ``aten.special_gammaln``."""
+    feed = (torch.randn(4, 16, dtype=torch.float64),)
+    ir, vr = _export_lower_verify(_Gammaln(), feed)
+    assert any(t.op == "gammaln" for t in _ops_of(ir.root))
+    assert vr.passed, vr
+
+
+def test_infix_bitwise_canonicalises():
+    """``a & b``/``a | b`` spell ``__and__.Tensor``/``__or__.Tensor``."""
+    feed = (
+        torch.randint(0, 8, (4, 8)),
+        torch.randint(0, 8, (4, 8)),
+    )
+    ir, vr = _export_lower_verify(_InfixBitwise(), feed)
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert {"bitwise_and", "bitwise_or"} <= ops
+    assert vr.passed, vr
+
+
+def test_eye_honours_exported_dtype():
+    """The carrier ``eye`` binding must apply the recorded dtype."""
+    eye = Op.make("eye", dim=3, dtype="float64")
+    mod = ir_to_torch_module(
+        IR(root=eye, inputs=[], input_names=set(), params={})
+    )
+    assert mod().dtype == torch.float64
