@@ -22,7 +22,6 @@ import random
 import statistics
 from typing import Any
 
-import families
 import torch
 from catopt_core.egraph import EGraph
 from catopt_core.features import compute_features
@@ -30,6 +29,7 @@ from catopt_core.game import Action, Evaluator, GameState
 from catopt_core.laws import all_rules
 from catopt_core.search_env import SearchEnv
 from catopt_core.trajectories import rule_samples
+from catopt_discovery import families
 from catopt_torch.rl import RLPolicy, train_reinforce
 
 

@@ -1,6 +1,6 @@
 """Workload generator — feed the law census *new* programs.
 
-The law-discovery pipeline (``tools/law_pipeline.py``) is validated:
+The law-discovery pipeline (``catopt_discovery.pipeline``) is validated:
 it rediscovers shipped winners under holdout and its verdicts are
 honest.  The corpus-expansion retro
 (``project/retros/law-corpus-expansion.md``) then showed the corpus is
@@ -48,7 +48,7 @@ Validity is enforced, not assumed.  Every candidate must
 
 On the lowering boundary, plainly: a generated ``TermCase`` carries
 fresh feeds (``randn`` per ``Var`` shape) and param values
-(``randn`` per ``Param`` shape), so ``law_impact._probe`` lowers and
+(``randn`` per ``Param`` shape), so ``catopt_discovery.impact._probe`` lowers and
 verifies it exactly like a real model — no ``nn.Module`` or export
 step is needed.  ``eval_term`` is the cheap pre-gate; the pipeline's
 own ``_lower_extracted`` + ``sink.verify`` remains the referee.
@@ -62,9 +62,9 @@ from mutation.  The numbers decide.
 
 Run::
 
-    .venv/bin/python tools/law_workload_gen.py --n 60 --seed 1
-    .venv/bin/python tools/law_workload_gen.py --n 60 --skip-pipeline
-    .venv/bin/python tools/law_workload_gen.py --json /tmp/gen.json
+    .venv/bin/python -m catopt_discovery.workload_gen --n 60 --seed 1
+    .venv/bin/python -m catopt_discovery.workload_gen --n 60 --skip-pipeline
+    .venv/bin/python -m catopt_discovery.workload_gen --json /tmp/gen.json
 
 CPU-only; generation is seconds, the enlarged pipeline a few minutes
 (``--gen-models`` caps how many generated terms join the expensive
@@ -76,7 +76,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,25 +96,23 @@ from catopt_torch.adapters import TorchSink
 # Sibling tools own the corpus, the census, the oracle and the
 # pipeline; reuse them so generated terms are judged by exactly the
 # machinery real models are judged by.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import law_pipeline as lpipe
-import law_proposal as lp
-from law_impact import (
-    TermCase,
-    _bench_cases,
-    _cost_fn,
-    _iter_subterms,
-    model_cases,
-)
-from law_shape_census import (
+from catopt_discovery import pipeline as lpipe
+from catopt_discovery import proposal as lp
+from catopt_discovery.census import (
     CorpusTerm,
     op_tuple_census,
     shape_census,
     shape_key,
     shape_repr,
 )
-from law_shape_proposal import _sink
+from catopt_discovery.impact import (
+    TermCase,
+    _bench_cases,
+    _cost_fn,
+    _iter_subterms,
+    model_cases,
+)
+from catopt_discovery.shape_proposal import _sink
 
 __all__ = [
     "CorpusStats",
@@ -193,7 +190,7 @@ class CorpusStats:
 
     # (op, (typed child markers)) -> count; and grouped by parent op.
     typed_tuples: Counter = field(default_factory=Counter)
-    tuples_of: dict[str, list] = field(default_factory=dict)
+    tuples_of: dict[str, Counter] = field(default_factory=dict)
     root_tuples: Counter = field(default_factory=Counter)
     # (parent op, position) -> typed child-marker multiset.
     child_at: dict = field(default_factory=dict)
@@ -624,7 +621,7 @@ def term_to_case(
     ``inputs`` are the term's ``Var`` leaves in first-encounter
     order; ``feed`` the matching env tensors; ``param_vals`` the
     ``Param`` env tensors keyed by name — exactly the plumbing
-    ``law_impact.synthetic_cases`` builds by hand.
+    ``catopt_discovery.impact.synthetic_cases`` builds by hand.
     """
     vs: list[Var] = []
     seen: set = set()
@@ -762,7 +759,7 @@ def _run_pipeline(
     vocab: str,
     holdout: str | None,
 ) -> dict:
-    """Mirror ``law_pipeline.run_pipeline`` on an explicit corpus.
+    """Mirror ``catopt_discovery.pipeline.run_pipeline`` on an explicit corpus.
 
     ``corpus_cases`` feeds the census AND the matcher (the terms the
     proposals are derived from and checked against); ``probe_models``

@@ -1,6 +1,6 @@
 """Schema-level search: proposing the grammar itself.
 
-``tools/law_proposal.py`` closed the *propose* half of "the AI invents
+``catopt_discovery.proposal`` closed the *propose* half of "the AI invents
 laws" by *enumerating instances* of a hand-written schema grammar: 23
 algebraic identities a human wrote down, of which 9 distinct are
 genuinely-new and useful.  Its retro
@@ -14,8 +14,8 @@ over the op algebra, with shared slots standing for repeated subterms
 -- and searches the *shape space*: it mutates and recombines shapes
 (swap operand positions, swap an op, change arity, change which
 subterms are shared, vary the RHS), instantiates each shape into a
-concrete law, and scores it with the same oracles ``law_proposal.py``
-uses -- ``law_verifier.verify_law`` derivability, the numeric truth
+concrete law, and scores it with the same oracles ``catopt_discovery.proposal.py``
+uses -- ``catopt_discovery.verifier.verify_law`` derivability, the numeric truth
 oracle, and the cost-delta usefulness test.
 
 Two questions are decided:
@@ -26,8 +26,8 @@ Two questions are decided:
 
 Run::
 
-    .venv/bin/python tools/grammar_proposal.py
-    .venv/bin/python tools/grammar_proposal.py --json /tmp/gp.json
+    .venv/bin/python -m catopt_discovery.grammar
+    .venv/bin/python -m catopt_discovery.grammar --json /tmp/gp.json
 
 CPU-only, bounded to a few minutes.
 """
@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,11 +47,7 @@ from catopt_core.ir import Const, Op, op_repr
 from catopt_core.laws import ALL_RULES
 from catopt_core.meta import canonicalize
 
-# ``law_proposal`` is a sibling script; running this file puts
-# ``tools/`` on ``sys.path``, so the import resolves either way.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import law_proposal as lp
+from catopt_discovery import proposal as lp
 
 __all__ = [
     "Shape",
@@ -238,6 +233,10 @@ def _instantiate(shape: Shape, env: dict[int, Any]) -> Any:
     if shape.op is None:
         if shape.slot is not None:
             return env[shape.slot]
+        if shape.const is None:
+            raise ValueError(
+                "leaf Shape carries neither slot nor const"
+            )
         return Const(shape.const)
     return Op.make(
         shape.op, *(_instantiate(c, env) for c in shape.children)
@@ -249,6 +248,10 @@ def _to_pattern(shape: Shape) -> Any:
     if shape.op is None:
         if shape.slot is not None:
             return f"s{shape.slot}"
+        if shape.const is None:
+            raise ValueError(
+                "leaf Shape carries neither slot nor const"
+            )
         return Const(shape.const)
     return Op.make(shape.op, *(_to_pattern(c) for c in shape.children))
 
@@ -554,7 +557,7 @@ def _grammar_closure() -> tuple[list, dict[str, int]]:
 def _evaluate(cands: list) -> list:
     """Score candidates with ``law_proposal``'s oracles, bounded.
 
-    Computes the same four verdicts ``law_proposal.evaluate`` does
+    Computes the same four verdicts ``catopt_discovery.proposal.evaluate`` does
     (derivable / num_true / relation / cost delta) from the same
     functions, but the library-derivability probe runs under the
     pipeline's *bounded saturation* policy (``rule_budgets`` + a node
@@ -670,7 +673,7 @@ def _fmt_report(human: dict, searched: dict, args) -> str:
     lines = [
         "== schema-level search vs the hand-written grammar ==",
         "",
-        "human grammar (law_proposal.schema_candidates)",
+        "human grammar (catopt_discovery.proposal.schema_candidates)",
         f"  candidates                {human['evaluated']:>6}",
         f"  distinct equalities       {human['distinct']:>6}",
         f"  useful & new (library)    {human['useful_new']:>6}",

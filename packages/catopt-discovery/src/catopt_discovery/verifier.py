@@ -35,8 +35,8 @@ Three experiments ride on top:
 
 Run::
 
-    .venv/bin/python tools/law_verifier.py
-    .venv/bin/python tools/law_verifier.py --json /tmp/law.json
+    .venv/bin/python -m catopt_discovery.verifier
+    .venv/bin/python -m catopt_discovery.verifier --json /tmp/law.json
 """
 
 from __future__ import annotations
@@ -59,6 +59,8 @@ from catopt_core.meta import (
     match_pattern,
     pattern_metavars,
 )
+
+from catopt_discovery import REPO_ROOT
 
 __all__ = [
     "LawResult",
@@ -128,7 +130,9 @@ class ProposalRow:
     expectation: str  # derivable | not-derivable
     lhs_repr: str
     rhs_repr: str
-    result: LawResult = field(default_factory=LawResult)
+    result: LawResult = field(
+        default_factory=lambda: LawResult(derivable=False)
+    )
     ok: bool = False
 
 
@@ -276,7 +280,7 @@ def _law_cases() -> dict:
     the bench package.  The repo root is put on ``sys.path`` because
     ``bench`` is a package, not an installed distribution.
     """
-    root = str(Path(__file__).resolve().parent.parent)
+    root = str(REPO_ROOT)
     if root not in sys.path:
         sys.path.insert(0, root)
     from bench.suites.correctness.law_bench import LAW_CASES

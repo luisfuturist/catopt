@@ -8,7 +8,7 @@ were not.  Proposal was decoupled from reality: it optimised algebraic
 novelty, not applicability.
 
 This tool closes that loop.  It reads the shape census
-(`tools/law_shape_census.py`) and, for the shapes real models actually
+(`catopt_discovery.census`) and, for the shapes real models actually
 contain, asks the only question that matters: **is there a true,
 cost-reducing equality whose LHS is (or contains) that shape?**
 
@@ -27,7 +27,7 @@ For each *schema* — a generic metavariable equality such as
 * **true** — the instantiated LHS and RHS agree numerically on random
   fp64 tensors of the *real* leaf shapes (the numeric oracle
   ``law_proposal`` uses for new axioms).
-* **derivable** — ``law_verifier.verify_law`` proves it from
+* **derivable** — ``catopt_discovery.verifier.verify_law`` proves it from
   ``ALL_RULES`` (then it is a composite and cannot lower a cost).
 * **new** — structurally not a duplicate or inverse of a library law.
 * **useful** — saturating a real matched term under ``ALL_RULES`` vs
@@ -42,8 +42,8 @@ is a decisive answer, not a bug.
 
 Run::
 
-    .venv/bin/python tools/law_shape_proposal.py
-    .venv/bin/python tools/law_shape_proposal.py --json /tmp/shape.json
+    .venv/bin/python -m catopt_discovery.shape_proposal
+    .venv/bin/python -m catopt_discovery.shape_proposal --json /tmp/shape.json
 
 CPU-only, bounded to a few minutes.
 """
@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,8 +64,7 @@ from catopt_core.laws import ALL_RULES
 
 # Sibling tools: the census/corpus, the verifier, and the numeric
 # oracle + saturation helpers the proposal retro already built.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from law_impact import (
+from catopt_discovery.impact import (
     _bench_cases,
     _cost_fn,
     _iter_subterms,
@@ -74,13 +72,13 @@ from law_impact import (
     new_laws,
     reach_row,
 )
-from law_proposal import (
+from catopt_discovery.proposal import (
     _library_keys,
     _numeric_true,
     _relation,
     _sat_cost,
 )
-from law_verifier import verify_law
+from catopt_discovery.verifier import verify_law
 
 __all__ = [
     "Schema",

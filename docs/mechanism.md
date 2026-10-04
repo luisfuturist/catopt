@@ -95,9 +95,9 @@ The loop above runs *inside* a fixed law library.  Two mechanisms
 operate on the library itself.
 
 **Coherence — the 3-cell layer.**  A rewrite is a 2-cell; a law
-*about* rewrites is a 3-cell.  `tools/law_coherence.py` enumerates
+*about* rewrites is a 3-cell.  `catopt_discovery.coherence` enumerates
 the pair layer over the shipped library (co-firing critical pairs,
-direct derivability edges); `tools/law_coherence2.py` measures
+direct derivability edges); `catopt_discovery.coherence2` measures
 depth 2 — stratification, reach under removal, and the mediator
 table ("the coherence of `A × B` requires `C`").  The measured
 structure: the derived layer of `ALL_RULES` is *flat* — zero laws
@@ -113,12 +113,12 @@ load-bearing derivable law under removal); and **divergence is
 found and mediated** — `silu_fold` shipped to restore confluence
 where `silu_expand` destroyed the `swiglu_fuse` redex, and it pays.
 
-**Discovery — the closed loop.**  `tools/law_pipeline.py` runs the
+**Discovery — the closed loop.**  `catopt_discovery.pipeline` runs the
 whole pipeline on a corpus of real exported models (94 terms / 163
 op-tuples today): **census** the op-shape tuples that occur →
 **propose** candidates (census-naturality, mixed-view,
 pattern-recognition and grammar schemas — and the proposers' op
-alphabet is itself property-derived by `tools/law_vocab.py`, not
+alphabet is itself property-derived by `catopt_discovery.vocab`, not
 hand-listed) → **verify** each candidate (numeric oracle,
 `sink.verify` on lowered modules, derivability oracle) →
 **measure** (fires / cost deltas / cert replay / closure ratio) →
@@ -128,10 +128,10 @@ bytecode-identical to the hand-written one in the held-out check).
 Two shipped laws came out of this loop (`select_mul`,
 `softmax_fold` — `silu_fold` came out of the coherence layer
 above), and the loop audits itself:
-adversarial witness generation (`tools/law_gap_targeted_gen.py`)
+adversarial witness generation (`catopt_discovery.gap_gen`)
 produces bindings the corpus cannot — it falsified paying-but-false
 candidates and the shipped matmul-family hole; the sqlite evidence
-store (`--evidence-db` / `tools/law_evidence.py`) caches verdicts
+store (`--evidence-db` / `catopt_discovery.evidence`) caches verdicts
 keyed by corpus × rules × code revision (~19× on a warm run) so
 "what did we measure, and did it change?" is a query, not a
 re-run.
@@ -147,8 +147,8 @@ re-run.
 | Extract | `extract_best`, `backend_cost` (measured pricing: `delivered_cost_for(profile, x=…)` / `executor_cost_for`) |
 | Certify | `verify_certificate` |
 | Evaluate | `catopt_core.features` (`ProgramFeatures`, `StaticProfiler`) · `SearchResult.frontier` · `PredictedCriterion`; `Meter` / `TargetProfile` for measurements (`tools/calibrate_profile.py`) |
-| Discover (meta) | `tools/law_pipeline.py` (census → propose → verify → measure → rank → emit) · `tools/law_vocab.py` (property-derived op alphabet) · `tools/law_gap_targeted_gen.py` (adversarial witnesses) · `tools/law_emit.py` (admission patch) |
-| Coherence (meta) | `tools/law_coherence.py` (`--emit-basis`) · `tools/law_coherence2.py` (stratification / reach / mediators) · `tools/law_evidence.py` (sqlite verdict store) |
+| Discover (meta) | `catopt_discovery.pipeline` (census → propose → verify → measure → rank → emit) · `catopt_discovery.vocab` (property-derived op alphabet) · `catopt_discovery.gap_gen` (adversarial witnesses) · `catopt_discovery.emit` (admission patch) |
+| Coherence (meta) | `catopt_discovery.coherence` (`--emit-basis`) · `catopt_discovery.coherence2` (stratification / reach / mediators) · `catopt_discovery.evidence` (sqlite verdict store) |
 
 ## See also
 

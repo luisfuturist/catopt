@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import argparse
 
-import families
 import torch
 from catopt_core.features import compute_features
 from catopt_core.game import Action, GameState
 from catopt_core.laws import all_rules
 from catopt_core.trajectories import rule_samples
+from catopt_discovery import families
 from catopt_torch.learned_policy import LearnedPolicy, train_rule_value
 
 

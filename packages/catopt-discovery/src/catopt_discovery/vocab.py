@@ -1,6 +1,6 @@
 """Machine-derived op vocabulary — classify corpus ops by property.
 
-The law-discovery pipeline (``tools/law_pipeline.py``) derives the
+The law-discovery pipeline (``catopt_discovery.pipeline``) derives the
 *shapes* it proposes from the corpus (the census's frequent ``f(g, g)``
 op-tuples), but takes the *op alphabet* — which ops are pointwise,
 which are views — from two hand-written tuples (``_POINTWISE``,
@@ -21,7 +21,7 @@ Properties (each decided by evaluating the op, not by membership):
 * **pointwise** — shape-preserving *and* commuting with views: the
   output has the input's (broadcast) shape and ``f(v(x), …) =
   v(f(x, …))`` for every view ``v``.  Test: the numeric oracle
-  (``law_proposal._allclose``) on both sides of the naturality.  The
+  (``catopt_discovery.proposal._allclose``) on both sides of the naturality.  The
   probe views are shape-agnostic (a flatten, an unsqueeze, a gather, a
   slice, a transpose), so the test applies to any op shape.
 * **reduction** — arity ≥ 1 and the op combines elements: the output
@@ -45,8 +45,8 @@ human table, and the tool says which it believes it is.  The test is
 
 Run::
 
-    .venv/bin/python tools/law_vocab.py
-    .venv/bin/python tools/law_vocab.py --json /tmp/law_vocab.json
+    .venv/bin/python -m catopt_discovery.vocab
+    .venv/bin/python -m catopt_discovery.vocab --json /tmp/catopt_discovery.vocab.json
 
 CPU-only, bounded to seconds.
 """
@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,13 +63,12 @@ import torch
 from catopt_core.ir import Op, TensorType, Var
 from catopt_core.typing import _shape_of
 
+from catopt_discovery.census import _iter_subterms
+
 # ``law_impact`` / ``law_shape_census`` own the corpus; reuse them so
 # the vocabulary is derived over exactly the graphs the pipeline reads.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from law_impact import _bench_cases, model_cases
-from law_proposal import _allclose
-from law_shape_census import _iter_subterms
+from catopt_discovery.impact import _bench_cases, model_cases
+from catopt_discovery.proposal import _allclose
 
 __all__ = [
     "OpClass",
@@ -118,7 +116,7 @@ def _numel(shape: tuple) -> int:
 
 def _eval(term: Any, env: dict) -> Any:
     """Evaluate *term* through the torch oracle, or ``_ERR``."""
-    from law_proposal import _eval_backend
+    from catopt_discovery.proposal import _eval_backend
 
     try:
         return _eval_backend().eval_term(term, env)
@@ -429,10 +427,11 @@ def _hand_tables() -> list[tuple[str, str, frozenset]]:
     ``"binary"`` or ``"unary"`` — it selects which derived set the table
     is compared against.
     """
-    import law_pipeline as lpl
     from catopt_core.cost import _VIEW_OPS as cost_views
     from catopt_core.laws import layout
     from catopt_orchestrator.morphisms import signature
+
+    from catopt_discovery import pipeline as lpl
 
     return [
         ("pipeline._POINTWISE", "binary", frozenset(lpl._POINTWISE)),

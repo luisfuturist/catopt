@@ -1,4 +1,4 @@
-"""Tests for the view/index oracle (``tools/law_view_oracle.py``).
+"""Tests for the view/index oracle (``catopt_discovery.oracle``).
 
 The oracle resolves law-pipeline candidates the single-instance
 numeric oracle cannot: view/index identities whose truth depends on
@@ -16,18 +16,11 @@ hand-built candidates whose truth is known:
 * ``mul(transpose(u,d0,d1), v) -> mul(u,v)`` — conditional on
   ``d0 == d1`` (the no-op transpose).
 
-The tool is not a package — import it via ``tools/`` on sys.path.
+The oracle lives in the ``catopt_discovery`` package.
 """
 
-import sys
-from pathlib import Path
-
-_TOOLS = Path(__file__).resolve().parent.parent / "tools"
-if str(_TOOLS) not in sys.path:
-    sys.path.insert(0, str(_TOOLS))
-
-import law_view_oracle as vo  # noqa: E402
-from catopt_core.ir import Const, Op, TensorType, Var  # noqa: E402
+from catopt_core.ir import Const, Op, TensorType, Var
+from catopt_discovery import oracle as vo
 
 
 def _p(op: str, *args, **attrs) -> Op:

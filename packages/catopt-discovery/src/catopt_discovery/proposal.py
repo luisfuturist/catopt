@@ -1,6 +1,6 @@
 """Candidate law proposal — the open half of "the AI invents laws".
 
-``tools/law_verifier.py`` closed the *verify* half: a proposed
+``catopt_discovery.verifier`` closed the *verify* half: a proposed
 equality ``lhs = rhs`` is decided in milliseconds by putting both
 sides in a fresh e-graph, saturating under the known laws, and asking
 whether they land in one e-class.  The rediscovery retro
@@ -48,8 +48,8 @@ Strategies:
 
 Run::
 
-    .venv/bin/python tools/law_proposal.py
-    .venv/bin/python tools/law_proposal.py --json /tmp/law_proposal.json
+    .venv/bin/python -m catopt_discovery.proposal
+    .venv/bin/python -m catopt_discovery.proposal --json /tmp/catopt_discovery.proposal.json
 
 CPU-only, bounded to a few minutes.
 """
@@ -58,7 +58,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,10 +78,7 @@ from catopt_core.laws.serialize import (
 from catopt_core.trajectories import rule_samples
 from catopt_torch.learned_policy import LearnedPolicy, train_rule_value
 
-# ``law_verifier`` is a sibling script; running this file puts
-# ``tools/`` on ``sys.path``, so the import resolves either way.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from law_verifier import (
+from catopt_discovery.verifier import (
     instance_of,
     verify_law,
 )

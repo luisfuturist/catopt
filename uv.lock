@@ -22,6 +22,7 @@ members = [
     "catopt-carriers",
     "catopt-core",
     "catopt-cuda",
+    "catopt-discovery",
     "catopt-orchestrator",
     "catopt-torch",
 ]
@@ -185,6 +186,7 @@ dependencies = [
     { name = "catopt-carriers" },
     { name = "catopt-core" },
     { name = "catopt-cuda" },
+    { name = "catopt-discovery" },
     { name = "catopt-orchestrator" },
     { name = "catopt-torch" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -255,6 +257,7 @@ requires-dist = [
     { name = "catopt-carriers", editable = "packages/catopt-carriers" },
     { name = "catopt-core", editable = "packages/catopt-core" },
     { name = "catopt-cuda", editable = "packages/catopt-cuda" },
+    { name = "catopt-discovery", editable = "packages/catopt-discovery" },
     { name = "catopt-orchestrator", editable = "packages/catopt-orchestrator" },
     { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0" },
@@ -346,6 +349,25 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "torch", specifier = ">=2.0" },
+]
+
+[[package]]
+name = "catopt-discovery"
+version = "0.1.0.dev0"
+source = { editable = "packages/catopt-discovery" }
+dependencies = [
+    { name = "catopt-core" },
+    { name = "catopt-orchestrator" },
+    { name = "catopt-torch" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "catopt-core", editable = "packages/catopt-core" },
+    { name = "catopt-orchestrator", editable = "packages/catopt-orchestrator" },
+    { name = "catopt-torch", editable = "packages/catopt-torch" },
     { name = "torch", specifier = ">=2.0" },
 ]
 

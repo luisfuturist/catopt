@@ -2,7 +2,7 @@ r"""Lemma certificates — ``Rewrite.derivation`` as replayable proof data.
 
 The axiom/lemma split annotated every non-kernel rule with
 ``derivation``: the names of shipped rules forming ONE measured
-derivation of the rule's instance (``tools/law_coherence.py
+derivation of the rule's instance (``catopt_discovery.coherence
 --emit-basis``, verified zero-drift).  Until now that field was
 *provenance metadata* — a record that a derivation exists.  This tool
 materializes it as a **certificate**: saturate the lemma's concrete
@@ -55,11 +55,11 @@ full store loop: pattern + cond + derivation + replayable proof.
 
 Run::
 
-    .venv/bin/python tools/law_lemma_cert.py
-    .venv/bin/python tools/law_lemma_cert.py --demo silu_mul_form
-    .venv/bin/python tools/law_lemma_cert.py --with-layout \\
+    .venv/bin/python -m catopt_discovery.lemma_cert
+    .venv/bin/python -m catopt_discovery.lemma_cert --demo silu_mul_form
+    .venv/bin/python -m catopt_discovery.lemma_cert --with-layout \\
         --probe right_factor_linear
-    .venv/bin/python tools/law_lemma_cert.py --json /tmp/certs.json
+    .venv/bin/python -m catopt_discovery.lemma_cert --json /tmp/certs.json
 
 CPU-only, ~5 s (instances for bench-registered laws build through
 torch, lazily).
@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -84,10 +83,8 @@ from catopt_core.egraph import (
 )
 from catopt_core.laws import ALL_RULES, ALL_RULES_WITH_LAYOUT
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import law_coherence as lc
-import law_verifier as lv
+from catopt_discovery import coherence as lc
+from catopt_discovery import verifier as lv
 
 __all__ = [
     "LemmaCertRow",
@@ -260,7 +257,7 @@ def materialize(
     for non-linear verdicts).
     """
     inst = lc._instance(rule) if inst is None else inst
-    base = {
+    base: dict[str, Any] = {
         "name": rule.name,
         "kind": rule.kind,
         "derivation": rule.derivation,
@@ -315,7 +312,7 @@ def probe(
     rule = by_name[name]
     others = [r for r in universe if r.name != name]
     inst = lc._instance(rule) if inst is None else inst
-    base = {
+    base: dict[str, Any] = {
         "name": rule.name,
         "kind": rule.kind,
         "derivation": rule.derivation,

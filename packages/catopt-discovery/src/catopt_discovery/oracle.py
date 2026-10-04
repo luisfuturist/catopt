@@ -1,6 +1,6 @@
 """View/index oracle — honest instantiation for view-family candidates.
 
-The pipeline's numeric oracle (``law_proposal._numeric_true``) proves a
+The pipeline's numeric oracle (``catopt_discovery.proposal._numeric_true``) proves a
 candidate equality by evaluating *one* concrete instance — the first
 viable real match — on random fp64 tensors.  That is sound but
 incomplete for the ``mixed:`` view/index family:
@@ -43,15 +43,15 @@ This tool is the missing oracle.  For a pattern pair ``(lhs, rhs)`` it
    the rewrite's target does not denote), or ``unproven`` (no
    evaluable instance at all).
 
-The verdict feeds ``tools/law_pipeline.py``'s ``measure`` step
+The verdict feeds ``catopt_discovery.pipeline``'s ``measure`` step
 (``--no-view-oracle`` disables).  A ``conditional`` candidate is *not*
 auto-admitted: it is evidence for a guarded law — the interesting
 outcome — reported for review.
 
 Run::
 
-    .venv/bin/python tools/law_view_oracle.py
-    .venv/bin/python tools/law_view_oracle.py --json /tmp/view_oracle.json
+    .venv/bin/python -m catopt_discovery.oracle
+    .venv/bin/python -m catopt_discovery.oracle --json /tmp/view_oracle.json
 
 CPU-only, bounded to a few minutes.
 """
@@ -61,7 +61,6 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
-import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,8 +72,7 @@ from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 
 # Sibling tools own the corpus, the eval backend and the comparator;
 # reuse them, never duplicate.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import law_proposal as lp
+from catopt_discovery import proposal as lp
 
 __all__ = [
     "Instance",
@@ -1165,11 +1163,11 @@ def verify_view_candidate(
 
 def _run() -> list[ViewVerdict]:
     """Run the oracle over the pipeline's current proposal set."""
-    import law_intake as li
-    import law_pipeline as pl
-    from law_impact import _bench_cases, model_cases
-    from law_shape_census import run_census
-    from law_shape_proposal import Schema, real_matches
+    from catopt_discovery import intake as li
+    from catopt_discovery import pipeline as pl
+    from catopt_discovery.census import run_census
+    from catopt_discovery.impact import _bench_cases, model_cases
+    from catopt_discovery.shape_proposal import Schema, real_matches
 
     census = run_census(pl._CENSUS_TOP)
     census_op = {

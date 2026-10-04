@@ -16,9 +16,9 @@ datacenter hardware:
 | executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (uncorrected picks ran 2–3× slower) | `tools/executor_cost_probe.py` | [executor-pricing-fix](../project/retros/executor-pricing-fix.md) |
 | `silu_fold` on the bench case | **−53–55% modeled cost, 1.43–2.62× wall-clock** | `bench run law_bench` | [three-cell-mediator](../project/retros/three-cell-mediator.md) |
 | contraction player, n=40 vs `opt_einsum` | **0.89–1.01× of randomised greedy at equal wall-clock** (0.91–0.98 at T≤1, three seeds, fed budgets); **0.51–0.90× deterministic greedy** | `tools/contraction_guided_restart.py` | [contraction-synthesis](../project/retros/contraction-synthesis.md), [contraction-player-shipped](../project/retros/contraction-player-shipped.md) |
-| pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `tools/law_pipeline.py --holdout` | [law-proposer-extensions](../project/retros/law-proposer-extensions.md), [groupnorm-convnext-corpus](../project/retros/groupnorm-convnext-corpus.md) |
-| coherence catalogue over `ALL_RULES` (54) | **40 axioms / 12 lemmas / 2 redundant; divergence 0** | `tools/law_coherence.py --emit-basis` | [axiom-lemma-split](../project/retros/axiom-lemma-split.md) |
-| evidence store, second run | **50/50 verdicts cached; 128 s → 6.6 s (~19×)** | `tools/law_pipeline.py --evidence-db` | [evidence-store](../project/retros/evidence-store.md) |
+| pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `catopt_discovery.pipeline --holdout` | [law-proposer-extensions](../project/retros/law-proposer-extensions.md), [groupnorm-convnext-corpus](../project/retros/groupnorm-convnext-corpus.md) |
+| coherence catalogue over `ALL_RULES` (54) | **40 axioms / 12 lemmas / 2 redundant; divergence 0** | `catopt_discovery.coherence --emit-basis` | [axiom-lemma-split](../project/retros/axiom-lemma-split.md) |
+| evidence store, second run | **50/50 verdicts cached; 128 s → 6.6 s (~19×)** | `catopt_discovery.pipeline --evidence-db` | [evidence-store](../project/retros/evidence-store.md) |
 
 Two reconciliation notes:
 

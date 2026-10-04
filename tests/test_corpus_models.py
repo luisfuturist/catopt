@@ -1,7 +1,7 @@
 """Corpus-expansion models — export and lowering fidelity.
 
 The law-discovery pipeline reads ``catopt_torch.models`` as its real-
-world corpus (``tools/law_impact.model_cases``).  These builders add
+world corpus (``catopt_discovery.impact.model_cases``).  These builders add
 architecture families the corpus lacked — soft MoE dispatch, GEGLU,
 gated residuals, conv norm blocks, manual-softmax attention, learned
 positional embedding, kernelized attention, and the round-2 index /

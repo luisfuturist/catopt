@@ -1,13 +1,13 @@
 """Law coherence, depth 2 — chains of derivations and mediating rules.
 
-``tools/law_coherence.py`` enumerated the *pair* layer: ``A ⇒ B``
+``catopt_discovery.coherence`` enumerated the *pair* layer: ``A ⇒ B``
 direct derivations, derivable-vs-primitive verdicts, and the one-step
 confluence probe.  Every relation it records is between two laws.
 The open question this spike measures: **is there useful structure at
 depth > 1, and does enumeration still suffice?**
 
 Three probes, all on the same instance-level, budgeted machinery
-(``law_verifier.verify_law`` — a fresh e-graph per question, so an
+(``catopt_discovery.verifier.verify_law`` — a fresh e-graph per question, so an
 oracle call is one bounded saturation plus a replayable certificate):
 
 1. **Derivation chains / stratification.**  The pair catalogue's
@@ -48,9 +48,9 @@ pair results already prune away.
 
 Run::
 
-    .venv/bin/python tools/law_coherence2.py            # ~1-2 min
-    .venv/bin/python tools/law_coherence2.py --with-layout
-    .venv/bin/python tools/law_coherence2.py --skip-reach --json o.json
+    .venv/bin/python -m catopt_discovery.coherence2            # ~1-2 min
+    .venv/bin/python -m catopt_discovery.coherence2 --with-layout
+    .venv/bin/python -m catopt_discovery.coherence2 --skip-reach --json o.json
 
 CPU-only.  Torch is imported lazily and only for the corpus-reach
 probe (model export); ``--skip-reach`` keeps the run torch-free.
@@ -60,7 +60,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,10 +73,8 @@ from catopt_core.laws import (
 from catopt_core.laws import tags as _tags
 from catopt_core.meta import apply_rewrite_at
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import law_coherence as lc
-import law_verifier as lv
+from catopt_discovery import coherence as lc
+from catopt_discovery import verifier as lv
 
 __all__ = ["MediatorRow", "main"]
 
@@ -126,11 +123,26 @@ def _set_phase(name: str) -> None:
     _PHASE["name"] = name
 
 
-def _counted_verify(*args: Any, **kwargs: Any) -> lv.LawResult:
+def _counted_verify(
+    lhs: Any,
+    rhs: Any,
+    rules: Any,
+    *,
+    max_iterations: int = 30,
+    max_nodes: int = 200000,
+    rule_budgets: dict[str, int] | None = None,
+) -> lv.LawResult:
     """Wrap ``lv.verify_law``; record one call + wall-time per phase."""
     t0 = time.perf_counter()
     try:
-        return _ORIG_VERIFY(*args, **kwargs)
+        return _ORIG_VERIFY(
+            lhs,
+            rhs,
+            rules,
+            max_iterations=max_iterations,
+            max_nodes=max_nodes,
+            rule_budgets=rule_budgets,
+        )
     finally:
         rec = _CALLS.setdefault(_PHASE["name"], [0, 0.0])
         rec[0] += 1
@@ -141,9 +153,13 @@ def _install_counter() -> None:
     """Route ``lv.verify_law`` through the accounting wrapper.
 
     The pair catalogue's calls resolve ``lv.verify_law`` at call
-    time, so patching the module attribute counts them too.
+    time, so patching the module attribute counts them too.  The
+    ``Any`` hop because a function value is not assignable to another
+    function's module attribute under the checker (and ``setattr``
+    would be rewritten back by the linter).
     """
-    lv.verify_law = _counted_verify
+    counted: Any = _counted_verify
+    lv.verify_law = counted
 
 
 def _cost_table() -> str:
@@ -406,9 +422,10 @@ def _derivation_graph_stats(
 
 def _corpus() -> list[tuple[str, Any]]:
     """Export the reach corpus; return ``(name, ir.root)`` pairs."""
-    import law_impact as li
     import torch  # lazy: only the reach probe needs the adapter
     from catopt_torch.adapters import TorchSource
+
+    from catopt_discovery import impact as li
 
     wanted = set(_CORPUS_MODELS)
     src = TorchSource()
@@ -535,7 +552,7 @@ def _pair_reducts(
 ) -> tuple[str, Any, Any] | None:
     """Recompute the confluence probe's two one-step reducts.
 
-    Mirrors ``law_coherence._confluence_probe``: host on *b*'s LHS
+    Mirrors ``catopt_discovery.coherence._confluence_probe``: host on *b*'s LHS
     instance when *a* co-fires, else on *a*'s.  Returns
     ``(base_name, second_reduct, first_reduct)`` or ``None`` when the
     pair shares no firing instance.

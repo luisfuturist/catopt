@@ -5,7 +5,10 @@ Categorical optimization of neural-network computation graphs
 live under `packages/` (`catopt-core` — the torch-free engine;
 `catopt-torch` — PyTorch adapters; `catopt-carriers` — carrier
 laws/executors; `catopt-cuda` — the CUDA-graph runner;
-`catopt-orchestrator` — the backend-neutral pipeline). The optional
+`catopt-orchestrator` — the backend-neutral pipeline;
+`catopt-discovery` — the law-discovery engine, formerly
+`tools/law_*.py`; invoke as `python -m catopt_discovery.<mod>`).
+The optional
 `catopt-native` package — the PyO3/Rust search engine, excluded from
 the uv workspace and built with maturin — is opt-in via `engine=`.
 The `catopt` façade is gone (plan 0008): `import catopt` fails and
@@ -330,9 +333,9 @@ Rules also carry tags from `catopt_core.laws.tags` (pass
 `R(..., tags=...)`); `EXPANSIVE` marks the closure-generating rules the
 pipeline budgets (`rules.tagged(EXPANSIVE)`).  Each rule's kernel kind
 lives on `Rewrite.derivation`/`rule.kind` — `R(..., derivation=(...))`
-names the axioms that prove a lemma (`tools/law_coherence.py
+names the axioms that prove a lemma (`catopt_discovery.coherence
 --emit-basis` emits the measured table; see
-`project/retros/axiom-lemma-split.md`).  `tools/law_lemma_cert.py`
+`project/retros/axiom-lemma-split.md`).  `catopt_discovery.lemma_cert`
 materializes each recorded derivation as a replayable `Certificate`
 (codec: `cert_to_data`/`cert_from_data` in `catopt_core.egraph.certs`;
 see `project/retros/lemma-certificates.md`).  The composable `RuleSet`

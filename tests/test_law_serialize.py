@@ -27,8 +27,6 @@ This file pins:
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
 from catopt_core.egraph import Certificate, EGraph, Rewrite
@@ -56,10 +54,7 @@ from catopt_core.laws.tensor import (
     SOFTMAX_FOLD,
 )
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "tools"))
-
-import law_evidence as le  # noqa: E402
+from catopt_discovery import evidence as le
 
 
 def _v(name, *shape):

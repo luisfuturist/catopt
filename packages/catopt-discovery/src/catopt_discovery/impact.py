@@ -1,6 +1,6 @@
 """Measure whether the 11 proposed laws actually pay on real models.
 
-``tools/law_proposal.py`` found 11 genuinely-new, cost-reducing laws
+``catopt_discovery.proposal`` found 11 genuinely-new, cost-reducing laws
 absent from ``ALL_RULES`` — mul-over-add factoring, neg-distribution,
 ``square(neg x) = square x``, the ``exp`` homomorphism, the
 annihilators, ``pow x 1``, ``x - x``, ``x + (-x)`` and ``x / x``.
@@ -32,8 +32,8 @@ zeros is a decisive answer, not a bug.
 
 Run::
 
-    .venv/bin/python tools/law_impact.py
-    .venv/bin/python tools/law_impact.py --json /tmp/law_impact.json
+    .venv/bin/python -m catopt_discovery.impact
+    .venv/bin/python -m catopt_discovery.impact --json /tmp/catopt_discovery.impact.json
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from catopt_core.cost import backend_cost, dag_cost, executor_cost_for
@@ -66,11 +66,13 @@ from catopt_core.laws.base import R
 from catopt_orchestrator.optimize import _lower_extracted
 from catopt_torch.adapters import TorchSink, TorchSource
 
-# ``bench`` is a repo-root package; running this file puts ``tools/``
-# on ``sys.path``, not the repo root, so add the root explicitly.
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from catopt_discovery import REPO_ROOT
+
+# ``bench`` is a repo-root package, not an installed distribution —
+# the lazy ``from bench.suites...`` imports below need the root on
+# ``sys.path`` regardless of the caller's cwd.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 __all__ = [
     "Firing",
@@ -529,7 +531,11 @@ def synthetic_cases() -> list[TermCase]:
 
     def feed(*vars_: Var) -> tuple:
         return tuple(
-            torch.randn(tuple(v.typ.shape), dtype=torch.float64) + 1.0
+            torch.randn(
+                tuple(cast("int", d) for d in v.typ.shape),
+                dtype=torch.float64,
+            )
+            + 1.0
             for v in vars_
         )
 

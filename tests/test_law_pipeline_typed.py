@@ -19,21 +19,15 @@ as a paying fire.  These tests pin the audit:
 * ``Evidence.no_ship_reason`` — surfaces "pays only on ill-typed
   sites" / "mints ill-typed members".
 
-The tool is not a package — import it via ``tools/`` on sys.path.
+The pipeline lives in ``catopt_discovery.pipeline`` (formerly
+``tools/law_pipeline.py``).
 """
 
-import sys
-from pathlib import Path
-
-_TOOLS = Path(__file__).resolve().parent.parent / "tools"
-if str(_TOOLS) not in sys.path:
-    sys.path.insert(0, str(_TOOLS))
-
-import law_pipeline as pl  # noqa: E402
-import torch  # noqa: E402
-from catopt_core.ir import Op, TensorType, Var  # noqa: E402
-from catopt_torch.adapters import TorchSink  # noqa: E402
-from law_impact import TermCase, _cost_fn  # noqa: E402
+import torch
+from catopt_core.ir import Op, TensorType, Var
+from catopt_discovery import pipeline as pl
+from catopt_discovery.impact import TermCase, _cost_fn
+from catopt_torch.adapters import TorchSink
 
 
 def _p(op: str, *args, **attrs) -> Op:

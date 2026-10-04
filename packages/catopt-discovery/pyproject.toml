@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catopt-discovery"
+version = "0.1.0dev"
+description = "Law-discovery engine for catopt: census, proposal, oracles, evidence store and intake (formerly tools/law_*.py)."
+requires-python = ">=3.11"
+dependencies = ["catopt-core", "catopt-torch", "catopt-orchestrator", "torch>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

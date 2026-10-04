@@ -14,6 +14,7 @@ dependencies = [
     "catopt-carriers",
     "catopt-orchestrator",
     "catopt-cuda",
+    "catopt-discovery",
     "torch>=2.0",
     "numpy>=1.24",
 ]
@@ -117,6 +118,7 @@ catopt-torch = { workspace = true }
 catopt-carriers = { workspace = true }
 catopt-orchestrator = { workspace = true }
 catopt-cuda = { workspace = true }
+catopt-discovery = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -147,6 +149,7 @@ root_packages = [
     "catopt_carriers",
     "catopt_orchestrator",
     "catopt_cuda",
+    "catopt_discovery",
 ]
 # `catopt_native` is deliberately NOT a root package: it is an optional
 # maturin/cargo build outside the uv workspace, so `uv sync` (and CI)
@@ -166,6 +169,7 @@ forbidden_modules = [
     "catopt_carriers",
     "catopt_orchestrator",
     "catopt_cuda",
+    "catopt_discovery",
 ]
 
 [[tool.importlinter.contracts]]
@@ -204,7 +208,11 @@ allow_indirect_imports = true
 name = "dependency layers"
 type = "layers"
 # `:` marks non-independent (mutually importable) siblings.
+# `catopt_discovery` is the meta-level law-discovery engine (formerly
+# ``tools/law_*.py``): it reads core/torch/orchestrator internals and
+# nothing may depend back on it, so it sits above the whole stack.
 layers = [
+    "catopt_discovery",
     "catopt_cuda",
     "catopt_torch : catopt_carriers",
     "catopt_orchestrator",
@@ -246,6 +254,7 @@ extra-paths = [
     "packages/catopt-carriers/src",
     "packages/catopt-orchestrator/src",
     "packages/catopt-cuda/src",
+    "packages/catopt-discovery/src",
     # catopt-native is optional (maturin-built); its `python/` source
     # dir holds the adapter plus the `_native.pyi` stub ty resolves
     # against the compiled extension.

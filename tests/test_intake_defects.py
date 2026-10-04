@@ -398,3 +398,17 @@ def test_copy_family_slice_write_unminted_base_declines():
     node = NS(target="fill_.Scalar", args=(dst_fx, 0.0))
     _handle_copy_(node, env)
     assert env["d"] == Op.make("zeros", shape=(4,), dtype="float64")
+
+
+def test_copy_family_unminted_src_declines():
+    """A ``copy_`` whose *source* was never minted is declined —
+    the write can't be threaded, and the env is left untouched."""
+    from types import SimpleNamespace as NS
+
+    from catopt_torch.torch_bridge import _handle_copy_
+
+    dst_fx = NS(name="d", target="placeholder")
+    env = {"d": Op.make("zeros", shape=(4,), dtype="float64")}
+    node = NS(target="copy_", args=(dst_fx, NS(name="unminted_src")))
+    _handle_copy_(node, env)
+    assert env["d"] == Op.make("zeros", shape=(4,), dtype="float64")

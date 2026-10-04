@@ -10,7 +10,7 @@ census-identified unsatisfied shape, rather than hoping sampling hits
 one.
 
 This tool closes that loop.  The pipeline
-(``tools/law_pipeline.py``) reports ~half its proposals as
+(``catopt_discovery.pipeline``) reports ~half its proposals as
 *inapplicable*: TRUE (or unevaluated) equalities whose LHS pattern
 never appears in the real corpus — the ``no firing on a real model``
 and ``inapplicable (no real match)`` verdicts.  For every such
@@ -27,7 +27,7 @@ candidate this tool
    (ii) type-check (``_shape_of`` concrete), (iii) satisfy the
    proposal's ``check``/``derive`` side conditions exactly as an
    e-graph firing would see them (``bound`` carries ``"$attr:"``
-   keys), and (iv) pass ``law_workload_gen.valid_term`` — sink-lowered
+   keys), and (iv) pass ``catopt_discovery.workload_gen.valid_term`` — sink-lowered
    ops only, evaluable under the torch oracle, novel vs every corpus
    root AND subterm;
 2. **embeds it in a plausible program** — the bare instance (the
@@ -38,9 +38,9 @@ candidate this tool
    shape-equal leaf slot (the ``graft`` case — the corpus model's own
    surrounding program);
 3. **measures it through the pipeline's own referees** —
-   ``law_impact._probe`` (does the lone rule fire? does extraction
+   ``catopt_discovery.impact._probe`` (does the lone rule fire? does extraction
    pick the rewrite? does the lowered module verify?) and
-   ``law_impact._reach_row`` (``ALL_RULES`` vs ``ALL_RULES +
+   ``catopt_discovery.impact._reach_row`` (``ALL_RULES`` vs ``ALL_RULES +
    {rule}``: end-to-end cost drop, certificate replay, enode closure
    ratio) — plus the oracle verdict the corpus never gave: the
    numeric-truth and derivability checks on the *generated* instance,
@@ -54,9 +54,9 @@ the corpus wasn't missing a law — it was missing a *useless* shape.
 
 Run::
 
-    .venv/bin/python tools/law_gap_targeted_gen.py
-    .venv/bin/python tools/law_gap_targeted_gen.py --json /tmp/gap.json
-    .venv/bin/python tools/law_gap_targeted_gen.py --only \
+    .venv/bin/python -m catopt_discovery.gap_gen
+    .venv/bin/python -m catopt_discovery.gap_gen --json /tmp/gap.json
+    .venv/bin/python -m catopt_discovery.gap_gen --only \
         factor_left,grammar:pow_one --skip-baseline
 
 ``--skip-baseline`` re-derives proposals without re-measuring the
@@ -73,7 +73,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import sys
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,20 +87,18 @@ from catopt_torch.adapters import TorchSink
 # Sibling tools own the corpus, the census, the oracle, the pipeline
 # and the five-gate validity checker; reuse them so a generated term
 # is judged by exactly the machinery real models are judged by.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import law_pipeline as lpipe
-import law_proposal as lp
-import law_workload_gen as lwg
-from law_impact import (
+from catopt_discovery import pipeline as lpipe
+from catopt_discovery import proposal as lp
+from catopt_discovery import workload_gen as lwg
+from catopt_discovery.impact import (
     TermCase,
     _bench_cases,
     _cost_fn,
     _probe,
     model_cases,
 )
-from law_shape_proposal import _sink
-from law_verifier import verify_law
+from catopt_discovery.shape_proposal import _sink
+from catopt_discovery.verifier import verify_law
 
 __all__ = [
     "GapResult",
@@ -555,15 +553,14 @@ def gen_cases_for(
                     prov["embeddings"].append(f"ctx{i}")
         graft = _graft(inst, out_shape, cases, st, seen, supported, rng)
         if graft is not None:
-            c = lwg.term_to_case(
-                graft,
-                f"gap:{tag}:graft{i}",
-                "gen-gap",
-                _case_env(graft),
-            )
-            if c is not None:
-                out.append(c)
-                prov["embeddings"].append(f"graft{i}")
+            genv = _case_env(graft)
+            if genv is not None:
+                c = lwg.term_to_case(
+                    graft, f"gap:{tag}:graft{i}", "gen-gap", genv
+                )
+                if c is not None:
+                    out.append(c)
+                    prov["embeddings"].append(f"graft{i}")
     return out, prov
 
 
@@ -806,15 +803,15 @@ def measure_candidate(
         if sub is not None:
             bound = _check_bound(p, sub)
             if bound is not None:
-                try:
+                # Best-effort probe: an instantiate/eval/verify
+                # failure just leaves the defaults on res.
+                with suppress(Exception):
                     rhs = _term_instantiate(p.rhs, bound)
                     res.rhs_instance = op_repr(rhs)
                     res.num_true = lp._numeric_true(lhs_inst, rhs)
                     res.derivable = verify_law(
                         lhs_inst, rhs, base_rules
                     ).derivable
-                except Exception:
-                    pass
     return res
 
 
@@ -954,8 +951,8 @@ def _named_targets(
             "be named when the baseline is not measured)"
         )
         return None
-    from law_shape_census import CorpusTerm, op_tuple_census
-    from law_shape_proposal import Schema, real_matches
+    from catopt_discovery.census import CorpusTerm, op_tuple_census
+    from catopt_discovery.shape_proposal import Schema, real_matches
 
     base_rules = lpipe._search_rules(holdout)
     lib = [lp._key(r.lhs, r.rhs) for r in base_rules]

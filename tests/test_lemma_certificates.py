@@ -5,7 +5,7 @@ the shipped premises proving the law's instance.  These tests pin the
 upgrade that turns the annotation into a *certificate*: saturate the
 lemma's instance under the recorded premises alone, reconstruct the
 positional derivation, and replay it strictly on real terms.  The
-measured shape (``tools/law_lemma_cert.py``): every derivation-carrying
+measured shape (``catopt_discovery.lemma_cert``): every derivation-carrying
 rule gets a linear certificate — one step, the recorded premise — and
 the replayable direction is the one the *axiom* fires forward.
 
@@ -18,8 +18,6 @@ replayable proof).
 """
 
 import json
-import sys
-from pathlib import Path
 
 import catopt_core.laws.layout
 import pytest
@@ -35,11 +33,8 @@ from catopt_core.egraph import (
 )
 from catopt_core.ir import Op, TensorType, Var, op_repr
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "tools"))
-
-import law_evidence as le  # noqa: E402
-import law_lemma_cert as llc  # noqa: E402
+from catopt_discovery import evidence as le
+from catopt_discovery import lemma_cert as llc
 
 
 def _t(d=4):

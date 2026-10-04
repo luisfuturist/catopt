@@ -1,6 +1,6 @@
 """The law-proposal game — a learned player builds candidate laws.
 
-The pipeline (``tools/law_pipeline.py``) discovers laws by
+The pipeline (``catopt_discovery.pipeline``) discovers laws by
 *enumeration + filter*: five generators emit a fixed pool, then the
 numeric oracle, the derivability oracle and the corpus measurements
 referee it.  The proposers are not players — nothing inside them
@@ -52,13 +52,13 @@ The pipeline's own stages are the score, via ``Referee``:
 
 1. **truth gate** — instantiate the candidate on the first real
    corpus-slice match (``_term_match`` + check/derive) and run the
-   numeric oracle ``law_proposal._numeric_true``.  One oracle call
+   numeric oracle ``catopt_discovery.proposal._numeric_true``.  One oracle call
    per distinct candidate; a false or undecidable proposal scores 0.
    No match at all costs *no* oracle call (the candidate never
    reached the referee).  Equality is symmetric, so one call
    referees *both* firing orientations, and the dedup cache covers
    the swapped pair.
-2. **fires** — ``law_impact._probe`` runs the rule alone over the
+2. **fires** — ``catopt_discovery.impact._probe`` runs the rule alone over the
    slice (a few models) and counts firings in each direction.
 3. **pay** — the extracted-cost delta under the pipeline cost model.
 
@@ -85,7 +85,7 @@ The currency is **oracle calls** (``_numeric_true`` invocations).
 Yield = true+firing candidates (and the stricter new-true-firing,
 the shippable proxy) per call, for
 
-* the enumerative baseline — ``law_pipeline.propose``'s pool,
+* the enumerative baseline — ``catopt_discovery.pipeline.propose``'s pool,
 * a uniform player (no learning, no prior),
 * the trained player (learned logits + prior).
 
@@ -94,9 +94,9 @@ Sanity check: does the player rediscover ``select_mul``- or
 
 Run::
 
-    .venv/bin/python tools/law_meta_game.py
-    .venv/bin/python tools/law_meta_game.py --episodes 600 --json /tmp/g.json
-    .venv/bin/python tools/law_meta_game.py --holdout select_mul
+    .venv/bin/python -m catopt_discovery.meta_game
+    .venv/bin/python -m catopt_discovery.meta_game --episodes 600 --json /tmp/g.json
+    .venv/bin/python -m catopt_discovery.meta_game --holdout select_mul
 
 CPU-only, bounded to a few minutes.
 """
@@ -107,7 +107,6 @@ import argparse
 import json
 import math
 import random
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -121,11 +120,14 @@ from torch import nn
 from torch.distributions import Categorical
 
 # Sibling tools own the corpus, the oracles and the measurements.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import law_pipeline as lpl
-import law_proposal as lp
-from law_impact import (
+from catopt_discovery import pipeline as lpl
+from catopt_discovery import proposal as lp
+from catopt_discovery.census import (
+    CorpusTerm,
+    op_tuple_census,
+    shape_census,
+)
+from catopt_discovery.impact import (
     TermCase,
     _bench_cases,
     _cost_fn,
@@ -133,13 +135,8 @@ from law_impact import (
     _probe,
     model_cases,
 )
-from law_shape_census import (
-    CorpusTerm,
-    op_tuple_census,
-    shape_census,
-)
-from law_shape_proposal import _sink
-from law_vocab import classify, corpus_ops
+from catopt_discovery.shape_proposal import _sink
+from catopt_discovery.vocab import classify, corpus_ops
 
 __all__ = [
     "BuildGame",
@@ -449,7 +446,7 @@ def _shape_slot(
 ) -> _Slot | None:
     """Convert a census *shape* key to a (deeper) LHS skeleton.
 
-    ``law_shape_census.shape_key`` abstracts a real subterm to
+    ``catopt_discovery.census.shape_key`` abstracts a real subterm to
     ``(op, attrs, children)`` with leaf placeholders — this re-mints
     it as a partial pattern: ops stay, leaf/const placeholders become
     holes, and concrete attr values become the shared per-``(op,
@@ -579,7 +576,7 @@ class BuildGame:
         """Bind the vocabulary and the RNG (seed sampling)."""
         self.v = vocab
         self.rng = rng
-        self.actions = (
+        self.actions: list[tuple[str, Any]] = (
             [("op", o) for o in vocab.ops]
             + [("mv", m) for m in _MV_NAMES]
             + [("const", c) for c in _CONSTS]
@@ -629,7 +626,8 @@ class BuildGame:
         """
         cur = self._cur()
         path = _first_hole(cur)
-        assert path is not None
+        if path is None:
+            raise RuntimeError("legal() on a term with no hole")
         cur_ops = self._ops(self.side)
         parent_op = None
         pos = 0
@@ -716,7 +714,8 @@ class BuildGame:
         kind, val = self.actions[idx]
         cur = self._cur()
         path = _first_hole(cur)
-        assert path is not None
+        if path is None:
+            raise RuntimeError("step() on a term with no hole")
         if kind == "op":
             new = _Slot(
                 kind="op",
@@ -1149,7 +1148,8 @@ def _tensors(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Featurize the state, the legal actions, and the prior logits."""
     hole = _first_hole(game._cur())
-    assert hole is not None
+    if hole is None:
+        raise RuntimeError("featurize a term with no hole")
     sv = torch.tensor(game.state_vec(), dtype=torch.float32)
     av = torch.tensor(
         [game.action_vec(i, hole) for i in legal],
@@ -1257,10 +1257,15 @@ def _clone(slot: _Slot | None) -> _Slot | None:
     """Deep-copy a slot tree (seeds are reused across plays)."""
     if slot is None:
         return None
+    children = [
+        cloned
+        for c in slot.children
+        if (cloned := _clone(c)) is not None
+    ]
     return _Slot(
         kind=slot.kind,
         op=slot.op,
-        children=[_clone(c) for c in slot.children],
+        children=children,
         attrs=dict(slot.attrs),
         name=slot.name,
         value=slot.value,

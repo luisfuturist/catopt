@@ -148,12 +148,12 @@ it.
 rsqrt spellings (`div_sqrt`, `pow`, `recip_sqrt`) — machinery-
 motivated bridges that make noncanonical RMSNorm spellings reach
 the fold.  And the workload intake itself is machine-driven:
-`tools/law_intake.py` feeds **166 real `nn.*` workloads** through
+`catopt_discovery.intake` feeds **166 real `nn.*` workloads** through
 the export boundary — 114 fp64-verified — and caught **three real
 lowering defects** no test caught
 ([intake-round-2.md](project/retros/intake-round-2.md)).
 
-**The loop is closed.**  `tools/law_pipeline.py` runs
+**The loop is closed.**  `catopt_discovery.pipeline` runs
 census → propose → verify → measure → rank → **emit** end to end:
 
 - **Validated by held-out rediscovery** — a shipped winner re-ranks
@@ -181,7 +181,7 @@ census → propose → verify → measure → rank → **emit** end to end:
 - **Laws are data, not just code.**  57/61 laws are fully
   serializable — pattern + declarative `cond`/`dspec` guards + tags
   + derivation, no Python — and `derivation=` metadata now replays
-  into real `Certificate`s (`tools/law_lemma_cert.py`)
+  into real `Certificate`s (`catopt_discovery.lemma_cert`)
   ([derive-declarative.md](project/retros/derive-declarative.md),
   [lemma-certificates.md](project/retros/lemma-certificates.md)).
 - **Verdicts are cached.**  `--evidence-db` persists them keyed by
@@ -207,10 +207,10 @@ launch-bound sizes — see [Limits](#limits)):
 | executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (was 2–3× slower) | `tools/executor_cost_probe.py` |
 | `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
 | contraction player n=40 vs `opt_einsum` | **0.91–0.98× randomised greedy at equal wall-clock** (0.51–0.90× deterministic) | `tools/contraction_guided_restart.py` |
-| pipeline held-out rediscovery | **winner re-ranks #1, every run** | `tools/law_pipeline.py` |
-| coherence catalogue | **46 axioms / 13 lemmas / 2 redundant; divergence 0** | `tools/law_coherence.py` |
-| workload intake | **166 real `nn.*` workloads, 114 fp64-verified** (corpus 290→588 op-tuples) | `tools/law_intake.py` |
-| laws as data | **57/61 fully serializable** (pattern + `cond`/`dspec` + derivation) | `tools/law_pipeline.py` |
+| pipeline held-out rediscovery | **winner re-ranks #1, every run** | `catopt_discovery.pipeline` |
+| coherence catalogue | **46 axioms / 13 lemmas / 2 redundant; divergence 0** | `catopt_discovery.coherence` |
+| workload intake | **166 real `nn.*` workloads, 114 fp64-verified** (corpus 290→588 op-tuples) | `catopt_discovery.intake` |
+| laws as data | **57/61 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_discovery.pipeline` |
 | bounded rewrites, real checkpoint | **up to 1.32× vs eager, 1.25× vs Inductor** (0.94–1.25) | `bench/suites` |
 
 Full measured picture and provenance: [`docs/results.md`](docs/results.md).

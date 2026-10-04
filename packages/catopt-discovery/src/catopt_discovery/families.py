@@ -99,7 +99,7 @@ def dup_programs(
     for _ in range(n):
         a, b = rng.randint(lo, hi), rng.randint(lo, hi)
         if rng.random() < 0.5:
-            t: Op = _v("x", a, b)
+            t: Var | Op = _v("x", a, b)
         else:
             t = Op.make("mul", _v("x", a, b), _v("y", a, b))
         out.append(
