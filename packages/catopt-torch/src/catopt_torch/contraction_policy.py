@@ -1,28 +1,37 @@
 """A pretrained contraction-ordering player — shipped weights + loader.
 
-Plan 0016's contraction thread closed at
-``project/retros/contraction-train-scale.md``: a curriculum-trained
-REINFORCE policy over scale-free board features reaches parity-to-1.5x
-of ``opt_einsum``'s *randomised* greedy at n = 40 (adequate budget), and
-beats the deterministic external greedy by ~25-30%, with no small-board
-regression and graceful starvation behaviour.  This module ships that
-player: the contraction game it runs on, the net, a usable
+The contraction thread's headline is
+``project/retros/contraction-synthesis.md``: a policy **distilled on
+every trial trajectory** of ``opt_einsum``'s ``RandomGreedy`` teacher
+(the ``oe-all`` arm of ``tools/contraction_distill.py``), driven under
+the lockstep/affine guided-restart protocol, **beats the teacher at
+equal wall-clock at n = 40** — 0.89-1.01 oe-cost ratios across three
+seeds at fed budgets, 0.89-0.98 at the best temperature — the first
+outright win over the field's best cheap player.  This module ships
+that player: the contraction game it runs on, the net, a usable
 :class:`ContractionPolicy` wrapper, a lazy
-:func:`load_contraction_policy`, and the bundled curriculum weights
-under ``artifacts/`` (trained by ``tools/train_contraction_artifact.py``
-— the weights are the only artifact; training stays a tools concern).
+:func:`load_contraction_policy`, and two bundled weight artifacts under
+``artifacts/`` — ``contraction_policy_distilled.pt`` (the default — the
+oe-all distilled player) and ``contraction_policy_curriculum.pt`` (the
+earlier REINFORCE curriculum weights, kept as lineage and loadable via
+an explicit path).  The weights are the only artifacts; training stays
+a tools concern (``tools/contraction_distill.py`` for the default,
+``tools/train_contraction_artifact.py`` for the lineage weights).
 
-**Honest capability statement.**  The bundled weights were trained on
+**Honest capability statement.**  The default weights were trained on
 the :func:`random_bond_network` einsum-valid instance family (every
-index a bond or an open leg) at scales 8-24 by REINFORCE with a
-greedy-completion critic.  The player is *single-pass*: it ties — does
-not beat — best-of-N randomised greedy at n = 40 (~1.04-1.5x), and it
-is throughput-starved under ~50 ms per-instance budgets (a forward
-pass per decision).  It generalises to unseen boards of the same
-family; other tensor-network distributions are out of scope.  This is
-a research artifact behind a documented API — **nothing wires it into
-``Optimizer.optimize``**: the pipeline has no contraction-ordering
-hook for it (the contraction diagram search in
+index a bond or an open leg) at scales 8-24 by masked cross-entropy
+over the teacher's trial trajectories.  The player is a *sampler*:
+:meth:`ContractionPolicy.best_order` — best-of-N temperature-sampled
+rollouts — is the measured winner; the single argmax pass
+(:meth:`ContractionPolicy.order`) is a plausible fallback, not the
+player (brittle at n = 40, reads 0.9-1.3x ``oe-greedy``).  The player
+is throughput-starved under ~50 ms per-instance budgets, where the
+affine prior can starve it to one episode.  It generalises to unseen
+boards of the same family; other tensor-network distributions are out
+of scope.  This is a research artifact behind a documented API —
+**nothing wires it into ``Optimizer.optimize``**: the pipeline has no
+contraction-ordering hook for it (the contraction diagram search in
 ``catopt_orchestrator.diagram`` is a different game).
 
 **Game contract.**  A board is ``(tensors, sizes)``: each tensor a
@@ -99,8 +108,11 @@ _FORMAT = "catopt-contraction-policy/1"
 #: Feature contract version — bump if the feature derivation changes.
 _FEATURE_CONTRACT = "scale-free-v1"
 
-#: Bundled default weights, relative to this package.
-_DEFAULT_NAME = "contraction_policy_curriculum.pt"
+#: Bundled default weights — the oe-all distilled player, relative to
+#: this package (``project/retros/contraction-synthesis.md``).  The
+#: earlier REINFORCE curriculum weights remain bundled alongside as
+#: ``contraction_policy_curriculum.pt``, loadable via an explicit path.
+_DEFAULT_NAME = "contraction_policy_distilled.pt"
 
 
 # ---------------------------------------------------------------------------
@@ -1164,13 +1176,19 @@ def load_contraction_policy(
 ) -> ContractionPolicy:
     """Load a contraction player from weights; return it ready to use.
 
-    ``path=None`` loads the bundled curriculum weights
-    (``catopt_torch/artifacts/contraction_policy_curriculum.pt``); a
-    user path loads a checkpoint written by
-    :func:`save_contraction_policy`.  Nothing is loaded at import —
-    the ``torch.load`` happens here, on call.  Raises ``ValueError``
-    when the payload is not a catopt contraction-policy artifact or
-    its feature spec does not match this module's derivation.
+    ``path=None`` loads the bundled **distilled** weights
+    (``catopt_torch/artifacts/contraction_policy_distilled.pt`` — the
+    oe-all player that beats ``opt_einsum``'s randomised greedy at
+    equal wall-clock at n = 40); a user path loads a checkpoint
+    written by :func:`save_contraction_policy`.  The earlier
+    curriculum-RL weights stay bundled at
+    ``artifacts/contraction_policy_curriculum.pt`` — load them with
+    ``load_contraction_policy(resources.files("catopt_torch") /
+    "artifacts" / "contraction_policy_curriculum.pt")``.  Nothing is
+    loaded at import — the ``torch.load`` happens here, on call.
+    Raises ``ValueError`` when the payload is not a catopt
+    contraction-policy artifact or its feature spec does not match
+    this module's derivation.
 
     The default ``device`` is CPU deliberately: a single forward pass
     per decision is small, and the artifact must work on a CUDA-free

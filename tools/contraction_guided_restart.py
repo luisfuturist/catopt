@@ -37,8 +37,8 @@ This tool adds what the earlier ladders did not isolate:
 Instances are the einsum-valid ``random_bond_network`` family (the one
 ``opt_einsum`` prices) and every order is scored by
 ``opt_einsum.contract_path`` — the independent metric — with our
-pairwise cost model alongside.  The bundled curriculum artifact
-(:func:`load_contraction_policy`) is the policy under test.
+pairwise cost model alongside.  The bundled distilled artifact
+(:func:`load_contraction_policy`'s default) is the policy under test.
 
 **Honest caveat.**  A uniform/oe rollout is a heuristic scan; a guided
 rollout costs a forward pass per contraction step, so the guided
@@ -678,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--policy",
         default=None,
-        help="policy artifact path (default: bundled curriculum weights)",
+        help="policy artifact path (default: bundled distilled weights)",
     )
     args = ap.parse_args(argv)
 

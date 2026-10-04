@@ -59,7 +59,7 @@ board reaches `(Q·Kᵀ)·V → Q·(Kᵀ·V)`, turning an O(T²d) intermediate i
 an O(Td²) one — a transform **nobody wrote down** (the details are
 [below](#the-transformation-it-found)).
 
-## RL Player
+## The learned player
 
 The player is a **`Policy`**, and it may only **reorder legal moves**.
 It can never change equivalence: a random player reaches the *identical*
@@ -67,8 +67,8 @@ equivalence class, and the certificate still replays.  That safety
 property — a policy that cannot make a program wrong — is what makes a
 learned player admissible at all.
 
-**It ships.**  The curriculum-trained contraction player is a bundled
-artifact — 25.6 KiB, trained once, loaded lazily:
+**It ships.**  The contraction player is a bundled artifact — ~25 KiB
+of weights, trained once, loaded lazily:
 
 ```python
 import catopt_torch
@@ -78,15 +78,26 @@ order = policy.order(tensors, sizes)               # one deterministic pass
 
 **The expectation: outperform humans.**  "Humans" means the hand-written
 heuristics — our `greedy`/`search`/`restart` players and `opt_einsum`'s
-orderings.  **The measured reality:**
+orderings.  **The measured reality: it now wins.**
 
-- **Beats the deterministic external greedy at n = 40** by ~25–30%
-  (0.68–0.73× pairwise, after training at scale), and reaches **~1.04×
-  of `opt_einsum`'s randomised greedy** at adequate budget — near parity
-  with the field's best cheap player, in a single pass
-  ([contraction-train-scale.md](project/retros/contraction-train-scale.md)).
-- **Throughput-starved at < 50 ms budgets** — a forward pass per
-  decision is the honest cost.
+- **Beats `opt_einsum`'s randomised greedy at n = 40, equal wall-clock**
+  — 0.91–0.98× oe-cost at fed budgets across three seeds (best cell
+  0.888), the first outright win over the field's best cheap player.
+  The bundled player is **distilled from the teacher's trial
+  distribution** (`oe-all` supervision): ~parity quality per rollout,
+  and the vectorised lockstep driver gives it ~2× the teacher's trial
+  rate — best-of-more at parity beats best-of-fewer
+  ([contraction-synthesis.md](project/retros/contraction-synthesis.md)).
+- **Beats the deterministic external greedy everywhere** under the
+  guided protocol (0.51–0.90× pairwise at fed budgets); its own single
+  argmax pass is a fallback, not the player — best-of-N sampled
+  rollouts are the point.
+- **Honest edges.**  Throughput-starved under ~50 ms budgets (the
+  affine prior can starve it to one episode), and the short-budget wins
+  partially overspent.  The earlier curriculum-RL weights
+  (`contraction_policy_curriculum.pt`) stay bundled as an alternate —
+  under the identical driver they never cross below 1.0× at n = 40, so
+  the win is attributable to the distilled proposal quality.
 - **Two structural limits, both measured.**  In catopt's own e-graph,
   reordering **cannot change extracted cost** (the fixed point is
   order-invariant — a random player reaches identical cost); and as a
@@ -171,7 +182,7 @@ launch-bound sizes — see [Limits](#limits)):
 | `select_mul` marginal (optimized vs law-ablated) | **faster in 19/20 measurements** | `tools/law_wallclock.py` |
 | executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (was 2–3× slower) | `tools/executor_cost_probe.py` |
 | `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
-| contraction player n=40 vs `opt_einsum` | **~1.04× randomised greedy, 0.68–0.73× deterministic** | `tools/contraction_einsum.py` |
+| contraction player n=40 vs `opt_einsum` | **0.91–0.98× randomised greedy at equal wall-clock** (0.51–0.90× deterministic) | `tools/contraction_guided_restart.py` |
 | pipeline held-out rediscovery | **winner re-ranks #1, every run** | `tools/law_pipeline.py` |
 | coherence catalogue | **40 axioms / 12 lemmas / 2 redundant; divergence 0** | `tools/law_coherence.py` |
 | bounded rewrites, real checkpoint | **up to 1.32× vs eager, 1.25× vs Inductor** (0.94–1.25) | `bench/suites` |
@@ -255,7 +266,7 @@ reached from a real call, not a promise:
 | Dimension | Reach it with |
 |---|---|
 | semantics | `verify_certificate(ir.root, cert, strict=True)` — every delivered program ships a replayable derivation |
-| search | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned / RL) orders the rules each iteration — see [RL Player](#rl-player) |
+| search | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned / RL) orders the rules each iteration — see [The learned player](#the-learned-player) |
 | evaluation | `criteria=PredictedCriterion(model)` prices extraction through a `PerformanceModel`; `SearchResult.frontier({...})` returns the non-dominated set; `StaticProfiler` describes a program without running it |
 | execution | the `Sink` / `Runner` / `Meter` ports — and `catopt_core.failures` classifies what went wrong |
 

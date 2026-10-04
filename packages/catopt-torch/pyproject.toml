@@ -32,6 +32,8 @@ where = ["src"]
 
 # Bundled pretrained weights — the contraction-ordering player
 # (``catopt_torch.contraction_policy.load_contraction_policy`` loads
-# ``artifacts/contraction_policy_curriculum.pt`` lazily at call time).
+# the oe-all distilled ``artifacts/contraction_policy_distilled.pt``
+# lazily at call time; ``contraction_policy_curriculum.pt`` is the
+# earlier RL lineage artifact, kept bundled as an alternate).
 [tool.setuptools.package-data]
 catopt_torch = ["artifacts/*.pt"]

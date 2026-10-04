@@ -24,8 +24,8 @@ exactly that:
 
 They are compared against the two existing regimes at equal eval:
 
-* ``rl`` — REINFORCE curriculum (the bundled-artifact regime retrained
-  against the current feature contract).
+* ``rl`` — REINFORCE curriculum (the lineage artifact's regime
+  retrained against the current feature contract).
 * ``dp`` — the existing imitation trainer's teacher: exact DP where
   affordable (``--dp-max``), our best-of-restart order beyond it.
   ``dp-small`` (opt-in) is the pure-DP control: only the scales where
@@ -49,6 +49,12 @@ Usage::
 
     uv sync --group einsum
     .venv/bin/python tools/contraction_distill.py --device cuda
+
+``--save <stem>`` serialises each arm as ``<stem>-<arm>.pt`` in the
+shipped artifact format — the ``oe-all`` arm is what ships bundled as
+``catopt_torch/artifacts/contraction_policy_distilled.pt``, the default
+:func:`catopt_torch.load_contraction_policy` loads
+(``project/retros/contraction-synthesis.md``).
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Train and ship the bundled contraction-policy weights.
+"""Train and ship the RL-lineage contraction-policy weights.
 
 ``project/retros/contraction-train-scale.md`` settled the regime: a
 **curriculum** — train on all scales (8, 12, 16, 20, 24) — preserves the
@@ -6,16 +6,21 @@ small-board and starvation behaviour of the base policy while nearly
 closing the n = 40 gap to the best cheap player.  This tool runs that
 regime once (REINFORCE with the greedy-completion critic, ``--iterations
 1800``) on the einsum-valid ``random_bond_network`` family and writes
-the artifact the shipped loader reads:
+the lineage artifact:
 
     packages/catopt-torch/src/catopt_torch/artifacts/
         contraction_policy_curriculum.pt
 
-so ``catopt_torch.load_contraction_policy()`` has real weights instead
-of every experiment retraining from scratch.  The player machinery
-itself lives in the package (``catopt_torch.contraction_policy``); the
-trainer stays in tools (``contraction_policy.train_rl``) because
-training is an experiment concern — only the weights ship.
+**This is no longer the bundled default** —
+``project/retros/contraction-synthesis.md`` showed the oe-all distilled
+policy (``tools/contraction_distill.py --arms oe-all --save``) beats
+``opt_einsum``'s randomised greedy at equal wall-clock at n = 40, where
+this player stays >= 1.0x; the default artifact is
+``contraction_policy_distilled.pt`` and this file remains bundled as an
+alternate.  The player machinery itself lives in the package
+(``catopt_torch.contraction_policy``); the trainer stays in tools
+(``contraction_policy.train_rl``) because training is an experiment
+concern — only the weights ship.
 
 The family patch mirrors ``contraction_einsum._on_family`` but is
 re-stated here so the tool runs without the opt-in ``einsum`` group

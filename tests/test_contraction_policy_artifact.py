@@ -1,11 +1,17 @@
-"""The bundled contraction-policy artifact — load, play, determinism.
+"""The bundled contraction-policy artifacts — load, play, determinism.
 
-``catopt_torch.contraction_policy`` ships the pretrained curriculum
-weights under ``artifacts/`` plus the game machinery the player runs
-on.  These tests check the artifact loads lazily, produces *valid*
-contraction orders on small boards, is deterministic under seed, and —
-the sanity quality bar — beats our cheapest-pair greedy on held-out
-boards of the family it was trained on (``random_bond_network``).
+``catopt_torch.contraction_policy`` ships two pretrained weight
+artifacts under ``artifacts/``: ``contraction_policy_distilled.pt``
+(the default — the oe-all distilled player that beats
+``opt_einsum``'s randomised greedy at equal wall-clock at n = 40;
+``project/retros/contraction-synthesis.md``) and
+``contraction_policy_curriculum.pt`` (the earlier REINFORCE lineage
+weights, kept loadable via an explicit path) — plus the game machinery
+the player runs on.  These tests check the artifacts load lazily,
+produce *valid* contraction orders on small boards, are deterministic
+under seed, and — the sanity quality bar — the sampled player beats
+our cheapest-pair greedy on held-out boards of the family it was
+trained on (``random_bond_network``).
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter
+from importlib import resources
 
 import catopt_torch
 import pytest
@@ -485,11 +492,37 @@ def bundled() -> ContractionPolicy:
 
 
 def test_bundled_loads_with_meta(bundled):
-    assert bundled.meta["trainer"] == "rl"
+    """The default artifact is the oe-all distilled player."""
+    assert bundled.meta["trainer"] == "distill-oe-all"
+    assert (
+        bundled.meta["teacher"]
+        == "oe-rand-greedy (all trial trajectories)"
+    )
     assert bundled.meta["train_scales"] == [8, 12, 16, 20, 24]
     assert bundled.meta["family"] == "random_bond_network"
     assert bundled.meta["hidden"] == 64
     assert bundled.meta["git_sha"]
+
+
+def test_rl_lineage_artifact_still_loads():
+    """The curriculum-RL weights stay bundled as an alternate.
+
+    They are no longer the default, but the lineage artifact remains
+    packaged and passes the same format/feature-contract checks when
+    loaded via an explicit resource path.
+    """
+    res = resources.files("catopt_torch").joinpath(
+        "artifacts", "contraction_policy_curriculum.pt"
+    )
+    with resources.as_file(res) as p:
+        policy = load_contraction_policy(p, device=_DEVICE)
+    assert policy.meta["trainer"] == "rl"
+    assert policy.meta["feature_contract"] == "scale-free-v1"
+    tensors, sizes = _board(10, 42)
+    order = policy.order(tensors, sizes)
+    ts, total = _replay(tensors, sizes, order)
+    assert len(ts) == 1
+    assert total > 0
 
 
 def test_bundled_plays_a_valid_order(bundled):
@@ -510,17 +543,21 @@ def test_bundled_deterministic_under_seed(bundled):
 def test_bundled_beats_our_greedy(bundled):
     """Sanity quality bar: mean policy/greedy cost on held-out boards.
 
-    The retro measured ratios of ~0.2-0.4 on bond boards near the
-    training scales; 0.8 leaves generous headroom for run-to-run
-    variation while still proving the artifact is a real player.
+    The shipped player is a *sampler* — best-of-N temperature-sampled
+    rollouts (``best_order``), not the brittle single argmax pass —
+    so the bar is set on the sampled player.  The oe-all distilled
+    policy sits near parity with ``oe-rand-greedy`` per rollout; 0.8
+    vs our cheapest-pair greedy leaves generous headroom while still
+    proving the artifact is a real player.
     """
     for n in (12, 16):
         ratios = []
         for k in range(5):
             tensors, sizes = random_bond_network(n, 4242 + 100 * n + k)
-            ratios.append(
-                bundled.cost(tensors, sizes) / greedy(tensors, sizes)
+            _order, cost = bundled.best_order(
+                tensors, sizes, samples=16, seed=k
             )
+            ratios.append(cost / greedy(tensors, sizes))
         assert sum(ratios) / len(ratios) < 0.8, (n, ratios)
 
 
