@@ -40,6 +40,12 @@ at that budget, plus the measured per-decision cost of a policy forward
 pass against a heuristic scan.  It is the falsification half of the
 result — reported as measured, including a negative.
 
+The player machinery itself — the game, the net, the feature derivation,
+the rollout driver — is **shipped** in
+:mod:`catopt_torch.contraction_policy` (the bundled-weights player,
+``contraction-player-artifact.md``); it is imported above so this tool
+keeps only the trainers and the measurement ladders.
+
 Usage::
 
     python tools/contraction_policy.py [--trainer rl] [--seed 0]
@@ -51,303 +57,47 @@ from __future__ import annotations
 import argparse
 import functools
 import heapq
-import math
 import random
 import statistics
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import count
 from typing import Any
 
 import contraction_scale as cs
-import numpy as np
 import torch
+from catopt_torch.contraction_policy import (
+    MAX_BATCH as _MAX_BATCH,
+)
+from catopt_torch.contraction_policy import (
+    PAIR_DIM as _PAIR_DIM,
+)
+from catopt_torch.contraction_policy import (
+    SAMPLE_TEMP as _TEMP,
+)
+from catopt_torch.contraction_policy import (
+    STD_FLOOR as _STD_FLOOR,
+)
+from catopt_torch.contraction_policy import (
+    ContractionGame,
+    PairPolicyNet,
+    run_policy_batch,
+)
+from catopt_torch.contraction_policy import (
+    batch_inputs as _batch_inputs,
+)
+from catopt_torch.contraction_policy import (
+    merge_tensors as _merge_ts,
+)
+from catopt_torch.contraction_policy import (
+    pair_logits as _logits,
+)
 from torch import nn
 from torch.distributions import Categorical
 from torch.nn import functional as F
 
 __all__ = ["main"]
-
-#: State feature width.
-_STATE_DIM = 7
-
-#: Pair (action) feature width.
-_PAIR_DIM = 9
-
-#: Feature-normalisation floor — stops an all-constant column from
-#: exploding when standardised.
-_STD_FLOOR = 0.1
-
-
-# ---------------------------------------------------------------------------
-#  The contraction game: state, action, reward
-# ---------------------------------------------------------------------------
-
-
-def _merge_ts(
-    ts: list[frozenset[int]], a: int, b: int
-) -> list[frozenset[int]]:
-    """Replace tensors ``a``/``b`` by their contraction (xor of sets)."""
-    merged = ts[a] ^ ts[b]
-    return [t for k, t in enumerate(ts) if k not in (a, b)] + [merged]
-
-
-def _bits(mk: int) -> Iterator[int]:
-    """Yield the set bit positions of a non-negative mask, low to high."""
-    while mk:
-        low = mk & -mk
-        yield low.bit_length() - 1
-        mk ^= low
-
-
-#: Cached strict-upper-triangle index arrays, keyed by matrix size.
-_TRIU: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-
-
-def _triu(m: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return cached ``(row, col)`` index arrays of the upper triangle."""
-    r = _TRIU.get(m)
-    if r is None:
-        r = np.triu_indices(m, 1)
-        _TRIU[m] = r
-    return r
-
-
-class ContractionGame:
-    """One contraction episode: the remaining tensors and the cost so far.
-
-    The state is the list of remaining tensors; the legal actions are
-    the unordered index pairs; ``step`` contracts one pair and charges
-    the classic pairwise cost.  ``greedy_ref`` (the full-network greedy
-    cost) anchors the scale-free features and the RL critic.
-
-    Every tensor is mirrored as an integer bitmask over the instance's
-    index labels, and the pairwise quantities the features need — the
-    ``log2`` intersection size and the intersection cardinality of each
-    tensor pair — are maintained **incrementally** across steps: a
-    contraction recomputes only the row/column of the freshly merged
-    tensor, not the whole ``O(m^2)`` table.  The feature matrices are
-    then assembled with NumPy in one shot.  The values are exactly the
-    ``math.fsum`` exactly-rounded sums the scalar implementation used
-    (``fsum`` is order-independent), so the feature vectors are
-    bit-identical and a policy trained on the old features stays valid;
-    only the cost changes.
-    """
-
-    def __init__(
-        self,
-        tensors: Any,
-        sizes: dict[int, int],
-        greedy_ref: float,
-        n0: int | None = None,
-        cost: float = 0.0,
-    ) -> None:
-        """Bind the instance, its greedy reference, and a start cost."""
-        self.sizes = dict(sizes)
-        self.log = {i: math.log2(s) for i, s in sizes.items()}
-        self.greedy_ref = float(greedy_ref)
-        self.ts = [frozenset(t) for t in tensors]
-        self.n0 = int(n0 if n0 is not None else len(self.ts))
-        self.cost = float(cost)
-        labels = sorted({i for t in self.ts for i in t})
-        self._bit = {lab: p for p, lab in enumerate(labels)}
-        self._log_bit = [self.log[lab] for lab in labels]
-        self._lsize_cache: dict[int, float] = {}
-        self._rebuild()
-
-    @property
-    def done(self) -> bool:
-        """Return whether only one tensor remains."""
-        return len(self.ts) <= 1
-
-    def clone(self) -> ContractionGame:
-        """Return an independent copy that shares the size caches.
-
-        The pairwise intersection tables are copied, so a ``step`` on
-        the clone cannot touch the original.  A tree search expands a
-        child per simulation this way, paying one incremental ``step``
-        instead of a full ``O(m^2)`` rebuild — the feature values are
-        unchanged, only the construction cost.
-        """
-        g = ContractionGame.__new__(ContractionGame)
-        g.sizes = self.sizes
-        g.log = self.log
-        g.greedy_ref = self.greedy_ref
-        g.n0 = self.n0
-        g.cost = self.cost
-        g._bit = self._bit
-        g._log_bit = self._log_bit
-        g._lsize_cache = self._lsize_cache
-        g.ts = list(self.ts)
-        g._masks = list(self._masks)
-        g._lsize = list(self._lsize)
-        g._ranks = list(self._ranks)
-        g._inter = self._inter.copy()
-        g._icount = self._icount.copy()
-        g._refresh()
-        return g
-
-    def _mask_of(self, t: frozenset[int]) -> int:
-        """Return the bitmask of an index set."""
-        mk = 0
-        for lab in t:
-            mk |= 1 << self._bit[lab]
-        return mk
-
-    def _lsize_mask(self, mk: int) -> float:
-        """Return the exactly-rounded ``log2`` volume of a bitmask."""
-        r = self._lsize_cache.get(mk)
-        if r is None:
-            r = math.fsum(self._log_bit[p] for p in _bits(mk))
-            self._lsize_cache[mk] = r
-        return r
-
-    def _rebuild(self) -> None:
-        """Build the mask and pairwise caches from the tensor list."""
-        self._masks = [self._mask_of(t) for t in self.ts]
-        self._lsize = [self._lsize_mask(mk) for mk in self._masks]
-        self._ranks = [len(t) for t in self.ts]
-        m = len(self._masks)
-        inter = np.zeros((m, m), dtype=np.float64)
-        count = np.zeros((m, m), dtype=np.int64)
-        for i in range(m):
-            inter[i, i] = self._lsize[i]
-            count[i, i] = self._ranks[i]
-            for j in range(i + 1, m):
-                both = self._masks[i] & self._masks[j]
-                v = self._lsize_mask(both)
-                inter[i, j] = inter[j, i] = v
-                c = both.bit_count()
-                count[i, j] = count[j, i] = c
-        self._inter = inter
-        self._icount = count
-        self._refresh()
-
-    def _refresh(self) -> None:
-        """Recompute the cached state summary for the current state."""
-        self.lsize = self._lsize
-        self.ranks = self._ranks
-        m = len(self._masks)
-        ia, ib = _triu(m)
-        self._ia = ia
-        self._ib = ib
-        self.pairs = list(zip(ia.tolist(), ib.tolist(), strict=True))
-        self._ls = np.asarray(self._lsize, dtype=np.float64)
-        self._rk = np.asarray(self._ranks, dtype=np.float64)
-        inter = self._inter[ia, ib]
-        ul = self._ls[ia] + self._ls[ib] - inter
-        self._inter_u = inter
-        self._cnt_u = self._icount[ia, ib]
-        self._ul = ul
-        self.union_sorted = np.sort(ul)
-        self.l_min = float(ul.min()) if ul.size else 0.0
-        self.spread = (float(ul.max()) - self.l_min) if ul.size else 0.0
-        self.mean_rank = (
-            math.fsum(self._ranks) / len(self._ranks)
-            if self._ranks
-            else 0.0
-        )
-        self._feat: np.ndarray | None = None
-
-    def state_features(self) -> list[float]:
-        """Return the scale-free description of the current state."""
-        den = 4.0 * self.mean_rank + 1.0
-        ranks = self.ranks or [0]
-        return [
-            len(self.ts) / self.n0,
-            self.cost / self.greedy_ref if self.greedy_ref > 0 else 0.0,
-            self.mean_rank / 4.0,
-            max(ranks) / 4.0,
-            min(ranks) / 4.0,
-            self.spread / den,
-            self.l_min / den,
-        ]
-
-    def _build_feat(self) -> np.ndarray:
-        """Assemble the ``[n_pairs, _PAIR_DIM]`` feature matrix.
-
-        Every column is the same IEEE arithmetic the scalar feature
-        builder applied (subtract ``l_min``, divide by the spread
-        denominator, divide the ranks by four), so the result is
-        bit-identical; the normalisation is done in place only to avoid
-        temporary arrays.
-        """
-        ul = self._ul
-        inter = self._inter_u
-        count = self._cnt_u
-        ls = self._ls
-        rk = self._rk
-        ia, ib = self._ia, self._ib
-        den = self.spread + 1.0
-        n_pairs = max(len(self.pairs), 1)
-        feat = np.empty((ul.shape[0], _PAIR_DIM), dtype=np.float64)
-        feat[:, 0] = ul
-        feat[:, 1] = ls[ia]
-        feat[:, 2] = ls[ib]
-        feat[:, 3] = ul - inter
-        feat[:, 4] = inter
-        feat[:, :5] -= self.l_min
-        feat[:, :5] /= den
-        feat[:, 5] = rk[ia]
-        feat[:, 6] = rk[ib]
-        feat[:, 5:7] /= 4.0
-        feat[:, 7] = count / np.maximum(rk[ia] + rk[ib] - count, 1.0)
-        feat[:, 8] = np.searchsorted(self.union_sorted, ul) / n_pairs
-        return feat
-
-    def pair_feature_matrix(self) -> np.ndarray:
-        """Return the ``[n_pairs, _PAIR_DIM]`` features, ``pairs`` order."""
-        feat = self._feat
-        if feat is None:
-            feat = self._build_feat()
-            self._feat = feat
-        return feat
-
-    def all_pair_features(self) -> list[list[float]]:
-        """Return one feature vector per legal action, in ``pairs`` order."""
-        return self.pair_feature_matrix().tolist()
-
-    def _advance(self, a: int, b: int) -> None:
-        """Contract ``(a, b)`` in the maintained caches, then refresh."""
-        masks = self._masks
-        m = len(masks)
-        keep = [k for k in range(m) if k != a and k != b]
-        new_ts = self.ts[a] ^ self.ts[b]
-        new_mask = masks[a] ^ masks[b]
-        new_lsize = self._lsize_mask(new_mask)
-        k = len(keep)
-        row_i = np.empty(k, dtype=np.float64)
-        row_c = np.empty(k, dtype=np.int64)
-        for pos, j in enumerate(keep):
-            both = new_mask & masks[j]
-            row_i[pos] = self._lsize_mask(both)
-            row_c[pos] = both.bit_count()
-        idx = np.asarray(keep, dtype=np.intp)
-        inter = np.empty((k + 1, k + 1), dtype=np.float64)
-        count = np.empty((k + 1, k + 1), dtype=np.int64)
-        inter[:k, :k] = self._inter[np.ix_(idx, idx)]
-        inter[k, k] = new_lsize
-        inter[:k, k] = row_i
-        inter[k, :k] = row_i
-        count[:k, :k] = self._icount[np.ix_(idx, idx)]
-        count[k, k] = len(new_ts)
-        count[:k, k] = row_c
-        count[k, :k] = row_c
-        self._inter = inter
-        self._icount = count
-        self.ts = [self.ts[j] for j in keep] + [new_ts]
-        self._masks = [masks[j] for j in keep] + [new_mask]
-        self._lsize = [self._lsize[j] for j in keep] + [new_lsize]
-        self._ranks = [self._ranks[j] for j in keep] + [len(new_ts)]
-        self._refresh()
-
-    def step(self, a: int, b: int) -> float:
-        """Contract pair ``(a, b)``; charge and return its cost."""
-        c = cs.pair_cost(self.ts[a], self.ts[b], self.sizes)
-        self.cost += c
-        self._advance(a, b)
-        return c
 
 
 @dataclass
@@ -357,73 +107,6 @@ class _Rollout:
     logps: list[torch.Tensor]
     advantages: list[float]
     entropies: list[torch.Tensor]
-
-
-# ---------------------------------------------------------------------------
-#  The policy net
-# ---------------------------------------------------------------------------
-
-
-class PairPolicyNet(nn.Module):
-    """Score a candidate pair from the state: ``(state (+) pair) -> logit``.
-
-    Scoring per action (rather than a fixed softmax head over a fixed
-    vocabulary) keeps the action space open: the number of pairs changes
-    every step, and a pair is a new point in the same feature space.
-    Inputs are standardised by buffers fitted from real trajectories.
-    """
-
-    mean: torch.Tensor
-    std: torch.Tensor
-
-    def __init__(self, hidden: int = 64) -> None:
-        """Build the MLP over ``(state (+) pair)`` inputs."""
-        super().__init__()
-        width = _STATE_DIM + _PAIR_DIM
-        self.register_buffer("mean", torch.zeros(width))
-        self.register_buffer("std", torch.ones(width))
-        self.net = nn.Sequential(
-            nn.Linear(width, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return one logit per row of ``x``, shape ``[n_rows]``."""
-        return self.net((x - self.mean) / self.std).squeeze(-1)
-
-
-def _logits(
-    model: nn.Module,
-    state_feats: torch.Tensor,
-    pair_feats: torch.Tensor,
-) -> torch.Tensor:
-    """Score every pair of every state; return shape ``[B, P]``."""
-    b, p, k = pair_feats.shape
-    s = state_feats.shape[1]
-    x = torch.cat(
-        [state_feats.unsqueeze(1).expand(b, p, s), pair_feats], dim=2
-    )
-    return model(x.reshape(b * p, s + k)).reshape(b, p)
-
-
-def _batch_inputs(
-    games: list[ContractionGame], device: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stack every game's state and pair features into batched tensors."""
-    sf = torch.as_tensor(
-        np.stack([g.state_features() for g in games]),
-        dtype=torch.float32,
-        device=device,
-    )
-    pf = torch.as_tensor(
-        np.stack([g.pair_feature_matrix() for g in games]),
-        dtype=torch.float32,
-        device=device,
-    )
-    return sf, pf
 
 
 def _fit_norm(
@@ -450,43 +133,6 @@ def _fit_norm(
     with torch.no_grad():
         model.mean.copy_(x.mean(0))
         model.std.copy_(x.std(0).clamp_min(_STD_FLOOR))
-
-
-# ---------------------------------------------------------------------------
-#  Rollouts
-# ---------------------------------------------------------------------------
-
-
-def run_policy_batch(
-    model: nn.Module,
-    tensors: Any,
-    sizes: dict[int, int],
-    greedy_ref: float,
-    *,
-    samples: int,
-    greedy: bool,
-    temperature: float,
-    device: str,
-) -> list[float]:
-    """Roll the policy out ``samples`` times; return the final costs.
-
-    All clones start from the same instance and advance in lockstep, so
-    one forward pass scores the whole batch each step.
-    """
-    games = [
-        ContractionGame(tensors, sizes, greedy_ref)
-        for _ in range(samples)
-    ]
-    while not games[0].done:
-        sf, pf = _batch_inputs(games, device)
-        logits = _logits(model, sf, pf)
-        if greedy:
-            idx = torch.argmax(logits, dim=1)
-        else:
-            idx = Categorical(logits=logits / temperature).sample()
-        for g, i in zip(games, idx.tolist(), strict=True):
-            g.step(*g.pairs[i])
-    return [g.cost for g in games]
 
 
 # ---------------------------------------------------------------------------
@@ -861,9 +507,6 @@ def _pack(
 #: Number of sampled policy rollouts in the ``policy-restart`` player.
 _RESTARTS = 64
 
-#: Sampling temperature for the policy restarts.
-_TEMP = 1.5
-
 
 def _ladder(
     tensors: Any,
@@ -1094,9 +737,6 @@ def _verdict(
 # ---------------------------------------------------------------------------
 #  Equal wall-clock: the anytime players
 # ---------------------------------------------------------------------------
-
-#: Largest lockstep batch the anytime policy will sample in one pass.
-_MAX_BATCH = 128
 
 
 @dataclass

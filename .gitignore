@@ -31,6 +31,9 @@ env/
 *.ckpt
 checkpoints/
 checkpoints/
+# ...except weights that are deliberately shipped with a package
+# (catopt_torch.contraction_policy's bundled curriculum player).
+!packages/catopt-torch/src/catopt_torch/artifacts/*.pt
 
 # IDEs
 .vscode/

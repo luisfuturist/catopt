@@ -7,7 +7,16 @@ name = "catopt-torch"
 version = "0.1.0dev"
 description = "PyTorch adapters for catopt: torch.export bridge, executors, model zoo, reports."
 requires-python = ">=3.11"
-dependencies = ["catopt-core", "catopt-orchestrator", "torch>=2.0"]
+dependencies = [
+    "catopt-core",
+    "catopt-orchestrator",
+    "torch>=2.0",
+    # The contraction-policy player's game maintains its pairwise
+    # feature tables as NumPy arrays (and export.py's safetensors path
+    # already calls ``Tensor.numpy()`` at runtime) — declare what was
+    # previously only pulled in transitively by the dev environment.
+    "numpy>=1.24",
+]
 # `catopt-carriers` is a deliberate *optional* runtime dependency: the
 # torch sink builds its carrier executor table from the carrier
 # lowerings (`catopt_torch.adapters._executor_specs`) under a
@@ -20,3 +29,9 @@ dependencies = ["catopt-core", "catopt-orchestrator", "torch>=2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Bundled pretrained weights — the contraction-ordering player
+# (``catopt_torch.contraction_policy.load_contraction_policy`` loads
+# ``artifacts/contraction_policy_curriculum.pt`` lazily at call time).
+[tool.setuptools.package-data]
+catopt_torch = ["artifacts/*.pt"]

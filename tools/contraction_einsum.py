@@ -53,6 +53,10 @@ import contraction_policy as cp
 import contraction_scale as cs
 import numpy as np
 import torch
+from catopt_torch.contraction_policy import (
+    random_bond_network,
+    rollout_orders,
+)
 
 try:
     import opt_einsum as oe
@@ -70,12 +74,6 @@ __all__ = ["main"]
 #: opt_einsum subscript alphabet (letters + digits: 62 distinct labels).
 _ALPHA = string.ascii_letters + string.digits
 
-#: Maximum tensor rank the bond-network generator will build.
-_DEGREE_CAP = 4
-
-#: Probability a bond-network tensor also carries an open (output) leg.
-_OPEN_LEG_P = 0.2
-
 #: An effectively-unbounded repeat count for the deadline-bounded
 #: randomised-greedy player (its ``max_time`` is the real budget).
 _HUGE = 10**9
@@ -86,55 +84,9 @@ _HUGE = 10**9
 # ---------------------------------------------------------------------------
 
 
-def random_bond_network(
-    n: int, seed: int
-) -> tuple[tuple[tuple[int, ...], ...], dict[int, int]]:
-    """Seeded random tensor network with every index shared <= 2 times.
-
-    A spanning tree guarantees connectivity, a few extra bonds add
-    cycles, and a fraction of tensors carry an open leg.  Every index
-    therefore appears in exactly two tensors (a *bond*) or exactly one
-    (an *open* leg) — the precondition for a faithful einsum mapping.
-    """
-    rng = random.Random(seed)
-    tensors: list[set[int]] = [set() for _ in range(n)]
-    sizes: dict[int, int] = {}
-    nxt = 0
-
-    def new_bond() -> int:
-        nonlocal nxt
-        sizes[nxt] = rng.randint(2, 8)
-        bond = nxt
-        nxt += 1
-        return bond
-
-    def link(i: int, j: int) -> None:
-        bond = new_bond()
-        tensors[i].add(bond)
-        tensors[j].add(bond)
-
-    for i in range(1, n):
-        room = [j for j in range(i) if len(tensors[j]) < _DEGREE_CAP]
-        link(i, rng.choice(room) if room else rng.randrange(i))
-    extra = max(1, n // 4)
-    added = 0
-    tries = 0
-    while added < extra and tries < 50 * extra + 50:
-        tries += 1
-        i = rng.randrange(n)
-        j = rng.randrange(n)
-        if i == j or (tensors[i] & tensors[j]):
-            continue
-        if len(tensors[i]) >= _DEGREE_CAP:
-            continue
-        if len(tensors[j]) >= _DEGREE_CAP:
-            continue
-        link(i, j)
-        added += 1
-    for i in range(n):
-        if rng.random() < _OPEN_LEG_P and len(tensors[i]) < _DEGREE_CAP:
-            tensors[i].add(new_bond())
-    return tuple(tuple(sorted(t)) for t in tensors), sizes
+# ``random_bond_network`` is imported from the shipped
+# ``catopt_torch.contraction_policy`` (the bundled-weights player was
+# trained on this family — it is the canonical generator).
 
 
 def _net_from_subs(
@@ -324,24 +276,12 @@ def _policy_rollouts(
 
     The mirror of ``contraction_policy.run_policy_batch``, except it also
     records the contraction order each rollout chose, so the order can be
-    re-scored with opt_einsum's independent cost model.
+    re-scored with opt_einsum's independent cost model.  The driver is
+    the shipped ``catopt_torch.contraction_policy.rollout_orders``.
     """
-    games = [
-        cp.ContractionGame(tensors, sizes, greedy_ref)
-        for _ in range(samples)
-    ]
-    orders: list[list[tuple[int, int]]] = [[] for _ in range(samples)]
-    while not games[0].done:
-        sf, pf = cp._batch_inputs(games, device)
-        logits = cp._logits(model, sf, pf)
-        idx = cp.Categorical(logits=logits / temperature).sample()
-        for j, (g, i) in enumerate(
-            zip(games, idx.tolist(), strict=True)
-        ):
-            a, b = g.pairs[i]
-            orders[j].append((a, b))
-            g.step(a, b)
-    return orders, [g.cost for g in games]
+    return rollout_orders(
+        model, tensors, sizes, greedy_ref, samples, device, temperature
+    )
 
 
 def policy_best_order(

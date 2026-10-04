@@ -59,13 +59,14 @@ import contraction_policy as cp
 import contraction_scale as cs
 import numpy as np
 import torch
+from catopt_torch.contraction_policy import STATE_DIM
 from torch import nn
 from torch.nn import functional as F
 
 __all__ = ["main"]
 
 #: State feature width: the game's own features plus the board scale.
-_STATE_DIM = cp._STATE_DIM + 1
+_STATE_DIM = STATE_DIM + 1
 
 
 def _sf(game: cp.ContractionGame) -> list[float]:
@@ -87,7 +88,7 @@ def _sf(game: cp.ContractionGame) -> list[float]:
 
 
 #: Pair feature width (unchanged).
-_PAIR_DIM = cp._PAIR_DIM
+_PAIR_DIM = cp._PAIR_DIM  # re-exported from the shipped module
 
 #: PUCT exploration constant.
 _C_PUCT = 1.5

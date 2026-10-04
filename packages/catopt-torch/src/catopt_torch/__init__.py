@@ -44,6 +44,8 @@ _DELEGATED = {
     "calibrate": "catopt_torch.calibrate",
     "TargetProfile": "catopt_torch.calibrate",
     "load_profile": "catopt_torch.calibrate",
+    "ContractionPolicy": "catopt_torch.contraction_policy",
+    "load_contraction_policy": "catopt_torch.contraction_policy",
 }
 
 
