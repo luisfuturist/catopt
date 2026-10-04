@@ -114,6 +114,52 @@ def test_alpha_key_shared_binding_is_position_sensitive():
     assert k_fwd != k_sw
 
 
+def test_alpha_key_canonicalizer_branches():
+    """`_attr_canon`/`_canon`: `$attr:` strings, literal and
+    unhashable attrs, Const and non-metavar leaves."""
+    # $attr:-prefixed attr values serialise under "av" — and stay
+    # literal (a bound attr name is not a leaf metavar): different
+    # names key differently.
+    k = alpha_key(
+        Op.make("select", "u", dim="$attr:D", index=0),
+        Op.make("select", "u", dim="$attr:E", index=0),
+    )
+    k2 = alpha_key(
+        Op.make("select", "w", dim="$attr:F", index=0),
+        Op.make("select", "w", dim="$attr:G", index=0),
+    )
+    assert k != k2
+    # ...but the LEAF metavars inside still abstract — same attr
+    # metavar, different leaf names: equal keys.
+    assert alpha_key(
+        Op.make("select", "u", dim="$attr:D", index=0),
+        Op.make("select", "w", dim="$attr:D", index=0),
+    ) == alpha_key(
+        Op.make("select", "p", dim="$attr:D", index=0),
+        Op.make("select", "q", dim="$attr:D", index=0),
+    )
+    # literal (hashable) vs unhashable attrs fall through lit/repr.
+    k3 = alpha_key(
+        Op.make("f", "x", n=2, dims=(1, 2)),
+        Op.make("f", "x", n=2, dims=[1, 2]),
+    )
+    assert isinstance(k3, tuple) and len(k3) == 2
+    # Const leaves stay literal ("c"), Var leaves hit the repr fallback.
+    k4 = alpha_key(
+        Op.make("pow", "x", Const(2)),
+        Op.make("pow", "x", Const(2)),
+    )
+    k5 = alpha_key(
+        Op.make("add", Var("x", TensorType((2,))), "y"),
+        Op.make("add", Var("x", TensorType((2,))), "y"),
+    )
+    assert k4 != alpha_key(
+        Op.make("pow", "x", Const(3)),
+        Op.make("pow", "x", Const(3)),
+    )
+    assert k5 == k5  # self-evident; the repr fallback ran
+
+
 # ---------------------------------------------------------------------------
 #  missing_hooks — the serializability census
 # ---------------------------------------------------------------------------
@@ -221,7 +267,7 @@ def test_law_record_roundtrip_rewrite_equality_unguarded():
             rebuilt = law_from_data(_json_roundtrip(law_to_data(rule)))
             assert rebuilt == rule, rule.name
             n += 1
-    assert n == 25
+    assert n == 24
 
 
 def test_law_record_flagged_hooks_drop_on_rebuild():

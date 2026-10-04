@@ -377,3 +377,24 @@ def test_eye_honours_exported_dtype():
         IR(root=eye, inputs=[], input_names=set(), params={})
     )
     assert mod().dtype == torch.float64
+
+
+def test_copy_family_slice_write_unminted_base_declines():
+    """A ``fill_``/``copy_``-family write into a ``slice`` view whose
+    BASE was never minted is declined (``env`` unchanged), not
+    silently dropped — the write can't be threaded to a base that
+    isn't there."""
+    from types import SimpleNamespace as NS
+
+    from catopt_torch.torch_bridge import _handle_copy_
+
+    dst_fx = NS(
+        name="d",
+        target="slice",
+        args=(NS(name="unminted"), 0, 0, 4),
+        meta={"val": NS(shape=(4,), dtype=torch.float64)},
+    )
+    env = {"d": Op.make("zeros", shape=(4,), dtype="float64")}
+    node = NS(target="fill_.Scalar", args=(dst_fx, 0.0))
+    _handle_copy_(node, env)
+    assert env["d"] == Op.make("zeros", shape=(4,), dtype="float64")

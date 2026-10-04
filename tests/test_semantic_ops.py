@@ -1187,6 +1187,15 @@ def test_arange_binding_const_operands():
     assert torch.equal(out, torch.arange(4))
 
 
+def test_scaled_extent_bool_guard():
+    """``isinstance(True, int)`` is True — a bool dim/scale is not a
+    concrete extent, and ``_scaled_extent`` declines it."""
+    from catopt_core.typing import _scaled_extent
+
+    assert _scaled_extent(8, True) is None
+    assert _scaled_extent(True, 2.0) is None
+
+
 # ---------------------------------------------------------------------------
 #  3. Export probes — the boundary fixes end to end
 # ---------------------------------------------------------------------------
