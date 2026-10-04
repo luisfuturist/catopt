@@ -49,10 +49,33 @@ Grammar
           | ("attr-type", NAME, K)   # isinstance per K:
                                      #   int|float|number|bool|str|tuple
           | ("attr-len", NAME, CMP, k)   # tuple attr, len CMP k
+          | ("attr-cmp-dim", NAME, CMP, T, K)
+                                     # $attr:NAME CMP shape(T)[$attr:K]
+          | ("bcast-eq", A,B,C,D)    # bcast(sA,sB) == bcast(sC,sD)
+          | ("ones-before", T, K)    # s[i]==1 for i < K mod (rank+1)
+          | ("axes-noop", T, D0, D1) # transpose pair is a semantic
+                                     #   no-op on T (same axis, or both
+                                     #   swapped extents are 1)
+          | ("flat-pair-unsq", T,K,G,S)  # flat-read pairing of T's dims
+                                     #   agrees between broadcast-into-G
+                                     #   and unsq-into-S (the wr guard)
+          | ("flat-map-unsq", T,K,V,S)   # the wl naturality: grid of
+                                     #   unsq(mul(u,v),K) equals grid of
+                                     #   mul(unsq(u,K),reshape(v,S)) AND
+                                     #   both operands' flat read maps
+                                     #   agree across the two orders
 
     T/A/B := metavar name (str) | ("mm-out", T, T)   — a *shape spec*:
              a bound term's inferred shape, or the matmul output shape
              of two specs (accepted by every shape-reading predicate).
+    G/S   := the same — any shape spec resolves here too.
+    Additional shape specs (accepted everywhere a spec is read):
+          | ("bcast", T, T)          # broadcast of two specs
+          | ("unsq-out", T, K)       # insert a 1 at $attr:K mod (rank+1)
+          | ("reshape-out", T, NAME) # resolved reshape target of T
+                                     #   under $attr:NAME (-1 folded,
+                                     #   numel checked — invalid→None)
+          | ("getitem-out", T)       # tensor-index output: s[1:]
     D*/NAME := attribute metavar names — looked up under "$attr:NAME".
     CMP    := "==" | "!=" | "<" | "<=" | ">" | ">=".
 
@@ -124,6 +147,7 @@ from catopt_core.typing import (
     _axis_pair,
     _broadcast,
     _matmul_shape,
+    _numel,
     _shape_of,
 )
 
@@ -169,24 +193,133 @@ _ATTR_TYPES: dict = {
 # ---------------------------------------------------------------------------
 
 
+def _unsq_shape(shape: Any, dim: Any) -> Any:
+    """Return ``unsqueeze``'s output shape: a 1 at ``dim % (rank+1)``.
+
+    Mirrors the ``unsqueeze`` branch of ``_infer_op_shape`` — a
+    non-tuple *shape* or non-int *dim* resolves to ``None``.
+    """
+    if not isinstance(shape, tuple) or not isinstance(dim, int):
+        return None
+    nd = dim % (len(shape) + 1)
+    return (*shape[:nd], 1, *shape[nd:])
+
+
+def _fold_minus1(shape: tuple, base_n: int) -> tuple:
+    """Fold ``-1`` dims of a reshape target through the base numel.
+
+    Mirrors the ``-1`` resolution in ``_infer_op_shape``'s ``reshape``
+    branch — an unresolvable fold leaves ``None`` in that slot.
+    """
+    if -1 not in shape:
+        return shape
+    known = 1
+    for d in shape:
+        if d != -1:
+            known *= d if isinstance(d, int) and d > 0 else 1
+    inferred = (
+        base_n // known if known and base_n % known == 0 else None
+    )
+    return tuple(inferred if d == -1 else d for d in shape)
+
+
+def _nonneg(shape: Any) -> bool:
+    return all(isinstance(d, int) and d >= 0 for d in shape)
+
+
+def _reshape_shape(base: Any, target: Any) -> Any:
+    """Return the resolved ``reshape`` output shape, or ``None``.
+
+    Mirrors the ``reshape`` branch of ``_infer_op_shape``: ``-1`` dims
+    fold through numel, and a numel-mismatched target is invalid —
+    reported here as ``None`` (the cond strictness contract declines;
+    it does not need the ``_INVALID`` poison marker).
+    """
+    if not isinstance(base, tuple):
+        return None
+    if not isinstance(target, (tuple, list)):
+        return None
+    shape = _fold_minus1(tuple(target), _numel(base))
+    if (
+        _nonneg(shape)
+        and _nonneg(base)
+        and _numel(shape) != _numel(base)
+    ):
+        return None
+    return shape
+
+
+def _s_mm_out(args: tuple, bound: dict) -> Any:
+    """``("mm-out", a, b)`` — matmul output shape of two specs."""
+    if len(args) != 2:
+        return None
+    return _matmul_shape(_shape(bound, args[0]), _shape(bound, args[1]))
+
+
+def _s_bcast(args: tuple, bound: dict) -> Any:
+    """``("bcast", a, b)`` — broadcast two specs (None reads wildcard)."""
+    if len(args) != 2:
+        return None
+    a, b = _shape(bound, args[0]), _shape(bound, args[1])
+    return _broadcast(
+        a if isinstance(a, tuple) else None,
+        b if isinstance(b, tuple) else None,
+    )
+
+
+def _s_unsq_out(args: tuple, bound: dict) -> Any:
+    """``("unsq-out", T, K)`` — the ``unsqueeze`` output shape."""
+    if len(args) != 2:
+        return None
+    return _unsq_shape(
+        _shape(bound, args[0]), bound.get(f"$attr:{args[1]}")
+    )
+
+
+def _s_reshape_out(args: tuple, bound: dict) -> Any:
+    """``("reshape-out", T, NAME)`` — the resolved reshape target."""
+    if len(args) != 2:
+        return None
+    return _reshape_shape(
+        _shape(bound, args[0]), bound.get(f"$attr:{args[1]}")
+    )
+
+
+def _s_getitem_out(args: tuple, bound: dict) -> Any:
+    """``("getitem-out", T)`` — tensor-index output: drop dim 0."""
+    if len(args) != 1:
+        return None
+    s = _shape(bound, args[0])
+    return s[1:] if isinstance(s, tuple) and s else None
+
+
+#: Tag-dispatch for tuple shape specs — each handler takes
+#: ``(args, bound)`` and validates its own arity.
+_SPEC_OPS: dict = {
+    "mm-out": _s_mm_out,
+    "bcast": _s_bcast,
+    "unsq-out": _s_unsq_out,
+    "reshape-out": _s_reshape_out,
+    "getitem-out": _s_getitem_out,
+}
+
+
 def _shape(bound: dict, ref: Any) -> Any:
     """Resolve a shape spec to an inferred shape (tuple | None | str).
 
     ``ref`` is a metavar name (looked up in ``bound`` and inferred via
-    ``_shape_of``) or ``("mm-out", a, b)`` — the matmul output shape of
-    two nested specs.  Anything else resolves to ``None`` (unknown),
-    which every predicate treats as a decline.
+    ``_shape_of``) or a tuple spec dispatched through ``_SPEC_OPS`` —
+    ``("mm-out", a, b)``, ``("bcast", a, b)``, ``("unsq-out", a, K)``,
+    ``("reshape-out", a, NAME)`` and ``("getitem-out", a)``.
+    Anything else resolves to ``None`` (unknown), which every
+    predicate treats as a decline.
     """
     if isinstance(ref, str):
         return _shape_of(bound.get(ref), _MEMO)
-    if (
-        isinstance(ref, (tuple, list))
-        and len(ref) == 3
-        and ref[0] == "mm-out"
-    ):
-        return _matmul_shape(
-            _shape(bound, ref[1]), _shape(bound, ref[2])
-        )
+    if isinstance(ref, (tuple, list)) and ref:
+        handler = _SPEC_OPS.get(ref[0])
+        if handler is not None:
+            return handler(tuple(ref[1:]), bound)
     return None
 
 
@@ -439,6 +572,218 @@ def _p_attr_len(args: tuple, bound: dict) -> bool:
     return isinstance(v, tuple) and _CMPS[args[1]](len(v), args[2])
 
 
+def _p_attr_cmp_dim(args: tuple, bound: dict) -> bool:
+    """``$attr:NAME CMP shape(T)[$attr:K]`` — attr-vs-dim comparison.
+
+    For slice-covering guards: ``end >= shape(u)[dim]`` spells
+    ``("attr-cmp-dim", "A_end", ">=", "U", "A_dim")``.  Both sides
+    must resolve to ints — a missing attr, an unshaped term, a
+    non-int index or a ``None`` dim all decline.
+    """
+    v = bound.get(f"$attr:{args[0]}")
+    s = _tshape(bound, args[2])
+    k = bound.get(f"$attr:{args[3]}")
+    if not isinstance(v, int) or s is None or not isinstance(k, int):
+        return False
+    ok, d = _dim_at(s, k)
+    return ok and isinstance(d, int) and _CMPS[args[1]](v, d)
+
+
+def _p_bcast_eq(args: tuple, bound: dict) -> bool:
+    """``bcast(sa, sb) == bcast(sc, sd)`` — output grids coincide.
+
+    The ``id:out_shape_eq`` half of a strip guard: every spec must
+    resolve to a tuple and both broadcasts must succeed — an unknown
+    or ill-typed side declines, it does not wildcard.
+    """
+    specs = [_shape(bound, a) for a in args]
+    if not all(isinstance(s, tuple) for s in specs):
+        return False
+    g1 = _broadcast(specs[0], specs[1])
+    g2 = _broadcast(specs[2], specs[3])
+    return isinstance(g1, tuple) and isinstance(g2, tuple) and g1 == g2
+
+
+def _p_ones_before(args: tuple, bound: dict) -> bool:
+    """``s[i] == 1`` for every dim before the normalized attr axis.
+
+    ``("ones-before", T, K)``: *K* is the bound ``unsqueeze`` axis
+    (normalized ``mod rank+1``).  This is the ``id:same_pairing``
+    half of the unsqueeze strip guard — broadcasting ``unsq(u, K)``
+    to the common grid reads ``u`` through the same index map as
+    broadcasting ``u`` exactly when every dim shifted by the
+    insertion is a broadcast-1.
+    """
+    s = _tshape(bound, args[0])
+    k = bound.get(f"$attr:{args[1]}")
+    if s is None or not isinstance(k, int):
+        return False
+    nd = k % (len(s) + 1)
+    return all(d == 1 for d in s[:nd])
+
+
+def _p_axes_noop(args: tuple, bound: dict) -> bool:
+    """``transpose(u, D0, D1)`` is a semantic no-op on ``u``.
+
+    True when the normalized axis pair is the same axis (``d0 == d1``
+    — the literal ``tr:noop``) or when both swapped extents are 1 —
+    swapping two size-1 axes neither changes the shape tuple nor the
+    broadcast pairing.  Anything else declines (an unknown shape or
+    unbound pair cannot be proven a no-op).  A rank-1 operand has only
+    the one axis — every valid pair is (0, 0).
+    """
+    s = _tshape(bound, args[0])
+    if s is None or not s:
+        return False
+    if len(s) == 1:
+        d0 = bound.get(f"$attr:{args[1]}")
+        d1 = bound.get(f"$attr:{args[2]}")
+        return (
+            isinstance(d0, int)
+            and isinstance(d1, int)
+            and -1 <= d0 < 1
+            and -1 <= d1 < 1
+        )
+    pair = _axes_pair(bound, args[1], args[2], len(s))
+    if pair is None:
+        return False
+    d0, d1 = pair
+    return d0 == d1 or (s[d0] == 1 and s[d1] == 1)
+
+
+def _all_int(shape: tuple) -> bool:
+    return all(isinstance(d, int) for d in shape)
+
+
+def _concrete_specs(bound: dict, refs: tuple) -> list | None:
+    """Resolve every spec in *refs*; ``None`` unless all concrete."""
+    out = []
+    for r in refs:
+        s = _tshape(bound, r)
+        if s is None or not _all_int(s):
+            return None
+        out.append(s)
+    return out
+
+
+def _stride(shape: tuple, i: int) -> int:
+    """Flat-index stride of ``shape[i]``: product of trailing dims."""
+    n = 1
+    for d in shape[i + 1 :]:
+        n *= d
+    return n
+
+
+def _p_flat_pair_unsq(args: tuple, bound: dict) -> bool:
+    """Flat-read pairing of ``u`` survives ``unsq→S`` vs ``bcast→G``.
+
+    ``("flat-pair-unsq", T, K, G, S)``: the *wr* naturality's u-side —
+    ``reshape(mul(u,v), S)`` reads ``u`` through its broadcast into
+    ``G = bcast(u,v)``; ``mul(unsq(u,K), reshape(v,S))`` reads it
+    through ``unsq``'s broadcast into ``S``.  For the elements to
+    coincide for all ``u`` each non-1 dim's flat-index digit must sit
+    at the same stride: ``u``-dim ``k`` is read at grid position
+    ``len(G)-r+k`` in ``G`` and at ``len(S)-(r+1)+j`` in ``S`` (``j``
+    is ``k`` or ``k+1`` past the inserted axis ``nd = K mod r+1``).
+    Requires every spec to resolve to a concrete-int shape.
+    """
+    k = bound.get(f"$attr:{args[1]}")
+    specs = _concrete_specs(bound, (args[0], args[2], args[3]))
+    if specs is None or not isinstance(k, int):
+        return False
+    su, g, s = specs
+    r, n, n2 = len(su), len(g), len(s)
+    nd = k % (r + 1)
+    for kk in range(r):
+        if su[kk] == 1:
+            continue
+        j = kk if kk < nd else kk + 1
+        p1, p2 = n - r + kk, n2 - (r + 1) + j
+        if not (0 <= p1 < n and 0 <= p2 < n2):
+            return False
+        if g[p1] != su[kk] or s[p2] != su[kk]:
+            return False
+        if _stride(g, p1) != _stride(s, p2):
+            return False
+    return True
+
+
+def _viewed_map(src: tuple, grid: tuple) -> dict:
+    """Flat-read coeff map of *src* broadcast into *grid*.
+
+    Returns ``{grid position: flat stride}`` for each non-1 dim —
+    the index map ``I ↦ Σ_p I[p]·c_p`` into the operand's flat
+    storage under right-aligned broadcasting.
+    """
+    off = len(grid) - len(src)
+    return {
+        off + j: _stride(src, j) for j, dj in enumerate(src) if dj != 1
+    }
+
+
+def _shifted_map(src: tuple, grid: tuple, nd: int) -> dict:
+    """Flat-read coeff map of *src* through an axis insertion.
+
+    The operand broadcasts into *grid*, then an axis is inserted at
+    ``nd`` — positions at or past it read one slot further right.
+    """
+    off = len(grid) - len(src)
+    out = {}
+    for j, dj in enumerate(src):
+        if dj != 1:
+            p = off + j
+            out[p + (1 if p >= nd else 0)] = _stride(src, j)
+    return out
+
+
+def _flat_map_ok(lmap: dict, rmap: dict, w: tuple) -> bool:
+    """Compare flat-read coefficient maps on the shared grid *w*.
+
+    Two maps read the same elements for every value iff their
+    coefficients agree at every position the grid actually varies
+    (``w[p] > 1``; size-1 positions read the constant 0 either way).
+    """
+    for p, wdim in enumerate(w):
+        if wdim == 1:
+            continue
+        if lmap.get(p, 0) != rmap.get(p, 0):
+            return False
+    return True
+
+
+def _p_flat_map_unsq(args: tuple, bound: dict) -> bool:
+    """Decide the *wl* naturality: ``unsq∘mul`` under a reshape partner.
+
+    ``("flat-map-unsq", T, K, V, S)`` decides
+    ``mul(unsq(u,K), reshape(v,S)) == unsq(mul(u,v), K)`` at shape
+    level: the output grids must coincide —
+    ``bcast(unsq(u), S) == unsq(bcast(u,v), K)`` (note *K* normalizes
+    against each operand's own rank) — and each operand's flat-read
+    coefficient map must agree across the two orders: ``v`` read via
+    ``reshape(v,S)``'s broadcast vs its broadcast in ``mul(u,v)``,
+    ``u`` read via ``unsq``'s broadcast vs its broadcast in
+    ``mul(u,v)`` shifted by the inserted axis.  All shapes must
+    resolve to concrete ints.
+    """
+    k = bound.get(f"$attr:{args[1]}")
+    specs = _concrete_specs(bound, (args[0], args[2], args[3]))
+    if specs is None or not isinstance(k, int):
+        return False
+    su, sv, s = specs
+    su_p = _unsq_shape(su, k)
+    gu = _broadcast(su, sv)
+    gl = _broadcast(su_p, s)
+    if not isinstance(gu, tuple) or not isinstance(gl, tuple):
+        return False
+    nd = k % (len(gu) + 1)
+    w = (*gu[:nd], 1, *gu[nd:])
+    if w != gl:
+        return False
+    return _flat_map_ok(
+        _viewed_map(su_p, w), _shifted_map(su, gu, nd), w
+    ) and _flat_map_ok(_viewed_map(s, w), _shifted_map(sv, gu, nd), w)
+
+
 _OPS: dict = {
     "and": None,  # combinators are handled in eval_cond directly
     "or": None,
@@ -473,6 +818,12 @@ _OPS: dict = {
     "attr-in": _p_attr_in,
     "attr-type": _p_attr_type,
     "attr-len": _p_attr_len,
+    "attr-cmp-dim": _p_attr_cmp_dim,
+    "bcast-eq": _p_bcast_eq,
+    "ones-before": _p_ones_before,
+    "axes-noop": _p_axes_noop,
+    "flat-pair-unsq": _p_flat_pair_unsq,
+    "flat-map-unsq": _p_flat_map_unsq,
 }
 
 

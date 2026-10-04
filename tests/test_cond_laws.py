@@ -638,3 +638,344 @@ def test_weight_factor_cond_verdicts():
     assert not WEIGHT_FACTOR.check({"W": vec[0], "W2": vec[1]})
     assert not WEIGHT_FACTOR.check({"W": scalar[0], "W2": scalar[1]})
     assert not WEIGHT_FACTOR.check({"W": w})  # unshaped W2 declines
+
+
+# ---------------------------------------------------------------------------
+#  View-guard predicates — the cond forms for the view-oracle's
+#  mechanical separators (see project/retros/cond-dsl-view-guards.md)
+# ---------------------------------------------------------------------------
+
+
+def test_unsq_out_and_getitem_out_specs():
+    u = _v("u", 2, 3)
+    b = {"u": u, "$attr:D": 0}
+    # ("unsq-out", T, K) inserts a 1 at K mod (rank+1)
+    b2 = {"u": u, "$attr:D": -3}
+    assert _shape_helper(("unsq-out", "u", "D"), b) == (1, 2, 3)
+    assert _shape_helper(("unsq-out", "u", "D"), b2) == (1, 2, 3)
+    assert _shape_helper(("unsq-out", "u", "D"), {"u": u, "$attr:D": 1}) == (2, 1, 3)
+    # unshaped operand / non-int attr → None → declines
+    assert _shape_helper(("unsq-out", "u", "D"), {"u": u}) is None
+    assert _shape_helper(("unsq-out", "missing", "D"), b) is None
+    assert _shape_helper(("unsq-out", "u", "D", "extra"), b) is None
+    # ("getitem-out", T) drops dim 0
+    assert _shape_helper(("getitem-out", "u"), b) == (3,)
+    assert _shape_helper(("getitem-out", "u"), {"u": _v("s")}) is None
+    assert _shape_helper(("getitem-out", "u", "x"), b) is None
+    assert _shape_helper(("getitem-out", "missing"), b) is None
+
+
+def test_bcast_and_reshape_out_specs():
+    u, v = _v("u", 2, 3), _v("v", 1, 3)
+    b = {"u": u, "v": v, "$attr:S": (2, 3), "$attr:NEG": (-1, 3)}
+    # ("bcast", T, T) broadcasts two specs; an unresolvable side is a
+    # wildcard (None), matching _broadcast's convention.
+    assert _shape_helper(("bcast", "u", "v"), b) == (2, 3)
+    assert _shape_helper(("bcast", "missing", "v"), b) == (1, 3)
+    assert _shape_helper(("bcast", "u"), b) is None  # arity
+    # ("reshape-out", T, NAME) resolves -1 and validates numel.
+    assert _shape_helper(("reshape-out", "u", "S"), b) == (2, 3)
+    assert _shape_helper(("reshape-out", "u", "NEG"), b) == (2, 3)
+    bad = {"u": u, "$attr:S": (2, 4)}  # numel mismatch → None
+    assert _shape_helper(("reshape-out", "u", "S"), bad) is None
+    assert _shape_helper(("reshape-out", "missing", "S"), b) is None
+    bad2 = {"u": u, "$attr:S": 4}  # non-tuple target
+    assert _shape_helper(("reshape-out", "u", "S"), bad2) is None
+    assert _shape_helper(("reshape-out", "u", "S", "x"), b) is None
+    # -1 that cannot be resolved leaves a None slot in the shape —
+    # the same "unknown dim" posture the typing rule reports.
+    odd = {"o": _v("o", 3), "$attr:S": (-1, 2)}
+    assert _shape_helper(("reshape-out", "o", "S"), odd) == (None, 2)
+    wild = {"w": _v("w", 3), "$attr:S": (-1, 4)}
+    assert _shape_helper(("reshape-out", "w", "S"), wild) == (None, 4)
+
+
+def _shape_helper(ref, bound):
+    from catopt_core.laws.cond import _shape
+
+    return _shape(bound, ref)
+
+
+def test_dim_eq_attr_declines():
+    # strictness: unshaped terms and non-int attr indices decline.
+    b = {"u": _v("u", 2, 3), "$attr:D": 0}
+    assert not eval_cond(("dim-eq-attr", "u", "D", "missing", "D"), b)
+    assert not eval_cond(("dim-eq-attr", "u", "MISSING", "u", "D"), b)
+
+
+def test_attr_cmp_dim():
+    u = _v("u", 2, 8)
+    b = {"u": u, "$attr:E": 8, "$attr:D": -1}
+    assert eval_cond(("attr-cmp-dim", "E", ">=", "u", "D"), b)
+    assert not eval_cond(("attr-cmp-dim", "E", "==", "u", "D"), {"u": u, "$attr:E": 3, "$attr:D": -1})
+    assert not eval_cond(("attr-cmp-dim", "E", ">=", "missing", "D"), b)
+    assert not eval_cond(("attr-cmp-dim", "E", ">=", "u", "MISSING"), b)
+    assert not eval_cond(("attr-cmp-dim", "MISSING", ">=", "u", "D"), b)
+    # out-of-range axis and unknown dims decline
+    far = {"u": u, "$attr:E": 8, "$attr:D": 9}
+    assert not eval_cond(("attr-cmp-dim", "E", ">=", "u", "D"), far)
+    wild = {"u": _v("w", 2, None), "$attr:E": 8, "$attr:D": -1}
+    assert not eval_cond(("attr-cmp-dim", "E", ">=", "w", "D"), wild)
+
+
+def test_bcast_eq_predicate():
+    u, v, w = _v("u", 2, 3), _v("v", 1, 3), _v("w", 2, 1)
+    b = {"u": u, "v": v, "w": w}
+    assert eval_cond(("bcast-eq", "u", "v", "u", "w"), b)  # (2,3)==(2,3)
+    assert not eval_cond(("bcast-eq", "u", "v", "v", "v"), b)  # (2,3)!=(1,3)
+    assert not eval_cond(("bcast-eq", "u", "missing", "u", "v"), b)
+    # an ill-typed broadcast side declines, it does not wildcard
+    bad = {"u": u, "v": _v("z", 5), "w": w}
+    assert not eval_cond(("bcast-eq", "u", "v", "u", "w"), bad)
+
+
+def test_ones_before():
+    u = _v("u", 1, 1, 4)
+    b = {"u": u, "$attr:D": 2}
+    assert eval_cond(("ones-before", "u", "D"), b)  # u[:2] all 1
+    assert eval_cond(("ones-before", "u", "D"), {"u": _v("x", 2, 1, 4), "$attr:D": 0})
+    assert eval_cond(("ones-before", "u", "D"), {"u": _v("x", 1, 2, 4), "$attr:D": 1})
+    # a non-1 dim at or before the axis fails the pairing
+    assert not eval_cond(("ones-before", "u", "D"), {"u": _v("x", 2, 1, 4), "$attr:D": 1})
+    assert not eval_cond(("ones-before", "u", "D"), {"u": _v("x", 2, 1, 4), "$attr:D": 2})
+    assert not eval_cond(("ones-before", "missing", "D"), b)
+    assert not eval_cond(("ones-before", "u", "MISSING"), b)
+    # negative axis normalizes mod (rank+1)
+    assert eval_cond(("ones-before", "u", "D"), {"u": u, "$attr:D": -2})
+    assert not eval_cond(("ones-before", "u", "D"), {"u": _v("x", 2, 1, 4), "$attr:D": -2})
+
+
+def test_axes_noop():
+    u = _v("u", 2, 3)
+    same = {"u": u, "$attr:D0": 0, "$attr:D1": 0}
+    neg_same = {"u": u, "$attr:D0": -2, "$attr:D1": 0}
+    swap = {"u": u, "$attr:D0": 0, "$attr:D1": 1}
+    assert eval_cond(("axes-noop", "u", "D0", "D1"), same)
+    assert eval_cond(("axes-noop", "u", "D0", "D1"), neg_same)
+    assert not eval_cond(("axes-noop", "u", "D0", "D1"), swap)
+    # swapping two size-1 axes is still a semantic no-op
+    flat = _v("f", 1, 1, 4)
+    both1 = {"u": flat, "$attr:D0": 0, "$attr:D1": 1}
+    assert eval_cond(("axes-noop", "u", "D0", "D1"), both1)
+    one1 = {"u": _v("g", 1, 3, 4), "$attr:D0": 0, "$attr:D1": 1}
+    assert not eval_cond(("axes-noop", "u", "D0", "D1"), one1)
+    # rank-1: every valid pair is (0, 0)
+    vec = {"u": _v("v", 4), "$attr:D0": 0, "$attr:D1": -1}
+    assert eval_cond(("axes-noop", "u", "D0", "D1"), vec)
+    far = {"u": _v("v", 4), "$attr:D0": 0, "$attr:D1": 5}
+    assert not eval_cond(("axes-noop", "u", "D0", "D1"), far)
+    noattr = {"u": _v("v", 4)}
+    assert not eval_cond(("axes-noop", "u", "D0", "D1"), noattr)
+    # scalar / unshaped / out-of-range pair decline
+    assert not eval_cond(("axes-noop", "u", "D0", "D1"), {"u": _v("s"), "$attr:D0": 0, "$attr:D1": 0})
+    assert not eval_cond(("axes-noop", "missing", "D0", "D1"), swap)
+    oor = {"u": u, "$attr:D0": 0, "$attr:D1": 7}
+    assert not eval_cond(("axes-noop", "u", "D0", "D1"), oor)
+
+
+def test_flat_pair_unsq():
+    # The wr pairing: reshape(mul(u,v),S) vs mul(unsq(u,d),reshape(v,S))
+    # reads u through the same flat index map.
+    cond = ("flat-pair-unsq", "U", "A_dim", "V", ("reshape-out", "V", "B_shape"))
+    # u=(4,), S=(4,1), nd=1 — trailing-1 insert keeps stride-1 reads.
+    b = {"U": _v("u", 4), "V": _v("v", 4),
+         "$attr:A_dim": -1, "$attr:B_shape": (4, 1)}
+    assert eval_cond(cond, b)
+    # u=(4,), S=(1,4), nd=0 — leading-1 insert keeps stride-1 reads.
+    b2 = {"U": _v("u", 4), "V": _v("v", 4),
+          "$attr:A_dim": 0, "$attr:B_shape": (1, 4)}
+    assert eval_cond(cond, b2)
+    # u=(4,), v=(2,3,4), S=(6,4), nd=0 — the observed equal instance.
+    b3 = {"U": _v("u", 4), "V": _v("v", 2, 3, 4),
+          "$attr:A_dim": 0, "$attr:B_shape": (6, 4)}
+    assert eval_cond(cond, b3)
+    # u with leading 1-dims: they are skipped by the pairing check.
+    b4 = {"U": _v("u", 1, 4), "V": _v("v", 1, 4),
+          "$attr:A_dim": 0, "$attr:B_shape": (1, 4)}
+    assert eval_cond(cond, b4)
+    # stride mismatch: S=(4,2) splits the multiplied axis.
+    nb = {"U": _v("u", 4), "V": _v("v", 2, 4),
+          "$attr:A_dim": -1, "$attr:B_shape": (4, 2)}
+    assert not eval_cond(cond, nb)
+    # extent mismatch: the grid dim does not carry u's extent.
+    nb_x = {"U": _v("u", 4), "V": _v("v", 2, 2),
+            "$attr:A_dim": -1, "$attr:B_shape": (4, 1)}
+    assert not eval_cond(cond, nb_x)
+    # S rank too small for the unsqueeze output → out of range.
+    nb2 = {"U": _v("u", 2, 3), "V": _v("v", 2, 3),
+           "$attr:A_dim": 0, "$attr:B_shape": (6,)}
+    assert not eval_cond(cond, nb2)
+    # ill-typed / unshaped / missing attr decline
+    assert not eval_cond(cond, {"U": _v("u", 4), "$attr:A_dim": 0,
+                                "$attr:B_shape": (4, 1)})
+    assert not eval_cond(cond, {"U": _v("u", 4), "V": _v("v", 4),
+                                "$attr:A_dim": 0, "$attr:B_shape": (4, 4)})
+
+
+def test_flat_map_unsq():
+    # The wl naturality: mul(unsq(u,d),reshape(v,S)) == unsq(mul(u,v),d)
+    cond = ("flat-map-unsq", "U", "A_dim", "V", ("reshape-out", "V", "B_shape"))
+    # u=(4,), v=(4,), S=(4,), d=0 — grids (1,4) agree, maps coincide.
+    b = {"U": _v("u", 4), "V": _v("v", 4),
+         "$attr:A_dim": 0, "$attr:B_shape": (4,)}
+    assert eval_cond(cond, b)
+    # u=(3,4), v=(4,), S=(4,1), d=2 — the observed ALiBi-like equal.
+    b2 = {"U": _v("u", 3, 4), "V": _v("v", 4),
+          "$attr:A_dim": 2, "$attr:B_shape": (4, 1)}
+    assert eval_cond(cond, b2)
+    # u=(4,), v=(2,3,4), S=(1,2,3,4), d=0 — observed equal instance.
+    b3 = {"U": _v("u", 4), "V": _v("v", 2, 3, 4),
+          "$attr:A_dim": 0, "$attr:B_shape": (1, 2, 3, 4)}
+    assert eval_cond(cond, b3)
+    # u=(2,3), v=(1,3), S=(1,3), d=0 — v's leading broadcast-1 dim.
+    b4 = {"U": _v("u", 2, 3), "V": _v("v", 1, 3),
+          "$attr:A_dim": 0, "$attr:B_shape": (1, 3)}
+    assert eval_cond(cond, b4)
+    # v-map mismatch at equal grids: v=(2,), S=(2,1) reads v[j]
+    # where the mul-order reads v[k] — same grid, wrong pairing.
+    nb = {"U": _v("u", 2, 2), "V": _v("v", 2),
+          "$attr:A_dim": 0, "$attr:B_shape": (2, 1)}
+    assert not eval_cond(cond, nb)
+    # u-map mismatch: the insertion shifts a non-1 u dim out of the
+    # grid position the mul-order reads it at.
+    nb_u = {"U": _v("u", 3), "V": _v("v", 2, 3, 1),
+            "$attr:A_dim": 1, "$attr:B_shape": (2, 1, 1, 3)}
+    assert not eval_cond(cond, nb_u)
+    # v misreads: v=(4,), S=(2,2) — numel ok but the flat map splits.
+    nb = {"U": _v("u", 4), "V": _v("v", 4),
+          "$attr:A_dim": -1, "$attr:B_shape": (2, 2)}
+    assert not eval_cond(cond, nb)
+    # grid mismatch: inserted axis does not reproduce the LHS grid.
+    nb2 = {"U": _v("u", 2, 3), "V": _v("v", 2, 3),
+           "$attr:A_dim": 1, "$attr:B_shape": (2, 3)}
+    assert not eval_cond(cond, nb2)
+    # ill-typed broadcast, unshaped spec, missing attr decline.
+    nb3 = {"U": _v("u", 2), "V": _v("v", 3),
+         "$attr:A_dim": 0, "$attr:B_shape": (6,)}
+    assert not eval_cond(cond, nb3)
+    assert not eval_cond(cond, {"U": _v("u", 4),
+                              "$attr:A_dim": 0, "$attr:B_shape": (4,)})
+    wild = {"U": _v("u", 4, None), "V": _v("v", 4),
+            "$attr:A_dim": 0, "$attr:B_shape": (4,)}
+    assert not eval_cond(cond, wild)
+
+
+# ---------------------------------------------------------------------------
+#  The decoded guards — one cond per conditional view-oracle candidate
+#  (project/retros/cond-dsl-view-guards.md has the full table; these
+#  pin the accept/decline verdicts on canonical true/false envs).
+# ---------------------------------------------------------------------------
+
+_UNSQ_STRIP_COND = (
+    "and",
+    ("ones-before", "U", "A_dim"),
+    ("bcast-eq", ("unsq-out", "U", "A_dim"), "V", "U", "V"),
+)
+
+
+def test_unsqueeze_strip_guard():
+    # mul(unsq(u,d), v) == mul(u,v) iff u dims before the inserted axis
+    # are all 1 AND the two broadcast grids coincide.
+    yes = {"U": _v("u", 4), "V": _v("v", 3, 4), "$attr:A_dim": 0}
+    yes2 = {"U": _v("u", 2, 3), "V": _v("v", 1, 2, 3), "$attr:A_dim": 0}
+    no_axis = {"U": _v("u", 2, 3), "V": _v("v", 1, 2, 3), "$attr:A_dim": 1}
+    no_grid = {"U": _v("u", 4), "V": _v("v", 3, 3), "$attr:A_dim": 0}
+    assert eval_cond(_UNSQ_STRIP_COND, yes)
+    assert eval_cond(_UNSQ_STRIP_COND, yes2)
+    # ones-before covers the non-pad insertions with leading 1s too.
+    pad = {"U": _v("u", 1, 3), "V": _v("v", 2, 1, 3), "$attr:A_dim": 1}
+    assert eval_cond(_UNSQ_STRIP_COND, pad)
+    assert not eval_cond(_UNSQ_STRIP_COND, no_axis)
+    assert not eval_cond(_UNSQ_STRIP_COND, no_grid)
+
+
+def test_slice_strip_guard():
+    cond = (
+        "and",
+        ("or", ("attr-is", "A_start", None), ("attr-eq", "A_start", 0)),
+        ("or", ("attr-is", "A_end", None),
+         ("attr-cmp-dim", "A_end", ">=", "U", "A_dim")),
+    )
+    full = {"U": _v("u", 2, 3), "$attr:A_dim": -1, "$attr:A_start": 0,
+            "$attr:A_end": 3}
+    full_huge = {"U": _v("u", 2, 3), "$attr:A_dim": -1,
+                 "$attr:A_start": 0, "$attr:A_end": 2**62}
+    none_attrs = {"U": _v("u", 2, 3), "$attr:A_dim": -1,
+                  "$attr:A_start": None, "$attr:A_end": None}
+    partial = {"U": _v("u", 2, 3), "$attr:A_dim": -1,
+               "$attr:A_start": 0, "$attr:A_end": 2}
+    offset = {"U": _v("u", 2, 3), "$attr:A_dim": -1,
+              "$attr:A_start": 1, "$attr:A_end": 3}
+    for bound in (full, full_huge, none_attrs):
+        assert eval_cond(cond, bound)
+    for bound in (partial, offset):
+        assert not eval_cond(cond, bound)
+
+
+def test_getitem_strip_guard():
+    cond = (
+        "and",
+        ("leaf", "U"),
+        ("dim-eq-const", "U", 0, 1),
+        ("attr-in", "A_index", (0, -1)),
+        ("bcast-eq", ("getitem-out", "U"), "V", "U", "V"),
+    )
+    yes = {"U": _v("u", 1, 4), "V": _v("v", 1, 4), "$attr:A_index": 0}
+    yes2 = {"U": _v("u", 1, 4), "V": _v("v", 2, 1, 4), "$attr:A_index": -1}
+    # grid mismatch: v drops the retained leading axis.
+    no_grid = {"U": _v("u", 1, 4), "V": _v("v", 4), "$attr:A_index": 0}
+    # extent > 1: getitem picks a row, not a broadcast no-op.
+    no_ext = {"U": _v("u", 2, 4), "V": _v("v", 2, 4), "$attr:A_index": 0}
+    # tuple producer bound: the RHS eq(u,v) does not denote.
+    tup = {"U": Op.make("topk", _v("w", 2, 4), k=2), "V": _v("v", 2, 4),
+           "$attr:A_index": 0}
+    for bound in (yes, yes2):
+        assert eval_cond(cond, bound)
+    for bound in (no_grid, no_ext, tup):
+        assert not eval_cond(cond, bound)
+
+
+def test_reshape_unsq_family_guards_roundtrip():
+    """The three mixed-family guards are pure data — round-trip by name."""
+    guards = {
+        "id": (
+            "and",
+            ("shape-eq", "V", ("reshape-out", "V", "B_shape")),
+            ("ones-before", "U", "A_dim"),
+            ("bcast-eq", ("unsq-out", "U", "A_dim"),
+             ("reshape-out", "V", "B_shape"), "U", "V"),
+        ),
+        "wr": (
+            "and",
+            ("bcast-into", "U", "V"),
+            ("bcast-into", ("unsq-out", "U", "A_dim"),
+             ("reshape-out", "V", "B_shape")),
+            ("flat-pair-unsq", "U", "A_dim", "V",
+             ("reshape-out", "V", "B_shape")),
+        ),
+        "wl": (
+            "flat-map-unsq", "U", "A_dim", "V",
+            ("reshape-out", "V", "B_shape"),
+        ),
+    }
+    raw = json.loads(json.dumps(cond_to_data(guards["id"])))
+    assert cond_from_data(raw) == guards["id"]
+    raw = json.loads(json.dumps(cond_to_data(guards["wr"])))
+    assert cond_from_data(raw) == guards["wr"]
+    raw = json.loads(json.dumps(cond_to_data(guards["wl"])))
+    assert cond_from_data(raw) == guards["wl"]
+    # the id guard on the canonical equal env (identity reshape + pad)
+    yes = {"U": _v("u", 4), "V": _v("v", 3, 4),
+           "$attr:A_dim": 0, "$attr:B_shape": (3, 4)}
+    assert eval_cond(guards["id"], yes)
+    no = {"U": _v("u", 4), "V": _v("v", 3, 4),
+          "$attr:A_dim": 1, "$attr:B_shape": (3, 4)}
+    assert not eval_cond(guards["id"], no)
+    # the wr guard on the canonical equal env
+    yes = {"U": _v("u", 4), "V": _v("v", 4),
+           "$attr:A_dim": -1, "$attr:B_shape": (4, 1)}
+    assert eval_cond(guards["wr"], yes)
+    # wl canonical equal env
+    yes = {"U": _v("u", 4), "V": _v("v", 4),
+           "$attr:A_dim": 0, "$attr:B_shape": (4,)}
+    assert eval_cond(guards["wl"], yes)
