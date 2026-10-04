@@ -24,12 +24,19 @@ def R(
     check=None,
     derive=None,
     tags: Any = (),
+    derivation: Any = (),
 ) -> Rewrite:
     """Shorthand for creating a rewrite rule.
 
     ``tags`` are the rule's intrinsic classification — constants from
     :mod:`catopt_core.laws.tags` (any iterable is frozen into a
     ``frozenset``).
+
+    ``derivation`` names the shipped rules proving this law — the
+    axiom/lemma split measured by ``tools/law_coherence.py``.  The
+    default ``()`` designates a kernel member (``rule.kind ==
+    "axiom"``); a non-empty tuple makes the rule a ``"lemma"`` (or
+    ``"redundant"`` when also tagged ``tags.REDUNDANT``).
     """
     return Rewrite(
         name=name,
@@ -39,6 +46,7 @@ def R(
         check=check,
         derive=derive,
         tags=frozenset(tags),
+        derivation=tuple(derivation),
     )
 
 

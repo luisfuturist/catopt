@@ -30,6 +30,14 @@ priority is a :class:`~catopt_core.laws.RuleSet` concern instead.
   scale commutation, the right-multiply absorb, the score-scale
   migration) — opt-in, never in
   :data:`~catopt_core.laws.DEFAULT`.
+* :data:`REDUNDANT` — a derivable rule whose spelling is a literal
+  alpha-duplicate of another shipped rule (the same 2-cell carried by
+  two rule objects — e.g. ``weight_distribute_matmul`` is
+  ``distribute_matmul_over_add`` under metavar renaming).  Combined
+  with :attr:`~catopt_core.egraph.Rewrite.derivation` it completes the
+  axiom/lemma taxonomy: ``rule.kind`` reports ``"axiom"`` /
+  ``"lemma"`` / ``"redundant"``.  Annotation, not scheduling — the
+  tag never joins a preset or a budget.
 """
 
 SIMPLIFICATION = "simplification"
@@ -43,6 +51,7 @@ LAYOUT = "layout"
 SCAN = "scan"
 DECODE = "decode"
 ATTENTION = "attention"
+REDUNDANT = "redundant"
 
 __all__ = [
     "ATTENTION",
@@ -52,6 +61,7 @@ __all__ = [
     "EXPANSIVE",
     "FUSION",
     "LAYOUT",
+    "REDUNDANT",
     "SCAN",
     "SIMPLIFICATION",
     "SUBSUMED",

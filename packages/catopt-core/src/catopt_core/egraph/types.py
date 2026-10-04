@@ -91,6 +91,17 @@ class Rewrite:
     fusion / carrier / …).  It is *metadata about what the rule is*;
     scheduling priority is a ``RuleSet`` concern and deliberately does
     not live here, so the e-graph type stays free of scheduling policy.
+
+    ``derivation`` is the axiom/lemma bookkeeping (measured by
+    ``tools/law_coherence.py``): the names of shipped rules forming
+    ONE recorded derivation of this law's instance — typically a
+    single premise (a measured direct edge ``{A} ⇒ this``), i.e. a
+    one-step proof from the kernel.  The empty tuple designates an
+    axiom — a primitive (nothing shipped derives it) or the chosen
+    representative of a derivability cycle: inverse pairs each prove
+    each other, so which direction is axiom vs lemma is a convention
+    (the alphabetical-first member), not a measurement.  See
+    :attr:`kind` and ``project/retros/axiom-lemma-split.md``.
     """
 
     name: str
@@ -108,12 +119,34 @@ class Rewrite:
     # can constrain or report the total.
     error_bound: float | None = None
     bound_norm: str = "spectral"
+    # Kernel taxonomy premise names — see the class docstring.  Not
+    # serialised by ``rulecache`` (synthesised rules carry ``parents``
+    # provenance instead); law-emit tooling may replay it into a real
+    # ``Derivation`` certificate (:mod:`catopt_core.egraph.certs`).
+    derivation: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         """Return a ``name: lhs -> rhs`` rendering."""
         return (
             f"{self.name}: {op_repr(self.lhs)} -> {op_repr(self.rhs)}"
         )
+
+    @property
+    def kind(self) -> str:
+        """Return the kernel-taxonomy kind of this rule.
+
+        ``"axiom"`` when no ``derivation`` is recorded (a kernel
+        member), ``"redundant"`` for a derivable rule also carrying
+        the ``REDUNDANT`` tag (a literal alpha-duplicate spelling of
+        another shipped rule — the constant lives in
+        :mod:`catopt_core.laws.tags`, one layer up, so the literal
+        string is matched here), else ``"lemma"``.
+        """
+        if not self.derivation:
+            return "axiom"
+        if "redundant" in self.tags:
+            return "redundant"
+        return "lemma"
 
 
 def _norm_attr_value(v: Any) -> Any:

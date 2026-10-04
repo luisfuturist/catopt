@@ -273,3 +273,42 @@ def test_laws_preserves_module_level_objects():
     """Private helpers the old shim carried still resolve from the package."""
     assert isinstance(laws._SHAPE_MEMO, dict)
     assert callable(laws._shape_of)
+
+
+def test_axiom_lemma_marker_covers_all_rules():
+    """The axiom/lemma split — every shipped rule carries a kernel kind.
+
+    Measured by ``tools/law_coherence.py --emit-basis`` (see
+    ``project/retros/axiom-lemma-split.md``): the kernel is the 29
+    primitives plus one designated member (alphabetically first) per
+    derivability cycle = 40 axioms; the other 14 rules carry a
+    ``derivation`` naming their premise rules — 12 lemmas (inverse
+    twins + the emergent silu_mul_form) and 2 redundant
+    alpha-duplicates.
+    """
+    by_name = {r.name: r for r in laws.ALL_RULES}
+    kinds = {"axiom": [], "lemma": [], "redundant": []}
+    for r in laws.ALL_RULES:
+        assert r.kind in kinds, (r.name, r.kind)
+        kinds[r.kind].append(r.name)
+        if r.kind == "axiom":
+            assert not r.derivation, r.name
+        else:
+            assert r.derivation, r.name
+            for premise in r.derivation:
+                # every recorded premise resolves to a shipped axiom —
+                # a lemma's proof sketch stays at kernel level
+                assert premise in by_name, (r.name, premise)
+                assert by_name[premise].kind == "axiom", (
+                    r.name,
+                    premise,
+                )
+    assert len(kinds["axiom"]) == 40
+    assert len(kinds["lemma"]) == 12
+    assert len(kinds["redundant"]) == 2
+    # the redundant kind rides on the tags.REDUNDANT constant
+    assert {
+        r.name
+        for r in laws.ALL_RULES
+        if laws.tags.REDUNDANT in r.tags
+    } == {"weight_distribute_matmul", "weight_factor_matmul"}

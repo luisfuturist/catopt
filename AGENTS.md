@@ -318,7 +318,11 @@ the rule in a group list at the bottom of its module
 `SCAN_LAWS`, `SCAN_DIAG_LAWS`; `ALL_RULES`/`all_rules()` is the union).
 Rules also carry tags from `catopt_core.laws.tags` (pass
 `R(..., tags=...)`); `EXPANSIVE` marks the closure-generating rules the
-pipeline budgets (`rules.tagged(EXPANSIVE)`).  The composable `RuleSet`
+pipeline budgets (`rules.tagged(EXPANSIVE)`).  Each rule's kernel kind
+lives on `Rewrite.derivation`/`rule.kind` — `R(..., derivation=(...))`
+names the axioms that prove a lemma (`tools/law_coherence.py
+--emit-basis` emits the measured table; see
+`project/retros/axiom-lemma-split.md`).  The composable `RuleSet`
 presets live in `catopt_core.laws.ruleset`.
 
 Measure it: `python -m bench run law_bench --laws <name[,name|group]>`

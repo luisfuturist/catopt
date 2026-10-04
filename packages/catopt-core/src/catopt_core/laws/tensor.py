@@ -167,18 +167,26 @@ SQUARE_TO_POW = R(
     Op.make("pow", "x", Const(2)),
     law="Reverse: square(x) ≡ pow(x, 2) for shape/cost reasons.",
     tags=_SIM,
+    derivation=("pow_to_square",),
 )
 
 # SwiGLU bridge: the exported graph has silu(linear(...)) followed by
 # mul with another linear(...).  Expanding silu exposes the common
 # x*sigmoid(x) factor, which lets naturality/distributivity see the
-# shared linear prefix.  Already have SILU_EXPAND; add the mul-form:
+# shared linear prefix.  Already have SILU_EXPAND; add the mul-form.
+#
+# The library's one emergent law: a measured one-step consequence of
+# the silu expand/fold class (the catalogue's only composite direct
+# edges — ``silu_expand ⇒ silu_mul_form`` fires inside the ``mul``
+# context).  Kept as a lemma: the spelled-out form buys reach on
+# hand-written SwiGLU graphs that the kernel path doesn't fire on.
 SILU_MUL_FORM = R(
     "silu_mul_form",
     Op.make("mul", Op.make("silu", "g"), "u"),
     Op.make("mul", Op.make("mul", "g", Op.make("sigmoid", "g")), "u"),
     law="SwiGLU: silu(g)*u = (g*sigmoid(g))*u (factor for prefix sharing).",
     tags=_SIM,
+    derivation=("silu_expand",),
 )
 
 # The definitional inverse of SILU_EXPAND — the manual-silu fold (the
@@ -208,6 +216,7 @@ SILU_FOLD = R(
     "inverse of silu_expand, and the mediating 3-cell of the "
     "silu_expand/silu_mul_form × swiglu_fuse critical pairs.",
     tags=_SIM,
+    derivation=("silu_expand",),
 )
 
 
@@ -386,6 +395,7 @@ FACTOR_MUL = R(
     law="Factoring common linear maps (reverse distributivity).",
     check=_check_mm_rhs_addends,
     tags=_CAT,
+    derivation=("distribute_matmul_over_add",),
 )
 
 # Right-side bilinearity.  In PyTorch, `x @ W` puts the WEIGHT second, so
@@ -413,11 +423,15 @@ RIGHT_FACTOR = R(
     Op.make("matmul", Op.make("add", "a", "b"), "W"),
     law="Factor a shared right-weight (the slot `x @ W` uses).",
     tags=_CAT,
+    derivation=("right_distribute_matmul",),
 )
 
 # THE WEIGHT-MERGE RULE.  x@W1 + x@W2 = x @ (W1 + W2): two projections of
 # the SAME input collapse to one matmul on a summed weight.  This is the
 # LoRA/adapter/model-soup merge that deployment tooling does by hand.
+# REDUNDANT: alpha-duplicate of factor_matmul (metavar renaming only) —
+# the same 2-cell a second time, annotated not deleted (the pair's
+# direction coverage lives on the lemma factor_matmul).
 WEIGHT_FACTOR = R(
     "weight_factor_matmul",
     Op.make(
@@ -426,10 +440,12 @@ WEIGHT_FACTOR = R(
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input projections: x@W1 + x@W2 = x@(W1+W2).",
     check=_check_mm_rhs_weights,
-    tags=_CAT,
+    tags=(*_CAT, tags.REDUNDANT),
+    derivation=("distribute_matmul_over_add",),
 )
 
 # x @ (W1 + W2) = x@W1 + x@W2  [reverse: expand for cost-model choice]
+# REDUNDANT: alpha-duplicate of the axiom distribute_matmul_over_add.
 WEIGHT_DISTRIBUTE = R(
     "weight_distribute_matmul",
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
@@ -438,7 +454,8 @@ WEIGHT_DISTRIBUTE = R(
     ),
     law="Reverse weight merge (lets eqsat weigh fused vs split forms).",
     check=_check_mm_rhs_weights,
-    tags=_CAT,
+    tags=(*_CAT, tags.REDUNDANT),
+    derivation=("distribute_matmul_over_add",),
 )
 
 
@@ -459,6 +476,10 @@ WEIGHT_FACTOR_LINEAR = R(
     " = linear(x, W1+W2)  (transpose distributes over +).",
     check=_check_mm_rhs_weights,
     tags=_CAT,
+    # inverse-pair twin of the axiom weight_distribute_linear (the
+    # alphabetical-first member of the {distribute, factor}_linear
+    # derivability cycle is the designated kernel representative)
+    derivation=("weight_distribute_linear",),
 )
 
 # linear(linear(x, A), B) = x @ A.T @ B.T = x @ (B@A).T = linear(x, B@A)
@@ -482,6 +503,7 @@ ASSOC_LINEAR_REV = R(
     law="Reverse linear composition: linear(x, B@A) = "
     "linear(linear(x, A), B) (eqsat weighs fused vs split).",
     tags=_CAT,
+    derivation=("assoc_linear",),
 )
 
 # ------------------------------------------------------------------
@@ -592,6 +614,7 @@ ASSOC_LINEAR_BIAS_REV = R(
     law="Reverse affine composition (eqsat weighs fused vs split).",
     check=_check_linear_bias_compose,
     tags=_CAT,
+    derivation=("assoc_linear_bias",),
 )
 
 # a@W.T + b@W.T = (a+b)@W.T   ->   linear(add(a,b), W)
@@ -768,6 +791,7 @@ LINEAR_CHANNEL_SCALE_REV = R(
     law="Reverse channel-scale fold (eqsat compares both forms).",
     check=_is_channel_scale,
     tags=_SYM,
+    derivation=("linear_channel_scale",),
 )
 
 LINEAR_ROW_SCALE = R(
@@ -787,6 +811,7 @@ LINEAR_ROW_SCALE_REV = R(
     law="Reverse row-scale hoist (eqsat compares both forms).",
     check=lambda b: _is_row_scale(b["r"]),
     tags=_SYM,
+    derivation=("linear_row_scale",),
 )
 
 
@@ -1289,6 +1314,7 @@ NATURALITY_SCALAR_REV = R(
     law="Reverse naturality: pull scalar into the matmul's input.",
     check=lambda b: _is_scalar(b["c"]),
     tags=_CAT,
+    derivation=("naturality_scalar",),
 )
 
 # (A @ B) @ C = A @ (B @ C)  — associativity of composition
@@ -1307,6 +1333,7 @@ ASSOC_MATMUL_REV = R(
     Op.make("matmul", "A", Op.make("matmul", "B", "C")),
     law="Reverse associativity: f∘(g∘h) = (f∘g)∘h.",
     tags=_CAT,
+    derivation=("assoc_matmul",),
 )
 # ---------------------------------------------------------------------------
 #  Rule collections
@@ -1368,6 +1395,17 @@ CATEGORICAL_RULES: list[Rewrite] = [
     *SDPA_FOLD_RULES,
 ]
 #: All rules combined — the default saturation set.
+#:
+#: The axiom/lemma split (measured by ``tools/law_coherence.py
+#: --emit-basis``, documented in
+#: ``project/retros/axiom-lemma-split.md``): 40 of these 54 rules are
+#: kernel members — ``kind == "axiom"`` — and 14 carry a recorded
+#: ``derivation`` from the kernel (12 ``"lemma"`` — inverse twins
+#: whose direction buys reach, plus the emergent ``silu_mul_form`` —
+#: and 2 ``"redundant"`` alpha-duplicate spellings tagged
+#: ``tags.REDUNDANT``).  The kernel itself is the 29 primitives plus
+#: one designated representative (alphabetically first) per
+#: derivability cycle.
 #:
 #: LAYOUT_RULES are deliberately NOT in the default: measured on the
 #: laws_effect bench they deliver runtime parity (the NT-GEMM form is

@@ -82,6 +82,7 @@ __all__ = [
     "ConfRow",
     "LawProfile",
     "catalogue",
+    "emit_basis",
     "main",
 ]
 
@@ -497,6 +498,103 @@ def _cluster_section() -> str:
 
 
 # ---------------------------------------------------------------------------
+#  Axiom/lemma emission — the kernel annotation table
+# ---------------------------------------------------------------------------
+
+
+def emit_basis(cat: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Project the catalogue onto the axiom/lemma annotation table.
+
+    Returns ``{rule_name: {"kind": ..., "derivation": [...]}}`` — the
+    measured classification the shipped ``R(..., derivation=...)``
+    annotations should carry:
+
+    * **axiom** — every primitive plus the designated representative
+      (alphabetically-first member) of each derivability cycle.  The
+      inverse pairs each prove each other, so the *choice* of seed is
+      a convention; that the class needs one seed is measured.
+    * **lemma** — a derivable rule whose spelling buys something the
+      kernel doesn't fire (the opposite direction of an inverse pair,
+      or the emergent ``silu_mul_form``).
+    * **redundant** — a derivable rule that is a literal
+      alpha-duplicate of an earlier class member (the same 2-cell
+      twice — no direction coverage gained).
+
+    ``derivation`` is the premise set of ONE measured proof: the
+    single axiom with a direct edge ``{A} ⇒ rule`` when one exists
+    (lexicographically first for determinism), else the found
+    derivation's witness rules verbatim — which may route through
+    other non-axioms (flagged in the table by a premise that is not
+    itself an axiom).
+    """
+    profiles: dict[str, LawProfile] = cat["profiles"]
+    dups = [set(p) for p in cat["structural"]["duplicates"]]
+    classes: list[list[str]] = cat["eq_classes"]
+    seeds = {g[0] for g in classes}
+    axioms = {
+        n for n, p in profiles.items() if p.verdict == "primitive"
+    } | seeds
+    table: dict[str, dict[str, Any]] = {}
+    for n in cat["rules"]:
+        p = profiles[n]
+        if p.verdict not in ("primitive", "derivable"):
+            # no-instance / undecided — report the raw verdict rather
+            # than guessing a kernel kind
+            table[n] = {"kind": p.verdict, "derivation": []}
+            continue
+        if n in axioms:
+            table[n] = {"kind": "axiom", "derivation": []}
+            continue
+        cls = next((g for g in classes if n in g), [])
+        # A member is redundant when an *earlier* classmate is already
+        # its alpha-duplicate — order matters: the first spelling of a
+        # 2-cell keeps the direction coverage, the re-spelling adds
+        # none.  A derivable law in no class (a downstream singleton
+        # like silu_mul_form) has no earlier classmate.
+        earlier = cls[: cls.index(n)] if n in cls else []
+        kind = (
+            "redundant"
+            if any({n, e} in dups for e in earlier)
+            else "lemma"
+        )
+        direct_axioms = sorted(set(p.direct_from) & axioms)
+        deriv = direct_axioms[:1] or list(p.witness)
+        table[n] = {"kind": kind, "derivation": deriv}
+    return table
+
+
+def _basis_section(table: dict[str, dict[str, Any]]) -> str:
+    """Render the emit_basis table for the report."""
+    kinds: dict[str, int] = {}
+    for row in table.values():
+        kinds[row["kind"]] = kinds.get(row["kind"], 0) + 1
+    tally = " | ".join(f"{k}: {v}" for k, v in sorted(kinds.items()))
+    lines = [
+        "Axiom/lemma basis — the annotation table",
+        "-" * 68,
+        f"  {tally}  (effective basis = {kinds.get('axiom', 0)})",
+    ]
+    for n, row in table.items():
+        if row["kind"] == "axiom":
+            continue
+        deriv = ", ".join(row["derivation"]) or "(no witness)"
+        lines.append(f"  {n:<34} {row['kind']:<10} <- {deriv}")
+    lines.append("")
+    lines.append("paste-ready R() annotations:")
+    for n, row in table.items():
+        if row["kind"] not in ("lemma", "redundant"):
+            continue
+        deriv = ", ".join(f'"{d}"' for d in row["derivation"])
+        extra = (
+            ", tags+=(tags.REDUNDANT,)"
+            if row["kind"] == "redundant"
+            else ""
+        )
+        lines.append(f"  # {n}: derivation=({deriv},){extra}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 #  Reporting
 # ---------------------------------------------------------------------------
 
@@ -612,6 +710,7 @@ def _jsonable(cat: dict[str, Any]) -> dict[str, Any]:
     return {
         "n_rules": len(cat["rules"]),
         "instanced": cat["instanced"],
+        "basis": emit_basis(cat),
         "structural": cat["structural"],
         "profiles": {
             n: {
@@ -652,6 +751,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--json", metavar="PATH", help="write the raw catalogue as JSON"
     )
+    ap.add_argument(
+        "--emit-basis",
+        action="store_true",
+        help="emit the measured axiom/lemma annotation table — the "
+        "kind + derivation= values the shipped R() calls should "
+        "carry (the kernel is primitives + one designated member "
+        "per derivability cycle)",
+    )
     args = ap.parse_args(argv)
 
     rules = list(
@@ -661,6 +768,9 @@ def main(argv: list[str] | None = None) -> int:
     print(_report(cat, rules))
     print()
     print(_cluster_section())
+    if args.emit_basis:
+        print()
+        print(_basis_section(emit_basis(cat)))
     if args.json:
         Path(args.json).write_text(
             json.dumps(_jsonable(cat), indent=1) + "\n"
