@@ -48,6 +48,8 @@ def _eval_allclose(a: Any, b: Any, tol: float = 1e-6) -> bool:
             _eval_allclose(x, y, tol) for x, y in zip(a, b, strict=True)
         )
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if a.shape != b.shape:
+            return False
         return bool(torch.allclose(a, b, atol=tol, rtol=tol))
     return False
 

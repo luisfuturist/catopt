@@ -642,6 +642,13 @@ def test_eval_allclose_and_term_is_ground():
     assert not meta._eval_allclose((a,), (a, a))
     assert not meta._eval_allclose(a, "nope")
     assert not meta._eval_allclose("x", "y")
+    # broadcastable-but-rank-mismatched operands are NOT equal —
+    # the oracle must not call (4,) == (1,4) or (4,4) == () true
+    v = torch.ones(4, dtype=torch.float64)
+    assert not meta._eval_allclose(v, v.reshape(1, 4))
+    assert not meta._eval_allclose(
+        a, torch.tensor(1.0, dtype=torch.float64)
+    )
     x = Var("x", _T())
     assert meta._term_is_ground(Op.make("add", x, Const(1.0)))
     assert not meta._term_is_ground("mv")
