@@ -72,6 +72,10 @@ from catopt_core.game import Action
 from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt_core.laws import ALL_RULES
 from catopt_core.laws import tags as _tags
+from catopt_core.laws.serialize import (
+    _canon,  # noqa: F401 — compat re-export (grammar_proposal)
+    alpha_key,
+)
 from catopt_core.trajectories import rule_samples
 from catopt_torch.learned_policy import LearnedPolicy, train_rule_value
 
@@ -175,47 +179,13 @@ class Outcome:
 # ---------------------------------------------------------------------------
 
 
-def _attr_canon(v: Any, mv: dict) -> Any:
-    """Canonical form of one attr value under the metavar map *mv*."""
-    if isinstance(v, str):
-        if v.startswith("$attr:"):
-            return ("av", v)
-        return ("m", mv.setdefault(v, len(mv)))
-    try:
-        hash(v)
-        return ("lit", v)
-    except TypeError:
-        return ("lit", repr(v))
-
-
-def _canon(term: Any, mv: dict) -> Any:
-    """Abstract a term to a leaf-renamed structural key.
-
-    Distinct leaves (``Var`` / ``Param`` / a bare ``str`` metavariable)
-    become shared metavar indices; ``Const`` stays literal; attrs are
-    canonicalised.  Two terms are alpha-equal iff their keys coincide
-    under a *shared* ``mv`` — the check the retro's
-    ``classify_relation`` performs, extended to concrete leaves.
-    """
-    if isinstance(term, Op):
-        args = tuple(_canon(a, mv) for a in term.args)
-        attrs = tuple(
-            sorted(
-                (k, _attr_canon(v, mv)) for k, v in term.attrs.items()
-            )
-        )
-        return (term.op, args, attrs)
-    if isinstance(term, Const):
-        return ("c", term.value)
-    if isinstance(term, str):
-        return ("m", mv.setdefault(term, len(mv)))
-    return ("m", mv.setdefault(repr(term), len(mv)))
-
-
 def _key(lhs: Any, rhs: Any) -> tuple[Any, Any]:
-    """Return the alpha-normal ``(lhs, rhs)`` key of a proposed law."""
-    mv: dict = {}
-    return _canon(lhs, mv), _canon(rhs, mv)
+    """Return the alpha-normal ``(lhs, rhs)`` key of a proposed law.
+
+    The canonicalisation lives in ``catopt_core.laws.serialize`` —
+    the lemma-store seam keys its rows by the same identity.
+    """
+    return alpha_key(lhs, rhs)
 
 
 def _library_keys() -> list[tuple[Any, Any]]:

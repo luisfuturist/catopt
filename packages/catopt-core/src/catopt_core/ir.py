@@ -26,10 +26,14 @@ __all__ = [
     "Param",
     "TensorType",
     "Var",
+    "attr_from_data",
+    "attr_to_data",
     "generator",
     "op_def",
     "op_repr",
     "op_repr_dag",
+    "term_from_data",
+    "term_to_data",
 ]
 
 
@@ -301,6 +305,86 @@ def op_repr_dag(term: Any) -> str:
     bound = " ".join(f"(#{i} {d})" for i, d in enumerate(defs))
     # The root is no node's child, so it is never a shared binding.
     return f"(let ({bound}) {rendered[term]})"
+
+
+# ---------------------------------------------------------------------------
+#  Term serialization — the JSON-safe data form (the lemma-store seam)
+# ---------------------------------------------------------------------------
+
+
+def attr_to_data(v: Any) -> Any:
+    """Encode an attribute value as JSON-safe data.
+
+    Also handles a ``$attr:`` binding value — strings stay strings
+    since they are metavar references.
+    """
+    if isinstance(v, tuple):
+        return {"__tuple__": [attr_to_data(x) for x in v]}
+    if isinstance(v, list):
+        return {"__list__": [attr_to_data(x) for x in v]}
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    raise TypeError(f"unserializable attribute value: {v!r}")
+
+
+def attr_from_data(v: Any) -> Any:
+    """Decode :func:`attr_to_data` output back to a Python value."""
+    if isinstance(v, dict):
+        if "__tuple__" in v:
+            return tuple(attr_from_data(x) for x in v["__tuple__"])
+        if "__list__" in v:
+            return [attr_from_data(x) for x in v["__list__"]]
+        raise ValueError(f"bad attr encoding: {v!r}")
+    return v
+
+
+def term_to_data(t: Any) -> Any:
+    """Encode a (sub)term as JSON-safe data: Op tree, metavar, leaf.
+
+    The scheme — canonical since ``rulecache`` adopted it — is
+    ``{"mvar": name}`` for a pattern metavariable (a bare ``str``
+    leaf), ``{"const": v}`` for :class:`Const`, ``{"var": name,
+    "shape": [...]}`` / ``{"param": name, "shape": [...]}`` for typed
+    leaves, and ``{"op": name, "args": [...], "attrs": {k: attr}}``
+    for :class:`Op` nodes.  Note ``"var"`` means a typed :class:`Var`
+    leaf — a *metavariable* is ``"mvar"``.
+    """
+    if isinstance(t, str):
+        return {"mvar": t}
+    if isinstance(t, Const):
+        return {"const": t.value}
+    if isinstance(t, Var):
+        return {"var": t.name, "shape": list(t.typ.shape)}
+    if isinstance(t, Param):
+        return {"param": t.name, "shape": list(t.typ.shape)}
+    if isinstance(t, Op):
+        return {
+            "op": t.op,
+            "args": [term_to_data(a) for a in t.args],
+            "attrs": {k: attr_to_data(v) for k, v in t.attrs.items()},
+        }
+    raise TypeError(f"unserializable term: {t!r}")
+
+
+def term_from_data(d: Any) -> Any:
+    """Decode :func:`term_to_data` output back to a term."""
+    if not isinstance(d, dict) or len(d) < 1:
+        raise ValueError(f"bad term encoding: {d!r}")
+    if "mvar" in d:
+        return d["mvar"]
+    if "const" in d:
+        return Const(d["const"])
+    if "var" in d:
+        return Var(d["var"], TensorType(tuple(d["shape"])))
+    if "param" in d:
+        return Param(d["param"], TensorType(tuple(d["shape"])))
+    if "op" in d:
+        return Op.make(
+            d["op"],
+            *[term_from_data(a) for a in d["args"]],
+            **{k: attr_from_data(v) for k, v in d["attrs"].items()},
+        )
+    raise ValueError(f"bad term encoding: {d!r}")
 
 
 # ---------------------------------------------------------------------------

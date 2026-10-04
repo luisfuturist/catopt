@@ -49,7 +49,12 @@ from typing import Any
 
 import catopt_core.meta as M
 from catopt_core.egraph import Rewrite
-from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_core.ir import (
+    attr_from_data,
+    attr_to_data,
+    term_from_data,
+    term_to_data,
+)
 from catopt_core.laws import cond
 
 __all__ = [
@@ -66,71 +71,18 @@ CACHE_VERSION = 1
 
 # ---------------------------------------------------------------------------
 #  Term / attribute serialization  (Op trees, metvars, placeholders — pure data)
+#
+#  The codec itself lives at the IR layer — ``catopt_core.ir.term_to_data``
+#  and friends — where ``laws.serialize`` (the lemma-store seam) reaches it
+#  without pulling in ``meta``.  The historical private names stay as
+#  aliases: the wire format is unchanged, so existing caches and
+#  fingerprints hold.
 # ---------------------------------------------------------------------------
 
-
-def _enc_attr(v: Any) -> Any:
-    """JSON-safe encoding of an attribute value.
-
-    Also handles a ``$attr:`` binding value — strings stay strings since
-    they are metavar references.
-    """
-    if isinstance(v, tuple):
-        return {"__tuple__": [_enc_attr(x) for x in v]}
-    if isinstance(v, list):
-        return {"__list__": [_enc_attr(x) for x in v]}
-    if isinstance(v, (str, int, float, bool)) or v is None:
-        return v
-    raise TypeError(f"unserializable attribute value: {v!r}")
-
-
-def _dec_attr(v: Any) -> Any:
-    if isinstance(v, dict):
-        if "__tuple__" in v:
-            return tuple(_dec_attr(x) for x in v["__tuple__"])
-        if "__list__" in v:
-            return [_dec_attr(x) for x in v["__list__"]]
-        raise ValueError(f"bad attr encoding: {v!r}")
-    return v
-
-
-def _enc_term(t: Any) -> Any:
-    """Encode a (sub)term: Op tree, metavar string, or leaf."""
-    if isinstance(t, str):
-        return {"mvar": t}
-    if isinstance(t, Const):
-        return {"const": t.value}
-    if isinstance(t, Var):
-        return {"var": t.name, "shape": list(t.typ.shape)}
-    if isinstance(t, Param):
-        return {"param": t.name, "shape": list(t.typ.shape)}
-    if isinstance(t, Op):
-        return {
-            "op": t.op,
-            "args": [_enc_term(a) for a in t.args],
-            "attrs": {k: _enc_attr(v) for k, v in t.attrs.items()},
-        }
-    raise TypeError(f"unserializable term: {t!r}")
-
-
-def _dec_term(d: Any) -> Any:
-    if not isinstance(d, dict) or len(d) < 1:
-        raise ValueError(f"bad term encoding: {d!r}")
-    if "mvar" in d:
-        return d["mvar"]
-    if "const" in d:
-        return Const(d["const"])
-    if "var" in d:
-        return Var(d["var"], TensorType(tuple(d["shape"])))
-    if "param" in d:
-        return Param(d["param"], TensorType(tuple(d["shape"])))
-    if "op" in d:
-        return Op.make(
-            d["op"],
-            *[_dec_term(a) for a in d["args"]],
-            **{k: _dec_attr(v) for k, v in d["attrs"].items()},
-        )
-    raise ValueError(f"bad term encoding: {d!r}")
+_enc_attr = attr_to_data
+_dec_attr = attr_from_data
+_enc_term = term_to_data
+_dec_term = term_from_data
 
 
 def _enc_binding(m: dict) -> list:

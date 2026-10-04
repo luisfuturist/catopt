@@ -7,6 +7,11 @@
   a ``cond`` is a serializable tuple tree interpreted against the same
   ``bound`` dict ``check`` sees (``R(..., cond=...)`` folds it into
   the rule's ``check`` hook at construction).
+* :mod:`catopt_core.laws.serialize` — laws as data: the
+  ``Rewrite`` ↔ JSON record codec (``law_to_data`` /
+  ``law_from_data``), the ``missing_hooks`` honesty flag for
+  procedural ``check``/``derive`` remainders, and ``alpha_key``, the
+  structural identity the lemma store keys rows by.
 * :mod:`catopt_core.laws.tensor` — the tensor-algebra laws:
   ``SIMPLIFICATION_RULES``, ``CATEGORICAL_RULES``, ``SDPA_FOLD_RULES``,
   ``ALL_RULES`` / ``all_rules()``.

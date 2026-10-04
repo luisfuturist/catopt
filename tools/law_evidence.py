@@ -7,15 +7,23 @@ search rule set and the verification code* — a perfect cache.  This
 module is that store: a small ``sqlite3`` database (stdlib only, no
 new dependencies) keyed by content hash.
 
-Two tables:
+Three tables:
 
 * ``candidates`` — one row per proposal, keyed by the alpha-normal
-  equality key (``law_proposal._key``, repr'd) with the last-seen
-  name / family and a rendered proposal for inspection.
+  equality key (``laws.serialize.alpha_key``, repr'd — the same
+  canonicalisation ``law_proposal._key`` delegates to) with the
+  last-seen name / family and a rendered proposal for inspection.
 * ``verdicts`` — one row per candidate *per run*, keyed by
   ``(alpha_key, corpus_hash, rules_hash, code_rev, run_id)``.  The
   columns are exactly the fields the pipeline's ``Evidence`` record
   already computes — this module measures nothing, it persists.
+* ``lemmas`` — one row per *admitted law*: the full
+  ``laws.serialize.law_to_data`` record under the same alpha-normal
+  key, so ``--admit`` rebuilds a live ``Rewrite`` straight from the
+  store.  The ``serializable`` / ``missing_hooks`` fields inside the
+  JSON record say honestly which laws are full-data and which are
+  pattern(+cond) with a ``check``/``derive`` remainder that still
+  needs code — see ``project/retros/lemma-store.md``.
 
 Scope keys — the honest boundary of a cached verdict:
 
@@ -31,13 +39,17 @@ Scope keys — the honest boundary of a cached verdict:
   corpus or generator invalidate honestly.  ``"unknown"`` (no git)
   rows are written but never served as cache hits.
 
-CLI — history over the store::
+CLI — history over the store, plus the lemma seam::
 
     .venv/bin/python tools/law_evidence.py --report /tmp/laws.db
     .venv/bin/python tools/law_evidence.py --report /tmp/laws.db --ships
     .venv/bin/python tools/law_evidence.py --report /tmp/laws.db --flips
     .venv/bin/python tools/law_evidence.py --report /tmp/laws.db \
         --history mul
+    .venv/bin/python tools/law_evidence.py --report /tmp/laws.db \
+        --add-lemma softmax_fold
+    .venv/bin/python tools/law_evidence.py --report /tmp/laws.db \
+        --admit '<alpha_key>'
 """
 
 from __future__ import annotations
@@ -87,6 +99,14 @@ CREATE TABLE IF NOT EXISTS verdicts (
     verdict TEXT NOT NULL,
     ts TEXT NOT NULL,
     PRIMARY KEY (alpha_key, corpus_hash, rules_hash, code_rev, run_id)
+);
+CREATE TABLE IF NOT EXISTS lemmas (
+    alpha_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    law_json TEXT NOT NULL,
+    derivation_json TEXT NOT NULL,
+    corpus_hash TEXT NOT NULL,
+    added_ts TEXT NOT NULL
 );
 """
 
@@ -341,6 +361,92 @@ def latest_verdicts(
 
 
 # ---------------------------------------------------------------------------
+#  Lemmas — laws as stored data, reconstructable into live rewrites
+# ---------------------------------------------------------------------------
+#
+#  A lemma row is the seam between the verdict cache and the library:
+#  a SHIP candidate the emit machinery wrote up can be *stored*, and
+#  ``--admit`` turns the stored record back into a ``Rewrite`` object
+#  that fires.  The heavy machinery stays lazy — the verdict-report
+#  path never imports catopt.
+
+
+def store_lemma(
+    conn: sqlite3.Connection, rule: Any, corpus_hash: str = ""
+) -> str:
+    """Persist *rule*'s data form in ``lemmas``; return its alpha key.
+
+    The row's ``law_json`` is the full
+    ``catopt_core.laws.serialize.law_to_data`` record — pattern pair,
+    ``cond``, tags, derivation, error bound, and the
+    ``serializable`` / ``missing_hooks`` honesty flags.  A rule whose
+    ``check``/``derive`` needs code is stored *flagged*, not dropped:
+    the record says exactly which parts data cannot carry.
+    ``corpus_hash`` records which corpus context the law was measured
+    under (``""`` when none applies — e.g. storing a shipped law).
+    """
+    from catopt_core.laws.serialize import alpha_key, law_to_data
+
+    data = law_to_data(rule)
+    key = repr(alpha_key(rule.lhs, rule.rhs))
+    with conn:
+        conn.execute(
+            "INSERT INTO lemmas"
+            " (alpha_key, name, law_json, derivation_json,"
+            "  corpus_hash, added_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(alpha_key) DO UPDATE SET"
+            " name=excluded.name, law_json=excluded.law_json,"
+            " derivation_json=excluded.derivation_json,"
+            " corpus_hash=excluded.corpus_hash,"
+            " added_ts=excluded.added_ts",
+            (
+                key,
+                rule.name,
+                json.dumps(data, sort_keys=True),
+                json.dumps(list(rule.derivation)),
+                corpus_hash,
+                now(),
+            ),
+        )
+    return key
+
+
+def admit_lemma(
+    conn: sqlite3.Connection, alpha_key: str
+) -> tuple[Any, dict] | None:
+    """Rebuild a stored lemma as a live ``Rewrite``, or ``None``.
+
+    Returns ``(rule, record)`` — the reconstructed rule plus the
+    parsed ``law_to_data`` record, so the caller can read
+    ``record["serializable"]`` / ``record["missing_hooks"]`` before
+    trusting the rule to fire identically to its source.  A
+    ``serializable: false`` record still rebuilds — pattern + cond —
+    but the reconstructed rule fires without the dropped hooks.
+    """
+    from catopt_core.laws.serialize import law_from_data
+
+    row = conn.execute(
+        "SELECT law_json FROM lemmas WHERE alpha_key = ?",
+        (alpha_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    data = json.loads(row["law_json"])
+    return law_from_data(data), data
+
+
+def lemma_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return every stored lemma row, newest first."""
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM lemmas ORDER BY added_ts DESC, rowid DESC"
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 #  Reporting — the history a /tmp JSON dump could never answer
 # ---------------------------------------------------------------------------
 
@@ -461,10 +567,12 @@ def render_report(
     n_ctx = conn.execute(
         "SELECT count(DISTINCT corpus_hash || rules_hash) FROM verdicts"
     ).fetchone()[0]
+    n_lem = conn.execute("SELECT count(*) FROM lemmas").fetchone()[0]
     lines = [
         f"== law_evidence — {path} ==",
         f"   {n_cand} candidates · {n_verd} verdict rows · "
-        f"{n_runs} runs · {n_ctx} corpus/rule contexts",
+        f"{n_runs} runs · {n_ctx} corpus/rule contexts · "
+        f"{n_lem} lemmas",
         "",
     ]
     hist = _candidate_history(conn)
@@ -486,6 +594,48 @@ def render_report(
     if ships_only:
         lines.append("(* = latest verdict is no longer SHIP)")
     return "\n".join(lines)
+
+
+def _store_lemma_cli(conn: sqlite3.Connection, name: str) -> int:
+    """Store a shipped ``ALL_RULES`` law by name as a lemma row."""
+    from catopt_core.laws import ALL_RULES
+
+    by_name = {r.name: r for r in ALL_RULES}
+    rule = by_name.get(name)
+    if rule is None:
+        print(f"no shipped law named {name!r}")
+        return 1
+    key = store_lemma(conn, rule)
+    data = json.loads(
+        conn.execute(
+            "SELECT law_json FROM lemmas WHERE alpha_key = ?", (key,)
+        ).fetchone()["law_json"]
+    )
+    state = (
+        "full-data"
+        if data["serializable"]
+        else "missing hooks: " + ", ".join(data["missing_hooks"])
+    )
+    print(f"stored {rule.name}  [{state}]")
+    print(f"  alpha_key = {key}")
+    return 0
+
+
+def _admit_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
+    """Rebuild a stored lemma into a live ``Rewrite`` and show it."""
+    got = admit_lemma(conn, alpha_key)
+    if got is None:
+        print(f"no lemma stored under {alpha_key}")
+        return 1
+    rule, data = got
+    state = (
+        "full-data"
+        if data["serializable"]
+        else "missing hooks: " + ", ".join(data["missing_hooks"])
+    )
+    print(f"admitted {rule.name}  [{state}]")
+    print(f"  {rule!r}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -512,12 +662,27 @@ def main(argv: list[str] | None = None) -> int:
         metavar="SUBSTR",
         help="every recorded verdict for names containing SUBSTR",
     )
+    parser.add_argument(
+        "--add-lemma",
+        metavar="NAME",
+        help="store a shipped ALL_RULES law as a lemma row",
+    )
+    parser.add_argument(
+        "--admit",
+        metavar="ALPHA_KEY",
+        help="rebuild a stored lemma into a live Rewrite",
+    )
     args = parser.parse_args(argv)
-    if not Path(args.report).is_file():
+    lemma_op = args.add_lemma is not None or args.admit is not None
+    if not lemma_op and not Path(args.report).is_file():
         print(f"no evidence store at {args.report}")
         return 1
     conn = connect(args.report)
     try:
+        if args.add_lemma is not None:
+            return _store_lemma_cli(conn, args.add_lemma)
+        if args.admit is not None:
+            return _admit_cli(conn, args.admit)
         print(
             render_report(
                 conn,
