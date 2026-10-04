@@ -248,6 +248,10 @@ def ruleset_fingerprint(rules: Iterable[Rewrite]) -> str:
                 # across every cond-carrying rule, so the hook sig
                 # cannot see a cond edit — hash the data itself.
                 "cond": cond.cond_to_data(getattr(r, "cond", None)),
+                # Same story for a folded ``dspec`` — one
+                # ``compile_derive`` closure signature across every
+                # spec-carrying rule.
+                "dspec": cond.derive_to_data(getattr(r, "dspec", None)),
             },
             sort_keys=True,
         )

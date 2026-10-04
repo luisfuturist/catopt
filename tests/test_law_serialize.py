@@ -10,14 +10,14 @@ This file pins:
   pattern);
 * the ``Rewrite`` record round-trip — ``law_to_data`` /
   ``law_from_data`` — including the exact census of which of the 61
-  shipped laws are *full-data* (43) vs pattern(+cond) with a
-  ``check`` (2, plus 2 ``check``+``derive``) or ``derive`` (14)
-  remainder;
+  shipped laws are *full-data* (57) vs pattern(+cond) with a
+  procedural remainder — 2 ``check``-only (glu_fold,
+  gqa_absorb_repeat) and 2 ``check``+``derive`` (the rms pair);
 * the honesty contract — a ``serializable: false`` record rebuilds
   its pattern + cond but *not* the dropped hooks: the reconstructed
-  ``softmax_fold`` fires and mints ``softmax(u, dim="SD")`` (the
-  unbound attr metavar falls back to its literal name — a visible
-  scar, not a silent veto);
+  ``rms_norm_fold`` fires and mints ``rms_norm(u, w, dim="ND")``
+  (the unbound attr metavar falls back to its literal name — a
+  visible scar, not a silent veto);
 * the sqlite ``lemmas`` table — ``store_lemma`` / ``admit_lemma`` /
   ``lemma_rows`` plus the ``--add-lemma`` / ``--admit`` CLI —
   closing the loop: a stored lemma admits into a live ``Rewrite``
@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import (
+    Const,
     Op,
     Param,
     TensorType,
@@ -48,7 +49,11 @@ from catopt_core.laws.serialize import (
     law_to_data,
     missing_hooks,
 )
-from catopt_core.laws.tensor import FACTOR_MUL, SOFTMAX_FOLD
+from catopt_core.laws.tensor import (
+    FACTOR_MUL,
+    RMS_NORM_FOLD,
+    SOFTMAX_FOLD,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
@@ -125,10 +130,11 @@ def test_serializability_census_of_shipped_library():
         else:
             need_check.append((rule.name, missing))
     assert len(ALL_RULES) == 61
-    assert len(full) == 43
-    assert len(need_derive) == 14
-    assert "softmax_fold" in need_derive
-    assert "qkv_fuse_asym" in need_derive
+    # the derive DSL closed the derive= gap: softmax_fold,
+    # qkv_fuse_asym, and all 12 sdpa_fold_* rules are now full-data
+    assert len(full) == 57
+    assert need_derive == []
+    assert "softmax_fold" in full and "qkv_fuse_asym" in full
     # glu_fold's split-axis parity, the rms pair's normalized-shape +
     # derive hooks, and gqa_absorb_repeat's repeat-chain side
     # conditions are still procedural
@@ -166,6 +172,30 @@ def test_missing_hooks_detects_procedural_check_under_cond():
         cond=("scalar", "a"),
     )
     assert missing_hooks(r3) == ()
+    # same for derive: a dspec is data, a spec+code composite is not
+    r4 = Rewrite(
+        name="spec",
+        lhs=Op.make("add", "a", "b"),
+        rhs="a",
+        dspec={"D": ("attr0", "RD")},
+    )
+    assert missing_hooks(r4) == ()
+    r5 = Rewrite(
+        name="spec_plus_code",
+        lhs=Op.make("add", "a", "b"),
+        rhs="a",
+        dspec={"D": ("attr0", "RD")},
+        derive=lambda bound: {"$attr:E": 0},
+    )
+    assert missing_hooks(r5) == ("derive",)
+    # a bare procedural derive flags too
+    r6 = Rewrite(
+        name="proc_derive",
+        lhs="a",
+        rhs="a",
+        derive=lambda bound: {},
+    )
+    assert missing_hooks(r6) == ("derive",)
 
 
 # ---------------------------------------------------------------------------
@@ -194,17 +224,27 @@ def test_law_record_roundtrip_rewrite_equality_unguarded():
 
 
 def test_law_record_flagged_hooks_drop_on_rebuild():
-    """A derive/check law stores pattern+cond, flagged honestly."""
-    data = law_to_data(SOFTMAX_FOLD)
+    """A check/derive law stores pattern+cond, flagged honestly."""
+    data = law_to_data(RMS_NORM_FOLD)
     assert data["serializable"] is False
-    assert data["missing_hooks"] == ["derive"]
+    assert data["missing_hooks"] == ["check", "derive"]
     rebuilt = law_from_data(_json_roundtrip(data))
-    assert rebuilt.derive is None
+    assert rebuilt.derive is None and rebuilt.dspec is None
     # the cond DID travel: the rebuilt rule still guards
-    assert rebuilt.cond == SOFTMAX_FOLD.cond
+    assert rebuilt.cond == RMS_NORM_FOLD.cond
     assert rebuilt.check is not None
     # and the record marks the rebuild clean — it has no hooks to drop
     assert law_to_data(rebuilt)["serializable"] is True
+
+
+def test_dspec_law_record_carries_the_derive():
+    """A spec-derived law serializes *whole* — derive and all."""
+    data = law_to_data(SOFTMAX_FOLD)
+    assert data["serializable"] is True
+    assert data["dspec"] == {"SD": ["attr0", "RD"]}
+    rebuilt = law_from_data(_json_roundtrip(data))
+    assert rebuilt.dspec == SOFTMAX_FOLD.dspec
+    assert rebuilt.derive({"$attr:RD": (-1,)}) == {"$attr:SD": -1}
 
 
 def test_law_record_preserves_provenance_fields():
@@ -273,21 +313,50 @@ def test_rebuilt_cond_law_fires_and_declines_identically():
         assert not _fires(rule, bad, bad_merged)
 
 
-def test_rebuilt_derive_law_shows_the_honest_scar():
-    """``softmax_fold`` without its derive fires — and mints the
-    unbound attr metavar *literally* (``dim="SD"``).  The flag says
-    why this cannot be trusted; the scar shows it."""
+def test_rebuilt_dspec_law_fires_identically():
+    """``softmax_fold`` round-trips *whole* now — the rebuilt rule
+    mints the derived dim, not the ``"SD"`` scar."""
     u = _v("u", 4, 8)
     src = Op.make(
         "div",
         Op.make("exp", u),
         Op.make("sum", Op.make("exp", u), dim=(-1,), keepdim=True),
     )
+    want = Op.make("softmax", u, dim=-1)
     rebuilt = law_from_data(_json_roundtrip(law_to_data(SOFTMAX_FOLD)))
-    scar = Op.make("softmax", u, dim="SD")
+    assert _fires(SOFTMAX_FOLD, src, want)
+    assert _fires(rebuilt, src, want)
+
+
+def test_rebuilt_flagged_law_shows_the_honest_scar():
+    """``rms_norm_fold`` without its hooks fires — and mints the
+    unbound attr metavar *literally* (``dim="ND"``).  The flag says
+    why this cannot be trusted; the scar shows it."""
+    u, w = _v("u", 4, 8), _p("w", 8)
+    src = Op.make(
+        "mul",
+        Op.make(
+            "mul",
+            u,
+            Op.make(
+                "rsqrt",
+                Op.make(
+                    "add",
+                    Op.make(
+                        "mean",
+                        Op.make("pow", u, Const(2)),
+                        dim=(-1,),
+                        keepdim=True,
+                    ),
+                    Const(1e-5),
+                ),
+            ),
+        ),
+        w,
+    )
+    scar = Op.make("rms_norm", u, w, dim="ND", eps="EP")
+    rebuilt = law_from_data(_json_roundtrip(law_to_data(RMS_NORM_FOLD)))
     assert _fires(rebuilt, src, scar)
-    # the shipped rule mints the derived dim instead
-    assert _fires(SOFTMAX_FOLD, src, Op.make("softmax", u, dim=-1))
 
 
 # ---------------------------------------------------------------------------
@@ -332,14 +401,33 @@ def test_admit_lemma_unknown_key_returns_none(tmp_path):
         conn.close()
 
 
-def test_admitted_softmax_fold_is_flagged(tmp_path):
+def test_admitted_rms_fold_is_flagged(tmp_path):
+    conn = _conn(tmp_path)
+    try:
+        key = le.store_lemma(conn, RMS_NORM_FOLD)
+        rule, data = le.admit_lemma(conn, key)
+        assert data["serializable"] is False
+        assert data["missing_hooks"] == ["check", "derive"]
+        assert rule.derive is None and rule.cond == RMS_NORM_FOLD.cond
+    finally:
+        conn.close()
+
+
+def test_admitted_softmax_fold_is_full_data(tmp_path):
     conn = _conn(tmp_path)
     try:
         key = le.store_lemma(conn, SOFTMAX_FOLD)
         rule, data = le.admit_lemma(conn, key)
-        assert data["serializable"] is False
-        assert data["missing_hooks"] == ["derive"]
-        assert rule.derive is None and rule.cond == SOFTMAX_FOLD.cond
+        assert data["serializable"] is True
+        assert rule.dspec == SOFTMAX_FOLD.dspec
+        # and the admitted rule mints the derived dim, not the scar
+        u = _v("u", 4, 8)
+        src = Op.make(
+            "div",
+            Op.make("exp", u),
+            Op.make("sum", Op.make("exp", u), dim=(-1,), keepdim=True),
+        )
+        assert _fires(rule, src, Op.make("softmax", u, dim=-1))
     finally:
         conn.close()
 
@@ -361,9 +449,9 @@ def test_lemma_cli_store_then_admit(tmp_path, capsys):
 
 def test_lemma_cli_reports_missing_hooks(tmp_path, capsys):
     db = str(tmp_path / "laws.db")
-    assert le.main(["--report", db, "--add-lemma", "softmax_fold"]) == 0
+    assert le.main(["--report", db, "--add-lemma", "rms_norm_fold"]) == 0
     out = capsys.readouterr().out
-    assert "missing hooks: derive" in out
+    assert "missing hooks: check, derive" in out
 
 
 def test_lemma_cli_errors(tmp_path, capsys):

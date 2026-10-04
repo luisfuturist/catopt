@@ -29,7 +29,7 @@ from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags
 from catopt_core.laws.base import R, _shape_of
-from catopt_core.laws.cond import as_check
+from catopt_core.laws.cond import as_check, as_derive
 from catopt_core.laws.layout import LAYOUT_RULES
 
 #: Tag bundles for the rule definitions below (see
@@ -309,10 +309,14 @@ _COND_SOFTMAX_FOLD = (
 _check_sum_keepdim = as_check(_COND_SOFTMAX_FOLD)
 
 
-def _derive_softmax_dim(bound) -> dict:
-    """Unwrap ``sum``'s ``dim`` tuple into ``softmax``'s scalar dim."""
-    dims = bound.get("$attr:RD")
-    return {"$attr:SD": dims[0] if isinstance(dims, tuple) else dims}
+#: Unwrap ``sum``'s ``dim`` tuple into ``softmax``'s scalar dim — the
+#: derived RHS attr as data (an empty ``dim`` tuple declines; the
+#: old Python hook crashed, so the spec's veto is strictly safer).
+_DSPEC_SOFTMAX_DIM = {"SD": ("attr0", "RD")}
+
+#: Compat alias — the test-facing hook; it IS the same data the rule
+#: carries in ``dspec`` (``as_derive`` keeps them from drifting).
+_derive_softmax_dim = as_derive(_DSPEC_SOFTMAX_DIM)
 
 
 SOFTMAX_FOLD = R(
@@ -327,7 +331,7 @@ SOFTMAX_FOLD = R(
     "— a composed-then-reduced chain IS the kernel's definition.  "
     "Folds div+exp+sum to one dispatched op.",
     cond=_COND_SOFTMAX_FOLD,
-    derive=_derive_softmax_dim,
+    dspec=_DSPEC_SOFTMAX_DIM,
     tags=_SIM,
 )
 
@@ -1241,16 +1245,20 @@ def _head_v(t: Any, shape_var: Any) -> Op:
     )
 
 
-def _derive_split_sizes(bound: dict) -> dict | None:
-    """Sizes = (|Q|, |K|, |V|) — each bound weight's output dim."""
-    sizes = []
-    for k in ("Q", "K", "V"):
-        w = bound.get(k)
-        shape = getattr(getattr(w, "typ", None), "shape", None)
-        if not shape or any(d is None for d in shape):
-            return None
-        sizes.append(shape[0])
-    return {"$attr:SZ": tuple(sizes)}
+#: Sizes = (|Q|, |K|, |V|) — each bound weight's *declared* output
+#: dim (``leaf-dim`` reads ``.typ.shape``, never inferred: an ``Op``
+#: binding or a ``None`` dim declines, exactly the old hook's veto).
+_DSPEC_SPLIT_SIZES = {
+    "SZ": (
+        "tuple",
+        ("leaf-dim", "Q", 0),
+        ("leaf-dim", "K", 0),
+        ("leaf-dim", "V", 0),
+    ),
+}
+
+#: Compat alias — the test-facing hook (see ``_derive_softmax_dim``).
+_derive_split_sizes = as_derive(_DSPEC_SPLIT_SIZES)
 
 
 _QKV_CAT = Op.make(
@@ -1305,7 +1313,7 @@ QKV_FUSE_ASYM = R(
     law="Asymmetric triple pairing: the same product law as qkv_fuse, "
     "but the three projections have different output dims — one "
     "GEMM, three uneven split views.  (GQA fused QKV.)",
-    derive=_derive_split_sizes,
+    dspec=_DSPEC_SPLIT_SIZES,
     tags=_SUB,
 )
 
@@ -1505,18 +1513,18 @@ def _scale_of(bound):
     return float(s) if isinstance(s, (int, float)) else None
 
 
-def _derive_scale_mul(bound):
-    s = _scale_of(bound)
-    return {"$attr:SC": s} if s is not None else None
+#: The ``scale`` attr ``sdpa`` takes — minted from the bound scalar
+#: leaf ``S`` (mul form), its reciprocal (div form), or the literal
+#: 1.0 (scale-free form).  A non-numeric ``S`` declines through the
+#: ``float`` op — the old hooks' ``isinstance`` veto verbatim.
+_DSPEC_SCALE_MUL = {"SC": ("float", ("const", "S"))}
+_DSPEC_SCALE_DIV = {"SC": ("recip", ("float", ("const", "S")))}
+_DSPEC_SCALE_ONE = {"SC": 1.0}
 
-
-def _derive_scale_div(bound):
-    s = _scale_of(bound)
-    return {"$attr:SC": 1.0 / s} if s is not None else None
-
-
-def _derive_scale_one(bound):
-    return {"$attr:SC": 1.0}
+#: Compat aliases — the test-facing hooks (see ``_derive_softmax_dim``).
+_derive_scale_mul = as_derive(_DSPEC_SCALE_MUL)
+_derive_scale_div = as_derive(_DSPEC_SCALE_DIV)
+_derive_scale_one = as_derive(_DSPEC_SCALE_ONE)
 
 
 def _make_sdpa_fold_rules() -> list:
@@ -1528,21 +1536,21 @@ def _make_sdpa_fold_rules() -> list:
             lambda: Op.make("mul", _QK_SCORES, "S"),
             _COND_SDPA_SCALED,
             _COND_SDPA_MF_SCALED,
-            _derive_scale_mul,
+            _DSPEC_SCALE_MUL,
         ),
         (
             "div",
             lambda: Op.make("div", _QK_SCORES, "S"),
             _COND_SDPA_SCALED,
             _COND_SDPA_MF_SCALED,
-            _derive_scale_div,
+            _DSPEC_SCALE_DIV,
         ),
         (
             "",
             lambda: _QK_SCORES,
             _COND_SDPA_BASE,
             _COND_SDPA_MF,
-            _derive_scale_one,
+            _DSPEC_SCALE_ONE,
         ),
     )
     wraps = (
@@ -1552,7 +1560,7 @@ def _make_sdpa_fold_rules() -> list:
             lambda sm: Op.make("dropout", sm, p="DP", train="DT"),
         ),
     )
-    for sname, scores, cond_add, cond_mf, derive in scaled:
+    for sname, scores, cond_add, cond_mf, dspec in scaled:
         for wname, wrap in wraps:
             sm = lambda inner: wrap(  # noqa: E731, B023
                 Op.make("softmax", inner, dim="SD")
@@ -1567,7 +1575,7 @@ def _make_sdpa_fold_rules() -> list:
                     law="softmax(qk^T s + m) v is sdpa — the additive mask is "
                     "the kernel's attn_mask argument.",
                     cond=cond_add,
-                    derive=derive,
+                    dspec=dspec,
                     tags=_FUS,
                 )
             )
@@ -1591,7 +1599,7 @@ def _make_sdpa_fold_rules() -> list:
                     "attn_mask — logical_not turns the fill-mask into "
                     "SDPA's keep-mask.",
                     cond=cond_mf,
-                    derive=derive,
+                    dspec=dspec,
                     tags=_FUS,
                 )
             )

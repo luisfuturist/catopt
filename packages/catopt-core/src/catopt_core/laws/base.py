@@ -26,6 +26,7 @@ def R(
     tags: Any = (),
     derivation: Any = (),
     cond: Any = None,
+    dspec: Any = None,
 ) -> Rewrite:
     """Shorthand for creating a rewrite rule.
 
@@ -42,8 +43,13 @@ def R(
     ``cond`` is the declarative side condition — pure data per
     :mod:`catopt_core.laws.cond`, evaluated against the same ``bound``
     dict ``check`` sees.  ``cond`` and ``check`` conjoin (cond for the
-    expressible part, ``check`` for procedural leftovers); ``derive``
-    stays Python — it *computes* attributes, a different role.
+    expressible part, ``check`` for procedural leftovers).
+
+    ``dspec`` is the declarative derive spec — the same module's
+    ``{NAME: expr}`` grammar — folded into ``derive`` at construction
+    (spec first, then any procedural ``derive`` remainder).
+    ``derive=`` also *accepts* a spec (non-callable data or an
+    ``as_derive`` partial); ``Rewrite`` recasts it into ``dspec``.
     """
     return Rewrite(
         name=name,
@@ -55,6 +61,7 @@ def R(
         tags=frozenset(tags),
         derivation=tuple(derivation),
         cond=cond,
+        dspec=dspec,
     )
 
 

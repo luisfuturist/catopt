@@ -3,6 +3,7 @@
 # ruff: noqa: RUF003 — math notation in comments/docstrings
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -112,6 +113,17 @@ class Rewrite:
     ``check`` hook so every evaluation site (apply_rule, certificate
     replay, term-level matching, meta's composite guards) honours the
     conjunction through the single ``rule.check`` convention.
+
+    ``dspec`` is the same move for ``derive``: an optional *declarative*
+    derive spec — pure data per :mod:`catopt_core.laws.cond` (a
+    ``{NAME: expr}`` map or tuple of pairs), evaluated against the same
+    ``bound`` environment to produce the ``{"$attr:NAME": value}`` map
+    the ``derive`` contract returns.  ``dspec`` and ``derive`` may
+    coexist: ``dspec`` carries the expressible part, ``derive`` the
+    procedural remainder; ``__post_init__`` folds ``dspec`` into the
+    ``derive`` hook.  For convenience ``derive=`` also *accepts* a spec
+    (non-callable data, or an ``as_derive`` partial) — it is recast
+    into ``dspec`` at construction.
     """
 
     name: str
@@ -139,15 +151,20 @@ class Rewrite:
     # Stored as data for serialization (the lemma-store seam); folded
     # into ``check`` at construction.
     cond: Any = None
+    # Declarative derive spec — pure data (see the class docstring).
+    # Folded into ``derive`` at construction.
+    dspec: Any = None
 
     def __post_init__(self) -> None:
-        """Fold a declarative ``cond`` into the ``check`` hook.
+        """Fold ``cond``/``dspec`` into the ``check``/``derive`` hooks.
 
         A rule carrying both evaluates ``cond`` first, then ``check``
         — the conjunction IS the side condition, folded here so every
         evaluation site (``apply_rule``, certificate replay, term-level
         matching, meta's composite guards) keeps the single
-        ``rule.check`` convention.  The lazy import avoids a cycle:
+        ``rule.check`` convention.  ``dspec`` folds the same way into
+        ``rule.derive`` — the spec runs first, then any procedural
+        remainder.  The lazy import avoids a cycle:
         ``catopt_core.laws`` depends on this module at load time.
         """
         if self.cond is not None:
@@ -163,6 +180,7 @@ class Rewrite:
             object.__setattr__(
                 self, "check", compile_guard(self.cond, self.check)
             )
+        _fold_dspec(self)
 
     def __repr__(self) -> str:
         """Return a ``name: lhs -> rhs`` rendering."""
@@ -186,6 +204,66 @@ class Rewrite:
         if "redundant" in self.tags:
             return "redundant"
         return "lemma"
+
+
+def _spec_from_derive(drv: Any) -> Any:
+    """Return the derive spec embedded in a ``derive`` argument, if any.
+
+    ``derive=`` accepts the spec itself: non-callable data is a spec
+    verbatim, and an ``as_derive(spec)`` partial — recognised by its
+    ``eval_derive`` target, one positional arg, no keywords — carries
+    the spec it was built from.  Anything else (``None``, a callable)
+    carries no spec.
+    """
+    if drv is not None and not callable(drv):
+        return drv
+    if (
+        isinstance(drv, functools.partial)
+        and len(drv.args) == 1
+        and not drv.keywords
+        and getattr(drv.func, "__module__", "")
+        == "catopt_core.laws.cond"
+        and getattr(drv.func, "__name__", "") == "eval_derive"
+    ):
+        return drv.args[0]
+    return None
+
+
+def _fold_dspec(rule: Rewrite) -> None:
+    """Fold *rule*'s ``dspec`` into its ``derive`` hook.
+
+    The spec is canonicalised (``derive_from_data`` — dicts and pair
+    lists become sorted tuple pairs, hashable and equal to their
+    source-spelled twins) and composed with any procedural ``derive``
+    through ``compile_derive`` — the same fold ``cond`` gets, keeping
+    every evaluation site on the single ``rule.derive`` convention.
+    A spec given twice (``dspec`` plus a spec-shaped ``derive``) is a
+    ``ValueError``, not a silent choice.  The lazy import avoids a
+    cycle: ``catopt_core.laws`` depends on this module at load time.
+    """
+    spec = rule.dspec
+    drv = rule.derive
+    source = _spec_from_derive(drv)
+    if source is None:
+        source = spec
+    elif spec is not None:
+        raise ValueError(
+            f"rule {rule.name!r}: derive spec given twice "
+            "(dspec and a non-callable derive)"
+        )
+    else:
+        # A spec sat in the derive slot — recast it to data and
+        # re-fold, so the hook is the canonical spec-closure (one code
+        # object per shape, which ``laws.serialize._proc_derive``
+        # probes) rather than the partial it arrived as.
+        drv = None
+    if source is None:
+        return
+    from catopt_core.laws.cond import compile_derive, derive_from_data
+
+    spec = derive_from_data(source)
+    object.__setattr__(rule, "dspec", spec)
+    object.__setattr__(rule, "derive", compile_derive(spec, drv))
 
 
 def _norm_attr_value(v: Any) -> Any:

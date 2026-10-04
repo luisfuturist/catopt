@@ -3,10 +3,13 @@
 * :mod:`catopt_core.laws.base` — the ``R`` rewrite constructor plus the
   shared check-hook machinery (``_SHAPE_MEMO``, ``_shape_of``, small
   term predicates).
-* :mod:`catopt_core.laws.cond` — the declarative side-condition DSL:
-  a ``cond`` is a serializable tuple tree interpreted against the same
-  ``bound`` dict ``check`` sees (``R(..., cond=...)`` folds it into
-  the rule's ``check`` hook at construction).
+* :mod:`catopt_core.laws.cond` — the declarative side-condition and
+  derive DSLs: a ``cond`` is a serializable tuple tree interpreted
+  against the same ``bound`` dict ``check`` sees, and a ``dspec`` is a
+  serializable ``{NAME: expr}`` map evaluated to the
+  ``{"$attr:NAME": value}`` extras ``derive`` returns (``R(...,
+  cond=...)`` / ``R(..., dspec=...)`` fold them into the rule's hooks
+  at construction).
 * :mod:`catopt_core.laws.serialize` — laws as data: the
   ``Rewrite`` ↔ JSON record codec (``law_to_data`` /
   ``law_from_data``), the ``missing_hooks`` honesty flag for

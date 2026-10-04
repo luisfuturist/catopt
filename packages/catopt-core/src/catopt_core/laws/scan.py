@@ -15,11 +15,11 @@ associativity alone once steps are lifted into the carrier domain.
 # ruff: noqa: RUF003 -- comments/docstrings use
 # mathematical notation (⊙, ×, ↦) deliberately.
 
-from catopt_core.egraph import Rewrite
+from catopt_core.egraph import Rewrite, _LeafRegistry
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags as _tags
 from catopt_core.laws.base import R as _R
-from catopt_core.laws.base import _shape_of
+from catopt_core.laws.cond import as_check, as_derive
 
 
 def R(name: str, lhs, rhs, **kw) -> Rewrite:
@@ -127,24 +127,25 @@ SCAN_LAWS: list[Rewrite] = [
 # ``applyd(f, h)``       — evaluate: f₀⊙h + f₁ (back in tensor-land)
 
 
-def _affd_state_like(bound: dict) -> bool:
-    """Side condition for the diagonal lifts.
+#: Side condition for the diagonal lifts, as data.  The ``h`` binding
+#: must be state-shaped — a previous step's ``add``/``sub`` spine, an
+#: already lifted application (``applyd``/``apply``), or a leaf (the
+#: h0 Param or a free Var).  Per-step vectors (a_t, b_t, x_t —
+#: select/mul terms) are NOT states.
+#:
+#: The check exists for e-graph economy, not soundness — the rewrite
+#: a⊙h + x ≡ applyd(aff_diag(a,x), h) is valid for ANY h.  Without it,
+#: the operand-position variants below would each fire a useless
+#: sideways lift binding an input vector as "h".
+_COND_AFFD_STATE = (
+    "or",
+    ("op-in", "h", ("add", "sub", "apply", "applyd")),
+    ("leaf", "h"),
+)
 
-    The ``h`` binding must be state-shaped — a previous step's
-    ``add``/``sub`` spine, an already lifted application
-    (``applyd``/``apply``), or a leaf (the h0 Param or a free Var).
-    Per-step vectors (a_t, b_t, x_t — select/mul terms) are NOT
-    states.
-
-    The check exists for e-graph economy, not soundness — the rewrite
-    a⊙h + x ≡ applyd(aff_diag(a,x), h) is valid for ANY h.  Without it,
-    the operand-position variants below would each fire a useless
-    sideways lift binding an input vector as "h".
-    """
-    t = bound.get("h")
-    if isinstance(t, Op):
-        return t.op in ("add", "sub", "apply", "applyd")
-    return True
+#: Compat alias — the test-facing hook; it IS the same data the rules
+#: carry in ``cond`` (``as_check`` keeps them from drifting).
+_affd_state_like = as_check(_COND_AFFD_STATE)
 
 
 # --- the four operand positions --------------------------------------
@@ -164,7 +165,7 @@ AFFD_LIFT = R(
     Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
     law="diagonal recurrence step is diagonal-affine "
     "application: a⊙h + x = (aff_diag(a,x))(h)",
-    check=_affd_state_like,
+    cond=_COND_AFFD_STATE,
 )
 
 AFFD_LIFT_SWAP = R(
@@ -173,7 +174,7 @@ AFFD_LIFT_SWAP = R(
     Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
     law="mul-order variant of affd_lift (canonicalised "
     "terms put the state operand first)",
-    check=_affd_state_like,
+    cond=_COND_AFFD_STATE,
 )
 
 AFFD_LIFT_POST = R(
@@ -182,7 +183,7 @@ AFFD_LIFT_POST = R(
     Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
     law="add-order variant of affd_lift (state-mul in "
     "the second add slot)",
-    check=_affd_state_like,
+    cond=_COND_AFFD_STATE,
 )
 
 AFFD_LIFT_POST_SWAP = R(
@@ -190,7 +191,7 @@ AFFD_LIFT_POST_SWAP = R(
     Op.make("add", "x", Op.make("mul", "h", "a")),
     Op.make("applyd", Op.make("aff_diag", "a", "x"), "h"),
     law="remaining operand position of affd_lift",
-    check=_affd_state_like,
+    cond=_COND_AFFD_STATE,
 )
 
 # The step rules need no side condition: the ``applyd`` inside the mul
@@ -264,48 +265,44 @@ AFFD_LIFT_STEP_POST_SWAP = R(
 # ``_leaf_shapes_consistent`` (the batched executor *stacks* leaf
 # a-parts; a scalar-shaped a would fail the check and bar the whole
 # carrier tree from BatchedScanModule AND trace_lift's carrier path).
-# ``US`` is an attribute metavariable filled by ``_derive_affd_unit``,
-# which also vetoes the firing when the bound shapes are not concrete.
+# ``US`` is an attribute metavariable filled by the ``_DSPEC_AFFD_UNIT``
+# spec, which also vetoes the firing when the bound shapes are not
+# concrete.
 
 
-def _affd_unit_state_like(bound: dict) -> bool:
-    """Side condition for the unit lifts.
+#: Side condition for the unit lifts, as data.  The ``h`` binding must
+#: be state-shaped — a previous step's ``add``/``sub`` spine, an
+#: already lifted application (``applyd``/``apply``), or a leaf (the
+#: h0 Param or a free Var).  Same economy guard as ``_affd_state_like``,
+#: plus a ``Const`` exclusion: a scalar offset is not an accumulating
+#: state.  Per-step increments (select/mul terms) are NOT states.
+_COND_AFFD_UNIT_STATE = (
+    "or",
+    ("op-in", "h", ("add", "sub", "apply", "applyd")),
+    ("and", ("leaf", "h"), ("not", ("const", "h"))),
+)
 
-    The ``h`` binding must be state-shaped — a previous step's
-    ``add``/``sub`` spine, an already lifted application
-    (``applyd``/``apply``), or a leaf (the h0 Param or a free Var).
-    Same economy guard as ``_affd_state_like``, plus a ``Const``
-    exclusion: a scalar offset is not an accumulating state.  Per-step
-    increments (select/mul terms) are NOT states.
-    """
-    t = bound.get("h")
-    if isinstance(t, Op):
-        return t.op in ("add", "sub", "apply", "applyd")
-    return not isinstance(t, Const)
+#: Compat alias — the test-facing hook; it IS the same data the rules
+#: carry in ``cond`` (``as_check`` keeps them from drifting).
+_affd_unit_state_like = as_check(_COND_AFFD_UNIT_STATE)
 
 
-def _derive_affd_unit(bound: dict) -> dict | None:
-    """Compute ``US`` := broadcast(shape(h), shape(x)).
+#: ``US`` := broadcast(shape(h), shape(x)) — the unit diagonal must
+#: materialise at the add's output shape (all ones).  ``bcast``
+#: declines when the result is not a concrete tuple — the old hook's
+#: veto verbatim.
+_DSPEC_AFFD_UNIT = {"US": ("bcast", "h", "x")}
 
-    The unit diagonal must materialise at the add's output shape (all
-    ones).  Vetoes the firing when either bound term's shape is
-    non-concrete.
-    """
-    from catopt_core.typing import _broadcast
+#: Compat alias — the test-facing hook (``as_derive`` — same data).
+_derive_affd_unit = as_derive(_DSPEC_AFFD_UNIT)
 
-    s = _broadcast(_shape_of(bound.get("h")), _shape_of(bound.get("x")))
-    if not (
-        isinstance(s, tuple) and all(isinstance(d, int) for d in s)
-    ):
-        return None  # pragma: no cover — defensive guard
-    # The RHS embeds ``Const(1.0)`` as a leaf; ``_instantiate`` adds
-    # leaf enodes keyed by repr WITHOUT registering the term, so
-    # ``any_term``/extraction would decode the raw string "1.0" unless
-    # the leaf is registered here, ahead of instantiation.
-    from catopt_core.egraph import _LeafRegistry
-
-    _LeafRegistry.register(Const(1.0))
-    return {"$attr:US": tuple(s)}
+# The RHS embeds ``Const(1.0)`` as a leaf; ``_instantiate`` adds leaf
+# enodes keyed by repr WITHOUT registering the term, so ``any_term``/
+# extraction would decode the raw string "1.0" unless the leaf is
+# registered.  The Python derive did it per-firing; the registry is a
+# single global table, so one up-front registration at import is
+# equivalent — and keeps the derive itself pure data.
+_LeafRegistry.register(Const(1.0))
 
 
 #: The unit diagonal as a shared pattern fragment: ones of the add's
@@ -324,8 +321,8 @@ AFFD_LIFT_UNIT = R(
     Op.make("applyd", Op.make("aff_diag", _AFFD_UNIT, "x"), "h"),
     law="Unit introduction: pure accumulation h + x IS the diagonal "
     "affine map with a ≡ 1 — applyd(aff_diag(1, x), h).",
-    check=_affd_unit_state_like,
-    derive=_derive_affd_unit,
+    cond=_COND_AFFD_UNIT_STATE,
+    dspec=_DSPEC_AFFD_UNIT,
 )
 
 AFFD_LIFT_UNIT_POST = R(
@@ -334,8 +331,8 @@ AFFD_LIFT_UNIT_POST = R(
     Op.make("applyd", Op.make("aff_diag", _AFFD_UNIT, "x"), "h"),
     law="add-order variant of affd_lift_unit (state operand in the "
     "second add slot)",
-    check=_affd_unit_state_like,
-    derive=_derive_affd_unit,
+    cond=_COND_AFFD_UNIT_STATE,
+    dspec=_DSPEC_AFFD_UNIT,
 )
 
 # The step rules need no side condition: the ``applyd`` inside the add
@@ -355,7 +352,7 @@ AFFD_LIFT_UNIT_STEP = R(
     ),
     law="compose a unit (pure-accumulation) step with the preceding "
     "map — the h ↦ h + x analogue of affd_lift_step",
-    derive=_derive_affd_unit,
+    dspec=_DSPEC_AFFD_UNIT,
 )
 
 AFFD_LIFT_UNIT_STEP_POST = R(
@@ -369,7 +366,7 @@ AFFD_LIFT_UNIT_STEP_POST = R(
         "h",
     ),
     law="add-order variant of affd_lift_unit_step",
-    derive=_derive_affd_unit,
+    dspec=_DSPEC_AFFD_UNIT,
 )
 
 AFFD_UNLIFT = R(
