@@ -558,10 +558,26 @@ def export_to_ir(
                     # ``reduce``.  Attrs are the only channel that
                     # reaches the binding.
                     attrs[k] = v
+                elif isinstance(v, torch.dtype):
+                    # ``dtype`` is semantics, not a dispatch detail —
+                    # ``zeros(shape, dtype=float64)`` must not lower
+                    # to an fp32 tensor.  Record the short name
+                    # ("float64"): torch.dtype objects do not survive
+                    # term serialization.
+                    attrs[k] = str(v).split(".")[-1]
             # Canonical attr spellings are guaranteed below by
             # ``Op.make`` (ATTR_SCHEMA): positional attrs were named at
             # emission above; any ``argN`` still present for a schema'd
             # op fails loudly at mint.
+            #
+            # aten elides trailing arguments at their defaults, so an
+            # implicit ``dim=0`` on split*/chunk never reaches the FX
+            # node.  Record it: an absent ``dim`` reads as the last
+            # axis (the minted-term/law convention), which is the
+            # WRONG axis for aten's positional default — the packed
+            # QKV in-proj split is a dim-0 split of a (3E, E) weight.
+            if ir_op in ("split", "chunk") and "dim" not in attrs:
+                attrs["dim"] = 0
             if (
                 ir_op == "getitem"
                 and args
@@ -724,7 +740,7 @@ def _arange_torch(*a: Any, **kw: Any) -> Any:
                 key=lambda k: int(k[3:]),
             )
         ]
-    return torch.arange(*vals)
+    return torch.arange(*vals, dtype=_creator_dtype(kw))
 
 
 def _batch_norm_torch(x: Any, *a: Any, **kw: Any) -> Any:
@@ -1423,41 +1439,57 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     # --- creators / casts / export artifacts ------------------------------
     "arange": _arange_torch,
     "zeros": lambda *a, **kw: torch.zeros(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "ones": lambda *a, **kw: torch.ones(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "empty": lambda *a, **kw: torch.empty(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "randn": lambda *a, **kw: torch.randn(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "rand": lambda *a, **kw: torch.rand(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "full": lambda *a, **kw: torch.full(
         tuple(attr_of(kw, "shape", "dim", default=())),
         _scalar_value(a[0]) if a else kw.get("fill_value", 0),
+        dtype=_creator_dtype(kw),
     ),
-    "zeros_like": lambda t, *a, **kw: torch.zeros_like(t),
-    "ones_like": lambda t, *a, **kw: torch.ones_like(t),
+    "zeros_like": lambda t, *a, **kw: torch.zeros_like(
+        t, dtype=_creator_dtype(kw)
+    ),
+    "ones_like": lambda t, *a, **kw: torch.ones_like(
+        t, dtype=_creator_dtype(kw)
+    ),
     "full_like": lambda t, *a, **kw: torch.full_like(
-        t, _scalar_value(a[0]) if a else kw.get("fill_value", 0)
+        t,
+        _scalar_value(a[0]) if a else kw.get("fill_value", 0),
+        dtype=_creator_dtype(kw),
     ),
     "new_zeros": lambda t, *a, **kw: t.new_zeros(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "new_ones": lambda t, *a, **kw: t.new_ones(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "new_empty": lambda t, *a, **kw: t.new_empty(
-        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ()))
+        tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
+        dtype=_creator_dtype(kw),
     ),
     "new_full": lambda t, *a, **kw: t.new_full(
         tuple(attr_of(kw, "shape", "dim", default=a[0] if a else ())),
         _scalar_value(a[-1]) if a else kw.get("fill_value", 0),
+        dtype=_creator_dtype(kw),
     ),
     "int": lambda t, *a, **kw: t.int(),
     "long": lambda t, *a, **kw: t.long(),
@@ -1630,6 +1662,23 @@ def _split_sizes(sizes: Any, kw: dict):
     if isinstance(sz, (list, tuple)) and sz:
         return list(sz)
     return int(sz if isinstance(sz, int) else 1)
+
+
+def _creator_dtype(kw: dict) -> Any:
+    """Resolve a ``dtype`` attr to a ``torch.dtype`` — or ``None``.
+
+    Exported terms record the dtype's short name ("float64" — see
+    ``export_to_ir``); a minted term may carry the ``torch.dtype``
+    object itself.  ``None`` leaves the torch default for the
+    no-operand creators and the operand's dtype for ``*_like`` /
+    ``new_*``.
+    """
+    d = attr_of(kw, "dtype")
+    if d is None:
+        return None
+    if isinstance(d, torch.dtype):
+        return d
+    return getattr(torch, str(d).split(".")[-1])
 
 
 def _dim_args(args: tuple, kwargs: dict) -> tuple:

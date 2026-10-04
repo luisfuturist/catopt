@@ -114,6 +114,12 @@ def verify_module(
                 for a in args
             ]
         )
+    # ``export_to_ir`` models the exported graph's FIRST output — a
+    # module returning several (MHA's attention weights, an RNN's
+    # ``(h_n, c_n)`` state tuple) verifies on the modelled output
+    # alone.
+    if isinstance(ref, (tuple, list)):
+        ref = ref[0]
     return verify_equiv(ref, out, rtol=rtol, atol=atol)
 
 
