@@ -57,8 +57,10 @@ import argparse
 import math
 import random
 import statistics
+import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import contraction_einsum as ce
@@ -70,6 +72,7 @@ from catopt_torch.contraction_policy import (
     PairPolicyNet,
     random_bond_network,
     rollout_orders,
+    save_contraction_policy,
 )
 from opt_einsum import paths as oe_paths
 from opt_einsum.path_random import RandomGreedy
@@ -89,6 +92,66 @@ _TRAIN_SEED = 50_000
 
 #: Held-out agreement-board seed offset.
 _AGREE_SEED = 60_000
+
+
+def _git_sha() -> str | None:
+    """Best-effort checkout SHA for a saved artifact's provenance."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+        )
+    except OSError:
+        return None
+    sha = out.stdout.strip()
+    return sha if out.returncode == 0 and sha else None
+
+
+def _save_arms(
+    models: dict[str, nn.Module],
+    stem: str,
+    args: argparse.Namespace,
+    train_ns: tuple[int, ...],
+) -> None:
+    """Write each trained arm to ``<stem>-<arm>.pt`` as an artifact.
+
+    The payload is the shipped ``save_contraction_policy`` format, so
+    ``load_contraction_policy`` (and every tool that takes a weights
+    path, e.g. ``contraction_guided_restart --policy``) reloads it.
+    """
+    teachers = {
+        "oe-best": "oe-rand-greedy (argmin order)",
+        "oe-all": "oe-rand-greedy (all trial trajectories)",
+        "dp": "exact DP + restart fallback",
+        "dp-small": "exact DP",
+        "rl": "self-play REINFORCE",
+    }
+    base = Path(stem)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    for name, model in models.items():
+        out = base.with_name(f"{base.name}-{name}.pt")
+        save_contraction_policy(
+            model,
+            out,
+            meta={
+                "trainer": f"distill-{name}",
+                "train_scales": list(train_ns),
+                "epochs": args.epochs,
+                "teacher": teachers.get(name, name),
+                "teacher_repeats": args.teacher_repeats,
+                "teacher_budget": args.teacher_budget,
+                "trial_cap": args.trial_cap,
+                "seed": args.seed,
+                "family": "random_bond_network",
+                "git_sha": _git_sha(),
+                "torch": str(torch.__version__),
+                "created": time.strftime("%Y-%m-%d"),
+            },
+        )
+        print(f"saved {out} ({out.stat().st_size / 1024:.1f} KiB)")
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +816,13 @@ def main(argv: list[str] | None = None) -> int:
         default="200,1000",
         help="comma-separated per-instance wall-clock budgets (ms)",
     )
+    ap.add_argument(
+        "--save",
+        default=None,
+        help="artifact stem: each trained arm is serialised to "
+        "<save>-<arm>.pt in the shipped artifact format (loadable "
+        "via load_contraction_policy / --policy paths)",
+    )
     args = ap.parse_args(argv)
 
     dev = args.device
@@ -883,6 +953,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"trained dp-small in {time.perf_counter() - t:.1f}s")
     print(f"all training done in {time.perf_counter() - t0:.1f}s")
+
+    if args.save:
+        _save_arms(models, args.save, args, train_ns)
 
     _agreement_section(
         models,
