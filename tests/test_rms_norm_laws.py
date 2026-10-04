@@ -1,4 +1,4 @@
-# ruff: noqa: RUF002, RUF003 — ⁻¹, σ-style math in docstrings is
+# ruff: noqa: RUF003 — ⁻¹, σ-style math in docstrings is
 # deliberate notation, per the laws-module convention.
 """Tests for the ``rms_norm_fold`` laws — the manual-RMSNorm folds
 (:data:`catopt_core.laws.tensor.RMS_NORM_FOLD` and
@@ -53,7 +53,7 @@ from __future__ import annotations
 import torch
 from catopt_core.cost import backend_cost, dag_cost, executor_cost_for
 from catopt_core.egraph import EGraph, verify_certificate
-from catopt_core.ir import Const, IR, Op, Param, TensorType, Var
+from catopt_core.ir import IR, Const, Op, Param, TensorType, Var
 from catopt_core.laws import (
     DEFAULT,
     RMS_NORM_FOLD,
@@ -512,7 +512,7 @@ def test_rms_norm_fold_fires_on_float_exponent_spelling():
     not type-strict."""
     u = Var("u", TensorType((4, 8)))
     w = Param("w", TensorType((8,)))
-    eg, root, _best = _saturate(
+    eg, _root, _best = _saturate(
         _gained_lhs(u, w, (-1,), True, Const(1e-6), exponent=Const(2.0)),
         [RMS_NORM_FOLD],
         _cost_fn(),
@@ -526,7 +526,7 @@ def test_rms_norm_fold_declines_on_wrong_weight_shape():
     inner mul."""
     u = Var("u", TensorType((4, 8)))
     w = Param("w", TensorType((4,)))
-    eg, root, _best = _saturate(
+    eg, _root, _best = _saturate(
         _gained_lhs(u, w, (-1,), True, Const(1e-6)),
         [RMS_NORM_FOLD, RMS_NORM_FOLD_NOGAIN],
         _cost_fn(),
