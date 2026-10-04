@@ -1196,6 +1196,17 @@ def test_scaled_extent_bool_guard():
     assert _scaled_extent(True, 2.0) is None
 
 
+def test_pow_shape_broadcasts_exponent():
+    """``pow``'s result broadcasts the exponent too — not just the
+    base.  ``pow((), (4,))`` evaluates to ``(4,)``; the shape rule
+    must agree."""
+    x = Var("x", TensorType(()))
+    y = Var("y", TensorType((4,)))
+    assert _shape_of(Op.make("pow", x, y)) == (4,)
+    z = Var("z", TensorType((2, 4)))
+    assert _shape_of(Op.make("pow", y, z)) == (2, 4)
+
+
 # ---------------------------------------------------------------------------
 #  3. Export probes — the boundary fixes end to end
 # ---------------------------------------------------------------------------

@@ -309,7 +309,11 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
         ):
             return shapes[0] or None
         case "pow":
-            return shapes[0] if shapes and shapes[0] is not None else ()
+            # Element-wise like add/mul: the exponent broadcasts too —
+            # pow((), (4,)) is (4,), not ().
+            return _broadcast(
+                shapes[0], shapes[1] if len(shapes) > 1 else None
+            )
         case "linear":
             # F.linear(x[..., in], W[out, in]) -> [..., out]
             # A scalar x () has no in-features axis — fall through to
