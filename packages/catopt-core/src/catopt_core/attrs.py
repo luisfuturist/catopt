@@ -89,7 +89,10 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     "flatten": {1: "start_dim", 2: "end_dim"},
     "unflatten": {1: "dim", 2: "sizes"},
     "index_select": {1: "dim", 2: "index"},
-    "take_along_dim": {1: "dim"},
+    # take_along_dim(t, indices, dim) — unlike gather, aten puts the
+    # index TENSOR at position 1 and the dim at position 2; position 1
+    # is always an operand, so the schema name only ever fires on 2.
+    "take_along_dim": {2: "dim"},
     "gather": {1: "dim"},
     # scatter(t, dim, index, src|value) — src/value stay operands;
     # scatter_add/index_add same layout minus the value overload.

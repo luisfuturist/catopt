@@ -259,6 +259,848 @@ class _LogSoftmaxHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+#  Round-2 compound candidates — bound-but-uncovered op spellings
+# ---------------------------------------------------------------------------
+
+
+class _CircularPad(nn.Module):
+    """Circular padding — a ``pad`` mode spelling conv builders use."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad circularly on the spatial axes."""
+        return F.pad(x, (1, 1, 1, 1), mode="circular")
+
+
+class _SpatialTransformer(nn.Module):
+    """STN localization: ``affine_grid`` + ``grid_sample``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Identity-warp the input through a lifted theta."""
+        theta = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=x.dtype
+        ).expand(x.shape[0], 2, 3)
+        grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+        return F.grid_sample(x, grid, align_corners=False)
+
+
+class _ShiftedWindow(nn.Module):
+    """Swin-style cyclic window shift — ``roll`` + rank-6 reshape."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Shift by half a window, partition, shift back."""
+        y = torch.roll(x, shifts=(-2, -2), dims=(1, 2))
+        b, h, w, c = y.shape
+        y = (
+            y.reshape(b, h // 4, 4, w // 4, 4, c)
+            .transpose(2, 3)
+            .reshape(b, h // 4, w // 4, 16, c)
+        )
+        return torch.roll(y, shifts=(2, 2), dims=(1, 2))
+
+
+class _ALiBiAttention(nn.Module):
+    """ALiBi attention: in-graph slope/distance bias feeding sdpa."""
+
+    def __init__(self, heads: int) -> None:
+        """Record the head count used for the slope schedule."""
+        super().__init__()
+        self.heads = heads
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the distance-penalty bias, then attend."""
+        n = q.shape[-2]
+        pos = torch.arange(n, dtype=q.dtype)
+        rel = pos.unsqueeze(0) - pos.unsqueeze(1)
+        slopes = torch.pow(
+            torch.tensor(2.0, dtype=q.dtype),
+            -torch.arange(self.heads, dtype=q.dtype) / self.heads,
+        )
+        bias = rel.unsqueeze(0) * slopes.reshape(-1, 1, 1)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+
+
+class _GQAAttention(nn.Module):
+    """Grouped-query attention — sdpa's ``enable_gqa`` spelling."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend with fewer kv heads than q heads."""
+        return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+class _EinsumAttention(nn.Module):
+    """Attention spelled with ``einsum`` contractions."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score, softmax, mix — all einsum."""
+        s = torch.einsum("bhqd,bhkd->bhqk", q, k) / (q.shape[-1] ** 0.5)
+        return torch.einsum(
+            "bhqk,bhvd->bhqd", torch.softmax(s, dim=-1), v
+        )
+
+
+class _ManualAttention(nn.Module):
+    """Manual attention: matmul + scale + softmax + matmul."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend without sdpa."""
+        s = q @ k.transpose(-1, -2) / (q.shape[-1] ** 0.5)
+        return torch.softmax(s, -1) @ v
+
+
+class _VarNorm(nn.Module):
+    """Manual layer norm through ``var_mean``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalise the last axis by its moments."""
+        v, m = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
+        return (x - m) * torch.rsqrt(v + 1e-5)
+
+
+class _StdNorm(nn.Module):
+    """Manual normalisation through ``std_mean``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Whitening spelled with std_mean."""
+        s, m = torch.std_mean(x, dim=-1, keepdim=True)
+        return (x - m) / (s + 1e-5)
+
+
+class _VarStdHead(nn.Module):
+    """Feature statistics: ``var`` + ``std`` reductions."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return var+std summaries."""
+        return x.var(dim=-1, keepdim=True) + x.std(dim=-1, keepdim=True)
+
+
+class _FakeQuant(nn.Module):
+    """Quantize-dequantize a layer: amax scale, clamp, round."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Symmetric int8-ish fake quantisation."""
+        s = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-3) / 7.0
+        return torch.round(x / s).clamp(-7, 7) * s
+
+
+class _SincKernel(nn.Module):
+    """Sinc interpolation kernel with a Kaiser-ish ``i0`` window."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale x by the summed windowed sinc."""
+        t = torch.arange(16, dtype=x.dtype) - 7.5
+        k = torch.sinc(t) * torch.i0(
+            8.0 * (torch.ones_like(t) - (t / 8) ** 2).clamp_min(0)
+        )
+        return x * k.sum()
+
+
+class _ScalarRsub(nn.Module):
+    """``1 - sigmoid(x)`` — the ``rsub.Scalar`` spelling."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the complement of a gate."""
+        return 1.0 - torch.sigmoid(x)
+
+
+class _CumsumScan(nn.Module):
+    """Prefix computations: ``cumsum`` + ``logcumsumexp``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return sum-prefix plus log-sum-exp-prefix."""
+        return torch.cumsum(x, dim=1) + torch.logcumsumexp(x, dim=1)
+
+
+class _CumProdGate(nn.Module):
+    """Decay gate spelled as a cumulative product."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the running product of sigmoid gates."""
+        return torch.cumprod(x.sigmoid(), dim=-1)
+
+
+class _CumMaxMin(nn.Module):
+    """Running range: ``cummax`` - ``cummin``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the running max-min envelope."""
+        hi = torch.cummax(x, dim=-1).values
+        lo = torch.cummin(x, dim=-1).values
+        return hi - lo
+
+
+class _IndexMoE(nn.Module):
+    """Expert dispatch that scatters outputs back via ``index_add``."""
+
+    def __init__(self, d: int) -> None:
+        """Build the routed expert."""
+        super().__init__()
+        self.expert = nn.Linear(d, d)
+
+    def forward(
+        self, x: torch.Tensor, idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the expert then scatter rows back by index."""
+        out = torch.zeros_like(x)
+        return out.index_add(0, idx, self.expert(x))
+
+
+class _ScatterAdd(nn.Module):
+    """``scatter_add`` dispatch — bag-style index accumulation."""
+
+    def forward(
+        self, x: torch.Tensor, idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Accumulate x's rows into a 4-row base by idx."""
+        base = torch.zeros(4, 8, dtype=x.dtype)
+        return base.scatter_add(0, idx.unsqueeze(-1).expand(-1, 8), x)
+
+
+class _MedianPool(nn.Module):
+    """Robust pooling — ``median`` over the feature axis."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the median per row."""
+        return torch.median(x, dim=-1).values
+
+
+class _SortSelect(nn.Module):
+    """Rank selection through ``sort`` + slice."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the top-4 sorted values doubled."""
+        v, _i = torch.sort(x, dim=-1, descending=True)
+        return v[..., :4] * 2
+
+
+class _ArgSort(nn.Module):
+    """``argsort`` — rank indices as features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the argsort as floats."""
+        return x.argsort(dim=-1).to(x.dtype)
+
+
+class _KthMode(nn.Module):
+    """Order statistics: ``kthvalue`` + ``mode``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return third-order statistic plus mode."""
+        v, _i = torch.kthvalue(x, 3, dim=-1)
+        m, _j = torch.mode(x, dim=-1)
+        return v + m
+
+
+class _TakeAlong(nn.Module):
+    """``take_along_dim`` — gather by computed indices."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Gather the top-4 elements by their argsort."""
+        idx = x.argsort(dim=-1, descending=True)[..., :4]
+        return x.take_along_dim(idx, dim=-1)
+
+
+class _NormalizeHead(nn.Module):
+    """``F.normalize`` — linalg_vector_norm + expand_as."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """L2-normalise rows."""
+        return F.normalize(x, p=2.0, dim=-1)
+
+
+class _SlidingUnfold(nn.Module):
+    """Sliding-window pooling via the ``unfold`` tensor method."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum non-overlapping-stride windows."""
+        return x.unfold(-1, 4, 2).sum(-1)
+
+
+class _MoveDimStack(nn.Module):
+    """``movedim`` + ``vstack``/``hstack`` assembly."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Move axes, stack both spellings, combine."""
+        moved = torch.vstack([x.movedim(1, 0), y.movedim(1, 0)]).sum(0)
+        return moved + torch.hstack([x, y]).sum()
+
+
+class _TensorSplit(nn.Module):
+    """``tensor_split`` — uneven-division splitting."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Split in two and re-multiply the halves."""
+        a, b = torch.tensor_split(x, 2, dim=-1)
+        return a * b
+
+
+class _AngleLog(nn.Module):
+    """``atan2`` + ``log1p`` — polar/log-domain head."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return angle plus soft log."""
+        return torch.atan2(x, y) + torch.log1p(x * x)
+
+
+class _Log10Expm1(nn.Module):
+    """``log10``/``expm1`` — alternate log bases."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return log10 of |x| plus expm1∘log1p of |x|."""
+        return torch.log10(x.abs() + 1e-3) + torch.expm1(
+            torch.log1p(x.abs())
+        )
+
+
+class _LogBase(nn.Module):
+    """``log2``/``exp2`` — bit-exact log-domain features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return log2 plus exp2."""
+        return torch.log2(x.clamp_min(1e-3)) + torch.exp2(x)
+
+
+class _NanGuard(nn.Module):
+    """``where`` + ``isfinite`` — sanitize activations."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Zero non-finite entries."""
+        return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+
+
+class _SanitizeHead(nn.Module):
+    """``isnan``/``isinf``/``nan_to_num``/``logical_or`` cleanup."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Clamp non-finite values and mask them out."""
+        bad = torch.logical_or(torch.isnan(x), torch.isinf(x))
+        fixed = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        return fixed * torch.logical_not(bad).to(x.dtype)
+
+
+class _NanStats(nn.Module):
+    """``nanmean``/``nansum`` — NaN-tolerant reductions."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return nan-tolerant mean plus sum."""
+        return torch.nanmean(x, dim=-1) + torch.nansum(x, dim=-1)
+
+
+class _MaskLogic(nn.Module):
+    """Boolean mask composition — ``logical_and``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Keep values in (0, 1)."""
+        m = torch.logical_and(x > 0, x < 1)
+        return x * m.to(x.dtype)
+
+
+class _LogicCombo(nn.Module):
+    """``logical_or``/``logical_xor``/``logical_not`` composition."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Combine predicates from two tensors."""
+        m = torch.logical_or(x > 0, y > 0)
+        m2 = torch.logical_xor(m, torch.logical_not(y > 1))
+        return x * m2.to(x.dtype)
+
+
+class _Bucketize(nn.Module):
+    """``searchsorted`` — bucket assignment like FeatureProcessor."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Bucket x against quartile edges."""
+        edges = torch.arange(4, dtype=x.dtype) / 4
+        return torch.searchsorted(edges, x).to(x.dtype)
+
+
+class _ChannelShuffle(nn.Module):
+    """ShuffleNet channel shuffle — reshape/transpose spine."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Shuffle four channel groups."""
+        b, c, h, w = x.shape
+        return (
+            x.reshape(b, 4, c // 4, h, w)
+            .transpose(1, 2)
+            .reshape(b, c, h, w)
+            .contiguous()
+        )
+
+
+class _FlipConv(nn.Module):
+    """True convolution via a ``flip``ped kernel (corr→conv)."""
+
+    def __init__(self) -> None:
+        """Build the kernel."""
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(4, 4, 3))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Conv1d with the flipped kernel."""
+        return F.conv1d(x, torch.flip(self.w, dims=[-1]))
+
+
+class _GeoMeanPool(nn.Module):
+    """Geometric-mean pooling — ``log``/``mean``/``exp``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the geometric mean per row."""
+        return torch.exp(torch.log(x.abs() + 1e-3).mean(dim=-1))
+
+
+class _LerpMix(nn.Module):
+    """``lerp`` — gated linear interpolation."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Blend x and y by a learned-free sigmoid gate."""
+        w = torch.sigmoid(x.mean(-1, keepdim=True))
+        return torch.lerp(x, y, w)
+
+
+class _AddcmulHead(nn.Module):
+    """``addcmul``/``addcdiv`` — fused scaled-update spellings."""
+
+    def forward(
+        self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+    ) -> torch.Tensor:
+        """Return x + 0.5*y*z + 0.25*y/z."""
+        return x.addcmul(y, z, value=0.5) + x.addcdiv(
+            y, z.clamp_min(1e-3), value=0.25
+        )
+
+
+class _TriuAttention(nn.Module):
+    """Anti-causal attention — ``triu`` mask + ``masked_fill``."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend with an upper-triangular (backward) mask."""
+        n = q.shape[-2]
+        m = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+        s = (q @ k.transpose(-1, -2)).masked_fill(m, float("-inf"))
+        return torch.softmax(s, -1) @ v
+
+
+class _TracePenalty(nn.Module):
+    """Weight regularizer via the diagonal sum — aten ``trace``."""
+
+    def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Return the readout plus tr(w)."""
+        return (x @ w).sum() + torch.trace(w)
+
+
+class _OuterPositional(nn.Module):
+    """Positional matrix built with ``outer``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add the outer-product position matrix."""
+        n = x.shape[-1]
+        pos = torch.arange(n, dtype=x.dtype)
+        return x + torch.outer(pos, pos) / n
+
+
+class _RepeatHead(nn.Module):
+    """``repeat`` — tiled expansion then mean."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Tile the batch, fold back by mean."""
+        return x.repeat(2, 1).reshape(4, 2, 16).mean(1)
+
+
+class _RemainderHead(nn.Module):
+    """``remainder`` vs ``fmod`` — the two mod spellings."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return their difference (sign handling)."""
+        return x.remainder(2.0) - torch.fmod(x, 2.0)
+
+
+class _ProdAminPool(nn.Module):
+    """``prod`` + ``amin`` — product and min reductions."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return row product plus min |x|."""
+        return x.prod(dim=-1) + x.abs().amin(dim=-1)
+
+
+class _MinFmax(nn.Module):
+    """``min`` pair + ``fmax`` — elementwise bounds."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return row min plus clipped-y sum."""
+        v, _i = torch.min(x, dim=-1)
+        return v + torch.fmax(y, torch.zeros_like(y)).sum(-1)
+
+
+class _BroadcastTo(nn.Module):
+    """``broadcast_to`` — explicit broadcast then add."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Broadcast x into y's shape and add."""
+        return torch.broadcast_to(x.unsqueeze(-1), y.shape) + y
+
+
+class _CountHead(nn.Module):
+    """``count_nonzero`` — a counting feature."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Count positive entries per row."""
+        return torch.count_nonzero(x > 0, dim=-1).to(x.dtype)
+
+
+class _BooleanIndex(nn.Module):
+    """Boolean-mask indexing — the ``index`` op spelling."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the positive entries."""
+        return x[x > 0].sum()
+
+
+class _SignTruncFrac(nn.Module):
+    """``sign``/``trunc``/``frac`` — integer-part decomposition."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return sign + trunc + frac."""
+        return torch.sign(x) + torch.trunc(x) + torch.frac(x)
+
+
+class _CeilFloor(nn.Module):
+    """``ceil``/``floor``/``reciprocal``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ceil - floor + clipped reciprocal."""
+        return (
+            torch.ceil(x) - torch.floor(x) + x.reciprocal().clamp(-4, 4)
+        )
+
+
+class _Heaviside(nn.Module):
+    """``heaviside`` — a step gate."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Step at zero."""
+        return torch.heaviside(x, torch.tensor(0.5, dtype=x.dtype))
+
+
+class _SdpaBiasParam(nn.Module):
+    """sdpa with a learned additive bias (attn_mask operand)."""
+
+    def __init__(self, n: int) -> None:
+        """Build the (n, n) bias parameter."""
+        super().__init__()
+        self.bias = nn.Parameter(torch.randn(n, n))
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend with the learned bias."""
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=self.bias
+        )
+
+
+class _CDist(nn.Module):
+    """``cdist`` — pairwise row distances (k-NN style)."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return pairwise euclidean distances."""
+        return torch.cdist(x, y)
+
+
+class _EyeInit(nn.Module):
+    """In-graph ``eye`` — identity-matrix residual."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add the identity matrix."""
+        return x + torch.eye(16, dtype=x.dtype)
+
+
+class _UnbindHead(nn.Module):
+    """``unbind`` — sequence-of-steps spelled per step."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the two unbound halves."""
+        a, b = x.unbind(dim=0)
+        return a + b
+
+
+class _SliceFill(nn.Module):
+    """``y[:, :4] = 0`` — ``fill_`` through a slice view."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Zero the first four columns in place."""
+        y = x.clone()
+        y[:, :4] = 0.0
+        return y
+
+
+class _FillWhole(nn.Module):
+    """``y.fill_(0.5)`` — whole-tensor scalar fill."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fill the clone."""
+        y = x.clone()
+        y.fill_(0.5)
+        return y
+
+
+class _FillSelect(nn.Module):
+    """``y[0].fill_(0)`` — ``fill_`` through a select view."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Zero the first row in place."""
+        y = x.clone()
+        y[0].fill_(0.0)
+        return y
+
+
+class _ZeroInit(nn.Module):
+    """``y.zero_()`` — the zeroing spelling of a fill."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Zero the clone."""
+        y = x.clone()
+        y.zero_()
+        return y
+
+
+class _MaskedFillInplace(nn.Module):
+    """``y.masked_fill_(m, 0)`` — masked in-place write."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mask out positive entries in place."""
+        y = x.clone()
+        y.masked_fill_(x > 0, 0.0)
+        return y
+
+
+class _MaskedFillTensor(nn.Module):
+    """``masked_fill_`` with a tensor fill value."""
+
+    def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Mask positives to the given value."""
+        y = x.clone()
+        y.masked_fill_(x > 0, v)
+        return y
+
+
+class _MaskedFillView(nn.Module):
+    """``masked_fill_`` through a slice view — scattered write."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mask positives in the first four columns only."""
+        y = x.clone()
+        y[:, :4].masked_fill_(x[:, :4] > 0, 0.0)
+        return y
+
+
+class _SelectWrite(nn.Module):
+    """``y[0] = v`` — ``select_scatter`` write."""
+
+    def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Write v into row zero."""
+        y = x.clone()
+        y[0] = v
+        return y
+
+
+class _IndexPut(nn.Module):
+    """``y[idx] = v`` — ``index_put`` write."""
+
+    def forward(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Write v into rows 0 and 2."""
+        y = x.clone()
+        y[torch.tensor([0, 2], dtype=torch.long)] = v
+        return y
+
+
+class _NarrowHead(nn.Module):
+    """``narrow`` — explicit windowing."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take a middle window."""
+        return x.narrow(-1, 2, 8) * 2
+
+
+class _NewCreators(nn.Module):
+    """``new_ones``/``full_like`` — tensor-derived creators."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a ones and a half tensor shaped like x."""
+        return x + x.new_ones(x.shape) + torch.full_like(x, 0.5)
+
+
+class _TypeAs(nn.Module):
+    """``type_as`` — dtype matching by operand."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Cast x to y's dtype and add."""
+        return x.type_as(y) + y
+
+
+class _ExpandAs(nn.Module):
+    """``expand_as`` — expand to another tensor's shape."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Expand x into y's trailing shape."""
+        return x.unsqueeze(-1).expand_as(y) + y
+
+
+class _IsNegPos(nn.Module):
+    """``isneginf``/``isposinf`` — infinity bookkeeping."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Count infinities through a cast."""
+        ninf = torch.isneginf(x).to(x.dtype)
+        pinf = torch.isposinf(x).to(x.dtype)
+        return x + ninf - pinf
+
+
+class _TrigHead(nn.Module):
+    """``atan``/``acos``/``asin`` — inverse trig features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the three inverse trig maps."""
+        c = x.clamp(-0.9, 0.9)
+        return torch.atan(x) + torch.acos(c) + torch.asin(c)
+
+
+class _HyperbolicHead(nn.Module):
+    """``sinh``/``cosh``/``asinh`` — hyperbolic features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a manual tanh plus asinh."""
+        return torch.sinh(x) / torch.cosh(x) + torch.asinh(x)
+
+
+class _CoshAcosh(nn.Module):
+    """``cosh``/``acosh``/``atanh`` — the inverse family."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return cosh + acosh(|x|+1.1) + atanh(clamped)."""
+        return (
+            torch.cosh(x)
+            + torch.acosh(x.abs() + 1.1)
+            + torch.atanh(x.clamp(-0.9, 0.9))
+        )
+
+
+class _DigammaLn(nn.Module):
+    """``digamma``/``gammaln`` — variational-style features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate digamma and gammaln at |x|+1."""
+        a = x.abs() + 1.0
+        return torch.digamma(a) + torch.special.gammaln(a)
+
+
+class _XlogyKL(nn.Module):
+    """``xlogy`` — KL divergence spelled in log-space."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return KL(p‖q) row-wise."""
+        p = torch.softmax(x, -1)
+        q = torch.softmax(y, -1)
+        return (torch.xlogy(p, p) - torch.xlogy(p, q)).sum(-1)
+
+
+class _RegluMlp(nn.Module):
+    """ReGLU MLP — chunk + relu + mul gated feed-forward."""
+
+    def __init__(self, d: int) -> None:
+        """Build the up/down projections."""
+        super().__init__()
+        self.up = nn.Linear(d, 2 * d)
+        self.down = nn.Linear(d, d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the gated MLP."""
+        a, b = self.up(x).chunk(2, dim=-1)
+        return self.down(F.relu(a) * b)
+
+
+class _SwiGLU(nn.Module):
+    """SwiGLU MLP — chunk + silu + mul gated feed-forward."""
+
+    def __init__(self, d: int) -> None:
+        """Build the up/down projections."""
+        super().__init__()
+        self.w = nn.Linear(d, 2 * d)
+        self.v = nn.Linear(d, d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the gated MLP."""
+        a, b = self.w(x).chunk(2, -1)
+        return self.v(F.silu(a) * b)
+
+
+class _OneHotEmbed(nn.Module):
+    """``one_hot`` + ``to``-cast + matmul — bag-of-classes readout."""
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        """One-hot then project through an identity matrix."""
+        oh = F.one_hot(idx, 16).to(torch.float64)
+        return oh @ torch.eye(16, dtype=torch.float64)
+
+
+class _BitwiseHead(nn.Module):
+    """Python ``&``/``|`` — the ``__and__``/``__or__`` spellings."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Combine bit patterns."""
+        return ((x & y) | (x | y)).to(torch.float64)
+
+
+class _RepeatInterleave(nn.Module):
+    """``repeat_interleave`` — per-element duplication."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Duplicate every feature twice."""
+        return x.repeat_interleave(2, dim=-1)
+
+
+class _DepthwiseConv2d(nn.Module):
+    """Depthwise + pointwise conv — ``conv2d`` with ``groups``."""
+
+    def __init__(self) -> None:
+        """Build the depthwise/pointwise pair."""
+        super().__init__()
+        self.dw = nn.Conv2d(8, 8, 3, padding=1, groups=8)
+        self.pw = nn.Conv2d(8, 8, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Depthwise conv, relu, pointwise mix."""
+        return self.pw(F.relu(self.dw(x)))
+
+
+# ---------------------------------------------------------------------------
 #  The candidate registry — thunks so import constructs nothing
 # ---------------------------------------------------------------------------
 
@@ -475,6 +1317,675 @@ def candidates() -> list[Workload]:
         Workload(
             "LogSoftmaxHead",
             lambda: (_LogSoftmaxHead(d, 8), _r(4, d)),
+            kind="compound",
+        ),
+        # --- round 2 — torch-native: activation spellings ----------
+        Workload(
+            "nn.LeakyReLU", lambda: (nn.LeakyReLU(0.05), _r(4, d))
+        ),
+        Workload("nn.CELU", lambda: (nn.CELU(), _r(4, d))),
+        Workload("nn.SELU", lambda: (nn.SELU(), _r(4, d))),
+        Workload("nn.Softplus", lambda: (nn.Softplus(), _r(4, d))),
+        Workload("nn.Softsign", lambda: (nn.Softsign(), _r(4, d))),
+        Workload(
+            "nn.Hardsigmoid", lambda: (nn.Hardsigmoid(), _r(4, d))
+        ),
+        Workload("nn.Hardtanh", lambda: (nn.Hardtanh(-2, 2), _r(4, d))),
+        Workload("nn.ReLU6", lambda: (nn.ReLU6(), _r(4, d))),
+        Workload(
+            "nn.RReLU", lambda: (nn.RReLU(0.1, 0.3).eval(), _r(4, d))
+        ),
+        Workload("nn.LogSigmoid", lambda: (nn.LogSigmoid(), _r(4, d))),
+        Workload("nn.Softmin", lambda: (nn.Softmin(-1), _r(4, d))),
+        Workload("nn.Tanhshrink", lambda: (nn.Tanhshrink(), _r(4, d))),
+        Workload("nn.Softshrink", lambda: (nn.Softshrink(), _r(4, d))),
+        # --- round 2 — pooling / upsampling / conv gaps ------------
+        Workload(
+            "nn.AvgPool1d", lambda: (nn.AvgPool1d(2), _r(1, 8, 16))
+        ),
+        Workload(
+            "nn.AvgPool2d", lambda: (nn.AvgPool2d(2), _r(1, 8, 8, 8))
+        ),
+        Workload(
+            "nn.AdaptiveMaxPool2d",
+            lambda: (nn.AdaptiveMaxPool2d(1), _r(1, 8, 8, 8)),
+        ),
+        Workload(
+            "nn.MaxPool1d", lambda: (nn.MaxPool1d(2), _r(1, 8, 16))
+        ),
+        Workload(
+            "nn.MaxPool3d",
+            lambda: (nn.MaxPool3d(2), _r(1, 4, 4, 4, 4)),
+        ),
+        Workload(
+            "nn.FractionalMaxPool2d",
+            lambda: (
+                nn.FractionalMaxPool2d(2, output_size=4),
+                _r(1, 8, 8, 8),
+            ),
+        ),
+        Workload(
+            "nn.Upsample(bicubic)",
+            lambda: (
+                nn.Upsample(
+                    scale_factor=2, mode="bicubic", align_corners=False
+                ),
+                _r(1, 8, 8, 8),
+            ),
+        ),
+        Workload(
+            "nn.Upsample(linear)",
+            lambda: (
+                nn.Upsample(
+                    scale_factor=2, mode="linear", align_corners=False
+                ),
+                _r(1, 8, 16),
+            ),
+        ),
+        Workload(
+            "nn.Upsample(area)",
+            lambda: (
+                nn.Upsample(scale_factor=2, mode="area"),
+                _r(1, 8, 8, 8),
+            ),
+        ),
+        Workload(
+            "nn.Upsample(nearest-exact)",
+            lambda: (
+                nn.Upsample(scale_factor=2, mode="nearest-exact"),
+                _r(1, 8, 8, 8),
+            ),
+        ),
+        Workload(
+            "nn.ConvTranspose1d",
+            lambda: (nn.ConvTranspose1d(8, 8, 3), _r(1, 8, 16)),
+        ),
+        Workload(
+            "nn.ConvTranspose3d",
+            lambda: (nn.ConvTranspose3d(4, 4, 3), _r(1, 4, 4, 4, 4)),
+        ),
+        Workload(
+            "nn.Conv1d(grouped)",
+            lambda: (
+                nn.Conv1d(8, 8, 3, padding=1, groups=4),
+                _r(1, 8, 16),
+            ),
+        ),
+        # --- round 2 — recurrent cells / embeddings / distances ----
+        Workload(
+            "nn.GRUCell",
+            lambda: (nn.GRUCell(8, 8), (_r(2, 8), _r(2, 8))),
+        ),
+        Workload(
+            "nn.LSTMCell",
+            lambda: (
+                nn.LSTMCell(8, 8),
+                (_r(2, 8), (_r(2, 8), _r(2, 8))),
+            ),
+        ),
+        Workload(
+            "nn.EmbeddingBag",
+            lambda: (
+                nn.EmbeddingBag(32, d),
+                torch.randint(0, 32, (2, 8)),
+            ),
+        ),
+        Workload(
+            "nn.PairwiseDistance",
+            lambda: (nn.PairwiseDistance(), (_r(4, d), _r(4, d))),
+        ),
+        # --- round 2 — losses --------------------------------------
+        Workload(
+            "nn.L1Loss", lambda: (nn.L1Loss(), (_r(4, d), _r(4, d)))
+        ),
+        Workload(
+            "nn.SmoothL1Loss",
+            lambda: (nn.SmoothL1Loss(), (_r(4, d), _r(4, d))),
+        ),
+        Workload(
+            "nn.HuberLoss",
+            lambda: (nn.HuberLoss(), (_r(4, d), _r(4, d))),
+        ),
+        Workload(
+            "nn.BCELoss",
+            lambda: (
+                nn.BCELoss(),
+                (
+                    torch.rand(4, 8).double(),
+                    torch.rand(4, 8).double(),
+                ),
+            ),
+        ),
+        Workload(
+            "nn.BCEWithLogitsLoss",
+            lambda: (
+                nn.BCEWithLogitsLoss(),
+                (_r(4, 8), torch.rand(4, 8).double()),
+            ),
+        ),
+        Workload(
+            "nn.KLDivLoss",
+            lambda: (
+                nn.KLDivLoss(),
+                (
+                    F.log_softmax(_r(4, 8), -1),
+                    F.softmax(_r(4, 8), -1),
+                ),
+            ),
+        ),
+        Workload(
+            "nn.SoftMarginLoss",
+            lambda: (
+                nn.SoftMarginLoss(),
+                (
+                    _r(4, 8),
+                    torch.randint(0, 2, (4, 8)).double() * 2 - 1,
+                ),
+            ),
+        ),
+        Workload(
+            "nn.MarginRankingLoss",
+            lambda: (
+                nn.MarginRankingLoss(),
+                (_r(4), _r(4), torch.ones(4)),
+            ),
+        ),
+        Workload(
+            "nn.TripletMarginLoss",
+            lambda: (
+                nn.TripletMarginLoss(),
+                (_r(4, d), _r(4, d), _r(4, d)),
+            ),
+        ),
+        Workload(
+            "nn.PoissonNLLLoss",
+            lambda: (
+                nn.PoissonNLLLoss(),
+                (_r(4, 8), torch.rand(4, 8).double() + 0.1),
+            ),
+        ),
+        Workload(
+            "nn.GaussianNLLLoss",
+            lambda: (
+                nn.GaussianNLLLoss(),
+                (
+                    _r(4, 8),
+                    torch.rand(4, 8).double(),
+                    torch.rand(4, 8).double() + 0.5,
+                ),
+            ),
+        ),
+        Workload(
+            "nn.CosineEmbeddingLoss",
+            lambda: (
+                nn.CosineEmbeddingLoss(),
+                (_r(4, d), _r(4, d), torch.ones(4)),
+            ),
+        ),
+        # --- round 2 — padding modes / misc natives ----------------
+        Workload(
+            "nn.ReflectionPad2d",
+            lambda: (nn.ReflectionPad2d(1), _r(1, 8, 8, 8)),
+        ),
+        Workload(
+            "nn.ReplicationPad2d",
+            lambda: (nn.ReplicationPad2d(1), _r(1, 8, 8, 8)),
+        ),
+        Workload(
+            "nn.ConstantPad2d",
+            lambda: (nn.ConstantPad2d(1, 0.5), _r(1, 8, 8, 8)),
+        ),
+        Workload(
+            "nn.PixelUnshuffle",
+            lambda: (nn.PixelUnshuffle(2), _r(1, 8, 8, 8)),
+        ),
+        # --- round 2 — compound models ------------------------------
+        Workload(
+            "CircularPad",
+            lambda: (_CircularPad(), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "SpatialTransformer",
+            lambda: (_SpatialTransformer(), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "ShiftedWindowRoll",
+            lambda: (_ShiftedWindow(), _r(1, 8, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ALiBiAttention",
+            lambda: (
+                _ALiBiAttention(4),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "GQA-sdpa",
+            lambda: (
+                _GQAAttention(),
+                (_r(1, 8, 8, d), _r(1, 2, 8, d), _r(1, 2, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "EinsumAttention",
+            lambda: (
+                _EinsumAttention(),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "ManualAttention",
+            lambda: (
+                _ManualAttention(),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "VarNorm",
+            lambda: (_VarNorm(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "StdNorm",
+            lambda: (_StdNorm(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "VarStdHead",
+            lambda: (_VarStdHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "FakeQuant",
+            lambda: (_FakeQuant(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SincKernel",
+            lambda: (_SincKernel(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ScalarRsub",
+            lambda: (_ScalarRsub(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "CumsumScan",
+            lambda: (_CumsumScan(), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "CumProdGate",
+            lambda: (_CumProdGate(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "CumMaxMin",
+            lambda: (_CumMaxMin(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "IndexAddMoE",
+            lambda: (
+                _IndexMoE(d),
+                (_r(8, d), torch.randint(0, 8, (8,))),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "ScatterAdd",
+            lambda: (
+                _ScatterAdd(),
+                (_r(8, 8), torch.randint(0, 4, (8,))),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "MedianPool",
+            lambda: (_MedianPool(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SortSelect",
+            lambda: (_SortSelect(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ArgSort",
+            lambda: (_ArgSort(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "KthMode",
+            lambda: (_KthMode(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "TakeAlongGather",
+            lambda: (_TakeAlong(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "NormalizeHead",
+            lambda: (_NormalizeHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SlidingUnfold",
+            lambda: (_SlidingUnfold(), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "MoveDimStack",
+            lambda: (_MoveDimStack(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "TensorSplitHead",
+            lambda: (_TensorSplit(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "AngleLog",
+            lambda: (_AngleLog(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "Log10Expm1",
+            lambda: (_Log10Expm1(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "LogBase",
+            lambda: (_LogBase(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "NanGuard",
+            lambda: (_NanGuard(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SanitizeHead",
+            lambda: (_SanitizeHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "NanStats",
+            lambda: (_NanStats(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "MaskLogic",
+            lambda: (_MaskLogic(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "LogicCombo",
+            lambda: (_LogicCombo(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "Bucketize",
+            lambda: (_Bucketize(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ChannelShuffle",
+            lambda: (_ChannelShuffle(), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "FlipConv",
+            lambda: (_FlipConv(), _r(1, 4, 16)),
+            kind="compound",
+        ),
+        Workload(
+            "GeoMeanPool",
+            lambda: (_GeoMeanPool(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "LerpMix",
+            lambda: (_LerpMix(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "AddcmulHead",
+            lambda: (_AddcmulHead(), (_r(4, d), _r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "TriuAttention",
+            lambda: (
+                _TriuAttention(),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "TracePenalty",
+            lambda: (_TracePenalty(), (_r(8, d), _r(d, d))),
+            kind="compound",
+        ),
+        Workload(
+            "OuterPositional",
+            lambda: (_OuterPositional(), _r(2, d, d)),
+            kind="compound",
+        ),
+        Workload(
+            "RepeatHead",
+            lambda: (_RepeatHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "RemainderHead",
+            lambda: (_RemainderHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ProdAminPool",
+            lambda: (_ProdAminPool(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "MinFmax",
+            lambda: (_MinFmax(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "BroadcastTo",
+            lambda: (_BroadcastTo(), (_r(4, d), _r(4, d, 4))),
+            kind="compound",
+        ),
+        Workload(
+            "CountNonzero",
+            lambda: (_CountHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "BooleanIndex",
+            lambda: (_BooleanIndex(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SignTruncFrac",
+            lambda: (_SignTruncFrac(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "CeilFloor",
+            lambda: (_CeilFloor(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "Heaviside",
+            lambda: (_Heaviside(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SdpaBiasParam",
+            lambda: (
+                _SdpaBiasParam(8),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "Cdist",
+            lambda: (_CDist(), (_r(4, 8), _r(6, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "EyeInit",
+            lambda: (_EyeInit(), _r(d, d)),
+            kind="compound",
+        ),
+        Workload(
+            "UnbindHead",
+            lambda: (_UnbindHead(), _r(2, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "SliceFill",
+            lambda: (_SliceFill(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "FillWhole",
+            lambda: (_FillWhole(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "FillSelect",
+            lambda: (_FillSelect(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ZeroInit",
+            lambda: (_ZeroInit(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "MaskedFillInplace",
+            lambda: (_MaskedFillInplace(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "MaskedFillTensor",
+            lambda: (
+                _MaskedFillTensor(),
+                (_r(4, d), torch.randn((), dtype=torch.float64)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "MaskedFillView",
+            lambda: (_MaskedFillView(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SelectWrite",
+            lambda: (_SelectWrite(), (_r(4, d), _r(d))),
+            kind="compound",
+        ),
+        Workload(
+            "IndexPut",
+            lambda: (_IndexPut(), (_r(4, d), _r(2, d))),
+            kind="compound",
+        ),
+        Workload(
+            "NarrowHead",
+            lambda: (_NarrowHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "NewCreators",
+            lambda: (_NewCreators(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "TypeAs",
+            lambda: (_TypeAs(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "ExpandAs",
+            lambda: (_ExpandAs(), (_r(4, d), _r(4, d, 4))),
+            kind="compound",
+        ),
+        Workload(
+            "IsNegPos",
+            lambda: (_IsNegPos(), _r(4, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "TrigHead",
+            lambda: (_TrigHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "HyperbolicHead",
+            lambda: (_HyperbolicHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "CoshAcosh",
+            lambda: (_CoshAcosh(), _r(4, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "DigammaLn",
+            lambda: (_DigammaLn(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "XlogyKL",
+            lambda: (_XlogyKL(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "RegluMLP",
+            lambda: (_RegluMlp(d), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SwiGLU",
+            lambda: (_SwiGLU(d), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "OneHotEmbed",
+            lambda: (_OneHotEmbed(), torch.randint(0, 16, (4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "BitwiseHead",
+            lambda: (
+                _BitwiseHead(),
+                (
+                    torch.randint(0, 8, (4, 8)),
+                    torch.randint(0, 8, (4, 8)),
+                ),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "RepeatInterleave",
+            lambda: (_RepeatInterleave(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "DepthwiseConv2d",
+            lambda: (_DepthwiseConv2d(), _r(1, 8, 8, 8)),
             kind="compound",
         ),
     ]

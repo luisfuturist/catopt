@@ -84,6 +84,24 @@ _ATEN_TO_IR: dict[str, str] = {
     "split_with_sizes": "split",
     "unsafe_split": "split",
     "unsafe_split_with_sizes": "split",
+    # In-place scalar fills functionalise to fill_.Tensor (a lifted
+    # 0-dim source) or fill_.Scalar (an inline number) — both are the
+    # ``copy_``-family mutation ``_handle_copy_`` threads, so both
+    # canonicalise to one "fill_" spelling.  masked_fill_ is the
+    # masked sibling — same dispatch, its source is the functional
+    # ``masked_fill`` term over the destination.
+    "fill_.Tensor": "fill_",
+    "fill_.Scalar": "fill_",
+    "masked_fill_.Tensor": "masked_fill_",
+    "masked_fill_.Scalar": "masked_fill_",
+    # torch.special.gammaln exports as aten.special_gammaln — same op
+    # as the ``gammaln`` the binding already lowers.
+    "special_gammaln": "gammaln",
+    # Infix ``a | b``/``a & b`` spell aten.__or__/__and__ — the bound
+    # bitwise ops (bitwise_or is dtype-polymorphic: bool tensors get
+    # the logical-or semantics the spelling means).
+    "__or__": "bitwise_or",
+    "__and__": "bitwise_and",
 }
 
 #: ATen overload-specific names (e.g. 'mul.Tensor') that do not survive
@@ -233,21 +251,68 @@ def _infer_shape(node_or_value: Any) -> tuple:
     return (None,)
 
 
+def _fill_src(node: Any, dst_fx: Any, env: dict[str, Any]) -> Any:
+    """Materialise a ``fill_``/``zero_`` scalar write as a term.
+
+    The destination's ``meta["val"]`` shape is the broadcast target —
+    an absent meta means the write cannot be sized honestly, so the
+    ``KeyError`` surfaces as an export rejection rather than minting a
+    term that drops the mutation.  ``fill_.Tensor``'s source is a
+    lifted 0-dim tensor (broadcast); ``fill_.Scalar``'s is an inline
+    number (a ``full`` creator); ``zero_`` carries none (``zeros``).
+    """
+    val = dst_fx.meta["val"]
+    shape = tuple(int(d) for d in val.shape)
+    dtype = str(val.dtype).split(".")[-1]
+    src_fx = node.args[1] if len(node.args) > 1 else None
+    if _aten_name(node.target) == "zero_":
+        return Op.make("zeros", shape=shape, dtype=dtype)
+    if hasattr(src_fx, "name"):
+        # KeyError on an unminted source is an honest rejection.
+        return Op.make("broadcast_to", env[src_fx.name], shape=shape)
+    return Op.make(
+        "full",
+        Const(cast("int | float", src_fx)),
+        shape=shape,
+        dtype=dtype,
+    )
+
+
 def _handle_copy_(node: Any, env: dict[str, Any]) -> None:
-    """Thread a functionalized ``copy_`` mutation through ``env``.
+    """Thread a functionalized ``copy_``/``fill_``/``zero_`` write.
 
     ``copy_(dst, src)`` where dst is a ``slice``/``select`` view rewrites
     the VIEWED BASE's env binding to the matching scatter — downstream
-    readers of the base then see the post-write value.  A copy on a
+    readers of the base then see the post-write value.  ``fill_`` and
+    ``zero_`` are the scalar spellings of the same write: the value is
+    first broadcast to the destination's shape (``_fill_src``), so a
+    ``y[:, :4] = 0`` slice fill lowers through ``slice_scatter`` like
+    the ``copy_`` view-write it functionalises from.  A copy on a
     whole tensor rewrites the dst binding itself to a ``copy`` op.
     """
-    if len(node.args) < 2:
+    if not node.args:
         return
-    dst_fx, src_fx = node.args[0], node.args[1]
-    src = env.get(src_fx.name)
+    dst_fx = node.args[0]
     dst = env.get(dst_fx.name)
-    if src is None or dst is None:
+    if dst is None:
         return
+    target = _aten_name(node.target)
+    if target in ("fill_", "zero_"):
+        src = _fill_src(node, dst_fx, env)
+    elif target == "masked_fill_":
+        # masked_fill_(dst, mask, v) — the functional ``masked_fill``
+        # term over dst is the written value; the view dispatch below
+        # scatters it onto the base exactly like a copy_ source.  An
+        # unminted mask/value raises (KeyError/IndexError) into the
+        # caller's rejection record — never a silently-dropped write.
+        mask = env[node.args[1].name]
+        v_fx = node.args[2]
+        v = env[v_fx.name] if hasattr(v_fx, "name") else Const(v_fx)
+        src = Op.make("masked_fill", dst, mask, v)
+    else:
+        src = env.get(node.args[1].name)
+        if src is None:
+            return
     dst_target = _aten_name(dst_fx.target)
     view_args = getattr(dst_fx, "args", ())
     if dst_target == "slice" and len(view_args) >= 4:
@@ -416,15 +481,17 @@ def export_to_ir(
         elif node.op == "call_function":
             op_name = _aten_name(node.target)
             ir_op = _ATEN_TO_IR.get(op_name, op_name)
-            if ir_op == "copy_":
+            if ir_op in ("copy_", "fill_", "zero_", "masked_fill_"):
                 # Functionalized in-place write ``dst = src`` — the
-                # FX graph is not SSA here: ``copy_`` MUTATES dst's
-                # tensor and downstream nodes keep referencing the
-                # pre-write node.  Thread the mutation through env:
-                # a copy through a ``slice``/``select`` view becomes
-                # the matching scatter on the viewed base; a copy on a
-                # whole tensor is the ``copy`` op — either way
-                # consumers of the dst node see the post-write value.
+                # FX graph is not SSA here: ``copy_``/``fill_``/
+                # ``zero_``/``masked_fill_`` MUTATE dst's tensor and
+                # downstream nodes keep referencing the pre-write
+                # node.  Thread the
+                # mutation through env: a write through a
+                # ``slice``/``select`` view becomes the matching
+                # scatter on the viewed base; a whole-tensor write is
+                # the ``copy`` op — either way consumers of the dst
+                # node see the post-write value.
                 _handle_copy_(node, env)
                 continue
             args = []
@@ -532,6 +599,12 @@ def export_to_ir(
                         attrs["keepdim"] = arg_node
                     else:
                         attrs[f"arg{i}"] = arg_node
+                elif isinstance(arg_node, torch.dtype):
+                    # ``to``/creator overloads carry a positional
+                    # ScalarType; record the short name just like the
+                    # dtype kwarg channel below — a dropped cast mints
+                    # a wrong-dtype term (one_hot's long->float).
+                    attrs["dtype"] = str(arg_node).split(".")[-1]
                 else:
                     key = (
                         arg_node.name
@@ -860,6 +933,8 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         x, y, rounding_mode=kw.get("rounding_mode")
     ),
     "sub": torch.sub,
+    # aten.rsub(self, other) = other - self — the ``1 - x`` spelling.
+    "rsub": lambda x, s, *a, **kw: torch.sub(s, x),
     "neg": torch.neg,
     "silu": torch.nn.functional.silu,
     "relu": torch.nn.functional.relu,
@@ -977,8 +1052,16 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
     # the op is a semantic identity there.  This binding is only valid
     # because export_to_ir always exports eval()-mode graphs.
     "dropout": lambda x, *a, **kw: x,
-    # dtype casts are identity at the precision we verify (float32)
-    "to": lambda x, *a, **kw: x,
+    # ``to`` — dtype/device casts.  A cast the boundary recorded must
+    # apply: ``one_hot(...)``'s long→float ``to(dtype)`` feeds a matmul
+    # that raises on dtype mismatch when the cast is dropped.  With no
+    # recorded dtype the cast is still identity at the precision we
+    # verify — the exported graph runs fp64 end to end.
+    "to": lambda x, *a, **kw: (
+        x.to(dtype=_creator_dtype(kw))
+        if _creator_dtype(kw) is not None
+        else x
+    ),
     "clone": lambda x, *a, **kw: x.clone(),
     "getitem": lambda t, **kw: t[attr_of(kw, "index", default=0)],
     "unbind": lambda t, *a, **kw: torch.unbind(
