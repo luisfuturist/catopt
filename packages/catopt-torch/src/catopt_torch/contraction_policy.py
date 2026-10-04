@@ -85,7 +85,10 @@ PAIR_DIM = 9
 STD_FLOOR = 0.1
 
 #: Largest lockstep batch sampled rollouts run in one forward pass.
-MAX_BATCH = 128
+#: The vectorised lockstep driver costs one fixed burst of kernel
+#: launches per step whatever the batch, so the cap is a memory
+#: guard, not a sweet spot.
+MAX_BATCH = 512
 
 #: Sampling temperature for the sampled (restart) rollouts.
 SAMPLE_TEMP = 1.5
@@ -582,60 +585,56 @@ def batch_inputs(
 
 
 # ---------------------------------------------------------------------------
-#  Rollouts
+#  Rollouts — the vectorised lockstep driver
 # ---------------------------------------------------------------------------
 
 
-def run_policy_batch(
+#: Per-(device, size) cached upper-triangle pair indices and arange.
+_TRIU_T: dict[
+    tuple[str, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _triu_dev(
+    m: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return cached device ``(row, col, arange)`` index tensors."""
+    key = (device, m)
+    r = _TRIU_T.get(key)
+    if r is None:
+        ia, ib = _triu(m)
+        r = (
+            torch.as_tensor(ia, device=device),
+            torch.as_tensor(ib, device=device),
+            torch.arange(m, device=device),
+        )
+        _TRIU_T[key] = r
+    return r
+
+
+#: Below this batch size the scalar per-game driver is faster: the
+#: vectorised step costs a fixed burst of kernel launches whatever the
+#: batch, so at ``samples <= _SCALAR_MAX`` the old loop wins on CUDA.
+_SCALAR_MAX = 2
+
+
+def _scalar_rollouts(
     model: nn.Module,
     tensors: Any,
     sizes: dict[int, int],
     greedy_ref: float,
-    *,
     samples: int,
+    device: str,
+    temperature: float,
     greedy: bool,
-    temperature: float,
-    device: str,
-) -> list[float]:
-    """Roll the policy out ``samples`` times; return the final costs.
-
-    All clones start from the same instance and advance in lockstep, so
-    one forward pass scores the whole batch each step.
-    """
-    games = [
-        ContractionGame(tensors, sizes, greedy_ref)
-        for _ in range(samples)
-    ]
-    while not games[0].done:
-        sf, pf = batch_inputs(games, device)
-        logits = pair_logits(model, sf, pf)
-        if greedy:
-            idx = torch.argmax(logits, dim=1)
-        else:
-            idx = Categorical(logits=logits / temperature).sample()
-        for g, i in zip(games, idx.tolist(), strict=True):
-            g.step(*g.pairs[i])
-    return [g.cost for g in games]
-
-
-def rollout_orders(
-    model: nn.Module,
-    tensors: Any,
-    sizes: dict[int, int],
-    greedy_ref: float,
-    samples: int,
-    device: str,
-    temperature: float,
-    *,
-    greedy: bool = False,
 ) -> tuple[list[list[tuple[int, int]]], list[float]]:
-    """Lockstep rollouts that also record each episode's chosen order.
+    """Lockstep rollouts over per-game :class:`ContractionGame` clones.
 
-    Same driver as :func:`run_policy_batch` under ``no_grad``, except
-    it returns the ``(a, b)`` index pairs every rollout picked, so an
-    order can be re-scored with an independent cost model or replayed.
-    With ``greedy=True`` the argmax pair is taken (deterministic);
-    otherwise pairs are sampled at ``temperature``.
+    The pre-vectorisation driver, kept for tiny batches (the single
+    pass ``ContractionPolicy.order`` runs at batch 1): per-game
+    feature assembly, one forward pass per step, the sampled indices
+    back to the host every step.  Identical feature semantics to
+    :func:`_lockstep_rollouts` — it *is* the scalar derivation.
     """
     games = [
         ContractionGame(tensors, sizes, greedy_ref)
@@ -657,6 +656,320 @@ def rollout_orders(
                 orders[j].append((a, b))
                 g.step(a, b)
     return orders, [g.cost for g in games]
+
+
+def _board_tensors(
+    ts: list[frozenset[int]], sizes: dict[int, int], device: str
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Pack a board into device tensors for the lockstep driver.
+
+    ``M[t, p]`` is 1.0 when label ``p`` (sorted-label order — the same
+    bit order :class:`ContractionGame` uses) belongs to tensor ``t``;
+    ``logb[p] = log2 sizes[label_p]``; ``svec[p] = sizes[label_p]``.
+    ``T = (M*logb) @ M^T`` is the pairwise intersection log-volume
+    table and ``C = M @ M^T`` the intersection-cardinality table — the
+    same contents as the scalar game's ``_inter`` / ``_icount``, so
+    ``T[t, t]`` is tensor ``t``'s own log-volume and ``C[t, t]`` its
+    rank.
+    """
+    labels = sorted({i for t in ts for i in t})
+    bit = {lab: p for p, lab in enumerate(labels)}
+    rows = np.zeros((len(ts), len(labels)), dtype=np.float64)
+    for t, tensor in enumerate(ts):
+        for lab in tensor:
+            rows[t, bit[lab]] = 1.0
+    logb = np.asarray([math.log2(sizes[lab]) for lab in labels])
+    svec = np.asarray([sizes[lab] for lab in labels], dtype=np.float64)
+    m0 = torch.as_tensor(rows, device=device)
+    logb_t = torch.as_tensor(logb, device=device)
+    svec_t = torch.as_tensor(svec, device=device)
+    v0 = m0 * logb_t
+    t0 = v0 @ m0.transpose(0, 1)
+    c0 = m0 @ m0.transpose(0, 1)
+    return m0, logb_t, svec_t, t0, c0
+
+
+def _lockstep_rollouts(
+    model: nn.Module,
+    tensors: Any,
+    sizes: dict[int, int],
+    greedy_ref: float,
+    samples: int,
+    device: str,
+    temperature: float,
+    greedy: bool,
+) -> tuple[list[list[tuple[int, int]]], list[float]]:
+    """Lockstep rollouts over a vectorised batched game state.
+
+    Same semantics as stepping ``samples`` :class:`ContractionGame`
+    clones in lockstep — every episode chooses one pair per step from
+    the policy's logits (``argmax`` under ``greedy``, else a
+    temperature-scaled categorical sample) — but the per-game tensor
+    sets live in one ``[B, m, L]`` indicator tensor and the pairwise
+    tables in ``[B, m, m]`` tensors maintained **incrementally**: a
+    step recomputes only the merged tensor's row/column (a skinny
+    batched matmul), mirroring the scalar game's incremental
+    ``_advance``.  The chosen-index history and the accumulated costs
+    come back to the host in a single copy at the end — there is no
+    per-step synchronisation, so a lockstep batch costs one short
+    burst of kernel launches per step whatever ``samples`` is.
+
+    Feature fidelity: every quantity is the same IEEE formula the
+    scalar derivation applies, evaluated in float64 and cast to
+    float32 for the net.  Pairwise sums come from batched GEMMs rather
+    than ``math.fsum``, so feature columns 0-4 (and the accumulated
+    cost once a product exceeds ``2**53``) can differ from the scalar
+    game in the last ulp; columns 5-7 are exact integers; column 8's
+    ranks can split *true* volume ties — mathematically equal union
+    volumes that ``math.fsum`` evaluates bitwise-identically — by up
+    to ``tie_size / n_pairs`` (measured, and empirically harmless, in
+    ``project/retros/contraction-throughput-v2.md``).  The move cost
+    is the exact union product while it stays below ``2**53``, the
+    same regime in which scalar ``pair_cost`` is exact.  Sampling
+    under ``greedy=False`` is the Gumbel-max trick — argmax of
+    ``logits / T + g`` over iid Gumbel ``g`` — the same categorical
+    distribution as ``Categorical(logits / T).sample()`` in fewer
+    kernels.
+    """
+    ts = [frozenset(t) for t in tensors]
+    n0 = len(ts)
+    if n0 < 2:
+        return [[] for _ in range(samples)], [0.0] * samples
+    m0, logb, svec, t0, c0 = _board_tensors(ts, sizes, device)
+    width = m0.shape[1]
+    ind = m0.unsqueeze(0).expand(samples, n0, width)
+    inter = t0.unsqueeze(0).expand(samples, n0, n0)
+    icount = c0.unsqueeze(0).expand(samples, n0, n0)
+    ref_inv = 1.0 / greedy_ref if greedy_ref > 0 else 0.0
+    cost = m0.new_zeros(samples)
+    hist: list[torch.Tensor] = []
+    tiny = torch.finfo(torch.float32).tiny
+    with torch.inference_mode():
+        for m in range(n0, 1, -1):
+            ia, ib, pos = _triu_dev(m, device)
+            n_pairs = ia.numel()
+            inter_u = inter[:, ia, ib]
+            cnt_u = icount[:, ia, ib]
+            lsize = inter.diagonal(0, 1, 2)
+            ranks = icount.diagonal(0, 1, 2)
+            ls_a = lsize[:, ia]
+            ls_b = lsize[:, ib]
+            ul = ls_a + ls_b - inter_u
+            l_min, u_max = torch.aminmax(ul, dim=1)
+            spread = u_max - l_min
+            den = spread + 1.0
+            rk_a = ranks[:, ia]
+            rk_b = ranks[:, ib]
+            f5 = torch.stack(
+                (ul, ls_a, ls_b, ul - inter_u, inter_u), dim=-1
+            )
+            f5 = (f5 - l_min[:, None, None]) / den[:, None, None]
+            c7 = cnt_u / (rk_a + rk_b - cnt_u).clamp_min(1.0)
+            srt = ul.sort(dim=1).values
+            pct = torch.searchsorted(srt, ul).to(m0.dtype) / n_pairs
+            pf = torch.cat(
+                (
+                    f5,
+                    torch.stack((rk_a, rk_b), dim=-1) / 4.0,
+                    c7.unsqueeze(-1),
+                    pct.unsqueeze(-1),
+                ),
+                dim=-1,
+            ).to(torch.float32)
+            mean_rank = ranks.sum(dim=1) / m
+            den_s = 4.0 * mean_rank + 1.0
+            r_min, r_max = torch.aminmax(ranks, dim=1)
+            sf = torch.stack(
+                (
+                    cost.new_full((samples,), m / n0),
+                    cost * ref_inv,
+                    mean_rank / 4.0,
+                    r_max / 4.0,
+                    r_min / 4.0,
+                    spread / den_s,
+                    l_min / den_s,
+                ),
+                dim=1,
+            ).to(torch.float32)
+            logits = pair_logits(model, sf, pf)
+            if greedy:
+                idx = logits.argmax(dim=1)
+            else:
+                u = torch.rand_like(logits)
+                gum = -torch.log(
+                    (-torch.log(u.clamp_min(tiny))).clamp_min(tiny)
+                )
+                idx = (logits / temperature + gum).argmax(dim=1)
+            a = ia[idx]
+            b = ib[idx]
+            hist.append(torch.stack((a, b), dim=1))
+            sel_a = a[:, None, None].expand(samples, 1, width)
+            sel_b = b[:, None, None].expand(samples, 1, width)
+            m_a = ind.gather(1, sel_a)
+            m_b = ind.gather(1, sel_b)
+            step_c = (
+                torch.where((m_a + m_b) > 0, svec, 1.0)
+                .prod(dim=2)
+                .squeeze(1)
+            )
+            cost = cost + step_c
+            merged = (m_a - m_b).abs()
+            keep = (pos[None, :] != a[:, None]) & (
+                pos[None, :] != b[:, None]
+            )
+            keep_idx = keep.to(torch.int8).argsort(
+                dim=1, descending=True, stable=True
+            )[:, : m - 2]
+            k = m - 2
+            ind = torch.cat(
+                (
+                    ind.gather(
+                        1,
+                        keep_idx[:, :, None].expand(samples, k, width),
+                    ),
+                    merged,
+                ),
+                dim=1,
+            )
+            mlog = merged * logb
+            kept_t = ind[:, :k].transpose(1, 2)
+            inter_row = mlog.bmm(kept_t).squeeze(1)
+            cnt_row = merged.bmm(kept_t).squeeze(1)
+            lsize_new = mlog.sum(dim=-1)
+            rank_new = merged.sum(dim=-1)
+            ki = keep_idx[:, :, None].expand(samples, k, m)
+            kj = keep_idx[:, None, :].expand(samples, k, k)
+            t_keep = inter.gather(1, ki).gather(2, kj)
+            c_keep = icount.gather(1, ki).gather(2, kj)
+            inter = torch.cat(
+                (
+                    torch.cat((t_keep, inter_row[:, :, None]), dim=2),
+                    torch.cat(
+                        (inter_row[:, None, :], lsize_new[:, :, None]),
+                        dim=2,
+                    ),
+                ),
+                dim=1,
+            )
+            icount = torch.cat(
+                (
+                    torch.cat((c_keep, cnt_row[:, :, None]), dim=2),
+                    torch.cat(
+                        (cnt_row[:, None, :], rank_new[:, :, None]),
+                        dim=2,
+                    ),
+                ),
+                dim=1,
+            )
+    picked = torch.stack(hist, dim=1).tolist()
+    orders = [[(a, b) for a, b in row] for row in picked]
+    return orders, cost.tolist()
+
+
+def _rollouts(
+    model: nn.Module,
+    tensors: Any,
+    sizes: dict[int, int],
+    greedy_ref: float,
+    samples: int,
+    device: str,
+    temperature: float,
+    greedy: bool,
+) -> tuple[list[list[tuple[int, int]]], list[float]]:
+    """Dispatch to the scalar or vectorised lockstep driver by batch.
+
+    Tiny batches take :func:`_scalar_rollouts` (the vectorised step
+    costs a fixed launch burst whatever ``samples`` is, so a batch of
+    one or two is cheaper per game); everything else takes
+    :func:`_lockstep_rollouts`.  The split is a measured crossover,
+    not a semantic one — both drivers implement the same rollout.
+    """
+    if samples < 1:
+        return [], []
+    if samples <= _SCALAR_MAX:
+        return _scalar_rollouts(
+            model,
+            tensors,
+            sizes,
+            greedy_ref,
+            samples,
+            device,
+            temperature,
+            greedy,
+        )
+    return _lockstep_rollouts(
+        model,
+        tensors,
+        sizes,
+        greedy_ref,
+        samples,
+        device,
+        temperature,
+        greedy,
+    )
+
+
+def run_policy_batch(
+    model: nn.Module,
+    tensors: Any,
+    sizes: dict[int, int],
+    greedy_ref: float,
+    *,
+    samples: int,
+    greedy: bool,
+    temperature: float,
+    device: str,
+) -> list[float]:
+    """Roll the policy out ``samples`` times; return the final costs.
+
+    All episodes advance in lockstep, so one forward pass scores the
+    whole batch each step — see :func:`_lockstep_rollouts` for the
+    batched driver and its float64/last-ulp feature-fidelity notes.
+    """
+    _orders, costs = _rollouts(
+        model,
+        tensors,
+        sizes,
+        greedy_ref,
+        samples,
+        device,
+        temperature,
+        greedy,
+    )
+    return costs
+
+
+def rollout_orders(
+    model: nn.Module,
+    tensors: Any,
+    sizes: dict[int, int],
+    greedy_ref: float,
+    samples: int,
+    device: str,
+    temperature: float,
+    *,
+    greedy: bool = False,
+) -> tuple[list[list[tuple[int, int]]], list[float]]:
+    """Lockstep rollouts that also record each episode's chosen order.
+
+    Same vectorised driver as :func:`run_policy_batch`, except it
+    returns the ``(a, b)`` index pairs every rollout picked, so an
+    order can be re-scored with an independent cost model or replayed.
+    With ``greedy=True`` the argmax pair is taken (deterministic);
+    otherwise pairs are sampled at ``temperature``.
+    """
+    return _rollouts(
+        model,
+        tensors,
+        sizes,
+        greedy_ref,
+        samples,
+        device,
+        temperature,
+        greedy,
+    )
 
 
 # ---------------------------------------------------------------------------

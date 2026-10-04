@@ -264,6 +264,44 @@ def test_rollout_orders_are_valid_and_priced():
         assert total == cost
 
 
+def test_rollout_orders_degenerate():
+    """A solved board ends immediately; zero samples returns empty."""
+    tensors, sizes = ((0,),), {0: 4}
+    model = PairPolicyNet(16)
+    orders, costs = rollout_orders(
+        model, tensors, sizes, 1.0, 2, _DEVICE, 1.0, greedy=True
+    )
+    assert orders == [[], []]
+    assert costs == [0.0, 0.0]
+    orders, costs = rollout_orders(
+        model, tensors, sizes, 1.0, 3, _DEVICE, 1.0
+    )
+    assert orders == [[], [], []]
+    assert costs == [0.0, 0.0, 0.0]
+    orders, costs = rollout_orders(
+        model, tensors, sizes, 1.0, 0, _DEVICE, 1.0
+    )
+    assert orders == [] and costs == []
+
+
+def test_rollout_orders_vec_greedy_and_priced():
+    """The batched driver: greedy argmax is deterministic and priced."""
+    tensors, sizes = _board(8, 3)
+    model = PairPolicyNet(16)
+    ref = greedy(tensors, sizes)
+    a, ca = rollout_orders(
+        model, tensors, sizes, ref, 4, _DEVICE, 1.0, greedy=True
+    )
+    b, cb = rollout_orders(
+        model, tensors, sizes, ref, 4, _DEVICE, 1.0, greedy=True
+    )
+    assert a == b and ca == cb
+    for order, cost in zip(a, ca, strict=True):
+        ts, total = _replay(tensors, sizes, order)
+        assert len(ts) == 1
+        assert total == cost
+
+
 def test_rollout_orders_greedy_flag():
     tensors, sizes = _board(6, 1)
     model = PairPolicyNet(16)
