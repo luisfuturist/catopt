@@ -34,9 +34,15 @@ itself.  This tool measures, per case:
   corrected by the measured per-executor factors — and times what the
   corrected extraction actually delivers.
 
-The seam is a tools-level experiment only: ``search(cost_fn=...)`` is
-public API (``backend_cost`` wraps it for feasibility); nothing in
-``packages/`` changes.  The measured cost table lands in the JSON dump.
+The corrected arm now exercises the SHIPPED selection path: the
+measured factors ride a ``TargetProfile.corrections`` table carried
+by the cost fn's ``profile`` marker (``backend_cost`` forwards it),
+``_select_best_term`` threads it plus the input's
+``shape_bucket`` into ``_carrier_upgrade``, and
+``_delivered_cost``'s corrected-price consumer applies the factor —
+no post-hoc re-implementation of the upgrade loop.  ``--emit-profile``
+writes the measured corrections as a ``TargetProfile`` JSON — the
+calibration artifact a ``cost_fn``-carrying search consumes.
 
 Honesty contract: the corrected factors are measured on these same
 shapes — a same-bucket correction demonstrating the mechanism, not a
@@ -47,6 +53,7 @@ Run::
 
     .venv/bin/python tools/executor_cost_probe.py
     .venv/bin/python tools/executor_cost_probe.py --json /tmp/ec.json
+    .venv/bin/python tools/executor_cost_probe.py --emit-profile /tmp/p.json
 """
 
 from __future__ import annotations
@@ -56,16 +63,20 @@ import json
 import math
 import statistics
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import torch
 from catopt_core.cost import dag_cost, executor_cost_for
+from catopt_core.cost.roofline import _LAUNCH_S, _PEAK_BW, _PEAK_FLOPS
 from catopt_core.ir import IR, Op
+from catopt_core.profile import TargetProfile, shape_bucket
 from catopt_orchestrator import Optimizer
 from catopt_orchestrator.optimize import (
     Autotuned,
     _carrier_plans,
+    _carrier_upgrade,
     _delivered_cost,
     _route_spec,
     default_rules,
@@ -111,6 +122,7 @@ def _is_plannable_carrier(term: Any) -> bool:
 
 def _delivered_cost_fn(
     factors: dict[str, float] | None = None,
+    profile: Any = None,
 ) -> Any:
     """Cost fn pricing each term under the executor it ROUTES to.
 
@@ -120,14 +132,19 @@ def _delivered_cost_fn(
     ``cost_fn``.  ``factors`` optionally multiplies each family's
     modeled price by a measured correction (``{"batched": f, ...}``).
 
+    ``profile`` rides the returned fn's ``profile`` marker —
+    ``backend_cost`` forwards it and ``_select_best_term`` reads it
+    into ``_carrier_upgrade``'s delivered-price comparison (the
+    shipped measured-pricing seam this probe demonstrates).
+
     Non-additive at carrier roots (``_batched_scan_latency`` is a
     whole-spine price): as an ``extract_best`` model it is
     approximate — the applyd member's local cost absorbs the spine's
     batched-vs-generic delta.  That is precisely the mechanism under
     test; the counterfactual reports what it actually extracts.
     """
-    gen = executor_cost_for(lowering="generic")
-    bat = executor_cost_for(lowering="batched_scan")
+    gen = executor_cost_for(profile, lowering="generic")
+    bat = executor_cost_for(profile, lowering="batched_scan")
     f_gen = (factors or {}).get("generic", 1.0)
     f_bat = (factors or {}).get("batched", 1.0)
     plannable: dict[Any, bool] = {}
@@ -142,7 +159,44 @@ def _delivered_cost_fn(
         return gen(term, memo) * f_gen
 
     cost.__name__ = "delivered_cost_fn"
+    cost.profile = profile
     return cost
+
+
+def _measured_profile(
+    factors: dict[str, float], counts: dict[str, int], bucket: str
+) -> TargetProfile:
+    """Return the measured family factors as a ``TargetProfile``.
+
+    Written under the ``corrections`` contract
+    ``catopt_core.profile.record_measured`` maintains —
+    ``{candidate: {bucket: {"factor", "n"}}}`` — keyed by the
+    candidate names ``_delivered_cost`` bills its routed executor
+    under and by this input's ``shape_bucket``, so the shipped
+    corrected-price consumer applies them.  The base fields carry
+    the model's OWN built-in constants (including the ``dispatch`` /
+    ``leaf_eval`` fallbacks a ``None`` profile uses): the only delta
+    vs the uncalibrated delivered comparison is the measured
+    correction.
+    """
+    return TargetProfile(
+        name="executor-cost-probe",
+        tflops=_PEAK_FLOPS / 1e12,
+        gbps=_PEAK_BW / 1e9,
+        launch_us=_LAUNCH_S * 1e6,
+        dispatch_us=_LAUNCH_S * 1e6,
+        leaf_eval_us=4.0 * _LAUNCH_S * 1e6,
+        device=torch.cuda.get_device_name(0),
+        measured_at=datetime.now(UTC).isoformat(),
+        corrections={
+            cand: {bucket: {"factor": f, "n": counts.get(cand, 2)}}
+            for cand, f in factors.items()
+        },
+        meta={
+            "source": "tools/executor_cost_probe.py",
+            "note": "pooled same-run factors — mechanism demo",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,76 +335,46 @@ def _probe_case(case: Any, opt: Optimizer, sink: Any) -> CaseRow:
 # ---------------------------------------------------------------------------
 
 
-def _corrected_upgrade(
-    eg: Any,
-    root_eid: int,
-    best_term: Any,
-    cost_fn: Any,
-    factors: dict[str, float],
-) -> Any:
-    """``_carrier_upgrade`` priced with corrected delivered costs.
-
-    The shipped pass compares ``_delivered_cost`` at the built-in
-    constants — ``profile=None`` always, since ``_select_best_term``
-    never threads a profile through.  Here each family's price is
-    scaled by the measured correction factor — the calibration the
-    inversion needs.  Mirrors the shipped loop exactly: only carrier
-    members of the ROOT e-class are re-examined (the upgrade can swap
-    a carrier member in; it never considers non-carrier members, so
-    a corrected comparison alone cannot demote a carrier pick the
-    greedy stage made — that half is the cost_fn's job).
-    """
-    eclasses = getattr(eg, "_classes", None)
-    if eclasses is None:
-        return best_term
-    plans = _carrier_plans()
-    cid = eg.find(root_eid)
-    carriers = [n for n in eclasses[cid].nodes if n.op in plans]
-    if not carriers:
-        return best_term
-
-    def corrected(t: Any) -> float:
-        fam = "batched" if _is_plannable_carrier(t) else "generic"
-        return _delivered_cost(t) * factors.get(fam, 1.0)
-
-    best_price = corrected(best_term)
-    for node in carriers:
-        cand = eg.extract_best(root_eid, cost_fn, overrides={cid: node})
-        if cand is None:
-            continue
-        price = corrected(cand)
-        if price < best_price:
-            best_term, best_price = cand, price
-    return best_term
-
-
 def _counterfactual(
     case: Any,
     opt: Optimizer,
     sink: Any,
     factors: dict[str, float] | None,
     tag: str,
+    counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Re-search *case* under delivered pricing; time what it ships.
 
-    Also runs the post-hoc corrected selection: greedy re-extract
-    under the search's own (corrected) cost_fn, then the
-    ``_carrier_upgrade`` comparison with corrected delivered prices —
-    the decision the shipped selection chain would have made had its
-    delivered pricing been calibrated.  The paired-extraction stage
-    is skipped (its group objects aren't recorded on the result);
-    under this cost_fn it agrees with greedy on these cases.
+    With *factors* given, the measured corrections ride the cost
+    fn's ``profile`` marker — a ``TargetProfile`` carrying them as a
+    ``corrections`` table under this input's ``shape_bucket`` — so
+    the SHIPPED ``_select_best_term`` → ``_carrier_upgrade`` →
+    ``_delivered_cost`` chain runs the corrected delivered
+    comparison itself (``res.term`` IS the corrected pick).  A
+    post-hoc ``_carrier_upgrade`` on the same e-graph re-confirms:
+    greedy re-extract under the search's cost_fn, then the shipped
+    upgrade priced off the forwarded profile marker — the decision
+    the pipeline makes once its delivered pricing is calibrated.
+    The paired-extraction stage is skipped (its group objects aren't
+    recorded on the result); under this cost_fn it agrees with
+    greedy on these cases.
     """
     torch.manual_seed(0)
     model = case.build().eval().double()
     x = torch.randn(*case.shape, dtype=torch.float64)
+    bucket = shape_bucket(x) if factors else None
+    prof = (
+        _measured_profile(factors, counts or {}, bucket)
+        if factors
+        else None
+    )
     res = opt.search(
         model,
         x,
         rules=default_rules(),
         max_iterations=_MAX_ITERS,
         max_enodes=_MAX_ENODES,
-        cost_fn=_delivered_cost_fn(factors),
+        cost_fn=_delivered_cost_fn(factors, profile=prof),
     )
     low = opt.lower(res, x, verify=True)
     root = res.term.op if isinstance(res.term, Op) else str(res.term)
@@ -376,10 +400,17 @@ def _counterfactual(
         return out
 
     # The corrected selection chain on the SAME e-graph: greedy under
-    # the corrected model, then the carrier-upgrade comparison priced
-    # with the measured factors.
-    pick = _corrected_upgrade(
-        res.eg, res.root_eid, greedy, res.cost_fn, factors
+    # the corrected model, then the SHIPPED carrier-upgrade
+    # comparison — fed the profile the ``backend_cost`` wrapper
+    # forwarded off the cost fn and this input's bucket, exactly the
+    # arguments ``_select_best_term`` supplies in-pipeline.
+    pick = _carrier_upgrade(
+        res.eg,
+        res.root_eid,
+        greedy,
+        res.cost_fn,
+        profile=getattr(res.cost_fn, "profile", None),
+        bucket=bucket,
     )
     proot = pick.op if isinstance(pick, Op) else str(pick)
     pspec = _route_spec(pick, sink)
@@ -456,14 +487,14 @@ def _autotune_arm(case: Any, opt: Optimizer) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _correction_factors(rows: list[CaseRow]) -> dict[str, float]:
-    """Geomean measured/modeled ratio per executor family (eager).
+def _correction_ratios(rows: list[CaseRow]) -> dict[str, list[float]]:
+    """Measured/modeled latency ratios per executor family (eager).
 
-    The ``corrections``-table idea, one bucket: each measured
-    alternative contributes ``measured_routed_ns / modeled_ns`` under
-    its routed family (``"batched"`` for the carrier executors,
-    ``"generic"``).  Same-shape measurements — the mechanism demo,
-    not a deployed calibration.
+    Each measured alternative contributes
+    ``measured_routed_ns / modeled_ns`` under its routed family
+    (``"batched"`` for the carrier executors, ``"generic"``).
+    Same-shape measurements — the mechanism demo, not a deployed
+    calibration.
     """
     ratios: dict[str, list[float]] = {"batched": [], "generic": []}
     for row in rows:
@@ -472,11 +503,64 @@ def _correction_factors(rows: list[CaseRow]) -> dict[str, float]:
                 continue
             fam = "generic" if a.routed == "generic" else "batched"
             ratios[fam].append(a.eager_ns / a.delivered_ns)
+    return ratios
+
+
+def _correction_factors(rows: list[CaseRow]) -> dict[str, float]:
+    """Geomean measured/modeled ratio per executor family (eager)."""
+    ratios = _correction_ratios(rows)
     return {
         fam: math.exp(statistics.fmean(math.log(r) for r in rs))
         for fam, rs in ratios.items()
         if rs
     }
+
+
+def _emit_profile(
+    path: str,
+    cases: list[Any],
+    factors: dict[str, float],
+    counts: dict[str, int],
+) -> None:
+    """Write the measured corrections as a ``TargetProfile`` JSON.
+
+    The ``corrections`` table ``record_measured`` maintains —
+    ``{candidate: {bucket: {"factor", "n"}}}`` — carrying the pooled
+    per-family factor under EVERY measured ``shape_bucket`` (one per
+    case), the same calibration the counterfactual consumes.  Pooled
+    rather than per-case: a single-case family often contributes one
+    observation, which sits below the learned-factor
+    ``_CORRECTION_MIN_SAMPLES`` gate and would never fire — pooling
+    keeps the emitted artifact live, at the documented granularity of
+    a same-run mechanism demo.  The base constants are the model's
+    built-ins — the correction table is the whole delta.  Feed the
+    result to a search as
+    ``cost_fn=executor_cost_for(TargetProfile.load(path))``.
+    """
+    corr: dict[str, dict[str, dict[str, Any]]] = {}
+    for case in cases:
+        bucket = shape_bucket(torch.empty(*case.shape))
+        for fam, f in factors.items():
+            corr.setdefault(fam, {})[bucket] = {
+                "factor": f,
+                "n": counts.get(fam, 2),
+            }
+    prof = TargetProfile(
+        name="executor-cost-probe",
+        tflops=_PEAK_FLOPS / 1e12,
+        gbps=_PEAK_BW / 1e9,
+        launch_us=_LAUNCH_S * 1e6,
+        dispatch_us=_LAUNCH_S * 1e6,
+        leaf_eval_us=4.0 * _LAUNCH_S * 1e6,
+        device=torch.cuda.get_device_name(0),
+        measured_at=datetime.now(UTC).isoformat(),
+        corrections=corr,
+        meta={
+            "source": "tools/executor_cost_probe.py",
+            "note": "same-shape measured factors — mechanism demo",
+        },
+    )
+    Path(path).write_text(prof.to_json() + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +728,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", help="write machine-readable results")
     parser.add_argument(
+        "--emit-profile",
+        metavar="PATH",
+        help=(
+            "write the measured executor corrections as a "
+            "TargetProfile JSON (per-case shape buckets)"
+        ),
+    )
+    parser.add_argument(
         "--skip-counterfactual",
         action="store_true",
         help="measure only; skip the corrected re-search",
@@ -663,6 +755,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  probed {case.name}", flush=True)
 
     factors = _correction_factors(rows)
+    counts = {
+        fam: len(rs) for fam, rs in _correction_ratios(rows).items()
+    }
     if not args.skip_counterfactual:
         for row, case in zip(rows, _cases(), strict=True):
             row.cf["modeled"] = _counterfactual(
@@ -670,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"  cf-modeled {case.name}", flush=True)
             row.cf["measured"] = _counterfactual(
-                case, opt, sink, factors, "measured"
+                case, opt, sink, factors, "measured", counts
             )
             print(f"  cf-measured {case.name}", flush=True)
             row.cf["autotune"] = _autotune_arm(case, opt)
@@ -682,6 +777,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         _dump_json(args.json, rows, factors)
         print(f"\nwrote {args.json}")
+    if args.emit_profile:
+        _emit_profile(
+            args.emit_profile, list(_cases()), factors, counts
+        )
+        print(f"wrote {args.emit_profile}")
     return 0
 
 

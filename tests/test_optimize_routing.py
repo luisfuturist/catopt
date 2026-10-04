@@ -393,7 +393,7 @@ def test_carrier_upgrade_swaps_when_delivered_cheaper(monkeypatch):
     monkeypatch.setattr(
         O,
         "_delivered_cost",
-        lambda t, profile=None, compiled=False: (
+        lambda t, profile=None, compiled=False, bucket=None: (
             1.0
             if isinstance(t, Op) and t.op in O._carrier_plans()
             else 100.0
@@ -478,3 +478,182 @@ def test_delivered_cost_compiled_prices_fusion_regions():
     assert _delivered_cost(
         ir.root, compiled=True
     ) == executor_cost_for(lowering="compiled")(ir.root)
+
+
+def _profile_with(corrections=None, measured_ns=None):
+    """A TargetProfile at the model's OWN constants + feedback data.
+
+    ``tflops``/``gbps``/``launch_us``/``dispatch_us``/``leaf_eval_us``
+    match the built-in fallbacks exactly, so the only delta vs a
+    ``None`` profile is the measured-feedback table — the same
+    isolation ``tools/executor_cost_probe.py``'s emitted profile uses.
+    """
+    from catopt_core.profile import TargetProfile
+
+    return TargetProfile(
+        name="routing-test",
+        tflops=2.5,
+        gbps=89.0,
+        launch_us=8.7,
+        dispatch_us=8.7,
+        leaf_eval_us=34.8,
+        device="cpu",
+        measured_at="2026-01-01T00:00:00",
+        corrections=corrections or {},
+        measured_ns=measured_ns or {},
+    )
+
+
+def test_delivered_cost_measured_correction_scales_route():
+    """A ``corrections`` factor for the routed candidate scales the
+    delivered price — the batched route reads ``"batched"``, the
+    generic route ``"generic"``."""
+    from catopt_core.profile import shape_bucket
+    from catopt_orchestrator.optimize import _delivered_cost
+
+
+
+    ir, h, env = _scan_ir()
+    x = torch.rand(3, dtype=torch.float64)
+    bucket = shape_bucket(x)
+    prof = _profile_with(
+        corrections={
+            "batched": {bucket: {"factor": 10.0, "n": 4}},
+            "generic": {bucket: {"factor": 0.5, "n": 4}},
+        },
+    )
+    assert _delivered_cost(
+        ir.root, prof, bucket=bucket
+    ) == pytest.approx(_delivered_cost(ir.root) * 10.0)
+
+    plain = Op.make("add", Var("x", _T((3,))), _P("p_w", (3,)))
+    assert _delivered_cost(
+        plain, prof, bucket=bucket
+    ) == pytest.approx(_delivered_cost(plain) * 0.5)
+
+
+def test_delivered_cost_no_measured_data_unchanged():
+    """No profile, empty tables, no bucket, or a cross-device bucket —
+    the delivered price stays the pure-model value (backward compat)."""
+    from catopt_orchestrator.optimize import _delivered_cost
+
+
+
+    ir, h, env = _scan_ir()
+    base = _delivered_cost(ir.root)
+    assert _delivered_cost(ir.root, None, bucket="cpu:2^5") == base
+    assert _delivered_cost(ir.root, _profile_with()) == base
+    assert (
+        _delivered_cost(ir.root, _profile_with(), bucket="cpu:2^5")
+        == base
+    )
+    other_dev = _profile_with(
+        corrections={
+            "batched": {"cuda:0:2^9": {"factor": 0.1, "n": 5}}
+        }
+    )
+    # cross-device buckets never interpolate: the cpu-bucket price is
+    # the uncorrected model price.
+    assert (
+        _delivered_cost(ir.root, other_dev, bucket="cpu:2^5") == base
+    )
+
+
+def test_carrier_upgrade_declines_measured_slower_carrier():
+    """The routing inversion fix: a measured profile pricing the
+    batched delivery slower than generic keeps the incumbent — the
+    upgrade honours measurement over the built-in constants."""
+    import catopt_orchestrator.optimize as O
+    from catopt_core.egraph import EGraph
+    from catopt_core.profile import shape_bucket
+
+
+
+    ir, h, env = _scan_ir()
+    eg = EGraph()
+    root = eg.add_term(ir.root)
+    incumbent = Op.make("add", h, _P("p0", (3,)))
+    bucket = shape_bucket(torch.rand(3, dtype=torch.float64))
+    prof = _profile_with(
+        measured_ns={
+            "batched": {bucket: {"median_ns": 1.0e12}}
+        },
+    )
+    # The measured median substitutes outright — the carrier member's
+    # delivered price IS the measurement, far above the incumbent's.
+    assert O._delivered_cost(ir.root, prof, bucket=bucket) == 1.0e12
+    out = O._carrier_upgrade(
+        eg, root, incumbent, flops_cost, profile=prof, bucket=bucket
+    )
+    assert out is incumbent
+
+
+def test_search_profile_marker_reaches_carrier_upgrade(monkeypatch):
+    """Plumbing + routing end-to-end on the inversion case.
+
+    ``backend_cost`` forwards the cost fn's ``profile`` marker,
+    ``_select_best_term`` threads it plus this input's
+    ``shape_bucket`` into ``_delivered_cost``, and
+    LinearRecurrence's batched apply member — which the uncalibrated
+    comparison swaps IN over the delivered-aware greedy ``add`` pick
+    (the SSM inversion ``tools/executor_cost_probe.py`` measures) —
+    is declined once the profile prices the carrier delivery slower.
+    """
+    import catopt_orchestrator.optimize as O
+    from catopt_core.cost import executor_cost_for
+    from catopt_core.profile import shape_bucket
+    from catopt_torch.models import LinearRecurrence
+
+
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    opt = Optimizer(backend=TorchBackend())
+    plans = O._carrier_plans()
+
+    def delivered_aware(profile):
+        gen = executor_cost_for(profile, lowering="generic")
+        bat = executor_cost_for(profile, lowering="batched_scan")
+
+        def cost(term, memo=None):
+            plannable = (
+                isinstance(term, Op)
+                and term.op in plans
+                and plans[term.op](term) is not None
+            )
+            if plannable:
+                # batched-scan family measured 1.9-2.7x the generic
+                # eval at these dims — a same-run factor, like the
+                # probe's counterfactual.
+                return bat(term, memo) * 10.0
+            return gen(term, memo)
+
+        cost.profile = profile
+        return cost
+
+    seen: dict = {}
+    orig = O._delivered_cost
+
+    def spy(t, profile=None, compiled=False, bucket=None):
+        seen["profile"] = profile
+        seen["bucket"] = bucket
+        return orig(t, profile, compiled, bucket)
+
+    monkeypatch.setattr(O, "_delivered_cost", spy)
+    prof = _profile_with(
+        measured_ns={
+            "batched": {shape_bucket(x): {"median_ns": 1.0e12}}
+        },
+    )
+    res = opt.search(m, x, cost_fn=delivered_aware(prof))
+
+    # profile + input bucket reached the delivered-price comparison.
+    assert seen["profile"] is prof
+    assert seen["bucket"] == shape_bucket(x)
+    # The corrected comparison keeps the delivered-aware greedy pick —
+    # the identical search WITHOUT a profile re-inverts it (greedy
+    # ``add`` -> shipped ``apply``).
+    assert getattr(res.term, "op", None) == "add"
+    res_default = opt.search(m, x, cost_fn=delivered_aware(None))
+    assert getattr(res_default.term, "op", None) in ("apply", "applyd")

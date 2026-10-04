@@ -82,6 +82,7 @@ from catopt_core.ports import (
     Strategy,
     TaskMetric,
 )
+from catopt_core.profile import corrected_price_ns, shape_bucket
 
 from catopt_orchestrator.carriers import get_carriers
 from catopt_orchestrator.criteria import (
@@ -267,8 +268,52 @@ def _carrier_plans() -> dict[str, Callable]:
     return {} if m is None else m.plans()
 
 
+#: Measured-feedback candidate names each delivered route consults,
+#: in preference order.  The ``record_measured`` write-back contract
+#: (the ``Autotuned`` strategy's ``profile=`` channel) records under
+#: candidate names: ``"generic"`` is the serial IRModule evaluator,
+#: ``"batched"`` the pipeline's own routed carrier delivery, and the
+#: compiled deliveries record under their builder names.  The
+#: ``executor_cost_for`` *lowering* names are accepted aliases too,
+#: so a table keyed by lowering (e.g. a hand-built or
+#: ``tools/executor_cost_probe.py --emit-profile`` profile) applies.
+_DELIVERED_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "generic": ("generic",),
+    "batched_scan": ("batched", "batched_scan"),
+    "compiled": ("torch_compile", "cuda_graph", "compiled"),
+}
+
+
+def _corrected_delivered(
+    profile: Any,
+    lowering: str,
+    bucket: str | None,
+    model_ns: float,
+) -> float:
+    """Apply the profile's measured correction to a delivered price.
+
+    The measured-feedback consumption contract, one hop:
+    :func:`~catopt_core.profile.corrected_price_ns` — the learned
+    ``corrections`` factor first, else a ``measured_ns`` residual or
+    median substitution — consulted under each candidate name
+    :data:`_DELIVERED_CANDIDATES` lists for *lowering*, first hit
+    wins.  No profile, no bucket, or no recorded correction returns
+    *model_ns* unchanged — the pure-model price is the default.
+    """
+    if profile is None or bucket is None:
+        return model_ns
+    for cand in _DELIVERED_CANDIDATES[lowering]:
+        priced = corrected_price_ns(profile, cand, bucket, model_ns)
+        if priced is not None and priced != model_ns:
+            return priced
+    return model_ns
+
+
 def _delivered_cost(
-    term: Any, profile: Any = None, compiled: bool = False
+    term: Any,
+    profile: Any = None,
+    compiled: bool = False,
+    bucket: str | None = None,
 ) -> float:
     """Price a term under the lowering it would actually get.
 
@@ -276,16 +321,25 @@ def _delivered_cost(
     eval otherwise (solver ops surcharged).  With ``compiled=True``
     the delivered module is torch.compile-wrapped whichever route
     ran, so the fusion-region model prices every term.
+
+    ``profile`` calibrates the executor model's constants — and when
+    it also carries measured-feedback data (``measured_ns`` residuals
+    or learned ``corrections`` factors keyed by ``(candidate,
+    bucket)`` — the contract :func:`~catopt_core.profile.record_measured`
+    writes), the price is corrected by
+    :func:`_corrected_delivered`.  ``bucket`` is the
+    :func:`~catopt_core.profile.shape_bucket` key the corrections
+    were recorded under; ``None`` keeps the pure-model price.
     """
+    lowering = "generic"
     if compiled:
-        return executor_cost_for(profile, lowering="compiled")(term)
-    if isinstance(term, Op) and term.op in _carrier_plans():
-        plan = _carrier_plans()[term.op](term)
-        if plan is not None:
-            return executor_cost_for(profile, lowering="batched_scan")(
-                term
-            )
-    return executor_cost_for(profile, lowering="generic")(term)
+        lowering = "compiled"
+    elif isinstance(term, Op):
+        plan = _carrier_plans().get(term.op)
+        if plan is not None and plan(term) is not None:
+            lowering = "batched_scan"
+    model_ns = executor_cost_for(profile, lowering=lowering)(term)
+    return _corrected_delivered(profile, lowering, bucket, model_ns)
 
 
 def _carrier_upgrade(
@@ -295,6 +349,7 @@ def _carrier_upgrade(
     cost_fn: CostFn,
     profile: Any = None,
     compiled: bool = False,
+    bucket: str | None = None,
 ) -> Any:
     """Coordinated carrier selection.
 
@@ -308,6 +363,11 @@ def _carrier_upgrade(
     carrier member is cheaper AND its batched plan exists (else the
     module degrades to serial eval and the price lied).
 
+    ``profile`` / ``bucket`` ride into :func:`_delivered_cost`: a
+    measured-calibrated profile corrects the comparison (a batched
+    delivery measured slower than generic stops winning it); no
+    profile keeps the built-in constants.
+
     An engine without a materialised ``_classes`` view (the
     :class:`~catopt_core.ports.Engine` port does not require one)
     skips the pass — greedy extraction already ran.
@@ -320,12 +380,12 @@ def _carrier_upgrade(
     carriers = [n for n in eclasses[cid].nodes if n.op in plans]
     if not carriers:
         return best_term
-    best_price = _delivered_cost(best_term, profile, compiled)
+    best_price = _delivered_cost(best_term, profile, compiled, bucket)
     for node in carriers:
         cand = eg.extract_best(root_eid, cost_fn, overrides={cid: node})
         if cand is None:
             continue
-        price = _delivered_cost(cand, profile, compiled)
+        price = _delivered_cost(cand, profile, compiled, bucket)
         if price < best_price:
             best_term, best_price = cand, price
     return best_term
@@ -1607,6 +1667,24 @@ def _special_lifts(
     return offers
 
 
+def _upgrade_pricing(cost_fn: CostFn, x: Any) -> tuple[Any, str | None]:
+    """(profile, bucket) the carrier upgrade's delivered pricing needs.
+
+    The ``profile`` marker the selection model carries
+    (``backend_cost`` forwards it from ``executor_cost_for(profile,
+    ...)`` and criteria blends), and — only when a profile and an
+    example input are both present — the
+    :func:`~catopt_core.profile.shape_bucket` key the profile's
+    measured corrections were recorded under.  ``(profile, None)``
+    keeps the pure-model delivered prices; ``(None, None)`` the
+    built-in constants.
+    """
+    profile = getattr(cost_fn, "profile", None)
+    if profile is None or x is None:
+        return profile, None
+    return profile, shape_bucket(x)
+
+
 def _select_best_term(
     eg: EGraph,
     root_eid: int,
@@ -1621,6 +1699,7 @@ def _select_best_term(
     source_tensors: dict,
     error_budget: float | None = None,
     src: Any = None,
+    x: Any = None,
 ) -> Any:
     """Extract the search's term: greedy -> paired -> carrier -> causal.
 
@@ -1631,7 +1710,10 @@ def _select_best_term(
       (one shared memo prices the baseline once);
     * :func:`_carrier_upgrade` — the whole-spine batched-executor win
       the additive decomposition can't price, billed under the
-      intended delivery (``delivers_compiled``);
+      intended delivery (``delivers_compiled``) and corrected by the
+      measured-feedback data a profile-carrying ``cost_fn`` supplies
+      (the ``profile`` marker + this input's ``shape_bucket`` — ``x``
+      keys the corrections);
     * the causal-mask const fold — the opt-out specialization, run
       through the capabilities object's optional
       ``specialize_causal(term, params, memo) -> term`` hook (a
@@ -1674,9 +1756,23 @@ def _select_best_term(
             stats["paired_extract"] = False
             stats["paired_delta"] = _forced_dag - _best_dag
     # Coordinated carrier selection: a batched-executor win is a
-    # whole-spine property the additive extraction can't price.
+    # whole-spine property the additive extraction can't price.  The
+    # delivered-price comparison runs under the profile the selection
+    # model carries (the ``profile`` marker ``backend_cost`` forwards
+    # — ``executor_cost_for(profile, ...)`` and criteria blends set
+    # it): a measured-calibrated cost_fn corrects the
+    # batched-vs-generic routing; no marker keeps the built-in
+    # constants.  ``bucket`` keys the profile's measured corrections
+    # to this input's shape class.
+    profile, bucket = _upgrade_pricing(cost_fn, x)
     best_term = _carrier_upgrade(
-        eg, root_eid, best_term, cost_fn, compiled=delivers_compiled
+        eg,
+        root_eid,
+        best_term,
+        cost_fn,
+        profile=profile,
+        compiled=delivers_compiled,
+        bucket=bucket,
     )
     # Causal specialization: a param-only attn_mask that evaluates to a
     # lower-triangular keep-mask is is_causal=True — no mask op at all.
@@ -2065,6 +2161,7 @@ def search(
         source_tensors=source_tensors,
         error_budget=error_budget,
         src=ir.root,
+        x=x,
     )
 
     if verbose:
