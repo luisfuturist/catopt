@@ -35,6 +35,12 @@ This tool is that end-to-end runnable: **one entry point** that
    hazard, not a win).
 5. **rank** — a single deterministic ordering over the evidence and a
    **ship / no-ship** verdict per candidate, with the reason.
+6. **emit** (``--emit-admission``) — for a SHIP candidate, writes the
+   *admission artifact* (``tools/law_emit.py``): the ``R(...)`` source
+   with named ``check`` / ``derive`` hooks, a generated
+   ``tests/test_admitted_<law>.py``, and a review patch
+   (``admission_<law>.patch``) showing the exact ``tensor.py``
+   insertion — a report, never a mutation.
 
 Held-out rediscovery
 --------------------
@@ -55,6 +61,8 @@ Run::
     .venv/bin/python tools/law_pipeline.py
     .venv/bin/python tools/law_pipeline.py --holdout select_mul
     .venv/bin/python tools/law_pipeline.py --json /tmp/pipeline.json
+    .venv/bin/python tools/law_pipeline.py --holdout softmax_fold \
+        --emit-admission recognize:softmax --out /tmp/admission
 
 CPU-only, bounded to a few minutes.
 """
@@ -579,6 +587,7 @@ class Evidence:
     relaxed: int = 0
     matches: int = 0
     example: str = ""
+    match_term: Any = None
     num_true: bool | None = None
     derivable: bool = False
     witness: tuple[str, ...] = ()
@@ -810,6 +819,7 @@ def measure(
         ev.witness = res.witness_rules
     if matches:
         ev.example = op_repr(matches[0])
+        ev.match_term = matches[0]
     _fire(proposal, models, sink, cost_fn, ev)
     if ev.fires:
         _reach(proposal, models, base_rules, cost_fn, ev)
@@ -915,6 +925,9 @@ def run_pipeline(
         "proposals": len(proposals),
         "ranked": ranked,
         "held_out": _held_out(ranked, holdout),
+        # Kept out of the JSON dump (terms are not serializable); the
+        # admission emitter reads the firing case for its e2e test.
+        "models": models,
     }
 
 
@@ -1147,6 +1160,20 @@ def main(argv: list[str] | None = None) -> int:
         "(default) or property-classified over the corpus "
         "(tools/law_vocab.py)",
     )
+    parser.add_argument(
+        "--emit-admission",
+        metavar="CANDIDATE",
+        help="emit the admission artifact for a SHIP candidate "
+        "(law + hooks + generated tests + review patch) — see "
+        "tools/law_emit.py",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="DIR",
+        default="admission_out",
+        help="output directory for --emit-admission "
+        "(default: %(default)s)",
+    )
     args = parser.parse_args(argv)
 
     result = run_pipeline(args.holdout, args.vocab)
@@ -1154,6 +1181,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         _dump_json(args.json, result)
         print(f"\nwrote {args.json}")
+    if args.emit_admission:
+        import law_emit
+
+        em = law_emit.emit_admission(
+            result, args.emit_admission, args.out
+        )
+        print("\n-- admission emission --")
+        if not em.emitted:
+            print(f"  REFUSED: {em.reason}")
+            return 1
+        for f in em.files:
+            print(f"  wrote {f}")
+        for n in em.notes:
+            print(f"  note: {n}")
     return 0
 
 
