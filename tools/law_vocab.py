@@ -132,9 +132,14 @@ def _concrete(shape: Any) -> bool:
     ``()`` (a scalar) is concrete: it is a real operand shape (the
     ``const`` exponent of ``pow``, the divisor of ``div``), and a
     pointwise op must still commute with a view of its tensor operand.
+
+    Non-positive dims are NOT concrete: ``_shape_of`` uses ``-1`` as
+    its unknown-dim sentinel (e.g. ``expand``'s keep-dim ``-1`` attr
+    leaks into the inferred shape), and a ``-1`` fed to ``torch.rand``
+    is a crash, not a probe.
     """
     return isinstance(shape, tuple) and all(
-        isinstance(d, int) for d in shape
+        isinstance(d, int) and d >= 0 for d in shape
     )
 
 

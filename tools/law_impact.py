@@ -295,6 +295,7 @@ def _model_cases() -> list[tuple[str, Any, Any]]:
     seq = torch.randn(2, 8, d, dtype=torch.float64)
     st = torch.randn(4, 8, dtype=torch.float64)
     img = torch.randn(1, 8, 4, 4, dtype=torch.float64)
+    wav = torch.randn(1, 8, 16, dtype=torch.float64)
     return [
         ("SwiGLU", M.SwiGLU(d, 2).eval().double(), t),
         ("RMSNorm", M.RMSNorm(d).eval().double(), t),
@@ -394,6 +395,35 @@ def _model_cases() -> list[tuple[str, Any, Any]]:
             M.KernelizedAttention(d).eval().double(),
             seq,
         ),
+        (
+            "TopKRouter",
+            M.TopKRouter(d, 4, 2).eval().double(),
+            t,
+        ),
+        (
+            "Wav2VecBlock",
+            M.Wav2VecBlock(8).eval().double(),
+            wav,
+        ),
+        (
+            "SinusoidalEncoding",
+            M.SinusoidalEncoding(d).eval().double(),
+            seq,
+        ),
+        (
+            "TrilCausalAttention",
+            M.TrilCausalAttention(d).eval().double(),
+            seq,
+        ),
+        ("HardDispatch", M.HardDispatch(d, 4).eval().double(), t),
+        (
+            "CodebookQuantizer",
+            M.CodebookQuantizer(d, 8).eval().double(),
+            t,
+        ),
+        ("MaxoutMLP", M.MaxoutMLP(d, 2).eval().double(), t),
+        ("GluMLP", M.GluMLP(d, 2).eval().double(), t),
+        ("NativeRmsNorm", M.NativeRmsNorm(d).eval().double(), t),
         ("SelectiveSSM", S.SelectiveSSM(8, 8, 4).eval().double(), st),
         ("DiagDenseSSM", S.DiagDenseSSM(8, 8, 4).eval().double(), st),
         ("DiagonalSSM", S.DiagonalSSM(8, 8, 4).eval().double(), st),

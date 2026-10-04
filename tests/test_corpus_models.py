@@ -4,9 +4,14 @@ The law-discovery pipeline reads ``catopt_torch.models`` as its real-
 world corpus (``tools/law_impact.model_cases``).  These builders add
 architecture families the corpus lacked — soft MoE dispatch, GEGLU,
 gated residuals, conv norm blocks, manual-softmax attention, learned
-positional embedding and kernelized attention — so the shape census
-sees new op-tuples (``sum``, ``exp``, ``gelu``, ``relu``,
-``batch_norm``, ``arange``, ``embedding``, ``elu``).
+positional embedding, kernelized attention, and the round-2 index /
+signal / routing families (top-k routing, causal conv1d, sinusoidal
+PE, in-graph mask construction, one-hot dispatch, VQ codebook,
+maxout, GLU, native ``rms_norm``) — so the shape census sees new
+op-tuples (``sum``, ``exp``, ``gelu``, ``relu``, ``batch_norm``,
+``arange``, ``embedding``, ``elu``, ``topk``, ``gather``, ``conv1d``,
+``pad``, ``sin``, ``cos``, ``tril``, ``argmax``, ``one_hot``,
+``argmin``, ``index_select``, ``maximum``, ``glu``, ``rms_norm``).
 
 Every builder is exercised end-to-end: forward, ``export_to_ir`` and a
 lowered ``IRModule`` verified fp64 against the original module.
@@ -15,15 +20,24 @@ lowered ``IRModule`` verified fp64 against the original module.
 import torch
 from catopt_core.ir import Op
 from catopt_torch.models import (
+    CodebookQuantizer,
     ConvNeXtBlock,
     DepthwiseConvBlock,
     GatedResidualBlock,
     GegluMLP,
+    GluMLP,
+    HardDispatch,
     KernelizedAttention,
     ManualSoftmaxAttention,
+    MaxoutMLP,
     MoEMLP,
+    NativeRmsNorm,
     PositionalEmbedding,
     ResNetBlock,
+    SinusoidalEncoding,
+    TopKRouter,
+    TrilCausalAttention,
+    Wav2VecBlock,
 )
 from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
@@ -48,6 +62,7 @@ d = 16
 VEC = torch.randn(4, d, dtype=torch.float64)
 SEQ = torch.randn(2, 8, d, dtype=torch.float64)
 IMG = torch.randn(1, 8, 4, 4, dtype=torch.float64)
+WAV = torch.randn(1, 8, 16, dtype=torch.float64)
 
 CASES = [
     ("MoEMLP", MoEMLP(d, 32, 3), VEC, {"softmax", "stack", "sum"}),
@@ -95,6 +110,45 @@ CASES = [
         SEQ,
         {"elu"},
     ),
+    (
+        "TopKRouter",
+        TopKRouter(d, 4, 2),
+        VEC,
+        {"topk", "getitem", "gather"},
+    ),
+    (
+        "Wav2VecBlock",
+        Wav2VecBlock(8),
+        WAV,
+        {"conv1d", "pad", "relu"},
+    ),
+    (
+        "SinusoidalEncoding",
+        SinusoidalEncoding(d),
+        SEQ,
+        {"sin", "cos"},
+    ),
+    (
+        "TrilCausalAttention",
+        TrilCausalAttention(d),
+        SEQ,
+        {"tril", "ones", "masked_fill"},
+    ),
+    (
+        "HardDispatch",
+        HardDispatch(d, 4),
+        VEC,
+        {"argmax", "one_hot"},
+    ),
+    (
+        "CodebookQuantizer",
+        CodebookQuantizer(d, 8),
+        VEC,
+        {"argmin", "index_select"},
+    ),
+    ("MaxoutMLP", MaxoutMLP(d, 2), VEC, {"maximum"}),
+    ("GluMLP", GluMLP(d, 2), VEC, {"glu"}),
+    ("NativeRmsNorm", NativeRmsNorm(d), VEC, {"rms_norm"}),
 ]
 
 

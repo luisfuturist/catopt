@@ -848,3 +848,257 @@ class KernelizedAttention(nn.Module):
         phi_q = F.elu(self.q_proj(x)) + 1
         phi_k = F.elu(self.k_proj(x)) + 1
         return phi_q @ (phi_k.transpose(-2, -1) @ self.v_proj(x))
+
+
+class TopKRouter(nn.Module):
+    """Switch/Mixtral-style top-k expert dispatch.
+
+    The hard-routing MoE spelled the way inference stacks write it:
+    the router's logits go through ``topk`` (values AND indices — the
+    ``getitem`` picks the value half), the selected expert outputs are
+    pulled out of the stacked dense pass by ``gather``, and the
+    softmax-renormalised top-k weights combine them.  Unlike
+    :class:`MoEMLP`'s dense ``mul(unsqueeze(w), stack)`` dispatch this
+    exports the index-family ops ``topk`` / ``getitem`` / ``gather`` —
+    the selection structure a routing law would need to see.
+    """
+
+    def __init__(
+        self, dim: int, n_experts: int = 4, k: int = 2
+    ) -> None:
+        """Initialise the router, experts, and top-k count."""
+        super().__init__()
+        self.router = nn.Linear(dim, n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            nn.Linear(dim, dim, bias=False) for _ in range(n_experts)
+        )
+        self.k = k
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Dispatch ``x`` through its top-``k`` experts."""
+        w, idx = torch.topk(self.router(x), k=self.k, dim=-1)
+        outs = torch.stack(
+            [e(x) for e in self.experts], dim=1
+        )  # (B, E, d)
+        sel = torch.gather(
+            outs, 1, idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        )  # (B, k, d)
+        return (torch.softmax(w, dim=-1).unsqueeze(-1) * sel).sum(1)
+
+
+class Wav2VecBlock(nn.Module):
+    """wav2vec-style causal depthwise conv1d feature block.
+
+    The speech-encoder conv stack: a left-pad (``pad`` — causal, no
+    future leakage), a depthwise ``conv1d`` (``groups=channels``, like
+    the wav2vec 2.0 feature extractor), a 1x1 pointwise projection,
+    and ``relu``.  Exports the corpus's first ``conv1d`` and ``pad``
+    nodes and the ``conv1d(pad)`` / ``conv1d(conv1d)`` chains — the
+    1-D analogue of the conv-norm families the last two expansions
+    added.
+    """
+
+    def __init__(self, channels: int = 8, kernel: int = 5) -> None:
+        """Initialise the depthwise and pointwise conv1d layers."""
+        super().__init__()
+        self.kernel = kernel
+        self.dw = nn.Conv1d(
+            channels,
+            channels,
+            kernel,
+            groups=channels,
+            bias=False,
+        )
+        self.pw = nn.Conv1d(channels, channels, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the causal depthwise-separable conv1d block."""
+        y = F.pad(x, (self.kernel - 1, 0))  # causal left-pad
+        return F.relu(self.pw(self.dw(y)))
+
+
+class SinusoidalEncoding(nn.Module):
+    """Classic transformer sinusoidal positional encoding.
+
+    The Vaswani PE: ``PE[pos] = [sin(pos·w), cos(pos·w)]`` with
+    geometric frequencies ``w_i = 10000^(-2i/d)``.  Exports the
+    corpus's first ``sin`` / ``cos`` / ``to`` nodes plus
+    ``concat(sin, cos)``, ``mul(unsqueeze, ·)`` and ``add(·, concat)``
+    — the transcendental pair a ``sin^2 + cos^2``-family law or a
+    phase-shift naturality would consume.
+    """
+
+    freq: torch.Tensor
+
+    def __init__(self, dim: int = 16) -> None:
+        """Initialise the geometric frequency table."""
+        super().__init__()
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, dtype=torch.float64)
+            / half
+        )
+        self.register_buffer("freq", freqs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add the sinusoidal encoding for the input's positions."""
+        pos = torch.arange(x.shape[1], device=x.device).unsqueeze(-1)
+        ang = pos.to(x.dtype) * self.freq
+        pe = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+        return x + pe
+
+
+class TrilCausalAttention(nn.Module):
+    """Eager causal attention whose mask is BUILT in-graph.
+
+    :class:`EagerAttention` registers its causal mask as a buffer, so
+    the corpus only sees ``masked_fill`` consuming a leaf.  Building
+    the mask in the forward — ``tril(ones(T,T)) == 0`` — exports the
+    ``tril`` / ``ones`` factory ops and the ``eq(tril, const)`` /
+    ``masked_fill(div, eq)`` chain: the in-graph mask construction a
+    causal-mask-fold law (``masked_fill + softmax → sdpa``) would
+    need to recognise end to end.
+    """
+
+    def __init__(self, dim: int = 16) -> None:
+        """Initialise the Q/K/V projections."""
+        super().__init__()
+        self.dim = dim
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run eager attention with an in-graph causal mask."""
+        _, t, c = x.shape
+        s = self.q_proj(x) @ self.k_proj(x).transpose(-2, -1)
+        s = s / math.sqrt(c)
+        mask = torch.tril(
+            torch.ones(t, t, device=x.device, dtype=x.dtype)
+        )
+        s = s.masked_fill(mask == 0, float("-inf"))
+        return F.softmax(s, dim=-1) @ self.v_proj(x)
+
+
+class HardDispatch(nn.Module):
+    """Switch-style top-1 hard routing: ``argmax`` + ``one_hot``.
+
+    The discrete cousin of :class:`TopKRouter`: the router argmax picks
+    ONE expert, ``one_hot`` turns the index into a dispatch mask, and
+    ``mul(unsqueeze(oh), stack(outs))`` selects.  Exports ``argmax``
+    and ``one_hot`` — the ops a hard-gating law (``argmax/one_hot →
+    gather``) would need — plus the ``to`` cast and the same
+    ``mul(unsqueeze, stack)`` dispatch shape MoEMLP contributes, now
+    over a *computed* mask rather than a softmax weight.
+    """
+
+    def __init__(self, dim: int, n_experts: int = 4) -> None:
+        """Initialise the router and the expert projections."""
+        super().__init__()
+        self.router = nn.Linear(dim, n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            nn.Linear(dim, dim, bias=False) for _ in range(n_experts)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Dispatch ``x`` through its argmax expert."""
+        idx = self.router(x).argmax(dim=-1)
+        oh = F.one_hot(idx, num_classes=len(self.experts)).to(x.dtype)
+        outs = torch.stack([e(x) for e in self.experts], dim=1)
+        return (oh.unsqueeze(-1) * outs).sum(1)
+
+
+class CodebookQuantizer(nn.Module):
+    """VQ-VAE-style codebook lookup: nearest row wins.
+
+    The vector-quantiser's encode step: pairwise squared distances
+    ``(x - codebook)^2`` summed over the feature axis, ``argmin`` over
+    the codebook, then ``index_select`` to gather the winning rows.
+    Exports ``argmin`` and ``index_select`` plus the
+    ``argmin(sum(pow(sub)))`` reduce-then-index chain — a
+    nearest-prototype pattern no current corpus model contains, and
+    the shape a commit-loss or lookup-fold law would target.
+    """
+
+    def __init__(self, dim: int = 16, n_codes: int = 8) -> None:
+        """Initialise the codebook embedding."""
+        super().__init__()
+        self.codebook = nn.Parameter(torch.randn(n_codes, dim) * 0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantise ``x`` to its nearest codebook rows."""
+        dist = (x.unsqueeze(-2) - self.codebook).pow(2).sum(-1)
+        idx = dist.argmin(dim=-1)
+        q = torch.index_select(self.codebook, 0, idx.reshape(-1))
+        return q.reshape(x.shape)
+
+
+class MaxoutMLP(nn.Module):
+    """Maxout unit: elementwise max over two affine maps.
+
+    Goodfellow's piecewise-linear activation: ``max(W1 x, W2 x)`` is a
+    learnable convex activation whose two linear children read the
+    SAME input — the ``f(g, g)`` census signature, here with ``f`` a
+    brand-new pointwise binary op (``maximum``) rather than
+    ``add``/``mul``.  A fifth binary pointwise op grows the derived
+    vocabulary's naturality alphabet.
+    """
+
+    def __init__(self, dim: int, hidden_mult: int = 2) -> None:
+        """Initialise the two affine pieces and the output projection."""
+        super().__init__()
+        h = dim * hidden_mult
+        self.f1 = nn.Linear(dim, h, bias=False)
+        self.f2 = nn.Linear(dim, h, bias=False)
+        self.down = nn.Linear(h, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the maxout activation and output projection."""
+        return self.down(torch.maximum(self.f1(x), self.f2(x)))
+
+
+class GluMLP(nn.Module):
+    """GLU gated feed-forward: ``down(glu(up(x)))``.
+
+    The fused gated-unit kernel (Dauphin et al.) — one op where
+    :class:`SwiGLU` and :class:`GegluMLP` spell the gate as
+    ``mul(act(a), b)``.  Exports the corpus's first ``glu`` node: the
+    *folded* spelling, so any ``mul-split-sigmoid → glu`` fusion law
+    sees both sides of the equation in one corpus — the manual shapes
+    from the gated MLPs and the kernel image here.
+    """
+
+    def __init__(self, dim: int, hidden_mult: int = 4) -> None:
+        """Initialise the up and down projections."""
+        super().__init__()
+        h = dim * hidden_mult
+        self.up = nn.Linear(dim, h, bias=False)
+        self.down = nn.Linear(h // 2, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the GLU gate and output projection."""
+        return self.down(F.glu(self.up(x), dim=-1))
+
+
+class NativeRmsNorm(nn.Module):
+    """``F.rms_norm`` + projection — the native-op norm spelling.
+
+    Every other norm in the corpus is spelled manually
+    (``x * rsqrt(mean(x^2)) * w`` — :class:`NormLinear`,
+    :class:`TransformerBlock`), so the ``rms_norm`` kernel op is
+    supported but absent.  This block exports it, giving the corpus
+    the ``rms_norm`` op and the ``linear(rms_norm)`` tuple — the
+    folded side of the gain-into-weight law the manual spelling
+    already feeds.
+    """
+
+    def __init__(self, dim: int = 16, eps: float = 1e-6) -> None:
+        """Initialise the native RMS norm and the projection."""
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, eps=eps)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the native RMS norm and the projection."""
+        return self.proj(self.norm(x))
