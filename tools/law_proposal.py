@@ -303,13 +303,22 @@ def _allclose(a: Any, b: Any, tol: float) -> bool:
     ``Const`` leaf lowers to an integer tensor), so it rejects a true
     ``x*0 = 0``; promoting both sides to fp64 first is the fix.  A
     shape mismatch is a *false* equality — equal terms always share a
-    shape — so it returns ``False`` rather than raising.
+    shape — so it returns ``False`` rather than raising.  The shape
+    check is exact (``torch.Size`` equality), not broadcastable:
+    ``torch.allclose`` would silently accept ``(n,)`` vs ``(1, n)``,
+    which let the meta-game certify the rank-changing "equality"
+    ``select(x) = unsqueeze(select(x))`` (see
+    ``project/retros/law-meta-game.md`` §3.2/§4).  The dtype
+    promotion is deliberately *not* a dtype check — it exists so a
+    literal ``Const`` compares fairly, not to relax shapes.
     """
     if isinstance(a, tuple) and isinstance(b, tuple):
         return len(a) == len(b) and all(
             _allclose(x, y, tol) for x, y in zip(a, b, strict=True)
         )
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if a.shape != b.shape:
+            return False
         try:
             return bool(
                 torch.allclose(
