@@ -23,7 +23,13 @@ Three tables:
   store.  The ``serializable`` / ``missing_hooks`` fields inside the
   JSON record say honestly which laws are full-data and which are
   pattern(+cond) with a ``check``/``derive`` remainder that still
-  needs code — see ``project/retros/lemma-store.md``.
+  needs code — see ``project/retros/lemma-store.md``.  When the law
+  carries a ``derivation`` annotation, :func:`store_lemma` also
+  materializes it as a replayable certificate
+  (``tools/law_lemma_cert.materialize``) and stores it in the
+  record's ``"cert"`` field — ``--admit`` replays it strictly, so a
+  stored lemma's derivation is a verifiable proof, not just
+  provenance metadata.
 
 Scope keys — the honest boundary of a cached verdict:
 
@@ -371,8 +377,40 @@ def latest_verdicts(
 #  path never imports catopt.
 
 
+#: Sentinel for :func:`store_lemma`'s ``cert=`` — distinguishes the
+#: default ("materialize the recorded derivation") from an explicit
+#: ``None`` ("store no certificate").
+_UNSET: Any = object()
+
+
+def _materialize_cert(rule: Any, universe: Any) -> Any:
+    """Materialize *rule*'s recorded derivation as a Certificate.
+
+    Only derivation-carrying rules are attempted — the certificate
+    proves the *annotation's* claim, so a rule with no ``derivation``
+    honestly stores ``cert: null``.  Saturation runs under the named
+    premises drawn from *universe* (default: the shipped
+    ``ALL_RULES``); a non-linear verdict (``saturation-only``,
+    ``gap``, ``bad-derivation``) yields ``None`` — a merge witness
+    that cannot replay standalone is never stored as a proof.
+    """
+    if not rule.derivation:
+        return None
+    import law_lemma_cert
+    from catopt_core.laws import ALL_RULES
+
+    uni = list(ALL_RULES) if universe is None else list(universe)
+    _row, cert = law_lemma_cert.materialize(rule, uni)
+    return cert
+
+
 def store_lemma(
-    conn: sqlite3.Connection, rule: Any, corpus_hash: str = ""
+    conn: sqlite3.Connection,
+    rule: Any,
+    corpus_hash: str = "",
+    *,
+    cert: Any = _UNSET,
+    universe: Any = None,
 ) -> str:
     """Persist *rule*'s data form in ``lemmas``; return its alpha key.
 
@@ -384,10 +422,20 @@ def store_lemma(
     the record says exactly which parts data cannot carry.
     ``corpus_hash`` records which corpus context the law was measured
     under (``""`` when none applies — e.g. storing a shipped law).
+
+    ``cert=`` controls the record's ``"cert"`` field: the default
+    materializes the rule's recorded ``derivation`` as a replayable
+    certificate (through ``tools/law_lemma_cert.materialize`` under
+    *universe*); an explicit :class:`Certificate` embeds as given;
+    an explicit ``None`` stores ``cert: null``.  Whatever the path,
+    the stored cert is the honest boundary — ``null`` where no
+    derivation replays, never a stub.
     """
     from catopt_core.laws.serialize import alpha_key, law_to_data
 
-    data = law_to_data(rule)
+    if cert is _UNSET:
+        cert = _materialize_cert(rule, universe)
+    data = law_to_data(rule, cert=cert)
     key = repr(alpha_key(rule.lhs, rule.rhs))
     with conn:
         conn.execute(
@@ -422,7 +470,9 @@ def admit_lemma(
     ``record["serializable"]`` / ``record["missing_hooks"]`` before
     trusting the rule to fire identically to its source.  A
     ``serializable: false`` record still rebuilds — pattern + cond —
-    but the reconstructed rule fires without the dropped hooks.
+    but the reconstructed rule fires without the dropped hooks.  The
+    record's ``"cert"`` field stays on the record — decode + verify
+    it with :func:`stored_certificate`.
     """
     from catopt_core.laws.serialize import law_from_data
 
@@ -444,6 +494,35 @@ def lemma_rows(conn: sqlite3.Connection) -> list[dict]:
             "SELECT * FROM lemmas ORDER BY added_ts DESC, rowid DESC"
         )
     ]
+
+
+def stored_certificate(record: dict, rules: Any = None) -> Any:
+    """Rebuild + strictly verify the cert a lemma record carries.
+
+    *record* is the parsed ``law_to_data`` dict (the second half of
+    :func:`admit_lemma`'s return).  *rules* resolves the rule names
+    the steps reference — default the shipped ``ALL_RULES``, which
+    covers a stored derivation's premises by construction (they are
+    shipped laws).  Returns ``None`` when the record claims no
+    certificate — ``cert: null`` is an honest absence, never a stub.
+
+    Verification is strict: ``egraph_dependent`` steps are refused,
+    and a stored cert that does not replay raises
+    ``CertificateVerificationError`` — a corrupt or drifted record is
+    a failure to surface, not a flag to read.
+    """
+    blob = record.get("cert")
+    if blob is None:
+        return None
+    from catopt_core.egraph import cert_from_data, verify_certificate
+
+    if rules is None:
+        from catopt_core.laws import ALL_RULES
+
+        rules = ALL_RULES
+    cert = cert_from_data(blob, rules)
+    verify_certificate(cert.src, cert, strict=True)
+    return cert
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +697,14 @@ def _store_lemma_cli(conn: sqlite3.Connection, name: str) -> int:
     )
     print(f"stored {rule.name}  [{state}]")
     print(f"  alpha_key = {key}")
+    cert = data.get("cert")
+    if cert is None:
+        print("  cert: none recorded")
+    else:
+        print(
+            f"  cert: {len(cert['steps'])}-step derivation"
+            f" {cert['rules_used']}"
+        )
     return 0
 
 
@@ -635,6 +722,18 @@ def _admit_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
     )
     print(f"admitted {rule.name}  [{state}]")
     print(f"  {rule!r}")
+    try:
+        cert = stored_certificate(data)
+    except Exception as exc:
+        print(f"  cert: STRICT REPLAY FAILED: {exc}")
+        return 1
+    if cert is None:
+        print("  cert: none recorded")
+    else:
+        print(
+            f"  cert: {cert.n_steps}-step {cert.rules_used}"
+            " — replayed strict"
+        )
     return 0
 
 

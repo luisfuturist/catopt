@@ -20,6 +20,14 @@ procedural remainder:
   fires and mints ``rms_norm(u, w, dim="ND", eps="EP")`` — the unbound
   attr metavars fall back to their literal names, a visible scar
   instead of a hidden veto.
+* the optional ``"cert"`` field — the recorded ``derivation``
+  materialized as a replayable proof
+  (:func:`catopt_core.egraph.cert_to_data` output), attached by the
+  lemma store at admission time.  It is record-level provenance, not
+  part of the 2-cell: :func:`law_from_data` does not fold it into the
+  rebuilt ``Rewrite`` — decode it with ``cert_from_data`` and verify
+  with ``verify_certificate``.  ``null`` is the honest absence: no
+  derivation claimed, or none that replayed.
 * :func:`alpha_key` — the alpha-normal ``(lhs, rhs)`` structural key
   the evidence store keys lemma rows by.  The same canonicalisation
   ``tools/law_proposal._key`` always used, lifted to core so the
@@ -33,7 +41,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from catopt_core.egraph import Rewrite
+from catopt_core.egraph import Certificate, Rewrite, cert_to_data
 from catopt_core.ir import Const, Op, term_from_data, term_to_data
 from catopt_core.laws.cond import (
     compile_derive,
@@ -51,7 +59,10 @@ __all__ = [
 ]
 
 #: Bump when the record layout or reconstruction semantics change.
-#: v2 adds the ``"dspec"`` field — declarative derive specs are data.
+#: v2 adds the ``"dspec"`` field (declarative derive specs are data)
+#: and the optional ``"cert"`` field.  ``"cert"`` needs no bump:
+#: :func:`law_from_data` reads explicit keys only, so older readers
+#: ignore it and older records (without the key) still load.
 LAW_FORMAT = 2
 
 
@@ -176,7 +187,16 @@ def missing_hooks(rule: Rewrite) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-def law_to_data(rule: Rewrite) -> dict[str, Any]:
+def _cert_field(cert: Certificate | None) -> dict[str, Any] | None:
+    """Encode the optional certificate field, or ``None``."""
+    if cert is None:
+        return None
+    return cert_to_data(cert)
+
+
+def law_to_data(
+    rule: Rewrite, cert: Certificate | None = None
+) -> dict[str, Any]:
     """Serialise *rule* to a JSON-safe record.
 
     Every field is data: the pattern pair through
@@ -187,6 +207,13 @@ def law_to_data(rule: Rewrite) -> dict[str, Any]:
     ``check``/``derive`` code the record is honest: pattern + cond +
     dspec are stored, ``"missing_hooks"`` names what the data does not
     carry.
+
+    *cert* attaches the recorded ``derivation``'s materialized
+    certificate — built by the caller
+    (``tools/law_lemma_cert.materialize``); this codec only carries
+    it.  The certificate proves the derivation replayed on ONE
+    concrete instance, not the law's semantic validity, and it stays
+    record-level: ``law_from_data`` never folds it into the Rewrite.
     """
     missing = missing_hooks(rule)
     return {
@@ -199,6 +226,7 @@ def law_to_data(rule: Rewrite) -> dict[str, Any]:
         "dspec": derive_to_data(rule.dspec),
         "tags": sorted(rule.tags),
         "derivation": list(rule.derivation),
+        "cert": _cert_field(cert),
         "error_bound": rule.error_bound,
         "bound_norm": rule.bound_norm,
         "serializable": not missing,
@@ -214,7 +242,9 @@ def law_from_data(data: dict[str, Any]) -> Rewrite:
     trusting a reconstructed lemma to fire identically.  A stored
     ``cond`` re-folds into ``check`` and a stored ``dspec`` into
     ``derive`` at construction, so a full-data record reproduces the
-    original rule's behaviour.
+    original rule's behaviour.  The optional ``"cert"`` field is
+    provenance, not part of the 2-cell — it is ignored here; decode
+    it with ``cert_from_data`` plus a name→rule map.
     """
     if data.get("version") != LAW_FORMAT:
         raise ValueError(

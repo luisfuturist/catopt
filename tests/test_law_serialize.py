@@ -31,7 +31,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from catopt_core.egraph import EGraph, Rewrite
+from catopt_core.egraph import Certificate, EGraph, Rewrite
+from catopt_core.egraph.certs import CERT_FORMAT
 from catopt_core.ir import (
     Const,
     Op,
@@ -265,6 +266,32 @@ def test_law_from_data_rejects_bad_version():
         law_from_data(data)
 
 
+def test_law_record_cert_field_is_optional_v2():
+    """``cert`` rides v2: null by default, ignored on rebuild, absent
+    in older records — no format bump, no reader rejection."""
+    data = law_to_data(FACTOR_MUL)
+    assert data["cert"] is None
+    cert = Certificate(
+        src=FACTOR_MUL.lhs,
+        dst=FACTOR_MUL.rhs,
+        root_eid=None,
+        steps=[],
+        rules={},
+    )
+    with_cert = law_to_data(FACTOR_MUL, cert=cert)
+    assert with_cert["cert"]["version"] == CERT_FORMAT
+    assert with_cert["cert"]["replayable"] is True
+    # the cert is record-level provenance — it does not fold into the
+    # reconstructed Rewrite (rebuilt rules aren't == under their
+    # folded check closures, so compare the re-serialized records)
+    assert law_to_data(law_from_data(with_cert)) == law_to_data(
+        law_from_data(data)
+    )
+    # a pre-cert v2 record (no "cert" key at all) still loads
+    del with_cert["cert"]
+    assert law_from_data(with_cert).name == FACTOR_MUL.name
+
+
 # ---------------------------------------------------------------------------
 #  Reconstructed laws fire — the proof the data is enough
 # ---------------------------------------------------------------------------
@@ -432,6 +459,55 @@ def test_admitted_softmax_fold_is_full_data(tmp_path):
         conn.close()
 
 
+def test_lemmas_table_carries_replayable_certificate(tmp_path):
+    """``store_lemma`` materializes the recorded derivation;
+    ``stored_certificate`` replays it strictly off the record."""
+    conn = _conn(tmp_path)
+    try:
+        key = le.store_lemma(conn, FACTOR_MUL)
+        stored = json.loads(
+            conn.execute(
+                "SELECT law_json FROM lemmas WHERE alpha_key = ?",
+                (key,),
+            ).fetchone()["law_json"]
+        )
+        assert stored["derivation"] == list(FACTOR_MUL.derivation)
+        assert stored["cert"] is not None
+        cert = le.stored_certificate(stored)
+        assert cert.replayable
+        assert cert.n_steps == 1
+        assert set(cert.rules_used) <= set(FACTOR_MUL.derivation)
+        # and admit hands the same record back — cert intact
+        _rule, record = le.admit_lemma(conn, key)
+        assert record["cert"] == stored["cert"]
+        assert le.stored_certificate(record) is not None
+    finally:
+        conn.close()
+
+
+def test_store_lemma_cert_knob(tmp_path):
+    """``cert=`` is explicit: ``None`` suppresses materialization, a
+    Certificate embeds as given."""
+    conn = _conn(tmp_path)
+    try:
+        key = le.store_lemma(conn, FACTOR_MUL, cert=None)
+        _rule, data = le.admit_lemma(conn, key)
+        assert data["cert"] is None
+        empty = Certificate(
+            src=FACTOR_MUL.lhs,
+            dst=FACTOR_MUL.rhs,
+            root_eid=None,
+            steps=[],
+            rules={},
+        )
+        key = le.store_lemma(conn, FACTOR_MUL, cert=empty)
+        _rule, data = le.admit_lemma(conn, key)
+        assert data["cert"]["version"] == CERT_FORMAT
+        assert data["cert"]["steps"] == []
+    finally:
+        conn.close()
+
+
 def test_lemma_cli_store_then_admit(tmp_path, capsys):
     db = str(tmp_path / "laws.db")
     assert le.main(["--report", db, "--add-lemma", "assoc_matmul"]) == 0
@@ -445,6 +521,29 @@ def test_lemma_cli_store_then_admit(tmp_path, capsys):
     assert le.main(["--report", db, "--admit", key]) == 0
     out = capsys.readouterr().out
     assert "admitted assoc_matmul  [full-data]" in out
+    assert "cert: none recorded" in out
+
+
+def test_lemma_cli_cert_roundtrip(tmp_path, capsys):
+    """A derivation-carrying law stores + admits with its cert —
+    ``--admit`` replays it strictly."""
+    db = str(tmp_path / "laws.db")
+    assert (
+        le.main(["--report", db, "--add-lemma", "factor_matmul"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert (
+        "cert: 1-step derivation ['distribute_matmul_over_add']" in out
+    )
+    key = next(
+        line.split("=", 1)[1].strip()
+        for line in out.splitlines()
+        if "alpha_key" in line
+    )
+    assert le.main(["--report", db, "--admit", key]) == 0
+    out = capsys.readouterr().out
+    assert "cert: 1-step ['distribute_matmul_over_add']" in out
+    assert "replayed strict" in out
 
 
 def test_lemma_cli_reports_missing_hooks(tmp_path, capsys):
