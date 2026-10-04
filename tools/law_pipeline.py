@@ -14,10 +14,12 @@ This tool is that end-to-end runnable: **one entry point** that
 
 1. **census** — mines the shape frequencies of the real corpus
    (``law_shape_census.run_census``).
-2. **propose** — collects candidate equalities from the existing
-   proposers (``law_shape_proposal.schemas`` shape-aware schemas and
-   ``law_proposal.schema_candidates`` algebraic grammar), unified to
-   pattern rules and de-duplicated by alpha-normal key.
+2. **propose** — collects candidate equalities from the proposers:
+   the census generators (same-view and mixed-view naturality over the
+   frequent op-tuples, plus composed-then-reduced pattern
+   recognition), ``law_shape_proposal.schemas`` shape-aware schemas
+   and ``law_proposal.schema_candidates`` algebraic grammar — unified
+   to pattern rules and de-duplicated by alpha-normal key.
 3. **verify** — runs *both* oracles on every candidate's concrete
    instance: the numeric-truth oracle (``law_proposal._numeric_true``)
    and the derivability oracle (``law_verifier.verify_law``), the
@@ -132,6 +134,13 @@ class Proposal:
     proposer already supplies one (the algebraic grammar); the
     shape-aware schemas supply patterns only and are instantiated from
     a real match instead.
+
+    ``check`` / ``derive`` are the ``Rewrite`` side-condition hooks,
+    for candidates whose RHS needs an attribute the LHS does not carry
+    verbatim — e.g. the softmax fold, whose ``dim`` is a single int
+    derived from ``sum``'s ``dim`` tuple.  They pass through to
+    :meth:`as_rule`, so firing, certificate replay and the oracles all
+    see the same side condition.
     """
 
     name: str
@@ -140,10 +149,18 @@ class Proposal:
     family: str
     sources: tuple[str, ...] = ()
     instance: tuple[Any, Any] | None = None
+    check: Any = None
+    derive: Any = None
 
     def as_rule(self) -> Rewrite:
         """Return the proposal as a fireable pattern ``Rewrite``."""
-        return Rewrite(self.name, self.lhs, self.rhs)
+        return Rewrite(
+            self.name,
+            self.lhs,
+            self.rhs,
+            check=self.check,
+            derive=self.derive,
+        )
 
 
 def _to_pattern(term: Any, mv: dict[str, str]) -> Any:
@@ -225,14 +242,18 @@ def _view_attrs(terms: list[Any], view_op: str) -> list[str]:
     return sorted(keys)
 
 
-def _view_node(view_op: str, leaf: Any, keys: list[str]) -> Any:
+def _view_node(
+    view_op: str, leaf: Any, keys: list[str], tag: str = "V"
+) -> Any:
     """Return a view-op pattern node with *keys* as attr metavariables.
 
-    The attribute values are shared metavariable names, so the two
-    view nodes of a naturality law must carry the same attrs — the
-    matcher enforces the precondition structurally.
+    The attribute values are shared metavariable names prefixed by
+    *tag*, so the two view nodes of a naturality law must carry the
+    same attrs — the matcher enforces the precondition structurally.
+    Distinct tags let a mixed-view pattern give each view node its own
+    attr metavariables (no cross-op attr equality is implied).
     """
-    return Op.make(view_op, leaf, **{k: f"V_{k}" for k in keys})
+    return Op.make(view_op, leaf, **{k: f"{tag}_{k}" for k in keys})
 
 
 def _vocab_sets(vocab: str) -> tuple[tuple, tuple]:
@@ -297,25 +318,233 @@ def _census_naturality(
     return out
 
 
+def _two_view_family(
+    op: str, g: str, h: str, terms: list[Any]
+) -> list[Proposal]:
+    """Emit the RHS family for a two-view tuple ``f(g(u,A), h(v,B))``.
+
+    The plausible wrap targets are the left view, the right view, and
+    no view at all (the ``id``/strip variant) — three shallow guesses,
+    each letting the oracles be the referee rather than an algebraic
+    theory of view inversion.  Each view keeps its own attr
+    metavariables (``A_*`` / ``B_*``), so the RHS re-wraps with the
+    bound attrs of whichever side it picks.
+    """
+    kg, kh = _view_attrs(terms, g), _view_attrs(terms, h)
+    lhs = Op.make(
+        op,
+        _view_node(g, "U", kg, tag="A"),
+        _view_node(h, "V", kh, tag="B"),
+    )
+    inner = Op.make(op, "U", "V")
+    variants = {
+        "wl": _view_node(g, inner, kg, tag="A"),
+        "wr": _view_node(h, inner, kh, tag="B"),
+        "id": inner,
+    }
+    return [
+        Proposal(
+            name=f"mixed:{op}_{g}_{h}_{tag}",
+            lhs=lhs,
+            rhs=rhs,
+            family="census-mixed-view",
+            sources=("census-mixed-view",),
+        )
+        for tag, rhs in variants.items()
+    ]
+
+
+def _one_view_family(
+    op: str, view: str, view_left: bool, terms: list[Any]
+) -> list[Proposal]:
+    """Emit the RHS family for ``f(view(u,A), v)`` with ``v`` opaque.
+
+    The non-view operand stays a bare metavariable — the census tuple
+    (``mul(slice, ·)``, ``mul(select, add)``, ``mul(unsqueeze,
+    stack)``) only fixes that a view feeds one side of a pointwise
+    op, so every asymmetric tuple collapses onto this one pattern and
+    de-dup merges the provenance.  The two plausible equalities are
+    the push-through ``w(f(u, v))`` and the strip ``f(u, v)``; truth
+    is per-instance and the oracles decide.
+    """
+    keys = _view_attrs(terms, view)
+    node = _view_node(view, "U", keys, tag="A")
+    lhs = (
+        Op.make(op, node, "V") if view_left else Op.make(op, "V", node)
+    )
+    side = "l" if view_left else "r"
+    inner = Op.make(op, "U", "V")
+    variants = {
+        "w": _view_node(view, inner, keys, tag="A"),
+        "id": inner,
+    }
+    return [
+        Proposal(
+            name=f"mixed:{op}_{view}_{side}_{tag}",
+            lhs=lhs,
+            rhs=rhs,
+            family="census-mixed-view",
+            sources=("census-mixed-view",),
+        )
+        for tag, rhs in variants.items()
+    ]
+
+
+def _census_mixed_naturality(
+    census_op: dict,
+    terms: list[Any],
+    pointwise: tuple = _POINTWISE,
+    views: tuple = _VIEW_OPS,
+) -> list[Proposal]:
+    """Generalize census naturality to *mixed* operand views.
+
+    :func:`_census_naturality` only reaches ``f(g, g)`` — a pointwise
+    op over two copies of the SAME view.  The expanded corpus's more
+    frequent shape is asymmetric: ``mul(slice, ·)``, ``mul(select,
+    add)``, ``add(matmul, select)``, ``mul(unsqueeze, stack)`` — the
+    retro's MoE-dispatch lead.  For every census tuple ``f(g, h)``
+    with distinct children where at least one is a view this emits a
+    small family of ``f(g(u, A), h(v, B)) -> w(f(u, v))`` candidates
+    (``w`` over the views present, plus the identity).  The numeric
+    oracle and the measurement gates — not this generator — decide
+    truth and worth; a false or worthless variant is an honest
+    rejection, not a generator bug.
+    """
+    out: list[Proposal] = []
+    for op, kids in census_op:
+        if op not in pointwise or len(kids) != 2:
+            continue
+        g, h = kids
+        if g == h:
+            continue  # same-view tuples are census-naturality's job
+        gl, hl = g in views, h in views
+        if gl and hl:
+            out.extend(_two_view_family(op, g, h, terms))
+        elif gl or hl:
+            out.extend(_one_view_family(op, g if gl else h, gl, terms))
+    return out
+
+
+def _reduce_chains(census_op: dict) -> list[tuple[str, str, str]]:
+    """Return ``(f, u, r)`` triples: ``f`` combines ``u(·)`` with ``r(u(·))``.
+
+    The census signature of a composed-then-reduced chain — a manual
+    normalization fold: a unary ``u`` feeding a reduction ``r`` (the
+    ``(r, (u,))`` tuple) AND a binary ``f`` combining ``u(·)`` with an
+    ``r`` node (``(f, (u, r))`` or ``(f, (r, u))``) both occur.  The
+    corpus's instance is ``div(exp(·), sum(exp(·)))`` — a softmax
+    spelled by hand.
+    """
+    out: list[tuple[str, str, str]] = []
+    for op, kids in census_op:
+        if len(kids) != 2:
+            continue
+        for i in (0, 1):
+            u, r = kids[i], kids[1 - i]
+            if u in ("·", "const") or r in ("·", "const"):
+                continue
+            if (r, (u,)) in census_op:
+                out.append((op, u, r))
+    return out
+
+
+def _check_sum_keepdim(bound: dict) -> bool:
+    """Guard the softmax fold: keepdim and a single reduce axis.
+
+    ``x / sum(x, dim)`` only broadcasts to a softmax when the sum
+    keeps its dim (a dropped dim broadcasts wrongly — or not at all —
+    against the numerator), and a multi-axis sum has no single-dim
+    ``softmax`` image.
+    """
+    dims = bound.get("$attr:RD")
+    if bound.get("$attr:RK") is not True:
+        return False
+    return isinstance(dims, int) or (
+        isinstance(dims, tuple) and len(dims) == 1
+    )
+
+
+def _derive_softmax_dim(bound: dict) -> dict:
+    """Unwrap ``sum``'s ``dim`` tuple into ``softmax``'s scalar dim."""
+    dims = bound.get("$attr:RD")
+    return {"$attr:SD": dims[0] if isinstance(dims, tuple) else dims}
+
+
+def _softmax_fold() -> Proposal:
+    """Return the ``exp/sum`` spelling of softmax — a true shape fold.
+
+    ``div(exp(u), sum(exp(u), dim, keepdim)) -> softmax(u, dim)`` is
+    the kernel-recognition candidate ``ManualSoftmaxAttention`` puts
+    in the corpus.  ``check``/``derive`` carry the side condition
+    (keepdim, single axis) and the attr translation (the sum's
+    ``dim`` tuple to softmax's int) — the oracles see them through
+    :meth:`Proposal.as_rule` exactly as firing does.
+    """
+    e = Op.make("exp", "U")
+    return Proposal(
+        name="recognize:softmax",
+        lhs=Op.make(
+            "div", e, Op.make("sum", e, dim="RD", keepdim="RK")
+        ),
+        rhs=Op.make("softmax", "U", dim="SD"),
+        family="pattern-recognition",
+        sources=("pattern-recognition",),
+        check=_check_sum_keepdim,
+        derive=_derive_softmax_dim,
+    )
+
+
+#: Composed-then-reduced chains with a known kernel image, keyed by
+#: ``(f, u, r)``.  Only the softmax fold is recognized today; a chain
+#: with no recognizer stays a census fact, never a guessed equality.
+_RECOGNIZERS: dict[tuple[str, str, str], Any] = {
+    ("div", "exp", "sum"): _softmax_fold,
+}
+
+
+def _pattern_recognition(census_op: dict) -> list[Proposal]:
+    """Emit candidates for recognized composed-then-reduced chains.
+
+    This is the shape-proposal source beyond view naturality: the
+    census is scanned for ``f(u(·), r(u(·)))`` chains and each chain
+    with a registered recognizer yields one candidate.  Chains with no
+    recognizer are evidence of a missing fold, silently skipped — the
+    candidate pool stays honest guesses only.
+    """
+    out: list[Proposal] = []
+    seen: set[tuple[str, str, str]] = set()
+    for chain in _reduce_chains(census_op):
+        if chain in seen:
+            continue
+        seen.add(chain)
+        build = _RECOGNIZERS.get(chain)
+        if build is not None:
+            out.append(build())
+    return out
+
+
 def propose(
     census_op: dict, terms: list[Any], vocab: str = "hand"
 ) -> list[Proposal]:
     """Collect, unify and de-duplicate every proposer's candidates.
 
-    Three sources feed the pool: the **census** generator (view
-    naturality over the frequent op-tuples, using the requested op
-    *vocab*), the shape-aware schemas
-    (``law_shape_proposal.schemas``), and the algebraic grammar
-    (``law_proposal.schema_candidates``, abstracted to patterns with
-    its concrete instance retained for the oracles).  De-dup is by
-    ``law_proposal._key`` — the alpha-normal equality — and a
-    duplicate's provenance is merged into ``sources``, so a candidate
-    reachable from the census generator is recorded as such.
+    Five sources feed the pool: the **census** generators (same-view
+    naturality and the mixed-view family, both over the frequent
+    op-tuples and the requested op *vocab*), **pattern recognition**
+    (composed-then-reduced chains like the ``exp/sum`` softmax fold),
+    the shape-aware schemas (``law_shape_proposal.schemas``), and the
+    algebraic grammar (``law_proposal.schema_candidates``, abstracted
+    to patterns with its concrete instance retained for the oracles).
+    De-dup is by ``law_proposal._key`` — the alpha-normal equality —
+    and a duplicate's provenance is merged into ``sources``, so a
+    candidate reachable from the census generator is recorded as such.
     """
     pointwise, views = _vocab_sets(vocab)
     by_key: dict = {}
     pool = [
         *_census_naturality(census_op, terms, pointwise, views),
+        *_census_mixed_naturality(census_op, terms, pointwise, views),
+        *_pattern_recognition(census_op),
         *_shape_aware(),
         *_grammar(),
     ]
@@ -461,15 +690,34 @@ def _reach_row(
 def _instance_from_match(
     proposal: Proposal, matches: list[Any]
 ) -> tuple[Any, Any] | None:
-    """Instantiate *proposal*'s RHS on its first real match, or None."""
-    if not matches:
-        return None
-    sub = matches[0]
-    subst = _term_match(proposal.lhs, sub)
-    if subst is None:
-        return None
-    rhs = _term_instantiate(proposal.rhs, subst)
-    return sub, rhs
+    """Instantiate *proposal*'s RHS on its first viable real match.
+
+    Applies the proposal's ``check`` / ``derive`` hooks (when present)
+    to each match's substitution — a check veto or a ``None`` derive
+    skips that match, exactly as an e-graph firing would — so the
+    oracles see the same instance the rule would produce.
+    """
+    for sub in matches:
+        subst = _term_match(proposal.lhs, sub)
+        if subst is None:
+            continue
+        if proposal.check is not None:
+            try:
+                if not proposal.check(subst):
+                    continue
+            except Exception:
+                continue
+        inst = dict(subst)
+        if proposal.derive is not None:
+            try:
+                extra = proposal.derive(subst)
+            except Exception:
+                continue
+            if extra is None:
+                continue
+            inst.update(extra)
+        return sub, _term_instantiate(proposal.rhs, inst)
+    return None
 
 
 def _fire(
