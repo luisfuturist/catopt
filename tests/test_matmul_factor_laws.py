@@ -410,8 +410,15 @@ def test_all_four_rules_carry_the_guard():
         PARALLEL_MUL_FUSE,
     ):
         assert r.check is not None, r.name
-    # and the tags the pipeline budgets on are unchanged
-    assert WEIGHT_FACTOR.tags == {tags.CATEGORICAL, tags.EXPANSIVE}
+    # and the tags the pipeline budgets on are unchanged — the
+    # weight-merge pair is annotated alpha-duplicate of the
+    # distribute/factor axioms (REDUNDANT: kept, not deleted)
+    assert WEIGHT_FACTOR.tags == {
+        tags.CATEGORICAL,
+        tags.EXPANSIVE,
+        tags.REDUNDANT,
+    }
+    assert WEIGHT_DISTRIBUTE.tags == WEIGHT_FACTOR.tags
     assert SWIGLU_FUSE.tags == {tags.FUSION, tags.SUBSUMED}
     names = {r.name for r in ALL_RULES}
     assert {

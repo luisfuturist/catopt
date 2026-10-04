@@ -50,6 +50,7 @@ from typing import Any
 import catopt_core.meta as M
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_core.laws import cond
 
 __all__ = [
     "RuleCache",
@@ -290,6 +291,11 @@ def ruleset_fingerprint(rules: Iterable[Rewrite]) -> str:
                 "rhs": _enc_term(r.rhs),
                 "check": _hook_sig(r.check),
                 "derive": _hook_sig(r.derive),
+                # Declarative conditions are data: a folded ``cond``
+                # shares one ``compile_guard`` closure signature
+                # across every cond-carrying rule, so the hook sig
+                # cannot see a cond edit — hash the data itself.
+                "cond": cond.cond_to_data(getattr(r, "cond", None)),
             },
             sort_keys=True,
         )

@@ -25,6 +25,7 @@ def R(
     derive=None,
     tags: Any = (),
     derivation: Any = (),
+    cond: Any = None,
 ) -> Rewrite:
     """Shorthand for creating a rewrite rule.
 
@@ -37,6 +38,12 @@ def R(
     default ``()`` designates a kernel member (``rule.kind ==
     "axiom"``); a non-empty tuple makes the rule a ``"lemma"`` (or
     ``"redundant"`` when also tagged ``tags.REDUNDANT``).
+
+    ``cond`` is the declarative side condition — pure data per
+    :mod:`catopt_core.laws.cond`, evaluated against the same ``bound``
+    dict ``check`` sees.  ``cond`` and ``check`` conjoin (cond for the
+    expressible part, ``check`` for procedural leftovers); ``derive``
+    stays Python — it *computes* attributes, a different role.
     """
     return Rewrite(
         name=name,
@@ -47,6 +54,7 @@ def R(
         derive=derive,
         tags=frozenset(tags),
         derivation=tuple(derivation),
+        cond=cond,
     )
 
 

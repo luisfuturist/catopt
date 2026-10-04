@@ -3,6 +3,10 @@
 * :mod:`catopt_core.laws.base` — the ``R`` rewrite constructor plus the
   shared check-hook machinery (``_SHAPE_MEMO``, ``_shape_of``, small
   term predicates).
+* :mod:`catopt_core.laws.cond` — the declarative side-condition DSL:
+  a ``cond`` is a serializable tuple tree interpreted against the same
+  ``bound`` dict ``check`` sees (``R(..., cond=...)`` folds it into
+  the rule's ``check`` hook at construction).
 * :mod:`catopt_core.laws.tensor` — the tensor-algebra laws:
   ``SIMPLIFICATION_RULES``, ``CATEGORICAL_RULES``, ``SDPA_FOLD_RULES``,
   ``ALL_RULES`` / ``all_rules()``.

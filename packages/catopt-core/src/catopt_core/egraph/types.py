@@ -102,6 +102,16 @@ class Rewrite:
     each other, so which direction is axiom vs lemma is a convention
     (the alphabetical-first member), not a measurement.  See
     :attr:`kind` and ``project/retros/axiom-lemma-split.md``.
+
+    ``cond`` is an optional *declarative* side condition — pure data
+    (a tuple tree per :mod:`catopt_core.laws.cond`), serializable to
+    JSON, evaluated by that module's interpreter over the same
+    ``bound`` environment ``check`` sees.  ``check`` and ``cond`` may
+    coexist: ``cond`` carries the expressible part, ``check`` the
+    procedural remainder.  ``__post_init__`` folds ``cond`` into the
+    ``check`` hook so every evaluation site (apply_rule, certificate
+    replay, term-level matching, meta's composite guards) honours the
+    conjunction through the single ``rule.check`` convention.
     """
 
     name: str
@@ -124,6 +134,34 @@ class Rewrite:
     # provenance instead); law-emit tooling may replay it into a real
     # ``Derivation`` certificate (:mod:`catopt_core.egraph.certs`).
     derivation: tuple[str, ...] = ()
+    # Declarative side condition — pure data (see the class docstring).
+    # Stored as data for serialization (the lemma-store seam); folded
+    # into ``check`` at construction.
+    cond: Any = None
+
+    def __post_init__(self) -> None:
+        """Fold a declarative ``cond`` into the ``check`` hook.
+
+        A rule carrying both evaluates ``cond`` first, then ``check``
+        — the conjunction IS the side condition, folded here so every
+        evaluation site (``apply_rule``, certificate replay, term-level
+        matching, meta's composite guards) keeps the single
+        ``rule.check`` convention.  The lazy import avoids a cycle:
+        ``catopt_core.laws`` depends on this module at load time.
+        """
+        if self.cond is not None:
+            from catopt_core.laws.cond import (
+                compile_guard,
+                cond_from_data,
+            )
+
+            # Canonicalise to the tuple-tree form — a list tree (as
+            # ``json.loads`` hands back) evaluates identically but is
+            # unhashable and unequal to its canonical twin.
+            object.__setattr__(self, "cond", cond_from_data(self.cond))
+            object.__setattr__(
+                self, "check", compile_guard(self.cond, self.check)
+            )
 
     def __repr__(self) -> str:
         """Return a ``name: lhs -> rhs`` rendering."""

@@ -28,13 +28,8 @@ from typing import Any, cast
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags
-from catopt_core.laws.base import (
-    R,
-    _is_channel_scale,
-    _is_row_scale,
-    _is_scalar,
-    _shape_of,
-)
+from catopt_core.laws.base import R
+from catopt_core.laws.cond import as_check
 from catopt_core.laws.layout import LAYOUT_RULES
 
 #: Tag bundles for the rule definitions below (see
@@ -270,19 +265,28 @@ SELECT_MUL = R(
 # Unlike select_mul the precondition is NOT structural: the sum's
 # `keepdim` must be True (a dropped dim broadcasts wrongly — or not
 # at all — against the numerator) and the reduce must cover exactly
-# one axis (softmax has no multi-axis image).  `check` carries that
+# one axis (softmax has no multi-axis image).  `cond` carries that
 # side condition; `derive` translates the sum's `dim` tuple `(-1,)`
 # to softmax's scalar `dim=-1` (the RHS attr the LHS does not carry
 # verbatim).  Single-direction and term-local, so it does not grow
 # the closure and belongs in the default set.
-def _check_sum_keepdim(bound) -> bool:
-    """Guard the softmax fold: keepdim and a single reduce axis."""
-    dims = bound.get("$attr:RD")
-    if bound.get("$attr:RK") is not True:
-        return False
-    return isinstance(dims, int) or (
-        isinstance(dims, tuple) and len(dims) == 1
-    )
+_COND_SOFTMAX_FOLD = (
+    "and",
+    ("attr-is", "RK", True),
+    (
+        "or",
+        ("attr-type", "RD", "int"),
+        (
+            "and",
+            ("attr-type", "RD", "tuple"),
+            ("attr-len", "RD", "==", 1),
+        ),
+    ),
+)
+
+#: Compat alias — the test-facing hook; it IS the same data the rule
+#: carries in ``cond`` (``as_check`` keeps them from drifting).
+_check_sum_keepdim = as_check(_COND_SOFTMAX_FOLD)
 
 
 def _derive_softmax_dim(bound) -> dict:
@@ -302,7 +306,7 @@ SOFTMAX_FOLD = R(
     law="exp(u) / Σ exp(u) = softmax(u): the manual normalization fold "
     "— a composed-then-reduced chain IS the kernel's definition.  "
     "Folds div+exp+sum to one dispatched op.",
-    check=_check_sum_keepdim,
+    cond=_COND_SOFTMAX_FOLD,
     derive=_derive_softmax_dim,
     tags=_SIM,
 )
@@ -334,43 +338,35 @@ SOFTMAX_FOLD = R(
 # ---------------------------------------------------------------------------
 
 
-def _mm_rhs_addends_aligned(sa: tuple, sb: tuple) -> bool:
-    """Whether two ``add`` addends keep the matmul contraction axis aligned.
+#: Contraction-axis alignment of two ``add`` addends, as data.
+#:
+#: Equal ranks align every axis pairwise.  Two rank>=2 addends may
+#: differ: broadcast then pads/replicates leading axes only, leaving
+#: each operand's axis -2 (the contraction axis) paired with the
+#: other's.  A rank-1 addend's only axis is BOTH its contraction axis
+#: and its broadcast tail — against a rank>=2 partner it lands on the
+#: partner's output axis, so the identity is false on every evaluable
+#: binding of that shape.  Scalar addends can never feed matmul, and
+#: an unshaped member cannot prove alignment — every rank op declines
+#: it (the same strict posture as layout's axes predicates).
+_COND_MM_ADDENDS = (
+    "or",
+    ("and", ("rank-eq", "a", "b"), ("rank", "a", ">=", 1)),
+    ("and", ("rank", "a", ">=", 2), ("rank", "b", ">=", 2)),
+)
 
-    Equal ranks align every axis pairwise.  Two rank>=2 addends may
-    differ: broadcast then pads/replicates leading axes only, leaving
-    each operand's axis -2 (the contraction axis) paired with the
-    other's.  A rank-1 addend's only axis is BOTH its contraction axis
-    and its broadcast tail — against a rank>=2 partner it lands on the
-    partner's output axis, so the identity is false on every evaluable
-    binding of that shape.  Scalar addends can never feed matmul.
-    """
-    ra, rb = len(sa), len(sb)
-    if ra == 0 or rb == 0:
-        return False
-    return ra == rb or min(ra, rb) >= 2
+#: The same alignment on the summed weights ``W``/``W2`` — applied to
+#: the ``linear`` spellings too (mathematically safe there, but a
+#: rank-mixed weight sum mints a member ``F.linear`` cannot lower).
+_COND_MM_WEIGHTS = (
+    "or",
+    ("and", ("rank-eq", "W", "W2"), ("rank", "W", ">=", 1)),
+    ("and", ("rank", "W", ">=", 2), ("rank", "W2", ">=", 2)),
+)
 
-
-def _check_mm_rhs_addends(bound: dict) -> bool:
-    """Rank guard for ``distribute_matmul_over_add`` / ``factor_matmul``."""
-    sa, sb = _shape_of(bound.get("a")), _shape_of(bound.get("b"))
-    if not (isinstance(sa, tuple) and isinstance(sb, tuple)):
-        return False
-    return _mm_rhs_addends_aligned(sa, sb)
-
-
-def _check_mm_rhs_weights(bound: dict) -> bool:
-    """Rank guard for the shared-input weight merges (``W``/``W2``).
-
-    Same contraction-axis alignment on the summed operands; applied to
-    the ``linear`` spellings too — mathematically safe there (a
-    weight's contraction axis is its last, the broadcast axis), but a
-    rank-mixed weight sum mints a member ``F.linear`` cannot lower.
-    """
-    sw, sw2 = _shape_of(bound.get("W")), _shape_of(bound.get("W2"))
-    if not (isinstance(sw, tuple) and isinstance(sw2, tuple)):
-        return False
-    return _mm_rhs_addends_aligned(sw, sw2)
+#: Compat aliases — the test-facing hooks (see ``_check_sum_keepdim``).
+_check_mm_rhs_addends = as_check(_COND_MM_ADDENDS)
+_check_mm_rhs_weights = as_check(_COND_MM_WEIGHTS)
 
 
 # matmul(W, a + b) = matmul(W, a) + matmul(W, b)
@@ -381,7 +377,7 @@ DISTRIBUTE_MUL = R(
         "add", Op.make("matmul", "W", "a"), Op.make("matmul", "W", "b")
     ),
     law="Distributivity of linear maps over addition (bilinearity).",
-    check=_check_mm_rhs_addends,
+    cond=_COND_MM_ADDENDS,
     tags=_CAT,
 )
 
@@ -393,7 +389,7 @@ FACTOR_MUL = R(
     ),
     Op.make("matmul", "W", Op.make("add", "a", "b")),
     law="Factoring common linear maps (reverse distributivity).",
-    check=_check_mm_rhs_addends,
+    cond=_COND_MM_ADDENDS,
     tags=_CAT,
     derivation=("distribute_matmul_over_add",),
 )
@@ -439,7 +435,7 @@ WEIGHT_FACTOR = R(
     ),
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input projections: x@W1 + x@W2 = x@(W1+W2).",
-    check=_check_mm_rhs_weights,
+    cond=_COND_MM_WEIGHTS,
     tags=(*_CAT, tags.REDUNDANT),
     derivation=("distribute_matmul_over_add",),
 )
@@ -453,7 +449,7 @@ WEIGHT_DISTRIBUTE = R(
         "add", Op.make("matmul", "x", "W"), Op.make("matmul", "x", "W2")
     ),
     law="Reverse weight merge (lets eqsat weigh fused vs split forms).",
-    check=_check_mm_rhs_weights,
+    cond=_COND_MM_WEIGHTS,
     tags=(*_CAT, tags.REDUNDANT),
     derivation=("distribute_matmul_over_add",),
 )
@@ -474,7 +470,7 @@ WEIGHT_FACTOR_LINEAR = R(
     Op.make("linear", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input nn.Linears: linear(x,W1)+linear(x,W2)"
     " = linear(x, W1+W2)  (transpose distributes over +).",
-    check=_check_mm_rhs_weights,
+    cond=_COND_MM_WEIGHTS,
     tags=_CAT,
     # inverse-pair twin of the axiom weight_distribute_linear (the
     # alphabetical-first member of the {distribute, factor}_linear
@@ -535,43 +531,34 @@ ASSOC_LINEAR_REV = R(
 # ------------------------------------------------------------------
 
 
-def _check_linear_bias_compose(bound: dict) -> bool:
-    """Shape guard: the chain dims must compose for B·b1 + b2.
+#: Shape guard for the affine compose, as data — the chain dims must
+#: compose for B·b1 + b2.  Well-typed when A (h, i), B (o, h), b1 (h,),
+#: b2 (o,) or scalar, and x's last dim feeds A's input dim.
+#:
+#: The matcher cannot see tensor types; without this the rule would
+#: also fire on e-nodes whose "bias" slot holds a non-vector term.
+#: ``dim-eq`` is *strict* equality on raw dims — unknown dims pass
+#: through as equalities on ``None`` (``None == None``), so the guard
+#: only vetoes PROVABLE mismatches, the same posture the procedural
+#: version took.
+_COND_BIAS_COMPOSE = (
+    "and",
+    ("rank", "A", "==", 2),
+    ("rank", "B", "==", 2),
+    ("dim-eq", "B", 1, "A", 0),  # B consumes A's out dim
+    ("rank", "b1", "==", 1),
+    ("dim-eq", "b1", 0, "A", 0),  # inner bias: exactly (h,)
+    (
+        "or",
+        ("scalar", "b2"),
+        ("and", ("rank", "b2", "==", 1), ("dim-eq", "b2", 0, "B", 0)),
+    ),  # outer bias: scalar|(o,)
+    ("rank", "x", ">=", 1),
+    ("dim-eq", "x", -1, "A", 1),  # x feeds A's input dim
+)
 
-    Well-typed when A (h, i), B (o, h), b1 (h,), b2 (o,) or scalar.
-
-    The matcher cannot see tensor types; without this the rule would
-    also fire on e-nodes whose "bias" slot holds a non-vector term.
-    Unknown dims pass through as equalities on None (the rewrite is
-    exact wherever the LHS is a real computation — the check only
-    vetoes PROVABLE mismatches).
-    """
-    x = _shape_of(bound.get("x"))
-    a = _shape_of(bound.get("A"))
-    b = _shape_of(bound.get("B"))
-    b1 = _shape_of(bound.get("b1"))
-    b2 = _shape_of(bound.get("b2"))
-    if not (
-        isinstance(a, tuple)
-        and isinstance(b, tuple)
-        and len(a) == 2
-        and len(b) == 2
-    ):
-        return False
-    h, i, o = a[0], a[1], b[0]
-    if b[1] != h:  # B consumes A's out dim
-        return False
-    if not (isinstance(b1, tuple) and len(b1) == 1 and b1[0] == h):
-        return False  # inner bias: exactly (h,)
-    if b2 != () and not (
-        isinstance(b2, tuple) and len(b2) == 1 and b2[0] == o
-    ):
-        return False  # outer bias: scalar|(o,)
-    if not (  # noqa: SIM103
-        isinstance(x, tuple) and len(x) >= 1 and x[-1] == i
-    ):
-        return False  # x feeds A's input dim
-    return True
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_linear_bias_compose = as_check(_COND_BIAS_COMPOSE)
 
 
 ASSOC_LINEAR_BIAS = R(
@@ -592,7 +579,7 @@ ASSOC_LINEAR_BIAS = R(
     "the fused bias is spelled linear(x, BA, B·b1) + b2 so both "
     "B-products fold at compile time — one GEMM plus one "
     "broadcast add at runtime.",
-    check=_check_linear_bias_compose,
+    cond=_COND_BIAS_COMPOSE,
     tags=_CAT,
 )
 
@@ -612,7 +599,7 @@ ASSOC_LINEAR_BIAS_REV = R(
     ),
     Op.make("linear", Op.make("linear", "x", "A", "b1"), "B", "b2"),
     law="Reverse affine composition (eqsat weighs fused vs split).",
-    check=_check_linear_bias_compose,
+    cond=_COND_BIAS_COMPOSE,
     tags=_CAT,
     derivation=("assoc_linear_bias",),
 )
@@ -636,7 +623,7 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
         "add", Op.make("linear", "x", "W"), Op.make("linear", "x", "W2")
     ),
     law="Expand a merged nn.Linear so eqsat can compare both forms.",
-    check=_check_mm_rhs_weights,
+    cond=_COND_MM_WEIGHTS,
     tags=_CAT,
 )
 
@@ -655,31 +642,22 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
 # ---------------------------------------------------------------------------
 
 
-def _check_fuse_pair(bound: dict) -> bool:
-    """Check the paired weights share a provably-equal shape.
+#: The paired weights share a provably-equal shape, as data.
+#:
+#: ``concat(A, B, dim=0)`` then ``chunk(·, 2, dim=-1)`` recovers each
+#: projection exactly only when the two weights agree on EVERY axis —
+#: unequal output dims mis-split the fused GEMM (A (o,i), B (o2,i)
+#: with o != o2 makes the first chunk straddle the A/B boundary), and
+#: a rank mismatch fails concat outright.  ``None`` dims are
+#: wildcards — ``shape-compat`` vetoes only provable mismatches.
+#: Without the guard a broadcastable-but-unequal pair (A (4,i),
+#: B (1,i)) — whose LHS DOES evaluate — minted a member whose mul
+#: operands do not even broadcast (the same matcher-cannot-see-shapes
+#: class as the matmul-addend rank guard above).
+_COND_FUSE_PAIR = ("shape-compat", "A", "B")
 
-    ``concat(A, B, dim=0)`` then ``chunk(·, 2, dim=-1)`` recovers each
-    projection exactly only when the two weights agree on EVERY axis —
-    unequal output dims mis-split the fused GEMM (A (o,i), B (o2,i)
-    with o != o2 makes the first chunk straddle the A/B boundary), and
-    a rank mismatch fails concat outright.  ``None`` dims are
-    wildcards — only provable mismatches are vetoed.  Without the
-    guard a broadcastable-but-unequal pair (A (4,i), B (1,i)) — whose
-    LHS DOES evaluate — minted a member whose mul operands do not even
-    broadcast (the same matcher-cannot-see-shapes class as the
-    matmul-addend rank guard above).
-    """
-    sa, sb = _shape_of(bound.get("A")), _shape_of(bound.get("B"))
-    if not (
-        isinstance(sa, tuple)
-        and isinstance(sb, tuple)
-        and len(sa) == len(sb)
-    ):
-        return False
-    return all(
-        da is None or db is None or da == db
-        for da, db in zip(sa, sb, strict=True)
-    )
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_fuse_pair = as_check(_COND_FUSE_PAIR)
 
 
 # silu(x@A.T) * (x@B.T)  ->  y = x@[A;B].T ; silu(y[..., :d]) * y[..., d:]
@@ -717,7 +695,7 @@ SWIGLU_FUSE = R(
     law="Product universal property: <f,g> = (f x g) . Delta.  Two "
     "projections of the same input are ONE GEMM into V x V, then "
     "project.  (Fused SwiGLU gate/up — MergedColumnParallelLinear.)",
-    check=_check_fuse_pair,
+    cond=_COND_FUSE_PAIR,
     tags=_SUB,
 )
 
@@ -748,7 +726,7 @@ PARALLEL_MUL_FUSE = R(
     ),
     law="Pairing without a gate nonlinearity: mul(<pi1 f>, <pi2 g>) "
     "recovers the parallel-product form.",
-    check=_check_fuse_pair,
+    cond=_COND_FUSE_PAIR,
     tags=_SUB,
 )
 
@@ -774,13 +752,32 @@ PARALLEL_MUL_FUSE = R(
 #  they can never win, and the verifier is the last line of defence.
 # ---------------------------------------------------------------------------
 
+#: Per-CHANNEL scale as data: c broadcasts over the weight's input
+#: dim — scalar, ``(in,)``, or ``(1,...,1,in)`` — i.e. every non-last
+#: dim of ``c`` is 1 and the last equals ``W``'s last.  (Same verdict
+#: as ``base._is_channel_scale``; unshaped ``c``/``W`` declines.)
+_COND_CHANNEL_SCALE = (
+    "and",
+    ("shaped", "c"),
+    ("rank", "W", ">=", 1),
+    (
+        "or",
+        ("scalar", "c"),
+        ("and", ("dim-eq", "c", -1, "W", -1), ("ones-but-last", "c")),
+    ),
+)
+
+#: Per-ROW scale as data: broadcasts to ``(B,T,1)`` — scalar or last
+#: dim 1.  (Same verdict as ``base._is_row_scale``.)
+_COND_ROW_SCALE = ("or", ("scalar", "r"), ("dim-eq-const", "r", -1, 1))
+
 LINEAR_CHANNEL_SCALE = R(
     "linear_channel_scale",
     Op.make("linear", Op.make("mul", "x", "c"), "W"),
     Op.make("linear", "x", Op.make("mul", "W", "c")),
     law="Channel scale is a right diagonal: (xD)W = x(DW).  Folds the "
     "norm's affine gain into the weight at compile time.",
-    check=_is_channel_scale,
+    cond=_COND_CHANNEL_SCALE,
     tags=_SYM,
 )
 
@@ -789,7 +786,7 @@ LINEAR_CHANNEL_SCALE_REV = R(
     Op.make("linear", "x", Op.make("mul", "W", "c")),
     Op.make("linear", Op.make("mul", "x", "c"), "W"),
     law="Reverse channel-scale fold (eqsat compares both forms).",
-    check=_is_channel_scale,
+    cond=_COND_CHANNEL_SCALE,
     tags=_SYM,
     derivation=("linear_channel_scale",),
 )
@@ -800,7 +797,7 @@ LINEAR_ROW_SCALE = R(
     Op.make("mul", Op.make("linear", "x", "W"), "r"),
     law="Row scale is a left diagonal: commutes through the linear map "
     "to the output (naturality of scalar action).",
-    check=lambda b: _is_row_scale(b["r"]),
+    cond=_COND_ROW_SCALE,
     tags=_SYM,
 )
 
@@ -809,7 +806,7 @@ LINEAR_ROW_SCALE_REV = R(
     Op.make("mul", Op.make("linear", "x", "W"), "r"),
     Op.make("linear", Op.make("mul", "x", "r"), "W"),
     law="Reverse row-scale hoist (eqsat compares both forms).",
-    check=lambda b: _is_row_scale(b["r"]),
+    cond=_COND_ROW_SCALE,
     tags=_SYM,
     derivation=("linear_row_scale",),
 )
@@ -1152,52 +1149,46 @@ def _const_val(t):
     return getattr(t, "value", None)
 
 
-def _check_score_transpose(bound) -> bool:
-    """K must be transposed on its last two dims — matmul(q, k^T)."""
-    ks = _shape_of(bound.get("K"))
-    d1, d2 = bound.get("$attr:TD1"), bound.get("$attr:TD2")
-    if not (
-        isinstance(ks, tuple)
-        and all(isinstance(x, int) for x in ks)
-        and isinstance(d1, int)
-        and isinstance(d2, int)
-    ):
-        return False
-    nd = len(ks)
-    return {d1 % nd, d2 % nd} == {nd - 2, nd - 1}
+#: K transposed on its last two dims — ``matmul(q, k^T)`` — as data.
+#: ``concrete`` asks for a tuple of int dims (the ``% nd`` arithmetic
+#: the old check did needs a concrete rank); ``axes-last2`` then does
+#: the same normalized-pair ``== {nd-2, nd-1}`` comparison, with the
+#: rank-0 crash case degrading to a plain decline.
+_COND_SCORE_T = (
+    "and",
+    ("concrete", "K"),
+    ("attr-type", "TD1", "int"),
+    ("attr-type", "TD2", "int"),
+    ("axes-last2", "K", "TD1", "TD2"),
+)
 
+#: Softmax over the last dim (keys) of the score matrix, as data.
+_COND_SM_DIM = ("axis", "Q", "SD", -1)
 
-def _check_softmax_dim(bound) -> bool:
-    """Softmax must be over the last dim (keys) of the score matrix."""
-    sd = bound.get("$attr:SD")
-    qs = _shape_of(bound.get("Q"))
-    if not (isinstance(sd, int) and isinstance(qs, tuple) and qs):
-        return False
-    return sd % len(qs) == len(qs) - 1
+#: The shared precondition of every sdpa_fold rule.
+_COND_SDPA_BASE = ("and", _COND_SCORE_T, _COND_SM_DIM)
+
+#: ``+ a numeric scale leaf (the ``S`` Const).``
+_COND_SDPA_SCALED = ("and", _COND_SDPA_BASE, ("const-num", "S"))
+
+#: ``+ a boolean masked_fill marker (the ``F`` Const < -1e30).``
+_COND_SDPA_MF = ("and", _COND_SDPA_BASE, ("const-cmp", "F", "<", -1e30))
+
+#: masked_fill + scale.
+_COND_SDPA_MF_SCALED = ("and", _COND_SDPA_MF, ("const-num", "S"))
+
+#: Compat aliases — the test-facing hooks (see ``_check_sum_keepdim``).
+_check_score_transpose = as_check(_COND_SCORE_T)
+_check_softmax_dim = as_check(_COND_SM_DIM)
+_check_sdpa_base = as_check(_COND_SDPA_BASE)
+_check_sdpa_scaled = as_check(_COND_SDPA_SCALED)
+_check_sdpa_mf = as_check(_COND_SDPA_MF)
+_check_sdpa_mf_scaled = as_check(_COND_SDPA_MF_SCALED)
 
 
 def _scale_of(bound):
     s = _const_val(bound.get("S"))
     return float(s) if isinstance(s, (int, float)) else None
-
-
-def _check_sdpa_base(bound) -> bool:
-    return _check_score_transpose(bound) and _check_softmax_dim(bound)
-
-
-def _check_sdpa_scaled(bound) -> bool:
-    return _check_sdpa_base(bound) and _scale_of(bound) is not None
-
-
-def _check_sdpa_mf(bound) -> bool:
-    if not _check_sdpa_base(bound):
-        return False
-    f = _const_val(bound.get("F"))
-    return isinstance(f, (int, float)) and f < -1e30
-
-
-def _check_sdpa_mf_scaled(bound) -> bool:
-    return _check_sdpa_mf(bound) and _scale_of(bound) is not None
 
 
 def _derive_scale_mul(bound):
@@ -1221,22 +1212,22 @@ def _make_sdpa_fold_rules() -> list:
         (
             "mul",
             lambda: Op.make("mul", _QK_SCORES, "S"),
-            _check_sdpa_scaled,
-            _check_sdpa_mf_scaled,
+            _COND_SDPA_SCALED,
+            _COND_SDPA_MF_SCALED,
             _derive_scale_mul,
         ),
         (
             "div",
             lambda: Op.make("div", _QK_SCORES, "S"),
-            _check_sdpa_scaled,
-            _check_sdpa_mf_scaled,
+            _COND_SDPA_SCALED,
+            _COND_SDPA_MF_SCALED,
             _derive_scale_div,
         ),
         (
             "",
             lambda: _QK_SCORES,
-            _check_sdpa_base,
-            _check_sdpa_mf,
+            _COND_SDPA_BASE,
+            _COND_SDPA_MF,
             _derive_scale_one,
         ),
     )
@@ -1247,7 +1238,7 @@ def _make_sdpa_fold_rules() -> list:
             lambda sm: Op.make("dropout", sm, p="DP", train="DT"),
         ),
     )
-    for sname, scores, check_add, check_mf, derive in scaled:
+    for sname, scores, cond_add, cond_mf, derive in scaled:
         for wname, wrap in wraps:
             sm = lambda inner: wrap(  # noqa: E731, B023
                 Op.make("softmax", inner, dim="SD")
@@ -1261,7 +1252,7 @@ def _make_sdpa_fold_rules() -> list:
                     Op.make("sdpa", "Q", "K", "V", "M", scale="SC"),
                     law="softmax(qk^T s + m) v is sdpa — the additive mask is "
                     "the kernel's attn_mask argument.",
-                    check=check_add,
+                    cond=cond_add,
                     derive=derive,
                     tags=_FUS,
                 )
@@ -1285,7 +1276,7 @@ def _make_sdpa_fold_rules() -> list:
                     law="masked_fill(m, -inf) before softmax is a boolean "
                     "attn_mask — logical_not turns the fill-mask into "
                     "SDPA's keep-mask.",
-                    check=check_mf,
+                    cond=cond_mf,
                     derive=derive,
                     tags=_FUS,
                 )
@@ -1295,6 +1286,10 @@ def _make_sdpa_fold_rules() -> list:
 
 SDPA_FOLD_RULES: list = _make_sdpa_fold_rules()
 
+#: Scalar factor as data — the bound term's shape is ``()``.  (Same
+#: verdict as ``base._is_scalar``.)
+_COND_SCALAR = ("scalar", "c")
+
 # matmul(W, mul(x, c)) = mul(matmul(W, x), c)
 # KEY RULE: naturality of scalar multiplication w.r.t. linear maps.
 # Lets the optimizer slide an elementwise scaling past a matmul.
@@ -1303,7 +1298,7 @@ NATURALITY_SCALAR = R(
     Op.make("matmul", "W", Op.make("mul", "x", "c")),
     Op.make("mul", Op.make("matmul", "W", "x"), "c"),
     law="Naturality: scalar multiplication commutes with linear maps.",
-    check=lambda b: _is_scalar(b["c"]),
+    cond=_COND_SCALAR,
     tags=_CAT,
 )
 
@@ -1312,7 +1307,7 @@ NATURALITY_SCALAR_REV = R(
     Op.make("mul", Op.make("matmul", "W", "x"), "c"),
     Op.make("matmul", "W", Op.make("mul", "x", "c")),
     law="Reverse naturality: pull scalar into the matmul's input.",
-    check=lambda b: _is_scalar(b["c"]),
+    cond=_COND_SCALAR,
     tags=_CAT,
     derivation=("naturality_scalar",),
 )

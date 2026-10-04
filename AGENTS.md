@@ -307,9 +307,13 @@ Laws live in `packages/catopt-core/src/catopt_core/laws/` — `tensor.py`
 `R(name, lhs, rhs, law=..., check=..., derive=...)` — lhs/rhs are
 `Op.make` pattern trees; bare `str` leaves are metavariables, `Const`
 leaves are literals, and `str` attr values are attr metavariables bound
-under `"$attr:"` keys.  `check(bound) -> bool` is the side-condition
-hook: `bound` maps each metavar to a resolved member term (use
-`laws.base._shape_of` for shape guards — the matcher cannot see types).
+under `"$attr:"` keys.  Prefer `cond=...` — a declarative side
+condition in `catopt_core.laws.cond` (pure data: `("and", ("rank-eq",
+"a", "b"), ("rank-ge", "a", 2))`, serializable via `cond_to_data`/
+`cond_from_data`; 29 of 54 laws use it) — over `check(bound) -> bool`,
+the escape hatch for conditions the DSL can't express: `bound` maps
+each metavar to a resolved member term (use `laws.base._shape_of` for
+shape guards — the matcher cannot see types).
 `derive(bound) -> dict | None` computes RHS attrs absent from the LHS
 (`{"$attr:SZ": ...}`); `None` vetoes.  Every firing records a witness
 (proof edge + rule provenance) — no extra bookkeeping needed.  Register
