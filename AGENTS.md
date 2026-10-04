@@ -310,7 +310,7 @@ leaves are literals, and `str` attr values are attr metavariables bound
 under `"$attr:"` keys.  Prefer `cond=...` — a declarative side
 condition in `catopt_core.laws.cond` (pure data: `("and", ("rank-eq",
 "a", "b"), ("rank-ge", "a", 2))`, serializable via `cond_to_data`/
-`cond_from_data`; 34 of 61 laws use it) — over `check(bound) -> bool`,
+`cond_from_data`; 35 of 61 laws use it) — over `check(bound) -> bool`,
 the escape hatch for conditions the DSL can't express: `bound` maps
 each metavar to a resolved member term (use `laws.base._shape_of` for
 shape guards — the matcher cannot see types).

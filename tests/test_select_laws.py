@@ -9,9 +9,11 @@ re-layout as ``transpose``.  Elementwise ``mul`` commutes with it:
 
 It is the ``select`` analogue of the layout family's
 ``transpose_pull_mul``.  The shared ``dim``/``index`` attribute
-metavariables make the *matcher* enforce the precondition (both
-operands must read the same index along the same axis), so there is no
-``check`` hook.
+metavariables make the *matcher* enforce the dim/index precondition —
+and a ``dim-eq-attr`` cond guards the residual: ``u``/``v`` must agree
+along ``D``, since broadcasting ``mul(u, v)`` along the *selected*
+axis changes the result (the view-oracle's counterexample:
+``u=(4,), v=(2,4)``).
 
 Covered surface:
 
@@ -156,6 +158,42 @@ def test_select_mul_sound_fp64():
     lhs = u.select(1, 2) * v.select(1, 2)
     rhs = (u * v).select(1, 2)
     assert torch.equal(lhs, rhs)
+
+
+def test_select_mul_broadcast_axis_guard():
+    """``dim-eq-attr`` declines when ``u``/``v`` disagree along ``D``.
+
+    Broadcasting ``mul(u, v)`` along the *selected* axis is the false
+    region: ``u=(4,), v=(2,4)`` gives ``u[0]·v[0]`` (scalar×vector) vs
+    ``(u·v)[0] = u·v[0]`` (elementwise) — genuinely different tensors.
+    Broadcasting on any *other* axis stays allowed.
+    """
+    from catopt_core.laws.cond import eval_cond
+
+    unsafe = {
+        "u": Var("u", TensorType((4,))),
+        "v": Var("v", TensorType((2, 4))),
+        "$attr:D": 0,
+        "$attr:I": 0,
+    }
+    assert not eval_cond(SELECT_MUL.cond, unsafe)
+    assert not SELECT_MUL.check(unsafe)
+    # other-axis broadcast (dim 1: 1 vs 4) — still safe.
+    other_axis = {
+        "u": Var("u", TensorType((2, 1))),
+        "v": Var("v", TensorType((2, 4))),
+        "$attr:D": 0,
+        "$attr:I": 0,
+    }
+    assert SELECT_MUL.check(other_axis)
+    # the numeric counterexample itself.
+    ut = torch.arange(4.0)
+    vt = torch.arange(8.0).reshape(2, 4)
+    assert not torch.equal(ut[0] * vt[0], (ut * vt)[0])
+    # and on the safe shapes the sides really are equal.
+    u2 = torch.randn(2, 4, dtype=torch.float64)
+    v2 = torch.randn(2, 4, dtype=torch.float64)
+    assert torch.equal(u2[0] * v2[0], (u2 * v2)[0])
 
 
 # ---------------------------------------------------------------------------

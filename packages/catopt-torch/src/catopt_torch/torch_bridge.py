@@ -84,16 +84,11 @@ _ATEN_TO_IR: dict[str, str] = {
     "split_with_sizes": "split",
     "unsafe_split": "split",
     "unsafe_split_with_sizes": "split",
-    # In-place scalar fills functionalise to fill_.Tensor (a lifted
-    # 0-dim source) or fill_.Scalar (an inline number) — both are the
-    # ``copy_``-family mutation ``_handle_copy_`` threads, so both
-    # canonicalise to one "fill_" spelling.  masked_fill_ is the
-    # masked sibling — same dispatch, its source is the functional
-    # ``masked_fill`` term over the destination.
-    "fill_.Tensor": "fill_",
-    "fill_.Scalar": "fill_",
-    "masked_fill_.Tensor": "masked_fill_",
-    "masked_fill_.Scalar": "masked_fill_",
+    # fill_.Tensor/fill_.Scalar/masked_fill_* are deliberately NOT in
+    # this table: they are ``copy_``-family mutations, dispatched by
+    # raw-name prefix below (like copy_/zero_ themselves) — a
+    # canonical entry would mint an unbound IR op and break the
+    # binding-coverage contract.
     # torch.special.gammaln exports as aten.special_gammaln — same op
     # as the ``gammaln`` the binding already lowers.
     "special_gammaln": "gammaln",
@@ -265,7 +260,7 @@ def _fill_src(node: Any, dst_fx: Any, env: dict[str, Any]) -> Any:
     shape = tuple(int(d) for d in val.shape)
     dtype = str(val.dtype).split(".")[-1]
     src_fx = node.args[1] if len(node.args) > 1 else None
-    if _aten_name(node.target) == "zero_":
+    if _aten_name(node.target).startswith("zero_"):
         return Op.make("zeros", shape=shape, dtype=dtype)
     if hasattr(src_fx, "name"):
         # KeyError on an unminted source is an honest rejection.
@@ -297,9 +292,9 @@ def _handle_copy_(node: Any, env: dict[str, Any]) -> None:
     if dst is None:
         return
     target = _aten_name(node.target)
-    if target in ("fill_", "zero_"):
+    if target.startswith(("fill_", "zero_")):
         src = _fill_src(node, dst_fx, env)
-    elif target == "masked_fill_":
+    elif target.startswith("masked_fill_"):
         # masked_fill_(dst, mask, v) — the functional ``masked_fill``
         # term over dst is the written value; the view dispatch below
         # scatters it onto the base exactly like a copy_ source.  An
@@ -481,7 +476,9 @@ def export_to_ir(
         elif node.op == "call_function":
             op_name = _aten_name(node.target)
             ir_op = _ATEN_TO_IR.get(op_name, op_name)
-            if ir_op in ("copy_", "fill_", "zero_", "masked_fill_"):
+            if op_name.startswith(
+                ("copy_", "fill_", "zero_", "masked_fill_")
+            ):
                 # Functionalized in-place write ``dst = src`` — the
                 # FX graph is not SSA here: ``copy_``/``fill_``/
                 # ``zero_``/``masked_fill_`` MUTATE dst's tensor and

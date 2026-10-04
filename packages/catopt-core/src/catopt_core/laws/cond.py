@@ -30,6 +30,7 @@ Grammar
           | ("dim-eq", A, i, B, j)   # sa[i] == sb[j]  (None==None ok)
           | ("dim-compat", A, i, B, j)  # sa[i]/sb[j] None-wildcard eq
           | ("dim-eq-const", T, i, k)   # s[i] == k
+          | ("dim-eq-attr", A, K, B, K2)  # sa[K]==sb[K2], Ks are attr metavars
           | ("bcast-into", T, U)     # _broadcast(s_T, s_U) == s_U
           | ("mm-shape-ok", A, B)    # _matmul_shape(sa, sb) not None
           | ("axes-last2", T, D0, D1)   # transpose pair = last-two swap
@@ -309,6 +310,28 @@ def _p_dim_eq_const(args: tuple, bound: dict) -> bool:
     return ok and d == args[2]
 
 
+def _p_dim_eq_attr(args: tuple, bound: dict) -> bool:
+    """``sa[K] == sb[K2]`` — dims named by bound attr metavars.
+
+    ``K``/``K2`` resolve through ``$attr:`` keys to bound ints
+    (negative dims are honored by ``_dim_at``).  Needed for view-
+    commutation guards where the axis is itself pattern-bound —
+    e.g. ``mul(select(u,D,I), select(v,D,I)) == select(mul(u,v),D,I)``
+    only when ``u``/``v`` agree along ``D``, since broadcasting the
+    product along the *selected* axis changes the result.
+    """
+    sa, sb = _tshape(bound, args[0]), _tshape(bound, args[2])
+    if sa is None or sb is None:
+        return False
+    ia = bound.get(f"$attr:{args[1]}")
+    ib = bound.get(f"$attr:{args[3]}")
+    if not isinstance(ia, int) or not isinstance(ib, int):
+        return False
+    ok_a, da = _dim_at(sa, ia)
+    ok_b, db = _dim_at(sb, ib)
+    return ok_a and ok_b and da == db
+
+
 def _p_bcast_into(args: tuple, bound: dict) -> bool:
     small, big = _tshape(bound, args[0]), _shape(bound, args[1])
     return (
@@ -432,6 +455,7 @@ _OPS: dict = {
     "dim-eq": _p_dim_eq,
     "dim-compat": _p_dim_compat,
     "dim-eq-const": _p_dim_eq_const,
+    "dim-eq-attr": _p_dim_eq_attr,
     "bcast-into": _p_bcast_into,
     "mm-shape-ok": _p_mm_shape_ok,
     "axes-last2": _p_axes_last2,

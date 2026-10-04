@@ -250,8 +250,15 @@ SILU_FOLD = R(
 #
 # The shared `dim`/`index` attribute metavariables force both operand
 # selects to read the same index along the same axis, so the matcher
-# enforces the precondition structurally — a mismatched dim/index
-# simply does not match, and no `check` hook is needed.
+# enforces the dim/index precondition structurally.  But that is NOT
+# the whole precondition — `mul(u, v)` broadcasts when u and v
+# disagree, and broadcasting along the *selected* axis changes the
+# result: u=(4,), v=(2,4) makes sel(u,0,0)⊙sel(v,0,0) = u[0]·v[0] a
+# scalar-times-vector, while sel(mul(u,v),0,0) = (u⊙v)[0] is u·v[0]
+# elementwise — different tensors (found by the view-oracle; the 13
+# real sites all happened to have agreeing D-dims, so it never bit).
+# The cond requires shape(u)[D] == shape(v)[D]; broadcasting on other
+# axes is safe (both sides broadcast identically after selection).
 SELECT_MUL = R(
     "select_mul",
     Op.make(
@@ -264,6 +271,7 @@ SELECT_MUL = R(
     "elementwise product of two slices is the slice of the product "
     "(naturality of the elementwise action over the select view).  "
     "Removes one dispatched op per site.",
+    cond=("dim-eq-attr", "u", "D", "v", "D"),
     tags=_SIM,
 )
 
