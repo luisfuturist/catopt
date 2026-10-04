@@ -85,6 +85,7 @@ from catopt_core.laws import ALL_RULES
 # Sibling tools own every stage; reuse them, never duplicate.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import law_evidence as ev_store
 import law_proposal as lp
 from law_impact import (
     TermCase,
@@ -96,7 +97,12 @@ from law_impact import (
     _saturate,
     model_cases,
 )
-from law_shape_census import _op_of, run_census
+from law_shape_census import (
+    _op_of,
+    run_census,
+    shape_key,
+    shape_repr,
+)
 from law_shape_proposal import (
     Schema,
     _sink,
@@ -826,6 +832,38 @@ def measure(
     return ev
 
 
+def _evidence_from_row(proposal: Proposal, row: dict) -> Evidence:
+    """Reconstruct the measured record a cached verdict row carries.
+
+    Two fields are not restored: ``match_term`` is not serializable
+    and ``reach``'s per-model rows are only read as aggregates
+    (``cost_drop`` / ``cert_fail`` / ``closure_ratio``, all stored).
+    Everything the ranking, the report, the JSON dump and the
+    admission emitter consume round-trips verbatim — the emitter
+    binds its test substitutions from ``fire_cases``' live model
+    terms, not ``match_term``.
+    """
+    ev = Evidence(proposal=proposal)
+    ev.census_sites = row["census_sites"]
+    ev.relaxed = row["relaxed"]
+    ev.matches = row["matches"]
+    ev.example = row["example"]
+    nt = row["numeric_true"]
+    ev.num_true = None if nt is None else bool(nt)
+    ev.derivable = bool(row["derivable"])
+    ev.witness = tuple(json.loads(row["witness_json"]))
+    ev.relation = row["relation"]
+    ev.fires = row["fires"]
+    ev.fire_cases = tuple(json.loads(row["fire_cases_json"]))
+    ev.changed = row["changed"]
+    ev.paid = row["paid"]
+    ev.verify_fail = row["verify_fail"]
+    ev.cost_drop = row["drop_pct"] / 100.0
+    ev.cert_fail = row["cert"]
+    ev.closure_ratio = row["enode_ratio"]
+    return ev
+
+
 # ---------------------------------------------------------------------------
 #  Ranking — the deterministic order and the ship verdict
 # ---------------------------------------------------------------------------
@@ -869,7 +907,10 @@ def _search_rules(holdout: str | None) -> list[Rewrite]:
 
 
 def run_pipeline(
-    holdout: str | None = None, vocab: str = "hand"
+    holdout: str | None = None,
+    vocab: str = "hand",
+    evidence_db: str | None = None,
+    use_cache: bool = False,
 ) -> dict:
     """Run census -> propose -> verify -> measure -> rank.
 
@@ -880,6 +921,13 @@ def run_pipeline(
     ``"hand"`` (the ``_POINTWISE`` / ``_VIEW_OPS`` tuples) or
     ``"derived"`` (property-classified over the corpus by
     ``tools/law_vocab.py``).
+
+    ``evidence_db`` opts into the evidence store
+    (``tools/law_evidence.py``): after the run every candidate and
+    verdict is upserted under a ``(corpus, rules, code)`` content
+    key.  ``use_cache`` additionally serves verdicts already recorded
+    for *this* key — a hit skips ``measure`` entirely, which is sound
+    because a verdict is deterministic given its scope.
     """
     base_rules = _search_rules(holdout)
     lib = [lp._key(r.lhs, r.rhs) for r in base_rules]
@@ -896,19 +944,65 @@ def run_pipeline(
     sink = _sink()
     cost_fn = _cost_fn(sink)
 
-    evs = [
-        measure(
-            p,
-            real_terms,
-            models,
-            base_rules,
-            lib,
-            census_op,
-            sink,
-            cost_fn,
+    conn = ev_store.connect(evidence_db) if evidence_db else None
+    corpus_h = rules_h = rev = ""
+    if conn is not None:
+        corpus_h = ev_store.corpus_hash(
+            f"{c.source}:{c.name}:{shape_repr(shape_key(c.term, {}))}"
+            for c in [*bench, *models]
         )
-        for p in proposals
-    ]
+        rules_h = ev_store.rules_hash(
+            repr(lp._key(r.lhs, r.rhs)) for r in base_rules
+        )
+        rev = ev_store.code_rev()
+    cached = (
+        ev_store.latest_verdicts(conn, corpus_h, rules_h, rev)
+        if conn is not None and use_cache
+        else {}
+    )
+    hits = 0
+    evs = []
+    for p in proposals:
+        row = cached.get(repr(lp._key(p.lhs, p.rhs)))
+        if row is not None:
+            evs.append(_evidence_from_row(p, row))
+            hits += 1
+        else:
+            evs.append(
+                measure(
+                    p,
+                    real_terms,
+                    models,
+                    base_rules,
+                    lib,
+                    census_op,
+                    sink,
+                    cost_fn,
+                )
+            )
+    if conn is not None:
+        meta = {
+            "corpus_hash": corpus_h,
+            "rules_hash": rules_h,
+            "code_rev": rev,
+            "run_id": ev_store.new_run_id(),
+            "holdout": holdout or "",
+            "ts": ev_store.now(),
+        }
+        ev_store.record_run(
+            conn,
+            meta,
+            (
+                ev_store.verdict_row(
+                    repr(lp._key(ev.proposal.lhs, ev.proposal.rhs)),
+                    ev,
+                    op_repr(ev.proposal.lhs),
+                    op_repr(ev.proposal.rhs),
+                )
+                for ev in evs
+            ),
+        )
+        conn.close()
     ranked = rank(evs)
     return {
         "holdout": holdout,
@@ -928,6 +1022,21 @@ def run_pipeline(
         # Kept out of the JSON dump (terms are not serializable); the
         # admission emitter reads the firing case for its e2e test.
         "models": models,
+        # The evidence-store cache record; None when --evidence-db is
+        # not given.
+        "cache": (
+            {
+                "db": evidence_db,
+                "hits": hits,
+                "total": len(proposals),
+                "code_rev": rev,
+                "corpus_hash": corpus_h[:12],
+                "rules_hash": rules_h[:12],
+                "use_cache": use_cache,
+            }
+            if evidence_db
+            else None
+        ),
     }
 
 
@@ -1023,6 +1132,19 @@ def _print_report(result: dict, top: int) -> None:
         f"{c['n_op_tuples']} op-tuples, {c['n_shapes']} shapes"
     )
     print(f"   proposals: {result['proposals']}")
+    cache = result.get("cache")
+    if cache is not None:
+        line = (
+            f"   evidence db: {cache['db']} "
+            f"(rev {cache['code_rev']}, corpus {cache['corpus_hash']}, "
+            f"rules {cache['rules_hash']})"
+        )
+        if cache["use_cache"]:
+            line += (
+                f" — {cache['hits']}/{cache['total']} "
+                "verdicts served from cache"
+            )
+        print(line)
     ship = [e for e in ranked if e.shippable]
     print(
         f"   firing on a real model: "
@@ -1109,6 +1231,7 @@ def _dump_json(path: str, result: dict) -> None:
         "census": result["census"],
         "proposals": result["proposals"],
         "held_out": result["held_out"],
+        "cache": result.get("cache"),
         "ranked": [
             {
                 "rank": i,
@@ -1174,9 +1297,34 @@ def main(argv: list[str] | None = None) -> int:
         help="output directory for --emit-admission "
         "(default: %(default)s)",
     )
+    parser.add_argument(
+        "--evidence-db",
+        metavar="PATH",
+        help="sqlite evidence store (tools/law_evidence.py): upsert "
+        "candidates + verdicts after the run, keyed by corpus/rule/"
+        "code content hashes.  Keep PATH outside tools/ — untracked "
+        "code-path files are hashed into the cache key",
+    )
+    parser.add_argument(
+        "--use-evidence-cache",
+        action="store_true",
+        help="serve verdicts already recorded in --evidence-db for "
+        "this corpus/rule-set/code-revision key instead of "
+        "re-measuring them",
+    )
     args = parser.parse_args(argv)
 
-    result = run_pipeline(args.holdout, args.vocab)
+    if args.use_evidence_cache and not args.evidence_db:
+        print(
+            "note: --use-evidence-cache without --evidence-db — "
+            "nothing to read, measuring fresh"
+        )
+    result = run_pipeline(
+        args.holdout,
+        args.vocab,
+        evidence_db=args.evidence_db,
+        use_cache=bool(args.use_evidence_cache and args.evidence_db),
+    )
     _print_report(result, args.top)
     if args.json:
         _dump_json(args.json, result)
