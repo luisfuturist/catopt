@@ -84,3 +84,40 @@ Measured 2026-10-02T00:40:26+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git 
 
 Measured 2026-10-02T00:22:06+00:00 on 12th Gen Intel(R) Core(TM) i5-12500H (git `ba38bd9` (dirty)) — baseline [`bench/baselines/reassoc_scale.json`](../bench/baselines/reassoc_scale.json).
 
+## Tooling-level measurements (hand-maintained)
+
+The sections above are generated from the pinned baselines —
+`python -m bench results` rewrites this file.  The rows below are
+*not* generated: the measurements live in `tools/` and are recorded
+in the retros, not in `bench/baselines/` — re-append this section
+after regenerating.
+
+All measured on the dev box (RTX 2050 / i5-12500H, fp64 — same
+hardware class as the baselines); magnitudes do not extrapolate to
+datacenter hardware:
+
+| measurement | result | tool | retro |
+|---|---|---|---|
+| `softmax_fold` on `ManualSoftmaxAttention` | **+13–27% eager, +29–48% CUDA-graph** vs raw | `tools/law_wallclock.py` | [law-wallclock-verification](../project/retros/law-wallclock-verification.md) |
+| `select_mul` marginal (optimized vs law-ablated) | **faster in 19/20 measurements** | `tools/law_wallclock.py` | [law-wallclock-verification](../project/retros/law-wallclock-verification.md) |
+| executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (uncorrected picks ran 2–3× slower) | `tools/executor_cost_probe.py` | [executor-pricing-fix](../project/retros/executor-pricing-fix.md) |
+| `silu_fold` on the bench case | **−53–55% modeled cost, 1.43–2.62× wall-clock** | `bench run law_bench` | [three-cell-mediator](../project/retros/three-cell-mediator.md) |
+| contraction player, n=40 vs `opt_einsum` | **~1.04× of randomised greedy** (≥200 ms budgets); **0.68–0.73× deterministic greedy** (1 s) | `tools/contraction_einsum.py` | [contraction-train-scale](../project/retros/contraction-train-scale.md) |
+| pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `tools/law_pipeline.py --holdout` | [law-proposer-extensions](../project/retros/law-proposer-extensions.md), [groupnorm-convnext-corpus](../project/retros/groupnorm-convnext-corpus.md) |
+| coherence catalogue over `ALL_RULES` (54) | **40 axioms / 12 lemmas / 2 redundant; divergence 0** | `tools/law_coherence.py --emit-basis` | [axiom-lemma-split](../project/retros/axiom-lemma-split.md) |
+| evidence store, second run | **50/50 verdicts cached; 128 s → 6.6 s (~19×)** | `tools/law_pipeline.py --evidence-db` | [evidence-store](../project/retros/evidence-store.md) |
+
+Two reconciliation notes:
+
+- **The contraction "~1.8×" claim is stale.**  Early numbers had
+  the learned policy at 1.54–1.78× of `opt_einsum`'s randomised
+  greedy at n=40; training at scale (the curriculum regime that
+  shipped as `catopt_torch.load_contraction_policy()`) narrowed the
+  gap to ~1.04× at adequate budgets — the figure in the table above.
+- **The `bounded_e2e` baseline's headline is vs eager** (best
+  1.322×, above).  Its per-cell `speedup_vs_inductor` spans
+  0.94–1.25 (1.16–1.25 over the budgets that delivered a bounded
+  member) — so the README's "1.15–1.32× vs Inductor" is not the
+  pinned baseline's literal column: the 1.32 is vs eager and the
+  vs-Inductor delivered range tops out at 1.25 on this baseline.
+

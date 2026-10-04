@@ -61,23 +61,37 @@ mod = opt.lower(res, x, verify=True).module
 Two consumption levels, both through the existing `cost_fn=` seam
 (no new pipeline parameter):
 
-* `executor_cost_for(profile)` — measured constants only: per-op
-  prices calibrated, the `_carrier_upgrade` comparison corrected by
-  the profile's `corrections`/`measured_ns` tables (the `profile`
-  marker `backend_cost` forwards into `_select_best_term`).
-* `delivered_cost_for(profile, x=x)` — additionally bills each term
+* `catopt_core.cost.executor_cost_for(profile)` — measured
+  constants only: per-op prices calibrated, the `_carrier_upgrade`
+  comparison corrected by the profile's `corrections`/`measured_ns`
+  tables (the `profile` marker `backend_cost` forwards into
+  `_select_best_term`).
+* `catopt_orchestrator.delivered_cost_for(profile=None, *, x=None,
+  bucket=None, compiled=False)` — additionally bills each term
   under the lowering it would actually be delivered by (batched
-  carrier vs generic), corrected by the measured factors under
-  `shape_bucket(x)`.  The delivered-aware extraction model the SSM
-  routing inversion needs — measured-slower batched deliveries stop
-  winning extraction.  Non-additive at carrier roots (documented
-  caveat, same as `fused_cost_for`).
+  carrier vs generic; `compiled=True` bills every term under the
+  fusion-region model), corrected by the measured factors under the
+  `shape_bucket`.  `x=` derives the bucket the corrections were
+  recorded under — an explicit `bucket=` wins; `bucket=None` keeps
+  the delivered-aware but *uncalibrated* comparison.  The
+  delivered-aware extraction model the SSM routing inversion needs —
+  measured-slower batched deliveries stop winning extraction.
+  Non-additive at carrier roots (documented caveat, same as
+  `fused_cost_for` and `lowering_aware_cost_for`).
 
-Corrections are per `(route, shape_bucket)` and clamped to
+Corrections are per `(route, shape_bucket)` — pooled geomean
+factors, consumed only at `n >= 2` observations — and clamped to
 `[0.1, 10]`; the executor-correction phase needs CUDA
-(`--skip-executor-corrections` writes a constants-only profile).
-`profile.save()` / `TargetProfile.load(name)` persist under
-`~/.cache/catopt/profiles`.
+(`--skip-executor-corrections` writes a constants-only profile on
+any machine).  `--input-device` keys the corrections' bucket to the
+device searches will run on (default `cpu`, the probe's convention —
+cross-device buckets never interpolate); `--dtype` (default
+`float64`), `--device`, `--name`, `--cases`, `--warmup`, `--iters`
+and `--quick` bound the sweeps.  `profile.save()` / `--save` persist
+under `profiles_dir()` (`$CATOPT_PROFILE_DIR`, else
+`$XDG_CACHE_HOME/catopt/profiles`, else `~/.cache/catopt/profiles`);
+`TargetProfile.load(name_or_path)` reads a profile name back from
+that dir or an explicit file path.
 
 ## The frontier — `catopt_core.pareto`
 
@@ -155,6 +169,7 @@ The ports are not decoration; each is reached from a real call:
 |---|---|
 | `Policy` | `EGraph.run(..., policy=)` — the schedule consults it once per iteration; `search(..., policy=...)` threads it through |
 | `Profiler` + `PerformanceModel` | `PredictedCriterion` — pass it as `criteria=` to price extraction by predicted runtime |
+| `TargetProfile` (measured) | `cost_fn=delivered_cost_for(profile, x=x)` on `search` — extraction and the `_carrier_upgrade` comparison both price off the measured tables (the `profile` marker forwards through `backend_cost`) |
 | `pareto` | `SearchResult.frontier(cost_fns)` — the non-dominated set over named axes |
 
 ```python
@@ -163,6 +178,7 @@ from catopt_core.perf_model import AnalyticalPerformanceModel
 from catopt_core.policies import GreedyPolicy
 from catopt_orchestrator import PredictedCriterion
 from catopt_orchestrator.optimize import search
+from catopt_torch.adapters import TorchSource
 
 res = search(
     model, x,
