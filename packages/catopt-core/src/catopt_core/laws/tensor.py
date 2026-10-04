@@ -301,7 +301,68 @@ SOFTMAX_FOLD = R(
 
 # ---------------------------------------------------------------------------
 #  Distributivity / naturality (the categorical insight)
+#
+#  RANK GUARD.  ``matmul`` contracts a rank>=2 right operand's axis -2
+#  but a rank-1 operand's ONLY axis, while ``add`` broadcast-aligns
+#  TRAILING axes.  Summing a vector with a rank>=2 addend therefore
+#  lands the vector's contraction index on the partner's OUTPUT axis
+#  and bilinearity fails:
+#
+#      x(16,)@a(16,) + x(16,)@b(16,16)  !=  x @ (a+b)
+#
+#  — the scalar dot product broadcasts across the matvec's output axis
+#  (max diff ~13 on randn; verified in
+#  project/retros/matmul-unsound-fix.md).  Equal-rank addends align
+#  axis-for-axis; two rank>=2 addends may still differ in rank —
+#  broadcast then only replicates leading/batch axes, never realigning
+#  axis -2, so the law holds.  The check vetoes only the provable
+#  mismatch (both shapes must be KNOWN — an unshaped member cannot
+#  prove its contraction axes align, so it declines, the same strict
+#  posture as layout's ``_check_commute_binary``).  The LEFT-operand
+#  pair (``right_distribute``/``right_factor``) needs no guard: there
+#  the contraction axis IS the last axis for every rank — exactly the
+#  axis broadcast aligns.
 # ---------------------------------------------------------------------------
+
+
+def _mm_rhs_addends_aligned(sa: tuple, sb: tuple) -> bool:
+    """Whether two ``add`` addends keep the matmul contraction axis aligned.
+
+    Equal ranks align every axis pairwise.  Two rank>=2 addends may
+    differ: broadcast then pads/replicates leading axes only, leaving
+    each operand's axis -2 (the contraction axis) paired with the
+    other's.  A rank-1 addend's only axis is BOTH its contraction axis
+    and its broadcast tail — against a rank>=2 partner it lands on the
+    partner's output axis, so the identity is false on every evaluable
+    binding of that shape.  Scalar addends can never feed matmul.
+    """
+    ra, rb = len(sa), len(sb)
+    if ra == 0 or rb == 0:
+        return False
+    return ra == rb or min(ra, rb) >= 2
+
+
+def _check_mm_rhs_addends(bound: dict) -> bool:
+    """Rank guard for ``distribute_matmul_over_add`` / ``factor_matmul``."""
+    sa, sb = _shape_of(bound.get("a")), _shape_of(bound.get("b"))
+    if not (isinstance(sa, tuple) and isinstance(sb, tuple)):
+        return False
+    return _mm_rhs_addends_aligned(sa, sb)
+
+
+def _check_mm_rhs_weights(bound: dict) -> bool:
+    """Rank guard for the shared-input weight merges (``W``/``W2``).
+
+    Same contraction-axis alignment on the summed operands; applied to
+    the ``linear`` spellings too — mathematically safe there (a
+    weight's contraction axis is its last, the broadcast axis), but a
+    rank-mixed weight sum mints a member ``F.linear`` cannot lower.
+    """
+    sw, sw2 = _shape_of(bound.get("W")), _shape_of(bound.get("W2"))
+    if not (isinstance(sw, tuple) and isinstance(sw2, tuple)):
+        return False
+    return _mm_rhs_addends_aligned(sw, sw2)
+
 
 # matmul(W, a + b) = matmul(W, a) + matmul(W, b)
 DISTRIBUTE_MUL = R(
@@ -311,6 +372,7 @@ DISTRIBUTE_MUL = R(
         "add", Op.make("matmul", "W", "a"), Op.make("matmul", "W", "b")
     ),
     law="Distributivity of linear maps over addition (bilinearity).",
+    check=_check_mm_rhs_addends,
     tags=_CAT,
 )
 
@@ -322,6 +384,7 @@ FACTOR_MUL = R(
     ),
     Op.make("matmul", "W", Op.make("add", "a", "b")),
     law="Factoring common linear maps (reverse distributivity).",
+    check=_check_mm_rhs_addends,
     tags=_CAT,
 )
 
@@ -362,6 +425,7 @@ WEIGHT_FACTOR = R(
     ),
     Op.make("matmul", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input projections: x@W1 + x@W2 = x@(W1+W2).",
+    check=_check_mm_rhs_weights,
     tags=_CAT,
 )
 
@@ -373,6 +437,7 @@ WEIGHT_DISTRIBUTE = R(
         "add", Op.make("matmul", "x", "W"), Op.make("matmul", "x", "W2")
     ),
     law="Reverse weight merge (lets eqsat weigh fused vs split forms).",
+    check=_check_mm_rhs_weights,
     tags=_CAT,
 )
 
@@ -392,6 +457,7 @@ WEIGHT_FACTOR_LINEAR = R(
     Op.make("linear", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input nn.Linears: linear(x,W1)+linear(x,W2)"
     " = linear(x, W1+W2)  (transpose distributes over +).",
+    check=_check_mm_rhs_weights,
     tags=_CAT,
 )
 
@@ -547,6 +613,7 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
         "add", Op.make("linear", "x", "W"), Op.make("linear", "x", "W2")
     ),
     law="Expand a merged nn.Linear so eqsat can compare both forms.",
+    check=_check_mm_rhs_weights,
     tags=_CAT,
 )
 
@@ -563,6 +630,34 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
 #  compiler cannot produce it because it must RESHAPE PARAMETERS, which
 #  lies outside kernel fusion.
 # ---------------------------------------------------------------------------
+
+
+def _check_fuse_pair(bound: dict) -> bool:
+    """Check the paired weights share a provably-equal shape.
+
+    ``concat(A, B, dim=0)`` then ``chunk(·, 2, dim=-1)`` recovers each
+    projection exactly only when the two weights agree on EVERY axis —
+    unequal output dims mis-split the fused GEMM (A (o,i), B (o2,i)
+    with o != o2 makes the first chunk straddle the A/B boundary), and
+    a rank mismatch fails concat outright.  ``None`` dims are
+    wildcards — only provable mismatches are vetoed.  Without the
+    guard a broadcastable-but-unequal pair (A (4,i), B (1,i)) — whose
+    LHS DOES evaluate — minted a member whose mul operands do not even
+    broadcast (the same matcher-cannot-see-shapes class as the
+    matmul-addend rank guard above).
+    """
+    sa, sb = _shape_of(bound.get("A")), _shape_of(bound.get("B"))
+    if not (
+        isinstance(sa, tuple)
+        and isinstance(sb, tuple)
+        and len(sa) == len(sb)
+    ):
+        return False
+    return all(
+        da is None or db is None or da == db
+        for da, db in zip(sa, sb, strict=True)
+    )
+
 
 # silu(x@A.T) * (x@B.T)  ->  y = x@[A;B].T ; silu(y[..., :d]) * y[..., d:]
 # The fused linear term is shared (the e-graph stores it once); both
@@ -599,6 +694,7 @@ SWIGLU_FUSE = R(
     law="Product universal property: <f,g> = (f x g) . Delta.  Two "
     "projections of the same input are ONE GEMM into V x V, then "
     "project.  (Fused SwiGLU gate/up — MergedColumnParallelLinear.)",
+    check=_check_fuse_pair,
     tags=_SUB,
 )
 
@@ -629,6 +725,7 @@ PARALLEL_MUL_FUSE = R(
     ),
     law="Pairing without a gate nonlinearity: mul(<pi1 f>, <pi2 g>) "
     "recovers the parallel-product form.",
+    check=_check_fuse_pair,
     tags=_SUB,
 )
 
