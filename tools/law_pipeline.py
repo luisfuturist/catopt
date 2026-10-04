@@ -939,7 +939,14 @@ def run_pipeline(
 
     bench, _be = _bench_cases()
     models, _me = model_cases()
-    real_terms = [c.term for c in [*bench, *models]]
+    # The side-file census (tools/law_intake.py): exported workloads
+    # union into the matcher terms; the probe-eligible subset joins
+    # the firing/reach stage.  No file -> both lists are empty.
+    import law_intake as li
+
+    intake = li.load_cases()
+    probe = [*models, *li.probe_cases()]
+    real_terms = [c.term for c in [*bench, *models, *intake]]
     proposals = propose(census_op, real_terms, vocab)
     sink = _sink()
     cost_fn = _cost_fn(sink)
@@ -949,7 +956,7 @@ def run_pipeline(
     if conn is not None:
         corpus_h = ev_store.corpus_hash(
             f"{c.source}:{c.name}:{shape_repr(shape_key(c.term, {}))}"
-            for c in [*bench, *models]
+            for c in [*bench, *models, *intake]
         )
         rules_h = ev_store.rules_hash(
             repr(lp._key(r.lhs, r.rhs)) for r in base_rules
@@ -972,7 +979,7 @@ def run_pipeline(
                 measure(
                     p,
                     real_terms,
-                    models,
+                    probe,
                     base_rules,
                     lib,
                     census_op,
@@ -1010,6 +1017,7 @@ def run_pipeline(
         "n_search_rules": len(base_rules),
         "n_bench": len(bench),
         "n_models": len(models),
+        "n_intake": len(intake),
         "census": {
             "n_terms": census["n_terms"],
             "n_op_nodes": census["n_op_nodes"],
@@ -1021,7 +1029,7 @@ def run_pipeline(
         "held_out": _held_out(ranked, holdout),
         # Kept out of the JSON dump (terms are not serializable); the
         # admission emitter reads the firing case for its e2e test.
-        "models": models,
+        "models": probe,
         # The evidence-store cache record; None when --evidence-db is
         # not given.
         "cache": (
@@ -1125,7 +1133,8 @@ def _print_report(result: dict, top: int) -> None:
     print(f"   op vocabulary: {result.get('vocab', 'hand')}")
     print(
         f"   corpus: {result['n_bench']} bench + "
-        f"{result['n_models']} models"
+        f"{result['n_models']} models + "
+        f"{result.get('n_intake', 0)} intake"
     )
     print(
         f"   census: {c['n_op_nodes']} op nodes, "
@@ -1228,6 +1237,7 @@ def _dump_json(path: str, result: dict) -> None:
         "n_search_rules": result["n_search_rules"],
         "n_bench": result["n_bench"],
         "n_models": result["n_models"],
+        "n_intake": result.get("n_intake", 0),
         "census": result["census"],
         "proposals": result["proposals"],
         "held_out": result["held_out"],

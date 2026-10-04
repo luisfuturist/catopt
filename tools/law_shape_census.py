@@ -84,6 +84,9 @@ def corpus() -> list[CorpusTerm]:
     Reuses ``law_impact``'s builders so the census and the impact
     probe read byte-identical graphs.  A builder that raised is
     already reported by ``law_impact``; here it is simply absent.
+    When ``tools/intake_corpus.json`` exists (written by
+    ``tools/law_intake.py``), the ingested workloads union in under
+    the ``"intake"`` source — the side-file census.
     """
     bench, _be = _bench_cases()
     models, _me = model_cases()
@@ -92,6 +95,12 @@ def corpus() -> list[CorpusTerm]:
         out.append(CorpusTerm("bench", c.name, c.term))
     for c in models:
         out.append(CorpusTerm("model", c.name, c.term))
+    # Lazy sibling import: law_intake already imports this module's
+    # census functions, so a top-level import would be circular.
+    from law_intake import load_cases
+
+    for c in load_cases():
+        out.append(CorpusTerm("intake", c.name, c.term))
     return out
 
 
@@ -339,6 +348,7 @@ def run_census(top: int = _DEFAULT_TOP) -> dict:
         "n_terms": len(terms),
         "n_bench": sum(1 for t in terms if t.source == "bench"),
         "n_models": sum(1 for t in terms if t.source == "model"),
+        "n_intake": sum(1 for t in terms if t.source == "intake"),
         "n_op_nodes": sum(op_counts.values()),
         "n_shapes": len(sh_counts),
         "op_tuples": [
@@ -390,7 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"   corpus: {len(terms)} terms "
         f"({sum(1 for t in terms if t.source == 'bench')} bench, "
-        f"{sum(1 for t in terms if t.source == 'model')} models)"
+        f"{sum(1 for t in terms if t.source == 'model')} models, "
+        f"{sum(1 for t in terms if t.source == 'intake')} intake)"
     )
     print(
         f"   {sum(op_counts.values())} op nodes, "
