@@ -299,6 +299,7 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             | "select_scatter"
             | "batch_norm"
             | "group_norm"
+            | "instance_norm"
             | "sort"
             | "topk"
             | "median"
@@ -1349,6 +1350,71 @@ register_shape_rule("bdiag", _bdiag_shape)
 register_shape_rule("parl", _bdiag_shape)
 register_shape_rule("eye", _eye_shape)
 register_shape_rule("cswap", _cswap_shape)
+
+
+def _resize_pair(v: Any) -> tuple | None:
+    """Normalize a resize arg to an (H, W) pair — or ``None``.
+
+    An int/float spells both axes; a >=2-list spells them in order.
+    A bool is not a size/scale (``isinstance(True, int)`` would
+    otherwise read True as extent 1).
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return (v, v)
+    if isinstance(v, (tuple, list)) and len(v) >= 2:
+        return (v[-2], v[-1])
+    return None
+
+
+def _scaled_extent(d: Any, s: Any) -> int | None:
+    """``int(d * s)`` when both are concrete — aten floors it."""
+    if isinstance(d, bool) or isinstance(s, bool):
+        return None
+    if isinstance(d, int) and isinstance(s, (int, float)):
+        return int(d * s)
+    return None
+
+
+def _upsample_nearest2d_shape(
+    op: Op, shapes: list
+) -> tuple | str | None:
+    """``upsample_nearest2d`` — (N,C,H,W) -> (N,C,H',W').
+
+    H'/W' come from the ``size`` attr verbatim, or the input dims
+    scaled by ``scale`` (aten floors ``input*scale``).  A sub-rank-4
+    or attribute-free spelling reports the input shape; a partially
+    known extent reports ``None`` rather than a guess.
+    """
+    base = shapes[0]
+    if not isinstance(base, tuple) or len(base) < 4:
+        return base
+    size = _resize_pair(attr_of(op, "size"))
+    if size is not None:
+        return (base[0], base[1], size[0], size[1])
+    scale = _resize_pair(attr_of(op, "scale"))
+    return (
+        base[0],
+        base[1],
+        _scaled_extent(base[2], scale[0]) if scale else None,
+        _scaled_extent(base[3], scale[1]) if scale else None,
+    )
+
+
+def _lstm_input_shape(op: Op, shapes: list) -> tuple | str | None:
+    """``lstm.input`` — the heterogeneous (output, h_n, c_n) triple.
+
+    Element shapes differ — (…, D·H), (D·L, N, H), (D·L, N, H) — so
+    no single shape describes it, and the same-shape element
+    convention the pair ops (topk/sort) lean on does not apply.
+    Honest unknown rather than x's shape.
+    """
+    return None
+
+
+register_shape_rule("upsample_nearest2d", _upsample_nearest2d_shape)
+register_shape_rule("lstm.input", _lstm_input_shape)
 
 
 # ---------------------------------------------------------------------------

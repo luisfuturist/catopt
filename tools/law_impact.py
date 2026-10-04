@@ -284,6 +284,21 @@ def _bench_cases() -> tuple[list[TermCase], list[str]]:
     return out, errors
 
 
+class _LSTMSeq(torch.nn.Module):
+    """``nn.LSTM`` reading the triple's output element.
+
+    The ``lstm.input`` corpus-expansion-r2 gap, now bound.
+    """
+
+    def __init__(self, in_f: int, hid: int) -> None:
+        super().__init__()
+        self.lstm = torch.nn.LSTM(in_f, hid)
+
+    def forward(self, x):
+        y, _ = self.lstm(x)
+        return y
+
+
 def _model_cases() -> list[tuple[str, Any, Any]]:
     """Return ``(name, model, example_input)`` for the real graphs."""
     from catopt_torch import models as M
@@ -441,6 +456,28 @@ def _model_cases() -> list[tuple[str, Any, Any]]:
             "TwoLayerHybrid",
             H.TwoLayerHybrid(8, 8, 8, 4, 2).eval().double(),
             st,
+        ),
+        # The corpus-expansion-r2 intake gaps — now bound.
+        (
+            "InstanceNorm",
+            torch.nn.InstanceNorm2d(
+                8, affine=True, track_running_stats=True
+            )
+            .eval()
+            .double(),
+            img,
+        ),
+        (
+            "UpsampleNearest",
+            torch.nn.Upsample(scale_factor=2, mode="nearest")
+            .eval()
+            .double(),
+            img,
+        ),
+        (
+            "LSTMSeq",
+            _LSTMSeq(16, 8).eval().double(),
+            torch.randn(4, 2, 16, dtype=torch.float64),
         ),
     ]
 

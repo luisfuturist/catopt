@@ -610,6 +610,94 @@ BINDING_CASES = [
         {"num_groups": 4},
         lambda x: F.group_norm(x, 4),
     ),
+    # instance_norm's operand layout: the affine pair leads, the
+    # running-stats pair tails iff use_input_stats is False.
+    (
+        "instance_norm",
+        (_t(2, 4, 4), _t(4), _t(4)),
+        {"use_input_stats": True, "eps": 1e-4},
+        lambda x, w, b: F.instance_norm(
+            x, weight=w, bias=b, use_input_stats=True, eps=1e-4
+        ),
+    ),
+    (
+        "instance_norm",
+        (_t(2, 4, 4),),
+        {"use_input_stats": True},
+        lambda x: F.instance_norm(x, use_input_stats=True),
+    ),
+    # A lone mid operand reads as weight (batch_norm's convention).
+    (
+        "instance_norm",
+        (_t(2, 4, 4), _t(4)),
+        {"use_input_stats": True},
+        lambda x, w: F.instance_norm(x, weight=w, use_input_stats=True),
+    ),
+    # use_input_stats=False: the tail pair is (running_mean,
+    # running_var) — the eval-mode export of track_running_stats.
+    (
+        "instance_norm",
+        (_t(2, 4, 4), _t(4).abs() + 0.5, _t(4).abs() + 0.5),
+        {"use_input_stats": False},
+        lambda x, rm, rv: F.instance_norm(
+            x, rm, rv, use_input_stats=False
+        ),
+    ),
+    (
+        "instance_norm",
+        (_t(2, 4, 4), _t(4), _t(4), _t(4).abs() + 0.5, _t(4).abs() + 0.5),
+        {"use_input_stats": False, "momentum": 0.2},
+        lambda x, w, b, rm, rv: F.instance_norm(
+            x, rm, rv, w, b, False, 0.2, 1e-5
+        ),
+    ),
+    # upsample_nearest2d — the canonical size/scale attr spellings.
+    (
+        "upsample_nearest2d",
+        (_t(2, 4, 8, 8),),
+        {"size": (16, 16)},
+        lambda x: F.interpolate(x, size=(16, 16), mode="nearest"),
+    ),
+    (
+        "upsample_nearest2d",
+        (_t(2, 4, 8, 8),),
+        {"scale": (2.0, 3.0)},
+        lambda x: F.interpolate(
+            x, scale_factor=(2.0, 3.0), mode="nearest"
+        ),
+    ),
+    # Scalar spellings broadcast to the (H, W) pair.
+    (
+        "upsample_nearest2d",
+        (_t(2, 4, 8, 8),),
+        {"size": 16},
+        lambda x: F.interpolate(x, size=(16, 16), mode="nearest"),
+    ),
+    (
+        "upsample_nearest2d",
+        (_t(2, 4, 8, 8),),
+        {"scale": 2.0},
+        lambda x: F.interpolate(x, scale_factor=(2.0, 2.0), mode="nearest"),
+    ),
+    # lstm.input — the (x, h0, c0, *params) operand tail, returning
+    # the (output, h_n, c_n) triple.
+    (
+        "lstm.input",
+        (_t(2, 5, 8), _t(1, 2, 6), _t(1, 2, 6),
+         _t(24, 8), _t(24, 6), _t(24), _t(24)),
+        {
+            "has_biases": True,
+            "num_layers": 1,
+            "dropout": 0.0,
+            "train": False,
+            "bidirectional": False,
+            "batch_first": True,
+        },
+        lambda x, h0, c0, w1, w2, b1, b2: torch.ops.aten.lstm.input(
+            x, [h0, c0], [w1, w2, b1, b2], True, 1, 0.0, False,
+            False, True
+        ),
+    ),
     (
         "conv1d",
         (_t(1, 3, 8), _t(4, 3, 3), _t(4)),
@@ -846,7 +934,51 @@ SHAPE_CASES = [
     (("sort", [(2, 4)], {"dim": -1}), (2, 4)),
     (("topk", [(2, 4)], {"k": 2, "dim": -1}), (2, 4)),
     (("batch_norm", [(2, 4, 4)], {}), (2, 4, 4)),
+    (("instance_norm", [(2, 4, 4)], {"use_input_stats": True}), (2, 4, 4)),
     (("_assert_tensor_metadata", [(2, 4)], {}), (2, 4)),
+    # upsample_nearest2d — the size attr spells the output extents;
+    # scale multiplies them (aten floors input*scale); neither known
+    # -> (N,C,?,?) extents unknown.
+    (
+        ("upsample_nearest2d", [(2, 4, 8, 8)], {"size": (16, 16)}),
+        (2, 4, 16, 16),
+    ),
+    (
+        ("upsample_nearest2d", [(2, 4, 8, 8)], {"scale": (2.0, 3.0)}),
+        (2, 4, 16, 24),
+    ),
+    (
+        ("upsample_nearest2d", [(2, 4, 8, 8)], {"scale": 2.0}),
+        (2, 4, 16, 16),
+    ),
+    (("upsample_nearest2d", [(2, 4, 8, 8)], {}), (2, 4, None, None)),
+    # A lone-element list cannot spell the (H, W) pair — unknown.
+    (
+        ("upsample_nearest2d", [(2, 4, 8, 8)], {"scale": (1.5,)}),
+        (2, 4, None, None),
+    ),
+    # A bool is not a scale (isinstance(True, int) would read it 1).
+    (
+        ("upsample_nearest2d", [(2, 4, 8, 8)], {"scale": True}),
+        (2, 4, None, None),
+    ),
+    # Unknown input extent -> the scaled extent stays unknown.
+    (
+        ("upsample_nearest2d", [(2, 4, None, 8)], {"scale": (2.0, 2.0)}),
+        (2, 4, None, 16),
+    ),
+    # Sub-rank-4 input: report the input shape.
+    (("upsample_nearest2d", [(2, 4, 8)], {"size": (16, 16)}), (2, 4, 8)),
+    # lstm.input — a heterogeneous (output, h_n, c_n) triple: honest
+    # unknown rather than x's shape.
+    (
+        (
+            "lstm.input",
+            [(2, 5, 8), (1, 2, 6), (1, 2, 6), (24, 8), (24, 6), (24,), (24,)],
+            {"num_layers": 1},
+        ),
+        None,
+    ),
     # reductions
     (("prod", [(2, 4, 3)], {"dim": 1, "keepdim": True}), (2, 1, 3)),
     (("prod", [(2, 4)], {}), ()),
@@ -1425,6 +1557,137 @@ def test_export_mm_bmm_mv_unify_matmul():
     ir, ref, out = _export_and_run(M(), _t(3, 4, 4))
     torch.testing.assert_close(out, ref)
     assert not [o for o in _iter_ops(ir.root) if o.op in ("mm", "bmm")]
+
+
+class _InstanceNormModel(torch.nn.Module):
+    """``nn.InstanceNorm2d`` — the corpus-expansion gap export."""
+
+    def __init__(self, affine: bool, track_running_stats: bool) -> None:
+        super().__init__()
+        self.norm = torch.nn.InstanceNorm2d(
+            4, affine=affine, track_running_stats=track_running_stats
+        )
+        if track_running_stats:
+            self.norm.running_mean.copy_(torch.arange(4.0))
+            self.norm.running_var.copy_(torch.arange(1.0, 5.0))
+
+    def forward(self, x):
+        return self.norm(x)
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("track_running_stats", [True, False])
+def test_export_instance_norm(affine, track_running_stats):
+    """All four affine/track_running_stats combos export the
+    ``instance_norm`` term, carry the canonical scalar attrs, and
+    lower numerically-equal (the running-stats operand pair is
+    present iff use_input_stats is False)."""
+    m = _InstanceNormModel(affine, track_running_stats).eval()
+    x = _t(2, 4, 8, 8)
+    ir, ref, out = _export_and_run(m, x)
+    torch.testing.assert_close(out, ref)
+    (t,) = [o for o in _iter_ops(ir.root) if o.op == "instance_norm"]
+    assert t.attrs["use_input_stats"] is not track_running_stats
+    assert t.attrs["eps"] == pytest.approx(1e-5)
+    assert not any(k.startswith("arg") for k in t.attrs), t.attrs
+    # operands: x + affine pair? + running-stats pair iff eval-stats.
+    assert len(t.args) == 1 + 2 * affine + 2 * track_running_stats
+
+
+class _UpsampleModel(torch.nn.Module):
+    def __init__(self, **kw) -> None:
+        super().__init__()
+        self.up = torch.nn.Upsample(mode="nearest", **kw)
+
+    def forward(self, x):
+        return self.up(x)
+
+
+def test_export_upsample_nearest2d_scale():
+    """``nn.Upsample(scale_factor=2)`` exports
+    ``upsample_nearest2d.vec`` — canonicalized to
+    ``upsample_nearest2d`` with the ``scale`` attr."""
+    m = _UpsampleModel(scale_factor=2).eval()
+    x = _t(2, 4, 8, 8)
+    ir, ref, out = _export_and_run(m, x)
+    torch.testing.assert_close(out, ref)
+    (t,) = [o for o in _iter_ops(ir.root) if o.op == "upsample_nearest2d"]
+    assert t.attrs["scale"] == (2.0, 2.0)
+    assert not any(k.startswith("arg") for k in t.attrs), t.attrs
+
+
+def test_export_upsample_nearest2d_size():
+    """The ``size``-spelled interpolate lands under the ``size``
+    attr of the same canonical op."""
+    m = _UpsampleModel(size=(5, 12)).eval()
+    x = _t(2, 4, 8, 8)
+    ir, ref, out = _export_and_run(m, x)
+    torch.testing.assert_close(out, ref)
+    (t,) = [o for o in _iter_ops(ir.root) if o.op == "upsample_nearest2d"]
+    assert t.attrs["size"] == (5, 12)
+    assert "scale" not in t.attrs
+
+
+class _LstmModel(torch.nn.Module):
+    """``nn.LSTM`` — the (output, h_n, c_n) triple; the model reads
+    element 0 through the ``getitem`` consumer."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__()
+        self.lstm = torch.nn.LSTM(8, 6, **kw)
+
+    def forward(self, x):
+        y, _ = self.lstm(x)
+        return y
+
+
+@pytest.mark.parametrize(
+    "kw", [
+        {"batch_first": True},
+        {},
+        {"batch_first": True, "num_layers": 2},
+        {"batch_first": True, "bidirectional": True},
+    ]
+)
+def test_export_lstm_input(kw):
+    """The ``lstm.input`` term lowers through the aten passthrough —
+    batch_first/seq-first, stacked, and bidirectional exports all
+    verify; the scalar tail lands under canonical names."""
+    m = _LstmModel(**kw).eval()
+    x = _t(2, 5, 8)
+    ir, ref, out = _export_and_run(m, x)
+    torch.testing.assert_close(out, ref)
+    (t,) = [o for o in _iter_ops(ir.root) if o.op == "lstm.input"]
+    assert t.attrs["num_layers"] == kw.get("num_layers", 1)
+    assert t.attrs["batch_first"] == kw.get("batch_first", False)
+    assert t.attrs["bidirectional"] == kw.get("bidirectional", False)
+    assert t.attrs["train"] is False
+    assert not any(k.startswith("arg") for k in t.attrs), t.attrs
+    # the consumer is getitem(0) — the triple's output element.
+    g = [o for o in _iter_ops(ir.root) if o.op == "getitem"]
+    assert g and g[0].args[0] is t
+
+
+def test_new_bindings_are_supported_ops():
+    """supported_ops coverage — the three gap ops are bound, so the
+    backend can lower them (extraction's hard feasibility set)."""
+    from catopt_torch.adapters import TorchSink
+
+    assert {
+        "instance_norm",
+        "upsample_nearest2d",
+        "lstm.input",
+    } <= TorchSink().supported_ops
+
+
+def test_instance_norm_uis_false_without_stats_is_loud():
+    """``use_input_stats=False`` with no running-stat operands is a
+    malformed spelling — the binding must not silently normalize
+    with input stats instead; aten raises."""
+    with pytest.raises(RuntimeError, match="running_mean"):
+        _IR_TO_TORCH["instance_norm"](
+            _t(2, 4, 4), use_input_stats=False
+        )
 
 
 # ---------------------------------------------------------------------------

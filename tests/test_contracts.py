@@ -403,6 +403,7 @@ _LAW_SPECS: dict[str, dict] = {
     "square_expand": {"x": (2, 3)},
     "pow_to_square": {"x": (2, 3)},
     "square_to_pow": {"x": (2, 3)},
+    "mul_square": {"u": (2, 3)},
     # select(u, dim, index) removes `dim`; both selects share dim/index
     "select_mul": {
         "shapes": {"u": (3, 4, 5), "v": (3, 4, 5)},
@@ -518,7 +519,8 @@ _LAW_SPECS: dict[str, dict] = {
 #: chain absorption, the 12 sdpa_fold mask/scale forms), carry
 #: non-tensor carrier values — or bind a metavar to a ``Const`` leaf
 #: the Var-binding spec machinery cannot express (the ``rms_norm_fold``
-#: pair's ``EPS``/``P`` literals).  They are counted, not failed.
+#: pair's ``EPS``/``P`` literals, the rsqrt canonicalizations'
+#: ``ONE``/``P`` literal bindings).  They are counted, not failed.
 _ALL_LAW_RULES = SIMPLIFICATION_RULES + CATEGORICAL_RULES
 
 _LAW_TRIALS = 4

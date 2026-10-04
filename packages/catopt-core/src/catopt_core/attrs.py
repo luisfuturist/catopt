@@ -178,6 +178,36 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
         7: "eps",
         8: "cudnn_enabled",
     },
+    # aten.instance_norm(x, w, b, rm, rv, use_input_stats, momentum,
+    # eps, cudnn) — positions 1-4 are the operand slots (None affine
+    # pair / running stats drop out at export); the scalar tail names
+    # here.  ``use_input_stats`` is semantic: False means "use the
+    # running stats" (the eval-mode export when
+    # track_running_stats=True).
+    "instance_norm": {
+        5: "use_input_stats",
+        6: "momentum",
+        7: "eps",
+        8: "cudnn_enabled",
+    },
+    # aten.upsample_nearest2d.vec(x, output_size, scale_factors) —
+    # the vec overload carries exactly one non-None list; both land
+    # under distinct names so the binding need not discriminate int
+    # vs float.  (aten.upsample_nearest2d.default's lone output_size
+    # arg shares position 1.)
+    "upsample_nearest2d": {1: "size", 2: "scale"},
+    # aten.lstm.input(x, hx[2], params[*], has_biases, num_layers,
+    # dropout, train, bidirectional, batch_first) — positions 1-2 are
+    # tensor LIST operands (flattened into args at export); the
+    # scalar tail names here.
+    "lstm.input": {
+        3: "has_biases",
+        4: "num_layers",
+        5: "dropout",
+        6: "train",
+        7: "bidirectional",
+        8: "batch_first",
+    },
     # aten.slice(t, dim, start, end, step) — the trailing three are
     # the slice bounds/stride, read by typing/the binding.
     "slice": {1: "dim", 2: "start", 3: "end", 4: "step"},

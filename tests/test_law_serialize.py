@@ -9,8 +9,8 @@ This file pins:
   scheme ``rulecache`` persists, round-tripped over every shipped
   pattern);
 * the ``Rewrite`` record round-trip — ``law_to_data`` /
-  ``law_from_data`` — including the exact census of which of the 57
-  shipped laws are *full-data* (39) vs pattern(+cond) with a
+  ``law_from_data`` — including the exact census of which of the 61
+  shipped laws are *full-data* (43) vs pattern(+cond) with a
   ``check`` (2, plus 2 ``check``+``derive``) or ``derive`` (14)
   remainder;
 * the honesty contract — a ``serializable: false`` record rebuilds
@@ -114,7 +114,7 @@ def test_alpha_key_shared_binding_is_position_sensitive():
 
 
 def test_serializability_census_of_shipped_library():
-    """Pin the honest partition of the 57 shipped laws."""
+    """Pin the honest partition of the 61 shipped laws."""
     full, need_derive, need_check = [], [], []
     for rule in ALL_RULES:
         missing = missing_hooks(rule)
@@ -124,8 +124,8 @@ def test_serializability_census_of_shipped_library():
             need_derive.append(rule.name)
         else:
             need_check.append((rule.name, missing))
-    assert len(ALL_RULES) == 57
-    assert len(full) == 39
+    assert len(ALL_RULES) == 61
+    assert len(full) == 43
     assert len(need_derive) == 14
     assert "softmax_fold" in need_derive
     assert "qkv_fuse_asym" in need_derive
@@ -190,7 +190,7 @@ def test_law_record_roundtrip_rewrite_equality_unguarded():
             rebuilt = law_from_data(_json_roundtrip(law_to_data(rule)))
             assert rebuilt == rule, rule.name
             n += 1
-    assert n == 23
+    assert n == 25
 
 
 def test_law_record_flagged_hooks_drop_on_rebuild():

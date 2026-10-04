@@ -505,7 +505,7 @@ def test_cond_data_roundtrip_is_canonical():
 
 
 def test_every_shipped_cond_roundtrips_through_json():
-    """All 32 migrated rules' conds survive the store wire format."""
+    """All 34 cond-carrying rules' conds survive the store wire format."""
     seen = 0
     for rule in all_rules():
         if rule.cond is None:
@@ -522,7 +522,7 @@ def test_every_shipped_cond_roundtrips_through_json():
             cond=json.loads(blob),  # list tree: canonicalized
         )
         assert rebuilt.cond == rule.cond
-    assert seen == 32
+    assert seen == 34
 
 
 def test_rebuilt_rule_fires_identically_in_egraph():
@@ -589,7 +589,7 @@ def test_migrated_rules_carry_cond_and_folded_check():
     migrated = [
         r for r in all_rules() if r.cond is not None
     ]
-    assert len(migrated) == 32
+    assert len(migrated) == 34
     for r in migrated:
         assert callable(r.check), r.name
     # gqa_absorb stays check-only; glu_fold conjoins cond + a

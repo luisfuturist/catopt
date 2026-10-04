@@ -165,6 +165,26 @@ SQUARE_TO_POW = R(
     derivation=("pow_to_square",),
 )
 
+# The x·x → square bridge — ``square_expand``'s definitional inverse
+# and the missing seed direction the RMSNorm fold's ``pow(u, 2)``
+# pattern needs: a graph that spells x² as ``mul(u, u)`` gains a
+# ``square`` member here, and ``square_to_pow`` then carries it into
+# the ``pow`` spelling ``rms_norm_fold``'s LHS pins (the
+# ``mul(x,x)``-spelled source was ``rms-norm-law.md``'s documented
+# miss).  The shared ``u`` metavariable is the whole precondition —
+# the matcher binds both mul operands to the same e-class, so
+# ``mul(u, v)`` never fires, and no check is needed.  Term-local,
+# at most one member per e-class — it does not grow the closure.
+MUL_SQUARE = R(
+    "mul_square",
+    Op.make("mul", "u", "u"),
+    Op.make("square", "u"),
+    law="x·x = square(x): the mul spelling of x² folds to the unary "
+    "kernel — the definitional inverse of square_expand.",
+    tags=_SIM,
+    derivation=("square_expand",),
+)
+
 # SwiGLU bridge: the exported graph has silu(linear(...)) followed by
 # mul with another linear(...).  Expanding silu exposes the common
 # x*sigmoid(x) factor, which lets naturality/distributivity see the
@@ -546,6 +566,62 @@ RMS_NORM_FOLD_NOGAIN = R(
     cond=_COND_RMS_FOLD,
     check=_check_rms_fold_nogain,
     derive=_derive_rms_norm,
+    tags=_SIM,
+)
+
+
+# ---------------------------------------------------------------------------
+#  rsqrt canonicalization — the normalizer's non-canonical spellings.
+#
+#  ``rsqrt`` is the library's canonical reciprocal-root: the RMSNorm
+#  fold pins ``rsqrt(mean(u²)+eps)`` literally, so a corpus graph
+#  spelling the same value as ``1/√(·)`` or ``(·)^-0.5`` could never
+#  match (``rms-norm-law.md``'s caveats recorded both as misses).
+#  These single-direction folds canonicalize both spellings into the
+#  member the kernel fold needs.  Both are numerics-exact — rsqrt is
+#  *defined* as the reciprocal root — and term-local.
+#
+#  The literal checks ride the cond DSL: ``const-cmp`` is a NUMERIC
+#  comparison, so ``Const(1)``/``Const(1.0)`` numerators and
+#  ``Const(-0.5)`` exponents all fold while a ``Var``/``Param``/
+#  non-Const binding declines (the DSL's strict posture — the matcher
+#  cannot see leaf kinds).
+# ---------------------------------------------------------------------------
+
+DIV_SQRT_TO_RSQRT = R(
+    "div_sqrt_to_rsqrt",
+    Op.make("div", "ONE", Op.make("sqrt", "u")),
+    Op.make("rsqrt", "u"),
+    law="1 / sqrt(x) = rsqrt(x): the two-op reciprocal-root spelling "
+    "folds to the dispatched kernel — the canonical form the RMSNorm "
+    "fold's pattern pins.",
+    cond=("const-cmp", "ONE", "==", 1),
+    tags=_SIM,
+)
+
+POW_TO_RSQRT = R(
+    "pow_to_rsqrt",
+    Op.make("pow", "u", "P"),
+    Op.make("rsqrt", "u"),
+    law="pow(x, -0.5) = rsqrt(x): the negative-half-power spelling "
+    "folds to the dispatched kernel — the same canonicalization as "
+    "div_sqrt_to_rsqrt one op-family over.",
+    cond=("const-cmp", "P", "==", -0.5),
+    tags=_SIM,
+)
+
+# The ``1/t`` spelling exports as ``reciprocal(t)`` — aten lowers
+# scalar-over-tensor division to ``reciprocal(t) * 1`` (id_mul strips
+# the unit), so ``1/sqrt(u)`` reaches the graph as
+# ``reciprocal(sqrt(u))``, not the div spelling above.  Fully
+# structural — no check.
+RECIP_SQRT_TO_RSQRT = R(
+    "recip_sqrt_to_rsqrt",
+    Op.make("reciprocal", Op.make("sqrt", "u")),
+    Op.make("rsqrt", "u"),
+    law="reciprocal(sqrt(x)) = rsqrt(x): the exported ``1/sqrt`` "
+    "spelling — aten lowers scalar-over-tensor div to reciprocal — "
+    "folds to the same canonical kernel.",
     tags=_SIM,
 )
 
@@ -1588,11 +1664,15 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     SQUARE_EXPAND,
     POW_TO_SQUARE,
     SQUARE_TO_POW,
+    MUL_SQUARE,
     SELECT_MUL,
     SOFTMAX_FOLD,
     GLU_FOLD,
     RMS_NORM_FOLD,
     RMS_NORM_FOLD_NOGAIN,
+    DIV_SQRT_TO_RSQRT,
+    POW_TO_RSQRT,
+    RECIP_SQRT_TO_RSQRT,
 ]
 
 #: Rules that implement the categorical insight: distributivity and naturality.
@@ -1634,9 +1714,9 @@ CATEGORICAL_RULES: list[Rewrite] = [
 #:
 #: The axiom/lemma split (measured by ``tools/law_coherence.py
 #: --emit-basis``, documented in
-#: ``project/retros/axiom-lemma-split.md``): 43 of these 57 rules are
-#: kernel members — ``kind == "axiom"`` — and 14 carry a recorded
-#: ``derivation`` from the kernel (12 ``"lemma"`` — inverse twins
+#: ``project/retros/axiom-lemma-split.md``): 46 of these 61 rules are
+#: kernel members — ``kind == "axiom"`` — and 15 carry a recorded
+#: ``derivation`` from the kernel (13 ``"lemma"`` — inverse twins
 #: whose direction buys reach, plus the emergent ``silu_mul_form`` —
 #: and 2 ``"redundant"`` alpha-duplicate spellings tagged
 #: ``tags.REDUNDANT``).  The kernel itself is the 32 primitives plus

@@ -110,6 +110,10 @@ _IR_TO_TORCH_EXTRA: dict[str, str] = {
     "amin.default": "amin",
     "scaled_dot_product_attention.default": "sdpa",
     "conv2d.default": "conv2d",
+    # aten.upsample_nearest2d.vec — the two-list overload torch.export
+    # emits for F.interpolate/nn.Upsample in ``nearest`` mode; the
+    # vec suffix is an overload tag, not a different op.
+    "upsample_nearest2d.vec": "upsample_nearest2d",
 }
 
 #: Positional-argument → named-attribute mapping lives in
@@ -748,6 +752,82 @@ def _batch_norm_torch(x: Any, *a: Any, **kw: Any) -> Any:
     )
 
 
+def _instance_norm_torch(x: Any, *a: Any, **kw: Any) -> Any:
+    """``aten.instance_norm`` → F.instance_norm's operand order.
+
+    ``aten.instance_norm(x, w, b, rm, rv, use_input_stats, momentum,
+    eps, cudnn)`` — None operands drop at export, so the operand list
+    is whatever survived: the affine pair fills the leading slots,
+    and the running-stats pair is the tail iff ``use_input_stats`` is
+    False (the eval-mode export of a ``track_running_stats=True``
+    module).  ``cudnn_enabled`` is a dispatch hint, not semantics —
+    F.instance_norm has no such kwarg.
+    """
+    uis = bool(attr_of(kw, "use_input_stats", default=True))
+    stats_ok = not uis and len(a) >= 2
+    rm, rv = (a[-2], a[-1]) if stats_ok else (None, None)
+    mid = a[:-2] if stats_ok else a
+    w = mid[0] if len(mid) >= 1 else None
+    b = mid[1] if len(mid) >= 2 else None
+    return torch.nn.functional.instance_norm(
+        x,
+        running_mean=rm,
+        running_var=rv,
+        weight=w,
+        bias=b,
+        use_input_stats=uis,
+        momentum=float(attr_of(kw, "momentum", default=0.1)),
+        eps=float(attr_of(kw, "eps", default=1e-5)),
+    )
+
+
+def _upsample_nearest2d_torch(x: Any, *a: Any, **kw: Any) -> Any:
+    """``aten.upsample_nearest2d[.vec]`` → F.interpolate nearest.
+
+    The vec overload's two list arguments land under the canonical
+    ``size`` / ``scale`` attrs (``ATTR_SCHEMA``); exactly one is
+    present on any export.  Scalar spellings broadcast to a pair.
+    """
+    size = attr_of(kw, "size", default=None)
+    scale = attr_of(kw, "scale", default=None)
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = (size, size)
+    if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+        scale = (float(scale), float(scale))
+    return torch.nn.functional.interpolate(
+        x,
+        size=size,
+        scale_factor=scale,
+        mode="nearest",
+    )
+
+
+def _lstm_input_torch(
+    x: Any, h0: Any, c0: Any, *params: Any, **kw: Any
+):
+    """``aten.lstm.input`` — the recurrent kernel passthrough.
+
+    The two operand lists (``hx``, the flat ``params`` table) arrive
+    flattened at export: ``h0``/``c0`` are always exactly the first
+    two slots, the weights/biases fill the rest (4 tensors per layer
+    per direction).  The scalar tail is schema'd (has_biases,
+    num_layers, dropout, train, bidirectional, batch_first).  The op
+    returns the ``(output, h_n, c_n)`` triple — a ``getitem``
+    consumer picks one.
+    """
+    return torch.ops.aten.lstm.input(
+        x,
+        [h0, c0],
+        list(params),
+        bool(attr_of(kw, "has_biases", default=True)),
+        int(attr_of(kw, "num_layers", default=1)),
+        float(attr_of(kw, "dropout", default=0.0)),
+        bool(attr_of(kw, "train", default=False)),
+        bool(attr_of(kw, "bidirectional", default=False)),
+        bool(attr_of(kw, "batch_first", default=False)),
+    )
+
+
 #: Core torch lowering bindings — the base ``OpTable``'s table (plan
 #: 0001 phase 2c).  Carrier ops (``trace``/``omd_*``/``cmask``...)
 #: are deliberately ABSENT: they live in each carrier
@@ -1291,6 +1371,12 @@ _CORE_TORCH_BINDINGS: dict[str, Any] = {
         a[1] if len(a) >= 2 else None,
         eps=float(attr_of(kw, "eps", default=1e-5)),
     ),
+    "instance_norm": _instance_norm_torch,
+    "upsample_nearest2d": _upsample_nearest2d_torch,
+    # The recurrent kernel — an aten passthrough (the term IS the
+    # overload; ``aten.lstm.data`` — the PackedSequence variant — stays
+    # unbound deliberately: same base name, different input type).
+    "lstm.input": _lstm_input_torch,
     "conv1d": lambda x, w, *a, **kw: torch.nn.functional.conv1d(
         x,
         w,

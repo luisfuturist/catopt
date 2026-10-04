@@ -11,7 +11,7 @@ of shipped laws, does ``A`` (possibly among the other rules) derive
 ``B``?  Do they commute?  Are they the same 2-cell twice?
 
 This tool builds that catalogue over ``catopt_core.laws.ALL_RULES``
-(57 rules; ``--with-layout`` adds the 77 opt-in ``LAYOUT_RULES``).
+(61 rules; ``--with-layout`` adds the 77 opt-in ``LAYOUT_RULES``).
 Every verdict is measured by the shipped machinery — ``EGraph``
 saturation on a per-law concrete instance — never asserted:
 
