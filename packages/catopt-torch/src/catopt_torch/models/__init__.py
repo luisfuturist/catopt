@@ -735,6 +735,47 @@ class DepthwiseConvBlock(nn.Module):
         return F.relu(self.pw(self.dw(x)))
 
 
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style block: ``x + pw2(gelu(pw1(norm(dw(x)))))``.
+
+    The modern-ConvNet residual block — a depthwise 7x7 conv
+    (``groups=channels``), a group norm, then the inverted-bottleneck
+    pointwise pair (1x1 expand → GELU → 1x1 contract) and the skip
+    ``add``.  This is the architecture family the ``group_norm``
+    ``arg5``/``cudnn_enabled`` schema gap kept out of the corpus; it
+    exports ``conv2d(conv2d)``, ``group_norm(conv2d)``,
+    ``gelu(group_norm)`` and ``conv2d(gelu)`` chains.
+    """
+
+    def __init__(
+        self,
+        channels: int = 16,
+        groups: int = 4,
+        expansion: int = 4,
+    ) -> None:
+        """Initialise the depthwise conv, norm, and pointwise pair."""
+        super().__init__()
+        h = channels * expansion
+        self.dw = nn.Conv2d(
+            channels,
+            channels,
+            7,
+            padding=3,
+            groups=channels,
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(groups, channels)
+        self.pw1 = nn.Conv2d(channels, h, 1, bias=False)
+        self.pw2 = nn.Conv2d(h, channels, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the ConvNeXt block."""
+        y = self.dw(x)
+        y = self.norm(y)
+        y = self.pw2(F.gelu(self.pw1(y)))
+        return x + y
+
+
 class ManualSoftmaxAttention(nn.Module):
     """Attention with the softmax spelled as ``exp / sum`` — pre-kernel form.
 

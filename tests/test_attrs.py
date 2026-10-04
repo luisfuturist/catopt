@@ -106,6 +106,16 @@ class _LayerNorm(torch.nn.Module):
         return F.layer_norm(x, (8,), self.w, self.b, eps=1e-5)
 
 
+class _GroupNorm(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones(8))
+        self.b = torch.nn.Parameter(torch.zeros(8))
+
+    def forward(self, x):
+        return F.group_norm(x, 4, self.w, self.b, eps=1e-5)
+
+
 class _SDPA(torch.nn.Module):
     def forward(self, q, k, v):
         return F.scaled_dot_product_attention(
@@ -359,6 +369,18 @@ class TestExportCanonicalization:
             _LayerNorm(), (torch.randn(2, 8),), "layer_norm", None
         )
         assert t.attrs["dim"] == (8,)
+        assert t.attrs["eps"] == pytest.approx(1e-5)
+        assert t.attrs.get("cudnn_enabled") is False
+
+    def test_group_norm_eps_is_eps_not_cudnn(self):
+        """Regression: aten.group_norm shares layer_norm's tail — eps
+        is the 4th positional (arg4), the 5th (arg5) is the cudnn
+        flag.  Without a ``5`` entry in the schema the export's
+        ``arg5`` had no canonical name and mint died."""
+        (t,) = self._check(
+            _GroupNorm(), (torch.randn(2, 8),), "group_norm", None
+        )
+        assert t.attrs["num_groups"] == 4
         assert t.attrs["eps"] == pytest.approx(1e-5)
         assert t.attrs.get("cudnn_enabled") is False
 

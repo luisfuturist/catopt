@@ -375,6 +375,11 @@ def _model_cases() -> list[tuple[str, Any, Any]]:
             img,
         ),
         (
+            "ConvNeXtBlock",
+            M.ConvNeXtBlock(8).eval().double(),
+            img,
+        ),
+        (
             "ManualSoftmaxAttention",
             M.ManualSoftmaxAttention(d).eval().double(),
             seq,

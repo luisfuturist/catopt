@@ -167,7 +167,10 @@ ATTR_SCHEMA: dict[str, dict[int, str]] = {
     # pad(t, pad_width_list, *, mode, value) — the width list lands
     # under ``pad``; mode/value are kwargs.
     "pad": {1: "pad", 2: "mode", 3: "value"},
-    "group_norm": {1: "num_groups", 4: "eps"},
+    # aten.group_norm(x, num_groups, weight, bias, eps,
+    # cudnn_enabled): same eps/cudnn tail as layer_norm (eps is arg4 —
+    # NOT arg5, the cudnn flag).
+    "group_norm": {1: "num_groups", 4: "eps", 5: "cudnn_enabled"},
     # batch_norm(x, w, b, rm, rv, training, momentum, eps, cudnn).
     "batch_norm": {
         5: "training",

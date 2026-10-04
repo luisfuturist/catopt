@@ -15,6 +15,7 @@ lowered ``IRModule`` verified fp64 against the original module.
 import torch
 from catopt_core.ir import Op
 from catopt_torch.models import (
+    ConvNeXtBlock,
     DepthwiseConvBlock,
     GatedResidualBlock,
     GegluMLP,
@@ -69,6 +70,12 @@ CASES = [
         DepthwiseConvBlock(8),
         IMG,
         {"conv2d"},
+    ),
+    (
+        "ConvNeXtBlock",
+        ConvNeXtBlock(8),
+        IMG,
+        {"conv2d", "group_norm", "gelu"},
     ),
     (
         "ManualSoftmaxAttention",
