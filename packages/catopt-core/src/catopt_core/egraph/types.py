@@ -131,8 +131,9 @@ class Rewrite:
     bound_norm: str = "spectral"
     # Kernel taxonomy premise names — see the class docstring.  Not
     # serialised by ``rulecache`` (synthesised rules carry ``parents``
-    # provenance instead); law-emit tooling may replay it into a real
-    # ``Derivation`` certificate (:mod:`catopt_core.egraph.certs`).
+    # provenance instead); ``tools/law_lemma_cert.py`` replays it into
+    # a real :class:`Certificate` (see :mod:`catopt_core.egraph.certs`
+    # for the data codec).
     derivation: tuple[str, ...] = ()
     # Declarative side condition — pure data (see the class docstring).
     # Stored as data for serialization (the lemma-store seam); folded

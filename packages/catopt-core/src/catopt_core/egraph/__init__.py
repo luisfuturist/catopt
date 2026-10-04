@@ -2,7 +2,8 @@
 
 Split (plan 0001 phase 2b):
   types.py   — ENode, EClass, UnionFind, Rewrite, leaf registry
-  certs.py   — ProofEdge, CertStep, Certificate, verification error
+  certs.py   — ProofEdge, CertStep, Certificate, verification error,
+               the certificate ↔ JSON data codec
   core.py    — EGraph: union-find, matching, saturation, rebuild
   extract.py — _ExtractMixin: extract_best / extract_paired / locate
   proof.py   — _ProofMixin: certificates, coherent paths, explanations
@@ -14,6 +15,8 @@ from catopt_core.egraph.certs import (
     CertificateVerificationError,
     CertStep,
     ProofEdge,
+    cert_from_data,
+    cert_to_data,
 )
 from catopt_core.egraph.core import EGraph
 from catopt_core.egraph.terms import (
@@ -40,5 +43,7 @@ __all__ = [
     "ProofEdge",
     "Rewrite",
     "UnionFind",
+    "cert_from_data",
+    "cert_to_data",
     "verify_certificate",
 ]

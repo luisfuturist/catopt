@@ -1,9 +1,16 @@
-"""Proof-carrying certificate types."""
+"""Proof-carrying certificate types + their data codec."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from catopt_core.ir import (
+    attr_from_data,
+    attr_to_data,
+    term_from_data,
+    term_to_data,
+)
 
 # ---------------------------------------------------------------------------
 #  Proof-carrying merges — 2-morphisms as first-class data
@@ -146,3 +153,127 @@ class Certificate:
         approximation.
         """
         return self.error_bound == 0.0
+
+
+# ---------------------------------------------------------------------------
+#  The data codec — certificates as JSON records
+# ---------------------------------------------------------------------------
+#
+#  A certificate is already *data-shaped*: an ordered list of single-rule
+#  rewrites, each located by a child-index ``path`` and carrying the
+#  concrete ``lhs``/``rhs`` instances plus the fired ``bindings``.  The
+#  codec below makes that explicit — every term encodes through
+#  :func:`catopt_core.ir.term_to_data` (the same scheme
+#  ``laws.serialize`` uses for patterns) and every binding value is
+#  either a term (metavariables) or a scalar/tuple attribute
+#  (``"$attr:"`` keys).  Rules are referenced *by name*: the record is
+#  honest about what data cannot carry — ``check``/``derive`` hooks are
+#  code, so :func:`cert_from_data` takes the rule objects to resolve
+#  against, exactly as a reconstructed law needs its hooks re-attached.
+#
+#  ``egraph_dependent`` steps serialize too: they are part of the
+#  recorded derivation, and replaying them as trusted assertions is
+#  what :func:`verify_certificate` already does under ``strict=False``.
+#  A record keeps the flag — the honesty is in the data, not in hiding
+#  the stub.
+
+#: Bump when the record layout or reconstruction semantics change.
+CERT_FORMAT = 1
+
+
+def _binding_to_data(key: str, value: Any) -> dict[str, Any]:
+    """Encode one fired binding entry as tagged JSON-safe data."""
+    if key.startswith("$attr:"):
+        return {"attr": attr_to_data(value)}
+    return {"term": term_to_data(value)}
+
+
+def _binding_from_data(key: str, data: dict[str, Any]) -> Any:
+    """Decode one tagged binding entry produced by ``_binding_to_data``."""
+    if "attr" in data:
+        return attr_from_data(data["attr"])
+    return term_from_data(data["term"])
+
+
+def cert_to_data(cert: Certificate) -> dict[str, Any]:
+    """Serialise *cert* to a JSON-safe record.
+
+    The record carries the derivation itself — ``src``/``dst`` plus
+    every step's rule name, ``path``, concrete ``lhs``/``rhs``
+    instances and fired ``bindings`` — not the e-graph provenance it
+    was reconstructed from.  ``rules_used`` is derived metadata for
+    consumers that want the premise set without walking the steps.
+    """
+    return {
+        "version": CERT_FORMAT,
+        "src": term_to_data(cert.src),
+        "dst": term_to_data(cert.dst),
+        "steps": [
+            {
+                "rule": s.rule,
+                "path": list(s.path),
+                "lhs": term_to_data(s.lhs),
+                "rhs": term_to_data(s.rhs),
+                "bindings": {
+                    k: _binding_to_data(k, v)
+                    for k, v in s.bindings.items()
+                },
+                "egraph_dependent": s.egraph_dependent,
+                "note": s.note,
+            }
+            for s in cert.steps
+        ],
+        "rules_used": cert.rules_used,
+        "replayable": cert.replayable,
+    }
+
+
+def _step_from_data(sd: dict[str, Any]) -> CertStep:
+    """Rebuild one :class:`CertStep` from its record entry."""
+    return CertStep(
+        sd["rule"],
+        tuple(sd["path"]),
+        term_from_data(sd["lhs"]),
+        term_from_data(sd["rhs"]),
+        {
+            k: _binding_from_data(k, v)
+            for k, v in sd.get("bindings", {}).items()
+        },
+        sd.get("egraph_dependent", False),
+        sd.get("note", ""),
+    )
+
+
+def cert_from_data(data: dict[str, Any], rules: Any) -> Certificate:
+    """Rebuild a :class:`Certificate` from :func:`cert_to_data` output.
+
+    ``rules`` supplies the rule objects the record references by name —
+    a name-to-``Rewrite`` mapping or any iterable of rules.  A step
+    naming a rule absent from *rules* decodes but cannot verify
+    (:func:`verify_certificate` raises "unknown rule"), the same honest
+    posture ``law_from_data`` takes toward missing hooks.
+    """
+    if data.get("version") != CERT_FORMAT:
+        raise ValueError(
+            f"bad certificate record version: {data.get('version')!r}"
+        )
+    rmap = (
+        rules if isinstance(rules, dict) else {r.name: r for r in rules}
+    )
+    steps = [_step_from_data(sd) for sd in data.get("steps", [])]
+    used = sorted({s.rule for s in steps if not s.egraph_dependent})
+    return Certificate(
+        src=term_from_data(data["src"]),
+        dst=term_from_data(data["dst"]),
+        root_eid=None,
+        steps=steps,
+        rules={n: rmap[n] for n in used if n in rmap},
+        stats={
+            "from_data": True,
+            "n_steps": len(steps),
+            "n_egraph_dependent": sum(
+                1 for s in steps if s.egraph_dependent
+            ),
+            "rules_used": used,
+        },
+    )

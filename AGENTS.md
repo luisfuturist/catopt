@@ -326,7 +326,10 @@ pipeline budgets (`rules.tagged(EXPANSIVE)`).  Each rule's kernel kind
 lives on `Rewrite.derivation`/`rule.kind` — `R(..., derivation=(...))`
 names the axioms that prove a lemma (`tools/law_coherence.py
 --emit-basis` emits the measured table; see
-`project/retros/axiom-lemma-split.md`).  The composable `RuleSet`
+`project/retros/axiom-lemma-split.md`).  `tools/law_lemma_cert.py`
+materializes each recorded derivation as a replayable `Certificate`
+(codec: `cert_to_data`/`cert_from_data` in `catopt_core.egraph.certs`;
+see `project/retros/lemma-certificates.md`).  The composable `RuleSet`
 presets live in `catopt_core.laws.ruleset`.
 
 Measure it: `python -m bench run law_bench --laws <name[,name|group]>`
