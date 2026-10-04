@@ -67,97 +67,102 @@ equivalence class, and the certificate still replays.  That safety
 property — a policy that cannot make a program wrong — is what makes a
 learned player admissible at all.
 
-It is trained on real models (`catopt_torch.models`) through the
-trajectory encoding in `catopt_core.trajectories`, and on the
-contraction game in `tools/contraction_policy.py`.
+**It ships.**  The curriculum-trained contraction player is a bundled
+artifact — 25.6 KiB, trained once, loaded lazily:
 
-**The expectation: outperform humans.**  "Humans" here means the
-hand-written heuristics and rule orderings — the `greedy`, `search` and
-`restart` players, and the engine's declaration order.
+```python
+import catopt_torch
+policy = catopt_torch.load_contraction_policy()   # the trained player
+order = policy.order(tensors, sizes)               # one deterministic pass
+```
 
-**The measured reality — not an overclaim.**
+**The expectation: outperform humans.**  "Humans" means the hand-written
+heuristics — our `greedy`/`search`/`restart` players and `opt_einsum`'s
+orderings.  **The measured reality:**
 
-- The learned contraction policy **beats our own players at equal
-  wall-clock**: `restart` at every scale and budget (0.65–0.90×),
-  `search` decisively (0.36–0.73×), and `greedy` likewise — it wins with
-  ~4× *fewer* rollouts, because one learned rollout is a far better
-  per-step chooser ([contraction-policy-compute.md](project/retros/contraction-policy-compute.md)).
-- It **beats `opt_einsum`'s staged greedy** at n = 20 (0.85–0.88×,
-  seed-stable) and n = 30 (0.83–0.90× at ≥ 200 ms), and — after the
-  rollout-throughput fix — on **3 of 4 seeds at n = 40**
-  ([contraction-policy-einsum.md](project/retros/contraction-policy-einsum.md),
-  [contraction-policy-throughput.md](project/retros/contraction-policy-throughput.md)).
-- But it **loses to `opt_einsum`'s randomised greedy at n = 40**
-  (~1.8× across four seeds), and the loss does not move: **quality
-  saturates with rollout count** — 6× more rollouts bought only ~10% of
-  quality ([contraction-policy-throughput.md](project/retros/contraction-policy-throughput.md)).
+- **Beats the deterministic external greedy at n = 40** by ~25–30%
+  (0.68–0.73× pairwise, after training at scale), and reaches **~1.04×
+  of `opt_einsum`'s randomised greedy** at adequate budget — near parity
+  with the field's best cheap player, in a single pass
+  ([contraction-train-scale.md](project/retros/contraction-train-scale.md)).
+- **Throughput-starved at < 50 ms budgets** — a forward pass per
+  decision is the honest cost.
+- **Two structural limits, both measured.**  In catopt's own e-graph,
+  reordering **cannot change extracted cost** (the fixed point is
+  order-invariant — a random player reaches identical cost); and as a
+  *law proposer* the learned player loses ~10× to enumeration —
+  **corpus knowledge is the discovery**
+  ([law-meta-game.md](project/retros/law-meta-game.md)).
 
-The sharpest negative is structural.  In catopt's *own* e-graph,
-reordering rules **cannot change the extracted cost**: the fixed point
-is order-invariant, so a learned policy and a random policy reach the
-*same* cost — measured identical on every held-out model, with the same
-equivalence-class partition.  The training signal on real models is
-nearly empty too: only **1.6%** of `(program, rule)` samples are
-improving ([stage7-policy-wiring-results.md](project/retros/stage7-policy-wiring-results.md)).
-
-So the player's value can only live where the choice is **not**
-order-invariant — contraction ordering, extraction / coordination, and
-law proposal.  The `Policy` seam is a real lever there; it is not a
-lever for extraction quality inside the shipped e-graph.
+So the player's value lives where the choice is **not** order-invariant:
+contraction ordering (shipped), extraction/coordination — not rule
+reordering and not law invention.
 
 ## Player Finds
 
-The payoff: what the player has already found, shipped.
+What the machine has found, verified and shipped — three laws in
+`DEFAULT`:
 
-**`select_mul`** — a law the machine **proposed**, the certificate
-**verified**, and the corpus **measured**:
+**`select_mul`** — the first machine-discovered law (census-naturality
+proposer).  `mul(select(u,D,I), select(v,D,I)) → select(mul(u,v),D,I)`:
+true on all 24 real sites, fires 24× across 5 models, **17–26% modeled
+cost drop**, cert replays
+([law-shape-aware.md](project/retros/law-shape-aware.md)).
 
-```
-mul(select(u, dim=D, index=I), select(v, dim=D, index=I))
-    -> select(mul(u, v), dim=D, index=I)
-```
+**`softmax_fold`** — `div(exp(u), sum(exp(u),dim,keepdim)) →
+softmax(u,dim)`: the manual normalization is the kernel's definition
+spelled out.  Found by *pattern recognition* over the corpus's composed-
+then-reduced chains; −19% cost, and **+13–48% measured wall-clock** on
+the real model
+([law-softmax-fold-shipped.md](project/retros/law-softmax-fold-shipped.md),
+[law-wallclock-verification.md](project/retros/law-wallclock-verification.md)).
 
-- **True** on all 24 real sites — the two selects always carry the same
-  `dim` and `index`, and the shared attribute metavariables make the
-  matcher enforce that structurally (no `check` hook needed).
-- **New** — no library rule does this.
-- **Fires 24× across 5 real models** (SelectiveSSM, DiagDenseSSM,
-  DiagonalSSM, HybridBlock, TwoLayerHybrid).
-- **Drops the extracted cost 17–26%** (SelectiveSSM 6.787e5 → 5.569e5;
-  TwoLayerHybrid 1.192e6 → 9.484e5), the certificate replaying and the
-  lowered before/after modules passing `sink.verify`.
-- **Now in `DEFAULT`.**
+**`silu_fold`** — `mul(x, sigmoid(x)) → silu(x)`: a **3-cell mediator**.
+The coherence catalogue — pairwise relations over all 53 laws — found
+two genuinely divergent pairs (`silu` expansion destroys the
+`swiglu_fuse` redex).  This law restores confluence **and pays**
+(1.43–2.62× on the bench case)
+([three-cell-mediator.md](project/retros/three-cell-mediator.md)).
 
-The mechanism is dispatch count: `mul(select, select)` is four dispatched
-ops (`linear`, `select`, `select`, `mul`) and the RHS is three, so the
-law removes exactly one dispatched op per site.  The gain holds across
-`d_inner ∈ {8…256}` — it is an op-count reduction, not a size artefact.
-Source: [law-shape-aware.md](project/retros/law-shape-aware.md).
+**The loop is closed.**  `tools/law_pipeline.py` runs
+census → propose → verify → measure → rank → **emit** end to end:
 
-**The pipeline that found it.**  `tools/law_pipeline.py` runs the loop
-end to end — census → propose → verify (BOTH oracles: derivability *and*
-numeric truth) → measure (fires, cost, certificate, closure safety) →
-ranked ship / no-ship ([law-pipeline.md](project/retros/law-pipeline.md)):
+- **Validated by held-out rediscovery** — a shipped winner re-ranks
+  #1, shippable, every run.
+- **The op vocabulary is machine-derived too** — ops are classified by
+  property tests (commutes-with-views, value-preserving), not human
+  tables; the derived alphabet recovers every hand entry *plus* the
+  ones humans missed
+  ([law-vocab-derived.md](project/retros/law-vocab-derived.md)).
+- **`--emit-admission` emits the `R(...)` + tests** as a `git apply`
+  patch; the emitted law is bytecode-identical to the hand-written one
+  ([automated-admission.md](project/retros/automated-admission.md)).
+- **The referee catches its own pool**: `reshape_transpose` fires 23×
+  and cost-lowers yet is **numerically false** — the oracle rejects it;
+  an oracle rank-mismatch hole was found by the meta-game and closed
+  in both oracles ([oracle-rank-mismatch-fix.md](project/retros/oracle-rank-mismatch-fix.md)).
+- **Honest limits**: learned-proposal loses to enumeration; workload
+  resampling can't feed self-play — law-bearing shapes come from
+  architecture semantics, not op marginals
+  ([law-workload-gen.md](project/retros/law-workload-gen.md)).
 
-- **Validated by held-out rediscovery.**  With `select_mul` — and only
-  it — removed from the rule set, the pipeline re-proposes it, verifies
-  it, measures it, and ranks it **#1 of 35**, shippable.  The winner is
-  **census-generated** (from the corpus's frequent `mul(select, select)`
-  op-tuple), independently of the hand-written schema that first named
-  it, and the verdict is stable across runs.
-- **Run for real: 0 further shippable.**  On the current library and
-  corpus the honest output is "nothing else clears the bar".
+## Benchmark
 
-**The safety demonstration.**  `reshape_transpose` fires 23× and
-cost-lowers on a real model — yet it is **numerically FALSE** (reshape
-then transpose is not transpose then reshape).  A cost-only proposer
-would have shipped it; the numeric oracle rejects it.  The truth oracle,
-not the generator, is what makes the pool trustworthy.
+Every number below is measured on the dev box (RTX 2050, fp64,
+launch-bound sizes — see [Limits](#limits)):
 
-**Still honest.**  The generator's op tables (`_POINTWISE` / `_VIEW_OPS`)
-are still human-authored — that is the remaining boundary.  The pipeline
-validates the judgment chain and the census → propose step; it does not
-yet show the op *vocabulary* is machine-invented.
+| measurement | result | source |
+|---|---|---|
+| `softmax_fold` on `ManualSoftmaxAttention` | **+13–27% eager, +29–48% CUDA-graph** vs raw | `tools/law_wallclock.py` |
+| `select_mul` marginal (optimized vs law-ablated) | **faster in 19/20 measurements** | `tools/law_wallclock.py` |
+| executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (was 2–3× slower) | `tools/executor_cost_probe.py` |
+| `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
+| contraction player n=40 vs `opt_einsum` | **~1.04× randomised greedy, 0.68–0.73× deterministic** | `tools/contraction_einsum.py` |
+| pipeline held-out rediscovery | **winner re-ranks #1, every run** | `tools/law_pipeline.py` |
+| coherence catalogue | **30 basis laws / 53; divergence 0** | `tools/law_coherence.py` |
+| bounded rewrites vs Inductor, real checkpoint | **1.15–1.32×** | `bench/suites` |
+
+Full measured picture and provenance: [`docs/results.md`](docs/results.md).
 
 ---
 
