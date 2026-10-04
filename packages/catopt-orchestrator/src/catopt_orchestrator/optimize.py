@@ -49,6 +49,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 from catopt_core.cost import (
+    _CostMarkers,
     backend_cost,
     dag_cost,
     executor_cost_for,
@@ -314,6 +315,7 @@ def _delivered_cost(
     profile: Any = None,
     compiled: bool = False,
     bucket: str | None = None,
+    memo: dict | None = None,
 ) -> float:
     """Price a term under the lowering it would actually get.
 
@@ -330,6 +332,10 @@ def _delivered_cost(
     :func:`_corrected_delivered`.  ``bucket`` is the
     :func:`~catopt_core.profile.shape_bucket` key the corrections
     were recorded under; ``None`` keeps the pure-model price.
+    ``memo`` is the shared extraction memo
+    :func:`delivered_cost_for` threads through — callers pricing
+    many terms over a shared-subterm DAG pass one dict so the
+    per-lowering prices memoize across calls.
     """
     lowering = "generic"
     if compiled:
@@ -338,8 +344,68 @@ def _delivered_cost(
         plan = _carrier_plans().get(term.op)
         if plan is not None and plan(term) is not None:
             lowering = "batched_scan"
-    model_ns = executor_cost_for(profile, lowering=lowering)(term)
+    model_ns = executor_cost_for(profile, lowering=lowering)(term, memo)
     return _corrected_delivered(profile, lowering, bucket, model_ns)
+
+
+def delivered_cost_for(
+    profile: Any = None,
+    *,
+    x: Any = None,
+    bucket: str | None = None,
+    compiled: bool = False,
+) -> CostFn:
+    """Bill each term at its DELIVERED price — extraction cost fn.
+
+    The selection model the executor-pricing fix needs as a public
+    path: :func:`_delivered_cost` lifted into a ``cost_fn`` —
+    carrier-apply-rooted, plannable terms bill under
+    ``lowering="batched_scan"``, everything else under ``"generic"``
+    (``compiled=True`` bills every term under the fusion-region
+    model).  Unlike the additive
+    :func:`~catopt_core.cost.executor_cost_for` default, extraction
+    sees the batched-vs-generic executor delta, so a term that is
+    cheaper *delivered* can win greedy extraction directly — the
+    mechanism ``tools/executor_cost_probe.py`` demonstrates with its
+    tools-level ``_delivered_cost_fn``.
+
+    ``profile`` — a measured
+    :class:`~catopt_core.profile.TargetProfile` (produce one with
+    ``tools/calibrate_profile.py``) — supplies both the executor
+    constants and the measured-feedback corrections
+    :func:`_delivered_cost` consumes through
+    :func:`~catopt_core.profile.corrected_price_ns`: a learned
+    ``corrections`` factor or a ``measured_ns`` residual recorded
+    under (route candidate, ``bucket``).  ``bucket`` is the
+    :func:`~catopt_core.profile.shape_bucket` key the corrections
+    were recorded under — pass ``x=`` the search's example input to
+    derive it (an explicit ``bucket`` wins).  ``bucket=None`` keeps
+    the pure-model delivered prices — a delivered-aware but
+    *uncalibrated* comparison (the probe's ``cf-modeled`` arm).
+    The closure also carries the ``profile`` marker
+    :func:`~catopt_core.cost.backend_cost` forwards into
+    ``_select_best_term``, so the same table corrects
+    ``_carrier_upgrade``'s comparison — under this input's OWN
+    ``shape_bucket`` — selection and upgrade priced off one
+    calibration.
+
+    Non-additive at carrier roots (the batched-scan price is a
+    whole-spine property): as an ``extract_best`` model it is
+    approximate — the documented caveat it shares with
+    :func:`~catopt_core.cost.fused_cost_for` and
+    :func:`~catopt_core.cost.lowering_aware_cost_for`.  Carrier
+    routing resolves at call time: built before the carrier package
+    registers, every term bills generic.
+    """
+    if bucket is None and x is not None:
+        bucket = shape_bucket(x)
+
+    def cost(term: Any, memo: dict | None = None) -> float:
+        return _delivered_cost(term, profile, compiled, bucket, memo)
+
+    cost.__name__ = "delivered_cost_for"
+    cast(_CostMarkers, cost).profile = profile
+    return cost
 
 
 def _carrier_upgrade(

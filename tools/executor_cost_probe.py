@@ -516,6 +516,38 @@ def _correction_factors(rows: list[CaseRow]) -> dict[str, float]:
     }
 
 
+def _corrections_table(
+    cases: list[Any],
+    factors: dict[str, float],
+    counts: dict[str, int],
+    *,
+    device: str | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Assemble the ``corrections`` table ``record_measured`` maintains.
+
+    ``{candidate: {bucket: {"factor", "n"}}}`` — the pooled
+    per-family factor under EVERY measured ``shape_bucket`` (one per
+    case), the same calibration the counterfactual consumes.  Pooled
+    rather than per-case: a single-case family often contributes one
+    observation, which sits below the learned-factor
+    ``_CORRECTION_MIN_SAMPLES`` gate and would never fire — pooling
+    keeps the emitted artifact live, at the documented granularity of
+    a same-run mechanism demo.  ``device`` re-keys the buckets for
+    searches whose example input lives off-CPU (e.g. ``"cuda"``);
+    the factors were timed on CUDA regardless — the bucket keys the
+    *search input's* device+size class.
+    """
+    corr: dict[str, dict[str, dict[str, Any]]] = {}
+    for case in cases:
+        bucket = shape_bucket(torch.empty(*case.shape, device=device))
+        for fam, f in factors.items():
+            corr.setdefault(fam, {})[bucket] = {
+                "factor": f,
+                "n": counts.get(fam, 2),
+            }
+    return corr
+
+
 def _emit_profile(
     path: str,
     cases: list[Any],
@@ -524,27 +556,11 @@ def _emit_profile(
 ) -> None:
     """Write the measured corrections as a ``TargetProfile`` JSON.
 
-    The ``corrections`` table ``record_measured`` maintains —
-    ``{candidate: {bucket: {"factor", "n"}}}`` — carrying the pooled
-    per-family factor under EVERY measured ``shape_bucket`` (one per
-    case), the same calibration the counterfactual consumes.  Pooled
-    rather than per-case: a single-case family often contributes one
-    observation, which sits below the learned-factor
-    ``_CORRECTION_MIN_SAMPLES`` gate and would never fire — pooling
-    keeps the emitted artifact live, at the documented granularity of
-    a same-run mechanism demo.  The base constants are the model's
-    built-ins — the correction table is the whole delta.  Feed the
-    result to a search as
+    The base constants are the model's built-ins — the correction
+    table :func:`_corrections_table` assembles is the whole delta.
+    Feed the result to a search as
     ``cost_fn=executor_cost_for(TargetProfile.load(path))``.
     """
-    corr: dict[str, dict[str, dict[str, Any]]] = {}
-    for case in cases:
-        bucket = shape_bucket(torch.empty(*case.shape))
-        for fam, f in factors.items():
-            corr.setdefault(fam, {})[bucket] = {
-                "factor": f,
-                "n": counts.get(fam, 2),
-            }
     prof = TargetProfile(
         name="executor-cost-probe",
         tflops=_PEAK_FLOPS / 1e12,
@@ -554,7 +570,7 @@ def _emit_profile(
         leaf_eval_us=4.0 * _LAUNCH_S * 1e6,
         device=torch.cuda.get_device_name(0),
         measured_at=datetime.now(UTC).isoformat(),
-        corrections=corr,
+        corrections=_corrections_table(cases, factors, counts),
         meta={
             "source": "tools/executor_cost_probe.py",
             "note": "same-shape measured factors — mechanism demo",

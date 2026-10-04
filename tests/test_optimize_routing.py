@@ -657,3 +657,98 @@ def test_search_profile_marker_reaches_carrier_upgrade(monkeypatch):
     assert getattr(res.term, "op", None) == "add"
     res_default = opt.search(m, x, cost_fn=delivered_aware(None))
     assert getattr(res_default.term, "op", None) in ("apply", "applyd")
+
+
+def test_delivered_cost_for_bills_routed_lowering():
+    """The shipped delivered-aware extraction model: carrier-rooted
+    plannable terms price under the batched lowering, plain terms
+    generic — and the ``profile`` marker rides the closure
+    (``backend_cost`` forwards it to ``_carrier_upgrade``)."""
+    from catopt_orchestrator.optimize import (
+        _delivered_cost,
+        delivered_cost_for,
+    )
+
+    ir, h, env = _scan_ir()
+    cf = delivered_cost_for()
+    assert getattr(cf, "profile", None) is None
+    assert cf(ir.root) == _delivered_cost(ir.root)
+    plain = Op.make("add", Var("x", _T((3,))), _P("p_w", (3,)))
+    assert cf(plain) == _delivered_cost(plain)
+
+    prof = _profile_with()
+    cf2 = delivered_cost_for(prof)
+    assert getattr(cf2, "profile", None) is prof
+    assert cf2(ir.root) == _delivered_cost(ir.root, prof)
+
+
+def test_delivered_cost_for_compiled_bills_fused():
+    """compiled=True: every term prices under the fusion-region model."""
+    from catopt_orchestrator.optimize import (
+        _delivered_cost,
+        delivered_cost_for,
+    )
+
+    ir, h, env = _scan_ir()
+    cf = delivered_cost_for(compiled=True)
+    assert cf(ir.root) == _delivered_cost(ir.root, compiled=True)
+
+
+def test_delivered_cost_for_bucket_keys_corrections():
+    """``x=``/``bucket=`` select the corrections bucket — explicit
+    ``bucket`` wins, ``bucket=None`` keeps the pure-model price, and
+    a cross-device bucket never interpolates."""
+    from catopt_core.profile import shape_bucket
+    from catopt_orchestrator.optimize import (
+        _delivered_cost,
+        delivered_cost_for,
+    )
+
+    ir, h, env = _scan_ir()
+    x = torch.rand(3, dtype=torch.float64)
+    bkt = shape_bucket(x)
+    prof = _profile_with(
+        corrections={
+            "batched": {bkt: {"factor": 10.0, "n": 4}},
+        },
+    )
+    base = _delivered_cost(ir.root)
+    # bucket=None — the uncalibrated delivered-aware price.
+    assert delivered_cost_for(prof)(ir.root) == pytest.approx(base)
+    # x= derives shape_bucket(x) — the correction fires.
+    assert delivered_cost_for(prof, x=x)(
+        ir.root
+    ) == pytest.approx(base * 10.0)
+    # An explicit bucket wins over x=.
+    other = torch.rand(1024, dtype=torch.float64)
+    assert delivered_cost_for(prof, x=other, bucket=bkt)(
+        ir.root
+    ) == pytest.approx(base * 10.0)
+    # Cross-device buckets never interpolate.
+    assert delivered_cost_for(prof, bucket="cuda:0:2^9")(
+        ir.root
+    ) == pytest.approx(base)
+
+
+def test_delivered_cost_for_search_keeps_generic_pick():
+    """End to end through shipped code, no hand-rolled cost fn:
+    a calibrated profile pricing the batched delivery slower keeps
+    LinearRecurrence's generic ``add`` member; the same search with
+    the bucket left underived re-inverts to the carrier member."""
+    from catopt_core.profile import shape_bucket
+    from catopt_orchestrator import delivered_cost_for
+    from catopt_torch.models import LinearRecurrence
+
+    torch.manual_seed(0)
+    m = LinearRecurrence(4, 8).eval().double()
+    x = torch.rand(8, 4, dtype=torch.float64)
+    opt = Optimizer(backend=TorchBackend())
+    prof = _profile_with(
+        measured_ns={
+            "batched": {shape_bucket(x): {"median_ns": 1.0e12}}
+        },
+    )
+    res = opt.search(m, x, cost_fn=delivered_cost_for(prof, x=x))
+    assert getattr(res.term, "op", None) == "add"
+    res_uncal = opt.search(m, x, cost_fn=delivered_cost_for(prof))
+    assert getattr(res_uncal.term, "op", None) in ("apply", "applyd")
