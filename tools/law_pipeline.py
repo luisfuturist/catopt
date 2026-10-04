@@ -87,6 +87,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import law_evidence as ev_store
 import law_proposal as lp
+import law_view_oracle as lvo
 from law_impact import (
     TermCase,
     _bench_cases,
@@ -607,6 +608,13 @@ class Evidence:
     cost_drop: float = 0.0
     cert_fail: int = 0
     closure_ratio: float = 1.0
+    # The view/index oracle's verdict for view-family candidates
+    # (``tools/law_view_oracle.py``): ``conditional`` candidates carry
+    # the separating guard in ``view_guard`` — evidence for a
+    # guarded law, reported for review, never auto-admitted.
+    view_verdict: str = ""
+    view_guard: str = ""
+    view_note: str = ""
 
     @property
     def truth(self) -> bool:
@@ -637,6 +645,13 @@ class Evidence:
         if self.shippable:
             return ""
         if not self.truth:
+            if self.view_verdict == "conditional":
+                return (
+                    "conditional truth (view-oracle): "
+                    f"{self.view_guard or 'guard not isolated'}"
+                )
+            if self.view_verdict == "ill-formed":
+                return "ill-formed RHS (view-oracle)"
             if self.num_true is False:
                 return "false (numeric oracle rejects)"
             if self.matches == 0:
@@ -799,6 +814,23 @@ def _lhs_tuple(term: Any) -> tuple | None:
     return (term.op, tuple(_op_of(a) for a in term.args))
 
 
+def _has_view_op(proposal: Proposal) -> bool:
+    """Return whether the proposal's patterns contain a view/index op.
+
+    The view oracle's scope: ``select``/``slice``/``getitem``/
+    ``unsqueeze``/``transpose``/``reshape``/``chunk``/… — the ops whose
+    naturality laws need shape/index instantiation the generic numeric
+    oracle cannot do honestly.
+    """
+    return any(
+        isinstance(t, Op) and t.op in lvo._VIEWISH
+        for t in [
+            *_iter_subterms(proposal.lhs),
+            *_iter_subterms(proposal.rhs),
+        ]
+    )
+
+
 def measure(
     proposal: Proposal,
     real_terms: list[Any],
@@ -808,6 +840,7 @@ def measure(
     census_op: dict,
     sink: Any,
     cost_fn: Any,
+    view_oracle: bool = True,
 ) -> Evidence:
     """Run both oracles and every measurement for one *proposal*."""
     ev = Evidence(proposal=proposal)
@@ -823,6 +856,31 @@ def measure(
         res = verify_law(inst[0], inst[1], base_rules)
         ev.derivable = res.derivable
         ev.witness = res.witness_rules
+    # The view/index oracle resolves every non-derivable view-family
+    # candidate — it sweeps *every* real match (the stock oracle reads
+    # only the first) and synthesizes satisfiable instantiations (view
+    # attrs + leaf shapes, tuple-sources for getitem).  It also
+    # *downgrades*: a single-instance ``True`` that is only
+    # conditionally true is reported as ``conditional``, which keeps
+    # the candidate out of the ship set until its guard is written.
+    if view_oracle and not ev.derivable and _has_view_op(proposal):
+        vo = lvo.verify_view_candidate(
+            proposal.name,
+            proposal.lhs,
+            proposal.rhs,
+            matches,
+            check=proposal.check,
+            derive=proposal.derive,
+        )
+        ev.view_verdict = vo.verdict
+        ev.view_guard = vo.guard
+        ev.view_note = vo.note
+        if vo.verdict == "true":
+            ev.num_true = True
+        elif vo.verdict in ("false", "ill-formed"):
+            ev.num_true = False
+        elif vo.verdict == "conditional":
+            ev.num_true = None
     if matches:
         ev.example = op_repr(matches[0])
         ev.match_term = matches[0]
@@ -911,6 +969,7 @@ def run_pipeline(
     vocab: str = "derived",
     evidence_db: str | None = None,
     use_cache: bool = False,
+    view_oracle: bool = True,
 ) -> dict:
     """Run census -> propose -> verify -> measure -> rank.
 
@@ -921,6 +980,13 @@ def run_pipeline(
     ``"hand"`` (the ``_POINTWISE`` / ``_VIEW_OPS`` tuples) or
     ``"derived"`` (property-classified over the corpus by
     ``tools/law_vocab.py``).
+
+    ``view_oracle`` (default on) runs the view/index oracle
+    (``tools/law_view_oracle.py``) on every non-derivable candidate
+    whose patterns contain a view/index op — resolving the
+    ``unproven``/``false`` verdicts the single-instance numeric oracle
+    cannot reach honestly (ill-typed instantiations, conditional
+    truths, tuple-valued ``getitem`` operands).
 
     ``evidence_db`` opts into the evidence store
     (``tools/law_evidence.py``): after the run every candidate and
@@ -985,6 +1051,7 @@ def run_pipeline(
                     census_op,
                     sink,
                     cost_fn,
+                    view_oracle=view_oracle,
                 )
             )
     if conn is not None:
@@ -1160,6 +1227,18 @@ def _print_report(result: dict, top: int) -> None:
         f"{sum(1 for e in ranked if e.fires)}; "
         f"shippable: {len(ship)}"
     )
+    vres = [e for e in ranked if e.view_verdict]
+    if vres:
+        from collections import Counter
+
+        tally = Counter(e.view_verdict for e in vres)
+        cond = [e for e in vres if e.view_verdict == "conditional"]
+        print(
+            f"   view-oracle: {len(vres)} view candidates — "
+            + ", ".join(f"{k}={n}" for k, n in sorted(tally.items()))
+        )
+        for e in cond:
+            print(f"      {e.proposal.name}: {e.view_guard}")
     print()
     print(f"-- ranked candidates (top {top}) --")
     print(_table(ranked, top))
@@ -1266,6 +1345,9 @@ def _dump_json(path: str, result: dict) -> None:
                 "cost_drop": ev.cost_drop,
                 "cert_fail": ev.cert_fail,
                 "closure_ratio": ev.closure_ratio,
+                "view_verdict": ev.view_verdict,
+                "view_guard": ev.view_guard,
+                "view_note": ev.view_note,
                 "shippable": ev.shippable,
                 "no_ship_reason": ev.no_ship_reason,
             }
@@ -1322,6 +1404,13 @@ def main(argv: list[str] | None = None) -> int:
         "this corpus/rule-set/code-revision key instead of "
         "re-measuring them",
     )
+    parser.add_argument(
+        "--no-view-oracle",
+        action="store_true",
+        help="skip the view/index oracle (tools/law_view_oracle.py): "
+        "view-family candidates keep the single-instance numeric "
+        "verdict — the pre-oracle behaviour",
+    )
     args = parser.parse_args(argv)
 
     if args.use_evidence_cache and not args.evidence_db:
@@ -1334,6 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
         args.vocab,
         evidence_db=args.evidence_db,
         use_cache=bool(args.use_evidence_cache and args.evidence_db),
+        view_oracle=not args.no_view_oracle,
     )
     _print_report(result, args.top)
     if args.json:
