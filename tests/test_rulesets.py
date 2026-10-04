@@ -406,7 +406,7 @@ class _PairMLP(nn.Module):
 def test_default_parity_with_legacy_all():
     """``DEFAULT`` reproduces the retired ``ruleset="all"`` behaviour.
 
-    The legacy switch saturated with ``all_rules() - _SUBSUMED`` (46
+    The legacy switch saturated with ``all_rules() - _SUBSUMED`` (53
     rules = today's ``SIMPLIFICATION + CATEGORICAL`` presets).
     ``DEFAULT`` drops the ``SYMMETRY`` generators and adds the core
     carrier laws by design; on this fixture (no scan sources, no

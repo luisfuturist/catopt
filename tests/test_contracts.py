@@ -414,6 +414,12 @@ _LAW_SPECS: dict[str, dict] = {
         "shapes": {"u": (2, 3)},
         "attrs": {"$attr:RD": (-1,), "$attr:RK": True},
     },
+    # check requires a shaped u whose split axis (the attr-named dim)
+    # is a known even int
+    "glu_fold": {
+        "shapes": {"u": (2, 4)},
+        "attrs": {"$attr:D": -1},
+    },
     # ---- CATEGORICAL_RULES: matmul/linear algebra ----
     "distribute_matmul_over_add": {
         "W": (4, 3),
@@ -509,8 +515,10 @@ _LAW_SPECS: dict[str, dict] = {
 
 #: Rules deliberately not fuzzed: they need side-condition checks that
 #: cannot be satisfied by unconstrained random bindings (GQA repeat-
-#: chain absorption, the 12 sdpa_fold mask/scale forms) — or carry
-#: non-tensor carrier values.  They are counted, not failed.
+#: chain absorption, the 12 sdpa_fold mask/scale forms), carry
+#: non-tensor carrier values — or bind a metavar to a ``Const`` leaf
+#: the Var-binding spec machinery cannot express (the ``rms_norm_fold``
+#: pair's ``EPS``/``P`` literals).  They are counted, not failed.
 _ALL_LAW_RULES = SIMPLIFICATION_RULES + CATEGORICAL_RULES
 
 _LAW_TRIALS = 4

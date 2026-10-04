@@ -423,6 +423,11 @@ def _model_cases() -> list[tuple[str, Any, Any]]:
         ),
         ("MaxoutMLP", M.MaxoutMLP(d, 2).eval().double(), t),
         ("GluMLP", M.GluMLP(d, 2).eval().double(), t),
+        (
+            "ManualGluMLP",
+            M.ManualGluMLP(d, 2).eval().double(),
+            t,
+        ),
         ("NativeRmsNorm", M.NativeRmsNorm(d).eval().double(), t),
         ("SelectiveSSM", S.SelectiveSSM(8, 8, 4).eval().double(), st),
         ("DiagDenseSSM", S.DiagDenseSSM(8, 8, 4).eval().double(), st),

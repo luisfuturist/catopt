@@ -28,7 +28,7 @@ from typing import Any, cast
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags
-from catopt_core.laws.base import R
+from catopt_core.laws.base import R, _shape_of
 from catopt_core.laws.cond import as_check
 from catopt_core.laws.layout import LAYOUT_RULES
 
@@ -308,6 +308,244 @@ SOFTMAX_FOLD = R(
     "Folds div+exp+sum to one dispatched op.",
     cond=_COND_SOFTMAX_FOLD,
     derive=_derive_softmax_dim,
+    tags=_SIM,
+)
+
+
+# The GLU kernel fold — the same recipe one op-family over (the
+# ``corpus-expansion-r2.md`` §6 lead): the corpus had the kernel image
+# (``GluMLP``'s ``glu`` node) but no manual spelling until
+# ``ManualGluMLP`` closed the pair.  ``F.glu(u, d)`` IS
+# ``a ⊗ σ(b)`` with ``a, b`` the two halves of ``u`` along ``d`` — and
+# the export's getitem fold lands the slice index on the ``chunk``
+# node itself, so the manual spelling is exactly
+# ``mul(chunk(u,2,d,0), σ(chunk(u,2,d,1)))``.
+#
+# Most of the precondition is structural: the shared ``u`` metavariable
+# binds both chunk operands to the same e-class (chunks of different
+# sources never match), the shared ``D`` attr metavariable pins them
+# to the same split axis and carries it to the RHS, and the literal
+# ``chunks``/``index`` attrs pin the two-equal-halves split and the
+# gate order — ``index=0`` ungated, ``index=1`` σ'd, matching
+# ``F.glu``'s first-half/second-half convention; the swapped-gate and
+# multi-chunk spellings cannot match.
+#
+# The residual guard is parity of the split axis.  ``glu`` halves its
+# ``dim`` exactly, but ``chunk(·, 2, d)`` splits an odd axis
+# first-big (n=3 → 2+1) — and (…,2)·(…,1) still broadcasts, so an
+# odd-axis redex evaluates while its ``glu`` image raises at eval.
+# Evenness of ``u.shape[D]`` is the exact precondition; it needs the
+# attr-named axis, which the cond DSL cannot index, so it stays a
+# procedural ``check`` — ``cond`` carries the expressible front
+# (``u`` shaped, rank ≥ 1; a scalar has no axis to halve).  Unknown or
+# ``None`` dims ON the split axis decline (the library's strict
+# posture); ``None`` dims elsewhere do not matter.  Term-local and
+# single-direction — at most one member per e-class, no closure
+# growth.
+_COND_GLU_FOLD = ("rank", "u", ">=", 1)
+
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_glu_shaped = as_check(_COND_GLU_FOLD)
+
+
+def _check_glu_fold(bound: dict) -> bool:
+    """Veto the odd-axis case: ``u.shape[dim]`` must be a known even int."""
+    from catopt_core.typing import _shape_of as _so
+
+    s = _so(bound.get("u"))
+    d = bound.get("$attr:D")
+    if not isinstance(s, tuple) or not isinstance(d, int):
+        return False
+    if not (-len(s) <= d < len(s)):
+        return False
+    n = s[d % len(s)]
+    return isinstance(n, int) and n % 2 == 0
+
+
+GLU_FOLD = R(
+    "glu_fold",
+    Op.make(
+        "mul",
+        Op.make("chunk", "u", chunks=2, dim="D", index=0),
+        Op.make(
+            "sigmoid",
+            Op.make("chunk", "u", chunks=2, dim="D", index=1),
+        ),
+    ),
+    Op.make("glu", "u", dim="D"),
+    law="chunk-half · σ(chunk-half) IS glu(u): the manual-GLU fold — "
+    "a ⊗ σ(b) over the two equal halves of u IS the kernel's "
+    "definition.  Folds mul+sigmoid+2 chunks to one dispatched op.",
+    cond=_COND_GLU_FOLD,
+    check=_check_glu_fold,
+    tags=_SIM,
+)
+
+
+# The RMSNorm kernel fold — the fourth machine-discovered law admitted
+# to the library, the ``corpus-expansion-r2.md`` §6 lead and the exact
+# ``softmax_fold`` situation one norm family over: the corpus carries
+# BOTH spellings of the same math — ``RMSNorm``/``NormLinear``/
+# ``TransformerBlock``/``ParallelBlock``'s manual
+# ``x·rsqrt(mean(x²)+eps)·w`` and ``NativeRmsNorm``'s fused ``rms_norm``
+# kernel op.  ``x·rms⁻¹·w`` IS ``F.rms_norm`` spelled by hand; folding
+# it recovers the kernel as one dispatched op (measured −83 % on
+# RMSNorm, −67 % on NormLinear, −31 % on TransformerBlock, −19 % on
+# ParallelBlock of extracted cost — see project/retros/rms-norm-law.md).
+#
+# The pattern pins the export's exact op-tree — ``pow`` (not the
+# ``square``/``mul(u,u)`` spellings: under DEFAULT saturation
+# ``pow_to_square``/``square_expand`` put all three in one e-class, but
+# only a graph that *carries* a ``pow`` enode matches; a ``mul(x,x)``-
+# spelled source is a documented miss, not an unsoundness), ``rsqrt``
+# (not ``div(1, sqrt)``), and the canonical ``(x·rms)·w`` association
+# the exporter writes — alternate mul orderings are reachable only
+# through the opt-in SYMMETRY set.
+#
+# The side condition splits the usual way.  ``cond`` carries the
+# expressible front: ``keepdim`` must be True (a dropped axis cannot
+# broadcast the rms back over ``u``), ``eps`` must be a numeric
+# ``Const`` leaf (the kernel's ``eps`` is a float attr — a tensor
+# ``eps`` has no image), and the ``pow`` exponent must be the literal
+# 2.  ``check`` carries what the DSL cannot: the ``mean``'s reduce
+# dims must name exactly u's last ``k`` axes — ``F.rms_norm`` only
+# normalizes a trailing block — and the gain ``w``'s shape must BE
+# that trailing block (``aten.rms_norm`` rejects any other weight
+# shape at eval, so a mismatch would mint an unlowerable member).
+# ``derive`` then computes the two RHS attrs the LHS cannot bind
+# verbatim: ``dim`` is the *normalized shape* tuple (u.shape[-k:]),
+# not the reduce dims, and ``eps`` unwraps the bound ``Const`` leaf
+# into the float attr.  Unknown or ``None`` dims decline — the same
+# strict posture as ``_check_glu_fold``; a law never mints an attr it
+# cannot verify.
+_COND_RMS_FOLD = (
+    "and",
+    ("attr-is", "MK", True),
+    ("const-num", "EPS"),
+    ("const-cmp", "P", "==", 2),
+)
+
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_rms_consts = as_check(_COND_RMS_FOLD)
+
+
+def _rms_dims(bound: dict) -> tuple | None:
+    """Return the ``mean``'s reduce dims as a tuple, or ``None``.
+
+    Accepts the exported ``(-1,)`` tuple, a list, or a hand-minted
+    bare int; every entry must be a non-``bool`` int.
+    """
+    dims = bound.get("$attr:MD")
+    if isinstance(dims, int) and not isinstance(dims, bool):
+        dims = (dims,)
+    if not (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(
+            isinstance(d, int) and not isinstance(d, bool) for d in dims
+        )
+    ):
+        return None
+    return tuple(dims)
+
+
+def _rms_normalized_shape(bound: dict):
+    """Return the ``normalized_shape`` the LHS proves, or ``None``.
+
+    ``mean(pow(u, 2), dims)`` is the kernel's reduce iff *dims* names
+    exactly u's last ``k`` axes — each in range, no duplicates — and
+    ``u`` is concretely shaped (the RHS ``dim`` attr IS ``u.shape[-k:]``,
+    so an unshaped ``u`` cannot mint it — the strict posture).
+    """
+    dims = _rms_dims(bound)
+    if dims is None:
+        return None
+    su = _shape_of(bound.get("u"))
+    if not (
+        isinstance(su, tuple) and all(isinstance(d, int) for d in su)
+    ):
+        return None
+    rank, k = len(su), len(dims)
+    if not 1 <= k <= rank or not all(-rank <= d < rank for d in dims):
+        return None
+    norm = {d % rank for d in dims}
+    # ``k`` distinct in-range axes whose minimum is ``rank - k`` IS
+    # the trailing block {rank-k … rank-1}.
+    if len(norm) != k or min(norm) != rank - k:
+        return None
+    return tuple(su[rank - k :])
+
+
+def _check_rms_fold(bound: dict) -> bool:
+    """Veto the gained fold when ``w``'s shape isn't the normalized shape."""
+    ns = _rms_normalized_shape(bound)
+    if ns is None:
+        return False
+    sw = _shape_of(bound.get("w"))
+    return isinstance(sw, tuple) and tuple(sw) == ns
+
+
+def _check_rms_fold_nogain(bound: dict) -> bool:
+    """Veto the gain-free fold when the reduce isn't a trailing block."""
+    return _rms_normalized_shape(bound) is not None
+
+
+def _derive_rms_norm(bound: dict) -> dict | None:
+    """Mint the kernel's ``dim`` (a shape, not the reduce dims) + ``eps``."""
+    ns = _rms_normalized_shape(bound)
+    eps = getattr(bound.get("EPS"), "value", None)
+    if ns is None or not isinstance(eps, (int, float)):
+        return None
+    return {"$attr:ND": ns, "$attr:EP": float(eps)}
+
+
+def _rms_reduce(u: str = "u") -> Op:
+    """``rsqrt(mean(u², MD, keepdim=MK) + EPS)`` — the shared LHS core."""
+    return Op.make(
+        "rsqrt",
+        Op.make(
+            "add",
+            Op.make(
+                "mean",
+                Op.make("pow", u, "P"),
+                dim="MD",
+                keepdim="MK",
+            ),
+            "EPS",
+        ),
+    )
+
+
+RMS_NORM_FOLD = R(
+    "rms_norm_fold",
+    Op.make("mul", Op.make("mul", "u", _rms_reduce()), "w"),
+    Op.make("rms_norm", "u", "w", dim="ND", eps="EP"),
+    law="x·rsqrt(mean(x²)+eps)·w IS rms_norm(x, w): the manual-RMSNorm "
+    "fold — composed-then-reduced then scaled IS the kernel's "
+    "definition.  Folds mul+mul+rsqrt+add+mean+pow to one dispatched "
+    "op.",
+    cond=_COND_RMS_FOLD,
+    check=_check_rms_fold,
+    derive=_derive_rms_norm,
+    tags=_SIM,
+)
+
+# The gain-free twin — ``x·rms⁻¹`` with no channel gain is
+# ``F.rms_norm(x, ns, weight=None)``.  Its LHS is the inner ``mul`` of
+# the gained fold's, so it also fires inside every gained site (the
+# ``mul(rms_norm(u), w)`` member it adds sits in the same e-class as
+# the gained fold's ``rms_norm(u, w)`` — the cost model picks the
+# fused one).  Term-local and single-direction, like its twin.
+RMS_NORM_FOLD_NOGAIN = R(
+    "rms_norm_fold_nogain",
+    Op.make("mul", "u", _rms_reduce()),
+    Op.make("rms_norm", "u", dim="ND", eps="EP"),
+    law="x·rsqrt(mean(x²)+eps) IS rms_norm(x): the weight-free "
+    "manual-RMSNorm fold — the gained fold's inner ``mul`` and a real "
+    "spelling of its own (gain-free RMSNorm blocks).",
+    cond=_COND_RMS_FOLD,
+    check=_check_rms_fold_nogain,
+    derive=_derive_rms_norm,
     tags=_SIM,
 )
 
@@ -1352,6 +1590,9 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     SQUARE_TO_POW,
     SELECT_MUL,
     SOFTMAX_FOLD,
+    GLU_FOLD,
+    RMS_NORM_FOLD,
+    RMS_NORM_FOLD_NOGAIN,
 ]
 
 #: Rules that implement the categorical insight: distributivity and naturality.
@@ -1393,12 +1634,12 @@ CATEGORICAL_RULES: list[Rewrite] = [
 #:
 #: The axiom/lemma split (measured by ``tools/law_coherence.py
 #: --emit-basis``, documented in
-#: ``project/retros/axiom-lemma-split.md``): 40 of these 54 rules are
+#: ``project/retros/axiom-lemma-split.md``): 43 of these 57 rules are
 #: kernel members — ``kind == "axiom"`` — and 14 carry a recorded
 #: ``derivation`` from the kernel (12 ``"lemma"`` — inverse twins
 #: whose direction buys reach, plus the emergent ``silu_mul_form`` —
 #: and 2 ``"redundant"`` alpha-duplicate spellings tagged
-#: ``tags.REDUNDANT``).  The kernel itself is the 29 primitives plus
+#: ``tags.REDUNDANT``).  The kernel itself is the 32 primitives plus
 #: one designated representative (alphabetically first) per
 #: derivability cycle.
 #:

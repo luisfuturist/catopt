@@ -51,6 +51,9 @@ PUBLIC_NAMES = [
     "SQUARE_TO_POW",
     "SELECT_MUL",
     "SOFTMAX_FOLD",
+    "GLU_FOLD",
+    "RMS_NORM_FOLD",
+    "RMS_NORM_FOLD_NOGAIN",
     # distributivity / naturality
     "DISTRIBUTE_MUL",
     "FACTOR_MUL",
@@ -135,6 +138,12 @@ PRIVATE_NAMES = [
     "_QKV_CAT",
     "_check_repeat_chain",
     "_check_gqa_absorb",
+    "_check_glu_fold",
+    "_check_glu_shaped",
+    "_check_rms_consts",
+    "_check_rms_fold",
+    "_check_rms_fold_nogain",
+    "_derive_rms_norm",
     "_REPEAT_KV",
     "_REPEAT_V",
     "_QK_SCORES",
@@ -184,28 +193,28 @@ def test_laws_exports_every_rewrite():
 
     found = _iter_module_rules(laws)
     assert all(isinstance(r, Rewrite) for r in found)
-    # 54 tensor (assoc_linear_rev + select_mul + softmax_fold
-    # + silu_fold)
+    # 57 tensor (assoc_linear_rev + select_mul + softmax_fold
+    # + silu_fold + glu_fold + the rms_norm_fold pair)
     # + 6 dense-scan + 16 diagonal-scan + 77 layout + 37 attention
     # rewrites.
-    assert len(found) == 190
+    assert len(found) == 193
 
 
 def test_all_rules_count_unchanged():
     # The default set excludes LAYOUT_RULES (opt-in — closure-cost
-    # regression documented in laws.tensor); WITH_LAYOUT keeps 131.
-    assert len(laws.all_rules()) == 54
+    # regression documented in laws.tensor); WITH_LAYOUT keeps 134.
+    assert len(laws.all_rules()) == 57
     assert laws.all_rules() == laws.ALL_RULES
     assert len(laws.ALL_RULES) == (
         len(laws.SIMPLIFICATION_RULES) + len(laws.CATEGORICAL_RULES)
     )
-    assert len(laws.ALL_RULES_WITH_LAYOUT) == 131
+    assert len(laws.ALL_RULES_WITH_LAYOUT) == 134
     # each call returns a fresh list, not the shared ALL_RULES object
     assert laws.all_rules() is not laws.ALL_RULES
 
 
 def test_collections_split_by_domain():
-    assert len(laws.SIMPLIFICATION_RULES) == 16
+    assert len(laws.SIMPLIFICATION_RULES) == 19
     assert len(laws.CATEGORICAL_RULES) == 38
     assert len(laws.SCAN_LAWS) == 6
     assert len(laws.SCAN_DIAG_LAWS) == 16
@@ -279,9 +288,9 @@ def test_axiom_lemma_marker_covers_all_rules():
     """The axiom/lemma split — every shipped rule carries a kernel kind.
 
     Measured by ``tools/law_coherence.py --emit-basis`` (see
-    ``project/retros/axiom-lemma-split.md``): the kernel is the 29
+    ``project/retros/axiom-lemma-split.md``): the kernel is the 32
     primitives plus one designated member (alphabetically first) per
-    derivability cycle = 40 axioms; the other 14 rules carry a
+    derivability cycle = 43 axioms; the other 14 rules carry a
     ``derivation`` naming their premise rules — 12 lemmas (inverse
     twins + the emergent silu_mul_form) and 2 redundant
     alpha-duplicates.
@@ -303,7 +312,7 @@ def test_axiom_lemma_marker_covers_all_rules():
                     r.name,
                     premise,
                 )
-    assert len(kinds["axiom"]) == 40
+    assert len(kinds["axiom"]) == 43
     assert len(kinds["lemma"]) == 12
     assert len(kinds["redundant"]) == 2
     # the redundant kind rides on the tags.REDUNDANT constant

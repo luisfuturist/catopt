@@ -1081,6 +1081,32 @@ class GluMLP(nn.Module):
         return self.down(F.glu(self.up(x), dim=-1))
 
 
+class ManualGluMLP(nn.Module):
+    """Manual GLU gated feed-forward: ``down(chunk0 · sigmoid(chunk1))``.
+
+    The same gated-unit math as :class:`GluMLP` spelled without the
+    kernel — ``a, b = up(x).chunk(2, -1); down(a * sigmoid(b))``.
+    Exports the ``chunk`` op and the ``mul(chunk, sigmoid(chunk))``
+    tuple: the manual side of the ``glu_fold`` law, whose kernel image
+    :class:`GluMLP` already supplies — the ``softmax_fold`` /
+    ``silu_fold`` recipe one op-family over.  (The export's getitem
+    fold lands the slice index on the ``chunk`` node itself:
+    ``chunk(·, 2, -1, index=0|1)``.)
+    """
+
+    def __init__(self, dim: int, hidden_mult: int = 4) -> None:
+        """Initialise the up and down projections."""
+        super().__init__()
+        h = dim * hidden_mult
+        self.up = nn.Linear(dim, h, bias=False)
+        self.down = nn.Linear(h // 2, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the manual GLU gate and output projection."""
+        a, b = self.up(x).chunk(2, dim=-1)
+        return self.down(a * torch.sigmoid(b))
+
+
 class NativeRmsNorm(nn.Module):
     """``F.rms_norm`` + projection — the native-op norm spelling.
 

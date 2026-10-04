@@ -183,6 +183,56 @@ def _c_softmax_fold(d: int, dev: torch.device):
     return term, env, [u]
 
 
+def _rms_manual(u: Any) -> Op:
+    """``rsqrt(mean(u², -1, keepdim) + 1e-6)`` — the manual rms factor."""
+    return Op.make(
+        "rsqrt",
+        Op.make(
+            "add",
+            Op.make(
+                "mean",
+                Op.make("pow", u, Const(2)),
+                dim=(-1,),
+                keepdim=True,
+            ),
+            Const(1e-6),
+        ),
+    )
+
+
+def _c_rms_norm_fold(d: int, dev: torch.device):
+    """x·rsqrt(mean(x²)+eps)·w — RMSNorm spelled by hand."""
+    b = 4
+    u, w = _v("u", b, d), _p("w", d)
+    env = {"u": _r(dev, b, d), "w": _r(dev, d)}
+    term = Op.make("mul", Op.make("mul", u, _rms_manual(u)), w)
+    return term, env, [u]
+
+
+def _c_rms_norm_fold_nogain(d: int, dev: torch.device):
+    """x·rsqrt(mean(x²)+eps) — the gain-free manual RMSNorm."""
+    b = 4
+    u = _v("u", b, d)
+    env = {"u": _r(dev, b, d)}
+    return Op.make("mul", u, _rms_manual(u)), env, [u]
+
+
+def _c_glu_fold(d: int, dev: torch.device):
+    """mul(chunk(u,2,-1,0), sigmoid(chunk(u,2,-1,1))) — manual GLU."""
+    b = 4
+    u = _v("u", b, d)
+    env = {"u": _r(dev, b, d)}
+    term = Op.make(
+        "mul",
+        Op.make("chunk", u, chunks=2, dim=-1, index=0),
+        Op.make(
+            "sigmoid",
+            Op.make("chunk", u, chunks=2, dim=-1, index=1),
+        ),
+    )
+    return term, env, [u]
+
+
 # -- matmul / linear family ------------------------------------------------
 
 
@@ -841,6 +891,9 @@ LAW_CASES: dict[str, Any] = {
     "pow_to_square": _c_pow,
     "select_mul": _c_select_mul,
     "softmax_fold": _c_softmax_fold,
+    "rms_norm_fold": _c_rms_norm_fold,
+    "rms_norm_fold_nogain": _c_rms_norm_fold_nogain,
+    "glu_fold": _c_glu_fold,
     # CATEGORICAL_RULES — bilinearity / merges
     "distribute_matmul_over_add": _c_distribute,
     "factor_matmul": _c_factor,

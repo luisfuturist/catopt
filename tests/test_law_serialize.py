@@ -9,9 +9,10 @@ This file pins:
   scheme ``rulecache`` persists, round-tripped over every shipped
   pattern);
 * the ``Rewrite`` record round-trip — ``law_to_data`` /
-  ``law_from_data`` — including the exact census of which of the 54
+  ``law_from_data`` — including the exact census of which of the 57
   shipped laws are *full-data* (39) vs pattern(+cond) with a
-  ``check`` (1) or ``derive`` (14) remainder;
+  ``check`` (2, plus 2 ``check``+``derive``) or ``derive`` (14)
+  remainder;
 * the honesty contract — a ``serializable: false`` record rebuilds
   its pattern + cond but *not* the dropped hooks: the reconstructed
   ``softmax_fold`` fires and mints ``softmax(u, dim="SD")`` (the
@@ -113,7 +114,7 @@ def test_alpha_key_shared_binding_is_position_sensitive():
 
 
 def test_serializability_census_of_shipped_library():
-    """Pin the honest partition of the 54 shipped laws."""
+    """Pin the honest partition of the 57 shipped laws."""
     full, need_derive, need_check = [], [], []
     for rule in ALL_RULES:
         missing = missing_hooks(rule)
@@ -123,13 +124,20 @@ def test_serializability_census_of_shipped_library():
             need_derive.append(rule.name)
         else:
             need_check.append((rule.name, missing))
-    assert len(ALL_RULES) == 54
+    assert len(ALL_RULES) == 57
     assert len(full) == 39
     assert len(need_derive) == 14
     assert "softmax_fold" in need_derive
     assert "qkv_fuse_asym" in need_derive
-    # gqa_absorb_repeat's side condition is still procedural
-    assert need_check == [("gqa_absorb_repeat", ("check",))]
+    # glu_fold's split-axis parity, the rms pair's normalized-shape +
+    # derive hooks, and gqa_absorb_repeat's repeat-chain side
+    # conditions are still procedural
+    assert need_check == [
+        ("glu_fold", ("check",)),
+        ("rms_norm_fold", ("check", "derive")),
+        ("rms_norm_fold_nogain", ("check", "derive")),
+        ("gqa_absorb_repeat", ("check",)),
+    ]
 
 
 def test_missing_hooks_detects_procedural_check_under_cond():

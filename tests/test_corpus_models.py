@@ -11,7 +11,9 @@ maxout, GLU, native ``rms_norm``) — so the shape census sees new
 op-tuples (``sum``, ``exp``, ``gelu``, ``relu``, ``batch_norm``,
 ``arange``, ``embedding``, ``elu``, ``topk``, ``gather``, ``conv1d``,
 ``pad``, ``sin``, ``cos``, ``tril``, ``argmax``, ``one_hot``,
-``argmin``, ``index_select``, ``maximum``, ``glu``, ``rms_norm``).
+``argmin``, ``index_select``, ``maximum``, ``glu``, ``rms_norm``)
+— plus the manual-GLU spelling (``chunk`` + ``sigmoid`` + ``mul``)
+that pairs with :class:`GluMLP`'s kernel image for ``glu_fold``.
 
 Every builder is exercised end-to-end: forward, ``export_to_ir`` and a
 lowered ``IRModule`` verified fp64 against the original module.
@@ -28,6 +30,7 @@ from catopt_torch.models import (
     GluMLP,
     HardDispatch,
     KernelizedAttention,
+    ManualGluMLP,
     ManualSoftmaxAttention,
     MaxoutMLP,
     MoEMLP,
@@ -148,6 +151,12 @@ CASES = [
     ),
     ("MaxoutMLP", MaxoutMLP(d, 2), VEC, {"maximum"}),
     ("GluMLP", GluMLP(d, 2), VEC, {"glu"}),
+    (
+        "ManualGluMLP",
+        ManualGluMLP(d, 2),
+        VEC,
+        {"chunk", "sigmoid", "mul"},
+    ),
     ("NativeRmsNorm", NativeRmsNorm(d), VEC, {"rms_norm"}),
 ]
 
