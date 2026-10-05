@@ -1030,6 +1030,29 @@ def _metavar_parents(lhs_pat: Any, rhs_pat: Any) -> dict:
     return parents
 
 
+def _diag_groups(groups: list[list]) -> Iterable:
+    """Yield ``groups[v][a]`` in increasing ``v + a`` (Cantor) order.
+
+    The companion of :func:`_diag_product` for a *ragged* product of
+    already-materialized lists: ``groups[v]`` is one viewed binding's
+    list of attr-combination bases (the lengths differ — a rank-1
+    operand's view table admits fewer axis pairs than a rank-2 one).
+    Yielding by index-sum keeps the low-index corner of *every* group
+    ahead of any group's deep tail, so a cap truncates a corner of the
+    ``(viewed x attr)`` space rather than a whole viewed binding — the
+    same fairness :func:`_binding_envs` applies one level up.
+    """
+    n = len(groups)
+    if not n:
+        return
+    top = (n - 1) + max(len(g) for g in groups) - 1
+    for total in range(top + 1):
+        for v in range(min(total, n - 1), -1, -1):
+            a = total - v
+            if a < len(groups[v]):
+                yield groups[v][a]
+
+
 def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
     """Yield ``(base, viewed_shapes, out_shapes)`` per viewed combo.
 
@@ -1037,6 +1060,18 @@ def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
     under a view op, merged with each shape-valid attribute
     assignment.  *viewed_shapes* / *out_shapes* are the operand and
     LHS-view output shapes the free operand's bank derives from.
+
+    The two inner dimensions — the viewed binding and the attribute
+    combination — are interleaved by index-sum (:func:`_diag_groups`),
+    not nested.  A shape-major nesting serves *every* attribute
+    combination of one viewed shape before the next shape opens, so a
+    guard needing a different operand rank waits on a whole shape's
+    attr domain: for the shipped ``sdpa_fold_*`` folds the leading
+    rank-1 ``(4,)`` operand spends 24 guard-declined bases before the
+    first rank-2 operand, and the accepted corner lands at base 27 of
+    324.  The diagonal reaches that corner at base 13 (measured), and
+    the same reordering carries to the deeper free dimension through
+    :func:`_binding_envs`.
     """
     mvs = sorted(
         set(_leaf_metavars(lhs_pat)) | set(_leaf_metavars(rhs_pat))
@@ -1044,19 +1079,23 @@ def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
     parents = _metavar_parents(lhs_pat, rhs_pat)
     nodes = _view_nodes([lhs_pat, rhs_pat])
     lhs_views = [n for n in _view_nodes([lhs_pat]) if n.args]
+    groups: list[list] = []
     for viewed in _viewed_bindings(mvs, parents):
         domains = _attr_domains(nodes, viewed)
         if domains is None:
             continue
+        u_shapes = [_operand_shape(t) for t in viewed.values()]
+        bases: list[tuple] = []
         for combo in _diag_product([d[1] for d in domains]):
             base = _attr_merge(domains, combo, viewed)
             if base is None:
                 continue
-            yield (
-                base,
-                [_operand_shape(t) for t in viewed.values()],
-                _lhs_out_shapes(lhs_views, base),
+            bases.append(
+                (base, u_shapes, _lhs_out_shapes(lhs_views, base))
             )
+        if bases:
+            groups.append(bases)
+    yield from _diag_groups(groups)
 
 
 def _binding_envs(lhs_pat: Any, rhs_pat: Any) -> Iterable[dict]:

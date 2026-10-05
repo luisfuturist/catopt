@@ -804,27 +804,36 @@ def test_synth_sites_respects_limit():
 
 
 # ---------------------------------------------------------------------------
-#  The selective cap policy — the starvation case and the escalation
+#  The selective cap policy — the escalation safety net
+#
+#  The ordering fix (``oracle._diag_groups``) surfaces the headline
+#  ``sdpa_fold_*`` folds at the default window, so the escalation is no
+#  longer paid for them.  It remains a latent safety net for a guarded
+#  rule whose window is still starved by a *different* gap (a shape or
+#  kind gap no cap reaches).
 # ---------------------------------------------------------------------------
 
 
-def test_sdpa_fold_addmul_starved_at_the_default_cap():
-    """The characterization: the shipped ``sdpa_fold_addmul`` guard
-    accepts nothing inside the default window.
+def test_sdpa_fold_addmul_surfaces_at_the_default_cap():
+    """The ordering fix: the shipped ``sdpa_fold_addmul`` guard's
+    accepted corner now lies inside the default window.
 
-    Its accepted corner is a multi-clause guard's region — the
-    ``axes-last2`` transpose precondition, ``softmax`` over the last
-    axis, a numeric scale — and the fair-order enumeration reaches it
-    only at index 793 (measured), past the 360 default.  Every site
-    inside the window is declined: the region is starved, not empty
-    by construction.
+    Its accepted corner is a multi-clause region — the ``axes-last2``
+    transpose precondition, ``softmax`` over the last axis, a numeric
+    scale — and the shape-major enumeration reached it only at index
+    793 (``cap-policy.md``), past the 360 default.  The
+    ``(viewed x attr)`` diagonal (``oracle._diag_groups``) surfaces it
+    at index 327: the window now accepts and proves the region instead
+    of declining every site (``enumeration-fairness.md``).
     """
     rule = _BY_NAME["sdpa_fold_addmul"]
     region = ev._guarded_evals(
         rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
     )
-    assert region.accepted == 0
-    assert region.declined == 360
+    assert region.accepted > 0
+    assert region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
+    assert region.declined > 0
     assert region.envs == 360
 
 
@@ -842,15 +851,20 @@ def test_sdpa_fold_addmul_region_appears_at_the_guarded_cap():
     assert region.declined > 0
 
 
-def test_guarded_truth_escalates_a_starved_region():
-    """``_guarded_truth`` applies the policy: a starved guarded rule's
-    synthesized region is swept again at the ceiling, and the rescued
-    region is non-empty with an equal site."""
-    rule = _BY_NAME["sdpa_fold_addmul"]
+def test_guarded_truth_escalates_a_still_starved_region():
+    """``_guarded_truth`` still applies the policy: a guarded rule
+    whose default window accepts nothing is swept again at the
+    ceiling.
+
+    ``rms_norm_fold`` stays starved — its guard's ``tail-block``
+    clause is a shape gap no cap reaches — so the escalation fires and
+    pays both windows without a rescue.  The ordering fix surfaced the
+    ``sdpa_fold_*`` folds at the default, so this is the remaining
+    (honest) cost of the safety net.
+    """
+    rule = _BY_NAME["rms_norm_fold"]
     synth, _real = ev._guarded_truth(rule, _corpus(), 360)
-    assert synth.accepted > 0
-    assert synth.equal > 0
-    assert synth.unequal == 0 and synth.rhs_err == 0
+    assert synth.accepted == 0
     # the cost is reported: both windows were paid.
     assert synth.envs > 360
 
@@ -886,10 +900,11 @@ def test_guarded_truth_masked_fill_kind_gap_remains():
     assert synth.envs > 360  # escalated
 
 
-def test_truth_gate_uses_the_selective_cap():
-    """The stage-4 wiring: a starved guarded rule clears the truth
-    gate on the escalated region (it would be refused as vacuous on
-    the default window)."""
+def test_truth_gate_surfaces_at_the_default_window():
+    """The stage-4 wiring: the ordering fix means the shipped
+    ``sdpa_fold_addmul`` clears the truth gate on the *default* window
+    — the escalation is not paid (it would have been refused as
+    vacuous on the old shape-major window)."""
     from types import SimpleNamespace
 
     rule = _BY_NAME["sdpa_fold_addmul"]
@@ -905,7 +920,7 @@ def test_truth_gate_uses_the_selective_cap():
     assert ev._truth_gate(rep, rule, _corpus(), None)
     assert rep.synth_region is not None
     assert rep.synth_region.accepted > 0
-    assert rep.synth_region.envs > 360
+    assert rep.synth_region.envs == 360
 
 
 def test_region_detail_reports_the_env_cost():

@@ -552,14 +552,106 @@ def test_binding_envs_covers_bases_early():
 
 
 # ---------------------------------------------------------------------------
+#  The (viewed x attr) diagonal — the enumeration-fairness reorder
+# ---------------------------------------------------------------------------
+#
+#  ``_diag_groups`` is the ragged-product companion of ``_diag_product``:
+#  it interleaves a *viewed binding's* list of attr-combination bases
+#  with the next viewed binding's, by index-sum.  The base dimension was
+#  the last nesting level still shape-major, and a guard needing a
+#  different operand rank waited on a whole shape's attr domain — the
+#  ``sdpa_fold_*`` starvation (``enumeration-fairness.md``).
+
+
+def test_diag_groups_cantor_order_and_ragged():
+    """``groups[v][a]`` in increasing ``v + a``; a ragged product
+    covers every element exactly once."""
+    g0 = [(0, a) for a in range(3)]
+    g1 = [(1, a) for a in range(2)]
+    g2 = [(2, a) for a in range(4)]
+    got = list(vo._diag_groups([g0, g1, g2]))
+    assert got == [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (2, 0),
+        (1, 1),
+        (0, 2),
+        (2, 1),
+        (2, 2),
+        (2, 3),
+    ]
+    # every element of every group survives, exactly once.
+    assert sorted(got) == sorted(g0 + g1 + g2)
+    # index-sum is non-decreasing — the Cantor order.
+    sums = [v + a for v, a in got]
+    assert sums == sorted(sums)
+    # degenerate: no groups; a single group is its own order.
+    assert list(vo._diag_groups([])) == []
+    assert list(vo._diag_groups([g0])) == g0
+
+
+def test_diag_groups_keeps_a_whole_binding_ahead_of_a_deep_tail():
+    """A cap keeps the low-index corners of the early groups, not one
+    group's deep tail — the truncation-fairness property."""
+    groups = [[(v, a) for a in range(6)] for v in range(4)]
+    got = list(vo._diag_groups(groups))
+    assert got[:6] == [(0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2)]
+    # inside a 10-entry cap every group is represented — the old
+    # shape-major order would have spent all ten on group 0's tail.
+    assert len({v for v, _a in got[:10]}) == 4
+    # every group's index-0 corner precedes any group's index-3 tail.
+    assert got.index((3, 0)) < got.index((0, 3))
+
+
+def test_synth_bases_interleaves_viewed_shapes():
+    """The base generator interleaves viewed bindings instead of
+    serving one shape's whole attr domain first.
+
+    The ``sdpa_fold_add`` transpose operand enumerates shapes whose
+    view table admits differing numbers of attr combos; under the old
+    shape-major nesting the leading rank-1 ``(4,)`` spent 24
+    guard-declined bases before the first rank-2 operand opened.  The
+    diagonal opens the first rank-2 operand at base 1 and reaches the
+    guard-satisfying corner (rank-2 ``K``, ``softmax`` over the last
+    axis) at base 13 — inside the 360 default.
+    """
+    from catopt_core.laws import ALL_RULES
+
+    rule = {r.name: r for r in ALL_RULES}["sdpa_fold_add"]
+    bases = list(vo._synth_bases(rule.lhs, rule.rhs))
+    # more than one viewed shape inside the first dozen bases.
+    shapes = []
+    for base, _us, _os in bases[:12]:
+        sh = tuple(base["K"].typ.shape)
+        if sh not in shapes:
+            shapes.append(sh)
+    assert len(shapes) > 1
+    # the first rank-2 K opens at base 1, not after a whole rank-1
+    # shape's 24 attr combos.
+    assert len(bases[0][0]["K"].typ.shape) == 1
+    assert len(bases[1][0]["K"].typ.shape) >= 2
+    # the guard-satisfying corner (last-two transpose axes AND the
+    # softmax axis at -1) is base 13.
+    corner = next(
+        i
+        for i, (base, _us, _os) in enumerate(bases)
+        if len(base["K"].typ.shape) >= 2
+        and base.get("$attr:SD") == -1
+        and {base.get("$attr:TD1"), base.get("$attr:TD2")} == {-2, -1}
+    )
+    assert corner == 13
+
+
+# ---------------------------------------------------------------------------
 #  The selective cap policy — escalate_limit
 # ---------------------------------------------------------------------------
 
 
 def test_guarded_cap_is_past_the_default():
-    """The escalation ceiling sits above the default window — the
-    shipped ``sdpa_fold_*`` accepted corners (indices 469/793) are
-    past the default but inside it."""
+    """The escalation ceiling sits above the default window — a
+    still-starved guarded rule (a shape/kind gap no cap reaches) pays
+    it, so it must stay above the default."""
     assert vo._MAX_INSTANCES < vo._GUARDED_CAP
 
 
@@ -598,6 +690,72 @@ def test_escalate_limit_never_lowers_and_never_raises_past_ceiling():
         vo.escalate_limit(vo._GUARDED_CAP, guarded=True, accepted=0)
         == vo._GUARDED_CAP
     )
+
+
+# ---------------------------------------------------------------------------
+#  The starved folds surface at the default cap — the ordering fix
+# ---------------------------------------------------------------------------
+#
+#  ``sdpa_fold_add`` / ``_addmul`` / ``_adddiv`` measured 0 accepted
+#  sites at the 360 default under the old shape-major base order (their
+#  equal corners sat at index 468 / 792 — ``cap-policy.md``).  The
+#  (viewed x attr) diagonal surfaces them inside the default window, so
+#  the selective-cap escalation is no longer paid for them.
+
+
+def _first_equal_index(rule, limit: int) -> int | None:
+    """Enumeration index of the first guard-accepted equal site."""
+    from catopt_discovery import evidence as ev
+
+    for idx, (subst, lhs_i) in enumerate(
+        ev._synth_sites(rule.lhs, rule.rhs, limit=limit)
+    ):
+        if ev._site_outcome(rule, subst, lhs_i) == "equal":
+            return idx
+    return None
+
+
+@pytest.mark.parametrize(
+    "name, first_equal",
+    [
+        ("sdpa_fold_add", 139),
+        ("sdpa_fold_addmul", 327),
+        ("sdpa_fold_adddiv", 327),
+    ],
+)
+def test_sdpa_folds_measure_at_the_default_cap(name, first_equal):
+    """The starved folds now accept and prove inside the 360 window,
+    at the measured index the diagonal reaches their corner."""
+    from catopt_core.laws import ALL_RULES
+    from catopt_discovery import evidence as ev
+
+    rule = {r.name: r for r in ALL_RULES}[name]
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+    )
+    assert region.accepted > 0
+    assert region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
+    assert region.declined > 0
+    assert region.envs == 360
+    assert _first_equal_index(rule, 360) == first_equal
+
+
+def test_sdpa_fold_drop_twins_surface_too():
+    """The ``_drop`` twins (the extra dropout metavars) surfaced at the
+    same index as their bare forms — the extra free dimension is
+    diagonalized, not left to bury the corner."""
+    from catopt_core.laws import ALL_RULES
+    from catopt_discovery import evidence as ev
+
+    for name in ("sdpa_fold_add_drop", "sdpa_fold_addmul_drop"):
+        rule = {r.name: r for r in ALL_RULES}[name]
+        region = ev._guarded_evals(
+            rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+        )
+        assert region.accepted > 0, name
+        assert region.equal > 0, name
+        assert region.unequal == 0 and region.rhs_err == 0, name
 
 
 # ---------------------------------------------------------------------------
@@ -1370,3 +1528,77 @@ def test_main_json(monkeypatch, tmp_path, capsys):
     # without --json nothing is written; the table still prints.
     rc = vo.main([])
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+#  Empty guarded regions that are enumeration gaps, not empty regions
+# ---------------------------------------------------------------------------
+#
+#  Two shipped guarded laws measure ``synth: 0 accepted`` not because
+#  their guard is unsatisfiable but because the enumeration never mints
+#  the binding the guard needs.  Both guards accept a hand-built
+#  binding, so the region is non-empty; the gap is in the enumerator's
+#  attr domains, which is out of this change's scope (see
+#  ``project/retros/guard-residuals.md``).
+
+
+def test_gqa_absorb_repeat_guard_accepts_a_chained_binding():
+    """The empty ``gqa_absorb_repeat`` synth window is an ENUMERATION
+    gap, not an empty region.
+
+    The guard's ``repeat-chain`` / ``repeat-heads`` clauses are
+    satisfiable: a hand-built ``unsqueeze(2) -> expand(2 at 2) ->
+    reshape(merge)`` chain with ``q[-2] == k[-2] * r`` clears.  The
+    enumeration never mints it — ``_attr_domains`` reads each view
+    node's operand shape from the *pre-view* term, so the
+    ``expand``/``reshape`` attr domains cannot chain onto the
+    ``unsqueeze`` output.
+    """
+    from catopt_core.laws import ALL_RULES
+
+    rule = next(r for r in ALL_RULES if r.name == "gqa_absorb_repeat")
+    bound = {
+        "q": _v("q", 2, 6, 4),
+        "k": _v("k", 2, 3, 4),
+        "v": _v("v", 2, 3, 4),
+        "$attr:UDk": 2,
+        "$attr:ESk": (2, 3, 2, 4),
+        "$attr:RSk": (2, 6, 4),
+        "$attr:UDv": 2,
+        "$attr:ESv": (2, 3, 2, 4),
+        "$attr:RSv": (2, 6, 4),
+        "$attr:D": -1,
+        "$attr:C": False,
+    }
+    assert rule.check(bound)
+
+
+def test_rms_norm_fold_guard_accepts_a_tail_block_binding():
+    """The ``tail-block`` spec is correct: the gained fold's guard
+    accepts ``u=(2,3,4)``, ``w=(4,)`` with ``MD`` naming ``u``'s last
+    axis (and the ``(0,1,2)`` spelling with ``w=(2,3,4)``).
+
+    The ``0/6000`` synth measurement is an enumeration-ordering
+    artifact — the four-free-operand diagonal buries the
+    non-scalar-``u`` corner (all 94 front-passing sites at 6000 have
+    ``u=()``) — not a mis-specified guard.
+    """
+    from catopt_core.laws import ALL_RULES
+
+    rules = {r.name: r for r in ALL_RULES}
+    gained = rules["rms_norm_fold"]
+    nogain = rules["rms_norm_fold_nogain"]
+    base = {
+        "u": _v("u", 2, 3, 4),
+        "w": _v("w", 4),
+        "EPS": Const(0.5),
+        "P": Const(2),
+        "$attr:MK": True,
+        "$attr:MD": -1,
+    }
+    assert gained.check(base)
+    assert nogain.check(base)
+    multi = dict(base, w=_v("w", 2, 3, 4), **{"$attr:MD": (0, 1, 2)})
+    assert gained.check(multi)
+    # a scalar u has no trailing block — the guard declines.
+    assert not gained.check(dict(base, u=_v("u")))
