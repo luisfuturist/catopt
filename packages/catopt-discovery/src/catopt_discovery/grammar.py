@@ -777,11 +777,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     searched = _counts(evaluate_schemas(schemas))
 
-    print(_fmt_report(human, searched, args))
+    print(_fmt_report(human, searched, args))  # stdout-compat
 
     if args.json:
         _dump_json(args.json, human, searched)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

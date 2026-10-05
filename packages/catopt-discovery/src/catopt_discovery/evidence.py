@@ -1457,7 +1457,7 @@ def _store_object_cli(
     by_name = {r.name: r for r in ALL_RULES}
     rule = by_name.get(name)
     if rule is None:
-        print(f"no shipped law named {name!r}")
+        print(f"no shipped law named {name!r}")  # stdout-compat
         return 1
     key = store_object(conn, rule, kind=kind)
     # the row was just written — the read-back cannot be empty
@@ -1467,14 +1467,14 @@ def _store_object_cli(
         if record["serializable"]
         else "missing hooks: " + ", ".join(record["missing_hooks"])
     )
-    print(f"stored {rule.name}  [{state}]")
-    print(f"  kind: {record['kind']}")
-    print(f"  alpha_key = {key}")
+    print(f"stored {rule.name}  [{state}]")  # stdout-compat
+    print(f"  kind: {record['kind']}")  # stdout-compat
+    print(f"  alpha_key = {key}")  # stdout-compat
     cert = record.get("cert")
     if cert is None:
-        print("  cert: none recorded")
+        print("  cert: none recorded")  # stdout-compat
     else:
-        print(
+        print(  # stdout-compat
             f"  cert: {len(cert['steps'])}-step derivation"
             f" {cert['rules_used']}"
         )
@@ -1495,10 +1495,12 @@ def _admit_object_cli(
     try:
         got = admit_object(conn, alpha_key)
     except ValueError as exc:
-        print(f"cannot admit object under {alpha_key}: {exc}")
+        print(  # stdout-compat
+            f"cannot admit object under {alpha_key}: {exc}"
+        )
         return 1
     if got is None:
-        print(f"no lemma stored under {alpha_key}")
+        print(f"no lemma stored under {alpha_key}")  # stdout-compat
         return 1
     rule, data = got
     state = (
@@ -1506,18 +1508,18 @@ def _admit_object_cli(
         if data["serializable"]
         else "missing hooks: " + ", ".join(data["missing_hooks"])
     )
-    print(f"admitted {rule.name}  [{state}]")
-    print(f"  kind: {data['kind']}")
-    print(f"  {rule!r}")
+    print(f"admitted {rule.name}  [{state}]")  # stdout-compat
+    print(f"  kind: {data['kind']}")  # stdout-compat
+    print(f"  {rule!r}")  # stdout-compat
     try:
         cert = stored_certificate(data)
     except Exception as exc:
-        print(f"  cert: STRICT REPLAY FAILED: {exc}")
+        print(f"  cert: STRICT REPLAY FAILED: {exc}")  # stdout-compat
         return 1
     if cert is None:
-        print("  cert: none recorded")
+        print("  cert: none recorded")  # stdout-compat
     else:
-        print(
+        print(  # stdout-compat
             f"  cert: {cert.n_steps}-step {cert.rules_used}"
             " — replayed strict"
         )
@@ -1528,21 +1530,25 @@ def _gauntlet_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
     """Run the admission gauntlet on a stored object; report usable."""
     rep = run_gauntlet(conn, alpha_key)
     if rep.rule is None or rep.record is None:
-        print(f"cannot admit object under {alpha_key}: {rep.reason}")
+        print(  # stdout-compat
+            f"cannot admit object under {alpha_key}: {rep.reason}"
+        )
         return 1
     state = (
         "full-data"
         if rep.record["serializable"]
         else "missing hooks: " + ", ".join(rep.record["missing_hooks"])
     )
-    print(f"admitted {rep.name}  [{state}]")
-    print(f"  kind: {rep.kind}")
-    print(f"  {rep.rule!r}")
-    print("-- admission gauntlet --")
+    print(f"admitted {rep.name}  [{state}]")  # stdout-compat
+    print(f"  kind: {rep.kind}")  # stdout-compat
+    print(f"  {rep.rule!r}")  # stdout-compat
+    print("-- admission gauntlet --")  # stdout-compat
     for s in rep.stages:
         mark = "pass" if s.passed else "FAIL"
-        print(f"  [{mark}] {s.name}: {s.detail}")
-    print(f"  usable: {'yes' if rep.usable else 'no'} — {rep.reason}")
+        print(f"  [{mark}] {s.name}: {s.detail}")  # stdout-compat
+    print(  # stdout-compat
+        f"  usable: {'yes' if rep.usable else 'no'} — {rep.reason}"
+    )
     return 0 if rep.usable else 1
 
 
@@ -1566,7 +1572,9 @@ def _op_dispatch(
         and args.admit is None
         and args.admit_object is None
     ):
-        print("--gauntlet needs --admit or --admit-object")
+        print(  # stdout-compat
+            "--gauntlet needs --admit or --admit-object"
+        )
         return 1
     if args.add_lemma is not None:
         return _store_object_cli(conn, args.add_lemma, args.kind)
@@ -1652,14 +1660,14 @@ def main(argv: list[str] | None = None) -> int:
         not any(o is not None for o in ops)
         and not Path(args.report).is_file()
     ):
-        print(f"no evidence store at {args.report}")
+        print(f"no evidence store at {args.report}")  # stdout-compat
         return 1
     conn = connect(args.report)
     try:
         rc = _op_dispatch(args, conn)
         if rc is not None:
             return rc
-        print(
+        print(  # stdout-compat
             render_report(
                 conn,
                 args.report,

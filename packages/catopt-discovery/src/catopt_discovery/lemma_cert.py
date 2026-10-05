@@ -511,39 +511,43 @@ def main(argv: list[str] | None = None) -> int:
         ALL_RULES_WITH_LAYOUT if args.with_layout else ALL_RULES
     )
     rows, certs = materialize_all(universe)
-    print(_report(rows, universe_name))
+    print(_report(rows, universe_name))  # stdout-compat
 
     if args.probe:
         row, cert = probe(args.probe, universe)
-        print()
-        print(f"Probe — {args.probe} vs (universe - self)")
-        print("-" * 68)
-        print(
+        print()  # stdout-compat
+        print(  # stdout-compat
+            f"Probe — {args.probe} vs (universe - self)"
+        )
+        print("-" * 68)  # stdout-compat
+        print(  # stdout-compat
             f"  verdict={row.verdict} dir={row.direction} "
             f"steps={row.n_steps} rules={list(row.rules_used)}"
         )
         if cert is not None:
             for s in cert.steps:
-                print(f"    {s.rule} @ {s.path}")
+                print(f"    {s.rule} @ {s.path}")  # stdout-compat
         elif row.note:
-            print(f"  note: {row.note}")
+            print(f"  note: {row.note}")  # stdout-compat
 
     if args.demo:
         record, replayed = serialize_demo(args.demo, universe)
-        print()
-        print(f"Serialization demo — {args.demo}")
-        print("-" * 68)
-        print(json.dumps(record, indent=1))
+        print()  # stdout-compat
+        print(f"Serialization demo — {args.demo}")  # stdout-compat
+        print("-" * 68)  # stdout-compat
+        print(json.dumps(record, indent=1))  # stdout-compat
         from catopt_core.ir import op_repr
 
-        print(f"replayed from data -> {op_repr(replayed)}")
-        print("verify_certificate(strict=True): OK")
+        print(  # stdout-compat
+            f"replayed from data -> {op_repr(replayed)}"
+        )
+        print("verify_certificate(strict=True): OK")  # stdout-compat
 
     if args.json:
         Path(args.json).write_text(
             json.dumps(_jsonable(rows, certs), indent=1) + "\n"
         )
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

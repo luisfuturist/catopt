@@ -555,24 +555,34 @@ def _validation_table(val: dict) -> str:
 
 def _print_report(vocab: Vocabulary, val: dict) -> None:
     """Print the full human-readable vocabulary report."""
-    print("== law_vocab — the op vocabulary by property ==")
-    print(
+    print(  # stdout-compat
+        "== law_vocab — the op vocabulary by property =="
+    )
+    print(  # stdout-compat
         f"   corpus ops: {len(vocab.classes)}; "
         f"pointwise(binary)={len(vocab.pointwise)}, "
         f"pointwise(unary)={len(vocab.unary_pointwise)}, "
         f"views={len(vocab.views)}"
     )
-    print()
-    print("-- derived classification --")
-    print(_class_table(vocab))
-    print()
-    print("-- derived sets --")
-    print(f"   pointwise (arity 2): {', '.join(vocab.pointwise)}")
-    print(f"   pointwise (arity 1): {', '.join(vocab.unary_pointwise)}")
-    print(f"   views:               {', '.join(vocab.views)}")
-    print()
-    print("-- validation: derived vs hand tables (over corpus ops) --")
-    print(_validation_table(val))
+    print()  # stdout-compat
+    print("-- derived classification --")  # stdout-compat
+    print(_class_table(vocab))  # stdout-compat
+    print()  # stdout-compat
+    print("-- derived sets --")  # stdout-compat
+    print(  # stdout-compat
+        f"   pointwise (arity 2): {', '.join(vocab.pointwise)}"
+    )
+    print(  # stdout-compat
+        f"   pointwise (arity 1): {', '.join(vocab.unary_pointwise)}"
+    )
+    print(  # stdout-compat
+        f"   views:               {', '.join(vocab.views)}"
+    )
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- validation: derived vs hand tables (over corpus ops) --"
+    )
+    print(_validation_table(val))  # stdout-compat
     for r in val["rows"]:
         if r["derived_only"]:
             tag = (
@@ -580,16 +590,16 @@ def _print_report(vocab: Vocabulary, val: dict) -> None:
                 if r["corroborated"]
                 else ""
             )
-            print(
+            print(  # stdout-compat
                 f"   {r['table']}: derived-only "
                 f"{', '.join(r['derived_only'])}{tag}"
             )
         if r["hand_only"]:
-            print(
+            print(  # stdout-compat
                 f"   {r['table']}: hand-only "
                 f"{', '.join(r['hand_only'])}"
             )
-    print()
+    print()  # stdout-compat
 
 
 def _dump_json(path: str, vocab: Vocabulary, val: dict) -> None:
@@ -626,7 +636,7 @@ def main(argv: list[str] | None = None) -> int:
     _print_report(vocab, val)
     if args.json:
         _dump_json(args.json, vocab, val)
-        print(f"wrote {args.json}")
+        print(f"wrote {args.json}")  # stdout-compat
     return 0
 
 

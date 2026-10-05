@@ -2427,7 +2427,9 @@ def _report_pipeline(
     bench, _be = _bench_cases()
     models, _me = model_cases()
     probe = _eligible(cases, records)
-    print(f"   probe-eligible intake cases: {len(probe)}")
+    print(  # stdout-compat
+        f"   probe-eligible intake cases: {len(probe)}"
+    )
     res = _run_delta(
         [*bench, *models],
         models,
@@ -2436,7 +2438,7 @@ def _report_pipeline(
         args.vocab,
         args.holdout,
     )
-    print(_delta_table(res))
+    print(_delta_table(res))  # stdout-compat
     e = res["enlarged"]
     payload["pipeline"] = {
         "baseline_terms": res["baseline"]["n_terms"],
@@ -2483,13 +2485,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
-    print("== law_intake — real workloads into the census ==")
+    print(  # stdout-compat
+        "== law_intake — real workloads into the census =="
+    )
     sink = TorchSink()
     cases, records, rejections = ingest(sink=sink)
     n_in = sum(1 for r in records if r["status"] == "ingested")
     n_co = sum(1 for r in records if r["status"] == "census-only")
     n_vf = sum(1 for r in records if r["status"] == "verify-failed")
-    print(
+    print(  # stdout-compat
         f"   {len(records)} exported: {n_in} ingested, "
         f"{n_co} census-only, {n_vf} verify-failed; "
         f"{len(rejections)} rejected"
@@ -2498,27 +2502,29 @@ def main(argv: list[str] | None = None) -> int:
     bench, _be = _bench_cases()
     models, _me = model_cases()
     delta = census_delta([*bench, *models], cases)
-    print()
-    print("-- intake table --")
-    print(_status_table(records, delta))
-    print()
-    print(
+    print()  # stdout-compat
+    print("-- intake table --")  # stdout-compat
+    print(_status_table(records, delta))  # stdout-compat
+    print()  # stdout-compat
+    print(  # stdout-compat
         f"-- census delta (intake vs {len(bench)} bench + "
         f"{len(models)} models) --"
     )
-    print(
+    print(  # stdout-compat
         f"   {delta['n_base_tuples']} -> "
         f"{delta['n_base_tuples'] + len(delta['new_op_tuples'])} "
         f"op-tuples, +{delta['new_shapes']} shapes, "
         f"{len(delta['new_ops'])} new ops: {delta['new_ops']}"
     )
-    print()
-    print("-- binding-gap backlog (exported, unbound) --")
-    print(_gap_table(records))
-    print()
-    print("-- export rejections --")
-    print(_rejection_table(rejections))
-    print()
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- binding-gap backlog (exported, unbound) --"
+    )
+    print(_gap_table(records))  # stdout-compat
+    print()  # stdout-compat
+    print("-- export rejections --")  # stdout-compat
+    print(_rejection_table(rejections))  # stdout-compat
+    print()  # stdout-compat
 
     payload: dict[str, Any] = {
         "n_exported": len(records),
@@ -2544,18 +2550,20 @@ def main(argv: list[str] | None = None) -> int:
             args.out,
             args.tensors,
         )
-        print(f"wrote {args.out} + {args.tensors}")
+        print(f"wrote {args.out} + {args.tensors}")  # stdout-compat
     else:
-        print("(--no-write: side files not written)")
+        print("(--no-write: side files not written)")  # stdout-compat
 
     if not args.skip_pipeline:
-        print()
-        print("-- pipeline delta (baseline vs corpus+intake) --")
+        print()  # stdout-compat
+        print(  # stdout-compat
+            "-- pipeline delta (baseline vs corpus+intake) --"
+        )
         _report_pipeline(cases, records, args, payload)
 
     if args.json:
         Path(args.json).write_text(json.dumps(payload, indent=2) + "\n")
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

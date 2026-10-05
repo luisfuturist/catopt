@@ -762,17 +762,17 @@ def main(argv: list[str] | None = None) -> int:
         ALL_RULES_WITH_LAYOUT if args.with_layout else ALL_RULES
     )
     cat = catalogue(rules)
-    print(_report(cat, rules))
-    print()
-    print(_cluster_section())
+    print(_report(cat, rules))  # stdout-compat
+    print()  # stdout-compat
+    print(_cluster_section())  # stdout-compat
     if args.emit_basis:
-        print()
-        print(_basis_section(emit_basis(cat)))
+        print()  # stdout-compat
+        print(_basis_section(emit_basis(cat)))  # stdout-compat
     if args.json:
         Path(args.json).write_text(
             json.dumps(_jsonable(cat), indent=1) + "\n"
         )
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

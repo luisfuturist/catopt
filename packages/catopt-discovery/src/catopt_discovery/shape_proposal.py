@@ -725,38 +725,40 @@ def _verdict(result: dict) -> None:
     pays = [o for o in outs if o.model_fires and o.fire_paid]
     true_pays = [o for o in pays if o.truth and o.new]
     false_pays = [o for o in pays if not (o.truth and o.new)]
-    print("== verdict ==")
-    print(
+    print("== verdict ==")  # stdout-compat
+    print(  # stdout-compat
         f"  schemas: {len(outs)}; with a real (equality-enforced) "
         f"match: {len(real)}"
     )
-    print(f"  true & new among those: {len(true_new)}")
-    print(f"  useful (cost-lowering on a real term): {len(useful)}")
-    print(f"  firing on a real model: {len(fires)}")
-    print(f"  firing AND cost-lowering: {len(pays)}")
-    print(f"    of which true & new: {len(true_pays)}")
-    print(
+    print(f"  true & new among those: {len(true_new)}")  # stdout-compat
+    print(  # stdout-compat
+        f"  useful (cost-lowering on a real term): {len(useful)}"
+    )
+    print(f"  firing on a real model: {len(fires)}")  # stdout-compat
+    print(f"  firing AND cost-lowering: {len(pays)}")  # stdout-compat
+    print(f"    of which true & new: {len(true_pays)}")  # stdout-compat
+    print(  # stdout-compat
         f"    of which false/duplicate (cost-only): {len(false_pays)}"
     )
     base = result["baseline"]
-    print(
+    print(  # stdout-compat
         f"  baseline (11 earlier laws): fires on models = "
         f"{sum(base['fires'].values())}"
     )
     if true_pays:
-        print("  paying & true schemas:")
+        print("  paying & true schemas:")  # stdout-compat
         for o in true_pays:
-            print(
+            print(  # stdout-compat
                 f"    - {o.schema.name}: fires={o.model_fires}, "
                 f"paid={o.fire_paid}, cases={o.fire_cases}"
             )
     if false_pays:
-        print(
+        print(  # stdout-compat
             "  cost-lowering but NOT true (oracle rejects — the "
             "reason a cost-only proposer is unsafe):"
         )
         for o in false_pays:
-            print(
+            print(  # stdout-compat
                 f"    - {o.schema.name}: num_true={o.num_true}, "
                 f"relation={o.relation}"
             )
@@ -804,31 +806,43 @@ def main(argv: list[str] | None = None) -> int:
     result = run_proposal()
     outs: list[SchemaOutcome] = result["outcomes"]
 
-    print("== law_shape_proposal — laws aimed at real shapes ==")
-    print(
+    print(  # stdout-compat
+        "== law_shape_proposal — laws aimed at real shapes =="
+    )
+    print(  # stdout-compat
         f"   corpus: {result['n_bench']} bench + "
         f"{result['n_models']} models; {len(outs)} schemas"
     )
-    print()
-    print("-- match / truth / usefulness (relax = shape only) --")
-    print(_match_table(outs))
-    print()
-    print("-- firing on real models (each schema run alone) --")
-    print(_fire_table(outs))
-    print()
-    print("-- examples (first real match per applicable schema) --")
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- match / truth / usefulness (relax = shape only) --"
+    )
+    print(_match_table(outs))  # stdout-compat
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- firing on real models (each schema run alone) --"
+    )
+    print(_fire_table(outs))  # stdout-compat
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- examples (first real match per applicable schema) --"
+    )
     for o in outs:
         if o.example:
-            print(f"  {o.schema.name:<20} {o.example[:90]}")
-    print()
-    print("-- end-to-end reach (ALL_RULES vs ALL_RULES + schema) --")
-    print(_reach_table(result["reach"]))
-    print()
+            print(  # stdout-compat
+                f"  {o.schema.name:<20} {o.example[:90]}"
+            )
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- end-to-end reach (ALL_RULES vs ALL_RULES + schema) --"
+    )
+    print(_reach_table(result["reach"]))  # stdout-compat
+    print()  # stdout-compat
     _verdict(result)
 
     if args.json:
         _dump_json(args.json, result)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

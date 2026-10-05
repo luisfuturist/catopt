@@ -705,34 +705,42 @@ def main(argv: list[str] | None = None) -> int:
     controls = run_controls(max_nodes=args.max_nodes)
     struct = structural_report()
 
-    print(
+    print(  # stdout-compat
         "== experiment 1: law rediscovery (derivable from the others?) =="
     )
-    print(_fmt_rows(rows))
-    print()
-    print("summary:", _summary(rows))
-    print()
-    print("structural duplicates:", struct["duplicates"])
-    print("structural inverse pairs:", len(struct["inverses"]))
-    print()
-    print("== experiment 2: proposal (confirm new, reject false) ==")
-    print(_fmt_proposals(proposals))
-    print()
+    print(_fmt_rows(rows))  # stdout-compat
+    print()  # stdout-compat
+    print("summary:", _summary(rows))  # stdout-compat
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "structural duplicates:", struct["duplicates"]
+    )
+    print(  # stdout-compat
+        "structural inverse pairs:", len(struct["inverses"])
+    )
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "== experiment 2: proposal (confirm new, reject false) =="
+    )
+    print(_fmt_proposals(proposals))  # stdout-compat
+    print()  # stdout-compat
     n_ok = sum(1 for p in proposals if p.ok)
-    print(f"proposals correct: {n_ok}/{len(proposals)}")
+    print(  # stdout-compat
+        f"proposals correct: {n_ok}/{len(proposals)}"
+    )
     bad = [p.label for p in proposals if not p.ok]
     if bad:
-        print("MISMATCHES:", bad)
-    print()
-    print("== experiment 3: soundness controls ==")
-    print(
+        print("MISMATCHES:", bad)  # stdout-compat
+    print()  # stdout-compat
+    print("== experiment 3: soundness controls ==")  # stdout-compat
+    print(  # stdout-compat
         f"laws checked: {controls['n']}; failures: "
         f"{controls['failures'] or 'none'}"
     )
 
     if args.json:
         _dump_json(args.json, rows, proposals, controls, struct)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0 if not bad and not controls["failures"] else 1
 
 

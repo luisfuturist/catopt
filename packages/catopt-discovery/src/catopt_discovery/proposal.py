@@ -1048,12 +1048,14 @@ def main(argv: list[str] | None = None) -> int:
     outcomes = evaluate(pool)
     table = yield_table(outcomes)
 
-    print("== candidate law proposal — yield per strategy ==")
-    print(_fmt_yield(table))
-    print()
-    print("== genuinely-new, useful laws found ==")
-    print(_fmt_useful(outcomes))
-    print()
+    print(  # stdout-compat
+        "== candidate law proposal — yield per strategy =="
+    )
+    print(_fmt_yield(table))  # stdout-compat
+    print()  # stdout-compat
+    print("== genuinely-new, useful laws found ==")  # stdout-compat
+    print(_fmt_useful(outcomes))  # stdout-compat
+    print()  # stdout-compat
 
     # A derivable candidate can never be useful (its members are
     # already reachable), so the value-ranking question is only
@@ -1065,13 +1067,19 @@ def main(argv: list[str] | None = None) -> int:
     nd_pool = [o.candidate for o in nd]
     sub = _rank_on(nd_pool, nd, seeds)
 
-    print("== strategy 4: learned vs heuristic vs random ranking ==")
+    print(  # stdout-compat
+        "== strategy 4: learned vs heuristic vs random ranking =="
+    )
     for label, r in (("full pool", full), ("non-derivable", sub)):
         if not r:
-            print(f"  [{label}] no useful candidate — undefined")
+            print(  # stdout-compat
+                f"  [{label}] no useful candidate — undefined"
+            )
             continue
-        print(f"  [{label}] pool={r['pool']} useful={r['useful']}")
-        print(
+        print(  # stdout-compat
+            f"  [{label}] pool={r['pool']} useful={r['useful']}"
+        )
+        print(  # stdout-compat
             f"    average precision  learned={r['learned_ap']:.2f}"
             f"  heuristic={r['heuristic_ap']:.2f}"
             f"  random={r['random_ap']:.2f}"
@@ -1081,7 +1089,7 @@ def main(argv: list[str] | None = None) -> int:
         _dump_json(
             args.json, outcomes, table, {"full": full, "sub": sub}
         )
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

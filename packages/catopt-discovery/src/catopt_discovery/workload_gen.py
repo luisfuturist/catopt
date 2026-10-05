@@ -1051,11 +1051,13 @@ def main(argv: list[str] | None = None) -> int:
         else (args.strategy,)
     )
 
-    print("== law_workload_gen — new workloads for the census ==")
+    print(  # stdout-compat
+        "== law_workload_gen — new workloads for the census =="
+    )
     bench, _be = _bench_cases()
     models, _me = model_cases()
     cases = [*bench, *models]
-    print(
+    print(  # stdout-compat
         f"   corpus: {len(bench)} bench + {len(models)} models; "
         f"seed={args.seed} n={args.n} strategies={strategies}"
     )
@@ -1064,30 +1066,30 @@ def main(argv: list[str] | None = None) -> int:
     gen, gstats = _generate(
         cases, st, rng, args.n, strategies, supported
     )
-    print()
-    print("-- generation --")
-    print(_gen_table(gen, gstats))
-    print()
-    print(_reject_table(gstats))
-    print()
+    print()  # stdout-compat
+    print("-- generation --")  # stdout-compat
+    print(_gen_table(gen, gstats))  # stdout-compat
+    print()  # stdout-compat
+    print(_reject_table(gstats))  # stdout-compat
+    print()  # stdout-compat
 
     delta = census_delta(cases, gen)
-    print("-- census delta (generated vs corpus) --")
-    print(
+    print("-- census delta (generated vs corpus) --")  # stdout-compat
+    print(  # stdout-compat
         f"   generated terms carry {delta['gen_tuple_total']} "
         f"distinct op-tuples ({len(delta['new_op_tuples'])} new), "
         f"{delta['gen_shape_total']} distinct shapes "
         f"({len(delta['new_shapes'])} new)"
     )
     for src, rec in sorted(delta["per_strategy"].items()):
-        print(
+        print(  # stdout-compat
             f"   {src}: {rec['terms']} terms, "
             f"{len(rec['new_tuples'])} new tuples, "
             f"{len(rec['new_shapes'])} new shapes"
         )
-    print()
-    print(_novelty_table(delta))
-    print()
+    print()  # stdout-compat
+    print(_novelty_table(delta))  # stdout-compat
+    print()  # stdout-compat
 
     payload: dict = {
         "n_requested": args.n,
@@ -1107,13 +1109,17 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if not args.skip_pipeline:
-        print("-- pipeline delta (baseline vs corpus+generated) --")
-        print("   (two full pipeline runs; a few minutes)")
+        print(  # stdout-compat
+            "-- pipeline delta (baseline vs corpus+generated) --"
+        )
+        print(  # stdout-compat
+            "   (two full pipeline runs; a few minutes)"
+        )
         gen_models = _interleave(gen, args.gen_models)
         res = run_with_workloads(
             cases, gen, models, gen_models, args.vocab, args.holdout
         )
-        print(_pipeline_delta(res))
+        print(_pipeline_delta(res))  # stdout-compat
         payload["pipeline"] = {
             "baseline": {
                 "n_terms": res["baseline"]["n_terms"],
@@ -1154,7 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         _dump_json(args.json, payload)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

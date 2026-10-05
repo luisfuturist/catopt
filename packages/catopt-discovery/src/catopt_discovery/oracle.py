@@ -1226,8 +1226,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", help="write machine-readable results")
     args = parser.parse_args(argv)
     verdicts = _run()
-    print("== law_view_oracle — view/index candidate resolution ==")
-    print(_table(verdicts))
+    print(  # stdout-compat
+        "== law_view_oracle — view/index candidate resolution =="
+    )
+    print(_table(verdicts))  # stdout-compat
     if args.json:
         payload = [
             {
@@ -1254,7 +1256,7 @@ def main(argv: list[str] | None = None) -> int:
             for v in verdicts
         ]
         Path(args.json).write_text(json.dumps(payload, indent=2) + "\n")
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

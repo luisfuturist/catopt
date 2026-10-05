@@ -1496,23 +1496,27 @@ def _print_report(result: dict, top: int) -> None:
     """Print the full human-readable pipeline report."""
     ranked: list[Evidence] = result["ranked"]
     c = result["census"]
-    print("== law_pipeline — census -> propose -> verify -> measure ==")
+    print(  # stdout-compat
+        "== law_pipeline — census -> propose -> verify -> measure =="
+    )
     ho = result["holdout"]
-    print(
+    print(  # stdout-compat
         f"   search rule set: {result['n_search_rules']} rules"
         + (f" (held out: {ho})" if ho else " (ALL_RULES)")
     )
-    print(f"   op vocabulary: {result.get('vocab', 'hand')}")
-    print(
+    print(  # stdout-compat
+        f"   op vocabulary: {result.get('vocab', 'hand')}"
+    )
+    print(  # stdout-compat
         f"   corpus: {result['n_bench']} bench + "
         f"{result['n_models']} models + "
         f"{result.get('n_intake', 0)} intake"
     )
-    print(
+    print(  # stdout-compat
         f"   census: {c['n_op_nodes']} op nodes, "
         f"{c['n_op_tuples']} op-tuples, {c['n_shapes']} shapes"
     )
-    print(f"   proposals: {result['proposals']}")
+    print(f"   proposals: {result['proposals']}")  # stdout-compat
     cache = result.get("cache")
     if cache is not None:
         line = (
@@ -1525,10 +1529,10 @@ def _print_report(result: dict, top: int) -> None:
                 f" — {cache['hits']}/{cache['total']} "
                 "verdicts served from cache"
             )
-        print(line)
+        print(line)  # stdout-compat
     ship = [e for e in ranked if e.shippable]
     ill = [e for e in ranked if e.fires_ill_typed]
-    print(
+    print(  # stdout-compat
         f"   firing on a real model: "
         f"{sum(1 for e in ranked if e.fires)} "
         f"({len(ill)} mint ill-typed members, "
@@ -1542,23 +1546,29 @@ def _print_report(result: dict, top: int) -> None:
 
         tally = Counter(e.view_verdict for e in vres)
         cond = [e for e in vres if e.view_verdict == "conditional"]
-        print(
+        print(  # stdout-compat
             f"   view-oracle: {len(vres)} view candidates — "
             + ", ".join(f"{k}={n}" for k, n in sorted(tally.items()))
         )
         for e in cond:
-            print(f"      {e.proposal.name}: {e.view_guard}")
-    print()
-    print(f"-- ranked candidates (top {top}) --")
-    print(_table(ranked, top))
-    print()
-    print("-- ship recommendations (evidence per candidate) --")
+            print(  # stdout-compat
+                f"      {e.proposal.name}: {e.view_guard}"
+            )
+    print()  # stdout-compat
+    print(f"-- ranked candidates (top {top}) --")  # stdout-compat
+    print(_table(ranked, top))  # stdout-compat
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- ship recommendations (evidence per candidate) --"
+    )
     if not ship:
-        print("  none — no candidate clears the ship bar")
+        print(  # stdout-compat
+            "  none — no candidate clears the ship bar"
+        )
     for i, ev in enumerate(ranked, start=1):
         if not ev.shippable:
             continue
-        print(
+        print(  # stdout-compat
             f"  #{i} {ev.proposal.name} [{ev.proposal.family}] — "
             f"true={ev.num_true} new={ev.relation} "
             f"census={ev.census_sites} match={ev.matches} "
@@ -1567,47 +1577,57 @@ def _print_report(result: dict, top: int) -> None:
             f"drop={ev.cost_drop * 100:.1f}% cert=pass "
             f"enode={ev.closure_ratio:.2f}x"
         )
-        print(f"      rule: {op_repr(ev.proposal.lhs)}")
-        print(f"         -> {op_repr(ev.proposal.rhs)}")
-        print(f"      cases: {', '.join(ev.fire_cases)}")
-    print()
-    print("-- why the rest did not ship --")
+        print(  # stdout-compat
+            f"      rule: {op_repr(ev.proposal.lhs)}"
+        )
+        print(  # stdout-compat
+            f"         -> {op_repr(ev.proposal.rhs)}"
+        )
+        print(  # stdout-compat
+            f"      cases: {', '.join(ev.fire_cases)}"
+        )
+    print()  # stdout-compat
+    print("-- why the rest did not ship --")  # stdout-compat
     for i, ev in enumerate(ranked, start=1):
         if ev.shippable:
             continue
-        print(f"  #{i:>2} {ev.proposal.name:<26} {ev.no_ship_reason}")
-    print()
+        print(  # stdout-compat
+            f"  #{i:>2} {ev.proposal.name:<26} {ev.no_ship_reason}"
+        )
+    print()  # stdout-compat
     _print_held_out(result)
 
 
 def _print_held_out(result: dict) -> None:
     """Print the held-out rediscovery verdict."""
     held = result["held_out"]
-    print("-- held-out rediscovery --")
+    print("-- held-out rediscovery --")  # stdout-compat
     if not held.get("holdout"):
-        print("  (no holdout — run with --holdout <rule> to validate)")
+        print(  # stdout-compat
+            "  (no holdout — run with --holdout <rule> to validate)"
+        )
         return
     if not held.get("found"):
-        print(
+        print(  # stdout-compat
             f"  held out: {held['holdout']} — NOT rediscovered "
             f"(no structurally-matching candidate was proposed)"
         )
         return
-    print(
+    print(  # stdout-compat
         f"  held out: {held['holdout']} — rediscovered as "
         f"{held['candidate']}: rank {held['rank']} of {held['of']}, "
         f"shippable={held['shippable']}"
     )
-    print(
+    print(  # stdout-compat
         f"  evidence: census LHS sites={held['census_sites']}, "
         f"match={held['matches']}, fires={held['fires']}, "
         f"paid={held['paid']}, drop={held['cost_drop'] * 100:.1f}%"
     )
-    print(
+    print(  # stdout-compat
         f"  proposed by: {', '.join(held['sources'])}"
         f" — census-generated={held['census_generated']}"
     )
-    print(
+    print(  # stdout-compat
         "  verdict: "
         + (
             "PASS — the pipeline ranks the known winner top"
@@ -1729,7 +1749,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.use_evidence_cache and not args.evidence_db:
-        print(
+        print(  # stdout-compat
             "note: --use-evidence-cache without --evidence-db — "
             "nothing to read, measuring fresh"
         )
@@ -1743,19 +1763,19 @@ def main(argv: list[str] | None = None) -> int:
     _print_report(result, args.top)
     if args.json:
         _dump_json(args.json, result)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     if args.emit_admission:
         from catopt_discovery import emit
 
         em = emit.emit_admission(result, args.emit_admission, args.out)
-        print("\n-- admission emission --")
+        print("\n-- admission emission --")  # stdout-compat
         if not em.emitted:
-            print(f"  REFUSED: {em.reason}")
+            print(f"  REFUSED: {em.reason}")  # stdout-compat
             return 1
         for f in em.files:
-            print(f"  wrote {f}")
+            print(f"  wrote {f}")  # stdout-compat
         for n in em.notes:
-            print(f"  note: {n}")
+            print(f"  note: {n}")  # stdout-compat
     return 0
 
 

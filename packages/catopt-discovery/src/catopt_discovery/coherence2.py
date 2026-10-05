@@ -888,30 +888,34 @@ def main(argv: list[str] | None = None) -> int:
     inst = {n: lc._instance(by_name[n]) for n in cat["instanced"]}
     inst = {n: i for n, i in inst.items() if i is not None}
 
-    print("=" * 68)
-    print("LAW COHERENCE — DEPTH 2 (chains, reach, mediators)")
-    print("=" * 68)
-    print(
+    print("=" * 68)  # stdout-compat
+    print(  # stdout-compat
+        "LAW COHERENCE — DEPTH 2 (chains, reach, mediators)"
+    )
+    print("=" * 68)  # stdout-compat
+    print(  # stdout-compat
         f"universe: {len(rules)} rules | instanced: {len(inst)} | "
         f"pair catalogue: {cat_seconds:.1f} s"
     )
-    print()
+    print()  # stdout-compat
 
     # -- probe 1: derivation graph + stratification -------------------
     _set_phase("stratification")
     strat = _stratify(rules, inst, profiles)
     _set_phase("grounding")
     ground = _grounding_check(rules, inst, strat)
-    print(_derivation_graph_stats(profiles, strat))
-    print()
-    print("Effective basis — seeds needed to derive the library")
-    print("-" * 68)
-    print(
+    print(_derivation_graph_stats(profiles, strat))  # stdout-compat
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "Effective basis — seeds needed to derive the library"
+    )
+    print("-" * 68)  # stdout-compat
+    print(  # stdout-compat
         f"  primitives: {strat['n_primitive']} | cyclic SCCs "
         f"seeded: {len(ground['seeded_cycles'])} "
         f"({', '.join(ground['seeded_cycles']) or 'none'})"
     )
-    print(
+    print(  # stdout-compat
         f"  unstratified laws still underivable under the seeds: "
         f"{len(ground['uncovered'])}"
         + (
@@ -920,36 +924,38 @@ def main(argv: list[str] | None = None) -> int:
             else ""
         )
     )
-    print(f"  measured effective basis: {ground['effective_basis']}")
-    print()
+    print(  # stdout-compat
+        f"  measured effective basis: {ground['effective_basis']}"
+    )
+    print()  # stdout-compat
 
     # -- probe 2: reach under removal ---------------------------------
     reach: list[dict[str, Any]] = []
     if not args.skip_reach:
         _set_phase("reach")
         reach = _reach_probe(rules, profiles)
-        print(_reach_table(reach))
-        print()
+        print(_reach_table(reach))  # stdout-compat
+        print()  # stdout-compat
     else:
-        print("(reach probe skipped — --skip-reach)")
-        print()
+        print("(reach probe skipped — --skip-reach)")  # stdout-compat
+        print()  # stdout-compat
 
     # -- probe 3: mediator table --------------------------------------
     _set_phase("mediators")
     med = _mediator_table(rules, inst, cat["confluence"])
-    print(_mediator_section(med))
-    print()
+    print(_mediator_section(med))  # stdout-compat
+    print()  # stdout-compat
 
-    print(_sanity(cat, med, rules))
-    print()
-    print(_cost_table())
+    print(_sanity(cat, med, rules))  # stdout-compat
+    print()  # stdout-compat
+    print(_cost_table())  # stdout-compat
 
     if args.json:
         Path(args.json).write_text(
             json.dumps(_jsonable(strat, ground, med, reach), indent=1)
             + "\n"
         )
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

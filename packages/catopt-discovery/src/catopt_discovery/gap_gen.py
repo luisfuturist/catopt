@@ -946,7 +946,7 @@ def _named_targets(
     ``None`` when ``only`` is unset (targets cannot be named).
     """
     if only is None:
-        print(
+        print(  # stdout-compat
             "   --skip-baseline requires --only (targets must "
             "be named when the baseline is not measured)"
         )
@@ -968,7 +968,7 @@ def _named_targets(
     for name in sorted(only):
         p = by_name.get(name)
         if p is None:
-            print(f"   !! {name}: no such proposal")
+            print(f"   !! {name}: no such proposal")  # stdout-compat
             continue
         ev = lpipe.Evidence(proposal=p)
         ev.relation = lp._relation(p.lhs, p.rhs, lib)
@@ -978,7 +978,9 @@ def _named_targets(
         if p.instance is not None:
             ev.num_true = lp._numeric_true(*p.instance)
         evs.append(ev)
-    print(f"   targets (named): {[e.proposal.name for e in evs]}")
+    print(  # stdout-compat
+        f"   targets (named): {[e.proposal.name for e in evs]}"
+    )
     return evs
 
 
@@ -1013,13 +1015,15 @@ def main(argv: list[str] | None = None) -> int:
     rng = random.Random(args.seed)
     only = set(args.only.split(",")) if args.only else None
 
-    print("== law_gap_targeted_gen — close the inapplicable loop ==")
+    print(  # stdout-compat
+        "== law_gap_targeted_gen — close the inapplicable loop =="
+    )
     bench, _be = _bench_cases()
     models, _me = model_cases()
     cases = [*bench, *models]
     st = lwg.corpus_stats(cases)
     supported = TorchSink().supported_ops
-    print(
+    print(  # stdout-compat
         f"   corpus: {len(bench)} bench + {len(models)} models; "
         f"seed={args.seed} vocab={args.vocab}"
     )
@@ -1030,11 +1034,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         base_rules = lpipe._search_rules(args.holdout)
     else:
-        print("   running the full pipeline for the baseline…")
+        print(  # stdout-compat
+            "   running the full pipeline for the baseline…"
+        )
         result = lpipe.run_pipeline(args.holdout, args.vocab)
         base_rules = lpipe._search_rules(args.holdout)
         evs = targets(result["ranked"], only)
-        print(
+        print(  # stdout-compat
             f"   pipeline: {len(result['ranked'])} candidates, "
             f"{len(evs)} gap targets "
             f"(fires=0, not proven-false)"
@@ -1058,38 +1064,46 @@ def main(argv: list[str] | None = None) -> int:
             measure_candidate(ev, gen, prov, base_rules, sink, cost_fn)
         )
 
-    print()
-    print("-- synthesized instances --")
+    print()  # stdout-compat
+    print("-- synthesized instances --")  # stdout-compat
     for r in results:
-        print(f"  {r.name:<28} [{r.family}] rel={r.relation}")
-        print(f"      was: {r.base_reason}")
+        print(  # stdout-compat
+            f"  {r.name:<28} [{r.family}] rel={r.relation}"
+        )
+        print(f"      was: {r.base_reason}")  # stdout-compat
         for inst in r.instances:
-            print(f"      gen: {inst[:66]}")
+            print(f"      gen: {inst[:66]}")  # stdout-compat
         if not r.instances:
-            print("      gen: (no valid instance synthesized)")
-        print(f"      embeddings: {', '.join(r.embeddings) or 'none'}")
-    print()
-    print("-- oracle on the generated instance --")
-    print(_oracle_table(results))
-    print()
-    print("-- per-case probe + reach --")
-    print(_case_table(results))
-    print()
-    print("-- verdict movement --")
-    print(_target_table(results))
-    print()
+            print(  # stdout-compat
+                "      gen: (no valid instance synthesized)"
+            )
+        print(  # stdout-compat
+            f"      embeddings: {', '.join(r.embeddings) or 'none'}"
+        )
+    print()  # stdout-compat
+    print("-- oracle on the generated instance --")  # stdout-compat
+    print(_oracle_table(results))  # stdout-compat
+    print()  # stdout-compat
+    print("-- per-case probe + reach --")  # stdout-compat
+    print(_case_table(results))  # stdout-compat
+    print()  # stdout-compat
+    print("-- verdict movement --")  # stdout-compat
+    print(_target_table(results))  # stdout-compat
+    print()  # stdout-compat
     fired = [r for r in results if r.fires]
     paid = [r for r in results if r.paid]
     ships = [r for r in results if r.would_ship]
-    print("== summary ==")
-    print(
+    print("== summary ==")  # stdout-compat
+    print(  # stdout-compat
         f"  {len(results)} gap targets; "
         f"{sum(1 for r in results if r.synthesized)} synthesized; "
         f"{len(fired)} now fire; {len(paid)} pay on a generated case; "
         f"{len(ships)} would ship if the shape were real"
     )
     if ships:
-        print(f"  would-ship: {[r.name for r in ships]}")
+        print(  # stdout-compat
+            f"  would-ship: {[r.name for r in ships]}"
+        )
 
     if args.json:
         _dump_json(
@@ -1101,7 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
                 "n_targets": len(results),
             },
         )
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 

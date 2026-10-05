@@ -392,34 +392,38 @@ def main(argv: list[str] | None = None) -> int:
     sh_counts, sh_terms = shape_census(terms)
     agg = sharing_census(terms)
 
-    print(
+    print(  # stdout-compat
         "== law_shape_census — what shapes do real graphs contain? =="
     )
-    print(
+    print(  # stdout-compat
         f"   corpus: {len(terms)} terms "
         f"({sum(1 for t in terms if t.source == 'bench')} bench, "
         f"{sum(1 for t in terms if t.source == 'model')} models, "
         f"{sum(1 for t in terms if t.source == 'intake')} intake)"
     )
-    print(
+    print(  # stdout-compat
         f"   {sum(op_counts.values())} op nodes, "
         f"{len(op_counts)} distinct op-tuples, "
         f"{len(sh_counts)} distinct shapes"
     )
-    print()
-    print(f"-- op-tuple census (top {args.top}) --")
-    print(_op_tuple_table(op_counts, op_terms, args.top))
-    print()
-    print(f"-- shape census (top {args.top}; share = repeated leaf) --")
-    print(_shape_table(sh_counts, sh_terms, args.top))
-    print()
-    print("-- sharing census (binary op nodes) --")
-    print(_sharing_table(agg))
-    print()
+    print()  # stdout-compat
+    print(f"-- op-tuple census (top {args.top}) --")  # stdout-compat
+    print(  # stdout-compat
+        _op_tuple_table(op_counts, op_terms, args.top)
+    )
+    print()  # stdout-compat
+    print(  # stdout-compat
+        f"-- shape census (top {args.top}; share = repeated leaf) --"
+    )
+    print(_shape_table(sh_counts, sh_terms, args.top))  # stdout-compat
+    print()  # stdout-compat
+    print("-- sharing census (binary op nodes) --")  # stdout-compat
+    print(_sharing_table(agg))  # stdout-compat
+    print()  # stdout-compat
 
     if args.json:
         _dump_json(args.json, run_census(args.top))
-        print(f"wrote {args.json}")
+        print(f"wrote {args.json}")  # stdout-compat
     return 0
 
 

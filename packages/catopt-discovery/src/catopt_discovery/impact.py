@@ -1025,48 +1025,56 @@ def _print_report(result: dict) -> None:
     n_model = sum(1 for f in firings if f.source == "model")
     n_synth = sum(1 for f in firings if f.source == "synthetic")
 
-    print(
+    print(  # stdout-compat
         "== law_impact — do the 11 proposed laws pay on real models? =="
     )
-    print(
+    print(  # stdout-compat
         f"   probes: {n_bench // len(laws)} bench x {len(laws)} laws, "
         f"{n_model // len(laws)} model x {len(laws)} laws, "
         f"{n_synth // len(laws)} synthetic x {len(laws)} laws"
     )
     if result["bench_errors"]:
-        print(f"   bench build errors: {result['bench_errors']}")
+        print(  # stdout-compat
+            f"   bench build errors: {result['bench_errors']}"
+        )
     if result["model_export_errors"]:
-        print("   model export failures:")
+        print("   model export failures:")  # stdout-compat
         for e in result["model_export_errors"]:
-            print(f"     - {e}")
-    print()
+            print(f"     - {e}")  # stdout-compat
+    print()  # stdout-compat
 
-    print("-- (a) firing table (bench / model / synthetic / total) --")
-    print(_fire_table(firings, laws))
-    print()
+    print(  # stdout-compat
+        "-- (a) firing table (bench / model / synthetic / total) --"
+    )
+    print(_fire_table(firings, laws))  # stdout-compat
+    print()  # stdout-compat
 
-    print(
+    print(  # stdout-compat
         "-- (a2) relaxed-pattern census over "
         f"{result['n_real_subterms']} real subterms --"
     )
-    print(_census_table(result))
-    print()
+    print(_census_table(result))  # stdout-compat
+    print()  # stdout-compat
 
-    print("-- (b) cost delta for every firing --")
-    print(_delta_table(firings))
-    print()
+    print("-- (b) cost delta for every firing --")  # stdout-compat
+    print(_delta_table(firings))  # stdout-compat
+    print()  # stdout-compat
 
-    print("-- whole-set firings (all 11 laws at once) --")
+    print(  # stdout-compat
+        "-- whole-set firings (all 11 laws at once) --"
+    )
     if result["set_fires"]:
         for key, hit in sorted(result["set_fires"].items()):
-            print(f"  {key}: {hit}")
+            print(f"  {key}: {hit}")  # stdout-compat
     else:
-        print("  (the set fired on no case)")
-    print()
+        print("  (the set fired on no case)")  # stdout-compat
+    print()  # stdout-compat
 
-    print("-- (c) reach: ALL_RULES vs ALL_RULES + new laws --")
-    print(_reach_table(result["reach"]))
-    print()
+    print(  # stdout-compat
+        "-- (c) reach: ALL_RULES vs ALL_RULES + new laws --"
+    )
+    print(_reach_table(result["reach"]))  # stdout-compat
+    print()  # stdout-compat
 
     _verdict(result)
 
@@ -1081,19 +1089,21 @@ def _verdict(result: dict) -> None:
     model = [f for f in firings if f.source == "model" and f.fires]
     reach_changed = [r for r in result["reach"] if r["changed"]]
 
-    print("== verdict ==")
+    print("== verdict ==")  # stdout-compat
     if not real:
-        print(
+        print(  # stdout-compat
             "  NONE of the 11 laws fires on any real bench case or model "
             "graph."
         )
     else:
-        print(
+        print(  # stdout-compat
             f"  {len(real)} real firing(s); {len(real_paid)} paid "
             f"(lowered the extracted cost)."
         )
-    print(f"  model firings: {len(model)}")
-    print(f"  reach changed by adding the laws: {len(reach_changed)}")
+    print(f"  model firings: {len(model)}")  # stdout-compat
+    print(  # stdout-compat
+        f"  reach changed by adding the laws: {len(reach_changed)}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1106,7 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
     _print_report(result)
     if args.json:
         _dump_json(args.json, result)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 
