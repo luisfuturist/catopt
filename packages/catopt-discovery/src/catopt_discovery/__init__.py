@@ -8,8 +8,11 @@ impact/verdict probes (:mod:`.impact`, :mod:`.pipeline`), the sqlite
 evidence store (:mod:`.evidence`), the coherence catalogue
 (:mod:`.coherence`, :mod:`.coherence2`), workload intake
 (:mod:`.intake`, :mod:`.workload_gen`), and the emit/vocab/meta-game
-helpers.  Formerly the ``tools/law_*.py`` scripts; every module keeps
-its CLI — invoke as ``python -m catopt_discovery.<module>``.
+helpers, and the object constructor (:mod:`.object_synthesis` — the
+ADR-0004 "construction operations" that *build* declared objects for
+the evidence store to admit).  Formerly the ``tools/law_*.py``
+scripts; every module keeps its CLI — invoke as
+``python -m catopt_discovery.<module>``.
 
 .. data:: REPO_ROOT
 
