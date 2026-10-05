@@ -262,8 +262,18 @@ def _numeric_true(lhs: Any, rhs: Any) -> bool | None:
     return _allclose(a, b, _TOL)
 
 
-def _allclose(a: Any, b: Any, tol: float) -> bool:
+def _allclose(
+    a: Any, b: Any, tol: float, *, equal_nan: bool = True
+) -> bool:
     """Compare two values with tolerance, promoting to fp64.
+
+    ``equal_nan`` defaults **True**: a rewrite is valid when both
+    sides produce the *same value including its undefined pattern* —
+    ``div(1, sqrt(u)) -> rsqrt(u)`` is sound on negative ``u`` (both
+    sides NaN), and reading that pair as a counterexample was a
+    false-refusal class (``project/retros/value-bank.md``).  A site
+    where only ONE side is non-finite still compares unequal — that
+    difference is informative.
 
     The shipped ``meta_eval`` comparison is strict about dtype (a
     ``Const`` leaf lowers to an integer tensor), so it rejects a true
@@ -280,7 +290,8 @@ def _allclose(a: Any, b: Any, tol: float) -> bool:
     """
     if isinstance(a, tuple) and isinstance(b, tuple):
         return len(a) == len(b) and all(
-            _allclose(x, y, tol) for x, y in zip(a, b, strict=True)
+            _allclose(x, y, tol, equal_nan=equal_nan)
+            for x, y in zip(a, b, strict=True)
         )
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if a.shape != b.shape:
@@ -292,6 +303,7 @@ def _allclose(a: Any, b: Any, tol: float) -> bool:
                     b.to(torch.float64),
                     atol=tol,
                     rtol=tol,
+                    equal_nan=equal_nan,
                 )
             )
         except Exception:
