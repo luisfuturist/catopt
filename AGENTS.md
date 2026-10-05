@@ -36,7 +36,7 @@ uv run pytest                 # full test suite (~7.5 min, single-process —
 .venv/bin/python tools/radon_ratchet.py   # complexity ratchet
 coverage run -m pytest tests/ -q   # source list includes catopt_discovery
 coverage report -m --omit="*/catopt_discovery/*"   # the five: fail_under=100
-coverage report -m --include="*/catopt_discovery/*" --fail-under=96   # ratchet floor — tighten, never lower
+coverage report -m --include="*/catopt_discovery/*" --fail-under=99   # ratchet floor — measured 99%; tighten, never lower
 ```
 
 > **Parallel-warning (measured, not theoretical).**  Do *not* run this
@@ -278,7 +278,7 @@ on `catopt_cuda`; import `CudaGraphRunner` from `catopt_cuda`.
   the suite is pinned at 100% for the five original packages; new
   branches need tests (or a justified `pragma: no cover`).
   `catopt_discovery` joined the source list after its staged climb
-  and sits under a **pinned ratchet floor** (`--fail-under=96` at
+  and sits under a **pinned ratchet floor** (`--fail-under=99` at
   landing — tighten the number as the residual gaps close, never
   lower it; the unreachable-defensive arcs are documented in
   `project/retros/discovery-package.md`).
