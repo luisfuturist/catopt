@@ -352,14 +352,15 @@ def test_measure_view_oracle_unproven_keeps_num_true(
     """An ``unproven`` verdict leaves ``num_true`` untouched.
 
     The proposal carries a ``select`` (which puts it in the view
-    oracle's scope) *and* a ``softmax`` attr metavar — an op outside
-    the oracle's attr-domain table, so every instantiation is
-    skipped honestly and no evaluable instance exists.
+    oracle's scope) *and* a ``softmax`` attr metavar under a key the
+    kind table cannot type (``axis`` — ``softmax``'s attr is named
+    ``dim``), so every instantiation is skipped honestly and no
+    evaluable instance exists.
     """
     sink, cost = sink_cost
     lhs = _p(
         "mul",
-        _p("softmax", "A", dim="D"),
+        _p("softmax", "A", axis="D"),
         _p("select", "B", dim="SD", index="SI"),
     )
     proposal = pl.Proposal("t:nodom", lhs, lhs, "t")

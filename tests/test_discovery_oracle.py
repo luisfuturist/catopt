@@ -16,6 +16,7 @@ The oracle is single-level-view only, as its docstring's candidate
 family implies; the ``pytest.raises`` test documents the boundary.
 """
 
+import itertools
 import json
 
 import pytest
@@ -249,9 +250,14 @@ def test_tuple_sources_and_leaf_bindings():
     # a getitem-parent metavar also gets the shape bank, no scalar.
     kinds = [vo._bind_desc(t) for t in got]
     assert not any(k.startswith("Const") for k in kinds)
-    # a free operand gets the scalar Var first and a Const literal.
+    # a free operand leads with the operand-derived shape Var (the
+    # most conservative instantiation), then the Const literal and
+    # the scalar Var — the distinct-kind bindings stay early under a
+    # capped enumeration.
     free = vo._leaf_bindings("V", set(), ((9, 9),))
-    assert isinstance(free[0], Var) and free[0].typ.shape == ()
+    assert isinstance(free[0], Var) and free[0].typ.shape == (9, 9)
+    assert free[1] == Const(0.5)
+    assert isinstance(free[2], Var) and free[2].typ.shape == ()
     assert Const(0.5) in free
     assert any(
         isinstance(t, Var) and t.typ.shape == (9, 9) for t in free
@@ -298,6 +304,162 @@ def test_attr_domains_shared_names_resolve_once():
         [a, b], {"U": _v("u", 4), "V": _v("v", 4)}
     )
     assert len(domains) == 1
+
+
+# ---------------------------------------------------------------------------
+#  Generic attr domains — non-view ops (attr-sweep retro)
+# ---------------------------------------------------------------------------
+
+
+def test_attr_kind_canonicalizes_and_overrides():
+    """``argN`` resolves through ``ATTR_SCHEMA``; the (op, name)
+    exceptions and the reduction-``dim`` family beat the name table."""
+    assert vo._attr_kind("sdpa", "scale") == "float"
+    assert vo._attr_kind("sdpa", "arg6") == "float"  # -> scale
+    assert vo._attr_kind("sdpa", "arg5") == "bool"  # -> is_causal
+    assert vo._attr_kind("softmax", "dim") == "axis"
+    assert vo._attr_kind("sum", "dim") == "red-dims"
+    assert vo._attr_kind("rms_norm", "dim") == "shape"
+    assert vo._attr_kind("rms_norm", "eps") == "float"
+    assert vo._attr_kind("eye", "dim") == "int"
+    assert vo._attr_kind("einsum", "equation") == "str"
+    # tensor-valued and unknown attrs stay honestly unenumerable.
+    assert vo._attr_kind("sdpa", "attn_mask") is None
+    assert vo._attr_kind("frobnicate", "axis") is None
+    assert vo._attr_kind("frobnicate", "arg9") is None
+
+
+def test_kind_domain_shapes():
+    """Kind domains are small and shape-aware where it matters."""
+    # axis: the shape-valid axes for a rank-3 operand.
+    assert set(vo._kind_domain("axis", (2, 3, 4))) <= {-3, -2, -1, 0, 1, 2}
+    # unknown shape -> the generic axis fallback, still enumerable.
+    assert vo._kind_domain("axis", ())
+    # red-dims carry both the scalar and tuple spellings.
+    rd = vo._kind_domain("red-dims", (2, 3))
+    assert (-1,) in rd and (0, 1) in rd and -1 in rd
+    # shape: trailing blocks of the operand's shape.
+    assert vo._kind_domain("shape", (8, 4)) == [(4,), (8, 4)]
+    assert vo._kind_domain("int", ()) == [0, 1, 2]
+    assert 0.5 in vo._kind_domain("float", ())
+    assert vo._kind_domain("bool", ()) == [False, True]
+    # "str" payloads are honestly unenumerable.
+    assert vo._kind_domain("str", ()) == []
+
+
+def test_generic_attr_options():
+    """The product over metavar'd keys is emitted, capped, and
+    vetoes only on an untypeable key."""
+    opts = vo._generic_attr_options("sdpa", ("scale",), ())
+    assert opts == [{"scale": 0.5}, {"scale": 1.0}, {"scale": 1e-05}]
+    # two metavar'd keys -> the Cartesian product.
+    opts = vo._generic_attr_options("dropout", ("p", "train"), ())
+    assert len(opts) == 6 and {"p": 0.5, "train": True} in opts
+    # ``argN`` spellings kind through the canonical schema.
+    opts = vo._generic_attr_options("sdpa", ("arg6",), ())
+    assert opts[0] == {"arg6": 0.5}
+    # an untypeable key vetoes the node — the honest skip.
+    assert vo._generic_attr_options("sdpa", ("attn_mask",), ()) is None
+    assert vo._generic_attr_options("frob", ("wat",), (2, 3)) is None
+
+
+def test_attr_options_falls_through_to_generic():
+    """``_attr_options``'s wildcard routes non-view ops to the
+    generic domain; the view tables still take precedence."""
+    assert vo._attr_options("sdpa", ("scale",), ()) == [
+        {"scale": 0.5},
+        {"scale": 1.0},
+        {"scale": 1e-05},
+    ]
+    # ``softmax``'s dim enumerates axes — the old ``None`` wall is gone.
+    assert vo._attr_options("softmax", ("dim",), (2, 3))
+    # an op whose attr cannot be typed still returns ``None``.
+    assert vo._attr_options("mystery", ("x",), (4,)) is None
+
+
+def test_synthesize_nonview_attr_metavar():
+    """``synthesize`` evaluates instances over a non-view attr metavar
+    — a ``softmax(dim=D)`` self-map now produces equal instances."""
+    insts = vo.synthesize(
+        _p("softmax", "U", dim="D"),
+        _p("softmax", "U", dim="D"),
+        limit=120,
+    )
+    assert insts
+    assert any(i.outcome == "equal" for i in insts)
+    dims = {
+        dict(i.binds).get("$attr:D")
+        for i in insts
+        if i.outcome in ("equal", "unequal")
+    }
+    assert len(dims) > 1
+
+
+def test_synthesize_sdpa_scale_metavar():
+    """The ``_g`` shape: ``sdpa(scale="SC")`` enumerates floats and the
+    instantiated RHS evaluates — no longer a domain veto."""
+    insts = vo.synthesize(
+        _p(
+            "matmul",
+            _p(
+                "softmax",
+                _p(
+                    "matmul",
+                    "Q",
+                    _p("transpose", "K", dim0="TD1", dim1="TD2"),
+                ),
+                dim=-1,
+            ),
+            "V",
+        ),
+        _p("sdpa", "Q", "K", "V", scale="SC"),
+        limit=120,
+    )
+    assert insts
+    assert any(
+        "$attr:SC" in dict(i.binds) for i in insts
+    )
+
+
+def test_diag_product_orders_corners_first():
+    """Cantor order covers the low-index corner of every coordinate
+    before deep values of any one — the truncation-fairness pin."""
+    a = [f"a{i}" for i in range(3)]
+    b = [f"b{i}" for i in range(3)]
+    c = [f"c{i}" for i in range(3)]
+    combos = list(vo._diag_product([a, b, c]))
+    assert len(combos) == 27 and set(combos) == set(
+        itertools.product(a, b, c)
+    )
+    # index-sum ordering: the prefix is the shallow corner.
+    assert combos[:4] == [
+        ("a0", "b0", "c0"),
+        ("a0", "b0", "c1"),
+        ("a0", "b1", "c0"),
+        ("a1", "b0", "c0"),
+    ]
+    # every coordinate's index-1 value lands inside the first 4 —
+    # ``itertools.product`` would put them ~10 tuples apart.
+    # degenerate products behave like ``itertools.product``.
+    assert list(vo._diag_product([])) == [()]
+    assert list(vo._diag_product([a, [], c])) == []
+
+
+def test_binding_envs_covers_bases_early():
+    """The (viewed x attr) bases all contribute before any goes deep:
+    the first envs span several view bindings, not one base's corner."""
+    lhs = _p("mul", _p("unsqueeze", "U", dim="A_d"), "V")
+    rhs = _p("mul", "U", "V")
+    u_shapes = []
+    for i, env in enumerate(vo._binding_envs(lhs, rhs)):
+        if i >= 12:
+            break
+        sh = tuple(env["U"].typ.shape)
+        if sh not in u_shapes:
+            u_shapes.append(sh)
+    # several viewed bindings are represented inside the first dozen —
+    # the old nesting served one base's whole free product first.
+    assert len(u_shapes) > 1
 
 
 # ---------------------------------------------------------------------------
@@ -916,14 +1078,19 @@ def test_verdict_counts_real_matches():
 
 
 def test_verdict_true_from_real_only():
-    """An attr op outside the option table kills synthesis; a real
-    match still carries the verdict."""
-    u = _v("u", 4, 4)
-    match = _p("softmax", u, dim=-1)
+    """An attr the domain cannot type kills synthesis; a real match
+    still carries the verdict.
+
+    ``attn_mask`` is a tensor-valued attr — outside the scalar
+    domains the sweep enumerates — so the ``sdpa`` node's metavar
+    vetoes every synthesized binding, honestly.
+    """
+    q, k, v = _v("q", 2, 4), _v("k", 3, 4), _v("v", 3, 4)
+    match = _p("sdpa", q, k, v, attn_mask=None)
     verdict = vo.verify_view_candidate(
         "t",
-        _p("softmax", "U", dim="D"),
-        _p("softmax", "U", dim="D"),
+        _p("sdpa", "Q", "K", "V", attn_mask="AM"),
+        _p("sdpa", "Q", "K", "V", attn_mask="AM"),
         [match],
     )
     assert verdict.verdict == "true"
@@ -934,13 +1101,13 @@ def test_verdict_true_from_real_only():
 
 def test_verdict_false_counterexample_from_real():
     """The real sweep supplies the counterexample when nothing
-    synthesizes."""
-    u = _v("u", 4, 4)
-    match = _p("softmax", u, dim=-1)
+    synthesizes (same unenumerable-attr shape as the twin above)."""
+    q, k, v = _v("q", 2, 4), _v("k", 3, 4), _v("v", 3, 4)
+    match = _p("sdpa", q, k, v, attn_mask=None)
     verdict = vo.verify_view_candidate(
         "t",
-        _p("softmax", "U", dim="D"),
-        _p("mul", "U", Const(2)),
+        _p("sdpa", "Q", "K", "V", attn_mask="AM"),
+        _p("mul", "Q", Const(2)),
         [match],
     )
     assert verdict.verdict == "false"

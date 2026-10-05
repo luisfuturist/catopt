@@ -139,8 +139,8 @@ def _silu_fold_commuted() -> synth.ConstructedObject:
 #: The transposed operand must swap K's last two axes — the
 #: ``_COND_SCORE_T`` fragment of the shipped ``sdpa_fold_*`` guards,
 #: restated as data.  (``softmax`` keeps a concrete ``dim=-1`` and the
-#: scale is literal: a str attr on a non-view op defeats the oracle's
-#: enumeration domain — ``_attr_options`` covers view ops only.)
+#: scale is literal — stylistic choice; a str attr on a non-view op
+#: is enumerable since the generic attr domain landed.)
 _COND_LAST2 = (
     "and",
     ("concrete", "K"),
@@ -186,9 +186,15 @@ def _sdpa_fold_div_nomask() -> synth.ConstructedObject:
 
     ``matmul(softmax(q@kᵀ / S, -1), v) -> sdpa(q,k,v, scale=1/S)`` —
     ``ManualAttention``'s spelling verbatim.  The transpose axes are
-    literal (the pattern pins the last-two swap — no cond needed) and
-    the scale is *derived*: the ``dspec`` float-veto declines a
-    non-``Const`` S at fire time, so the derive is the guard.
+    literal (the pattern pins the last-two swap — no axes cond
+    needed) and the scale is *derived*: the ``dspec`` float-veto
+    declines a non-``Const`` S at fire time.  What the veto does not
+    cover is rank — ``sdpa`` cannot denote below rank 2 while the
+    ``matmul`` spelling still evaluates a vector LHS, so once the
+    sweep enumerated the non-view ``scale`` metavar (attr-sweep
+    retro) the rank-1 bindings measured ``rhs-err`` and the raw
+    verdict went honestly ``conditional``.  ``cond`` declares the
+    operand ranks the target needs.
     """
     return synth.fold_object(
         "sdpa_fold_div_nomask",
@@ -210,6 +216,12 @@ def _sdpa_fold_div_nomask() -> synth.ConstructedObject:
             "V",
         ),
         ("sdpa", "Q", "K", "V", {"scale": "SC"}),
+        cond=(
+            "and",
+            ("rank", "Q", ">=", 2),
+            ("rank", "K", ">=", 2),
+            ("rank", "V", ">=", 2),
+        ),
         dspec={"SC": ("recip", ("float", ("const", "S")))},
         tags=("fusion",),
     )
@@ -705,7 +717,10 @@ def test_sdpa_fold_nomask_fires_and_behaves(tmp_path):
 
 
 def test_sdpa_fold_div_nomask_clears_the_gauntlet(tmp_path):
-    """The scaled mask-free block — the dspec float-veto is the guard."""
+    """The scaled mask-free block — dspec float-veto plus the rank
+    precondition ``sdpa`` needs.  The raw oracle correctly stays
+    ``conditional`` (rank-1 mints); the guarded sweep verifies the
+    declared region."""
     conn = ev.connect(str(tmp_path / "s.db"))
     key = synth.store_constructed(conn, _sdpa_fold_div_nomask())
     rep = ev.run_gauntlet(
@@ -713,7 +728,9 @@ def test_sdpa_fold_div_nomask_clears_the_gauntlet(tmp_path):
     )
     conn.close()
     assert rep.usable, rep.reason
-    assert rep.evidence.num_true is True
+    assert rep.synth_region.equal >= 1
+    assert rep.real_region.equal >= 1
+    assert rep.synth_region.unequal == rep.real_region.unequal == 0
     assert rep.evidence.paid >= 1
 
 
@@ -849,11 +866,11 @@ def test_guarded_carrier_premise_declines_symbolic_compose():
     assert obj is None
 
 
-def test_guarded_object_outside_the_sweep_domain_fails_truth(tmp_path):
+def test_guarded_attr_metavar_object_clears_the_gauntlet(tmp_path):
     """A guarded object whose RHS mints an attr metavar (``scale=SC``)
-    leaves the oracle's enumeration domain — zero synthesized sites —
-    so the guarded truth gate cannot be satisfied even though the one
-    real match verifies equal.  The measured envelope of the sweep."""
+    on a non-view op: the generic attr domain (attr-sweep retro) lets
+    the sweep enumerate the region — the guarded truth gate now
+    verifies it where the raw oracle stays ``conditional``."""
     conn = ev.connect(str(tmp_path / "s.db"))
     guarded = synth.fold_object(
         "sdpa_fold_div_nomask_g",
@@ -888,8 +905,8 @@ def test_guarded_object_outside_the_sweep_domain_fails_truth(tmp_path):
         conn, key, corpus=_corpus(_attn_div_nomask_case())
     )
     conn.close()
-    assert not rep.usable
-    stages = _stages(rep)
-    assert not stages["truth"].passed
-    assert rep.synth_region.accepted == 0
+    assert rep.usable, rep.reason
+    assert rep.synth_region.accepted > 0
+    assert rep.synth_region.equal >= 1
+    assert rep.synth_region.unequal == 0
     assert rep.real_region.equal >= 1

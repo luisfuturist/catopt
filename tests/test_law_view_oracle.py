@@ -114,8 +114,10 @@ def test_unsqueeze_strip_is_conditional():
     assert v.verdict == "conditional"
     assert v.synth_equal > 0
     assert v.synth_unequal > 0
-    # The separating guard is the pairing/out-shape conjunction.
-    assert "id:" in v.guard
+    # The separating feature the new enumeration surfaces first is
+    # the inserted axis being a broadcast pad — the same guard the
+    # ``id:``-prefixed conjunction used to name.
+    assert "d_in_pad" in v.guard
 
 
 def test_getitem_strip_is_false():

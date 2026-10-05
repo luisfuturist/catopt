@@ -180,7 +180,13 @@ def test_admitted_object_fires_only_in_guarded_region(tmp_path):
 
 def test_guarded_truth_sweep_counts(tmp_path):
     """The guarded-region sweep sees the cond's exact cut: every
-    accepted synth binding is equal, the false region is declined."""
+    accepted synth binding is equal, the false region is declined.
+
+    The exact equal count rides the enumeration's ordering — the
+    operand-shape-led bank (plan 0017 attr-sweep) lands 23 accepted
+    equals inside the 360 cap; the region's *shape* is the pin, not
+    the count.
+    """
     conn = ev.connect(str(tmp_path / "s.db"))
     key = ev.store_object(conn, _mul_unsqueeze_l_id())
     rule, _rec = ev.admit_object(conn, key)
@@ -188,7 +194,7 @@ def test_guarded_truth_sweep_counts(tmp_path):
     region = ev._guarded_evals(
         rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
     )
-    assert region.equal == 25
+    assert region.equal == 23
     assert region.unequal == 0 and region.rhs_err == 0
     assert region.guard_err == 0
     assert region.declined > 300
@@ -793,6 +799,119 @@ def test_synth_sites_respects_limit():
     lhs = _p("mul", _p("unsqueeze", "U", dim="A_d"), "V")
     rhs = _p("mul", "U", "V")
     assert len(list(ev._synth_sites(lhs, rhs, limit=5))) == 5
+
+
+# ---------------------------------------------------------------------------
+#  Non-view attr metavars — the generic attr domain (attr-sweep retro)
+# ---------------------------------------------------------------------------
+
+#: The guarded ``sdpa`` fold's transpose-axes precondition — the
+#: ``_COND_SCORE_T`` fragment of the shipped ``sdpa_fold_*`` guards.
+_COND_LAST2 = (
+    "and",
+    ("concrete", "K"),
+    ("attr-type", "TD1", "int"),
+    ("attr-type", "TD2", "int"),
+    ("axes-last2", "K", "TD1", "TD2"),
+)
+
+
+def _sdpa_fold_div_nomask_g() -> Rewrite:
+    """The guarded twin: ``scale="SC"`` is an attr metavar on a
+    *non-view* op — unreachable by the sweep before the generic
+    attr domain."""
+    return Rewrite(
+        name="sdpa_fold_div_nomask_g",
+        lhs=_p(
+            "matmul",
+            _p(
+                "softmax",
+                _p(
+                    "div",
+                    _p(
+                        "matmul",
+                        "Q",
+                        _p(
+                            "transpose",
+                            "K",
+                            dim0="TD1",
+                            dim1="TD2",
+                        ),
+                    ),
+                    "S",
+                ),
+                dim=-1,
+            ),
+            "V",
+        ),
+        rhs=_p("sdpa", "Q", "K", "V", scale="SC"),
+        cond=("and", _COND_LAST2, ("const-num", "S")),
+        dspec={"SC": ("recip", ("float", ("const", "S")))},
+    )
+
+
+def _attn_div_case() -> TermCase:
+    """``matmul(softmax(q@kᵀ / 4.0, -1), v)`` — the real firing site."""
+    q, k, v = _v("q", 2, 4), _v("k", 3, 4), _v("v", 3, 4)
+    scores = _p(
+        "div",
+        _p("matmul", q, _p("transpose", k, dim0=-1, dim1=-2)),
+        Const(4.0),
+    )
+    return _case(
+        "attn_div",
+        _p("matmul", _p("softmax", scores, dim=-1), v),
+        q,
+        k,
+        v,
+    )
+
+
+def test_nonview_attr_metavar_sweep_is_nonempty():
+    """A ``scale="SC"`` metavar on ``sdpa`` no longer empties the
+    synthesized domain — the generic attr domain enumerates it."""
+    rule = _sdpa_fold_div_nomask_g()
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+    )
+    # The guard accepts the evaluable corner and every accepted
+    # binding is equal — the region verifies, it is not vacuous.
+    assert region.accepted > 0
+    assert region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
+    assert region.guard_err == 0
+    assert region.declined > 0
+
+
+def test_nonview_attr_metavar_object_clears_the_gauntlet(tmp_path):
+    """``sdpa_fold_div_nomask_g`` end to end: previously refused at
+    truth on an empty synth region — now ``usable`` on its guard."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(
+        conn, _sdpa_fold_div_nomask_g(), kind="abstraction"
+    )
+    rep = ev.run_gauntlet(
+        conn, key, corpus=_corpus(_attn_div_case())
+    )
+    conn.close()
+    assert rep.usable, rep.reason
+    assert all(s.passed for s in rep.stages)
+    assert rep.synth_region.equal >= 1
+    assert rep.synth_region.unequal == 0
+    assert rep.real_region.equal == 1
+    assert rep.evidence.paid >= 1
+
+
+def test_shipped_nonview_attr_law_sweeps():
+    """The shipped ``softmax_fold`` — attr metavars on ``sum`` and
+    ``softmax`` — sweeps a nonempty guarded region now (the shipped
+    rules were unenumerable before the extension, too)."""
+    rule = _BY_NAME["softmax_fold"]
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+    )
+    assert region.accepted > 0 and region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
 
 
 def test_measure_exception_is_a_gate_failure(tmp_path, monkeypatch):
