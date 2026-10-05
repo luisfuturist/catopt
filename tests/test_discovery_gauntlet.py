@@ -22,6 +22,7 @@ from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import Const, Op, TensorType, Var
 from catopt_core.laws import ALL_RULES
 from catopt_discovery import evidence as ev
+from catopt_discovery import object_synthesis as synth
 from catopt_discovery import oracle as vo
 from catopt_discovery import pipeline as pl
 from catopt_discovery.impact import TermCase, _cost_fn
@@ -863,20 +864,26 @@ def test_guarded_truth_keeps_the_default_when_not_starved():
     assert synth.envs <= 360
 
 
-def test_guarded_truth_domain_gap_is_not_rescued():
-    """The honest limit: a guard that needs a leaf value the bank
-    never mints is not rescued by a bigger window.
+def test_guarded_truth_masked_fill_kind_gap_remains():
+    """The value bank closes the *value* gap; a *kind* gap keeps the
+    rule starved.
 
-    ``sdpa_fold_masked_fill``'s guard requires ``const-cmp F < -1e30``
-    and ``F`` is a free leaf the bank fills only with ``Const(0.5)``
-    and scalar Vars — the escalation reaches declines, not the
-    region.  Recorded, not hidden: the policy widens the window, it
-    does not widen the value bank.
+    ``sdpa_fold_masked_fill``'s guard requires ``const-cmp F < -1e30``.
+    The per-op constant domain (``oracle._CONST_DOMAIN``) now mints
+    ``Const(-inf)`` for a ``masked_fill`` leaf, so the escalated window
+    *accepts* a site — but the mask leaf itself is a float ``Var`` and
+    ``masked_fill`` needs a bool mask, so the accepted site is an
+    ``lhs-err``: the region still exhibits no equal instance and the
+    truth gate still refuses it as vacuous.  Recorded, not hidden: the
+    value bank widens the *values*; the mask *kind* is a separate
+    mechanism.
     """
     rule = _BY_NAME["sdpa_fold_masked_fill"]
     synth, _real = ev._guarded_truth(rule, _corpus(), 360)
-    assert synth.accepted == 0
-    assert synth.envs > 360  # escalated, still starved
+    assert synth.equal == 0
+    assert synth.accepted > 0  # the sentinel is mintable now
+    assert synth.other_err > 0  # ... but the float mask cannot denote
+    assert synth.envs > 360  # escalated
 
 
 def test_truth_gate_uses_the_selective_cap():
@@ -910,6 +917,171 @@ def test_region_detail_reports_the_env_cost():
     detail = ev._region_detail(rescued, starved)
     assert "synth: 9eq/0ne/0rerr (41 accepted, 1959 declined, 2360 envs)" in detail
     assert "real: 0eq/0ne/0rerr (0 accepted, 360 declined, 360 envs)" in detail
+
+
+# ---------------------------------------------------------------------------
+#  A measured counterexample outranks a derivation
+# ---------------------------------------------------------------------------
+#
+#  The hole: the truth gate was ``derivable or (region checks)``, so a
+#  rule the saturation *derived* passed without a clean region sweep.
+#  ``channel_then_row`` (compose of two shipped premises) is derivable
+#  yet inherits ``linear_row_scale``'s blind spot — a measured
+#  ``unequal`` site.  The fix: the measured site blocks regardless of
+#  derivability; ``derivable`` may only waive the *starvation* case
+#  (no equal site measured).
+
+
+def _channel_then_row() -> synth.ConstructedObject:
+    """``compose(linear_channel_scale_rev, linear_row_scale)``.
+
+    Derivable (both premises are shipped), fully declarative (pure
+    data) — and unclean: the transported guard inherits
+    ``linear_row_scale``'s rank-1 blind spot.
+    """
+    obj = synth.compose_objects(
+        "channel_then_row_scale",
+        _BY_NAME["linear_channel_scale_rev"],
+        _BY_NAME["linear_row_scale"],
+    )
+    assert obj is not None
+    return obj
+
+
+def _stub_evidence(*, derivable: bool, num_true=None) -> object:
+    """An ``Evidence``-shaped stub for the gate's own inputs."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        num_true=num_true,
+        derivable=derivable,
+        view_verdict="conditional",
+        view_note="n",
+    )
+
+
+def test_derivation_does_not_override_a_measured_counterexample(
+    tmp_path,
+):
+    """The channel_then_row composite is derivable — and refused.
+
+    Its guard-accepted region carries one ``unequal`` site (the
+    inherited premise blind spot), so the truth gate blocks on the
+    measured counterexample even though ``derivable`` is True.
+    """
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = synth.store_constructed(conn, _channel_then_row())
+    x, w = _v("x", 2, 4), _v("W", 3, 4)
+    term = _p("linear", x, _p("mul", w, Const(2.0)))
+    rep = ev.run_gauntlet(
+        conn, key, corpus=_corpus(_case("chrev", term, x, w))
+    )
+    conn.close()
+    assert not rep.usable
+    assert rep.reason.startswith("truth:")
+    assert rep.evidence.derivable
+    # measured 1 at the 360-site window; the count rides the bank, the
+    # *presence* of the counterexample is the pin.
+    assert rep.synth_region.unequal >= 1
+    assert "derivation overridden" in _stages(rep)["truth"].detail
+
+
+def test_derivable_but_clean_rule_still_admits():
+    """Do not over-tighten: a derivable rule whose accepted region is
+    clean and exhibits an equal site still clears the truth gate."""
+    rep = ev.Gauntlet(
+        alpha_key="k",
+        evidence=_stub_evidence(derivable=True),
+    )
+    assert ev._truth_gate(rep, _BY_NAME["glu_fold"], _corpus(), None)
+    assert rep.synth_region.equal >= 1
+    assert rep.synth_region.unequal == 0
+
+
+def test_derivable_waives_only_the_starvation_requirement():
+    """A derivable rule whose window is starved (no equal site) still
+    clears truth — derivability waives the vacuity bar, not a
+    counterexample.  The same rule *without* derivability is refused.
+
+    The starved guard is a synthetic ``rank ≥ 99`` predicate the bank
+    never satisfies, so the test pins the *gate's* logic rather than a
+    particular rule's enumeration.
+    """
+    rule = Rewrite(
+        name="starved_guard",
+        lhs=_p("mul", "U", "V"),
+        rhs=_p("mul", "V", "U"),
+        cond=("rank", "U", ">=", 99),
+    )
+    starved = ev.Gauntlet(
+        alpha_key="k", evidence=_stub_evidence(derivable=True)
+    )
+    assert ev._truth_gate(starved, rule, _corpus(), None)
+    assert starved.synth_region.equal == 0
+    assert starved.synth_region.accepted == 0
+    # The starvation bar bites when there is no derivation to waive it.
+    vacuous = ev.Gauntlet(
+        alpha_key="k", evidence=_stub_evidence(derivable=False)
+    )
+    assert not ev._truth_gate(vacuous, rule, _corpus(), None)
+
+
+def test_derivation_cannot_override_a_measured_rhs_err():
+    """``rhs_err`` — an accepted binding whose minted RHS cannot
+    denote — is a measured counterexample too: derivability does not
+    waive it (``linear_channel_scale`` carries 16)."""
+    rep = ev.Gauntlet(
+        alpha_key="k", evidence=_stub_evidence(derivable=True)
+    )
+    assert not ev._truth_gate(
+        rep, _BY_NAME["linear_channel_scale"], _corpus(), None
+    )
+    assert rep.synth_region.rhs_err > 0
+
+
+def test_derivation_cannot_override_an_unequal_site():
+    """``unequal`` (the two sides differ on an accepted binding)
+    blocks regardless of derivability (``linear_row_scale`` carries
+    3)."""
+    rep = ev.Gauntlet(
+        alpha_key="k", evidence=_stub_evidence(derivable=True)
+    )
+    assert not ev._truth_gate(
+        rep, _BY_NAME["linear_row_scale"], _corpus(), None
+    )
+    assert rep.synth_region.unequal > 0
+
+
+def test_unguarded_derivable_false_still_refuses():
+    """The unguarded branch reads the same rule off the numeric
+    oracle: a measured ``num_true is False`` blocks even when the
+    candidate is derivable; derivable waives only ``num_true is
+    None``."""
+    rep = ev.Gauntlet(
+        alpha_key="k",
+        evidence=_stub_evidence(derivable=True, num_true=False),
+    )
+    assert not ev._truth_gate(
+        rep, _BY_NAME["comm_mul"], _corpus(), None
+    )
+    rep2 = ev.Gauntlet(
+        alpha_key="k",
+        evidence=_stub_evidence(derivable=True, num_true=None),
+    )
+    assert ev._truth_gate(rep2, _BY_NAME["comm_mul"], _corpus(), None)
+
+
+def test_region_clean_ignores_equal_count():
+    """``_region_clean`` is the counterexample test alone — an empty
+    region is clean, an unequal one is not."""
+    assert ev._region_clean(ev.GuardedRegion())
+    assert ev._region_clean(ev.GuardedRegion(equal=5, accepted=5))
+    assert not ev._region_clean(ev.GuardedRegion(unequal=1))
+    assert not ev._region_clean(ev.GuardedRegion(rhs_err=1))
+    assert not ev._region_clean(ev.GuardedRegion(guard_err=1))
+    # ``_region_ok`` adds the starvation bar on top.
+    assert ev._region_ok(ev.GuardedRegion(), need_equal=False)
+    assert not ev._region_ok(ev.GuardedRegion(), need_equal=True)
 
 
 # ---------------------------------------------------------------------------

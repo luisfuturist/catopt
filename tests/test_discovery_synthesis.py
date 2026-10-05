@@ -1085,9 +1085,20 @@ def test_declarative_guards_transport_as_cond_clauses():
     assert not eval_cond(obj.rule.cond, dict(good, c=_v("c", 3)))
 
 
-def test_declarative_transport_clears_the_gauntlet(tmp_path):
-    """A declaratively transported composite is *admissible*: both guards
-    are data, the guarded region verifies and the object pays."""
+def test_declarative_transport_refused_by_an_inherited_counterexample(
+    tmp_path,
+):
+    """A declaratively transported composite is *not* admissible when
+    its guard-accepted region carries a measured counterexample — even
+    though the composite is *derivable*.
+
+    The composite's guard is the premises' conjunction, so it inherits
+    ``linear_row_scale``'s own blind spot (a rank-1 degenerate weight
+    where ``linear`` mis-evaluates); the sweep measures that one
+    ``unequal`` site, and the truth gate now blocks on it: a measured
+    counterexample outranks the derivation.  Construction is a claim;
+    the gauntlet is the referee.
+    """
     conn = ev.connect(str(tmp_path / "s.db"))
     key = synth.store_constructed(conn, _channel_then_row())
     x, w = _v("x", 2, 4), _v("W", 3, 4)
@@ -1096,9 +1107,14 @@ def test_declarative_transport_clears_the_gauntlet(tmp_path):
         conn, key, corpus=_corpus(_case("chrev", term, x, w))
     )
     conn.close()
-    assert rep.usable, rep.reason
-    assert rep.evidence.paid >= 1
+    assert not rep.usable
+    assert rep.reason.startswith("truth:")
+    assert rep.evidence.derivable  # provable — and overridden
+    # measured 1 at the 360-site window; the count rides the bank, the
+    # *presence* of the inherited counterexample is the pin.
+    assert rep.synth_region.unequal >= 1
     assert rep.synth_region.rhs_err == 0
+    assert "derivation overridden" in _stages(rep)["truth"].detail
 
 
 def test_transport_inherits_the_premise_blind_spot():

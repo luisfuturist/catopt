@@ -951,18 +951,31 @@ def _synth_sites(lhs_pat: Any, rhs_pat: Any, *, limit: int) -> Iterable:
             return
 
 
+def _region_clean(region: GuardedRegion) -> bool:
+    """Whether a guarded region holds no *measured* counterexample.
+
+    A measured counterexample is a guard-accepted binding the sweep
+    *evaluated* and found contradictory: ``unequal`` (the two sides
+    differ), ``rhs_err`` (the minted RHS cannot denote), or
+    ``guard_err`` (the guard itself raised — a non-total predicate).
+    These outrank any derivation: a proof that the equality holds
+    cannot coexist with a measured instance where it does not, so the
+    derivation is the thing that must yield.
+    """
+    return not (region.unequal or region.rhs_err or region.guard_err)
+
+
 def _region_ok(region: GuardedRegion, *, need_equal: bool) -> bool:
     """Whether a guarded region supports the declared equality.
 
-    The region must be contradiction-free — no ``unequal`` instance,
-    no accepted binding whose RHS fails to denote, no guard error —
+    The region must be contradiction-free (:func:`_region_clean`)
     and, where *need_equal* holds, must exhibit at least one equal
     instance (a guard that accepts nothing provable is vacuous, not
     verified).
     """
-    if region.unequal or region.rhs_err or region.guard_err:
-        return False
-    return not need_equal or region.equal >= 1
+    return _region_clean(region) and (
+        not need_equal or region.equal >= 1
+    )
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1204,18 @@ def _truth_gate(
 ) -> bool:
     """Stage 4: the declared equality must hold where the rule fires.
 
+    A measured counterexample outranks a derivation.  Derivability is
+    legitimate evidence — a proof from shipped axioms — but it is a
+    claim about *every* binding, and a measured ``unequal`` /
+    ``rhs_err`` / ``guard_err`` site is a fact about one the guard
+    accepts.  The two cannot both stand, so the gate blocks on the
+    measured site regardless of ``derivable``; ``derivable`` may only
+    waive the *starvation* requirement (that the sweep exhibit at
+    least one equal site), never a measured counterexample.  An
+    unguarded object reads the same rule off the numeric oracle: a
+    measured ``num_true is False`` blocks, and ``derivable`` waives
+    only the "no measurement" (``num_true is None``) case.
+
     *synth_limit* sets the sweep's first-phase window (the oracle's
     default when ``None``); a starved window escalates once under the
     selective-cap policy (:func:`catopt_discovery.oracle.escalate_limit`)
@@ -1200,30 +1225,30 @@ def _truth_gate(
 
     evd = rep.evidence
     if rule.cond is None and rule.check is None:
-        return _gate(
-            rep,
-            "truth",
-            evd.derivable or evd.num_true is True,
-            _truth_detail(evd),
+        ok = evd.num_true is not False and (
+            evd.derivable or evd.num_true is True
         )
+        return _gate(rep, "truth", ok, _truth_detail(evd))
     limit = (
         synth_limit if synth_limit is not None else lvo._MAX_INSTANCES
     )
     rep.synth_region, rep.real_region = _guarded_truth(
         rule, corpus, limit
     )
-    ok = evd.derivable or (
-        _region_ok(rep.synth_region, need_equal=True)
-        and _region_ok(rep.real_region, need_equal=False)
+    clean = _region_clean(rep.synth_region) and _region_clean(
+        rep.real_region
     )
-    return _gate(
-        rep,
-        "truth",
-        ok,
+    ok = clean and (evd.derivable or rep.synth_region.equal >= 1)
+    detail = (
         _truth_detail(evd)
         + " | guarded: "
-        + _region_detail(rep.synth_region, rep.real_region),
+        + _region_detail(rep.synth_region, rep.real_region)
     )
+    if not clean and evd.derivable:
+        detail += (
+            " | derivation overridden by a measured counterexample"
+        )
+    return _gate(rep, "truth", ok, detail)
 
 
 def _typed_pay_gate(rep: Gauntlet) -> bool:
