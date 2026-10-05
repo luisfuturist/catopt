@@ -83,7 +83,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -781,6 +781,8 @@ class GuardedRegion:
     evaluation outcomes over the accepted region — ``rhs_err`` is an
     accepted binding whose instantiated RHS cannot denote, the
     ill-typed-mint signal the typed-pay gate audits at term level.
+    ``envs`` is the enumeration cost — the number of synthesized sites
+    the sweep evaluated (the window the counts are measured over).
     """
 
     accepted: int = 0
@@ -792,6 +794,7 @@ class GuardedRegion:
     other_err: int = 0
     witness: str = ""
     counterexample: str = ""
+    envs: int = 0
 
 
 def _site_outcome(rule: Any, subst: dict, lhs_i: Any) -> str:
@@ -844,9 +847,10 @@ def _guarded_evals(rule: Any, sites: Iterable) -> GuardedRegion:
     """
     from catopt_core.ir import op_repr
 
-    acc = dec = gerr = eq = neq = rerr = oerr = 0
+    acc = dec = gerr = eq = neq = rerr = oerr = envs = 0
     wit = cex = ""
     for subst, lhs_i in sites:
+        envs += 1
         out = _site_outcome(rule, subst, lhs_i)
         if out == "declined":
             dec += 1
@@ -875,6 +879,7 @@ def _guarded_evals(rule: Any, sites: Iterable) -> GuardedRegion:
         other_err=oerr,
         witness=wit,
         counterexample=cex,
+        envs=envs,
     )
 
 
@@ -1023,6 +1028,7 @@ def _region_detail(synth: GuardedRegion, real: GuardedRegion) -> str:
             f"{label}: {r.equal}eq/{r.unequal}ne/{r.rhs_err}rerr "
             f"({r.accepted} accepted, {r.declined} declined"
             + (f", {r.guard_err} guard-err" if r.guard_err else "")
+            + (f", {r.envs} envs" if r.envs else "")
             + ")"
         )
     return " | ".join(out)
@@ -1038,9 +1044,19 @@ def _guarded_truth(
     and every real corpus match filtered the same way.  The truth
     question for a guarded object is "equal wherever the rule can
     fire" — this pair answers it on both domains.
+
+    The synthesized sweep is *selective-cap*: it runs at *limit* (the
+    default window) and, when that window is starved — the rule is
+    guarded and the window accepted nothing, a multi-clause guard's
+    accepted corner lying past the default — re-runs once at
+    :data:`catopt_discovery.oracle._GUARDED_CAP` (the policy lives in
+    :func:`catopt_discovery.oracle.escalate_limit`).  The common case
+    keeps the default: an unguarded rule and a guarded rule whose
+    window already accepted a site never pay the escalation.
     """
     from catopt_core.egraph.terms import _term_match
 
+    from catopt_discovery import oracle as lvo
     from catopt_discovery.shape_proposal import Schema, real_matches
 
     schema = Schema(rule.name, rule.lhs, rule.rhs)
@@ -1056,6 +1072,14 @@ def _guarded_truth(
     synth = _guarded_evals(
         rule, _synth_sites(rule.lhs, rule.rhs, limit=limit)
     )
+    eff = lvo.escalate_limit(
+        limit, guarded=True, accepted=synth.accepted
+    )
+    if eff > limit:
+        wider = _guarded_evals(
+            rule, _synth_sites(rule.lhs, rule.rhs, limit=eff)
+        )
+        synth = replace(wider, envs=synth.envs + wider.envs)
     return synth, real
 
 
@@ -1165,7 +1189,13 @@ def _truth_gate(
     corpus: GauntletCorpus,
     synth_limit: int | None,
 ) -> bool:
-    """Stage 4: the declared equality must hold where the rule fires."""
+    """Stage 4: the declared equality must hold where the rule fires.
+
+    *synth_limit* sets the sweep's first-phase window (the oracle's
+    default when ``None``); a starved window escalates once under the
+    selective-cap policy (:func:`catopt_discovery.oracle.escalate_limit`)
+    — see :func:`_guarded_truth`.
+    """
     from catopt_discovery import oracle as lvo
 
     evd = rep.evidence
@@ -1382,6 +1412,13 @@ def run_gauntlet(
     smallest declarative ``cond`` covering the measured domain, then
     re-runs the gauntlet on the rewritten record.  ``auto_cond_clauses``
     bounds the conjunction the search may mint.
+
+    ``synth_limit`` sets the guarded-region sweep's first-phase
+    window (the oracle's default when ``None``).  The selective-cap
+    policy applies underneath: a guarded rule whose window accepts
+    nothing escalates once to
+    :data:`catopt_discovery.oracle._GUARDED_CAP`, so a sound law whose
+    accepted corner lies past the default is not refused as vacuous.
     """
     rep = Gauntlet(alpha_key=alpha_key)
     got = _reconstruct_gate(conn, rep)

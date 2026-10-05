@@ -79,6 +79,7 @@ from catopt_discovery import proposal as lp
 __all__ = [
     "Instance",
     "ViewVerdict",
+    "escalate_limit",
     "eval_instance",
     "sweep_real",
     "synthesize",
@@ -88,8 +89,43 @@ __all__ = [
 #: Numeric-comparison tolerance (fp64), shared with ``law_proposal``.
 _TOL = 1e-6
 
-#: Cap on synthesized instances per candidate.
+#: Cap on synthesized instances per candidate — the default window.
 _MAX_INSTANCES = 360
+
+#: Second-phase cap for a *starved* guarded-region sweep.  A
+#: multi-clause guard's accepted corner sits deep in the fair-order
+#: enumeration: the diagonal interleaves every ``(viewed x attr)``
+#: base, so the base whose guard admits a site is reached only after
+#: each base before it has spent a round.  Measured on the shipped
+#: ``sdpa_fold_*`` folds (limit → first equal site): ``sdpa_fold_add``
+#: 469, ``sdpa_fold_addmul`` / ``sdpa_fold_adddiv`` 793 — all past the
+#: 360 default, so the default window accepts nothing and the truth
+#: gate refuses a sound law as vacuous.  The escalation is *selective*
+#: (see :func:`escalate_limit`): the common case keeps the default.
+_GUARDED_CAP = 2000
+
+
+def escalate_limit(limit: int, *, guarded: bool, accepted: int) -> int:
+    """Return the effective enumeration cap after one guarded sweep.
+
+    The selective cap policy: the default window stays the common
+    case.  A sweep escalates to :data:`_GUARDED_CAP` only when it is
+    *starved* — the rule carries a guard (``cond`` / ``check``) and
+    the window accepted no site at all, i.e. it reached only declines
+    and guard errors.  A multi-clause guard's accepted region is a
+    corner the fair ordering reaches late; the accepted corner of the
+    shipped ``sdpa_fold_*`` folds lies at index 469-793, past the
+    default.
+
+    The escalation never fires for an unguarded rule (no guard region
+    to starve) nor for a window that already accepted a site (the
+    region is non-empty; the cap is not what is biting).  The
+    returned cap is never below *limit*.
+    """
+    if guarded and accepted == 0:
+        return max(limit, _GUARDED_CAP)
+    return limit
+
 
 #: View/index ops this oracle knows how to attribute-instantiate.
 #: Anything outside the table leaves the attr metavariables unbound —

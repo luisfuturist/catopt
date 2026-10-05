@@ -22,6 +22,7 @@ from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import Const, Op, TensorType, Var
 from catopt_core.laws import ALL_RULES
 from catopt_discovery import evidence as ev
+from catopt_discovery import oracle as vo
 from catopt_discovery import pipeline as pl
 from catopt_discovery.impact import TermCase, _cost_fn
 from catopt_discovery.shape_proposal import _sink
@@ -799,6 +800,116 @@ def test_synth_sites_respects_limit():
     lhs = _p("mul", _p("unsqueeze", "U", dim="A_d"), "V")
     rhs = _p("mul", "U", "V")
     assert len(list(ev._synth_sites(lhs, rhs, limit=5))) == 5
+
+
+# ---------------------------------------------------------------------------
+#  The selective cap policy — the starvation case and the escalation
+# ---------------------------------------------------------------------------
+
+
+def test_sdpa_fold_addmul_starved_at_the_default_cap():
+    """The characterization: the shipped ``sdpa_fold_addmul`` guard
+    accepts nothing inside the default window.
+
+    Its accepted corner is a multi-clause guard's region — the
+    ``axes-last2`` transpose precondition, ``softmax`` over the last
+    axis, a numeric scale — and the fair-order enumeration reaches it
+    only at index 793 (measured), past the 360 default.  Every site
+    inside the window is declined: the region is starved, not empty
+    by construction.
+    """
+    rule = _BY_NAME["sdpa_fold_addmul"]
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+    )
+    assert region.accepted == 0
+    assert region.declined == 360
+    assert region.envs == 360
+
+
+def test_sdpa_fold_addmul_region_appears_at_the_guarded_cap():
+    """The same rule inside the escalation ceiling: the region is
+    there — non-empty, all equal, no counterexample."""
+    rule = _BY_NAME["sdpa_fold_addmul"]
+    region = ev._guarded_evals(
+        rule,
+        ev._synth_sites(rule.lhs, rule.rhs, limit=vo._GUARDED_CAP),
+    )
+    assert region.accepted > 0
+    assert region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
+    assert region.declined > 0
+
+
+def test_guarded_truth_escalates_a_starved_region():
+    """``_guarded_truth`` applies the policy: a starved guarded rule's
+    synthesized region is swept again at the ceiling, and the rescued
+    region is non-empty with an equal site."""
+    rule = _BY_NAME["sdpa_fold_addmul"]
+    synth, _real = ev._guarded_truth(rule, _corpus(), 360)
+    assert synth.accepted > 0
+    assert synth.equal > 0
+    assert synth.unequal == 0 and synth.rhs_err == 0
+    # the cost is reported: both windows were paid.
+    assert synth.envs > 360
+
+
+def test_guarded_truth_keeps_the_default_when_not_starved():
+    """A guarded rule whose window already accepts a site is not
+    escalated — the common case pays only the default window."""
+    rule = _BY_NAME["glu_fold"]
+    synth, _real = ev._guarded_truth(rule, _corpus(), 360)
+    assert synth.accepted > 0
+    assert synth.envs <= 360
+
+
+def test_guarded_truth_domain_gap_is_not_rescued():
+    """The honest limit: a guard that needs a leaf value the bank
+    never mints is not rescued by a bigger window.
+
+    ``sdpa_fold_masked_fill``'s guard requires ``const-cmp F < -1e30``
+    and ``F`` is a free leaf the bank fills only with ``Const(0.5)``
+    and scalar Vars — the escalation reaches declines, not the
+    region.  Recorded, not hidden: the policy widens the window, it
+    does not widen the value bank.
+    """
+    rule = _BY_NAME["sdpa_fold_masked_fill"]
+    synth, _real = ev._guarded_truth(rule, _corpus(), 360)
+    assert synth.accepted == 0
+    assert synth.envs > 360  # escalated, still starved
+
+
+def test_truth_gate_uses_the_selective_cap():
+    """The stage-4 wiring: a starved guarded rule clears the truth
+    gate on the escalated region (it would be refused as vacuous on
+    the default window)."""
+    from types import SimpleNamespace
+
+    rule = _BY_NAME["sdpa_fold_addmul"]
+    rep = ev.Gauntlet(
+        alpha_key="k",
+        evidence=SimpleNamespace(
+            num_true=None,
+            derivable=False,
+            view_verdict="conditional",
+            view_note="n",
+        ),
+    )
+    assert ev._truth_gate(rep, rule, _corpus(), None)
+    assert rep.synth_region is not None
+    assert rep.synth_region.accepted > 0
+    assert rep.synth_region.envs > 360
+
+
+def test_region_detail_reports_the_env_cost():
+    """The gauntlet report carries the sweep cost per domain."""
+    starved = ev.GuardedRegion(accepted=0, declined=360, envs=360)
+    rescued = ev.GuardedRegion(
+        accepted=41, declined=1959, equal=9, envs=2360
+    )
+    detail = ev._region_detail(rescued, starved)
+    assert "synth: 9eq/0ne/0rerr (41 accepted, 1959 declined, 2360 envs)" in detail
+    assert "real: 0eq/0ne/0rerr (0 accepted, 360 declined, 360 envs)" in detail
 
 
 # ---------------------------------------------------------------------------

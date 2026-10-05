@@ -463,6 +463,55 @@ def test_binding_envs_covers_bases_early():
 
 
 # ---------------------------------------------------------------------------
+#  The selective cap policy — escalate_limit
+# ---------------------------------------------------------------------------
+
+
+def test_guarded_cap_is_past_the_default():
+    """The escalation ceiling sits above the default window — the
+    shipped ``sdpa_fold_*`` accepted corners (indices 469/793) are
+    past the default but inside it."""
+    assert vo._MAX_INSTANCES < vo._GUARDED_CAP
+
+
+def test_escalate_limit_starved_guarded_rule_escalates():
+    """A guarded rule whose window accepted nothing escalates."""
+    assert (
+        vo.escalate_limit(vo._MAX_INSTANCES, guarded=True, accepted=0)
+        == vo._GUARDED_CAP
+    )
+
+
+def test_escalate_limit_leaves_the_common_case_alone():
+    """An unguarded rule (no guard region to starve) and a guarded
+    rule whose window already accepted a site keep the default."""
+    assert (
+        vo.escalate_limit(vo._MAX_INSTANCES, guarded=False, accepted=0)
+        == vo._MAX_INSTANCES
+    )
+    assert (
+        vo.escalate_limit(vo._MAX_INSTANCES, guarded=True, accepted=1)
+        == vo._MAX_INSTANCES
+    )
+    assert (
+        vo.escalate_limit(vo._MAX_INSTANCES, guarded=True, accepted=53)
+        == vo._MAX_INSTANCES
+    )
+
+
+def test_escalate_limit_never_lowers_and_never_raises_past_ceiling():
+    """The returned cap is never below *limit*; a window already at or
+    past the ceiling is unchanged."""
+    assert (
+        vo.escalate_limit(4000, guarded=True, accepted=0) == 4000
+    )
+    assert (
+        vo.escalate_limit(vo._GUARDED_CAP, guarded=True, accepted=0)
+        == vo._GUARDED_CAP
+    )
+
+
+# ---------------------------------------------------------------------------
 #  synthesize — enumeration, skip and veto paths
 # ---------------------------------------------------------------------------
 
