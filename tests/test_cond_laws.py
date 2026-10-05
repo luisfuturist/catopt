@@ -505,7 +505,7 @@ def test_cond_data_roundtrip_is_canonical():
 
 
 def test_every_shipped_cond_roundtrips_through_json():
-    """All 35 cond-carrying rules' conds survive the store wire format."""
+    """All 36 cond-carrying rules' conds survive the store wire format."""
     seen = 0
     for rule in all_rules():
         if rule.cond is None:
@@ -522,7 +522,7 @@ def test_every_shipped_cond_roundtrips_through_json():
             cond=json.loads(blob),  # list tree: canonicalized
         )
         assert rebuilt.cond == rule.cond
-    assert seen == 35
+    assert seen == 36
 
 
 def test_rebuilt_rule_fires_identically_in_egraph():
@@ -589,16 +589,20 @@ def test_migrated_rules_carry_cond_and_folded_check():
     migrated = [
         r for r in all_rules() if r.cond is not None
     ]
-    assert len(migrated) == 35
+    assert len(migrated) == 36
     for r in migrated:
         assert callable(r.check), r.name
-    # gqa_absorb stays check-only; glu_fold conjoins cond + a
-    # procedural split-axis parity check
+    # every shipped guard is data now — the once-procedural laws all
+    # carry cond (glu_fold's parity, the rms pair's trailing block,
+    # gqa_absorb's repeat chains)
     by_name = {r.name: r for r in all_rules()}
-    gqa = by_name["gqa_absorb_repeat"]
-    assert gqa.cond is None and gqa.check is not None
-    glu = by_name["glu_fold"]
-    assert glu.cond is not None and glu.check is not None
+    for name in (
+        "glu_fold",
+        "rms_norm_fold",
+        "rms_norm_fold_nogain",
+        "gqa_absorb_repeat",
+    ):
+        assert by_name[name].cond is not None, name
 
 
 def test_check_aliases_are_the_same_data_as_rule_cond():
@@ -701,6 +705,54 @@ def test_dim_eq_attr_declines():
     b = {"u": _v("u", 2, 3), "$attr:D": 0}
     assert not eval_cond(("dim-eq-attr", "u", "D", "missing", "D"), b)
     assert not eval_cond(("dim-eq-attr", "u", "MISSING", "u", "D"), b)
+
+
+def test_dim_mod():
+    # ("dim-mod", T, K, m, r): the attr-named dim satisfies a modular
+    # congruence — glu_fold's split-axis parity is ("dim-mod","u","D",2,0).
+    u = _v("u", 4, 8)
+    b = {"u": u, "$attr:D": -1}
+    assert eval_cond(("dim-mod", "u", "D", 2, 0), b)
+    assert eval_cond(("dim-mod", "u", "D", 4, 0), b)  # 8 % 4 == 0
+    assert not eval_cond(("dim-mod", "u", "D", 3, 0), b)  # 8 % 3 != 0
+    assert not eval_cond(("dim-mod", "u", "D", 2, 1), b)  # 8 % 2 != 1
+    # an odd axis declines — the glu veto
+    odd = {"u": _v("o", 4, 3), "$attr:D": -1}
+    assert not eval_cond(("dim-mod", "u", "D", 2, 0), odd)
+    # strictness: unshaped T, non-int axis, out-of-range axis,
+    # non-int or zero modulus, and a None dim ON the axis all decline
+    assert not eval_cond(("dim-mod", "missing", "D", 2, 0), b)
+    assert not eval_cond(("dim-mod", "u", "MISSING", 2, 0), b)
+    assert not eval_cond(
+        ("dim-mod", "u", "D", 2, 0), {"u": u, "$attr:D": (-1,)}
+    )
+    assert not eval_cond(
+        ("dim-mod", "u", "D", 2, 0), {"u": u, "$attr:D": 5}
+    )
+    assert not eval_cond(("dim-mod", "u", "D", 0, 0), b)  # mod 0
+    assert not eval_cond(("dim-mod", "u", "D", "x", 0), b)
+    wild = {"u": _v("w", 4, None), "$attr:D": -1}
+    assert not eval_cond(("dim-mod", "u", "D", 2, 0), wild)
+    # ...but a None dim OFF the axis is fine
+    off = {"u": _v("w", None, 8), "$attr:D": -1}
+    assert eval_cond(("dim-mod", "u", "D", 2, 0), off)
+    # scalar u has no axis to name
+    assert not eval_cond(
+        ("dim-mod", "u", "D", 2, 0), {"u": _v("s"), "$attr:D": 0}
+    )
+
+
+def test_attr_eq_attr():
+    b = {"$attr:A": (1, 2), "$attr:B": (1, 2), "$attr:C": (1, 3)}
+    assert eval_cond(("attr-eq-attr", "A", "B"), b)
+    assert not eval_cond(("attr-eq-attr", "A", "C"), b)
+    # an unbound side declines, it does not compare None == None
+    assert not eval_cond(("attr-eq-attr", "A", "MISSING"), b)
+    assert not eval_cond(("attr-eq-attr", "NOPE", "MISSING"), b)
+    # a legitimately None-bound attr still counts as bound
+    assert eval_cond(
+        ("attr-eq-attr", "A", "B"), {"$attr:A": None, "$attr:B": None}
+    )
 
 
 def test_attr_cmp_dim():
@@ -858,6 +910,105 @@ def test_flat_map_unsq():
     wild = {"U": _v("u", 4, None), "V": _v("v", 4),
             "$attr:A_dim": 0, "$attr:B_shape": (4,)}
     assert not eval_cond(cond, wild)
+
+
+def test_tail_block_spec():
+    # ("tail-block", T, NAME): resolves to shape(T)[-k:] iff the bound
+    # reduce dims name exactly T's last k axes — the rms pair's
+    # normalized_shape, one spec for check AND derive.
+    u = _v("u", 2, 4, 8)
+    b = {"u": u, "$attr:MD": (-2, -1)}
+    assert _shape_helper(("tail-block", "u", "MD"), b) == (4, 8)
+    assert _shape_helper(("tail-block", "u", "MD"), {"u": u, "$attr:MD": (0, 1, 2)}) == (2, 4, 8)
+    # bare-int and list spellings normalize the same way
+    assert _shape_helper(("tail-block", "u", "MD"), {"u": _v("x", 4, 8), "$attr:MD": -1}) == (8,)
+    assert _shape_helper(("tail-block", "u", "MD"), {"u": _v("x", 4, 8), "$attr:MD": [1]}) == (8,)
+    # declines: non-trailing, duplicate, out-of-range, over-rank dims
+    for dims in ((0,), (1,), (-1, -1), (-4,), (), None, True, (True,), "x", (1.5,)):
+        assert _shape_helper(
+            ("tail-block", "u", "MD"), {"u": u, "$attr:MD": dims}
+        ) is None, dims
+    # more dims than rank is no block either
+    assert _shape_helper(
+        ("tail-block", "u", "MD"), {"u": _v("x", 4, 8), "$attr:MD": (0, 1, -1)}
+    ) is None
+    # u's shape must be concrete — the spec IS the minted attr
+    assert _shape_helper(
+        ("tail-block", "u", "MD"), {"u": _v("w", None, 4, 8), "$attr:MD": (-2, -1)}
+    ) is None
+    assert _shape_helper(("tail-block", "missing", "MD"), b) is None
+    # and arity is validated like every spec
+    assert _shape_helper(("tail-block", "u"), b) is None
+    # as a guard: shaped proves the block, shape-eq gates on it
+    assert eval_cond(("shaped", ("tail-block", "u", "MD")), b)
+    assert not eval_cond(("shaped", ("tail-block", "u", "MD")), {"u": u, "$attr:MD": (0,)})
+    w = _p("w", 4, 8)
+    assert eval_cond(("shape-eq", "w", ("tail-block", "u", "MD")), {**b, "w": w})
+    assert not eval_cond(("shape-eq", "w", ("tail-block", "u", "MD")), {**b, "w": _p("w2", 8)})
+    # scalar u: no rank for a block to live in
+    assert not eval_cond(
+        ("shaped", ("tail-block", "s", "MD")), {"s": _v("s"), "$attr:MD": (-1,)}
+    )
+
+
+def _repeat_bound(r=4, *, ud=3, es=None, rs=None, k_shape=(1, 4, 2, 3)):
+    """A well-formed unsqueeze→expand→reshape binding (repeat_chain)."""
+    k = _p("k", *k_shape)
+    us = (*k_shape[:ud], 1, *k_shape[ud:])
+    if es is None:
+        es = (*us[:ud], r, *us[ud + 1 :])
+    if rs is None:
+        rs = (*us[: ud - 1], us[ud - 1] * r, *us[ud + 1 :])
+    return {"k": k, "$attr:UDk": ud, "$attr:ESk": es, "$attr:RSk": rs}
+
+
+def test_repeat_chain_predicate():
+    # ("repeat-chain", T, UD, ES, RS): unsq→expand→reshape IS
+    # repeat_interleave on T's dim d-1.
+    cond = ("repeat-chain", "k", "UDk", "ESk", "RSk")
+    ok = _repeat_bound()
+    assert eval_cond(cond, ok)
+    # non-int dim attr / non-tuple shapes / unshaped base → decline
+    assert not eval_cond(cond, {**ok, "$attr:UDk": "3"})
+    assert not eval_cond(cond, {**ok, "$attr:ESk": 5})
+    assert not eval_cond(cond, {**ok, "$attr:RSk": 5})
+    assert not eval_cond(cond, {"k": _v("k"), "$attr:UDk": 1,
+                                "$attr:ESk": (1, 1), "$attr:RSk": (1,)})
+    # symbolic dims in the base decline
+    assert not eval_cond(cond, _repeat_bound(k_shape=(None, 4, 2, 3)))
+    # unsqueeze at position 0 is not a repeat_interleave pattern
+    assert not eval_cond(cond, _repeat_bound(ud=0))
+    # expand must match the unsqueezed rank
+    assert not eval_cond(cond, {**ok, "$attr:ESk": (1, 4, 2, 4)})
+    # the repeat factor must be an int > 1
+    assert not eval_cond(cond, {**ok, "$attr:ESk": (1, 4, 2, 1, 3)})
+    assert not eval_cond(cond, {**ok, "$attr:ESk": (1, 4, 2, 1.5, 3)})
+    # expand may only grow the inserted dim
+    assert not eval_cond(cond, {**ok, "$attr:ESk": (1, 8, 2, 4, 3)})
+    # reshape must have the base rank and merge the repeated dims
+    assert not eval_cond(cond, {**ok, "$attr:RSk": (1, 4, 8)})
+    assert not eval_cond(cond, {**ok, "$attr:RSk": (1, 4, 2, 4, 3)})
+
+
+def test_repeat_heads_predicate():
+    # ("repeat-heads", A, B, UD, ES): sa[-2] == sb[-2] * es[d] —
+    # query heads = kv heads times the repeat factor.
+    cond = ("repeat-heads", "q", "k", "UDk", "ESk")
+    ok = {"q": _p("q", 1, 4, 8, 3), "k": _p("k", 1, 4, 2, 3),
+          "$attr:UDk": 3, "$attr:ESk": (1, 4, 2, 4, 3)}
+    assert eval_cond(cond, ok)  # 8 == 2 * 4
+    assert not eval_cond(cond, {**ok, "q": _p("q", 1, 4, 7, 3)})
+    # unshaped / low-rank / symbolic operands decline
+    assert not eval_cond(cond, {**ok, "q": _v("q")})
+    assert not eval_cond(cond, {**ok, "q": _p("q", 8)})
+    assert not eval_cond(cond, {**ok, "q": _p("q", 1, 4, None, 3)})
+    assert not eval_cond(cond, {**ok, "k": _p("k", 1, None, 2, 3)})
+    # non-int axis / non-tuple expand shape / factor slot misses
+    assert not eval_cond(cond, {**ok, "$attr:UDk": "3"})
+    assert not eval_cond(cond, {**ok, "$attr:ESk": 5})
+    assert not eval_cond(cond, {**ok, "$attr:ESk": (1,)})
+    # a non-int factor declines
+    assert not eval_cond(cond, {**ok, "$attr:ESk": (1, 4, 2, 1.5, 3)})
 
 
 # ---------------------------------------------------------------------------

@@ -1664,30 +1664,7 @@ class GuideArena:
         st = self.arms[arm]
         st.drawn += 1
         st.oracle_calls += calls
-        ship = (
-            v.truth
-            and v.relation == "new"
-            and v.fires > 0
-            and v.paid > 0
-            and v.verify_fail == 0
-        )
-        if v.truth:
-            st.true += 1
-            if self.first_true_at is None:
-                self.first_true_at = self.spent
-        if v.fires:
-            st.firing += 1
-        if v.truth and v.fires and v.relation == "new":
-            st.new_tf += 1
-        if ship:
-            st.shippable += 1
-            if self.first_ship_at is None:
-                self.first_ship_at = self.spent
-        if v.score > st.best:
-            st.best = v.score
-        if self.best is None or v.score > self.best.score:
-            self.best = v
-            self.best_arm = arm
+        self._tally(arm, st, v)
         if lhs is None or rhs is None:
             return  # mint-error — nothing was adjudicated
         key = lp._key(lhs, rhs)
@@ -1708,6 +1685,41 @@ class GuideArena:
             v.rhs_repr,
         )
         ev_store.record_run(self.conn, self.meta, [row])
+
+    @staticmethod
+    def _ship(v: Verdict) -> bool:
+        """Return whether the verdict ships (the pipeline's test)."""
+        return (
+            v.truth
+            and v.relation == "new"
+            and v.fires > 0
+            and v.paid > 0
+            and v.verify_fail == 0
+        )
+
+    def _tally(self, arm: str, st: Any, v: Verdict) -> None:
+        """Fold one adjudicated verdict into the arm's tallies."""
+        if v.truth:
+            st.true += 1
+            if self.first_true_at is None:
+                self.first_true_at = self.spent
+        if v.fires:
+            st.firing += 1
+        if v.truth and v.fires and v.relation == "new":
+            st.new_tf += 1
+        if self._ship(v):
+            st.shippable += 1
+            if self.first_ship_at is None:
+                self.first_ship_at = self.spent
+        self._tally_best(arm, st, v)
+
+    def _tally_best(self, arm: str, st: Any, v: Verdict) -> None:
+        """Fold *v* into the per-arm and global best-score tracking."""
+        if v.score > st.best:
+            st.best = v.score
+        if self.best is None or v.score > self.best.score:
+            self.best = v
+            self.best_arm = arm
 
     def summary(self, budget: int = 0) -> dict:
         """Aggregate the run: yields, per-arm tallies, the best find."""

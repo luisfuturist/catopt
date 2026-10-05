@@ -10,14 +10,13 @@ This file pins:
   pattern);
 * the ``Rewrite`` record round-trip — ``law_to_data`` /
   ``law_from_data`` — including the exact census of which of the 61
-  shipped laws are *full-data* (57) vs pattern(+cond) with a
-  procedural remainder — 2 ``check``-only (glu_fold,
-  gqa_absorb_repeat) and 2 ``check``+``derive`` (the rms pair);
+  shipped laws are *full-data* (all 61 now — the last four
+  procedural hooks went declarative in stage 0 of plan 0017);
 * the honesty contract — a ``serializable: false`` record rebuilds
-  its pattern + cond but *not* the dropped hooks: the reconstructed
-  ``rms_norm_fold`` fires and mints ``rms_norm(u, w, dim="ND")``
-  (the unbound attr metavar falls back to its literal name — a
-  visible scar, not a silent veto);
+  its pattern + cond but *not* the dropped hooks: a synthetic
+  flagged law fires and mints ``fused(u, dim="ND")`` (the unbound
+  attr metavar falls back to its literal name — a visible scar,
+  not a silent veto);
 * the sqlite ``lemmas`` table — ``store_lemma`` / ``admit_lemma`` /
   ``lemma_rows`` plus the ``--add-lemma`` / ``--admit`` CLI —
   closing the loop: a stored lemma admits into a live ``Rewrite``
@@ -50,7 +49,6 @@ from catopt_core.laws.serialize import (
 )
 from catopt_core.laws.tensor import (
     FACTOR_MUL,
-    RMS_NORM_FOLD,
     SOFTMAX_FOLD,
 )
 
@@ -172,20 +170,14 @@ def test_serializability_census_of_shipped_library():
         else:
             need_check.append((rule.name, missing))
     assert len(ALL_RULES) == 61
-    # the derive DSL closed the derive= gap: softmax_fold,
-    # qkv_fuse_asym, and all 12 sdpa_fold_* rules are now full-data
-    assert len(full) == 57
+    # the whole shipped library is full-data now: the four stragglers
+    # went declarative in stage 0 of plan 0017 — glu_fold's parity on
+    # a dim-mod predicate, the rms pair's trailing block on the
+    # tail-block spec, and gqa_absorb_repeat's repeat-chain /
+    # attr-eq-attr / repeat-heads triple
+    assert len(full) == 61
     assert need_derive == []
-    assert "softmax_fold" in full and "qkv_fuse_asym" in full
-    # glu_fold's split-axis parity, the rms pair's normalized-shape +
-    # derive hooks, and gqa_absorb_repeat's repeat-chain side
-    # conditions are still procedural
-    assert need_check == [
-        ("glu_fold", ("check",)),
-        ("rms_norm_fold", ("check", "derive")),
-        ("rms_norm_fold_nogain", ("check", "derive")),
-        ("gqa_absorb_repeat", ("check",)),
-    ]
+    assert need_check == []
 
 
 def test_missing_hooks_detects_procedural_check_under_cond():
@@ -265,15 +257,31 @@ def test_law_record_roundtrip_rewrite_equality_unguarded():
     assert n == 24
 
 
+def _flagged_rule():
+    """A rule data cannot fully carry — a cond + procedural check +
+    procedural derive composite.  No shipped law is flagged anymore
+    (the census is clean), so the honesty path gets a synthetic
+    stand-in."""
+    return Rewrite(
+        name="flagged_fused",
+        lhs=Op.make("mul", "u", Op.make("rsqrt", "u")),
+        rhs=Op.make("fused", "u", dim="ND"),
+        cond=("rank", "u", ">=", 1),
+        check=lambda bound: True,
+        derive=lambda bound: {"$attr:ND": 1},
+    )
+
+
 def test_law_record_flagged_hooks_drop_on_rebuild():
     """A check/derive law stores pattern+cond, flagged honestly."""
-    data = law_to_data(RMS_NORM_FOLD)
+    rule = _flagged_rule()
+    data = law_to_data(rule)
     assert data["serializable"] is False
     assert data["missing_hooks"] == ["check", "derive"]
     rebuilt = law_from_data(_json_roundtrip(data))
     assert rebuilt.derive is None and rebuilt.dspec is None
     # the cond DID travel: the rebuilt rule still guards
-    assert rebuilt.cond == RMS_NORM_FOLD.cond
+    assert rebuilt.cond == rule.cond
     assert rebuilt.check is not None
     # and the record marks the rebuild clean — it has no hooks to drop
     assert law_to_data(rebuilt)["serializable"] is True
@@ -397,33 +405,14 @@ def test_rebuilt_dspec_law_fires_identically():
 
 
 def test_rebuilt_flagged_law_shows_the_honest_scar():
-    """``rms_norm_fold`` without its hooks fires — and mints the
+    """A flagged law rebuilt without its hooks fires — and mints the
     unbound attr metavar *literally* (``dim="ND"``).  The flag says
     why this cannot be trusted; the scar shows it."""
-    u, w = _v("u", 4, 8), _p("w", 8)
-    src = Op.make(
-        "mul",
-        Op.make(
-            "mul",
-            u,
-            Op.make(
-                "rsqrt",
-                Op.make(
-                    "add",
-                    Op.make(
-                        "mean",
-                        Op.make("pow", u, Const(2)),
-                        dim=(-1,),
-                        keepdim=True,
-                    ),
-                    Const(1e-5),
-                ),
-            ),
-        ),
-        w,
-    )
-    scar = Op.make("rms_norm", u, w, dim="ND", eps="EP")
-    rebuilt = law_from_data(_json_roundtrip(law_to_data(RMS_NORM_FOLD)))
+    rule = _flagged_rule()
+    u = _v("u", 4, 8)
+    src = Op.make("mul", u, Op.make("rsqrt", u))
+    scar = Op.make("fused", u, dim="ND")
+    rebuilt = law_from_data(_json_roundtrip(law_to_data(rule)))
     assert _fires(rebuilt, src, scar)
 
 
@@ -469,14 +458,15 @@ def test_admit_lemma_unknown_key_returns_none(tmp_path):
         conn.close()
 
 
-def test_admitted_rms_fold_is_flagged(tmp_path):
+def test_admitted_flagged_rule_is_flagged(tmp_path):
     conn = _conn(tmp_path)
     try:
-        key = le.store_lemma(conn, RMS_NORM_FOLD)
-        rule, data = le.admit_lemma(conn, key)
+        rule = _flagged_rule()
+        key = le.store_lemma(conn, rule)
+        admitted, data = le.admit_lemma(conn, key)
         assert data["serializable"] is False
         assert data["missing_hooks"] == ["check", "derive"]
-        assert rule.derive is None and rule.cond == RMS_NORM_FOLD.cond
+        assert admitted.derive is None and admitted.cond == rule.cond
     finally:
         conn.close()
 
@@ -588,8 +578,16 @@ def test_lemma_cli_cert_roundtrip(tmp_path, capsys):
 
 
 def test_lemma_cli_reports_missing_hooks(tmp_path, capsys):
+    """Every shipped law is full-data now, so the flagged report comes
+    from a synthetic rule stored directly — ``--admit`` prints its
+    missing hooks."""
     db = str(tmp_path / "laws.db")
-    assert le.main(["--report", db, "--add-lemma", "rms_norm_fold"]) == 0
+    conn = le.connect(db)
+    try:
+        key = le.store_lemma(conn, _flagged_rule())
+    finally:
+        conn.close()
+    assert le.main(["--report", db, "--admit", key]) == 0
     out = capsys.readouterr().out
     assert "missing hooks: check, derive" in out
 

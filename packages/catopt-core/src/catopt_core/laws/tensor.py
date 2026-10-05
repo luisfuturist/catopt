@@ -23,13 +23,18 @@ Collections:
 # ruff: noqa: RUF001 RUF002 RUF003 -- the law strings and docstrings use
 # mathematical notation (σ, ⊗, ×) deliberately; ASCII would misstate it.
 
-from typing import Any, cast
+from typing import Any
 
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags
-from catopt_core.laws.base import R, _shape_of
-from catopt_core.laws.cond import as_check, as_derive
+from catopt_core.laws.base import R
+from catopt_core.laws.cond import (
+    _shape,
+    as_check,
+    as_derive,
+    eval_cond,
+)
 from catopt_core.laws.layout import LAYOUT_RULES
 
 #: Tag bundles for the rule definitions below (see
@@ -366,32 +371,31 @@ SOFTMAX_FOLD = R(
 # ``dim`` exactly, but ``chunk(·, 2, d)`` splits an odd axis
 # first-big (n=3 → 2+1) — and (…,2)·(…,1) still broadcasts, so an
 # odd-axis redex evaluates while its ``glu`` image raises at eval.
-# Evenness of ``u.shape[D]`` is the exact precondition; it needs the
-# attr-named axis, which the cond DSL cannot index, so it stays a
-# procedural ``check`` — ``cond`` carries the expressible front
-# (``u`` shaped, rank ≥ 1; a scalar has no axis to halve).  Unknown or
-# ``None`` dims ON the split axis decline (the library's strict
-# posture); ``None`` dims elsewhere do not matter.  Term-local and
-# single-direction — at most one member per e-class, no closure
-# growth.
-_COND_GLU_FOLD = ("rank", "u", ">=", 1)
+# Evenness of ``u.shape[D]`` is the exact precondition; the ``dim-mod``
+# predicate indexes the attr-named axis declaratively, so the whole
+# guard is ``cond`` — (``u`` shaped, rank ≥ 1; a scalar has no axis to
+# halve) and the parity check in one tree.  Unknown or ``None`` dims
+# ON the split axis decline (the library's strict posture); ``None``
+# dims elsewhere do not matter.  Term-local and single-direction — at
+# most one member per e-class, no closure growth.
+_COND_GLU_SHAPED = ("rank", "u", ">=", 1)
+
+#: Parity of the attr-named split axis — the once-procedural half.
+_COND_GLU_PARITY = ("dim-mod", "u", "D", 2, 0)
+
+_COND_GLU_FOLD = ("and", _COND_GLU_SHAPED, _COND_GLU_PARITY)
 
 #: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
-_check_glu_shaped = as_check(_COND_GLU_FOLD)
+_check_glu_shaped = as_check(_COND_GLU_SHAPED)
 
 
 def _check_glu_fold(bound: dict) -> bool:
-    """Veto the odd-axis case: ``u.shape[dim]`` must be a known even int."""
-    from catopt_core.typing import _shape_of as _so
+    """Veto the odd-axis case: ``u.shape[dim]`` must be a known even int.
 
-    s = _so(bound.get("u"))
-    d = bound.get("$attr:D")
-    if not isinstance(s, tuple) or not isinstance(d, int):
-        return False
-    if not (-len(s) <= d < len(s)):
-        return False
-    n = s[d % len(s)]
-    return isinstance(n, int) and n % 2 == 0
+    Kept a ``def`` — the discovery emitter's hook-name collision probe
+    reads tensor.py source — but the verdict IS the cond data.
+    """
+    return eval_cond(_COND_GLU_PARITY, bound)
 
 
 GLU_FOLD = R(
@@ -409,7 +413,6 @@ GLU_FOLD = R(
     "a ⊗ σ(b) over the two equal halves of u IS the kernel's "
     "definition.  Folds mul+sigmoid+2 chunks to one dispatched op.",
     cond=_COND_GLU_FOLD,
-    check=_check_glu_fold,
     tags=_SIM,
 )
 
@@ -434,22 +437,22 @@ GLU_FOLD = R(
 # the exporter writes — alternate mul orderings are reachable only
 # through the opt-in SYMMETRY set.
 #
-# The side condition splits the usual way.  ``cond`` carries the
-# expressible front: ``keepdim`` must be True (a dropped axis cannot
+# The side condition splits the usual way — and is now *all* data.
+# The front: ``keepdim`` must be True (a dropped axis cannot
 # broadcast the rms back over ``u``), ``eps`` must be a numeric
 # ``Const`` leaf (the kernel's ``eps`` is a float attr — a tensor
 # ``eps`` has no image), and the ``pow`` exponent must be the literal
-# 2.  ``check`` carries what the DSL cannot: the ``mean``'s reduce
-# dims must name exactly u's last ``k`` axes — ``F.rms_norm`` only
-# normalizes a trailing block — and the gain ``w``'s shape must BE
-# that trailing block (``aten.rms_norm`` rejects any other weight
-# shape at eval, so a mismatch would mint an unlowerable member).
-# ``derive`` then computes the two RHS attrs the LHS cannot bind
-# verbatim: ``dim`` is the *normalized shape* tuple (u.shape[-k:]),
-# not the reduce dims, and ``eps`` unwraps the bound ``Const`` leaf
-# into the float attr.  Unknown or ``None`` dims decline — the same
-# strict posture as ``_check_glu_fold``; a law never mints an attr it
-# cannot verify.
+# 2.  The trailing-block half rides one ``tail-block`` shape spec:
+# it resolves to ``u.shape[-k:]`` iff the ``mean``'s reduce dims
+# name exactly u's last ``k`` axes — ``F.rms_norm`` only normalizes
+# a trailing block — so ``shaped`` gives the gain-free gate and
+# ``shape-eq`` gives the gained fold's ``w`` gate (``aten.rms_norm``
+# rejects any other weight shape at eval, so a mismatch would mint
+# an unlowerable member).  The same spec is the ``dim`` derive —
+# the normalized shape tuple, not the reduce dims — while
+# ``("float", ("const", "EPS"))`` unwraps the bound ``Const`` into
+# the float attr.  Unknown or ``None`` dims decline — a law never
+# mints an attr it cannot verify.
 _COND_RMS_FOLD = (
     "and",
     ("attr-is", "MK", True),
@@ -457,28 +460,28 @@ _COND_RMS_FOLD = (
     ("const-cmp", "P", "==", 2),
 )
 
+#: The trailing-block spec — resolves to ``u.shape[-k:]`` exactly
+#: when the bound reduce dims name u's last ``k`` axes.  One piece
+#: of data serves the side condition AND the derive below.
+_SPEC_RMS_TAIL = ("tail-block", "u", "MD")
+
+#: The gained fold's trailing half — ``w`` must BE the normalized shape.
+_COND_RMS_GAINED_TAIL = ("shape-eq", "w", _SPEC_RMS_TAIL)
+
+#: The gain-free twin's — the trailing block must merely exist.
+_COND_RMS_NOGAIN_TAIL = ("shaped", _SPEC_RMS_TAIL)
+
+_COND_RMS_FOLD_GAINED = ("and", _COND_RMS_FOLD, _COND_RMS_GAINED_TAIL)
+_COND_RMS_FOLD_NOGAIN = ("and", _COND_RMS_FOLD, _COND_RMS_NOGAIN_TAIL)
+
 #: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
 _check_rms_consts = as_check(_COND_RMS_FOLD)
 
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_rms_fold = as_check(_COND_RMS_GAINED_TAIL)
 
-def _rms_dims(bound: dict) -> tuple | None:
-    """Return the ``mean``'s reduce dims as a tuple, or ``None``.
-
-    Accepts the exported ``(-1,)`` tuple, a list, or a hand-minted
-    bare int; every entry must be a non-``bool`` int.
-    """
-    dims = bound.get("$attr:MD")
-    if isinstance(dims, int) and not isinstance(dims, bool):
-        dims = (dims,)
-    if not (
-        isinstance(dims, (tuple, list))
-        and dims
-        and all(
-            isinstance(d, int) and not isinstance(d, bool) for d in dims
-        )
-    ):
-        return None
-    return tuple(dims)
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_rms_fold_nogain = as_check(_COND_RMS_NOGAIN_TAIL)
 
 
 def _rms_normalized_shape(bound: dict):
@@ -488,47 +491,21 @@ def _rms_normalized_shape(bound: dict):
     exactly u's last ``k`` axes — each in range, no duplicates — and
     ``u`` is concretely shaped (the RHS ``dim`` attr IS ``u.shape[-k:]``,
     so an unshaped ``u`` cannot mint it — the strict posture).
+    Delegates to the ``tail-block`` spec so the test-facing helper and
+    the rule's cond/derive can never drift.
     """
-    dims = _rms_dims(bound)
-    if dims is None:
-        return None
-    su = _shape_of(bound.get("u"))
-    if not (
-        isinstance(su, tuple) and all(isinstance(d, int) for d in su)
-    ):
-        return None
-    rank, k = len(su), len(dims)
-    if not 1 <= k <= rank or not all(-rank <= d < rank for d in dims):
-        return None
-    norm = {d % rank for d in dims}
-    # ``k`` distinct in-range axes whose minimum is ``rank - k`` IS
-    # the trailing block {rank-k … rank-1}.
-    if len(norm) != k or min(norm) != rank - k:
-        return None
-    return tuple(su[rank - k :])
+    return _shape(bound, _SPEC_RMS_TAIL)
 
 
-def _check_rms_fold(bound: dict) -> bool:
-    """Veto the gained fold when ``w``'s shape isn't the normalized shape."""
-    ns = _rms_normalized_shape(bound)
-    if ns is None:
-        return False
-    sw = _shape_of(bound.get("w"))
-    return isinstance(sw, tuple) and tuple(sw) == ns
+#: The kernel's ``dim`` (the normalized shape, not the reduce dims)
+#: plus the unwrapped float ``eps`` — both minted declaratively.
+_DSPEC_RMS_NORM = {
+    "ND": ("shape", _SPEC_RMS_TAIL),
+    "EP": ("float", ("const", "EPS")),
+}
 
-
-def _check_rms_fold_nogain(bound: dict) -> bool:
-    """Veto the gain-free fold when the reduce isn't a trailing block."""
-    return _rms_normalized_shape(bound) is not None
-
-
-def _derive_rms_norm(bound: dict) -> dict | None:
-    """Mint the kernel's ``dim`` (a shape, not the reduce dims) + ``eps``."""
-    ns = _rms_normalized_shape(bound)
-    eps = getattr(bound.get("EPS"), "value", None)
-    if ns is None or not isinstance(eps, (int, float)):
-        return None
-    return {"$attr:ND": ns, "$attr:EP": float(eps)}
+#: Compat alias — the test-facing hook (see ``_derive_softmax_dim``).
+_derive_rms_norm = as_derive(_DSPEC_RMS_NORM)
 
 
 def _rms_reduce(u: str = "u") -> Op:
@@ -556,9 +533,8 @@ RMS_NORM_FOLD = R(
     "fold — composed-then-reduced then scaled IS the kernel's "
     "definition.  Folds mul+mul+rsqrt+add+mean+pow to one dispatched "
     "op.",
-    cond=_COND_RMS_FOLD,
-    check=_check_rms_fold,
-    derive=_derive_rms_norm,
+    cond=_COND_RMS_FOLD_GAINED,
+    dspec=_DSPEC_RMS_NORM,
     tags=_SIM,
 )
 
@@ -575,9 +551,8 @@ RMS_NORM_FOLD_NOGAIN = R(
     law="x·rsqrt(mean(x²)+eps) IS rms_norm(x): the weight-free "
     "manual-RMSNorm fold — the gained fold's inner ``mul`` and a real "
     "spelling of its own (gain-free RMSNorm blocks).",
-    cond=_COND_RMS_FOLD,
-    check=_check_rms_fold_nogain,
-    derive=_derive_rms_norm,
+    cond=_COND_RMS_FOLD_NOGAIN,
+    dspec=_DSPEC_RMS_NORM,
     tags=_SIM,
 )
 
@@ -1338,68 +1313,37 @@ QKV_FUSE_ASYM = R(
 # ---------------------------------------------------------------------------
 
 
+#: The whole guard is now data: both kv operands must be
+#: ``unsqueeze→expand→reshape`` repeat-chains (the ``repeat-chain``
+#: predicate — the same copy-map verification ``decode_laws`` uses
+#: through ``_check_repeat_chain``), their expand shapes must agree
+#: (same repeat factor), and q's head count must equal kv heads × r
+#: (``repeat-heads``: ``qs[-2] == ks[-2] * es[d]``).
+_COND_GQA_ABSORB = (
+    "and",
+    ("repeat-chain", "k", "UDk", "ESk", "RSk"),
+    ("repeat-chain", "v", "UDv", "ESv", "RSv"),
+    ("attr-eq-attr", "ESk", "ESv"),
+    ("repeat-heads", "q", "k", "UDk", "ESk"),
+)
+
+
 def _check_repeat_chain(bound: dict, pre: str) -> bool:
     """Check reshape(expand(unsqueeze(t, d))) is repeat_interleave.
 
     Must be exactly repeat_interleave on dim d-1: unsqueeze inserts a 1,
     expand broadcasts only that dim by r, and the reshape merges dims
-    d-1,d into one.
+    d-1,d into one.  Delegates to the ``repeat-chain`` predicate so the
+    test/carrier-facing helper and the rule's cond cannot drift.
     """
-    from catopt_core.typing import _shape_of as _so
-
-    d = bound.get(f"$attr:UD{pre}")
-    es = bound.get(f"$attr:ES{pre}")
-    rs = bound.get(f"$attr:RS{pre}")
-    base = bound.get(pre)
-    bs = _so(base)
-    if not (
-        isinstance(d, int)
-        and isinstance(es, tuple)
-        and isinstance(rs, tuple)
-        and isinstance(bs, tuple)
-    ):
-        return False
-    if any(x is None for x in bs):
-        return False
-    nd = len(bs)
-    d = d % (nd + 1)
-    us = bs[:d] + (1,) + bs[d:]  # noqa: RUF005
-    if len(es) != len(us) or len(rs) != nd or d == 0:
-        return False
-    r = es[d]
-    if not isinstance(r, int) or r <= 1:
-        return False
-    if any(es[i] != us[i] for i in range(len(us)) if i != d):
-        return False  # expand may only grow the inserted dim
-    merged = us[: d - 1] + ((us[d - 1] or 0) * r,) + us[d + 1 :]  # noqa: RUF005
-    return rs == merged
+    return eval_cond(
+        ("repeat-chain", pre, f"UD{pre}", f"ES{pre}", f"RS{pre}"),
+        bound,
+    )
 
 
-def _check_gqa_absorb(bound: dict) -> bool:
-    """Require k and v to be repeat-chains with the same factor r.
-
-    q's head count must equal kv_heads * r.
-    """
-    from catopt_core.typing import _shape_of as _so
-
-    for side in ("k", "v"):
-        if not _check_repeat_chain(bound, side):
-            return False
-    if bound["$attr:ESk"] != bound["$attr:ESv"]:
-        return False
-    d = bound["$attr:UDk"] % (len(cast("tuple", _so(bound["k"]))) + 1)
-    r = bound["$attr:ESk"][d]
-    qs, ks = _so(bound["q"]), _so(bound["k"])
-    if not (
-        isinstance(qs, tuple)
-        and isinstance(ks, tuple)
-        and len(qs) >= 2
-        and len(ks) >= 2
-    ):
-        return False
-    if None in qs or None in ks:
-        return False
-    return qs[-2] == ks[-2] * r  # hq == hkv * n_rep
+#: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
+_check_gqa_absorb = as_check(_COND_GQA_ABSORB)
 
 
 _REPEAT_KV = Op.make(
@@ -1451,7 +1395,7 @@ GQA_ABSORB = R(
     "kv head r times (repeat_kv).  SDPA implements that copy inside "
     "the kernel via enable_gqa — pushing Delta into the consumer "
     "deletes the materialisation entirely.",
-    check=_check_gqa_absorb,
+    cond=_COND_GQA_ABSORB,
     tags=_FUS,
 )
 

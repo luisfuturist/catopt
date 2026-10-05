@@ -51,6 +51,8 @@ Grammar
           | ("attr-len", NAME, CMP, k)   # tuple attr, len CMP k
           | ("attr-cmp-dim", NAME, CMP, T, K)
                                      # $attr:NAME CMP shape(T)[$attr:K]
+          | ("attr-eq-attr", A, B)   # bound attrs equal (both bound)
+          | ("dim-mod", T, K, m, r)  # sa[K mod rank] % m == r
           | ("bcast-eq", A,B,C,D)    # bcast(sA,sB) == bcast(sC,sD)
           | ("ones-before", T, K)    # s[i]==1 for i < K mod (rank+1)
           | ("axes-noop", T, D0, D1) # transpose pair is a semantic
@@ -64,6 +66,10 @@ Grammar
                                      #   mul(unsq(u,K),reshape(v,S)) AND
                                      #   both operands' flat read maps
                                      #   agree across the two orders
+          | ("repeat-chain", T,UD,ES,RS)  # unsq→expand→reshape is
+                                     #   repeat_interleave on T's dim
+          | ("repeat-heads", A,B,UD,ES)  # sa[-2] == sb[-2] * the repeat
+                                     #   factor $attr:ES[UD mod rank+1]
 
     T/A/B := metavar name (str) | ("mm-out", T, T)   — a *shape spec*:
              a bound term's inferred shape, or the matmul output shape
@@ -76,6 +82,11 @@ Grammar
                                      #   under $attr:NAME (-1 folded,
                                      #   numel checked — invalid→None)
           | ("getitem-out", T)       # tensor-index output: s[1:]
+          | ("tail-block", T, NAME)  # the trailing block attr NAME's
+                                     #   reduce dims prove — su[-k:]
+                                     #   when they name exactly T's
+                                     #   last k axes (the *_norm
+                                     #   normalized_shape), else None
     D*/NAME := attribute metavar names — looked up under "$attr:NAME".
     CMP    := "==" | "!=" | "<" | "<=" | ">" | ">=".
 
@@ -293,6 +304,71 @@ def _s_getitem_out(args: tuple, bound: dict) -> Any:
     return s[1:] if isinstance(s, tuple) and s else None
 
 
+def _attr_dims(bound: dict, name: str) -> tuple | None:
+    """Return the bound reduce-dims attr as a tuple, or ``None``.
+
+    Accepts the exported ``(-1,)`` tuple, a list, or a hand-minted
+    bare int; every entry must be a non-``bool`` int — the
+    normalization the procedural rms hook used.
+    """
+    dims = bound.get(f"$attr:{name}")
+    if isinstance(dims, int) and not isinstance(dims, bool):
+        dims = (dims,)
+    if not (
+        isinstance(dims, (tuple, list))
+        and dims
+        and all(
+            isinstance(d, int) and not isinstance(d, bool) for d in dims
+        )
+    ):
+        return None
+    return tuple(dims)
+
+
+def _s_tail_block(args: tuple, bound: dict) -> Any:
+    """``("tail-block", T, NAME)`` — the trailing block NAME proves.
+
+    The ``F.*_norm`` ``normalized_shape`` contract: resolves to
+    ``shape(T)[-k:]`` (``k = len(dims)``) iff the bound
+    ``$attr:NAME`` reduce dims — a bare non-``bool`` int or a
+    non-empty tuple/list of non-``bool`` ints — name *exactly* T's
+    last ``k`` axes: each in range, no duplicates, covering
+    ``{rank-k … rank-1}`` (``k`` distinct in-range axes whose minimum
+    is ``rank - k`` IS that block).  T's shape must be a tuple of
+    concrete ints — the resolved value IS the trailing block, so an
+    unshaped or ``None``-dim operand cannot mint it.  Every failure
+    resolves to ``None``, which both the ``shape-eq``/``shaped``
+    guards and the ``("shape", spec)`` derive read as a decline —
+    one spec serves the whole normalized-shape precondition.
+    """
+    if len(args) != 2:
+        return None
+    dims = _attr_dims(bound, args[1])
+    su = _shape(bound, args[0])
+    if (
+        dims is None
+        or not isinstance(su, tuple)
+        or not all(isinstance(d, int) for d in su)
+    ):
+        return None
+    return _trailing_block(su, dims)
+
+
+def _trailing_block(su: tuple, dims: tuple) -> tuple | None:
+    """Return ``su[-k:]`` iff *dims* names exactly su's last ``k`` axes.
+
+    ``k`` distinct in-range axes whose minimum is ``rank - k`` IS the
+    trailing block ``{rank-k … rank-1}``.
+    """
+    rank, k = len(su), len(dims)
+    if not 1 <= k <= rank or not all(-rank <= d < rank for d in dims):
+        return None
+    norm = {d % rank for d in dims}
+    if len(norm) != k or min(norm) != rank - k:
+        return None
+    return tuple(su[rank - k :])
+
+
 #: Tag-dispatch for tuple shape specs — each handler takes
 #: ``(args, bound)`` and validates its own arity.
 _SPEC_OPS: dict = {
@@ -301,6 +377,7 @@ _SPEC_OPS: dict = {
     "unsq-out": _s_unsq_out,
     "reshape-out": _s_reshape_out,
     "getitem-out": _s_getitem_out,
+    "tail-block": _s_tail_block,
 }
 
 
@@ -465,6 +542,33 @@ def _p_dim_eq_attr(args: tuple, bound: dict) -> bool:
     return ok_a and ok_b and da == db
 
 
+def _p_dim_mod(args: tuple, bound: dict) -> bool:
+    """``("dim-mod", T, K, m, r)`` — ``sa[K % rank] % m == r``.
+
+    For parity-style guards on an attr-named axis — the ``glu_fold``
+    split axis (``("dim-mod", "u", "D", 2, 0)`` requires the dim the
+    bound ``$attr:D`` names to be a known even int, since ``chunk``
+    splits an odd axis first-big while ``glu`` halves exactly).
+    ``K`` resolves like ``dim-eq-attr``'s indices: the bound attr
+    must be an int in range; the named dim must itself be an int —
+    ``None`` dims off the axis are fine, on it they decline.  A
+    non-int or zero modulus declines rather than raising.
+    """
+    s = _tshape(bound, args[0])
+    d = bound.get(f"$attr:{args[1]}")
+    m = args[2]
+    if (
+        s is None
+        or not isinstance(d, int)
+        or not isinstance(m, int)
+        or m == 0
+        or not (-len(s) <= d < len(s))
+    ):
+        return False
+    n = s[d % len(s)]
+    return isinstance(n, int) and n % m == args[3]
+
+
 def _p_bcast_into(args: tuple, bound: dict) -> bool:
     small, big = _tshape(bound, args[0]), _shape(bound, args[1])
     return (
@@ -587,6 +691,18 @@ def _p_attr_cmp_dim(args: tuple, bound: dict) -> bool:
         return False
     ok, d = _dim_at(s, k)
     return ok and isinstance(d, int) and _CMPS[args[1]](v, d)
+
+
+def _p_attr_eq_attr(args: tuple, bound: dict) -> bool:
+    """``("attr-eq-attr", A, B)`` — two bound attrs compare equal.
+
+    The attr-to-attr sibling of ``attr-eq``: for guards where two
+    pattern-bound attrs must coincide (``gqa_absorb_repeat``'s k/v
+    expand shapes).  An unbound side declines — the strict posture.
+    """
+    a = bound.get(f"$attr:{args[0]}", _MISSING)
+    b = bound.get(f"$attr:{args[1]}", _MISSING)
+    return a is not _MISSING and a == b
 
 
 def _p_bcast_eq(args: tuple, bound: dict) -> bool:
@@ -784,6 +900,98 @@ def _p_flat_map_unsq(args: tuple, bound: dict) -> bool:
     ) and _flat_map_ok(_viewed_map(s, w), _shifted_map(sv, gu, nd), w)
 
 
+def _repeat_merge_ok(bs: tuple, d: int, es: tuple, rs: tuple) -> bool:
+    """Decide the chain's shape equation at the normalized axis ``d``.
+
+    Expand must be exactly the unsqueezed shape with an int factor
+    ``r > 1`` at ``d`` — and reshape exactly
+    ``us[:d-1] + (us[d-1]*r,) + us[d+1:]``.
+    """
+    nd = len(bs)
+    d = d % (nd + 1)
+    us = _unsq_shape(bs, d)
+    if len(es) != len(us) or len(rs) != nd or d == 0:
+        return False
+    r = es[d]
+    if not isinstance(r, int) or r <= 1:
+        return False
+    if any(es[i] != us[i] for i in range(len(us)) if i != d):
+        return False
+    merged = (*us[: d - 1], (us[d - 1] or 0) * r, *us[d + 1 :])
+    return rs == merged
+
+
+def _p_repeat_chain(args: tuple, bound: dict) -> bool:
+    """``("repeat-chain", T, UD, ES, RS)`` — the copy-map chain.
+
+    Decides that ``reshape(expand(unsqueeze(T, UD), ES), RS)`` is
+    ``repeat_interleave`` on T's dim ``d-1``: unsqueeze inserts a 1
+    at ``d = UD % (rank+1)``, expand broadcasts *only* that dim by
+    an int factor ``r > 1``, and the reshape merges dims ``d-1`` and
+    ``d`` back into one.  The base shape must be a tuple of concrete
+    dims — every unprovable piece declines (the strict posture; a
+    law never admits a chain it cannot verify).
+    """
+    d = bound.get(f"$attr:{args[1]}")
+    es = bound.get(f"$attr:{args[2]}")
+    rs = bound.get(f"$attr:{args[3]}")
+    bs = _shape(bound, args[0])
+    if not (
+        isinstance(d, int)
+        and isinstance(es, tuple)
+        and isinstance(rs, tuple)
+        and isinstance(bs, tuple)
+    ):
+        return False
+    if any(x is None for x in bs):
+        return False
+    return _repeat_merge_ok(bs, d, es, rs)
+
+
+def _concrete_rank2(bound: dict, ref: Any) -> tuple | None:
+    """Resolve *ref* to a rank-≥2 shape of concrete dims, or None."""
+    s = _tshape(bound, ref)
+    if s is None or len(s) < 2 or any(x is None for x in s):
+        return None
+    return s
+
+
+def _rep_factor(es: tuple, d: int, rank: int) -> int | None:
+    """Return the expand factor at the normalized axis, or None."""
+    dd = d % (rank + 1)
+    if not (0 <= dd < len(es)):
+        return None
+    r = es[dd]
+    return r if isinstance(r, int) else None
+
+
+def _p_repeat_heads(args: tuple, bound: dict) -> bool:
+    """``("repeat-heads", A, B, UD, ES)`` — the repeated-head relation.
+
+    ``sa[-2] == sb[-2] * r`` where ``r = es[d]`` is the expand
+    factor at the normalized unsqueeze axis ``d = UD %
+    (len(sb)+1)`` — the head-count equation a repeat-absorption law
+    needs (query heads = kv heads times the repeat factor).  Both
+    shapes must resolve, be rank ≥ 2, and carry concrete dims
+    throughout; the axis must be a bound int and ``es`` a tuple
+    covering it with an int at the factor position — anything
+    unprovable declines.
+    """
+    sa = _concrete_rank2(bound, args[0])
+    sb = _concrete_rank2(bound, args[1])
+    d = bound.get(f"$attr:{args[2]}")
+    es = bound.get(f"$attr:{args[3]}")
+    if (
+        sa is None
+        or sb is None
+        or not isinstance(d, int)
+        or not isinstance(es, tuple)
+    ):
+        return False
+    r = _rep_factor(es, d, len(sb))
+    return r is not None and sa[-2] == sb[-2] * r
+
+
 _OPS: dict = {
     "and": None,  # combinators are handled in eval_cond directly
     "or": None,
@@ -801,6 +1009,7 @@ _OPS: dict = {
     "dim-compat": _p_dim_compat,
     "dim-eq-const": _p_dim_eq_const,
     "dim-eq-attr": _p_dim_eq_attr,
+    "dim-mod": _p_dim_mod,
     "bcast-into": _p_bcast_into,
     "mm-shape-ok": _p_mm_shape_ok,
     "axes-last2": _p_axes_last2,
@@ -819,11 +1028,14 @@ _OPS: dict = {
     "attr-type": _p_attr_type,
     "attr-len": _p_attr_len,
     "attr-cmp-dim": _p_attr_cmp_dim,
+    "attr-eq-attr": _p_attr_eq_attr,
     "bcast-eq": _p_bcast_eq,
     "ones-before": _p_ones_before,
     "axes-noop": _p_axes_noop,
     "flat-pair-unsq": _p_flat_pair_unsq,
     "flat-map-unsq": _p_flat_map_unsq,
+    "repeat-chain": _p_repeat_chain,
+    "repeat-heads": _p_repeat_heads,
 }
 
 

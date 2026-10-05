@@ -46,7 +46,9 @@ from catopt_core.laws.scan import (
 )
 from catopt_core.laws.tensor import (
     QKV_FUSE_ASYM,
+    RMS_NORM_FOLD,
     SOFTMAX_FOLD,
+    _derive_rms_norm,
     _derive_scale_div,
     _derive_scale_mul,
     _derive_scale_one,
@@ -411,7 +413,7 @@ def test_fingerprint_covers_dspec_data():
 
 
 def test_every_shipped_dspec_roundtrips_through_json():
-    """All 18 spec-carrying rules' dspecs survive the store wire format."""
+    """All 20 spec-carrying rules' dspecs survive the store wire format."""
     seen = 0
     for rule in [*ALL_RULES, *SCAN_DIAG_LAWS]:
         if rule.dspec is None:
@@ -427,7 +429,7 @@ def test_every_shipped_dspec_roundtrips_through_json():
             dspec=json.loads(blob),
         )
         assert rebuilt.dspec == rule.dspec
-    assert seen == 18
+    assert seen == 20
 
 
 def test_migrated_alias_partials_are_the_same_data():
@@ -436,6 +438,7 @@ def test_migrated_alias_partials_are_the_same_data():
     assert _derive_softmax_dim.args == (SOFTMAX_FOLD.dspec,)
     assert _derive_split_sizes.args == (QKV_FUSE_ASYM.dspec,)
     assert _derive_affd_unit.args == (AFFD_LIFT_UNIT.dspec,)
+    assert _derive_rms_norm.args == (RMS_NORM_FOLD.dspec,)
     # verdict parity on accept and decline bindings
     assert _derive_scale_mul({"S": Const(0.125)}) == {"$attr:SC": 0.125}
     assert _derive_scale_div({"S": Const(0.125)}) == {"$attr:SC": 8.0}
@@ -446,6 +449,23 @@ def test_migrated_alias_partials_are_the_same_data():
     assert _derive_split_sizes(
         {"Q": _p("Q", 6, 4), "K": _p("K", 2, 4), "V": _p("V", 2, 4)}
     ) == {"$attr:SZ": (6, 2, 2)}
+    # the rms derive: tail-block spec + unwrapped Const eps
+    rms_bound = {
+        "u": _v("u", 4, 8),
+        "EPS": Const(1e-5),
+        "$attr:MD": (-1,),
+    }
+    assert _derive_rms_norm(rms_bound) == {
+        "$attr:ND": (8,),
+        "$attr:EP": 1e-5,
+    }
+    # a non-trailing reduce or a non-Const eps vetoes the spec
+    assert (
+        _derive_rms_norm({**rms_bound, "$attr:MD": (0,)}) is None
+    )
+    assert (
+        _derive_rms_norm({**rms_bound, "EPS": _v("e")}) is None
+    )
 
 
 def test_migrated_rules_carry_dspec_and_folded_derive():
@@ -455,6 +475,8 @@ def test_migrated_rules_carry_dspec_and_folded_derive():
         "qkv_fuse_asym",
         *[f"sdpa_fold_add{s}{w}" for s in ("mul", "div", "") for w in ("", "_drop")],
         *[f"sdpa_fold_masked_fill{s}{w}" for s in ("mul", "div", "") for w in ("", "_drop")],
+        "rms_norm_fold",
+        "rms_norm_fold_nogain",
         "affd_lift_unit",
         "affd_lift_unit_post",
         "affd_lift_unit_step",
