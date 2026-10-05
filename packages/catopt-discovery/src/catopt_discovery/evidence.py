@@ -69,21 +69,25 @@ CLI — history over the store, plus the lemma seam::
         --add-object silu_mul_form --kind abstraction
     .venv/bin/python -m catopt_discovery.evidence --report /tmp/laws.db \
         --admit-object '<alpha_key>'
+    .venv/bin/python -m catopt_discovery.evidence --report /tmp/laws.db \
+        --admit-object '<alpha_key>' --gauntlet
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import sqlite3
 import subprocess
 import sys
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from catopt_discovery import REPO_ROOT
 
@@ -614,6 +618,687 @@ def stored_certificate(record: dict, rules: Any = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
+#  The admission gauntlet — a stored object earns "usable" (ADR 0004)
+# ---------------------------------------------------------------------------
+#
+#  ``admit_object`` reconstructs a stored record into a live
+#  ``Rewrite`` — but reconstruction is not admission.  An *introduced*
+#  object (a candidate the machine synthesized) faces the same
+#  adversarial gauntlet a shipped law cleared: the numeric oracle and
+#  derivability prover (``pipeline.measure``), the view oracle's
+#  guarded-region sweep (``catopt_discovery.oracle`` — the candidate's
+#  own ``cond`` decides which bindings the equality must hold on),
+#  the typed-pay gate (every merged fire mints a well-typed member and
+#  extraction pays somewhere), closure safety, and — when the record
+#  carries a derivation — strict certificate replay.  ``run_gauntlet``
+#  is that composition; ``usable`` is ``True`` only when every stage
+#  passed.  The pipeline's ``Evidence.shippable`` verdict is *not*
+#  reused verbatim because it answers a different question — a
+#  guarded object is *conditionally* true by construction (the plain
+#  view-oracle verdict stays ``conditional``), so the truth gate here
+#  is the guarded-region sweep, not the unguarded verdict.
+
+
+@dataclass(frozen=True)
+class GauntletCorpus:
+    """The measurement context a stored object's gauntlet runs on.
+
+    The same inputs ``pipeline.run_pipeline`` assembles:
+    ``real_terms`` for match enumeration, ``probe`` (``TermCase``
+    list) for the firing / typed-pay / reach stages, ``base_rules``
+    the search rule set the derivability oracle and the reach
+    baseline use, ``census_op`` the op-tuple census, and
+    ``sink``/``cost_fn`` the lowering + pricing backend.  Inject a
+    small corpus in tests; the default is the real one
+    (:func:`default_gauntlet_corpus`).
+    """
+
+    real_terms: tuple
+    probe: tuple
+    base_rules: tuple
+    census_op: dict
+    sink: Any
+    cost_fn: Any
+
+
+def default_gauntlet_corpus() -> GauntletCorpus:
+    """Assemble the real corpus the pipeline measures against.
+
+    The heavy imports stay lazy — the verdict-report path never loads
+    catopt or torch.
+    """
+    from catopt_core.laws import ALL_RULES
+
+    from catopt_discovery import intake as li
+    from catopt_discovery import pipeline as pl
+    from catopt_discovery.census import run_census
+    from catopt_discovery.impact import (
+        _bench_cases,
+        _cost_fn,
+        model_cases,
+    )
+    from catopt_discovery.shape_proposal import _sink
+
+    census = run_census(pl._CENSUS_TOP)
+    census_op = {
+        (e["op"], tuple(e["children"])): e["count"]
+        for e in census["op_tuples"]
+    }
+    bench, _be = _bench_cases()
+    models, _me = model_cases()
+    intake = li.load_cases()
+    sink = _sink()
+    return GauntletCorpus(
+        real_terms=tuple(c.term for c in [*bench, *models, *intake]),
+        probe=tuple([*models, *li.probe_cases()]),
+        base_rules=tuple(ALL_RULES),
+        census_op=census_op,
+        sink=sink,
+        cost_fn=_cost_fn(sink),
+    )
+
+
+@dataclass(frozen=True)
+class GuardedRegion:
+    """Outcome counts over the bindings an object's guard accepts.
+
+    ``accepted`` / ``declined`` count the guard's decision;
+    ``guard_err`` counts bindings the guard raised on (a non-total
+    guard is not admissible data); the rest are the tri-state
+    evaluation outcomes over the accepted region — ``rhs_err`` is an
+    accepted binding whose instantiated RHS cannot denote, the
+    ill-typed-mint signal the typed-pay gate audits at term level.
+    """
+
+    accepted: int = 0
+    declined: int = 0
+    guard_err: int = 0
+    equal: int = 0
+    unequal: int = 0
+    rhs_err: int = 0
+    other_err: int = 0
+    witness: str = ""
+    counterexample: str = ""
+
+
+def _site_outcome(rule: Any, subst: dict, lhs_i: Any) -> str:
+    """Evaluate one bound site under *rule*'s guard; return a tag.
+
+    The guard is the rule's own ``check`` — the same environment and
+    the same predicate an e-graph firing consults.  A ``derive``
+    veto counts as ``declined`` (a firing aborts the same way); an
+    uninstantiable RHS counts as ``rhs-err``.  Otherwise the
+    instantiated pair is evaluated fp64 and the tri-state outcome —
+    ``equal`` / ``unequal`` / ``rhs-err`` / ``lhs-err`` / ``both-err``
+    / ``env-err`` — is the oracle's verdict on that binding.
+    """
+    from catopt_core.egraph.terms import _term_instantiate
+
+    from catopt_discovery import oracle as lvo
+
+    try:
+        ok = rule.check is None or bool(rule.check(subst))
+    except Exception:
+        return "guard-err"
+    inst = dict(subst)
+    if ok and rule.derive is not None:
+        try:
+            extra = rule.derive(subst)
+        except Exception:
+            extra = None
+        if extra is None:
+            ok = False
+        else:
+            inst.update(extra)
+    if not ok:
+        return "declined"
+    try:
+        rhs_i = _term_instantiate(rule.rhs, inst)
+    except Exception:
+        return "rhs-err"
+    outcome, _note = lvo.eval_instance(lhs_i, rhs_i)
+    return outcome
+
+
+def _guarded_evals(rule: Any, sites: Iterable) -> GuardedRegion:
+    """Evaluate ``lhs == rhs`` on every guarded site in *sites*.
+
+    *sites* yields ``(subst, lhs_term)`` pairs — the binding
+    environment plus the instantiated LHS — from real matches or the
+    synthesized domain.  This is the view oracle's sweep restricted
+    to the region the object's own precondition accepts: the honest
+    meaning of "the equality holds where the law can fire".
+    """
+    from catopt_core.ir import op_repr
+
+    acc = dec = gerr = eq = neq = rerr = oerr = 0
+    wit = cex = ""
+    for subst, lhs_i in sites:
+        out = _site_outcome(rule, subst, lhs_i)
+        if out == "declined":
+            dec += 1
+            continue
+        if out == "guard-err":
+            gerr += 1
+            continue
+        acc += 1
+        if out == "equal":
+            eq += 1
+            wit = wit or op_repr(lhs_i)
+        elif out == "unequal":
+            neq += 1
+            cex = cex or op_repr(lhs_i)
+        elif out == "rhs-err":
+            rerr += 1
+        else:
+            oerr += 1
+    return GuardedRegion(
+        accepted=acc,
+        declined=dec,
+        guard_err=gerr,
+        equal=eq,
+        unequal=neq,
+        rhs_err=rerr,
+        other_err=oerr,
+        witness=wit,
+        counterexample=cex,
+    )
+
+
+def _synth_parents(lhs_pat: Any, rhs_pat: Any) -> dict:
+    """Map each leaf metavar to its parent ops across both patterns."""
+    from catopt_discovery import oracle as lvo
+
+    parents: dict[str, set] = {}
+    for m, ops in lvo._parents(lhs_pat).items():
+        parents.setdefault(m, set()).update(ops)
+    for m, ops in lvo._parents(rhs_pat).items():
+        parents.setdefault(m, set()).update(ops)
+    return parents
+
+
+def _attr_merge(domains: list, attr_combo: tuple, viewed: dict) -> Any:
+    """Merge one attr combination into *viewed*; ``None`` on conflict.
+
+    Shared attr metavariables across two view nodes must resolve
+    identically — a combo disagreeing with an earlier binding is not
+    a legal instantiation.
+    """
+    base = dict(viewed)
+    for (node, _opts), vals in zip(domains, attr_combo, strict=True):
+        for k, mv_name in node.attrs.items():
+            if not isinstance(mv_name, str):
+                continue
+            ak = f"$attr:{mv_name}"
+            if ak in base and base[ak] != vals.get(k):
+                return None
+            if k in vals:
+                base[ak] = vals[k]
+    return base
+
+
+def _lhs_out_shapes(lhs_views: list, base: dict) -> list:
+    """Return the instantiated LHS view nodes' output shapes."""
+    from catopt_core.egraph.terms import _term_instantiate
+
+    from catopt_discovery import oracle as lvo
+
+    out: list = []
+    for n in lhs_views:
+        try:
+            s = lvo._operand_shape(_term_instantiate(n, base))
+        except Exception:
+            continue
+        if s:
+            out.append(s)
+    return out
+
+
+def _free_metavars(lhs_pat: Any, rhs_pat: Any) -> list:
+    """Return the leaf metavars not sitting under a view op."""
+    from catopt_discovery import oracle as lvo
+
+    mvs = sorted(
+        set(lvo._leaf_metavars(lhs_pat))
+        | set(lvo._leaf_metavars(rhs_pat))
+    )
+    parents = _synth_parents(lhs_pat, rhs_pat)
+    return [
+        m for m in mvs if not (parents.get(m, set()) & lvo._VIEWISH)
+    ]
+
+
+def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
+    """Yield ``(base, viewed_shapes, out_shapes)`` per viewed combo.
+
+    The outer half of the oracle's enumeration: every leaf-metavar
+    binding under a view op, merged with each shape-valid attribute
+    assignment.  *viewed_shapes* / *out_shapes* are the operand and
+    LHS-view output shapes the free operand's bank derives from.
+    """
+    from catopt_discovery import oracle as lvo
+
+    mvs = sorted(
+        set(lvo._leaf_metavars(lhs_pat))
+        | set(lvo._leaf_metavars(rhs_pat))
+    )
+    parents = _synth_parents(lhs_pat, rhs_pat)
+    nodes = lvo._view_nodes([lhs_pat, rhs_pat])
+    lhs_views = [n for n in lvo._view_nodes([lhs_pat]) if n.args]
+    for viewed in lvo._viewed_bindings(mvs, parents):
+        domains = lvo._attr_domains(nodes, viewed)
+        if domains is None:
+            continue
+        for combo in itertools.product(*[d[1] for d in domains]):
+            base = _attr_merge(domains, combo, viewed)
+            if base is None:
+                continue
+            yield (
+                base,
+                [lvo._operand_shape(t) for t in viewed.values()],
+                _lhs_out_shapes(lhs_views, base),
+            )
+
+
+def _inst_pair(lhs_pat: Any, rhs_pat: Any, bound: dict) -> Any:
+    """Instantiate both pattern sides under *bound*; ``None`` on failure."""
+    from catopt_core.egraph.terms import _term_instantiate
+
+    try:
+        return (
+            _term_instantiate(lhs_pat, bound),
+            _term_instantiate(rhs_pat, bound),
+        )
+    except Exception:
+        return None
+
+
+def _synth_sites(lhs_pat: Any, rhs_pat: Any, *, limit: int) -> Iterable:
+    """Yield ``(bound, lhs_term)`` over the view oracle's domain.
+
+    Mirrors ``oracle.synthesize``'s enumeration — the same leaf
+    binding banks, the same shape-valid attr domains — but yields the
+    *binding environment* so the object's own guard, not the oracle,
+    decides which region the equality must hold on.  ``oracle`` is a
+    read-only sibling: this is its enumeration with the evaluation
+    step replaced by a yield.  Instantiated ``(lhs, rhs)`` pairs are
+    deduped so each evaluable site is counted once.
+    """
+    from catopt_discovery import oracle as lvo
+
+    free = _free_metavars(lhs_pat, rhs_pat)
+    seen: set = set()
+    for base, u_shapes, out_shapes in _synth_bases(lhs_pat, rhs_pat):
+        derived = lvo._derived_free_shapes(u_shapes, out_shapes)
+        lists = [lvo._leaf_bindings(m, set(), derived) for m in free]
+        for fcombo in itertools.product(*lists):
+            full = {**base, **dict(zip(free, fcombo, strict=True))}
+            pair = _inst_pair(lhs_pat, rhs_pat, full)
+            if pair is None or pair in seen:
+                continue
+            seen.add(pair)
+            yield full, pair[0]
+            if len(seen) >= limit:
+                return
+
+
+def _region_ok(region: GuardedRegion, *, need_equal: bool) -> bool:
+    """Whether a guarded region supports the declared equality.
+
+    The region must be contradiction-free — no ``unequal`` instance,
+    no accepted binding whose RHS fails to denote, no guard error —
+    and, where *need_equal* holds, must exhibit at least one equal
+    instance (a guard that accepts nothing provable is vacuous, not
+    verified).
+    """
+    if region.unequal or region.rhs_err or region.guard_err:
+        return False
+    return not need_equal or region.equal >= 1
+
+
+@dataclass(frozen=True)
+class GauntletStage:
+    """One gate's verdict: the stage name, pass/fail, evidence line."""
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+@dataclass
+class Gauntlet:
+    """The adversarial admission verdict for one stored object.
+
+    ``stages`` is the ordered gate list — the object's honest record
+    of where it stood.  ``usable`` is ``True`` only when every stage
+    passed: the store never reports a synthesized object as usable on
+    the strength of reconstruction alone.  ``rule`` / ``record`` are
+    the live ``Rewrite`` and the parsed object record (when stage 1
+    cleared); ``evidence`` is the pipeline's measured ``Evidence``
+    row; ``synth_region`` / ``real_region`` are the guarded-region
+    sweeps for ``cond``-carrying objects.
+    """
+
+    alpha_key: str
+    name: str = ""
+    kind: str = ""
+    usable: bool = False
+    stages: tuple[GauntletStage, ...] = ()
+    rule: Any = None
+    record: dict | None = None
+    evidence: Any = None
+    synth_region: GuardedRegion | None = None
+    real_region: GuardedRegion | None = None
+
+    @property
+    def reason(self) -> str:
+        """Return the first failing stage, or the cleared verdict."""
+        for s in self.stages:
+            if not s.passed:
+                return f"{s.name}: {s.detail}"
+        return "cleared" if self.stages else "no stages ran"
+
+
+def _truth_detail(evd: Any) -> str:
+    """Render the measured truth evidence for the gauntlet report."""
+    parts = [f"numeric={evd.num_true}", f"derivable={evd.derivable}"]
+    if evd.view_verdict:
+        parts.append(f"view={evd.view_verdict} ({evd.view_note})")
+    return " ".join(parts)
+
+
+def _region_detail(synth: GuardedRegion, real: GuardedRegion) -> str:
+    """Render the guarded-region sweeps for the gauntlet report."""
+    out: list[str] = []
+    for label, r in (("synth", synth), ("real", real)):
+        out.append(
+            f"{label}: {r.equal}eq/{r.unequal}ne/{r.rhs_err}rerr "
+            f"({r.accepted} accepted, {r.declined} declined"
+            + (f", {r.guard_err} guard-err" if r.guard_err else "")
+            + ")"
+        )
+    return " | ".join(out)
+
+
+def _guarded_truth(
+    rule: Any, corpus: GauntletCorpus, limit: int
+) -> Any:
+    """Sweep the guard-accepted region of *rule*'s domain.
+
+    Returns ``(synth_region, real_region)``: the synthesized domain
+    (the oracle's binding banks) filtered by the rule's own ``check``,
+    and every real corpus match filtered the same way.  The truth
+    question for a guarded object is "equal wherever the rule can
+    fire" — this pair answers it on both domains.
+    """
+    from catopt_core.egraph.terms import _term_match
+
+    from catopt_discovery.shape_proposal import Schema, real_matches
+
+    schema = Schema(rule.name, rule.lhs, rule.rhs)
+    matches = real_matches(list(corpus.real_terms), schema)
+    real = _guarded_evals(
+        rule,
+        (
+            (s, m)
+            for m in matches
+            if (s := _term_match(rule.lhs, m)) is not None
+        ),
+    )
+    synth = _guarded_evals(
+        rule, _synth_sites(rule.lhs, rule.rhs, limit=limit)
+    )
+    return synth, real
+
+
+def _gate(rep: Gauntlet, name: str, ok: bool, detail: str = "") -> bool:
+    """Append one stage verdict to *rep*; return whether it passed."""
+    rep.stages = (*rep.stages, GauntletStage(name, bool(ok), detail))
+    return ok
+
+
+def _finish(rep: Gauntlet) -> Gauntlet:
+    """Seal the report: ``usable`` iff every recorded stage passed."""
+    rep.usable = bool(rep.stages) and all(s.passed for s in rep.stages)
+    return rep
+
+
+def _reconstruct_gate(
+    conn: sqlite3.Connection, rep: Gauntlet
+) -> tuple[Any, dict] | None:
+    """Stages 1-2: the record must rebuild, and rebuild *fully*.
+
+    An unknown kind or a missing row is a reconstruction failure; a
+    record that dropped hooks admits a weaker rule than it declares —
+    the full-data gate refuses to call that usable.  Returns
+    ``(rule, record)`` on success, ``None`` after a failed gate.
+    """
+    try:
+        got = admit_object(conn, rep.alpha_key)
+    except ValueError as exc:
+        _gate(rep, "reconstruct", False, str(exc))
+        return None
+    if got is None:
+        _gate(rep, "reconstruct", False, "no object under this key")
+        return None
+    rule, record = got
+    rep.rule, rep.record = rule, record
+    rep.name, rep.kind = rule.name, record["kind"]
+    _gate(rep, "reconstruct", True, f"{record['kind']} rebuilds")
+    missing = list(record["missing_hooks"])
+    ok = _gate(
+        rep,
+        "full-data",
+        not missing,
+        "the record carries every hook"
+        if not missing
+        else "dropped hooks: " + ", ".join(missing),
+    )
+    return (rule, record) if ok else None
+
+
+def _measure_gate(
+    rep: Gauntlet,
+    rule: Any,
+    record: dict,
+    corpus: GauntletCorpus,
+    synth_limit: int | None,
+) -> bool:
+    """Stages 3-4: ``pipeline.measure`` on the rebuilt rule, then truth.
+
+    The rebuilt rule's ``check``/``derive`` hooks ride along on the
+    ``Proposal``, so every stage measure runs — the numeric oracle,
+    derivability, the raw view-oracle verdict, the firing probe and
+    the typedness audit — sees the *guarded* rule, not the bare
+    pattern.  Truth for a guarded object lives in the region its
+    ``cond`` accepts (:func:`_guarded_truth`); the raw view verdict
+    stays ``conditional`` there by construction, so it is reported
+    but the sweep is the gate.
+    """
+    from catopt_discovery import pipeline as pl
+    from catopt_discovery import proposal as lp
+
+    prop = pl.Proposal(
+        name=rule.name,
+        lhs=rule.lhs,
+        rhs=rule.rhs,
+        family=f"object:{record['kind']}",
+        check=rule.check,
+        derive=rule.derive,
+    )
+    lib = [lp._key(r.lhs, r.rhs) for r in corpus.base_rules]
+    try:
+        evd = pl.measure(
+            prop,
+            list(corpus.real_terms),
+            list(corpus.probe),
+            list(corpus.base_rules),
+            lib,
+            corpus.census_op,
+            corpus.sink,
+            corpus.cost_fn,
+        )
+    except Exception as exc:
+        _gate(rep, "measure", False, f"{type(exc).__name__}: {exc}")
+        return False
+    rep.evidence = evd
+    _gate(
+        rep,
+        "measure",
+        True,
+        f"matches={evd.matches} census={evd.census_sites}",
+    )
+    return _truth_gate(rep, rule, corpus, synth_limit)
+
+
+def _truth_gate(
+    rep: Gauntlet,
+    rule: Any,
+    corpus: GauntletCorpus,
+    synth_limit: int | None,
+) -> bool:
+    """Stage 4: the declared equality must hold where the rule fires."""
+    from catopt_discovery import oracle as lvo
+
+    evd = rep.evidence
+    if rule.cond is None and rule.check is None:
+        return _gate(
+            rep,
+            "truth",
+            evd.derivable or evd.num_true is True,
+            _truth_detail(evd),
+        )
+    limit = (
+        synth_limit if synth_limit is not None else lvo._MAX_INSTANCES
+    )
+    rep.synth_region, rep.real_region = _guarded_truth(
+        rule, corpus, limit
+    )
+    ok = evd.derivable or (
+        _region_ok(rep.synth_region, need_equal=True)
+        and _region_ok(rep.real_region, need_equal=False)
+    )
+    return _gate(
+        rep,
+        "truth",
+        ok,
+        _truth_detail(evd)
+        + " | guarded: "
+        + _region_detail(rep.synth_region, rep.real_region),
+    )
+
+
+def _typed_pay_gate(rep: Gauntlet) -> bool:
+    """Stage 6: fires, all well-typed, pays, lowered modules agree."""
+    evd = rep.evidence
+    return _gate(
+        rep,
+        "typed-pay",
+        evd.fires > 0
+        and evd.fires_ill_typed == 0
+        and evd.paid > 0
+        and evd.verify_fail == 0,
+        f"fires={evd.fires} typed={evd.fires_typed} "
+        f"ill={evd.fires_ill_typed} paid={evd.paid} "
+        f"verify_fail={evd.verify_fail}",
+    )
+
+
+def _closure_gate(rep: Gauntlet) -> bool:
+    """Stage 7: bounded closure and no object-attributable cert break.
+
+    ``evd.cert_fail`` counts every ``add_cert`` failure over the probe
+    corpus — including cases the object never fired on and whose
+    *base* replay already fails (an ambient corpus instability).  The
+    gate the honest contract asks is narrower: failures *attributable*
+    to the object — a case whose baseline certificate replayed but
+    whose with-rule one did not.  Ambient failures are reported, not
+    charged.
+    """
+    evd = rep.evidence
+    cert_att = sum(
+        1
+        for r in evd.reach
+        if r["add_cert"] != "pass" and r["base_cert"] == "pass"
+    )
+    return _gate(
+        rep,
+        "closure",
+        cert_att == 0 and evd.reach_ill == 0 and evd.closure_safe,
+        f"enode={evd.closure_ratio:.2f}x cert_fail={cert_att} "
+        f"(ambient={evd.cert_fail - cert_att}) "
+        f"reach_ill={evd.reach_ill}",
+    )
+
+
+def _cert_gate(rep: Gauntlet, record: dict) -> bool:
+    """Stage 8: a record carrying a derivation replays it strictly."""
+    try:
+        cert = stored_certificate(record)
+    except Exception as exc:
+        return _gate(rep, "cert", False, f"strict replay failed: {exc}")
+    return _gate(
+        rep,
+        "cert",
+        True,
+        "no derivation recorded"
+        if cert is None
+        else f"{cert.n_steps}-step cert replays strict",
+    )
+
+
+def run_gauntlet(
+    conn: sqlite3.Connection,
+    alpha_key: str,
+    *,
+    corpus: GauntletCorpus | None = None,
+    synth_limit: int | None = None,
+) -> Gauntlet:
+    """Run the admission gauntlet on a stored declared object.
+
+    The same gates a shipped law cleared, in the ADR's order:
+    reconstruct the record → require full data → measure (numeric
+    oracle, derivability, the view oracle's raw verdict) → truth
+    (unguarded: the measured verdict; guarded: the guarded-region
+    sweep — every accepted evaluable binding must be equal, and at
+    least one must exist) → novelty (the object is not a library
+    spelling) → typed-pay (fires, all well-typed, pays, lowerings
+    agree) → closure (no enode blow-up, in-graph certs replay) → the
+    stored derivation cert replays strict when present.  A failing
+    gate stops the run — later stages are not reached, not skipped.
+
+    *corpus* defaults to the pipeline's real corpus
+    (:func:`default_gauntlet_corpus`); tests inject a small one.
+    ``usable`` is ``True`` only when every stage passed — the honest
+    contract: the store refuses to call a synthesized object usable
+    on reconstruction alone.
+    """
+    rep = Gauntlet(alpha_key=alpha_key)
+    got = _reconstruct_gate(conn, rep)
+    if got is None:
+        return _finish(rep)
+    rule, record = got
+    if corpus is None:
+        corpus = default_gauntlet_corpus()
+    if not _measure_gate(rep, rule, record, corpus, synth_limit):
+        return _finish(rep)
+    # 5 — novelty: a stored object duplicating a library spelling is
+    # not a new inhabitant.
+    evd = rep.evidence
+    if not _gate(
+        rep,
+        "novelty",
+        evd.relation == "new",
+        f"relation={evd.relation}",
+    ):
+        return _finish(rep)
+    if not _typed_pay_gate(rep) or not _closure_gate(rep):
+        return _finish(rep)
+    _cert_gate(rep, record)
+    return _finish(rep)
+
+
+# ---------------------------------------------------------------------------
 #  Reporting — the history a /tmp JSON dump could never answer
 # ---------------------------------------------------------------------------
 
@@ -775,9 +1460,8 @@ def _store_object_cli(
         print(f"no shipped law named {name!r}")
         return 1
     key = store_object(conn, rule, kind=kind)
-    record = stored_object(conn, key)
-    if record is None:  # unreachable — the row was just written
-        return 1
+    # the row was just written — the read-back cannot be empty
+    record = cast(dict, stored_object(conn, key))
     state = (
         "full-data"
         if record["serializable"]
@@ -797,8 +1481,17 @@ def _store_object_cli(
     return 0
 
 
-def _admit_object_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
-    """Rebuild a stored object into a live ``Rewrite`` and show it."""
+def _admit_object_cli(
+    conn: sqlite3.Connection, alpha_key: str, gauntlet: bool = False
+) -> int:
+    """Rebuild a stored object into a live ``Rewrite`` and show it.
+
+    With *gauntlet* the admit runs :func:`run_gauntlet` instead —
+    the adversarial admission stages — and reports ``usable`` only
+    when every gate passed (exit 1 otherwise).
+    """
+    if gauntlet:
+        return _gauntlet_cli(conn, alpha_key)
     try:
         got = admit_object(conn, alpha_key)
     except ValueError as exc:
@@ -831,6 +1524,28 @@ def _admit_object_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
     return 0
 
 
+def _gauntlet_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
+    """Run the admission gauntlet on a stored object; report usable."""
+    rep = run_gauntlet(conn, alpha_key)
+    if rep.rule is None or rep.record is None:
+        print(f"cannot admit object under {alpha_key}: {rep.reason}")
+        return 1
+    state = (
+        "full-data"
+        if rep.record["serializable"]
+        else "missing hooks: " + ", ".join(rep.record["missing_hooks"])
+    )
+    print(f"admitted {rep.name}  [{state}]")
+    print(f"  kind: {rep.kind}")
+    print(f"  {rep.rule!r}")
+    print("-- admission gauntlet --")
+    for s in rep.stages:
+        mark = "pass" if s.passed else "FAIL"
+        print(f"  [{mark}] {s.name}: {s.detail}")
+    print(f"  usable: {'yes' if rep.usable else 'no'} — {rep.reason}")
+    return 0 if rep.usable else 1
+
+
 #: The ``--kind`` choices the CLI accepts — mirrors
 #: ``laws.serialize.OBJECT_KINDS``, kept literal so the report path
 #: stays catopt-free; ``object_to_data`` validates authoritatively.
@@ -844,16 +1559,23 @@ def _op_dispatch(
 
     ``--add-lemma`` / ``--admit`` are the law-flavoured spellings of
     ``--add-object`` / ``--admit-object`` — the general seam is the
-    object one.
+    object one.  ``--gauntlet`` modifies the admit ops only.
     """
+    if (
+        args.gauntlet
+        and args.admit is None
+        and args.admit_object is None
+    ):
+        print("--gauntlet needs --admit or --admit-object")
+        return 1
     if args.add_lemma is not None:
         return _store_object_cli(conn, args.add_lemma, args.kind)
     if args.add_object is not None:
         return _store_object_cli(conn, args.add_object, args.kind)
     if args.admit is not None:
-        return _admit_object_cli(conn, args.admit)
+        return _admit_object_cli(conn, args.admit, args.gauntlet)
     if args.admit_object is not None:
-        return _admit_object_cli(conn, args.admit_object)
+        return _admit_object_cli(conn, args.admit_object, args.gauntlet)
     return None
 
 
@@ -910,6 +1632,14 @@ def main(argv: list[str] | None = None) -> int:
         default="law",
         help="declaration kind for --add-object / --add-lemma"
         " (default: law)",
+    )
+    parser.add_argument(
+        "--gauntlet",
+        action="store_true",
+        help="with --admit/--admit-object: run the admission gauntlet"
+        " (numeric oracle -> guarded-region truth -> typed-pay ->"
+        " closure -> cert replay) and report 'usable' only when every"
+        " stage passed",
     )
     args = parser.parse_args(argv)
     ops = (
