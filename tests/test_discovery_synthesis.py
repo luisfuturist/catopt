@@ -12,9 +12,10 @@ constructed objects the gates refuse.
 """
 
 import torch
-from catopt_core.egraph import EGraph
+from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import Const, Op, TensorType, Var
-from catopt_core.laws import ALL_RULES
+from catopt_core.laws import ALL_RULES, serialize
+from catopt_core.laws.cond import eval_cond
 from catopt_core.typing import _shape_of
 from catopt_discovery import evidence as ev
 from catopt_discovery import object_synthesis as synth
@@ -837,33 +838,302 @@ def test_affd_scan2_fires_and_behaves(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-#  Honest negatives — construction depth does not buy admission
+#  Guard transport — composing premises whose guard needs real shapes
 # ---------------------------------------------------------------------------
 
 
-def test_guarded_carrier_premise_declines_symbolic_compose():
-    """``compose(om_lift, om_split)``: ``om_split``'s shape-derived
-    guard cannot evaluate on metavar terms — the operation declines
-    (``None``), the documented guarded-compose limit."""
-    from catopt_carriers.om import OM_LAWS
-
-    om_lift = synth.lift_object(
+def _om_lift_object() -> synth.ConstructedObject:
+    """The online-softmax lift, declared as data (see the lift section)."""
+    return synth.lift_object(
         "om_lift",
         ("matmul", ("softmax", "S", {"dim": -1}), "V"),
         ("om_elem", "S", "V"),
         "om_apply",
     )
+
+
+def _om_chunk2() -> synth.ConstructedObject:
+    """``compose(om_lift, om_split)`` — the two-block chunked attention.
+
+    ``om_split``'s guard reads *real shapes* (the concat dims must name
+    the key axes, the chunk shapes must align) and cannot evaluate on the
+    symbolic binding — the composition used to decline (``None``).  Guard
+    transport fires the premise structurally and carries its ``check``
+    into the composite, so the composite is admissible exactly where
+    ``om_split`` would have fired.
+    """
+    from catopt_carriers.om import OM_LAWS
+
     om_split = next(r for r in OM_LAWS if r.name == "om_split")
     obj = synth.compose_objects(
         "om_chunk2",
-        om_lift,
+        _om_lift_object(),
         om_split,
         specialize={
             "S": ("concat", "s1", "s2", {"dim": "SD"}),
             "V": ("concat", "v1", "v2", {"dim": "VD"}),
         },
     )
-    assert obj is None
+    assert obj is not None
+    return obj
+
+
+def test_guarded_carrier_premise_composes_via_transport():
+    """``compose(om_lift, om_split)`` builds now: the shape-reading
+    premise guard is *transported* rather than declining the composite."""
+    obj = _om_chunk2()
+    assert obj.construction == ("compose", "om_lift", "om_split")
+    assert obj.rule.lhs == _p(
+        "matmul",
+        _p("softmax", _p("concat", "s1", "s2", dim="SD"), dim=-1),
+        _p("concat", "v1", "v2", dim="VD"),
+    )
+    assert obj.rule.rhs == _p(
+        "om_apply",
+        _p(
+            "om_compose",
+            _p("om_elem", "s1", "v1"),
+            _p("om_elem", "s2", "v2"),
+        ),
+    )
+    # ``om_split``'s guard is code (not a declarative cond), so the
+    # composite carries it as its fire-time check — and the store reports
+    # the honest boundary: the record cannot carry it.
+    assert obj.rule.check is not None
+    assert serialize.missing_hooks(obj.rule) == ("check",)
+
+
+def test_transported_guard_fires_exactly_where_the_premise_does():
+    """The composite's transported check IS ``om_split``'s guard
+    re-evaluated on the premise's own binding: aligned chunk pairs are
+    accepted, mis-aligned ones declined."""
+    rule = _om_chunk2().rule
+    good = {
+        "s1": _v("s1", 5, 3),
+        "s2": _v("s2", 5, 4),
+        "v1": _v("v1", 3, 6),
+        "v2": _v("v2", 4, 6),
+        "$attr:SD": -1,
+        "$attr:VD": -2,
+    }
+    assert rule.check(good) is True
+    # scores concat on the row axis — om_split's last-dim condition fails.
+    assert rule.check(dict(good, **{"$attr:SD": 0})) is False
+    # v2's key dim (9) no longer contracts with s2's (4).
+    assert rule.check(dict(good, **{"v2": _v("v2", 9, 6)})) is False
+
+
+def test_first_premise_guard_is_transported():
+    """A first premise whose own guard is *code* (``om_lift``'s
+    ``_check_om_lift`` — softmax over the key axis) rides the composite as
+    a procedural step when the caller declares no ``cond``: the composite
+    fires only where the head premise would."""
+    from catopt_carriers.om import OM_LAWS
+
+    by_name = {r.name: r for r in OM_LAWS}
+    obj = synth.compose_objects(
+        "om_lift_unlift", by_name["om_lift"], by_name["om_unlift"]
+    )
+    assert obj is not None
+    rule = obj.rule
+    assert rule.rhs == _p("matmul", _p("softmax", "s", dim=-1), "v")
+    assert serialize.missing_hooks(rule) == ("check",)
+    good = {"s": _v("s", 4, 4), "v": _v("v", 4, 6), "$attr:SD": -1}
+    assert rule.check(good) is True
+    # softmax over dim 0 — om_lift's last-axis condition fails.
+    assert rule.check(dict(good, **{"$attr:SD": 0})) is False
+
+
+def test_structural_fire_runs_derive_and_declines_uninstantiable():
+    """The structural path runs a premise's ``derive`` (its RHS attributes
+    must instantiate) and declines — as ``None`` — when the RHS cannot
+    denote: a derive that vetoes, an attr metavar no derive supplies, and
+    a rewrite that leaves the term unchanged."""
+    first = Rewrite(
+        "t_wrap", _p("wrap", "u"), _p("add", _p("frob", "u"), "u")
+    )
+    derived = Rewrite(
+        "t_frob_derive",
+        _p("frob", "u"),
+        _p("frob", "u", dim="D"),
+        # undecidable on the symbolic binding (u is a metavar string),
+        # true once u is a concrete term — the structural path's premise.
+        check=lambda b: isinstance(b.get("u"), Var),
+        derive=lambda _b: {"$attr:D": 0},
+    )
+    obj = synth.compose_objects("t_wrap_frob", first, derived)
+    assert obj is not None
+    assert obj.rule.rhs == _p("add", _p("frob", "u", dim=0), "u")
+    assert serialize.missing_hooks(obj.rule) == ("check",)
+    assert obj.rule.check({"u": _v("u", 4, 4)}) is True
+
+    # a derive that vetoes on the symbolic binding — the RHS cannot
+    # instantiate, so the composition declines.
+    veto = Rewrite(
+        "t_frob_veto",
+        _p("frob", "u"),
+        _p("frob", "u", dim="D"),
+        derive=lambda _b: None,
+    )
+    assert synth.compose_objects("t_wrap_veto", first, veto) is None
+
+    # a derive that raises on the symbolic binding — a veto too, never
+    # propagated.
+    def _raise(_bound):
+        raise ValueError("derive boom")
+
+    raising = Rewrite(
+        "t_frob_raise",
+        _p("frob", "u"),
+        _p("frob", "u", dim="D"),
+        derive=_raise,
+    )
+    assert synth.compose_objects("t_wrap_raise", first, raising) is None
+
+    # an RHS attr metavar no derive supplies: uninstantiable — declined.
+    unbound = Rewrite(
+        "t_frob_unbound", _p("frob", "u"), _p("frob", "u", dim="D")
+    )
+    assert (
+        synth.compose_objects("t_wrap_unbound", first, unbound) is None
+    )
+
+    # a no-op rewrite: the structural match changes nothing — declined.
+    noop = Rewrite("t_frob_noop", _p("frob", "u"), _p("frob", "u"))
+    assert synth.compose_objects("t_wrap_noop", first, noop) is None
+
+
+def test_transported_recheck_declines_when_the_guard_raises():
+    """A transported guard that raises on the composite's concrete binding
+    declines — a firing abort, never a crash — so the composite is
+    vacuous there."""
+    first = Rewrite(
+        "t_wrap2", _p("wrap", "u"), _p("add", _p("frob", "u"), "u")
+    )
+
+    def _boom(_bound):
+        raise ValueError("boom")
+
+    bad = Rewrite(
+        "t_frob_boom",
+        _p("frob", "u"),
+        _p("frob", "u", dim="D"),
+        check=_boom,
+        derive=lambda _b: {"$attr:D": 0},
+    )
+    obj = synth.compose_objects("t_wrap_boom", first, bad)
+    assert obj is not None
+    assert obj.rule.check({"u": _v("u", 4, 4)}) is False
+
+
+def test_om_chunk2_gauntlet_refuses_the_procedural_guard(tmp_path):
+    """The composite is a *claim*: the gauntlet refuses it at full-data —
+    the transported guard is code the record cannot carry.  Building is
+    unblocked; admission is not bought."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = synth.store_constructed(conn, _om_chunk2())
+    record = ev.stored_object(conn, key)
+    assert record["serializable"] is False
+    assert record["missing_hooks"] == ["check"]
+    s1, s2 = _v("s1", 5, 3), _v("s2", 5, 4)
+    v1, v2 = _v("v1", 3, 6), _v("v2", 4, 6)
+    term = _p(
+        "matmul",
+        _p("softmax", _p("concat", s1, s2, dim=-1), dim=-1),
+        _p("concat", v1, v2, dim=-2),
+    )
+    rep = ev.run_gauntlet(
+        conn, key, corpus=_corpus(_case("chunk2", term, s1, s2, v1, v2))
+    )
+    conn.close()
+    assert not rep.usable
+    assert rep.reason.startswith("full-data:")
+    assert _stages(rep)["full-data"].detail == "dropped hooks: check"
+
+
+def _channel_then_row() -> synth.ConstructedObject:
+    """``compose(linear_channel_scale_rev, linear_row_scale)``.
+
+    Both premises carry *declarative* rank/shape guards that decline on
+    the symbolic binding (``rank`` needs a shape); transport folds them
+    into the composite's ``cond`` — pure data, so the composite stays
+    serializable.  The first premise's guard (channel scale on ``W``/
+    ``c``) rides the composite's LHS; the fired premise's row-scale guard
+    (on ``c``) is renamed onto the composite's metavariable.
+    """
+    obj = synth.compose_objects(
+        "channel_then_row_scale",
+        _BY_NAME["linear_channel_scale_rev"],
+        _BY_NAME["linear_row_scale"],
+    )
+    assert obj is not None
+    return obj
+
+
+def test_declarative_guards_transport_as_cond_clauses():
+    """Both premises' declarative guards ride the composite's ``cond``
+    (renamed onto the composite's metavariables) — the composite is pure
+    data, no procedural remainder."""
+    obj = _channel_then_row()
+    assert obj.rule.lhs == _p("linear", "x", _p("mul", "W", "c"))
+    assert obj.rule.rhs == _p("mul", _p("linear", "x", "W"), "c")
+    assert obj.rule.cond is not None
+    assert serialize.missing_hooks(obj.rule) == ()
+    good = {"x": _v("x", 2, 4), "W": _v("W", 3, 4), "c": Const(2.0)}
+    assert eval_cond(obj.rule.cond, good)
+    # c=(3,) is neither scalar nor last-dim-1 → the row guard declines.
+    assert not eval_cond(obj.rule.cond, dict(good, c=_v("c", 3)))
+
+
+def test_declarative_transport_clears_the_gauntlet(tmp_path):
+    """A declaratively transported composite is *admissible*: both guards
+    are data, the guarded region verifies and the object pays."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = synth.store_constructed(conn, _channel_then_row())
+    x, w = _v("x", 2, 4), _v("W", 3, 4)
+    term = _p("linear", x, _p("mul", w, Const(2.0)))
+    rep = ev.run_gauntlet(
+        conn, key, corpus=_corpus(_case("chrev", term, x, w))
+    )
+    conn.close()
+    assert rep.usable, rep.reason
+    assert rep.evidence.paid >= 1
+    assert rep.synth_region.rhs_err == 0
+
+
+def test_transport_inherits_the_premise_blind_spot():
+    """Transport is faithful: the composite's guard IS the premises'
+    conjunction, so it inherits their blind spots rather than adding new
+    ones.  ``linear_row_scale`` accepts a rank-1 degenerate weight where
+    the law mis-evaluates; the composite's one unequal synth site is
+    exactly that premise's own site."""
+    from catopt_core.egraph.terms import _term_instantiate
+
+    rule = _channel_then_row().rule
+    uneq = [
+        subst
+        for subst, lhs_i in ev._synth_sites(
+            rule.lhs, rule.rhs, limit=400
+        )
+        if ev._site_outcome(rule, subst, lhs_i) == "unequal"
+    ]
+    assert uneq, "expected the inherited blind-spot site"
+    row = _BY_NAME["linear_row_scale"]
+    for subst in uneq:
+        # the same binding as linear_row_scale's own (x, W, r := c)
+        psubst = {"x": subst["x"], "W": subst["W"], "r": subst["c"]}
+        assert row.check(psubst)
+        assert (
+            ev._site_outcome(
+                row, psubst, _term_instantiate(row.lhs, psubst)
+            )
+            == "unequal"
+        )
+
+
+# ---------------------------------------------------------------------------
+#  Honest negatives — construction depth does not buy admission
+# ---------------------------------------------------------------------------
 
 
 def test_guarded_attr_metavar_object_clears_the_gauntlet(tmp_path):

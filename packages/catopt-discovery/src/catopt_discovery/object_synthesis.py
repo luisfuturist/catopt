@@ -51,11 +51,21 @@ from dataclasses import dataclass
 from typing import Any
 
 from catopt_core.egraph import Certificate, Rewrite
-from catopt_core.egraph.terms import _term_instantiate, _term_match
+from catopt_core.egraph.terms import (
+    _replace_subterm,
+    _term_instantiate,
+    _term_match,
+)
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags as _tags
 from catopt_core.laws.cond import eval_cond
-from catopt_core.meta import _positions, apply_rewrite_at
+from catopt_core.meta import (
+    _positions,
+    _subterm,
+    apply_rewrite_at,
+    instantiate_pattern,
+    match_pattern,
+)
 
 __all__ = [
     "AutoCond",
@@ -241,6 +251,192 @@ def _as_rule(obj: Any) -> Rewrite:
     return obj.rule if isinstance(obj, ConstructedObject) else obj
 
 
+# ---------------------------------------------------------------------------
+#  Guard transport — composing premises whose guard needs real shapes
+# ---------------------------------------------------------------------------
+#
+#  A premise fires decidable (``apply_rewrite_at``) only when its guard
+#  evaluates on the symbolic binding.  A guard that reads real extents —
+#  ``om_split``'s ``_check_om_concat_dims`` asks the concat dims to name
+#  the right axes and the chunk shapes to align — declines there: the
+#  metavariables are leaves, not shaped tensors, so the predicate is
+#  undecidable, not false.  The composition used to abort (``None``).
+#
+#  The honest fix is *guard transport*: fire the premise structurally
+#  (its LHS alone) and carry its guard into the composite, so the
+#  composite is admissible exactly where every premise it rewrote would
+#  have fired.  Two flavours, chosen by what the premise's guard is:
+#
+#  * **declarative** — a purely declarative ``cond`` is re-expressed
+#    (metavariable references renamed) and folded into the composite's
+#    own ``cond``.  The composite stays pure data (serializable), so the
+#    gauntlet's guarded-region sweep can rule on it.
+#  * **procedural** — a ``check``/``derive`` with a code remainder is
+#    re-run at fire time on the premise's own binding (the intermediate
+#    re-instantiated from the composite's binding).  The composite is
+#    sound but non-serializable: the store flags ``missing_hooks``
+#    honestly and the gauntlet's full-data gate refuses it — construction
+#    is a claim, and a claim data cannot carry is refused as such.
+
+
+def _structural_fire(rule: Rewrite, term: Any) -> tuple | None:
+    """First position where *rule*'s LHS matches *term*, guard ignored.
+
+    The decidable path (:func:`catopt_core.meta.apply_rewrite_at`)
+    evaluates the premise's guard on the symbolic binding; a guard that
+    needs real shapes declines there.  This retries the *structural*
+    match — the LHS alone — and returns ``(path, rewritten, match)`` so
+    the caller can transport the premise's guard into the composite.
+    The premise's ``derive`` still runs (its RHS attributes must
+    instantiate); a ``derive`` that cannot evaluate on the symbolic
+    binding declines — a composite whose RHS needs instance-computed
+    attributes is not constructible at pattern level, honestly.
+    """
+    for path, sub in _positions(term):
+        subst = match_pattern(rule.lhs, sub, {})
+        if subst is None:
+            continue
+        inst = dict(subst)
+        if rule.derive is not None:
+            try:
+                extra = rule.derive(subst)
+            except Exception:
+                extra = None
+            if extra is None:
+                continue
+            inst = {**subst, **extra}
+        try:
+            rhs = instantiate_pattern(rule.rhs, inst)
+        except KeyError:
+            continue
+        nxt = _replace_subterm(term, path, rhs)
+        if nxt != term:
+            return path, nxt, subst
+    return None
+
+
+def _rename_cond(node: Any, rename: dict[str, str]) -> Any:
+    """Rename metavariable references inside a declarative cond tree."""
+    if isinstance(node, str):
+        return rename.get(node, node)
+    if isinstance(node, (tuple, list)):
+        return tuple(_rename_cond(x, rename) for x in node)
+    return node
+
+
+def _declarative_clause(rule: Rewrite, match: dict) -> Any:
+    """Re-express *rule*'s declarative guard over the composite's metavars.
+
+    Returns the premise's ``cond`` with its metavariable references
+    renamed to the composite's, or ``None`` when the guard is not purely
+    declarative (a procedural ``check`` remainder) or binds a
+    metavariable to a compound subterm — a cond atom addresses
+    metavariables by name, so a compound binding is un-expressible as a
+    clause and must ride the procedural path.
+    """
+    from catopt_core.laws.serialize import _proc_check
+
+    if rule.cond is None or _proc_check(rule):
+        return None
+    rename: dict[str, str] = {}
+    for k, v in match.items():
+        if not isinstance(v, str):
+            return None
+        rename[k[len("$attr:") :] if k.startswith("$attr:") else k] = v
+    return _rename_cond(rule.cond, rename)
+
+
+def _guard_transport(steps: list) -> Any:
+    """Build the composite's fire-time check from transported premises.
+
+    *steps* is ``(rule, mid_pattern, path)`` per premise fired
+    structurally — *mid_pattern* the intermediate term (over the
+    composite's metavariables) the premise fired into, *path* the
+    position inside it.  On a composite firing the intermediate is
+    re-instantiated from the binding and the premise's own ``check``
+    re-run on ITS binding (the check sees only the LHS binding, never
+    the premise's ``derive`` output — the ``apply_rewrite_at`` order),
+    so the composite is admissible exactly where every transported
+    premise is.  Total — an un-evaluable re-check declines, never
+    raises (the ``apply_rewrite_at`` convention).
+    """
+
+    def check(bound: dict) -> bool:
+        for rule, mid, path in steps:
+            try:
+                term = instantiate_pattern(mid, bound)
+                m = match_pattern(rule.lhs, _subterm(term, path), {})
+                if rule.check is not None and not rule.check(m):
+                    return False
+            except Exception:
+                return False
+        return True
+
+    return check
+
+
+def _fold_and(clauses: list) -> Any:
+    """Fold guard clauses into one declarative cond datum (or ``None``)."""
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return ("and", *clauses)
+
+
+def _fire_premise(rule: Rewrite, cur: Any) -> tuple | None:
+    """Fire *rule* on *cur*, decidable first then structurally.
+
+    Returns ``(rewritten, clause, step)`` — the rewritten term, the
+    declarative guard clause to fold into the composite's ``cond`` (or
+    ``None``), and the procedural ``(rule, mid, path)`` re-check step (or
+    ``None``) — or ``None`` when the premise's LHS matches nowhere.  A
+    decidable firing transports nothing (its guard held on the symbolic
+    binding); a structural firing transports the guard.
+    """
+    for path, _sub in _positions(cur):
+        nxt = apply_rewrite_at(rule, cur, path)
+        if nxt is not None and nxt != cur:
+            return nxt, None, None
+    fired = _structural_fire(rule, cur)
+    if fired is None:
+        return None
+    path, nxt, match = fired
+    clause = _declarative_clause(rule, match)
+    if clause is not None:
+        return nxt, clause, None
+    return nxt, None, (rule, cur, path)
+
+
+def _spec_map(specialize: dict | None) -> dict:
+    """Build the ``{metavar: term}`` substitution from a spec map."""
+    return {k: term_from_spec(v) for k, v in (specialize or {}).items()}
+
+
+def _premise_names(rules: list) -> tuple[str, ...]:
+    """Return the premises' names, deduplicated, in firing order."""
+    return tuple(dict.fromkeys(r.name for r in rules))
+
+
+def _head_transport(
+    head: Rewrite, lhs: Any, has_caller_cond: bool
+) -> tuple:
+    """Transport the first premise's guard (it guards the composite LHS).
+
+    Returns ``(clause, step)``.  A declaratively re-expressible guard
+    becomes a cond clause; otherwise the caller's ``cond`` is taken as
+    the declared composite guard (the pre-existing contract) unless none
+    was given, in which case the guard rides a procedural fire-time step.
+    """
+    if head.cond is None and head.check is None:
+        return None, None
+    m0 = match_pattern(head.lhs, lhs, {})
+    clause = _declarative_clause(head, m0) if m0 is not None else None
+    if clause is not None:
+        return clause, None
+    return None, (None if has_caller_cond else (head, lhs, ()))
+
+
 def _specialize(pat: Any, subst: dict) -> Any:
     """Instantiate *pat* under *subst*, leaving unbound metavars.
 
@@ -273,11 +469,21 @@ def compose_objects(
 
     The composite ``first.lhs(specialized) -> rhs`` where ``rhs`` is
     ``first.rhs`` rewritten by each of *rest* in turn, applied at the
-    first position where the premise fires
-    (:func:`catopt_core.meta.apply_rewrite_at` — guards and derives
-    are evaluated on the symbolic binding, so a premise whose guard
-    cannot evaluate on metavar terms declines and the composition
-    fails as ``None``, honestly).
+    first position where the premise fires.
+
+    A premise fires **decidable** when its guard evaluates on the
+    symbolic binding (:func:`catopt_core.meta.apply_rewrite_at` — the
+    cond DSL and its shape specs decide leaf/rank/spec clauses without
+    concrete values).  A premise whose guard *needs real shapes* —
+    ``om_split``'s concat-dim/chunk-alignment check, which reads tensor
+    extents a metavariable does not carry — is instead fired
+    **structurally** (its LHS alone) and its guard is *transported* into
+    the composite (see the module note on guard transport): a purely
+    declarative premise ``cond`` becomes an extra clause of the
+    composite's own ``cond`` (still pure data), a procedural
+    ``check``/``derive`` becomes the composite's fire-time ``check``.
+    A premise whose LHS does not match anywhere still fails the
+    composition as ``None``, honestly.
 
     *specialize* instantiates ``first``'s pattern metavariables
     (``{name: spec}``) before composition — how
@@ -289,35 +495,43 @@ def compose_objects(
     can carry a replayable certificate.
 
     *cond* / *dspec* declare the composite's own guard and derive spec
-    — the constructor's claim about where the composite is legal.
-    Full *cond*-transport (re-expressing each premise's condition over
-    the composite's metavars) is not wired in; the caller states the
-    guard the composite should carry and the gauntlet's guarded-region
-    sweep rules on it.
+    — the constructor's claim about where the composite is legal.  A
+    declaratively transported premise guard is ANDed onto *cond*; a
+    procedural one rides ``check`` (the composite then reports
+    ``missing_hooks == ["check"]`` at the store, honestly).
     """
     rules = [_as_rule(first), *(_as_rule(r) for r in rest)]
-    subst = {
-        k: term_from_spec(v) for k, v in (specialize or {}).items()
-    }
+    subst = _spec_map(specialize)
     lhs = _specialize(rules[0].lhs, subst)
     cur = _specialize(rules[0].rhs, subst)
+    clauses: list = []
+    steps: list = []
+    # The first premise's own guard applies to the composite's LHS, so it
+    # is transported too (see :func:`_head_transport`).
+    head_clause, head_step = _head_transport(
+        rules[0], lhs, cond is not None
+    )
+    if head_clause is not None:
+        clauses.append(head_clause)
+    if head_step is not None:
+        steps.append(head_step)
     for r in rules[1:]:
-        nxt = None
-        for path, _sub in _positions(cur):
-            nxt = apply_rewrite_at(r, cur, path)
-            if nxt is not None and nxt != cur:
-                break
-            nxt = None
-        if nxt is None:
+        fired = _fire_premise(r, cur)
+        if fired is None:
             return None
-        cur = nxt
-    premises = tuple(dict.fromkeys(r.name for r in rules))
+        cur, clause, step = fired
+        if clause is not None:
+            clauses.append(clause)
+        elif step is not None:
+            steps.append(step)
+    premises = _premise_names(rules)
     rule = Rewrite(
         name=name,
         lhs=lhs,
         rhs=cur,
         law="composite of " + " ∘ ".join(premises),
-        cond=cond,
+        check=_guard_transport(steps) if steps else None,
+        cond=_fold_and(([cond] if cond is not None else []) + clauses),
         dspec=dspec,
         tags=frozenset(tags),
         derivation=premises,
