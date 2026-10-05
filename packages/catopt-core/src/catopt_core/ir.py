@@ -135,24 +135,30 @@ class Param:
 
 
 def _hashable_attr(v: Any) -> Any:
-    """Hashable form of an attr value — strict: [3,5] != (3,5).
+    """Strict key form of an attr value: the spelling, not the number.
 
-    Unhashable values (lists, dicts) fall back to ``repr``.
+    The intern key and ``Op.__eq__`` follow the same rule as
+    :class:`Const` leaf identity — ``repr`` — because Python's numeric
+    tower (``0 == 0.0 == False``, shared hashes) is a semantic claim
+    the IR is not entitled to make: ``clamp(min=0)`` and
+    ``clamp(min=0.0)`` are different programs (an int bound promotes
+    differently at lowering; a float ``dim`` is simply malformed).
+    repr also keeps ``[3,5]`` distinct from ``(3,5)`` and ``(3,5)``
+    from ``(3.0,5.0)``, makes ``nan`` attrs reflexive, and covers the
+    unhashables outright.  Matchers that *want* numeric leniency say
+    so — the pattern matchers compare attr values with ``!=``.
     """
-    try:
-        hash(v)
-    except TypeError:
-        return repr(v)
-    return v
+    return repr(v)
 
 
 def _attr_key(attrs: dict[str, Any]) -> tuple:
+    """Intern/identity key for an attrs dict — repr-keyed, sorted."""
     return tuple(
         sorted((k, _hashable_attr(v)) for k, v in attrs.items())
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Op:
     """An operation (an ENode in the e-graph).
 
@@ -161,21 +167,43 @@ class Op:
     content-based — term objects are safe dict/set keys, and the old
     ``id(t)``-keyed memos can all key on ``t`` directly (no GC-reuse
     hazard, no keepalive lists).
+
+    Attr identity is *spelling-strict* — the :class:`Const` precedent
+    one level down: ``min=0`` and ``min=0.0`` are different terms.
+    The numeric tower's ``0 == 0.0`` (with ``hash(0) == hash(0.0)``)
+    leaked through the raw-value ``_attr_key`` and the dataclass dict
+    compare, coalescing both spellings into one interned object — a
+    silent attr rewrite before any law fired.  ``__eq__`` therefore
+    compares the repr-keyed ``_ak`` signature rather than the attrs
+    dicts.  *Matching* stays numerically lenient — ``_term_match``,
+    ``match_pattern`` and ``EGraph._m_stream`` all compare attr
+    values with ``!=``.
     """
 
     op: str
     args: tuple[Any, ...]
     attrs: dict[str, Any] = field(default_factory=dict)
     _h: int = field(init=False, repr=False, compare=False, hash=False)
+    _ak: tuple = field(
+        init=False, repr=False, compare=False, hash=False
+    )
 
     _INTERN: ClassVar[Any] = None  # weakref table, created at import
 
     def __post_init__(self) -> None:
-        """Cache the content hash of the term."""
-        object.__setattr__(
-            self,
-            "_h",
-            hash((self.op, self.args, _attr_key(self.attrs))),
+        """Cache the strict attr signature and content hash."""
+        ak = _attr_key(self.attrs)
+        object.__setattr__(self, "_ak", ak)
+        object.__setattr__(self, "_h", hash((self.op, self.args, ak)))
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare structure — op, args, and the strict attr key."""
+        if not isinstance(other, Op):
+            return NotImplemented
+        return (
+            self.op == other.op
+            and self.args == other.args
+            and self._ak == other._ak
         )
 
     @staticmethod

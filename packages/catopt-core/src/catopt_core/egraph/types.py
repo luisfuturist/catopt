@@ -10,13 +10,47 @@ from typing import Any, ClassVar
 from catopt_core.ir import Op, op_repr
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ENode:
-    """A term node in the e-graph: an op name with e-class children."""
+    """A term node in the e-graph: an op name with e-class children.
+
+    ``attrs`` stores values raw — the matcher reads them with ``!=``,
+    keeping numeric leniency (a pattern ``dim=0`` still matches a node
+    spelled ``dim=0.0``, mirroring the ``Const`` leniency
+    ``match_pattern`` keeps for leaves).  Node *identity*, though, is
+    spelling-strict: ``__eq__``/``__hash__`` compare the repr-keyed
+    ``_sig`` so ``min=0`` and ``min=0.0`` are distinct enodes — the
+    :class:`catopt_core.ir.Const` precedent applied to the attr tuple.
+    Under field-compare the numeric tower (``0 == 0.0``, shared hash)
+    merged both spellings into one e-class — the same silent
+    corruption the ``Const`` fix removed from leaf identity.
+    """
 
     op: str
     children: tuple[int, ...]
     attrs: tuple[tuple[str, Any], ...] = ()
+    _sig: tuple = field(init=False, repr=False, compare=False)
+    _h: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Precompute the spelling-strict signature and its hash."""
+        sig = (
+            self.op,
+            self.children,
+            tuple((k, repr(v)) for k, v in self.attrs),
+        )
+        object.__setattr__(self, "_sig", sig)
+        object.__setattr__(self, "_h", hash(sig))
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare the strict signature — attr spellings, not numbers."""
+        if not isinstance(other, ENode):
+            return NotImplemented
+        return self._sig == other._sig
+
+    def __hash__(self) -> int:
+        """Return the cached signature hash."""
+        return self._h
 
 
 @dataclass

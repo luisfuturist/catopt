@@ -388,6 +388,11 @@ def match_pattern(
     ``"$attr:<name>"`` — mirroring :meth:`EGraph._match`.  Returns the
     substitution dict or ``None``.
 
+    Concrete attr values compare numerically (``!=``), so a pattern
+    ``min=0`` still matches a term spelled ``min=0.0`` — deliberate
+    leniency at match time, mirroring :func:`_leaf_eq`; term/enode
+    *identity* is spelling-strict (see :class:`catopt_core.ir.Op`).
+
     Near-clone of :func:`catopt_core.egraph.terms._term_match`, kept
     separate because the leaf compare genuinely differs: this compares
     ``Const`` leaves *numerically* on ``.value`` (``Const(0)`` matches

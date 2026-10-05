@@ -750,10 +750,13 @@ class EGraph(_ExtractMixin, _ProofMixin):
             node_attrs = dict(node.attrs)
             if set(node_attrs) != pn.keyset:
                 continue
-            # Attribute matching: literal values must equal; a string
-            # pattern value is an attribute metavariable bound under
-            # "$attr:<name>" — binding must be consistent everywhere
-            # the metavar repeats.
+            # Attribute matching: literal values must equal — under
+            # ``!=``, i.e. numerically (a ``dim=0`` pattern still
+            # matches a ``dim=0.0`` enode; match-time leniency while
+            # enode identity is spelling-strict, see
+            # ``catopt_core.ir.Op``).  A string pattern value is an
+            # attribute metavariable bound under "$attr:<name>" —
+            # binding must be consistent everywhere it repeats.
             marked: list[str] = []
             ok = True
             for k, pv in pn.attrs:
@@ -841,6 +844,8 @@ class EGraph(_ExtractMixin, _ProofMixin):
                 node_attrs = dict(node.attrs)
                 if set(node_attrs) != pn.keyset:
                     continue
+                # Same numerically-lenient ``!=`` attr compare as
+                # ``_m_stream`` — see its comment for the contract.
                 attr_substs: list[dict[str, Any]] = [dict(subst)]
                 attr_ok = True
                 for k, pv in pn.attrs:

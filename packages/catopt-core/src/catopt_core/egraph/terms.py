@@ -42,6 +42,9 @@ def _term_match(
     metavariables must bind structurally equal terms); string-valued
     attributes are attribute metavariables bound under ``"$attr:"``
     keys; concrete leaves (Var/Const/Param) match by ``repr``.
+    Concrete attr values compare numerically (``!=``) — match-time
+    leniency, deliberately kept while term/enode *identity* is
+    spelling-strict (see :class:`catopt_core.ir.Op`).
     Returns the bindings dict, or ``None`` on mismatch.
     """
     subst = {} if _subst is None else _subst
