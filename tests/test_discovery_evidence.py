@@ -689,3 +689,104 @@ def test_main_admit_object_unknown_kind_cli(tmp_path, capsys):
     assert ev.main(["--report", db, "--admit-object", key]) == 1
     out = capsys.readouterr().out
     assert "unknown object kind" in out
+
+
+# ---------------------------------------------------------------------------
+#  Cross-scope verdicts — the attributable history view
+# ---------------------------------------------------------------------------
+
+
+def test_corpus_dependent_cols_split():
+    """The documented split: corpus measurements are flagged, the
+    truth/novelty columns a cross-scope reader may trust are not."""
+    dep = set(ev.CORPUS_DEPENDENT_COLS)
+    assert {"matches", "fires", "paid", "drop_pct", "verdict"} <= dep
+    assert dep.isdisjoint(
+        {
+            "numeric_true",
+            "derivable",
+            "relation",
+            "alpha_key",
+            "corpus_hash",
+            "run_id",
+            "ts",
+        }
+    )
+
+
+def test_verdicts_across_scopes_groups_by_corpus(tmp_path):
+    """One latest-verdict table per corpus; every row stays stamped."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    m_a = _meta(corpus_hash="A", ts="2024-01-01T00:00:00+00:00")
+    m_b = _meta(
+        corpus_hash="B", run_id="r2", ts="2024-01-02T00:00:00+00:00"
+    )
+    ev.record_run(conn, m_a, [_row("law_a", "K1"), _row("law_b", "K2")])
+    ev.record_run(conn, m_b, [_row("law_a", "K1", ship=False)])
+    scopes = ev.verdicts_across_scopes(conn, m_b)
+    assert set(scopes) == {"A", "B"}
+    # corpus_B's "no:" row does not overwrite corpus_A's SHIP —
+    # grouping, not a merged bag.
+    assert scopes["A"]["K1"]["verdict"] == "SHIP"
+    assert scopes["B"]["K1"]["verdict"].startswith("no:")
+    # the scope tag rides on the row — attribution survives a
+    # flattened read.
+    assert scopes["A"]["K1"]["corpus_hash"] == "A"
+    assert scopes["A"]["K1"]["run_id"] == "run0"
+    # each group is exactly latest_verdicts for that scope.
+    assert scopes["A"] == ev.latest_verdicts(
+        conn, "A", m_a["rules_hash"], "abc123"
+    )
+    assert scopes["B"] == ev.latest_verdicts(
+        conn, "B", m_b["rules_hash"], "abc123"
+    )
+    conn.close()
+
+
+def test_verdicts_across_scopes_scope_keys_still_bind(tmp_path):
+    """Only corpus_hash varies — rules/code scope keys still filter,
+    and "unknown" revisions serve nothing."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    ev.record_run(conn, _meta(run_id="r1"), [_row("law_a", "K1")])
+    # a holdout-style ruleset is a different context entirely.
+    ev.record_run(
+        conn,
+        _meta(rules_hash=ev.rules_hash(["holdout"])),
+        [_row("law_b", "K2")],
+    )
+    scopes = ev.verdicts_across_scopes(conn, _meta())
+    assert len(scopes) == 1
+    assert set(next(iter(scopes.values()))) == {"K1"}
+    assert (
+        ev.verdicts_across_scopes(conn, _meta(code_rev="unknown"))
+        == {}
+    )
+    # an unknown-rev ROW is written but never served.
+    ev.record_run(
+        conn, _meta(code_rev="unknown"), [_row("law_c", "K3")]
+    )
+    scopes = ev.verdicts_across_scopes(conn, _meta())
+    assert set(next(iter(scopes.values()))) == {"K1"}
+    conn.close()
+
+
+def test_verdicts_across_scopes_newest_per_key_per_scope(tmp_path):
+    """Re-measurement under a new run collapses to the newest row —
+    per corpus, not across corpora."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    ev.record_run(
+        conn,
+        _meta(run_id="r1", ts="2024-01-01T00:00:00+00:00"),
+        [_row("law_a", "K1", ship=False)],
+    )
+    ev.record_run(
+        conn,
+        _meta(run_id="r2", ts="2024-01-02T00:00:00+00:00"),
+        [_row("law_a", "K1", ship=True)],
+    )
+    scopes = ev.verdicts_across_scopes(conn, _meta())
+    assert len(scopes) == 1
+    sole = next(iter(scopes.values()))
+    assert sole["K1"]["verdict"] == "SHIP"
+    assert sole["K1"]["run_id"] == "r2"
+    conn.close()

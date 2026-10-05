@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from catopt_core.attrs import ATTR_SCHEMA, is_positional_attr
 from catopt_core.egraph.terms import _term_instantiate, _term_match
 from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 
@@ -320,7 +321,11 @@ def _attr_options(
     *shape* is the operand's inferred shape (``tuple`` or ``()``);
     tuple-producing operands report their element shape.  ``None``
     means the oracle cannot honestly instantiate this op — the
-    instance is skipped, not guessed.
+    instance is skipped, not guessed.  View-family ops take the
+    hand-tuned tables; anything else falls to
+    :func:`_generic_attr_options`, which types each attr through the
+    canonical schema and enumerates a small domain per kind — a key
+    it cannot type stays ``None``.
     """
     sh = tuple(shape) if isinstance(shape, tuple) else ()
     r = len(sh)
@@ -432,7 +437,259 @@ def _attr_options(
         case "flatten":
             return [{"start_dim": 0, "end_dim": -1}]
         case _:
+            return _generic_attr_options(op, keys, shape)
+
+
+# ---------------------------------------------------------------------------
+#  Generic attr domains — non-view ops keyed by the attr schema
+# ---------------------------------------------------------------------------
+#
+#  The view table above enumerates attrs *shape-valid for a bound
+#  operand*; ops outside it used to veto the whole binding — an attr
+#  metavariable on ``softmax``/``sdpa``/``sum`` emptied the synthesized
+#  domain entirely, even when a rule's ``derive`` would overwrite the
+#  value anyway.  The generic fallback restores a non-empty domain:
+#  each metavar'd attr key is *typed* — the canonical name resolved
+#  through ``catopt_core.attrs.ATTR_SCHEMA`` (so ``arg6`` on ``sdpa``
+#  kinds as ``scale``) — and the kind picks a small honest domain.
+#  The enumeration proposes candidates; the fp64 eval disposes —
+#  an out-of-range axis or ill-typed tuple surfaces as a counted
+#  eval error, the same posture the leaf-shape banks take.  An attr
+#  key the table cannot type (``attn_mask``, an ``equation`` string)
+#  stays honestly unenumerable — ``None``, the binding is skipped.
+
+#: Canonical attr names -> the value kind the sweep can enumerate.
+#: ``ATTR_SCHEMA`` *names* every positional attr; this table *types*
+#: the names.  ``dim`` defaults to a plain axis — the reduction ops
+#: and the normalized-shape spellings override below.
+_ATTR_KINDS: dict[str, str] = {
+    # axes — valid values are ``-rank..rank-1`` of the operand
+    "dim": "axis",
+    "dim0": "axis",
+    "dim1": "axis",
+    "start_dim": "axis",
+    "end_dim": "axis",
+    "source": "axis",
+    "destination": "axis",
+    # small ints — indices, counts, bounds, kernel sizes
+    "index": "int",
+    "start": "int",
+    "end": "int",
+    "step": "int",
+    "length": "int",
+    "chunks": "int",
+    "k": "int",
+    "sections": "int",
+    "num_groups": "int",
+    "num_classes": "int",
+    "num_layers": "int",
+    "groups": "int",
+    "shifts": "int",
+    "diagonal": "int",
+    "correction": "int",
+    "upscale_factor": "int",
+    "downscale_factor": "int",
+    "stride": "int",
+    "padding": "int",
+    "dilation": "int",
+    "m": "int",
+    # float scalars — scales, epsilons, rates
+    "scale": "float",
+    "eps": "float",
+    "momentum": "float",
+    "p": "float",
+    "dropout_p": "float",
+    "dropout": "float",
+    "rtol": "float",
+    "atol": "float",
+    "alpha": "float",
+    "beta": "float",
+    "threshold": "float",
+    "min": "float",
+    "max": "float",
+    "input_scale": "float",
+    "value": "float",
+    "ord": "float",
+    # boolean flags
+    "keepdim": "bool",
+    "is_causal": "bool",
+    "enable_gqa": "bool",
+    "train": "bool",
+    "training": "bool",
+    "largest": "bool",
+    "sorted": "bool",
+    "descending": "bool",
+    "accumulate": "bool",
+    "equal_nan": "bool",
+    "cudnn_enabled": "bool",
+    "has_biases": "bool",
+    "bidirectional": "bool",
+    "batch_first": "bool",
+    "use_input_stats": "bool",
+    "right": "bool",
+    "out_int32": "bool",
+    # shape-typed tuples — normalized_shape and friends
+    "shape": "shape",
+    "sizes": "shape",
+    "size": "shape",
+    "pad": "shape",
+    # int-or-tuple axis lists (roll's ``dims``)
+    "dims": "red-dims",
+    # honestly unenumerable — string payloads, not scalars
+    "equation": "str",
+    "mode": "str",
+    "reduce": "str",
+    "layout": "str",
+}
+
+#: ``(op, canonical-attr)`` pairs whose value kind differs from the
+#: name default — the attr names are honest but not typed, and these
+#: are the measured exceptions.
+_ATTR_KIND_OVERRIDES: dict[tuple[str, str], str] = {
+    # the norms' ``dim`` attr is aten's normalized_shape list, not an
+    # axis (``rms_norm(x, ns, w, eps)`` / ``layer_norm``'s arg1).
+    ("layer_norm", "dim"): "shape",
+    ("rms_norm", "dim"): "shape",
+    # ``eye(n)`` / ``eye.m(n, m)`` — sizes, not axes.
+    ("eye", "dim"): "int",
+    # unfold's ``size`` is a kernel extent; upsample's ``size`` stays
+    # a shape tuple.
+    ("unfold", "size"): "int",
+}
+
+#: Ops whose ``dim`` attr accepts an axis OR a tuple of axes (the
+#: aten reduction signature) — the domain enumerates both spellings.
+_REDUCTION_DIM_OPS = frozenset(
+    {
+        "sum",
+        "mean",
+        "prod",
+        "amax",
+        "amin",
+        "max",
+        "min",
+        "argmax",
+        "argmin",
+        "median",
+        "mode",
+        "var",
+        "std",
+        "var_mean",
+        "std_mean",
+        "nansum",
+        "nanmean",
+        "count_nonzero",
+        "linalg_vector_norm",
+    }
+)
+
+#: Cap on one node's generic option dicts (the product over its
+#: metavar'd keys) — matches the view tables' per-node caps.
+_MAX_GENERIC_OPTIONS = 16
+
+#: Axes offered when the operand's shape is not visible (a free
+#: metavariable bound later, or a rank-0 operand): the common last-
+#: and first-axis spellings.  Out-of-range draws surface as counted
+#: eval errors — honest enumeration, honest accounting.
+_FALLBACK_AXES: list[int] = [-2, -1, 0, 1]
+
+#: Trailing tuples offered for a shape-typed attr whose operand
+#: shape is unknown — plausible normalized-shape spellings.
+_FALLBACK_SHAPES: list[tuple] = [(1,), (2,), (4,), (2, 4)]
+
+#: Sentinel shapes the free operand's derived bank always carries —
+#: the scalar corner and two generic mismatches.
+_FREE_SENTINELS: tuple = ((), (4,), (7, 7))
+
+
+def _attr_kind(op: str, key: str) -> str | None:
+    """Return the value kind of *op*'s attr *key* — ``None`` if unknown.
+
+    ``argN`` positional spellings resolve to the canonical name
+    through ``ATTR_SCHEMA`` first, then ``(op, name)`` overrides and
+    the reduction-``dim`` family take precedence over the name table.
+    """
+    canon = key
+    if is_positional_attr(key):
+        canon = (ATTR_SCHEMA.get(op) or {}).get(int(key[3:]), key)
+    kind = _ATTR_KIND_OVERRIDES.get((op, canon))
+    if kind is not None:
+        return kind
+    if canon == "dim" and op in _REDUCTION_DIM_OPS:
+        return "red-dims"
+    return _ATTR_KINDS.get(canon)
+
+
+def _kind_domain(kind: str, shape: tuple) -> list:
+    """Return the candidate values one attr *kind* ranges over.
+
+    *shape* is the operand's shape (``()`` when unknown); kinds that
+    need it fall back to a small generic domain — the enumeration
+    proposes, the eval decides.
+    """
+    match kind:
+        case "axis":
+            return _dims(len(shape)) or list(_FALLBACK_AXES)
+        case "red-dims":
+            return _red_dims_domain(len(shape))
+        case "int":
+            return [0, 1, 2]
+        case "float":
+            return [0.5, 1.0, 1e-5]
+        case "bool":
+            return [False, True]
+        case "shape":
+            return _shape_block_domain(shape)
+        case _:
+            return []
+
+
+def _red_dims_domain(r: int) -> list:
+    """Return the ``reduce``-dim payload — axes plus the tuples."""
+    out: list = _dims(r) or list(_FALLBACK_AXES)
+    out.append((-1,))
+    if r > 1:
+        out.append(tuple(range(r)))
+    return out
+
+
+def _shape_block_domain(shape: tuple) -> list:
+    """Return the ``weight``-shaped payload — trailing blocks of *shape*."""
+    if len(shape):
+        return [
+            tuple(shape[-k:]) for k in range(1, min(len(shape), 3) + 1)
+        ]
+    return list(_FALLBACK_SHAPES)
+
+
+def _generic_attr_options(
+    op: str, keys: tuple, shape: Any
+) -> list[dict] | None:
+    """Return concrete attr dicts for a non-view op, or ``None``.
+
+    Each metavar'd key contributes its kind's domain; the option dicts
+    are the Cartesian product, capped at ``_MAX_GENERIC_OPTIONS``.
+    ``None`` marks an attr key the table cannot type — the instance is
+    skipped, honestly.
+    """
+    sh = tuple(shape) if isinstance(shape, tuple) else ()
+    domains: list[tuple[str, list]] = []
+    for k in keys:
+        kind = _attr_kind(op, k)
+        if kind is None:
             return None
+        vals = _kind_domain(kind, sh)
+        if not vals:
+            return []
+        domains.append((k, vals))
+    names = [k for k, _ in domains]
+    return [
+        dict(zip(names, combo, strict=True))
+        for combo in itertools.islice(
+            itertools.product(*[v for _, v in domains]),
+            _MAX_GENERIC_OPTIONS,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -478,12 +735,22 @@ def _leaf_bindings(
     out: list[Any] = []
     if "getitem" in parents:
         out.extend(_tuple_sources(mv))
-    for s in itertools.chain(_VIEWED_SHAPES, derived):
+    # The operand-derived shapes lead the bank: a bound operand's own
+    # shape is the most conservative instantiation and belongs at
+    # index 0 the way the scalar probe did — under a capped
+    # enumeration the scalar-led order buries the evaluable corner
+    # (measured: for a three-free-operand pattern the first equal
+    # site lay ~10⁴ sites into the scalar-led order, ~40 into the
+    # operand-led one).
+    for s in itertools.chain(derived, _VIEWED_SHAPES):
         out.append(Var(mv, TensorType(tuple(s))))
     if not parents or all(p not in _VIEWISH for p in parents):
         # A free operand may bind a literal scalar — the corpus does.
-        out.append(Const(0.5))
-        out.insert(0, Var(mv, TensorType(())))
+        # The ``Const`` rides at index 1 and the scalar ``Var`` at
+        # index 2: the only non-``Var`` binding and the degenerate
+        # corner both stay early under a capped enumeration.
+        out.insert(1, Var(mv, TensorType(())))
+        out.insert(1, Const(0.5))
     return out
 
 
@@ -522,11 +789,43 @@ def _operand_shape(term: Any) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+def _combos_at_sum(lists: tuple, total: int) -> Iterable[tuple]:
+    """Yield ``product(*lists)`` tuples whose index-sum is *total*."""
+    if not lists:
+        if total == 0:
+            yield ()
+        return
+    head, rest = lists[0], lists[1:]
+    for i, v in enumerate(head):
+        if i > total:
+            break
+        for tail in _combos_at_sum(rest, total - i):
+            yield (v, *tail)
+
+
+def _diag_product(lists: list) -> Iterable[tuple]:
+    """Yield ``product(*lists)`` in Cantor (index-sum) order.
+
+    ``itertools.product`` advances the last coordinate fastest, so a
+    capped enumeration barely moves the early coordinates — a binding
+    deep in a *first* metavariable's list is never reached (measured:
+    three free operands, ``Const`` last, cap 360 → the ``Const``
+    binding lay ~10⁴ tuples in).  Diagonal order covers the low-index
+    corner of every coordinate first: a cap truncates a *corner* of
+    the product space, not a whole dimension.
+    """
+    sizes = [len(lst) for lst in lists]
+    if any(s == 0 for s in sizes):
+        return
+    for total in range(sum(s - 1 for s in sizes) + 1):
+        yield from _combos_at_sum(tuple(lists), total)
+
+
 def _viewed_bindings(mvs: list[str], parents: dict) -> Iterable[dict]:
     """Yield binding dicts for metavariables under a view node."""
     viewed = [m for m in mvs if parents.get(m, set()) & _VIEWISH]
     lists = [_leaf_bindings(m, parents[m], ()) for m in viewed]
-    for combo in itertools.product(*lists):
+    for combo in _diag_product(lists):
         yield dict(zip(viewed, combo, strict=True))
 
 
@@ -536,34 +835,36 @@ def _derived_free_shapes(
     """Return the derived shape bank for a free (non-viewed) operand.
 
     The candidates that probe the boundary region the naturality
-    candidates hinge on: the viewed operand's own shape, the view's
-    output shape, every single-axis-1 insertion of each (the
-    broadcast-pad cases), a leading pad, and a genuinely mismatched
-    shape.
+    candidates hinge on — the viewed operand's own shape FIRST (it
+    leads the free bank: the most conservative instantiation), then
+    each view's output shape, every single-axis-1 insertion of each
+    (the broadcast-pad cases), a leading pad, and genuinely
+    mismatched shapes.
     """
-    derived: list[tuple] = [(), (4,), (7, 7)]
-    for sh in [*u_shapes, *out_shapes]:
-        if not sh or sh in derived:
+    derived: list[tuple] = []
+    for sh in itertools.chain(u_shapes, out_shapes, _FREE_SENTINELS):
+        if sh in derived:
             continue
         derived.append(sh)
-        for i in range(len(sh) + 1):
-            ins = (*sh[:i], 1, *sh[i:])
+        for ins in _pad_insertions(sh):
             if ins not in derived:
                 derived.append(ins)
     return derived
 
 
-def _attr_domains(
-    nodes: list[Op], subst: dict
-) -> list[tuple[Op, list[dict]]] | None:
-    """Return ``(node, option dicts)`` per distinct attr-metavar group.
+def _pad_insertions(sh: tuple) -> Iterable[tuple]:
+    """Every single-axis-1 insertion of *sh* (the broadcast pads)."""
+    for i in range(len(sh) + 1):
+        yield (*sh[:i], 1, *sh[i:])
 
-    Each group is one view node's set of attr metavariable names; the
-    option dicts assign concrete values to the node's *attr keys*
-    (shared metavariable names across LHS/RHS resolve once).
-    ``None`` marks a node the oracle cannot instantiate honestly.
+
+def _attr_groups(nodes: list[Op]) -> list[tuple[str, Op]]:
+    """Group *nodes* by their sorted attr-metavar name sets.
+
+    Shared metavariable names across LHS/RHS resolve once — each
+    group carries one representative node.
     """
-    groups: dict[str, tuple[Op, list[str]]] = {}
+    groups: dict[str, Op] = {}
     order: list[str] = []
     for node in nodes:
         names = tuple(
@@ -573,11 +874,22 @@ def _attr_domains(
             continue
         key = "|".join(names)
         if key not in groups:
-            groups[key] = (node, list(node.attrs))
+            groups[key] = node
             order.append(key)
+    return [(key, groups[key]) for key in order]
+
+
+def _attr_domains(
+    nodes: list[Op], subst: dict
+) -> list[tuple[Op, list[dict]]] | None:
+    """Return ``(node, option dicts)`` per distinct attr-metavar group.
+
+    Each group is one node's set of attr metavariable names; the
+    option dicts assign concrete values to the node's *attr keys*.
+    ``None`` marks a node the oracle cannot instantiate honestly.
+    """
     out = []
-    for key in order:
-        node, _keys = groups[key]
+    for _key, node in _attr_groups(nodes):
         try:
             bound = (
                 _term_instantiate(node.args[0], subst)
@@ -589,11 +901,133 @@ def _attr_domains(
         shape = _operand_shape(bound) if bound is not None else ()
         # For getitem over a tuple source the index domain is the
         # tuple arity, not an axis extent — options stay {0,1}.
-        opts = _attr_options(node.op, tuple(node.attrs), shape)
+        # Only the metavar'd keys are enumerated — a literal attr
+        # contributes no binding and must not veto the domain.
+        mv_keys = tuple(
+            k for k, v in node.attrs.items() if isinstance(v, str)
+        )
+        opts = _attr_options(node.op, mv_keys, shape)
         if not opts:
             return None
         out.append((node, opts))
     return out
+
+
+def _attr_merge(domains: list, attr_combo: tuple, viewed: dict) -> Any:
+    """Merge one attr combination into *viewed*; ``None`` on conflict.
+
+    Shared attr metavariables across two nodes must resolve
+    identically — a combo disagreeing with an earlier binding is not
+    a legal instantiation.
+    """
+    base = dict(viewed)
+    for (node, _opts), vals in zip(domains, attr_combo, strict=True):
+        for k, mv_name in node.attrs.items():
+            if not isinstance(mv_name, str):
+                continue
+            ak = f"$attr:{mv_name}"
+            if ak in base and base[ak] != vals.get(k):
+                return None
+            if k in vals:
+                base[ak] = vals[k]
+    return base
+
+
+def _lhs_out_shapes(lhs_views: list, base: dict) -> list:
+    """Return the instantiated LHS view nodes' output shapes."""
+    out: list = []
+    for n in lhs_views:
+        try:
+            s = _operand_shape(_term_instantiate(n, base))
+        except Exception:
+            continue
+        if s:
+            out.append(s)
+    return out
+
+
+def _metavar_parents(lhs_pat: Any, rhs_pat: Any) -> dict:
+    """Map each leaf metavar to its parent ops across both patterns."""
+    mvs = sorted(
+        set(_leaf_metavars(lhs_pat)) | set(_leaf_metavars(rhs_pat))
+    )
+    parents: dict[str, set] = {m: set() for m in mvs}
+    for m, ops in _parents(lhs_pat).items():
+        parents.setdefault(m, set()).update(ops)
+    for m, ops in _parents(rhs_pat).items():
+        parents.setdefault(m, set()).update(ops)
+    return parents
+
+
+def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
+    """Yield ``(base, viewed_shapes, out_shapes)`` per viewed combo.
+
+    The outer half of the enumeration: every leaf-metavar binding
+    under a view op, merged with each shape-valid attribute
+    assignment.  *viewed_shapes* / *out_shapes* are the operand and
+    LHS-view output shapes the free operand's bank derives from.
+    """
+    mvs = sorted(
+        set(_leaf_metavars(lhs_pat)) | set(_leaf_metavars(rhs_pat))
+    )
+    parents = _metavar_parents(lhs_pat, rhs_pat)
+    nodes = _view_nodes([lhs_pat, rhs_pat])
+    lhs_views = [n for n in _view_nodes([lhs_pat]) if n.args]
+    for viewed in _viewed_bindings(mvs, parents):
+        domains = _attr_domains(nodes, viewed)
+        if domains is None:
+            continue
+        for combo in _diag_product([d[1] for d in domains]):
+            base = _attr_merge(domains, combo, viewed)
+            if base is None:
+                continue
+            yield (
+                base,
+                [_operand_shape(t) for t in viewed.values()],
+                _lhs_out_shapes(lhs_views, base),
+            )
+
+
+def _binding_envs(lhs_pat: Any, rhs_pat: Any) -> Iterable[dict]:
+    """Yield full binding dicts over the synthesized domain.
+
+    The enumeration is Cantor-ordered across the whole nested
+    product — ``(base, free-combo)`` index pairs in increasing
+    index-sum — and diagonal inside each base's free domain.
+    Ordering matters under a cap: exhausting one base's ~10⁴ free
+    combos before the next base opens starves every later dimension
+    (measured: a pattern with three free operands enumerates 360
+    sites over a single rank-1 viewed binding — the guard's true
+    region is never reached).  The diagonal keeps the cap honest:
+    it truncates a *corner* of the space, not a whole dimension.
+    """
+    parents = _metavar_parents(lhs_pat, rhs_pat)
+    free = sorted(
+        m for m in parents if not (parents.get(m, set()) & _VIEWISH)
+    )
+    # entries[i] = [base, free-combo generator, alive] — the i-th
+    # (viewed x attr) base.  The bases are a bounded few hundred at
+    # worst; materializing them keeps the diagonal loop simple.
+    entries: list[list] = []
+    for base, u_shapes, out_shapes in _synth_bases(lhs_pat, rhs_pat):
+        derived = _derived_free_shapes(u_shapes, out_shapes)
+        lists = [_leaf_bindings(m, set(), derived) for m in free]
+        entries.append([base, _diag_product(lists), True])
+    total = 0
+    live = len(entries)
+    while live:
+        for i in range(min(total, len(entries) - 1), -1, -1):
+            entry = entries[i]
+            if not entry[2]:
+                continue
+            try:
+                combo = next(entry[1])
+            except StopIteration:
+                entry[2] = False
+                live -= 1
+                continue
+            yield {**entry[0], **dict(zip(free, combo, strict=True))}
+        total += 1
 
 
 def synthesize(
@@ -601,126 +1035,88 @@ def synthesize(
     rhs_pat: Any,
     *,
     limit: int = _MAX_INSTANCES,
+    derive: Any = None,
 ) -> list[Instance]:
     """Enumerate satisfiable instances; evaluate both sides fp64.
 
     The enumeration is total over a small domain: every leaf
     metavariable over its binding bank (Vars over the shape bank,
     tuple-producers under ``getitem``, a scalar ``Const`` and derived
-    shapes for the free operand), every view node over attribute
-    values valid for the bound operand's shape.  Duplicate
-    instantiations (the same ``(lhs, rhs)`` pair from different
-    bindings) are evaluated once.
+    shapes for the free operand), every attr metavariable over values
+    valid for its kind — shape-valid axes for view ops, per-kind
+    domains for other ops.  When *derive* is supplied it rides each
+    binding with firing semantics exactly as ``sweep_real`` applies
+    it — the computed ``$attr:`` bindings *override* the enumerated
+    placeholder (a metavariable the rule derives is not a free
+    choice), and a vetoed binding is not a realizable instance —
+    skipped, not counted.  Duplicate instantiations (the same
+    ``(lhs, rhs)`` pair from different bindings) are evaluated once.
     """
-    mvs = sorted(
-        set(_leaf_metavars(lhs_pat)) | set(_leaf_metavars(rhs_pat))
-    )
-    parents = {m: set() for m in mvs}
-    for m, ops in _parents(lhs_pat).items():
-        parents.setdefault(m, set()).update(ops)
-    for m, ops in _parents(rhs_pat).items():
-        parents.setdefault(m, set()).update(ops)
-    nodes = _view_nodes([lhs_pat, rhs_pat])
-    lhs_views = [n for n in _view_nodes([lhs_pat]) if n.args]
-    free = [m for m in mvs if not (parents.get(m, set()) & _VIEWISH)]
-
     out: list[Instance] = []
     seen: set[tuple] = set()
-    for viewed in _viewed_bindings(mvs, parents):
-        domains = _attr_domains(nodes, viewed)
-        if domains is None:
-            continue
-        for attr_combo in itertools.product(*[d[1] for d in domains]):
-            base = dict(viewed)
-            skip = False
-            for (node, _opts), vals in zip(
-                domains, attr_combo, strict=True
-            ):
-                for k, mv_name in node.attrs.items():
-                    if isinstance(mv_name, str):
-                        ak = f"$attr:{mv_name}"
-                        if ak in base and base[ak] != vals.get(k):
-                            skip = True
-                            break
-                        if k in vals:
-                            base[ak] = vals[k]
-                if skip:
-                    break
-            if skip:
+    for full in _binding_envs(lhs_pat, rhs_pat):
+        inst = full
+        if derive is not None:
+            try:
+                extra = derive(full)
+            except Exception:
                 continue
-            # The free operand's bank derives from this exact
-            # instantiation: operand shapes and each LHS view node's
-            # output shape.
-            u_shapes = [_operand_shape(t) for t in viewed.values()]
-            out_shapes: list[tuple] = []
-            for n in lhs_views:
-                try:
-                    s = _operand_shape(_term_instantiate(n, base))
-                except Exception:
-                    continue
-                if s:
-                    out_shapes.append(s)
-            derived = _derived_free_shapes(u_shapes, out_shapes)
-            free_lists = [
-                _leaf_bindings(m, set(), derived) for m in free
-            ]
-            for fcombo in itertools.product(*free_lists):
-                full = {**base, **dict(zip(free, fcombo, strict=True))}
-                try:
-                    lhs_i = _term_instantiate(lhs_pat, full)
-                    rhs_i = _term_instantiate(rhs_pat, full)
-                except Exception:
-                    continue
-                # ``op_repr`` renders a bound Var by name only — the
-                # shape lives in the binding, so the sig must carry it
-                # or every shape assignment dedups to one instance.
-                sig = (
-                    op_repr(lhs_i),
-                    op_repr(rhs_i),
-                    tuple(
-                        sorted(
-                            (k, _bind_desc(v))
-                            for k, v in full.items()
-                            if not k.startswith("$attr:")
-                        )
-                        + sorted(
-                            (k, repr(v))
-                            for k, v in full.items()
-                            if k.startswith("$attr:")
-                        )
-                    ),
+            if extra is None:
+                continue
+            inst = {**full, **extra}
+        try:
+            lhs_i = _term_instantiate(lhs_pat, inst)
+            rhs_i = _term_instantiate(rhs_pat, inst)
+        except Exception:
+            continue
+        # ``op_repr`` renders a bound Var by name only — the
+        # shape lives in the binding, so the sig must carry it
+        # or every shape assignment dedups to one instance.
+        sig = (
+            op_repr(lhs_i),
+            op_repr(rhs_i),
+            tuple(
+                sorted(
+                    (k, _bind_desc(v))
+                    for k, v in inst.items()
+                    if not k.startswith("$attr:")
                 )
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                outcome, note = eval_instance(lhs_i, rhs_i)
-                feats = _features(
-                    lhs_pat, rhs_pat, full, lhs_i, rhs_i, outcome
+                + sorted(
+                    (k, repr(v))
+                    for k, v in inst.items()
+                    if k.startswith("$attr:")
                 )
-                out.append(
-                    Instance(
-                        origin="synth",
-                        outcome=outcome,
-                        lhs_repr=op_repr(lhs_i),
-                        rhs_repr=op_repr(rhs_i),
-                        binds=tuple(
-                            sorted(
-                                (k, _bind_desc(v))
-                                for k, v in full.items()
-                                if not k.startswith("$attr:")
-                            )
-                            + sorted(
-                                (k, v)
-                                for k, v in full.items()
-                                if k.startswith("$attr:")
-                            )
-                        ),
-                        feats=tuple(sorted(feats.items())),
-                        note=note,
+            ),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+        outcome, note = eval_instance(lhs_i, rhs_i)
+        feats = _features(lhs_pat, rhs_pat, inst, lhs_i, rhs_i, outcome)
+        out.append(
+            Instance(
+                origin="synth",
+                outcome=outcome,
+                lhs_repr=op_repr(lhs_i),
+                rhs_repr=op_repr(rhs_i),
+                binds=tuple(
+                    sorted(
+                        (k, _bind_desc(v))
+                        for k, v in inst.items()
+                        if not k.startswith("$attr:")
                     )
-                )
-                if len(out) >= limit:
-                    return out
+                    + sorted(
+                        (k, v)
+                        for k, v in inst.items()
+                        if k.startswith("$attr:")
+                    )
+                ),
+                feats=tuple(sorted(feats.items())),
+                note=note,
+            )
+        )
+        if len(out) >= limit:
+            return out
     return out
 
 
@@ -1083,7 +1479,9 @@ def verify_view_candidate(
     real = sweep_real(
         name, lhs_pat, rhs_pat, matches, check=check, derive=derive
     )
-    synth = synthesize(lhs_pat, rhs_pat, limit=synth_limit)
+    synth = synthesize(
+        lhs_pat, rhs_pat, limit=synth_limit, derive=derive
+    )
     insts = [*real, *synth]
     v = ViewVerdict(
         name=name,

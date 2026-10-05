@@ -77,13 +77,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import itertools
 import json
 import sqlite3
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -382,6 +381,80 @@ def latest_verdicts(
         (corpus_hash, rules_hash, code_rev),
     ):
         out.setdefault(row["alpha_key"], dict(row))
+    return out
+
+
+#: Verdict columns whose value is a measurement *of* the corpus the
+#: row was recorded under — match/site counts, the firing probe, pay
+#: and the closure sweep.  Rows under different ``corpus_hash``
+#: scopes must never have these compared, summed or merged: each
+#: answers "on this corpus" only.  ``verdict`` itself is listed here
+#: deliberately — ``SHIP`` conflates truth with the pay columns, so
+#: the label is a corpus-A answer to a corpus-A question.
+#:
+#: The corpus-INVARIANT columns — the ones a cross-scope reader may
+#: trust — are ``numeric_true`` (an equality measured true on a real
+#: instance is a fact about the candidate; the corpus supplied the
+#: instance, not the truth), ``derivable`` and ``relation`` (both
+#: scoped by ``rules_hash``, which :func:`verdicts_across_scopes`
+#: holds fixed), plus the descriptive text (``witness_json`` /
+#: ``example`` / the rendered sides name *what* was measured).
+CORPUS_DEPENDENT_COLS = (
+    "census_sites",
+    "matches",
+    "fires",
+    "fire_cases_json",
+    "changed",
+    "paid",
+    "verify_fail",
+    "drop_pct",
+    "cert",
+    "enode_ratio",
+    "verdict",
+)
+
+
+def verdicts_across_scopes(
+    conn: sqlite3.Connection, meta_base: Mapping[str, str]
+) -> dict[str, dict[str, dict]]:
+    """Return the newest verdict per candidate, grouped by corpus.
+
+    The cross-scope companion of :func:`latest_verdicts`: where that
+    answers "what do we know under *this* context", this answers
+    "what was ever measured, under which corpus".  Only the
+    ``corpus_hash`` scope key is allowed to vary — *meta_base*'s
+    ``rules_hash`` and ``code_rev`` still bind — so the result is a
+    family of same-ruleset, same-code verdict tables, one per corpus
+    the store has seen::
+
+        {corpus_hash: {alpha_key: verdict_row}}
+
+    Each inner dict is exactly :func:`latest_verdicts`' shape for
+    that corpus (newest row per candidate), and every row still
+    carries its own ``corpus_hash`` / ``run_id`` / ``ts`` columns —
+    attribution survives flattening the grouping.
+
+    The grouping, not a merged bag, is the contract.  The columns in
+    :data:`CORPUS_DEPENDENT_COLS` are measurements *of* a corpus and
+    are never comparable across groups; ``numeric_true``,
+    ``derivable`` and ``relation`` are corpus-invariant and may be
+    read across the boundary — "verdict V was measured on corpus A,
+    not the current corpus B" is answerable without conflating the
+    two.  The current scope is not special-cased out; the caller
+    decides which groups are prior.  ``"unknown"`` code revisions
+    yield no rows, matching ``latest_verdicts``.
+    """
+    if meta_base["code_rev"] == "unknown":
+        return {}
+    out: dict[str, dict[str, dict]] = {}
+    for row in conn.execute(
+        "SELECT * FROM verdicts"
+        " WHERE rules_hash = ? AND code_rev = ?"
+        " ORDER BY ts DESC, rowid DESC",
+        (meta_base["rules_hash"], meta_base["code_rev"]),
+    ):
+        scope = out.setdefault(row["corpus_hash"], {})
+        scope.setdefault(row["alpha_key"], dict(row))
     return out
 
 
@@ -805,99 +878,35 @@ def _guarded_evals(rule: Any, sites: Iterable) -> GuardedRegion:
     )
 
 
-def _synth_parents(lhs_pat: Any, rhs_pat: Any) -> dict:
-    """Map each leaf metavar to its parent ops across both patterns."""
-    from catopt_discovery import oracle as lvo
-
-    parents: dict[str, set] = {}
-    for m, ops in lvo._parents(lhs_pat).items():
-        parents.setdefault(m, set()).update(ops)
-    for m, ops in lvo._parents(rhs_pat).items():
-        parents.setdefault(m, set()).update(ops)
-    return parents
-
-
 def _attr_merge(domains: list, attr_combo: tuple, viewed: dict) -> Any:
     """Merge one attr combination into *viewed*; ``None`` on conflict.
 
-    Shared attr metavariables across two view nodes must resolve
-    identically — a combo disagreeing with an earlier binding is not
-    a legal instantiation.
+    The enumeration machinery lives in the oracle — this delegates so
+    the sweep's helpers keep one name.
     """
-    base = dict(viewed)
-    for (node, _opts), vals in zip(domains, attr_combo, strict=True):
-        for k, mv_name in node.attrs.items():
-            if not isinstance(mv_name, str):
-                continue
-            ak = f"$attr:{mv_name}"
-            if ak in base and base[ak] != vals.get(k):
-                return None
-            if k in vals:
-                base[ak] = vals[k]
-    return base
+    from catopt_discovery import oracle as lvo
+
+    return lvo._attr_merge(domains, attr_combo, viewed)
 
 
 def _lhs_out_shapes(lhs_views: list, base: dict) -> list:
     """Return the instantiated LHS view nodes' output shapes."""
-    from catopt_core.egraph.terms import _term_instantiate
-
     from catopt_discovery import oracle as lvo
 
-    out: list = []
-    for n in lhs_views:
-        try:
-            s = lvo._operand_shape(_term_instantiate(n, base))
-        except Exception:
-            continue
-        if s:
-            out.append(s)
-    return out
-
-
-def _free_metavars(lhs_pat: Any, rhs_pat: Any) -> list:
-    """Return the leaf metavars not sitting under a view op."""
-    from catopt_discovery import oracle as lvo
-
-    mvs = sorted(
-        set(lvo._leaf_metavars(lhs_pat))
-        | set(lvo._leaf_metavars(rhs_pat))
-    )
-    parents = _synth_parents(lhs_pat, rhs_pat)
-    return [
-        m for m in mvs if not (parents.get(m, set()) & lvo._VIEWISH)
-    ]
+    return lvo._lhs_out_shapes(lhs_views, base)
 
 
 def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
     """Yield ``(base, viewed_shapes, out_shapes)`` per viewed combo.
 
-    The outer half of the oracle's enumeration: every leaf-metavar
-    binding under a view op, merged with each shape-valid attribute
-    assignment.  *viewed_shapes* / *out_shapes* are the operand and
-    LHS-view output shapes the free operand's bank derives from.
+    The outer half of the oracle's enumeration — delegated verbatim:
+    the viewed-binding banks, the shape-valid attr domains, the
+    derived free-operand shapes all live in
+    :mod:`catopt_discovery.oracle`.
     """
     from catopt_discovery import oracle as lvo
 
-    mvs = sorted(
-        set(lvo._leaf_metavars(lhs_pat))
-        | set(lvo._leaf_metavars(rhs_pat))
-    )
-    parents = _synth_parents(lhs_pat, rhs_pat)
-    nodes = lvo._view_nodes([lhs_pat, rhs_pat])
-    lhs_views = [n for n in lvo._view_nodes([lhs_pat]) if n.args]
-    for viewed in lvo._viewed_bindings(mvs, parents):
-        domains = lvo._attr_domains(nodes, viewed)
-        if domains is None:
-            continue
-        for combo in itertools.product(*[d[1] for d in domains]):
-            base = _attr_merge(domains, combo, viewed)
-            if base is None:
-                continue
-            yield (
-                base,
-                [lvo._operand_shape(t) for t in viewed.values()],
-                _lhs_out_shapes(lhs_views, base),
-            )
+    yield from lvo._synth_bases(lhs_pat, rhs_pat)
 
 
 def _inst_pair(lhs_pat: Any, rhs_pat: Any, bound: dict) -> Any:
@@ -916,30 +925,25 @@ def _inst_pair(lhs_pat: Any, rhs_pat: Any, bound: dict) -> Any:
 def _synth_sites(lhs_pat: Any, rhs_pat: Any, *, limit: int) -> Iterable:
     """Yield ``(bound, lhs_term)`` over the view oracle's domain.
 
-    Mirrors ``oracle.synthesize``'s enumeration — the same leaf
-    binding banks, the same shape-valid attr domains — but yields the
-    *binding environment* so the object's own guard, not the oracle,
-    decides which region the equality must hold on.  ``oracle`` is a
-    read-only sibling: this is its enumeration with the evaluation
-    step replaced by a yield.  Instantiated ``(lhs, rhs)`` pairs are
-    deduped so each evaluable site is counted once.
+    ``oracle._binding_envs`` IS the enumeration — the same leaf
+    binding banks, the same attr domains, the same fair ordering —
+    with the evaluation step replaced by a yield of the *binding
+    environment*, so the object's own guard, not the oracle, decides
+    which region the equality must hold on.  Instantiated
+    ``(lhs, rhs)`` pairs are deduped so each evaluable site is
+    counted once.
     """
     from catopt_discovery import oracle as lvo
 
-    free = _free_metavars(lhs_pat, rhs_pat)
     seen: set = set()
-    for base, u_shapes, out_shapes in _synth_bases(lhs_pat, rhs_pat):
-        derived = lvo._derived_free_shapes(u_shapes, out_shapes)
-        lists = [lvo._leaf_bindings(m, set(), derived) for m in free]
-        for fcombo in itertools.product(*lists):
-            full = {**base, **dict(zip(free, fcombo, strict=True))}
-            pair = _inst_pair(lhs_pat, rhs_pat, full)
-            if pair is None or pair in seen:
-                continue
-            seen.add(pair)
-            yield full, pair[0]
-            if len(seen) >= limit:
-                return
+    for full in lvo._binding_envs(lhs_pat, rhs_pat):
+        pair = _inst_pair(lhs_pat, rhs_pat, full)
+        if pair is None or pair in seen:
+            continue
+        seen.add(pair)
+        yield full, pair[0]
+        if len(seen) >= limit:
+            return
 
 
 def _region_ok(region: GuardedRegion, *, need_equal: bool) -> bool:

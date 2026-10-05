@@ -1018,12 +1018,14 @@ def test_guide_corpus_cli(monkeypatch, tmp_path, capsys):
     )
     assert rc == 0
     payload = json.loads(out.read_text())
-    # corpus arms armed -> the corpus-first control joins the board.
+    # corpus arms armed -> the corpus-first control and the
+    # history-reading prior-aware guide join the board.
     assert set(payload["results"]) == {
         "enumeration",
         "enum-corpus-first",
         "uniform",
         "learned",
+        "prior-aware",
     }
     for s in payload["results"].values():
         assert "workload_gen" in s["arms"]
@@ -1065,3 +1067,183 @@ def test_guide_episodes_cli_trains_arm_policy(
     assert len(payload["guide_train_hist"]) == 2
     printed = capsys.readouterr().out
     assert "arm-policy training" in printed
+
+
+# ---------------------------------------------------------------------------
+#  Cross-scope history — GuideObs.history and the prior-aware guide
+# ---------------------------------------------------------------------------
+
+
+def test_observation_history_empty_before_rotation():
+    """No prior scopes means no history — an empty map, not noise."""
+    arena = _corpus_arena()
+    assert arena.observation(10).history == {}
+    arena.invest(mg.Allocation("algebraic-grammar", 2))
+    assert arena.observation(10).history == {}  # still one scope
+
+
+def test_observation_history_is_scope_tagged():
+    """``obs.history`` serves the rotated-away scopes grouped by the
+    corpus that measured them — never merged into the current
+    scope's ``verdicts``."""
+    arena = _corpus_arena()
+    old_hash = arena.meta["corpus_hash"]
+    arena.invest(mg.Allocation("algebraic-grammar", 2))
+    prior_keys = set(arena.observation(10).verdicts)
+    assert prior_keys
+    arena.invest(mg.Allocation("workload_gen", 1))
+    obs = arena.observation(10)
+    # current scope is empty; the corpus_A rows are history now.
+    assert obs.verdicts == {}
+    assert set(obs.history) == {old_hash}
+    assert set(obs.history[old_hash]) == prior_keys
+    # every row carries its own scope — attribution survives.
+    for row in obs.history[old_hash].values():
+        assert row["corpus_hash"] == old_hash
+    # after another rotation the groups accumulate, each stamped,
+    # and the current hash is never among them.
+    arena.invest(mg.Allocation("algebraic-grammar", 5))
+    arena.invest(mg.Allocation("workload_gen", 1))
+    obs2 = arena.observation(10)
+    assert old_hash in obs2.history
+    assert arena.meta["corpus_hash"] not in obs2.history
+    for h, rows in obs2.history.items():
+        for row in rows.values():
+            assert row["corpus_hash"] == h
+
+
+def _seed_prior_true(conn, prop, *, corpus="corpus_A", fires=7):
+    """Record a TRUE verdict for *prop* under another corpus —
+    a store that outlived corpus_A (a prior run on a slice where
+    the pattern matched)."""
+    ev = lpl.Evidence(proposal=prop)
+    ev.num_true = True
+    ev.matches = 1
+    ev.relation = "new"
+    ev.fires = fires
+    ev.paid = 3
+    ev_store.record_run(
+        conn,
+        dict(_META, corpus_hash=corpus),
+        [
+            ev_store.verdict_row(
+                repr(lp._key(prop.lhs, prop.rhs)), ev, "l", "r"
+            )
+        ],
+    )
+
+
+def test_prior_aware_prioritizes_gap_on_prior_true_target():
+    """The informed move: a live ``no-instance`` target that was
+    TRUE under a prior corpus is a proven equality missing only an
+    instance — ``gap_gen`` jumps ahead of the fixed order."""
+    prop = _gap_proposal()
+    arena = _corpus_arena(
+        pools={"shape-aware": [prop]}, cases=_tiny_cases()
+    )
+    _seed_prior_true(arena.conn, prop)
+    vs = arena.invest(mg.Allocation("shape-aware", 1))
+    assert vs[0].reason == "no-instance"
+    obs = arena.observation(10)
+    cur = obs.verdicts[repr(lp._key(prop.lhs, prop.rhs))]
+    assert cur["numeric_true"] is None  # unmeasured on this corpus
+    prior = obs.history["corpus_A"][repr(lp._key(prop.lhs, prop.rhs))]
+    assert prior["numeric_true"] == 1
+    # corpus-dependent columns never leak: corpus_A's fires/paid
+    # stay under corpus_A.
+    assert cur["fires"] == 0 and cur["paid"] == 0
+    assert prior["fires"] == 7
+    g = mg.PriorAwareGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=2
+    )
+    a = g.choose(obs)
+    assert a.generator == "gap_gen" and a.n == 2
+    # the uninformed control takes the fixed order — workload_gen
+    # before gap_gen.
+    e = mg.EnumerationGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=2
+    )
+    assert e.choose(obs).generator == "workload_gen"
+
+
+def test_prior_aware_defers_without_prior_true():
+    """A live target whose priors are all ``no-instance`` does not
+    trigger the override — and neither does one measured FALSE."""
+    prop = _gap_proposal()
+    arena = _corpus_arena(pools={"shape-aware": [prop]})
+    arena.invest(mg.Allocation("shape-aware", 1))
+    obs = arena.observation(10)
+    assert obs.remaining["gap_gen"] == 1
+    assert obs.history == {}  # nothing prior — plain enumeration
+    g = mg.PriorAwareGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=2
+    )
+    assert g.choose(obs).generator == "workload_gen"
+    # a FALSE prior is refutation, not promise — gap stays put.
+    conn2 = arena.conn
+    ev = lpl.Evidence(proposal=prop)
+    ev.num_true = False
+    ev.matches = 1
+    ev_store.record_run(
+        conn2,
+        dict(_META, corpus_hash="corpus_F"),
+        [
+            ev_store.verdict_row(
+                repr(lp._key(prop.lhs, prop.rhs)), ev, "l", "r"
+            )
+        ],
+    )
+    obs = arena.observation(10)
+    assert g.choose(obs).generator == "workload_gen"
+
+
+def test_prior_aware_releases_when_no_prior_true_remains():
+    """The override is per-decision: once the informed target is
+    converted, the guide returns to the fixed order."""
+    prop = _gap_proposal()
+    prop2 = lpl.Proposal(
+        name="gaptest2",
+        lhs=_p("tanh", _p("sub", "U", "V")),
+        rhs=_p("sigmoid", _p("sub", "U", "V")),
+        family="t",
+        sources=("t",),
+    )
+    arena = _corpus_arena(
+        pools={"shape-aware": [prop, prop2]}, cases=_tiny_cases()
+    )
+    _seed_prior_true(arena.conn, prop)  # only the first has a prior
+    arena.invest(mg.Allocation("shape-aware", 2))
+    obs = arena.observation(10)
+    assert obs.remaining["gap_gen"] == 2
+    g = mg.PriorAwareGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=2
+    )
+    assert g.choose(obs).generator == "gap_gen"
+    vs = arena.invest(mg.Allocation("gap_gen", 1))
+    # the witnessed target re-adjudicated — its current-scope row
+    # outranks the priors, and the remaining target has none.
+    assert vs[0].reason != "no-instance"
+    obs2 = arena.observation(10)
+    if obs2.remaining["gap_gen"]:
+        assert g.choose(obs2).generator == "workload_gen"
+
+
+def test_prior_aware_matches_enumeration_on_fresh_store():
+    """On a fresh store the trigger is structurally dead — the guide
+    plays exactly the enumeration schedule."""
+    pools = _pools()
+    arena = _corpus_arena(pools=pools, gen_cap=2)
+    g = mg.PriorAwareGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=2
+    )
+    e = mg.EnumerationGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=2
+    )
+    for _ in range(6):
+        obs = arena.observation(30)
+        a, b = g.choose(obs), e.choose(obs)
+        if a is None:
+            assert b is None
+            break
+        assert a.generator == b.generator
+        arena.invest(a)

@@ -127,7 +127,13 @@ writes under the new scope, while ``GuideObs.verdicts`` reads
 corpus_A is never served as corpus_B evidence.  ``gap_gen`` then
 re-adjudicates the ``no-instance`` candidate it witnessed under the
 new scope, which is where a corpus draw's payoff can become a real
-verdict.
+verdict.  The evidence a rotation leaves behind is not lost:
+``GuideObs.history`` serves
+``evidence.verdicts_across_scopes`` minus the current scope —
+verdicts grouped by the corpus they were measured on — so a guide
+(:class:`PriorAwareGuide`) can trust the corpus-invariant truth
+columns without ever mistaking a corpus_A ``fires``/``paid`` count
+for a current one.
 
 Run::
 
@@ -192,6 +198,7 @@ __all__ = [
     "GuideArena",
     "GuideObs",
     "LearnedGuide",
+    "PriorAwareGuide",
     "RandomGuide",
     "Referee",
     "Verdict",
@@ -1463,6 +1470,18 @@ class GuideObs:
     ``scope_epoch`` mark the growth (each ingestion is one epoch).
     ``arms`` carries the per-generator tallies (copies — an
     observation cannot mutate the board).
+
+    ``history`` is the attributable cross-scope view —
+    ``evidence.verdicts_across_scopes`` minus the current scope:
+    ``{corpus_hash: {alpha_key: row}}``, every row still tagged by
+    the corpus it was measured under.  A guide may read the
+    corpus-invariant columns (``numeric_true``, ``derivable``,
+    ``relation``) across the boundary — truth and novelty survive a
+    scope rotation — but a corpus-dependent column (``fires``,
+    ``paid``, ``verdict`` — ``evidence.CORPUS_DEPENDENT_COLS``)
+    answers "on corpus A", never "on the current corpus".  Nothing
+    is merged: a row appears under exactly one corpus_hash, so the
+    two fields can never double-count a verdict.
     """
 
     round: int
@@ -1472,6 +1491,7 @@ class GuideObs:
     remaining: dict[str, int]
     arms: dict[str, ArmStat]
     verdicts: dict[str, dict]
+    history: dict[str, dict[str, dict]] = field(default_factory=dict)
     corpus_size: int = 0
     scope_epoch: int = 0
 
@@ -1704,6 +1724,8 @@ class GuideArena:
         The verdict rows are scoped by the *current*
         ``meta["corpus_hash"]`` — after a corpus mutation only
         evidence attributable to the grown corpus is served.
+        ``history`` carries the scopes the corpus left behind,
+        grouped by the ``corpus_hash`` each row was measured under.
         """
         verdicts = ev_store.latest_verdicts(
             self.conn,
@@ -1711,6 +1733,11 @@ class GuideArena:
             self.meta["rules_hash"],
             self.meta["code_rev"],
         )
+        history = ev_store.verdicts_across_scopes(self.conn, self.meta)
+        # the current scope is ``verdicts``' job — history serves the
+        # scopes a rotated corpus left behind (or a shared store
+        # carries from earlier runs).
+        history.pop(self.meta["corpus_hash"], None)
         return GuideObs(
             round=self.rounds,
             spent=self.spent,
@@ -1719,6 +1746,7 @@ class GuideArena:
             remaining={k: self._remaining(k) for k in self.arms},
             arms={k: replace(s) for k, s in self.arms.items()},
             verdicts=verdicts,
+            history=history,
             corpus_size=len(self.ref.terms),
             scope_epoch=self.scope_epoch,
         )
@@ -2318,6 +2346,79 @@ class LearnedGuide(Guide):
         self.opt.step()
 
 
+def _no_instance_keys(obs: GuideObs) -> set[str]:
+    """Alpha keys whose newest verdict across scopes is no-instance.
+
+    The store's rendering of a ``no-instance`` adjudication is
+    ``numeric_true`` NULL with ``matches`` 0 — the candidate never
+    reached the oracle.  Current-scope rows outrank prior-scope ones
+    outright (a rotation is strictly later); among prior scopes the
+    newer ``ts`` wins.  The result approximates the live ``gap_gen``
+    target set — it can overcount keys already spent on a
+    ``gap-miss`` (the ``_gap_done`` bookkeeping is arena-side), so
+    callers must still check ``remaining["gap_gen"]``.
+    """
+    latest = {r["alpha_key"]: r for r in obs.verdicts.values()}
+    for scope in obs.history.values():
+        for key, row in scope.items():
+            if key in obs.verdicts:
+                continue  # a current-scope row is strictly newer
+            prev = latest.get(key)
+            if prev is None or row["ts"] >= prev["ts"]:
+                latest[key] = row
+    return {
+        k
+        for k, r in latest.items()
+        if r["numeric_true"] is None and not r["matches"]
+    }
+
+
+class PriorAwareGuide(EnumerationGuide):
+    """Enumeration order plus one scope-history override.
+
+    The fixed order stays the baseline; the single informed move
+    reads ``obs.history`` — prior-scope verdicts grouped by the
+    ``corpus_hash`` they were measured under — and uses only the
+    corpus-invariant truth column.  When ``gap_gen`` is live, its
+    targets are the candidates whose newest verdict is
+    ``no-instance``; if one of them was measured TRUE under a prior
+    scope, the equality is already proven (``numeric_true`` is
+    corpus-invariant — the corpus supplied the instance, not the
+    truth) and the witness ``gap_gen`` synthesizes converts a
+    known-good candidate rather than a guess, so ``gap_gen`` takes
+    the allocation ahead of the fixed order.  Corpus-dependent
+    columns (``evidence.CORPUS_DEPENDENT_COLS`` — ``fires``,
+    ``paid``, ``verdict`` …) are deliberately never read: they were
+    measured on the prior corpus's probe set.
+
+    Within one run the trigger is structurally quiet: the corpus
+    only grows and the referee's dedup survives rotation, so a live
+    target's prior-scope rows are themselves all ``no-instance``.
+    The prior-TRUE target appears when the store outlives a corpus —
+    a shared ``conn`` across runs on different slices — which is
+    exactly the evidence a fresh scope otherwise loses.
+    """
+
+    def choose(self, obs: GuideObs) -> Allocation | None:
+        """Allocate ``gap_gen`` first while a prior-TRUE target lives."""
+        if self._prior_true_target(obs):
+            return Allocation("gap_gen", self.step)
+        return super().choose(obs)
+
+    @staticmethod
+    def _prior_true_target(obs: GuideObs) -> bool:
+        """Whether a live ``gap_gen`` target was TRUE under a prior scope."""
+        if obs.remaining.get("gap_gen", 0) <= 0:
+            return False
+        targets = _no_instance_keys(obs)
+        return any(
+            row["numeric_true"]
+            for scope in obs.history.values()
+            for key, row in scope.items()
+            if key in targets
+        )
+
+
 def run_guide(arena: GuideArena, guide: Guide, budget: int) -> dict:
     """Play the guide game until *budget* proposals are drawn.
 
@@ -2688,9 +2789,16 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
     if args.guide_corpus:
         # a second control: the same fixed schedule with the corpus
         # arms *first* — separates "corpus arms pay" from "a policy
-        # allocated better".
+        # allocated better".  ``prior-aware`` is the enumeration plus
+        # the scope-history override — on a fresh store it is exactly
+        # the enumeration (the trigger needs a store that outlives a
+        # corpus), so its row measures the seam's presence cost.
         guides["enum-corpus-first"] = lambda: EnumerationGuide(
             order=CORPUS_ARMS + ENUMERATION_ORDER,
+            step=args.guide_step,
+        )
+        guides["prior-aware"] = lambda: PriorAwareGuide(
+            order=ENUMERATION_ORDER + CORPUS_ARMS,
             step=args.guide_step,
         )
     # Inline the compare loop so the played arenas survive for the
