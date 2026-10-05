@@ -24,7 +24,8 @@ Each case exports + lowers + verifies through the same
 
 import pytest
 import torch
-from catopt_core.ir import IR, Op
+from catopt_core.egraph import Rewrite
+from catopt_core.ir import IR, Const, Op, TensorType, Var
 from catopt_discovery import intake as li
 from catopt_torch.adapters import TorchSink
 from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
@@ -704,3 +705,499 @@ def test_round3_chunk_noop_guard_now_fires():
     region = ev._guarded_evals(guard, iter(sites))
     assert region.accepted >= 1 and region.equal >= 1
     assert region.unequal == 0 and region.rhs_err == 0
+
+
+# ---------------------------------------------------------------------------
+#  Round 6 — corpus round 4: the wrap / mirror spellings
+# ---------------------------------------------------------------------------
+#
+# Round 3 fired the *left* view-identity guards.  The auto-cond set's
+# remaining inert guards are the *wrap* family
+# ``f(view(u), v) -> view(f(u, v))`` — true exactly when ``v``
+# broadcasts trivially into the view — plus the right-operand mirrors,
+# the shared-factor algebra laws, the neg/exp/square grammar finds and
+# the scalar-corner annihilators.  The round-4 workloads spell each
+# region with a real broadcast / gate / residual idiom.
+
+#: Round-4 workloads and the ops their exported term must carry.
+_R4_SPELLINGS = {
+    "ChannelGateBroadcast": {"unsqueeze", "mul"},
+    "LiftedScalarScale": {"unsqueeze", "mul"},
+    "HeadGateBroadcast": {"unsqueeze", "mul"},
+    "LiftedScalarScaleRight": {"unsqueeze", "mul"},
+    "LiftedScalarCenter": {"unsqueeze", "sub"},
+    "ContrastiveCenter": {"unsqueeze", "sub"},
+    "PairwiseSubLift": {"unsqueeze", "sub"},
+    "ScaledChunkProjection": {"chunk", "mul", "linear"},
+    "SingleChunkGate": {"chunk", "mul", "linear"},
+    "ChunkHalfScale": {"chunk", "mul", "linear"},
+    "NoopTransposeResidual": {"transpose", "add"},
+    "ScalarTransposeBias": {"transpose", "add"},
+    "Rank3TransposeAdd": {"transpose", "add"},
+    "SelectGateSum": {"select", "add"},
+    "SelectGateDiff": {"select", "sub"},
+    "SharedFactorMixture": {"mul", "add"},
+    "SharedFactorContrast": {"mul", "sub"},
+    "SharedFactorMixtureRight": {"mul", "add"},
+    "SharedFactorContrastRight": {"mul", "sub"},
+    "QuadraticFeature": {"mul", "add"},
+    "DoubleReshapeHead": {"reshape"},
+    "NegatedSum": {"neg", "add"},
+    "NegDistributeHead": {"neg", "add"},
+    "SubNegBias": {"sub", "neg"},
+    "NegatedScale": {"mul", "neg"},
+    "ExpProductHead": {"exp", "mul"},
+    "ExpSumHead": {"exp", "add"},
+    "SquareNegHead": {"square", "neg"},
+    "SquareMulHead": {"square", "mul"},
+    "SigmoidNegGate": {"sigmoid", "neg"},
+    "PowOneHead": {"pow"},
+    "SubAddFactorHead": {"sub"},
+    "DivAddHead": {"div", "add"},
+    "ScalarAnnihilator": {"mul"},
+    "ScalarSelfCancel": {"sub"},
+    "ScalarSelfRatio": {"div"},
+    "ScalarInverseSum": {"add", "neg"},
+}
+
+
+def _round4(name):
+    """Build the named round-4 candidate's ``(model, feed)``."""
+    w = {x.name: x for x in li.candidates()}[name]
+    model, x = w.build()
+    return model, (x if isinstance(x, tuple) else (x,))
+
+
+@pytest.mark.parametrize("name,ops", sorted(_R4_SPELLINGS.items()))
+def test_round4_workloads_verify(name, ops):
+    """A round-4 spelling exports, lowers and fp64-verifies."""
+    model, feed = _round4(name)
+    ir, vr = _export_lower_verify(model, feed)
+    present = {t.op for t in _ops_of(ir.root)}
+    assert ops <= present, (name, present)
+    assert vr.passed, vr
+
+
+def _fires(guard, name):
+    """Return the guarded region of *guard* over a round-4 term."""
+    from catopt_core.egraph.terms import _term_match
+    from catopt_discovery import evidence as ev
+    from catopt_discovery.shape_proposal import Schema, real_matches
+
+    torch.manual_seed(0)
+    model, feed = _round4(name)
+    ir, _ = export_to_ir(model.eval().double(), feed)
+    schema = Schema(guard.name, guard.lhs, guard.rhs)
+    matches = real_matches([ir.root], schema)
+    sites = [
+        (s, m) for m in matches if (s := _term_match(guard.lhs, m))
+    ]
+    assert sites, f"{name}: expected a site for {guard.name}"
+    return ev._guarded_evals(guard, iter(sites))
+
+
+def _wrap_guard(name, view, elem, view_kw, *, rhs=None):
+    """Build a ``elem(view(U), V) -> view(elem(U, V))`` wrap guard."""
+    lhs = Op.make(elem, Op.make(view, "U", **view_kw), "V")
+    wrapped = Op.make(view, Op.make(elem, "U", "V"), **view_kw)
+    return Rewrite(
+        name=name,
+        lhs=lhs,
+        rhs=wrapped if rhs is None else rhs,
+        cond=(
+            "bcast-eq",
+            ("unsq-out", "U", "A_dim"),
+            "V",
+            ("unsq-out", ("bcast", "U", "V"), "A_dim"),
+            ("unsq-out", ("bcast", "U", "V"), "A_dim"),
+        ),
+    )
+
+
+def test_round4_unsqueeze_wrap_l_now_fires():
+    """``mul_unsqueeze_l_w`` fires on a same-shape lifted gate.
+
+    The wrap ``mul(unsqueeze(u, d), v) -> unsqueeze(mul(u, v), d)``
+    holds exactly when ``v`` broadcasts trivially through the lift —
+    the round-4 ``ChannelGateBroadcast`` supplies a same-shape gate.
+    """
+    guard = _wrap_guard(
+        "mul_unsqueeze_l_w", "unsqueeze", "mul", {"dim": "A_dim"}
+    )
+    region = _fires(guard, "ChannelGateBroadcast")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_unsqueeze_wrap_r_now_fires():
+    """``mul_unsqueeze_r_w`` fires on a right-hand lifted gate."""
+    guard = Rewrite(
+        name="mul_unsqueeze_r_w",
+        lhs=Op.make("mul", "V", Op.make("unsqueeze", "U", dim="A_dim")),
+        rhs=Op.make("unsqueeze", Op.make("mul", "U", "V"), dim="A_dim"),
+        cond=(
+            "bcast-eq",
+            ("unsq-out", "U", "A_dim"),
+            "V",
+            ("unsq-out", ("bcast", "U", "V"), "A_dim"),
+            ("unsq-out", ("bcast", "U", "V"), "A_dim"),
+        ),
+    )
+    region = _fires(guard, "HeadGateBroadcast")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_sub_unsqueeze_wrap_now_fires():
+    """``sub_unsqueeze_l_w`` fires on a same-shape lifted centre."""
+    guard = Rewrite(
+        name="sub_unsqueeze_l_w",
+        lhs=Op.make("sub", Op.make("unsqueeze", "U", dim="A_dim"), "V"),
+        rhs=Op.make("unsqueeze", Op.make("sub", "U", "V"), dim="A_dim"),
+        cond=(
+            "bcast-eq",
+            ("unsq-out", "U", "A_dim"),
+            "V",
+            ("unsq-out", ("bcast", "U", "V"), "A_dim"),
+            ("unsq-out", ("bcast", "U", "V"), "A_dim"),
+        ),
+    )
+    region = _fires(guard, "ContrastiveCenter")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_double_unsqueeze_now_fires():
+    """``census:sub_unsqueeze`` fires on the lifted pairwise difference."""
+    guard = Rewrite(
+        name="census:sub_unsqueeze",
+        lhs=Op.make(
+            "sub",
+            Op.make("unsqueeze", "U", dim="V_dim"),
+            Op.make("unsqueeze", "V", dim="V_dim"),
+        ),
+        rhs=Op.make("unsqueeze", Op.make("sub", "U", "V"), dim="V_dim"),
+        cond=(
+            "bcast-eq",
+            ("unsq-out", "U", "V_dim"),
+            ("unsq-out", "V", "V_dim"),
+            ("unsq-out", ("bcast", "U", "V"), "V_dim"),
+            ("unsq-out", ("bcast", "U", "V"), "V_dim"),
+        ),
+    )
+    region = _fires(guard, "PairwiseSubLift")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_chunk_wrap_now_fires():
+    """``mul_chunk_r_w`` fires on a scalar-scaled chunk."""
+    guard = Rewrite(
+        name="mul_chunk_r_w",
+        lhs=Op.make(
+            "mul",
+            "V",
+            Op.make(
+                "chunk",
+                "U",
+                chunks="A_chunks",
+                dim="A_dim",
+                index="A_index",
+            ),
+        ),
+        rhs=Op.make(
+            "chunk",
+            Op.make("mul", "U", "V"),
+            chunks="A_chunks",
+            dim="A_dim",
+            index="A_index",
+        ),
+        cond=(
+            "bcast-eq",
+            ("chunk-out", "U", "A_chunks", "A_dim"),
+            "V",
+            ("chunk-out", ("bcast", "U", "V"), "A_chunks", "A_dim"),
+            ("chunk-out", ("bcast", "U", "V"), "A_chunks", "A_dim"),
+        ),
+    )
+    region = _fires(guard, "ScaledChunkProjection")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_chunk_right_noop_now_fires():
+    """``mul_chunk_r_id`` fires on a right-hand one-chunk split."""
+    guard = Rewrite(
+        name="mul_chunk_r_id",
+        lhs=Op.make(
+            "mul",
+            "V",
+            Op.make(
+                "chunk",
+                "U",
+                chunks="A_chunks",
+                dim="A_dim",
+                index="A_index",
+            ),
+        ),
+        rhs=Op.make("mul", "U", "V"),
+        cond=("attr-eq", "A_chunks", 1),
+    )
+    region = _fires(guard, "SingleChunkGate")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_transpose_right_noop_now_fires():
+    """``add_transpose_r_id`` fires on a right-hand no-op transpose."""
+    guard = Rewrite(
+        name="add_transpose_r_id",
+        lhs=Op.make(
+            "add",
+            "V",
+            Op.make("transpose", "U", dim0="A_dim0", dim1="A_dim1"),
+        ),
+        rhs=Op.make("add", "U", "V"),
+        cond=("axes-noop", "U", "A_dim0", "A_dim1"),
+    )
+    region = _fires(guard, "NoopTransposeResidual")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_transpose_right_wrap_now_fires():
+    """``add_transpose_r_w`` fires on a scalar plus a transposed map."""
+    guard = Rewrite(
+        name="add_transpose_r_w",
+        lhs=Op.make(
+            "add",
+            "V",
+            Op.make("transpose", "U", dim0="A_dim0", dim1="A_dim1"),
+        ),
+        rhs=Op.make(
+            "transpose",
+            Op.make("add", "U", "V"),
+            dim0="A_dim0",
+            dim1="A_dim1",
+        ),
+        cond=(
+            "and",
+            (
+                "bcast-eq",
+                ("transpose-out", "U", "A_dim0", "A_dim1"),
+                "V",
+                (
+                    "transpose-out",
+                    ("bcast", "U", "V"),
+                    "A_dim0",
+                    "A_dim1",
+                ),
+                (
+                    "transpose-out",
+                    ("bcast", "U", "V"),
+                    "A_dim0",
+                    "A_dim1",
+                ),
+            ),
+            (
+                "or",
+                ("axes-noop", "V", "A_dim0", "A_dim1"),
+                ("rank", "V", "<=", 1),
+            ),
+        ),
+    )
+    region = _fires(guard, "ScalarTransposeBias")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_select_add_now_fires():
+    """``select_add`` fires on two summed channel slices."""
+    guard = Rewrite(
+        name="select_add",
+        lhs=Op.make(
+            "add",
+            Op.make("select", "A", dim="D", index="I"),
+            Op.make("select", "B", dim="D", index="I"),
+        ),
+        rhs=Op.make(
+            "select", Op.make("add", "A", "B"), dim="D", index="I"
+        ),
+        cond=(
+            "and",
+            ("axis-align-eq", "A", "B", "D"),
+            (
+                "bcast-eq",
+                ("select-out", "A", "D"),
+                ("select-out", "B", "D"),
+                ("select-out", ("bcast", "A", "B"), "D"),
+                ("select-out", ("bcast", "A", "B"), "D"),
+            ),
+        ),
+    )
+    region = _fires(guard, "SelectGateSum")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_shared_factor_now_fires():
+    """``factor_left`` fires on a two-expert elementwise mixture."""
+    guard = Rewrite(
+        name="factor_left",
+        lhs=Op.make(
+            "add",
+            Op.make("mul", "A", "B"),
+            Op.make("mul", "A", "C"),
+        ),
+        rhs=Op.make("mul", "A", Op.make("add", "B", "C")),
+        cond=True,
+    )
+    region = _fires(guard, "SharedFactorMixture")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_false_mul_factor_self_product_now_fires():
+    """``FALSE_mul_factor``'s ``term-eq`` region fires on ``d*d + d*e``."""
+    guard = Rewrite(
+        name="FALSE_mul_factor",
+        lhs=Op.make(
+            "add",
+            Op.make("mul", "M0", "M1"),
+            Op.make("mul", "M0", "M2"),
+        ),
+        rhs=Op.make("mul", "M0", Op.make("add", "M0", "M2")),
+        cond=("term-eq", "M0", "M1"),
+    )
+    region = _fires(guard, "QuadraticFeature")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round4_scalar_corner_now_fires():
+    """``sub_self``'s ``rank == 0`` region fires on a scalar input."""
+    guard = Rewrite(
+        name="sub_self",
+        lhs=Op.make("sub", "A", "A"),
+        rhs=Const(0),
+        cond=("rank", "A", "==", 0),
+    )
+    region = _fires(guard, "ScalarSelfCancel")
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+# -- the seven guards that stay inert: structural, not a corpus gap --
+
+
+def test_round4_full_extent_slice_folds_to_alias():
+    """A full-extent slice exports as ``alias`` — no ``slice`` node.
+
+    ``mul_slice_l_id`` / ``_r_id`` need ``start == 0`` and
+    ``end == size(dim)``; ``torch.export`` folds every such slice to
+    ``alias``, so the LHS's ``slice`` operand never appears in a real
+    term.  The round-4 ``DoubleReshapeHead`` and the pre-round-4
+    ``FullSliceScale`` both confirm it.
+    """
+
+    class M(torch.nn.Module):
+        def forward(self, x, v):
+            return x[:, : x.shape[1], :] * v
+
+    ir, _ = export_to_ir(
+        M().eval(),
+        (
+            torch.randn(2, 4, 8, dtype=torch.float64),
+            torch.randn(2, 4, 8, dtype=torch.float64),
+        ),
+    )
+    ops = {t.op for t in _ops_of(ir.root)}
+    assert "alias" in ops and "slice" not in ops
+
+
+def test_round4_getitem_needs_a_tuple_returning_op():
+    """``getitem`` only arises from tuple-returning ops, never a leaf.
+
+    The ``getitem``-family guards (``add_getitem_l_w``,
+    ``eq_getitem_l_w``, ``eq_getitem_l_id``, ``census:add_getitem``)
+    all require ``leaf(U)``.  ``x[0]`` / ``x[:, 0]`` export as
+    ``select``, not ``getitem``, and ``getitem`` appears only when a
+    tuple-returning op (``var_mean``, ``topk``, …) is indexed — whose
+    operand is a compound, never a leaf.  The guard's region is
+    structurally empty.
+    """
+
+    class Sel(torch.nn.Module):
+        def forward(self, x):
+            return x[0] * 2.0
+
+    class Tup(torch.nn.Module):
+        def forward(self, x):
+            return torch.var_mean(x, dim=-1)[1] * 2.0
+
+    feed = (torch.randn(4, 8, dtype=torch.float64),)
+    ir_sel, _ = export_to_ir(Sel().eval(), feed)
+    ir_tup, _ = export_to_ir(Tup().eval(), feed)
+    sel_ops = {t.op for t in _ops_of(ir_sel.root)}
+    tup_ops = {t.op for t in _ops_of(ir_tup.root)}
+    assert "select" in sel_ops and "getitem" not in sel_ops
+    assert "getitem" in tup_ops and "var_mean" in tup_ops
+
+
+def test_round4_zero_left_canonicalises_to_zero_right():
+    """``0 * x`` exports as ``mul(x, 0)`` — no left-zero form.
+
+    ``grammar:mul_zero_left``'s LHS is ``mul(Const(0), M0)``; torch
+    canonicalises ``0 * x`` to ``mul(x, 0)``, so the left-zero
+    spelling never survives to the boundary.
+    """
+
+    class M(torch.nn.Module):
+        def forward(self, x):
+            return 0 * x
+
+    ir, _ = export_to_ir(
+        M().eval(), (torch.randn(4, 8, dtype=torch.float64),)
+    )
+    muls = [t for t in _ops_of(ir.root) if t.op == "mul"]
+    assert muls, "expected a mul node"
+    # The zero lands on the right; no ``mul(Const(0), x)`` survives.
+    assert all(isinstance(m.args[1], Const) for m in muls)
+    assert not any(isinstance(m.args[0], Const) for m in muls)
+
+
+# ---------------------------------------------------------------------------
+#  Shape-inference robustness — a string attr metavariable declines
+# ---------------------------------------------------------------------------
+#
+#  The guarded-region sweep enumerates a law pattern before
+#  instantiation, when attribute metavariables are still *string names*
+#  (``unsqueeze(k, dim="UDk")``).  Shape inference must decline on them,
+#  not raise: ``gqa_absorb_repeat``'s unsqueeze reached
+#  ``_infer_op_shape``'s ``d % (rank + 1)`` and crashed the whole sweep
+#  with ``TypeError: not all arguments converted during string
+#  formatting`` (recorded in project/retros/derivable-gate.md).
+
+
+def test_infer_op_shape_declines_on_str_attr_metavar():
+    """``_infer_op_shape`` returns ``None`` (unknown), not a TypeError,
+    when an axis attribute is still a string metavariable name."""
+    from catopt_core.typing import _infer_op_shape
+
+    unsq = Op.make("unsqueeze", Var("k", TensorType((2, 3))), dim="UDk")
+    assert _infer_op_shape(unsq) is None
+
+
+def test_gqa_absorb_repeat_sweep_no_longer_crashes():
+    """The real ``gqa_absorb_repeat`` pattern — whose
+    ``unsqueeze``/``expand``/``reshape`` carry string attr metavars —
+    now sweeps without raising (the guard is total; it simply declines
+    the uninstantiated bindings)."""
+    from catopt_core.laws import ALL_RULES
+    from catopt_discovery import evidence as ev
+
+    rule = next(r for r in ALL_RULES if r.name == "gqa_absorb_repeat")
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=120)
+    )
+    assert region.guard_err == 0

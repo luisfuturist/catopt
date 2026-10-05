@@ -1826,6 +1826,478 @@ class _MatrixInverse(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+#  Round 4 — the wrap / mirror spellings the inert guards need
+# ---------------------------------------------------------------------------
+#
+# Round 3 fired the *left* view-identity guards (``mul_unsqueeze_l_id``
+# &c.).  The auto-cond set's remaining inert guards are the *wrap*
+# family ``f(view(u), v) -> view(f(u, v))`` — true exactly when ``v``
+# broadcasts trivially into the view — plus the right-operand mirrors,
+# the shared-factor algebra laws, the neg/exp/square grammar finds and
+# the scalar-corner annihilators.  Each workload below spells one of
+# those regions with a real broadcast / gate / residual idiom; the
+# ``_w`` guards need ``v`` scalar or the same shape as the viewed
+# operand, so every spelling is a genuine broadcast, not a synthetic
+# term.
+
+
+class _ChannelGateBroadcast(nn.Module):
+    """Squeeze-excitation reweighting with a lifted batch axis.
+
+    ``x.unsqueeze(0) * g`` with ``g`` the same shape as the feature
+    map — the unsqueeze is broadcast-inert, the ``mul_unsqueeze_l_w``
+    wrap region.
+    """
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Reweight the lifted feature map by the channel gate."""
+        return x.unsqueeze(0) * g
+
+
+class _LiftedScalarScale(nn.Module):
+    """A learned scalar output scale on a lifted feature map.
+
+    ``x.unsqueeze(0) * s`` — the scalar broadcasts into the inserted
+    axis, so the lift commutes (``mul_unsqueeze_l_w``).
+    """
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Scale the lifted map by the scalar."""
+        return x.unsqueeze(0) * s
+
+
+class _HeadGateBroadcast(nn.Module):
+    """Per-head gate broadcast under a leading head-axis lift.
+
+    ``g * x.unsqueeze(0)`` — the gate carries the head shape and the
+    leading unsqueeze is broadcast-inert (``mul_unsqueeze_r_w``).
+    """
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Gate the head tensor through the leading lift."""
+        return g * x.unsqueeze(0)
+
+
+class _LiftedScalarScaleRight(nn.Module):
+    """A scalar scale applied left of a trailing lift.
+
+    ``s * x.unsqueeze(-1)`` — the right-operand mirror of
+    :class:`_LiftedScalarScale` (``mul_unsqueeze_r_w``).
+    """
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Scale the lifted tensor by the scalar."""
+        return s * x.unsqueeze(-1)
+
+
+class _LiftedScalarCenter(nn.Module):
+    """Centre a lifted map by a scalar offset.
+
+    ``x.unsqueeze(0) - s`` — the scalar broadcasts through the lift
+    (``sub_unsqueeze_l_w``).
+    """
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Subtract the scalar offset from the lifted map."""
+        return x.unsqueeze(0) - s
+
+
+class _ContrastiveCenter(nn.Module):
+    """Centre a lifted map by a same-shape running mean.
+
+    ``x.unsqueeze(0) - m`` — the mean broadcasts trivially, the
+    ``sub_unsqueeze_l_w`` region.
+    """
+
+    def forward(self, x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        """Subtract the running mean from the lifted map."""
+        return x.unsqueeze(0) - m
+
+
+class _PairwiseSubLift(nn.Module):
+    """Pairwise differences under an explicit batch-axis lift.
+
+    ``x.unsqueeze(0) - y.unsqueeze(0)`` — both operands lifted the
+    same way, the ``census:sub_unsqueeze`` region.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return the lifted pairwise difference."""
+        return x.unsqueeze(0) - y.unsqueeze(0)
+
+
+class _ScaledChunkProjection(nn.Module):
+    """A scalar-scaled half of a doubled projection.
+
+    ``s * proj(x).chunk(2, -1)[0]`` — the scalar broadcasts into the
+    chunk, the ``mul_chunk_r_w`` region.
+    """
+
+    def __init__(self, d: int) -> None:
+        """Build the doubled projection."""
+        super().__init__()
+        self.proj = nn.Linear(d, 2 * d)
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Scale the first half of the doubled projection."""
+        return s * self.proj(x).chunk(2, dim=-1)[0]
+
+
+class _SingleChunkGate(nn.Module):
+    """A gate on the sole chunk of a projection.
+
+    ``g * proj(x).chunk(1, -1)[0]`` — the one-chunk split is a no-op,
+    so both the ``mul_chunk_r_id`` (``chunks == 1``) and the
+    ``mul_chunk_r_w`` guards fire.
+    """
+
+    def __init__(self, d: int) -> None:
+        """Build the projection."""
+        super().__init__()
+        self.proj = nn.Linear(d, d)
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Gate the sole chunk of the projection."""
+        return g * self.proj(x).chunk(1, dim=-1)[0]
+
+
+class _ChunkHalfScale(nn.Module):
+    """A scalar scale on the second half of a split projection.
+
+    ``s * proj(x).chunk(2, -1)[1]`` — the ``mul_chunk_r_w`` region at
+    chunk index 1.
+    """
+
+    def __init__(self, d: int) -> None:
+        """Build the doubled projection."""
+        super().__init__()
+        self.proj = nn.Linear(d, 2 * d)
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Scale the second half of the doubled projection."""
+        return s * self.proj(x).chunk(2, dim=-1)[1]
+
+
+class _NoopTransposeResidual(nn.Module):
+    """A residual add against a no-op-transposed singleton map.
+
+    ``v + x.transpose(-1, -2)`` with ``x`` shaped ``(C, 1, 1)`` — the
+    swapped axes are both size one, the ``add_transpose_r_id`` region.
+    """
+
+    def forward(self, v: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Add the swapped singleton map into the residual."""
+        return v + x.transpose(-1, -2)
+
+
+class _ScalarTransposeBias(nn.Module):
+    """A scalar bias added to a transposed map.
+
+    ``s + x.transpose(-1, -2)`` — the scalar has rank 0, so the
+    transpose commutes out (``add_transpose_r_w``).
+    """
+
+    def forward(self, s: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Add the scalar bias to the transposed map."""
+        return s + x.transpose(-1, -2)
+
+
+class _Rank3TransposeAdd(nn.Module):
+    """A rank-3 broadcast added to a no-op transposed map.
+
+    ``v + x.transpose(-1, -2)`` with ``v`` shaped ``(1, C, 1, 1)`` —
+    the ``rank(V) <= 1`` disjunct of ``add_transpose_r_w`` never holds,
+    but ``axes-noop(V)`` does (both swapped axes are size one).
+    """
+
+    def forward(self, v: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Broadcast the rank-3 map into the transposed residual."""
+        return v + x.transpose(-1, -2)
+
+
+class _SelectGateSum(nn.Module):
+    """Sum two channel slices under a shared select.
+
+    ``x[:, 0] + y[:, 0]`` — the select commutes with the add
+    (``select_add``).
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Add the first channel of both maps."""
+        return x[:, 0] + y[:, 0]
+
+
+class _SelectGateDiff(nn.Module):
+    """Difference of two channel slices under a shared select.
+
+    ``x[:, 0] - y[:, 0]`` — the ``select_sub`` naturality.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Subtract the first channel of the second map."""
+        return x[:, 0] - y[:, 0]
+
+
+class _SharedFactorMixture(nn.Module):
+    """A two-expert elementwise mixture on a shared input.
+
+    ``x * w1 + x * w2`` — the shared left factor, ``factor_left``.
+    """
+
+    def forward(
+        self, x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+    ) -> torch.Tensor:
+        """Sum the two multiplicative gates of the shared input."""
+        return x * w1 + x * w2
+
+
+class _SharedFactorContrast(nn.Module):
+    """A two-expert elementwise contrast on a shared input.
+
+    ``x * w1 - x * w2`` — the shared left factor under subtraction,
+    ``factor_sub_left``.
+    """
+
+    def forward(
+        self, x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+    ) -> torch.Tensor:
+        """Subtract the second multiplicative gate of the shared input."""
+        return x * w1 - x * w2
+
+
+class _SharedFactorMixtureRight(nn.Module):
+    """A two-expert mixture with the shared factor on the right.
+
+    ``w1 * x + w2 * x`` — ``factor_right``.
+    """
+
+    def forward(
+        self, x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+    ) -> torch.Tensor:
+        """Sum the two right-hand multiplicative gates."""
+        return w1 * x + w2 * x
+
+
+class _SharedFactorContrastRight(nn.Module):
+    """A two-expert contrast with the shared factor on the right.
+
+    ``w1 * x - w2 * x`` — ``factor_sub_right``.
+    """
+
+    def forward(
+        self, x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+    ) -> torch.Tensor:
+        """Subtract the two right-hand multiplicative gates."""
+        return w1 * x - w2 * x
+
+
+class _QuadraticFeature(nn.Module):
+    """A quadratic feature: self-product plus a cross term.
+
+    ``d * d + d * e`` — the ``FALSE_mul_factor`` guard's ``term-eq``
+    region (``M0 == M1``) and ``factor_left``.
+    """
+
+    def forward(self, d: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+        """Return the squared plus cross feature."""
+        return d * d + d * e
+
+
+class _DoubleReshapeHead(nn.Module):
+    """A head that flattens through two reshapes.
+
+    ``x.reshape(a, b, c).reshape(a, b * c)`` — ``reshape_reshape``.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Flatten the two trailing axes in two steps."""
+        a, b, c = x.shape
+        return x.reshape(a, b, c).reshape(a, b * c)
+
+
+class _NegatedSum(nn.Module):
+    """A sum of two negated operands.
+
+    ``(-x) + (-y)`` — ``neg_add``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Add the two negated operands."""
+        return (-x) + (-y)
+
+
+class _NegDistributeHead(nn.Module):
+    """A negated sum spelled as a distribution.
+
+    ``-(x + y)`` — ``grammar:neg_distribute``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Negate the sum of the operands."""
+        return -(x + y)
+
+
+class _SubNegBias(nn.Module):
+    """A subtract of a negated bias.
+
+    ``x - (-y)`` — ``sub_neg``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Subtract the negated bias."""
+        return x - (-y)
+
+
+class _NegatedScale(nn.Module):
+    """A scale by a negated factor.
+
+    ``(-x) * y`` — ``mul_neg_left``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Scale by the negated factor."""
+        return (-x) * y
+
+
+class _ExpProductHead(nn.Module):
+    """A product of exponentials.
+
+    ``exp(x) * exp(y)`` — ``exp_add``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return the product of the exponentials."""
+        return torch.exp(x) * torch.exp(y)
+
+
+class _ExpSumHead(nn.Module):
+    """An exponential of a sum.
+
+    ``exp(x + y)`` — ``grammar:exp_distribute``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return the exponential of the summed operands."""
+        return torch.exp(x + y)
+
+
+class _SquareNegHead(nn.Module):
+    """A square of a negated operand.
+
+    ``square(-x)`` — ``square_neg``.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the square of the negated operand."""
+        return torch.square(-x)
+
+
+class _SquareMulHead(nn.Module):
+    """A square of a product.
+
+    ``square(x * y)`` — ``grammar:square_mul``.
+    """
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return the square of the product."""
+        return torch.square(x * y)
+
+
+class _SigmoidNegGate(nn.Module):
+    """A sigmoid of a negated logit.
+
+    ``sigmoid(-x)`` — ``grammar:sigmoid_neg`` (``= 1 - sigmoid(x)``).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the sigmoid of the negated logit."""
+        return torch.sigmoid(-x)
+
+
+class _PowOneHead(nn.Module):
+    """A power-one passthrough.
+
+    ``x ** 1`` — ``grammar:pow_one``.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the power-one passthrough."""
+        return x**1
+
+
+class _SubAddFactorHead(nn.Module):
+    """A doubly-subtracted reduction.
+
+    ``(x - y) - z`` — ``grammar:sub_add_factor``.
+    """
+
+    def forward(
+        self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+    ) -> torch.Tensor:
+        """Subtract the two operands in sequence."""
+        return (x - y) - z
+
+
+class _DivAddHead(nn.Module):
+    """A divided sum.
+
+    ``(x + y) / z`` — ``grammar:div_add``.
+    """
+
+    def forward(
+        self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+    ) -> torch.Tensor:
+        """Divide the summed operands."""
+        return (x + y) / z
+
+
+class _ScalarAnnihilator(nn.Module):
+    """A scalar gated to zero.
+
+    ``s * 0`` on a rank-0 operand — ``mul_zero``'s ``rank(A) == 0``
+    region (the only binding where the scalar-literal RHS is
+    shape-equal).
+    """
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """Gate the scalar to zero."""
+        return s * 0
+
+
+class _ScalarSelfCancel(nn.Module):
+    """A scalar centred against itself.
+
+    ``s - s`` — ``sub_self``.
+    """
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """Return the scalar self-cancellation."""
+        return s - s
+
+
+class _ScalarSelfRatio(nn.Module):
+    """A scalar normalised by itself.
+
+    ``s / s`` — ``div_self``.
+    """
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """Return the scalar self-ratio."""
+        return s / s
+
+
+class _ScalarInverseSum(nn.Module):
+    """A scalar added to its own negation.
+
+    ``s + (-s)`` — ``add_inv``.
+    """
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """Return the scalar inverse sum."""
+        return s + (-s)
+
+
+# ---------------------------------------------------------------------------
 #  The candidate registry — thunks so import constructs nothing
 # ---------------------------------------------------------------------------
 
@@ -1840,8 +2312,12 @@ class Workload:
 
 
 def _r(*shape: int) -> torch.Tensor:
-    """Return a fresh fp64 CPU example input."""
-    return torch.randn(*shape, dtype=torch.float64)
+    """Return a fresh fp64 CPU example input.
+
+    Called with no shape it yields a rank-0 (scalar) tensor — the
+    binding the scalar-corner guards (``rank(A) == 0``) need.
+    """
+    return torch.randn(tuple(shape), dtype=torch.float64)
 
 
 def _enc_layer(d: int) -> nn.TransformerEncoderLayer:
@@ -2992,6 +3468,222 @@ def candidates() -> list[Workload]:
         Workload(
             "MatrixInverse",
             lambda: (_MatrixInverse(), _r(2, 8, 8)),
+            kind="compound",
+        ),
+        # --- round 4 — the unsqueeze-wrap (gated broadcast) family --
+        Workload(
+            "ChannelGateBroadcast",
+            lambda: (
+                _ChannelGateBroadcast(),
+                (_r(8, 8, 8), _r(8, 8, 8)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "LiftedScalarScale",
+            lambda: (_LiftedScalarScale(), (_r(8, 8, 8), _r())),
+            kind="compound",
+        ),
+        Workload(
+            "HeadGateBroadcast",
+            lambda: (_HeadGateBroadcast(), (_r(8, 8, 8), _r(8, 8, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "LiftedScalarScaleRight",
+            lambda: (_LiftedScalarScaleRight(), (_r(8, 8, 8), _r())),
+            kind="compound",
+        ),
+        Workload(
+            "LiftedScalarCenter",
+            lambda: (_LiftedScalarCenter(), (_r(8, 8, 8), _r())),
+            kind="compound",
+        ),
+        Workload(
+            "ContrastiveCenter",
+            lambda: (_ContrastiveCenter(), (_r(8, 8, 8), _r(8, 8, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "PairwiseSubLift",
+            lambda: (_PairwiseSubLift(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        # --- round 4 — chunked-projection mirrors -------------------
+        Workload(
+            "ScaledChunkProjection",
+            lambda: (_ScaledChunkProjection(d), (_r(4, d), _r())),
+            kind="compound",
+        ),
+        Workload(
+            "SingleChunkGate",
+            lambda: (_SingleChunkGate(d), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "ChunkHalfScale",
+            lambda: (_ChunkHalfScale(d), (_r(4, d), _r())),
+            kind="compound",
+        ),
+        # --- round 4 — transposed-add mirrors -----------------------
+        Workload(
+            "NoopTransposeResidual",
+            lambda: (
+                _NoopTransposeResidual(),
+                (_r(8, 1, 1), _r(8, 1, 1)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "ScalarTransposeBias",
+            lambda: (_ScalarTransposeBias(), (_r(), _r(8, 1, 1))),
+            kind="compound",
+        ),
+        Workload(
+            "Rank3TransposeAdd",
+            lambda: (
+                _Rank3TransposeAdd(),
+                (_r(1, 8, 1, 1), _r(8, 1, 1)),
+            ),
+            kind="compound",
+        ),
+        # --- round 4 — select naturality ----------------------------
+        Workload(
+            "SelectGateSum",
+            lambda: (_SelectGateSum(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "SelectGateDiff",
+            lambda: (_SelectGateDiff(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        # --- round 4 — shared-factor algebra ------------------------
+        Workload(
+            "SharedFactorMixture",
+            lambda: (
+                _SharedFactorMixture(),
+                (_r(4, 8), _r(4, 8), _r(4, 8)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "SharedFactorContrast",
+            lambda: (
+                _SharedFactorContrast(),
+                (_r(4, 8), _r(4, 8), _r(4, 8)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "SharedFactorMixtureRight",
+            lambda: (
+                _SharedFactorMixtureRight(),
+                (_r(4, 8), _r(4, 8), _r(4, 8)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "SharedFactorContrastRight",
+            lambda: (
+                _SharedFactorContrastRight(),
+                (_r(4, 8), _r(4, 8), _r(4, 8)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "QuadraticFeature",
+            lambda: (_QuadraticFeature(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        # --- round 4 — reshape / neg / exp / square grammar ---------
+        Workload(
+            "DoubleReshapeHead",
+            lambda: (_DoubleReshapeHead(), _r(2, 3, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "NegatedSum",
+            lambda: (_NegatedSum(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "NegDistributeHead",
+            lambda: (_NegDistributeHead(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "SubNegBias",
+            lambda: (_SubNegBias(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "NegatedScale",
+            lambda: (_NegatedScale(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "ExpProductHead",
+            lambda: (_ExpProductHead(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "ExpSumHead",
+            lambda: (_ExpSumHead(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "SquareNegHead",
+            lambda: (_SquareNegHead(), _r(4, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "SquareMulHead",
+            lambda: (_SquareMulHead(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "SigmoidNegGate",
+            lambda: (_SigmoidNegGate(), _r(4, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "PowOneHead",
+            lambda: (_PowOneHead(), _r(4, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "SubAddFactorHead",
+            lambda: (
+                _SubAddFactorHead(),
+                (_r(4, 8), _r(4, 8), _r(4, 8)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "DivAddHead",
+            lambda: (_DivAddHead(), (_r(4, 8), _r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        # --- round 4 — scalar-corner annihilators -------------------
+        Workload(
+            "ScalarAnnihilator",
+            lambda: (_ScalarAnnihilator(), _r()),
+            kind="compound",
+        ),
+        Workload(
+            "ScalarSelfCancel",
+            lambda: (_ScalarSelfCancel(), _r()),
+            kind="compound",
+        ),
+        Workload(
+            "ScalarSelfRatio",
+            lambda: (_ScalarSelfRatio(), _r()),
+            kind="compound",
+        ),
+        Workload(
+            "ScalarInverseSum",
+            lambda: (_ScalarInverseSum(), _r()),
             kind="compound",
         ),
     ]
