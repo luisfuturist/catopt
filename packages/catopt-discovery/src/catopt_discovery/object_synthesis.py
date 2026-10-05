@@ -137,9 +137,11 @@ def term_from_spec(spec: Any) -> Any:
 def fold_object(
     name: str,
     spelled: Any,
-    kernel: str,
+    kernel: Any,
     *,
     arg: str = "X",
+    cond: Any = None,
+    dspec: Any = None,
     kind: str = "abstraction",
     tags: Any = (_tags.SIMPLIFICATION,),
 ) -> ConstructedObject:
@@ -149,18 +151,39 @@ def fold_object(
     1)), "softsign")`` declares ``div(x, |x|+1) → softsign(x)`` — the
     fused kernel *is* the abstraction; the spelled form is its
     expansion.  *arg* names the metavariable the kernel wraps.
+
+    *kernel* also accepts a full term spec — the general fold
+    ``spelled → <term spec>`` for abstractions whose dispatched form
+    is not a unary kernel, e.g. the mask-free attention fold
+    ``matmul(softmax(q@kᵀ,·),v) → sdpa(q,k,v,scale=1)`` spelled as
+    ``("sdpa", "Q", "K", "V", {"scale": 1.0})``.  *cond* / *dspec*
+    carry the object's declarative side condition and derive spec —
+    pure data, the same serializable shape shipped ``cond=`` /
+    ``dspec=`` laws take; the gauntlet's guarded-region sweep reads
+    the cond to decide where the declared equality must hold.
     """
     lhs = term_from_spec(spelled)
-    rhs = Op.make(kernel, arg)
+    rhs = (
+        Op.make(kernel, arg)
+        if isinstance(kernel, str)
+        else term_from_spec(kernel)
+    )
     rule = Rewrite(
         name=name,
         lhs=lhs,
         rhs=rhs,
-        law=f"{kernel}({arg}) folds its spelled-out expansion",
+        law="the spelled composition folds to its dispatched form",
+        cond=cond,
+        dspec=dspec,
         tags=frozenset(tags),
     )
     return ConstructedObject(
-        rule=rule, kind=kind, construction=("fold", kernel)
+        rule=rule,
+        kind=kind,
+        construction=(
+            "fold",
+            kernel if isinstance(kernel, str) else repr(kernel),
+        ),
     )
 
 
@@ -171,6 +194,8 @@ def lift_object(
     apply_op: str,
     *,
     state: Any = None,
+    cond: Any = None,
+    dspec: Any = None,
     kind: str = "abstraction",
     tags: Any = (_tags.CARRIER,),
 ) -> ConstructedObject:
@@ -183,6 +208,9 @@ def lift_object(
     ("add", ("matmul", "A", "h"), "x"), ("aff", "A", "x"), "apply",
     state="h")`` declares the affine-step lift;
     ``state=None`` covers the unary applies (``om_apply``).
+    *cond* / *dspec* carry the object's declarative guard and derive
+    spec — e.g. the state-shape condition the diagonal-scan lifts
+    ship with (an economy guard, serializable as data).
     """
     lhs = term_from_spec(step)
     args = [term_from_spec(carrier)]
@@ -194,6 +222,8 @@ def lift_object(
         lhs=lhs,
         rhs=rhs,
         law=f"{apply_op} lift: the step is one carrier application",
+        cond=cond,
+        dspec=dspec,
         tags=frozenset(tags),
     )
     return ConstructedObject(
@@ -229,6 +259,8 @@ def compose_objects(
     first: Any,
     *rest: Any,
     specialize: dict | None = None,
+    cond: Any = None,
+    dspec: Any = None,
     kind: str = "abstraction",
     tags: Any = (),
 ) -> ConstructedObject | None:
@@ -250,6 +282,13 @@ def compose_objects(
     lift.  The composite's ``derivation`` names the premises —
     deduplicated, in firing order — so a composite over shipped rules
     can carry a replayable certificate.
+
+    *cond* / *dspec* declare the composite's own guard and derive spec
+    — the constructor's claim about where the composite is legal.
+    Full *cond*-transport (re-expressing each premise's condition over
+    the composite's metavars) is not wired in; the caller states the
+    guard the composite should carry and the gauntlet's guarded-region
+    sweep rules on it.
     """
     rules = [_as_rule(first), *(_as_rule(r) for r in rest)]
     subst = {
@@ -273,6 +312,8 @@ def compose_objects(
         lhs=lhs,
         rhs=cur,
         law="composite of " + " ∘ ".join(premises),
+        cond=cond,
+        dspec=dspec,
         tags=frozenset(tags),
         derivation=premises,
     )
