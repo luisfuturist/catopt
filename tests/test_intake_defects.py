@@ -412,3 +412,73 @@ def test_copy_family_unminted_src_declines():
     node = NS(target="copy_", args=(dst_fx, NS(name="unminted_src")))
     _handle_copy_(node, env)
     assert env["d"] == Op.make("zeros", shape=(4,), dtype="float64")
+
+
+# ---------------------------------------------------------------------------
+#  Round 3 — Const leaf spelling (``8`` vs ``8.0``) is structural identity
+# ---------------------------------------------------------------------------
+
+
+def test_const_int_float_spellings_are_distinct():
+    """``Const(8)`` and ``Const(8.0)`` are different leaves.
+
+    Python's numeric tower makes ``8 == 8.0``; a ``Const`` is a
+    structural object (the int-preservation contract in its docstring
+    exists because ``x % 2`` needs an int64 operand).  The dataclass
+    default ``__eq__``/``__hash__`` leaked that numeric equality into
+    structural identity: ``Op.make`` interning returned the
+    first-minted spelling, and ``EGraph.add_term``'s content-keyed
+    memo mapped the second ``Const`` onto the first's leaf e-class —
+    silently rewriting ``* 8.0`` into ``* 8`` in the graph.  The
+    e-graph's leaf-key convention (``repr``) is the invariant the
+    equality now matches.
+    """
+    from catopt_core.egraph import EGraph
+    from catopt_core.ir import Const
+
+    assert Const(8) != Const(8.0)
+    assert Const(8.0) == Const(8.0)
+    a = Op.make("mul", Const(8.0), Const(3))
+    b = Op.make("mul", Const(8), Const(3))
+    assert a is not b and a != b
+
+    eg = EGraph()
+    eg.add_term(Op.make("sub", Const(8), Const(8.0)))
+    keys = {
+        n.attrs[0][1]
+        for ec in eg._classes.values()
+        for n in ec.nodes
+        if n.op == "leaf"
+    }
+    assert {"8", "8.0"} <= keys
+
+
+def test_sinc_kernel_certificate_replays():
+    """``intake:SincKernel`` — mixed ``8``/``8.0`` leaves certify.
+
+    The Kaiser window spells the scale as ``8.0 *`` (float) and the
+    taper as ``t / 8`` (int), so the exported term carries both leaf
+    spellings.  Leaf coalescence put ``8.0``'s occurrences in the
+    ``8`` e-class, so ``comm_mul``'s recorded binding resolved to
+    ``Const(8)`` while the real subterm carries ``8.0`` — replay died
+    on "binding b tampered" under the base ruleset (no admitted
+    object involved).  With spelling-strict leaves the e-graph keeps
+    both classes and the derivation replays end to end.
+    """
+    from catopt_core.egraph import verify_certificate
+    from catopt_core.laws import ALL_RULES
+    from catopt_discovery.impact import _cert_ok, _cost_fn, _saturate
+    from catopt_discovery.intake import _SincKernel
+
+    d = 16
+    feed = (torch.randn(4, d, dtype=torch.float64),)
+    model = _SincKernel().eval().double()
+    ir, _tensors = export_to_ir(model, feed)
+    sink = TorchSink()
+    cost_fn = _cost_fn(sink)
+    eg, _root, best, _stats = _saturate(ir.root, list(ALL_RULES), cost_fn)
+    # The pipeline's base-ruleset certificate must replay on the
+    # source term — the intake failure was CertificateVerificationError.
+    assert _cert_ok(eg, ir.root, best, cost_fn) == "pass"
+    cert = eg.certificate(ir.root, best, cost_fn=cost_fn)
+    assert verify_certificate(ir.root, cert) is not None

@@ -83,13 +83,26 @@ class Var:
         return self.name
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Const:
     """A literal constant scalar.
 
     Int values are preserved (not coerced to float): ``x % 2`` must
     eval to an int64 operand or weak-type promotion goes wrong
     downstream.
+
+    Equality is *spelling-strict* — ``Const(8) != Const(8.0)`` —
+    because ``Const`` is a structural object, not a number: it is the
+    e-graph's leaf identity (``EGraph.add_leaf`` keys on
+    ``repr(term)``, ``_term_match`` compares ``repr``) and it is what
+    ``Op`` interning, ``add_term`` memos and every term-keyed dict
+    hash and compare on.  Python's numeric tower (``8 == 8.0``,
+    ``hash(8) == hash(8.0)``) leaking through the dataclass-default
+    ``__eq__`` silently coalesced ``Const(8)`` and ``Const(8.0)`` into
+    one interned object / one leaf e-class — a real dtype change in
+    the program.  Matchers that *want* numeric leaf leniency say so
+    explicitly: ``meta.match_pattern`` compares ``Const.value``
+    numerically for the identity laws.
     """
 
     value: int | float
@@ -97,6 +110,16 @@ class Const:
     def __repr__(self) -> str:
         """Return the constant's value as text."""
         return str(self.value)
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare leaf identity: same spelling, not just same number."""
+        if not isinstance(other, Const):
+            return NotImplemented
+        return repr(self.value) == repr(other.value)
+
+    def __hash__(self) -> int:
+        """Hash the leaf's repr — the same key the e-graph uses."""
+        return hash(repr(self.value))
 
 
 @dataclass(frozen=True)

@@ -389,11 +389,13 @@ def match_pattern(
     substitution dict or ``None``.
 
     Near-clone of :func:`catopt_core.egraph.terms._term_match`, kept
-    separate because the leaf compare genuinely differs: this uses
-    ``==`` (numeric equality — ``Const(0)`` matches ``Const(0.0)``,
-    which the identity rules rely on), while ``_term_match`` compares
-    ``repr`` — the e-graph's leaf-key convention, where ``"0" !=
-    "0.0"`` and two same-named Vars are one leaf regardless of type.
+    separate because the leaf compare genuinely differs: this compares
+    ``Const`` leaves *numerically* on ``.value`` (``Const(0)`` matches
+    ``Const(0.0)``, which the identity rules rely on — ``Const``
+    itself is spelling-strict, see its docstring), while
+    ``_term_match`` compares ``repr`` — the e-graph's leaf-key
+    convention, where ``"0" != "0.0"`` and two same-named Vars are one
+    leaf regardless of type.
     """
     if subst is None:
         subst = {}
@@ -427,7 +429,20 @@ def match_pattern(
             if subst is None:
                 return None
         return subst
-    return subst if pat == term else None
+    return subst if _leaf_eq(pat, term) else None
+
+
+def _leaf_eq(pat: Any, term: Any) -> bool:
+    """Leaf equality for :func:`match_pattern` — numeric on Const.
+
+    ``Const`` itself is spelling-strict (``Const(0) != Const(0.0)`` —
+    its ``__eq__`` is the e-graph's leaf-key identity); this matcher
+    keeps the numeric leniency the identity laws rely on by comparing
+    ``.value``.  Other leaves compare with ``==`` as before.
+    """
+    if isinstance(pat, Const) and isinstance(term, Const):
+        return pat.value == term.value
+    return pat == term
 
 
 def instantiate_pattern(pat: Any, subst: dict) -> Any:
