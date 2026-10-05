@@ -489,7 +489,12 @@ impl NativeCore {
                                 let mut nxt: Vec<Subst> = Vec::new();
                                 for cs in &attr_substs {
                                     match cs.get(&key) {
-                                        Some(SVal::Attr(av)) if av == nv => {
+                                        // lenient: the matcher accepts
+                                        // 0 for 0.0 — strict eq would
+                                        // break consistent-binding
+                                        Some(SVal::Attr(av))
+                                            if av.loose_eq(nv) =>
+                                        {
                                             nxt.push(cs.clone())
                                         }
                                         Some(SVal::Attr(_)) => {}
@@ -507,7 +512,9 @@ impl NativeCore {
                                 attr_substs = nxt;
                             }
                             PAttr::Lit(lit) => {
-                                if nv != lit {
+                                // lenient match — literal 0 accepts
+                                // attr 0.0 (Python parity)
+                                if !nv.loose_eq(lit) {
                                     attr_ok = false;
                                     break;
                                 }

@@ -25,7 +25,7 @@ from typing import Any, ClassVar
 import pytest
 from catopt_core import laws
 from catopt_core.cost import dag_cost, flops_cost
-from catopt_core.egraph import EGraph
+from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import (
     IR,
     Const,
@@ -503,6 +503,31 @@ def test_native_add_term_returns_same_shape() -> None:
     assert pe == ne == py.find(pe) == nat.find(ne)
     assert nat.n_enodes == py.n_enodes
     assert nat.n_classes == py.n_classes
+
+
+@requires_native
+def test_native_attr_spelling_strict_identity() -> None:
+    """``min=0`` and ``min=0.0`` intern to distinct enodes, like Python.
+
+    The Python side keys attr identity on ``repr`` (``ir.py``) —
+    numeric-tower equality must not merge the spellings.  The Rust
+    ``AttrVal`` mirrors it: variant-strict ``Eq``/``Hash``/``Ord``,
+    lenient only at match sites (``loose_eq``).
+    """
+    x = Var("x", TensorType((4,)))
+    t_int = Op.make("clamp", x, min=0, max=1)
+    t_float = Op.make("clamp", x, min=0.0, max=1)
+    nat = NativeEngine()
+    c_int = nat.add_term(t_int)
+    c_float = nat.add_term(t_float)
+    assert c_int != c_float
+
+    # matching stays lenient: a ``clamp(x, min=0, ...)`` pattern still
+    # binds ``min=0.0`` spellings (Python ``_leaf_eq`` parity)
+    pat = Op.make("clamp", "a", min=0, max=1)
+    rule = Rewrite("clamp_self", pat, "a")
+    nat.run([rule], c_float, max_iterations=4)
+    assert nat.rule_fires.get("clamp_self", 0) >= 1
 
 
 @requires_native

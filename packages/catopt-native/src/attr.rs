@@ -3,9 +3,11 @@
 //!
 //! Mirrors the Python semantics of ``catopt_core.egraph.types``:
 //! attribute values are ints, floats, bools, strings, tuples or None.
-//! Equality follows Python (``1 == 1.0 == True`` numerically); the hash
-//! is canonical so equal values hash identically (``hash(1) ==
-//! hash(1.0)`` in Python — we normalise the same way).
+//! Identity is *spelling-strict* — ``Int(1)``, ``Float(1.0)`` and
+//! ``Bool(true)`` are distinct enode members (Python: ``repr``-keyed
+//! ``_attr_key``/``Op.__eq__``; ``0.0`` != ``-0.0``; NaN is reflexive).
+//! Matching stays numerically lenient through ``loose_eq`` — the same
+//! split Python keeps between identity and the match sites.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyFloat, PyInt, PyList, PyString, PyTuple};
@@ -34,15 +36,18 @@ impl AttrVal {
         }
     }
 
-    /// Rank used for the deterministic total order (member iteration in
-    /// Rust is BTreeSet-ordered; Python iterates hash sets, so any
-    /// canonical order is equally faithful — we just need one).
+    /// Rank used for the deterministic total order — one rank per
+    /// variant so ``Ord`` agrees with the strict ``Eq`` partition
+    /// (``BTreeSet`` dedup runs through ``Ord``, so a lenient order
+    /// would merge ``0``/``0.0`` enodes even with strict equality).
     fn rank(&self) -> u8 {
         match self {
             AttrVal::None => 0,
-            AttrVal::Bool(_) | AttrVal::Int(_) | AttrVal::Float(_) => 1,
-            AttrVal::Str(_) => 2,
-            AttrVal::Tuple(_) => 3,
+            AttrVal::Bool(_) => 1,
+            AttrVal::Int(_) => 2,
+            AttrVal::Float(_) => 3,
+            AttrVal::Str(_) => 4,
+            AttrVal::Tuple(_) => 5,
         }
     }
 
@@ -114,12 +119,15 @@ impl AttrVal {
     }
 }
 
-impl PartialEq for AttrVal {
-    fn eq(&self, other: &AttrVal) -> bool {
+impl AttrVal {
+    /// Numerically lenient equality — the *matcher* contract: Python's
+    /// match sites deliberately accept ``0`` for ``0.0`` (the
+    /// ``match_pattern`` / ``_term_match`` attr leniency is docstring-
+    /// pinned there).  Use only at match points, never for identity —
+    /// interning/dedup go through the strict ``==``/``Hash``/``Ord``.
+    pub fn loose_eq(&self, other: &AttrVal) -> bool {
         match (self.as_f64(), other.as_f64()) {
             (Some(a), Some(b)) => {
-                // Python numeric equality; for i64-exact compare keep
-                // integer precision when both are ints.
                 if let (AttrVal::Int(x), AttrVal::Int(y)) = (self, other) {
                     return x == y;
                 }
@@ -128,9 +136,33 @@ impl PartialEq for AttrVal {
             _ => match (self, other) {
                 (AttrVal::None, AttrVal::None) => true,
                 (AttrVal::Str(a), AttrVal::Str(b)) => a == b,
-                (AttrVal::Tuple(a), AttrVal::Tuple(b)) => a == b,
+                (AttrVal::Tuple(a), AttrVal::Tuple(b)) => {
+                    a.len() == b.len()
+                        && a.iter().zip(b.iter()).all(|(x, y)| x.loose_eq(y))
+                }
                 _ => false,
             },
+        }
+    }
+}
+
+impl PartialEq for AttrVal {
+    /// Strict (repr-keyed) identity — mirrors Python's ``Op.__eq__`` /
+    /// ``_attr_key`` post the attr-interning fix: ``Int(1)``,
+    /// ``Float(1.0)`` and ``Bool(true)`` are distinct; ``0.0`` !=
+    /// ``-0.0``; every NaN compares equal (Python ``repr`` keys them
+    /// all as ``"nan"``).
+    fn eq(&self, other: &AttrVal) -> bool {
+        match (self, other) {
+            (AttrVal::None, AttrVal::None) => true,
+            (AttrVal::Bool(a), AttrVal::Bool(b)) => a == b,
+            (AttrVal::Int(a), AttrVal::Int(b)) => a == b,
+            (AttrVal::Float(a), AttrVal::Float(b)) => {
+                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+            }
+            (AttrVal::Str(a), AttrVal::Str(b)) => a == b,
+            (AttrVal::Tuple(a), AttrVal::Tuple(b)) => a == b,
+            _ => false,
         }
     }
 }
@@ -141,32 +173,30 @@ impl Hash for AttrVal {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             AttrVal::None => state.write_u8(0),
-            // All numerics hash through a canonical form so that
-            // Int(1), Float(1.0) and Bool(true) collide identically
-            // (Python: hash(1) == hash(1.0) == hash(True)).
+            // Strict: the tag distinguishes Bool/Int/Float so the hash
+            // agrees with the repr-keyed ``==`` partition.
             AttrVal::Bool(b) => {
                 state.write_u8(1);
-                state.write_i64(if *b { 1 } else { 0 });
+                b.hash(state);
             }
             AttrVal::Int(i) => {
-                state.write_u8(1);
-                state.write_i64(*i);
+                state.write_u8(2);
+                i.hash(state);
             }
             AttrVal::Float(f) => {
-                state.write_u8(1);
-                let v = if *f == 0.0 { 0.0 } else { *f }; // -0.0 == 0.0
-                if v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
-                    state.write_i64(v as i64);
-                } else {
-                    state.write_u64(v.to_bits());
-                }
+                state.write_u8(3);
+                // bits distinguish 0.0/-0.0; all NaN payloads share
+                // one canonical hash (repr "nan").
+                let bits =
+                    if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+                state.write_u64(bits);
             }
             AttrVal::Str(s) => {
-                state.write_u8(2);
+                state.write_u8(4);
                 s.hash(state);
             }
             AttrVal::Tuple(items) => {
-                state.write_u8(3);
+                state.write_u8(5);
                 items.hash(state);
             }
         }
@@ -187,13 +217,14 @@ impl Ord for AttrVal {
         }
         match (self, other) {
             (AttrVal::None, AttrVal::None) => Ordering::Equal,
-            // Numeric ordering across int/float/bool.
-            (a, b) if a.as_f64().is_some() && b.as_f64().is_some() => {
-                if let (AttrVal::Int(x), AttrVal::Int(y)) = (self, other) {
-                    return x.cmp(y);
-                }
-                let (fa, fb) = (a.as_f64().unwrap(), b.as_f64().unwrap());
-                fa.partial_cmp(&fb).unwrap_or(Ordering::Equal)
+            (AttrVal::Bool(a), AttrVal::Bool(b)) => a.cmp(b),
+            (AttrVal::Int(a), AttrVal::Int(b)) => a.cmp(b),
+            // IEEE total order; NaN payloads canonicalise (consistent
+            // with the nan-reflexive ``Eq``).
+            (AttrVal::Float(a), AttrVal::Float(b)) => {
+                let fa = if a.is_nan() { f64::NAN } else { *a };
+                let fb = if b.is_nan() { f64::NAN } else { *b };
+                fa.total_cmp(&fb)
             }
             (AttrVal::Str(a), AttrVal::Str(b)) => a.cmp(b),
             (AttrVal::Tuple(a), AttrVal::Tuple(b)) => a.cmp(b),
