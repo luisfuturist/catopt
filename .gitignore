@@ -72,3 +72,4 @@ mutants/
 tools/intake_corpus.json
 tools/intake_tensors.pt
 tools/evidence.db
+packages/catopt-native/target/
