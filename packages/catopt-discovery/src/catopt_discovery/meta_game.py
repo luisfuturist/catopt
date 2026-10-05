@@ -1308,7 +1308,7 @@ def train(
         hist.append(r)
         if log_every and (ep + 1) % log_every == 0:
             lo = max(0, ep + 1 - log_every)
-            print(
+            print(  # stdout-compat
                 f"  ep {ep + 1:>4}: mean reward "
                 f"{sum(hist[lo:]) / (ep + 1 - lo):.3f} "
                 f"(baseline {baseline:.3f}, "
@@ -1661,6 +1661,10 @@ class GuideArena:
         #: target set is those whose latest verdict is
         #: ``no-instance`` (the corpus never gave them a match).
         self._candidates: dict = {}
+        #: Which arm minted each adjudicated candidate — the
+        #: admission pass attributes a ``usable`` object to the arm
+        #: that found it.
+        self._cand_arm: dict = {}
         self._gap_targets: dict = {}
         self._gap_done: set = set()
         if not gen_cap:
@@ -2036,6 +2040,7 @@ class GuideArena:
         if proposal is not None:
             check, derive = proposal.check, proposal.derive
         self._candidates[key] = (lhs, rhs, check, derive)
+        self._cand_arm[key] = arm
         if v.reason == "no-instance":
             self._gap_targets[key] = None
         else:
@@ -2320,9 +2325,16 @@ def run_guide(arena: GuideArena, guide: Guide, budget: int) -> dict:
     draws and referees them; the guide observes the mean verdict
     score as reward.  The game ends when the budget is spent, the
     guide stops (``None``), or it allocates to a drained arm.
+
+    The returned summary carries ``"trace"`` — the allocation
+    sequence (arm, draws, batch score, and the ``gap_gen`` targets
+    live at choose time) — so a run's *schedule* is reportable, not
+    only its tallies.
     """
+    trace: list[dict] = []
     while arena.spent < budget:
-        alloc = guide.choose(arena.observation(budget))
+        obs = arena.observation(budget)
+        alloc = guide.choose(obs)
         if alloc is None:
             break
         n = min(alloc.n, budget - arena.spent)
@@ -2330,8 +2342,19 @@ def run_guide(arena: GuideArena, guide: Guide, budget: int) -> dict:
         if not verdicts:
             break
         reward = sum(v.score for v in verdicts) / len(verdicts)
+        trace.append(
+            {
+                "round": obs.round,
+                "arm": alloc.generator,
+                "drawn": len(verdicts),
+                "score": reward,
+                "gap_targets": obs.remaining.get("gap_gen", 0),
+            }
+        )
         guide.update(reward, verdicts)
-    return arena.summary(budget)
+    s = arena.summary(budget)
+    s["trace"] = trace
+    return s
 
 
 def compare_guides(
@@ -2377,7 +2400,7 @@ def train_guide(
 
 
 def _pretrain_arm_guide(
-    make_arena: Callable[[], GuideArena],
+    make_arena: Callable[[int], GuideArena],
     args: argparse.Namespace,
 ) -> tuple[list[float] | None, dict[str, Callable[[], Guide]]]:
     """Run the ``--guide-episodes`` hook: train, freeze, register.
@@ -2386,15 +2409,197 @@ def _pretrain_arm_guide(
     frozen trained policy joins the comparison as
     ``learned-trained``, so its measured yield is attributable to
     the learned weights rather than in-run adaptation.
+
+    Training episodes roll *different-seeded* arenas
+    (``args.seed + 1 + ep``): a policy that memorizes one corpus-
+    growth stream is not a schedule, so the episodes sample the
+    stream family the eval arena (``args.seed``) is drawn from —
+    every eval board is one the trainer never played.
     """
     if not args.guide_episodes:
         return None, {}
     guide = LearnedGuide(step=args.guide_step)
+    ep = 0
+
+    def next_arena() -> GuideArena:
+        nonlocal ep
+        ep += 1
+        return make_arena(args.seed + ep)
+
     hist = train_guide(
-        make_arena, guide, args.guide_episodes, args.budget
+        next_arena, guide, args.guide_episodes, args.budget
     )
     frozen = guide.frozen()
     return hist, {"learned-trained": lambda g=frozen: g}
+
+
+def _guide_corpus(
+    args: argparse.Namespace,
+) -> tuple[list, list, list, dict, dict, Any]:
+    """Assemble the arena's corpus: cases, terms, census tables.
+
+    ``small`` is the legacy slice — a handful of named model and
+    bench cases (``_slice_cases``) for both the instance search and
+    the firing probe, and bench+models for the census pools.
+    ``full`` is the real corpus the pipeline measures: bench +
+    models + the intake side-file for the census and the instance
+    search (``intake.load_cases``), and the pipeline's own probe
+    set — models + ``intake.probe_cases()`` — for the firing
+    probe.  Returns ``(cases, ref_terms, all_terms, census_op,
+    counts, cts)`` — ``ref_terms`` is the referee's instance-search
+    list (the slice's own terms in ``small``, every real term in
+    ``full``) and ``all_terms`` the census corpus.
+    """
+    bench, _be = _bench_cases()
+    models, _me = model_cases()
+    if args.guide_slice == "full":
+        from catopt_discovery import intake as li
+
+        intake = li.load_cases()
+        src = [*bench, *models, *intake]
+        # the pipeline's probe set: real models plus the
+        # probe-eligible intake cases (feed-bearing, node-capped)
+        cases = [*models, *li.probe_cases()]
+    else:
+        src = [*bench, *models]
+        cases = _slice_cases(bench, models)
+    cts = [CorpusTerm(c.source, c.name, c.term) for c in src]
+    counts, _tc = op_tuple_census(cts)
+    all_terms = [c.term for c in src]
+    ref_terms = (
+        all_terms
+        if args.guide_slice == "full"
+        else [c.term for c in cases]
+    )
+    census_op = {k: v for k, v in counts.items()}
+    return cases, ref_terms, all_terms, census_op, counts, cts
+
+
+def _gauntlet_corpus_for(
+    args: argparse.Namespace,
+    all_terms: list,
+    cases: list,
+    base_rules: list,
+    census_op: dict,
+    sink: Any,
+    cost_fn: Any,
+) -> Any:
+    """Return the ``GauntletCorpus`` the admission pass measures on.
+
+    In ``full`` mode the arena's own corpus *is* the real corpus —
+    the admission pass reuses the already-loaded terms, probe set
+    and sink rather than reloading them.  In ``small`` mode the
+    standard admission bar applies: ``default_gauntlet_corpus``.
+    A ``--holdout`` restricts the derivability/reach rule set to
+    the arena's own search rules.
+    """
+    if args.guide_slice == "full":
+        return ev_store.GauntletCorpus(
+            real_terms=tuple(all_terms),
+            probe=tuple(cases),
+            base_rules=tuple(base_rules),
+            census_op=census_op,
+            sink=sink,
+            cost_fn=cost_fn,
+        )
+    gc = ev_store.default_gauntlet_corpus()
+    if args.holdout:
+        gc = replace(gc, base_rules=tuple(base_rules))
+    return gc
+
+
+def _admit_arena_candidates(
+    arena: GuideArena,
+    corpus: Any,
+    memo: dict,
+) -> list[dict]:
+    """Store + gauntlet the arena's reachable candidates.
+
+    Every adjudicated candidate whose verdict leaves admission
+    conceivable — ``truth`` or ``unknown`` — is written to the
+    arena's own store as a declared object and faces
+    ``evidence.run_gauntlet`` on *corpus*.  The rest
+    (``no-instance``, ``false``, ``tautology``, ``repeat``) cannot
+    clear the gauntlet's truth gate on the same corpus, so they
+    are counted out without spending a measure.  *memo* dedups
+    repeated objects across guide runs of one experiment — the
+    gauntlet outcome for a stored key is deterministic given the
+    corpus.  Returns one record per tested object: usable verdict,
+    first failing stage, and the minting arm.
+    """
+    out: list[dict] = []
+    for key, (lhs, rhs, check, derive) in arena._candidates.items():
+        v = arena.ref.by_key.get(key)
+        if v is None or not (v.truth or v.reason == "unknown"):
+            continue
+        rule = Rewrite(v.name, lhs, rhs, check=check, derive=derive)
+        akey = ev_store.store_object(
+            arena.conn, rule, arena.meta["corpus_hash"]
+        )
+        if akey in memo:
+            rec = dict(memo[akey])
+        else:
+            rep = ev_store.run_gauntlet(arena.conn, akey, corpus=corpus)
+            rec = {
+                "usable": rep.usable,
+                "reason": rep.reason,
+                "stages": [
+                    {
+                        "name": s.name,
+                        "passed": s.passed,
+                        "detail": s.detail,
+                    }
+                    for s in rep.stages
+                ],
+            }
+            memo[akey] = rec
+        out.append(
+            {
+                "name": v.name,
+                "arm": arena._cand_arm.get(key, ""),
+                "usable": rec["usable"],
+                "reason": rec["reason"],
+                "stages": rec["stages"],
+                "arena": {
+                    "reason": v.reason,
+                    "fires": v.fires,
+                    "paid": v.paid,
+                },
+            }
+        )
+    return out
+
+
+def _run_admissions(
+    args: argparse.Namespace,
+    arenas: dict[str, GuideArena],
+    all_terms: list,
+    cases: list,
+    base_rules: list,
+    census_op: dict,
+    sink: Any,
+    cost_fn: Any,
+) -> dict:
+    """Gauntlet every guide's reachable candidates; tally usable.
+
+    One shared *memo* dedups objects several guides adjudicated —
+    a stored key's gauntlet outcome is deterministic given the
+    corpus, so a repeat admit is free and the tally stays honest
+    (each guide's own count still reflects what *it* reached).
+    """
+    gc = _gauntlet_corpus_for(
+        args, all_terms, cases, base_rules, census_op, sink, cost_fn
+    )
+    memo: dict = {}
+    out: dict = {}
+    for label, arena in arenas.items():
+        objs = _admit_arena_candidates(arena, gc, memo)
+        out[label] = {
+            "objects": objs,
+            "tested": len(objs),
+            "usable": sum(1 for o in objs if o["usable"]),
+        }
+    return out
 
 
 def run_guide_experiment(args: argparse.Namespace) -> dict:
@@ -2412,29 +2617,26 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
     games (:func:`train_guide`) — the learned guide otherwise sees
     only ``budget/step`` reward observations per run — and the
     trained net joins the board as ``learned-trained``, frozen for
-    the measurement.
+    the measurement.  ``--guide-slice full`` plays the board on
+    the real 276-term corpus (bench + models + intake);
+    ``--guide-gauntlet`` then admits each guide's reachable
+    candidates through ``evidence.run_gauntlet`` — the
+    ``usable: yes`` tally the yield rows only approximate.
     """
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
-    bench, _be = _bench_cases()
-    models, _me = model_cases()
-    cts = [
-        CorpusTerm(c.source, c.name, c.term) for c in [*bench, *models]
-    ]
-    counts, _tc = op_tuple_census(cts)
+    cases, slice_terms, all_terms, census_op, counts, cts = (
+        _guide_corpus(args)
+    )
     sh_counts, _st = shape_census(cts)
-    all_terms = [c.term for c in [*bench, *models]]
-    census_op = {k: v for k, v in counts.items()}
-
-    cases = _slice_cases(bench, models)
-    slice_terms = [c.term for c in cases]
     pools = generator_pools(census_op, all_terms, args.vocab)
     vocab = build_vocab(all_terms, counts, sh_counts, args.top_seeds)
 
     sink = _sink()
     cost_fn = _cost_fn(sink)
-    lib = [lp._key(r.lhs, r.rhs) for r in _search_rules(args.holdout)]
+    base_rules = _search_rules(args.holdout)
+    lib = [lp._key(r.lhs, r.rhs) for r in base_rules]
 
     build_model = None
     if args.guide_train:
@@ -2450,10 +2652,10 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
             log_every=0,
         )
 
-    def make_arena() -> GuideArena:
+    def make_arena(seed: int) -> GuideArena:
         ref = Referee(slice_terms, cases, sink, cost_fn, lib)
         game = (
-            BuildGame(vocab, random.Random(args.seed))
+            BuildGame(vocab, random.Random(seed))
             if args.guide_build
             else None
         )
@@ -2465,7 +2667,7 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
             seed_frac=args.seed_frac,
             plays_cap=args.plays_cap,
             gen_cap=args.guide_corpus,
-            gen_rng=random.Random(args.seed + 7919),
+            gen_rng=random.Random(seed + 7919),
             corpus=cts,
             vocab=args.vocab,
         )
@@ -2491,7 +2693,14 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
             order=CORPUS_ARMS + ENUMERATION_ORDER,
             step=args.guide_step,
         )
-    results = compare_guides(make_arena, guides, args.budget)
+    # Inline the compare loop so the played arenas survive for the
+    # optional admission pass below (``compare_guides`` drops them).
+    results: dict = {}
+    arenas: dict[str, GuideArena] = {}
+    for label, make in guides.items():
+        arena = make_arena(args.seed)
+        results[label] = run_guide(arena, make(), args.budget)
+        arenas[label] = arena
     enum_tf = results["enumeration"]["referee"]["yield_tf_per_call"]
     ratios = {
         label: (
@@ -2501,12 +2710,28 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
         )
         for label, s in results.items()
     }
+    admissions = (
+        _run_admissions(
+            args,
+            arenas,
+            all_terms,
+            cases,
+            base_rules,
+            census_op,
+            sink,
+            cost_fn,
+        )
+        if args.guide_gauntlet
+        else None
+    )
     return {
         "args": vars(args),
         "pools": {k: len(v) for k, v in pools.items()},
+        "corpus": {"terms": len(all_terms), "cases": len(cases)},
         "results": results,
         "yield_tf_ratio_vs_enumeration": ratios,
         "guide_train_hist": guide_train_hist,
+        "admissions": admissions,
     }
 
 
@@ -2515,7 +2740,7 @@ def _print_train_line(hist: list[float] | None) -> None:
     if not hist:
         return
     tail = hist[-10:]
-    print(
+    print(  # stdout-compat
         f"   arm-policy training: {len(hist)} episodes, "
         f"yield_tf first {hist[0]:.3f} -> "
         f"last-10 mean {sum(tail) / len(tail):.3f}"
@@ -2524,8 +2749,10 @@ def _print_train_line(hist: list[float] | None) -> None:
 
 def _print_guide_report(result: dict) -> None:
     """Print the guide comparison table."""
-    print("== guide seam — which generator invests compute where ==")
-    print(
+    print(  # stdout-compat
+        "== guide seam — which generator invests compute where =="
+    )
+    print(  # stdout-compat
         "   pool: "
         + ", ".join(f"{k}={n}" for k, n in result["pools"].items())
     )
@@ -2548,25 +2775,60 @@ def _print_guide_report(result: dict) -> None:
             )
         if ratio is not None:
             line += f" ({ratio:.2f}x enum)"
-        print(line)
+        print(line)  # stdout-compat
         arms = ", ".join(
             f"{k}:{a['drawn']}d/{a['true']}t"
             for k, a in s["arms"].items()
             if a["drawn"]
         )
         if arms:
-            print(f"      arms: {arms}")
+            print(f"      arms: {arms}")  # stdout-compat
         best = s["best"]
         if best is not None:
-            print(
+            print(  # stdout-compat
                 f"      best {best['score']:.2f} "
                 f"[{best['generator']}] "
                 f"{best['lhs']} -> {best['rhs']}"
             )
         if s["first_ship_at"] is not None:
-            print(f"      first shippable at draw {s['first_ship_at']}")
+            print(  # stdout-compat
+                f"      first shippable at draw {s['first_ship_at']}"
+            )
         elif s["first_true_at"] is not None:
-            print(f"      first true at draw {s['first_true_at']}")
+            print(  # stdout-compat
+                f"      first true at draw {s['first_true_at']}"
+            )
+        _print_admissions(result, label)
+
+
+def _print_admissions(result: dict, label: str) -> None:
+    """Print one guide's gauntlet tally and failing-stage census."""
+    adm = (result.get("admissions") or {}).get(label)
+    if adm is None:
+        return
+    usable = [o for o in adm["objects"] if o["usable"]]
+    print(  # stdout-compat
+        f"      gauntlet: usable {adm['usable']}/"
+        f"{adm['tested']} tested"
+        + (
+            " — " + ", ".join(o["name"] for o in usable)
+            if usable
+            else ""
+        )
+    )
+    # the failing-stage census — where the non-usable objects
+    # actually stood down.
+    fail: dict[str, int] = {}
+    for o in adm["objects"]:
+        if o["usable"]:
+            continue
+        stage = o["reason"].split(":", 1)[0]
+        fail[stage] = fail.get(stage, 0) + 1
+    if fail:
+        print(  # stdout-compat
+            "      refused at: "
+            + ", ".join(f"{k} x{n}" for k, n in sorted(fail.items()))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2660,7 +2922,7 @@ def _reason_table(referee: Referee) -> dict[str, int]:
 
 def _print_yield(tag: str, s: dict) -> None:
     """Print one yield row."""
-    print(
+    print(  # stdout-compat
         f"  {tag:<22} plays={s['plays']:>4} cands={s['candidates']:>4} "
         f"calls={s['oracle_calls']:>4} true={s['true']:>3} "
         f"true+fire={s['true_firing']:>3} "
@@ -2675,12 +2937,12 @@ def _print_top(referee: Referee, top: int) -> None:
     """Print the highest-scoring distinct candidates."""
     vs = sorted(referee.by_key.values(), key=lambda v: -v.score)[:top]
     if not vs:
-        print("  (no scored candidates)")
+        print("  (no scored candidates)")  # stdout-compat
         return
     for v in vs:
         if not v.truth:
             continue
-        print(
+        print(  # stdout-compat
             f"  {v.score:6.2f} {v.relation:<9} fires={v.fires:>2} "
             f"paid={v.paid} drop={v.rel_drop * 100:4.1f}%  "
             f"{v.lhs_repr} -> {v.rhs_repr}"
@@ -2704,13 +2966,13 @@ def run_experiment(args: argparse.Namespace) -> dict:
 
     cases = _slice_cases(bench, models)
     slice_terms = [c.term for c in cases]
-    print(
+    print(  # stdout-compat
         f"corpus: {len(bench)} bench + {len(models)} models; "
         f"slice: {len(cases)} cases"
     )
 
     vocab = build_vocab(all_terms, counts, sh_counts, args.top_seeds)
-    print(
+    print(  # stdout-compat
         f"vocab: {len(vocab.ops)} ops, {len(vocab.seeds)} seed "
         f"skeletons (top {args.top_seeds} tuples)"
     )
@@ -2741,7 +3003,7 @@ def run_experiment(args: argparse.Namespace) -> dict:
     # -- trained player --------------------------------------------------
     game = BuildGame(vocab, rng)
     train_ref = Referee(slice_terms, cases, sink, cost_fn, lib)
-    print(f"-- training ({args.episodes} episodes) --")
+    print(f"-- training ({args.episodes} episodes) --")  # stdout-compat
     model, hist = train(
         game,
         train_ref,
@@ -2854,6 +3116,22 @@ def main(argv: list[str] | None = None) -> int:
         help="draw cap per corpus-mutating arm "
         "(workload_gen, gap_gen); 0 disables them",
     )
+    p.add_argument(
+        "--guide-slice",
+        choices=("small", "full"),
+        default="small",
+        help="arena corpus: 'small' is the legacy ~16-case slice; "
+        "'full' is the real corpus (bench + models + intake for "
+        "the census/instance search, models + probe_cases for "
+        "the firing probe)",
+    )
+    p.add_argument(
+        "--guide-gauntlet",
+        action="store_true",
+        help="after the comparison, store each guide's reachable "
+        "candidates and run the admission gauntlet — the "
+        "'usable: yes' tally per guide",
+    )
     p.add_argument("--episodes", type=int, default=600)
     p.add_argument(
         "--budget",
@@ -2907,46 +3185,52 @@ def main(argv: list[str] | None = None) -> int:
         _print_guide_report(r)
         if args.json:
             _dump_json(args.json, r)
-            print(f"\nwrote {args.json}")
+            print(f"\nwrote {args.json}")  # stdout-compat
         return 0
 
     r = run_experiment(args)
 
-    print()
-    print("== law meta-game — yield per oracle call ==")
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "== law meta-game — yield per oracle call =="
+    )
     _print_yield("enumerative", r["baseline"])
     _print_yield("uniform player", r["random"])
     _print_yield("learned player", r["player"])
-    print(
+    print(  # stdout-compat
         f"  (training: {r['train_oracle']} oracle calls, "
         f"{r['train_true']} true candidates found, "
         f"tail reward {r['train_reward_tail']:.3f})"
     )
-    print()
-    print("-- where the search stalls (distinct candidates) --")
+    print()  # stdout-compat
+    print(  # stdout-compat
+        "-- where the search stalls (distinct candidates) --"
+    )
     for tag in ("baseline_reasons", "random_reasons", "player_reasons"):
-        print(f"  {tag[:-8]:<18} {r[tag]}")
-    print()
-    print("-- uniform player's top candidates --")
+        print(f"  {tag[:-8]:<18} {r[tag]}")  # stdout-compat
+    print()  # stdout-compat
+    print("-- uniform player's top candidates --")  # stdout-compat
     _print_top(r["random_ref"], args.top)
-    print()
-    print("-- learned player's top candidates --")
+    print()  # stdout-compat
+    print("-- learned player's top candidates --")  # stdout-compat
     _print_top(r["player_ref"], args.top)
-    print()
-    print("-- rediscovery of known winners --")
+    print()  # stdout-compat
+    print("-- rediscovery of known winners --")  # stdout-compat
     for label, hits in r["player_rediscovered"].items():
         if hits:
             for h in hits:
-                print(
+                print(  # stdout-compat
                     f"  {label}: REDISCOVERED truth={h['truth']} "
                     f"fires={h['fires']} rel={h['relation']}"
                 )
-                print(f"      {h['lhs']} -> {h['rhs']}")
+                print(  # stdout-compat
+                    f"      {h['lhs']} -> {h['rhs']}"
+                )
         else:
-            print(f"  {label}: not found in-budget")
+            print(f"  {label}: not found in-budget")  # stdout-compat
     if args.json:
         _dump_json(args.json, r)
-        print(f"\nwrote {args.json}")
+        print(f"\nwrote {args.json}")  # stdout-compat
     return 0
 
 
