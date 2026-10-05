@@ -980,7 +980,10 @@ class Gauntlet:
     the live ``Rewrite`` and the parsed object record (when stage 1
     cleared); ``evidence`` is the pipeline's measured ``Evidence``
     row; ``synth_region`` / ``real_region`` are the guarded-region
-    sweeps for ``cond``-carrying objects.
+    sweeps for ``cond``-carrying objects.  ``auto_cond`` records an
+    auto-cond attempt (``run_gauntlet(auto_cond=True)``): the found
+    guard's clauses, the measured-domain counts and the refusal detail
+    — ``None`` when no attempt ran.
     """
 
     alpha_key: str
@@ -993,6 +996,7 @@ class Gauntlet:
     evidence: Any = None
     synth_region: GuardedRegion | None = None
     real_region: GuardedRegion | None = None
+    auto_cond: dict | None = None
 
     @property
     def reason(self) -> str:
@@ -1251,12 +1255,107 @@ def _cert_gate(rep: Gauntlet, record: dict) -> bool:
     )
 
 
+def _auto_cond_retry(
+    conn: sqlite3.Connection,
+    rep: Gauntlet,
+    corpus: GauntletCorpus,
+    synth_limit: int | None,
+    max_clauses: int,
+) -> Gauntlet:
+    """Attempt the conditional→guarded rewrite after a refusal.
+
+    Called when a stored object fails the gauntlet on truth (the
+    candidate measured *conditional*) or on full-data with exactly the
+    ``check`` hook missing (the reconstructed rule is already the bare
+    pattern — the missing ``check`` is what a found ``cond`` would
+    carry).  ``object_synthesis.auto_cond_object`` searches the
+    declarative guard vocabulary for the smallest conjunction covering
+    the measured equal sites and declining the measured bad ones; on a
+    hit the object record is rewritten — same alpha key, now carrying
+    the found ``cond`` and ``kind="abstraction"`` — and the gauntlet
+    re-runs on the rewritten record (``auto_cond=False``: one retry,
+    not a chase).
+
+    The returned report is the *second* run's, with an ``auto-cond``
+    stage prepended carrying the search's detail; the refusal case
+    keeps the original report, annotated in ``rep.auto_cond``.
+    """
+    from catopt_core.laws.cond import cond_to_data
+
+    from catopt_discovery import object_synthesis as obs
+    from catopt_discovery import oracle as lvo
+
+    limit = (
+        synth_limit if synth_limit is not None else lvo._MAX_INSTANCES
+    )
+    res = obs.auto_cond_object(
+        rep.rule,
+        corpus_terms=corpus.real_terms,
+        synth_limit=limit,
+        max_clauses=max_clauses,
+        kind="abstraction",
+    )
+    rep.auto_cond = {
+        "found": res.object is not None,
+        "cond": cond_to_data(res.cond),
+        "clauses": [cond_to_data(c) for c in res.clauses],
+        "measured": res.measured,
+        "equal": res.equal,
+        "bad": res.bad,
+        "unstable": res.unstable,
+        "other": res.other,
+        "accepted": res.accepted,
+        "accepted_other": res.accepted_other,
+        "detail": res.detail,
+        "first_reason": rep.reason,
+    }
+    if res.object is None:
+        return _finish(rep)
+    row = conn.execute(
+        "SELECT corpus_hash FROM lemmas WHERE alpha_key = ?",
+        (rep.alpha_key,),
+    ).fetchone()
+    obs.store_constructed(
+        conn, res.object, row["corpus_hash"] if row else ""
+    )
+    rep2 = run_gauntlet(
+        conn, rep.alpha_key, corpus=corpus, synth_limit=synth_limit
+    )
+    rep2.auto_cond = rep.auto_cond
+    rep2.stages = (
+        GauntletStage("auto-cond", True, res.detail),
+        *rep2.stages,
+    )
+    return rep2
+
+
+def _auto_cond_armed(rep: Gauntlet, stage: str) -> bool:
+    """Whether the auto-cond retry applies to this refusal.
+
+    ``truth``: the candidate measured conditional — the minted guard
+    is the missing piece.  ``full-data``: exactly the ``check`` hook
+    is missing — the reconstructed rule is already the bare pattern,
+    and the found ``cond`` is what the record was missing.  Anything
+    else (a rebuild failure, a missing ``dspec``/``derive``) is not
+    an auto-cond question.
+    """
+    if rep.rule is None:
+        return False
+    if stage == "truth":
+        return bool(rep.stages) and rep.stages[-1].name == "truth"
+    return rep.record is not None and list(
+        rep.record["missing_hooks"]
+    ) == ["check"]
+
+
 def run_gauntlet(
     conn: sqlite3.Connection,
     alpha_key: str,
     *,
     corpus: GauntletCorpus | None = None,
     synth_limit: int | None = None,
+    auto_cond: bool = False,
+    auto_cond_clauses: int = 3,
 ) -> Gauntlet:
     """Run the admission gauntlet on a stored declared object.
 
@@ -1276,18 +1375,45 @@ def run_gauntlet(
     ``usable`` is ``True`` only when every stage passed — the honest
     contract: the store refuses to call a synthesized object usable
     on reconstruction alone.
+
+    ``auto_cond=True`` arms the conditional→guarded retry
+    (:func:`_auto_cond_retry`): a truth refusal (or a ``full-data``
+    refusal on a missing ``check`` alone) attempts to mint the
+    smallest declarative ``cond`` covering the measured domain, then
+    re-runs the gauntlet on the rewritten record.  ``auto_cond_clauses``
+    bounds the conjunction the search may mint.
     """
     rep = Gauntlet(alpha_key=alpha_key)
     got = _reconstruct_gate(conn, rep)
     if got is None:
+        if auto_cond and _auto_cond_armed(rep, "full-data"):
+            return _auto_cond_retry(
+                conn,
+                rep,
+                corpus or default_gauntlet_corpus(),
+                synth_limit,
+                auto_cond_clauses,
+            )
         return _finish(rep)
     rule, record = got
     if corpus is None:
         corpus = default_gauntlet_corpus()
     if not _measure_gate(rep, rule, record, corpus, synth_limit):
+        if auto_cond and _auto_cond_armed(rep, "truth"):
+            return _auto_cond_retry(
+                conn, rep, corpus, synth_limit, auto_cond_clauses
+            )
         return _finish(rep)
-    # 5 — novelty: a stored object duplicating a library spelling is
-    # not a new inhabitant.
+    return _admit_tail(rep, record)
+
+
+def _admit_tail(rep: Gauntlet, record: dict) -> Gauntlet:
+    """Stages 5-8: novelty → typed-pay → closure → cert replay.
+
+    *record* is the stored object record for the cert gate.
+    """
+    # novelty: a stored object duplicating a library spelling is not
+    # a new inhabitant.
     evd = rep.evidence
     if not _gate(
         rep,
@@ -1486,16 +1612,20 @@ def _store_object_cli(
 
 
 def _admit_object_cli(
-    conn: sqlite3.Connection, alpha_key: str, gauntlet: bool = False
+    conn: sqlite3.Connection,
+    alpha_key: str,
+    gauntlet: bool = False,
+    auto_cond: bool = False,
 ) -> int:
     """Rebuild a stored object into a live ``Rewrite`` and show it.
 
     With *gauntlet* the admit runs :func:`run_gauntlet` instead —
     the adversarial admission stages — and reports ``usable`` only
-    when every gate passed (exit 1 otherwise).
+    when every gate passed (exit 1 otherwise).  *auto_cond* arms the
+    conditional→guarded retry inside the gauntlet.
     """
     if gauntlet:
-        return _gauntlet_cli(conn, alpha_key)
+        return _gauntlet_cli(conn, alpha_key, auto_cond)
     try:
         got = admit_object(conn, alpha_key)
     except ValueError as exc:
@@ -1530,9 +1660,11 @@ def _admit_object_cli(
     return 0
 
 
-def _gauntlet_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
+def _gauntlet_cli(
+    conn: sqlite3.Connection, alpha_key: str, auto_cond: bool = False
+) -> int:
     """Run the admission gauntlet on a stored object; report usable."""
-    rep = run_gauntlet(conn, alpha_key)
+    rep = run_gauntlet(conn, alpha_key, auto_cond=auto_cond)
     if rep.rule is None or rep.record is None:
         print(  # stdout-compat
             f"cannot admit object under {alpha_key}: {rep.reason}"
@@ -1585,9 +1717,13 @@ def _op_dispatch(
     if args.add_object is not None:
         return _store_object_cli(conn, args.add_object, args.kind)
     if args.admit is not None:
-        return _admit_object_cli(conn, args.admit, args.gauntlet)
+        return _admit_object_cli(
+            conn, args.admit, args.gauntlet, args.auto_cond
+        )
     if args.admit_object is not None:
-        return _admit_object_cli(conn, args.admit_object, args.gauntlet)
+        return _admit_object_cli(
+            conn, args.admit_object, args.gauntlet, args.auto_cond
+        )
     return None
 
 
@@ -1652,6 +1788,15 @@ def main(argv: list[str] | None = None) -> int:
         " (numeric oracle -> guarded-region truth -> typed-pay ->"
         " closure -> cert replay) and report 'usable' only when every"
         " stage passed",
+    )
+    parser.add_argument(
+        "--auto-cond",
+        action="store_true",
+        help="with --admit/--admit-object --gauntlet: on a truth"
+        " (or missing-check full-data) refusal, attempt to mint the"
+        " smallest declarative cond covering the measured domain,"
+        " rewrite the record as kind=abstraction, and re-run the"
+        " gauntlet",
     )
     args = parser.parse_args(argv)
     ops = (

@@ -44,18 +44,23 @@ pattern trees do by hand, but as a value the constructor can carry::
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 from catopt_core.egraph import Certificate, Rewrite
-from catopt_core.egraph.terms import _term_instantiate
+from catopt_core.egraph.terms import _term_instantiate, _term_match
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags as _tags
+from catopt_core.laws.cond import eval_cond
 from catopt_core.meta import _positions, apply_rewrite_at
 
 __all__ = [
+    "AutoCond",
     "ConstructedObject",
+    "auto_cond_object",
     "compose_objects",
     "fold_object",
     "lift_object",
@@ -386,3 +391,900 @@ def store_constructed(
     if env is not None and obj.rule.derivation:
         kwargs["cert"] = _certify(obj.rule, universe, env)
     return ev.store_object(conn, obj.rule, corpus_hash, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+#  Auto-cond — the conditional → guarded constructor
+# ---------------------------------------------------------------------------
+#
+#  The real-corpus run's honest finding (project/retros/guide-real-run.md):
+#  candidates reach ``SHIP`` in the arena but ``usable: yes`` stays 0 —
+#  they are *conditional* equalities (``gap_gen`` witnesses mint the
+#  instances where they happen to hold; on the real corpus they are
+#  conditional).  Admission requires the guard written as declarative
+#  ``cond`` data.  :func:`auto_cond_object` is that step:
+#
+#  1. **Measure the bare domain** — the oracle's synthesized binding
+#     envs (:func:`evidence._synth_sites`, the attr-sweep machinery)
+#     plus every real corpus match — each site evaluated tri-state
+#     exactly as a firing would: the candidate's own ``derive`` rides
+#     along (a veto is a firing abort — the site never enters the
+#     guard's universe), then both sides evaluate fp64.
+#  2. **Enumerate guard predicates** — the declarative vocabulary
+#     ``catopt_core.laws.cond`` already interprets, instantiated over
+#     the pattern's metavariables and attr metavariables (leaf/shape/
+#     rank/broadcast predicates, attr comparisons, the view-op
+#     predicates — ``ones-before``/``axes-*``/``bcast-eq`` over the
+#     computed shape specs, the attr values *observed* in the measured
+#     domain for ``attr-eq``).
+#  3. **Minimal conjunction** — a covering set: the smallest set of
+#     predicates that accepts every measured ``equal`` site and
+#     declines every measured ``unequal`` / ``rhs-err`` site — the
+#     smallest guard that keeps all measured equal sites, not a guard
+#     tuned to exclude one known false site.  ``other``-bucket sites
+#     (lhs-err &c.) are don't-care, with the tie-break preferring the
+#     combination that admits fewest of them.
+#
+#  A refusal is the honest answer when nothing declarable separates:
+#  no measured equal site, or no conjunction of ``max_clauses`` covers.
+#  The minted object is *pure data* — it carries the found ``cond``
+#  (plus the candidate's ``dspec``/procedural remainders, which the
+#  store flags honestly) and still faces ``evidence.run_gauntlet`` —
+#  construction is a claim, the gauntlet is the referee.
+
+
+@dataclass(frozen=True)
+class AutoCond:
+    """The outcome of an auto-cond search over a measured domain.
+
+    ``object`` is the minted guarded :class:`ConstructedObject`, or
+    ``None`` on refusal — the refusal is the honest answer, recorded
+    in ``detail``.  ``cond`` is the minted declarative guard (``True``
+    when the domain measured no bad site — a vacuous cover, flagged
+    in ``detail``); ``clauses`` the separating predicates the search
+    chose, in bank order.  The site counts partition the measured
+    domain: ``equal`` sites where the declared equality held, ``bad``
+    the ``unequal``/``rhs-err`` sites the guard must decline,
+    ``other`` non-evaluable sites, ``declined`` firing aborts
+    (``derive`` vetoes) outside the universe; ``accepted`` /
+    ``accepted_other`` count what the minted guard admits.
+    """
+
+    object: ConstructedObject | None
+    cond: Any = None
+    clauses: tuple = ()
+    measured: int = 0
+    equal: int = 0
+    bad: int = 0
+    unstable: int = 0
+    other: int = 0
+    declined: int = 0
+    accepted: int = 0
+    accepted_other: int = 0
+    detail: str = ""
+
+
+#: Default cap on conjunction size — the minimal cover search is
+#: bounded by this, so "no cover found" means "no cover of ≤ k".
+_AUTO_MAX_CLAUSES = 3
+
+#: Visit cap for the covering DFS — a guard needing a wider search is
+#: refused, not chased.
+_AUTO_VISIT_CAP = 200_000
+
+
+def _mv_names(*pats: Any) -> list[str]:
+    """Sorted leaf-metavariable names over *pats*."""
+    from catopt_discovery import oracle as lvo
+
+    out: set[str] = set()
+    for p in pats:
+        out.update(lvo._leaf_metavars(p))
+    return sorted(out)
+
+
+def _attr_mvs(*pats: Any) -> list[str]:
+    """Sorted attr-metavariable names over *pats* (``$attr:`` bodies)."""
+    from catopt_discovery import oracle as lvo
+
+    out: set[str] = set()
+    for pat in pats:
+        for node in lvo._view_nodes([pat]):
+            out.update(
+                v for v in node.attrs.values() if isinstance(v, str)
+            )
+    return sorted(out)
+
+
+def _view_specs(nodes: Iterable[Op]) -> list[tuple[str, tuple]]:
+    """``(operand-mv, output-shape spec)`` per enumerable view node."""
+    out: list[tuple[str, tuple]] = []
+    for n in nodes:
+        if not n.args or not isinstance(n.args[0], str):
+            continue
+        u = n.args[0]
+        if n.op == "unsqueeze" and isinstance(n.attrs.get("dim"), str):
+            out.append((u, ("unsq-out", u, n.attrs["dim"])))
+        elif n.op in ("reshape", "view") and isinstance(
+            n.attrs.get("shape"), str
+        ):
+            out.append((u, ("reshape-out", u, n.attrs["shape"])))
+        elif n.op == "getitem":
+            out.append((u, ("getitem-out", u)))
+    return out
+
+
+def _mv_preds(mvs: list[str]) -> list[tuple]:
+    """Single-metavar predicates — leaf kind, shape, rank, const."""
+    bank: list[tuple] = []
+    for t in mvs:
+        bank += [
+            ("concrete", t),
+            ("shaped", t),
+            ("scalar", t),
+            ("uniform", t),
+            ("ones-but-last", t),
+            ("leaf", t),
+            ("const", t),
+            ("const-num", t),
+            ("not", ("leaf", t)),
+            ("not", ("const", t)),
+        ]
+        for k in (0, 1, 2, 3):
+            bank.append(("rank", t, "==", k))
+            if k:
+                bank.append(("rank", t, ">=", k))
+                bank.append(("rank", t, "<=", k))
+        bank += [("rank", t, "!=", 0), ("rank", t, ">=", 4)]
+        for cmp_ in ("==", "!=", ">", "<="):
+            for v in (0, 1):
+                bank.append(("const-cmp", t, cmp_, v))
+    return bank
+
+
+def _mv_pair_preds(mvs: list[str]) -> list[tuple]:
+    """Two-metavar predicates — shape relations and broadcasts."""
+    bank: list[tuple] = []
+    for a, b in itertools.combinations(mvs, 2):
+        bank += [
+            ("rank-eq", a, b),
+            ("shape-eq", a, b),
+            ("shape-compat", a, b),
+            ("term-eq", a, b),
+            ("bcast-into", a, b),
+            ("bcast-into", b, a),
+            ("mm-shape-ok", a, b),
+            ("mm-shape-ok", b, a),
+        ]
+        for i in (-1, 0, 1):
+            for j in (-1, 0, 1):
+                bank.append(("dim-eq", a, i, b, j))
+                bank.append(("dim-compat", a, i, b, j))
+    return bank
+
+
+def _spec_preds(
+    mvs: list[str], specs: list[tuple[str, tuple]]
+) -> list[tuple]:
+    """Predicates over the computed shape specs (view outputs)."""
+    bank: list[tuple] = []
+    for u, s in specs:
+        for m in mvs:
+            bank += [
+                ("shape-eq", s, m),
+                ("bcast-into", m, s),
+                ("bcast-into", s, m),
+            ]
+            if m != u:
+                # the strip family: bcast(view(u), v) == bcast(u, v)
+                bank.append(("bcast-eq", s, m, u, m))
+                bank.append(("bcast-eq", s, u, u, m))
+    return bank
+
+
+def _attr_shape_preds(n: str, mvs: list[str]) -> list[tuple]:
+    """Attr-vs-shape predicates for one attr metavariable."""
+    bank: list[tuple] = []
+    for t in mvs:
+        for k in (-1, 0, 1, 2):
+            bank.append(("axis", t, n, k))
+        for m_ in (2, 3):
+            for r in (0, 1):
+                bank.append(("dim-mod", t, n, m_, r))
+    return bank
+
+
+def _attr_observed_preds(n: str, envs: Iterable[dict]) -> list[tuple]:
+    """``attr-eq`` over the values the measurement observed for *n*.
+
+    The domain's own vocabulary — no guessed constants beyond the
+    small ``attr-is``/``attr-len`` sets.
+    """
+    seen: list = []
+    for env in envs:
+        v = env.get(f"$attr:{n}", None)
+        if v is not None and not isinstance(v, bool):
+            if isinstance(v, list):
+                v = tuple(v)
+            if v not in seen and len(seen) < 12:
+                seen.append(v)
+    return [("attr-eq", n, v) for v in seen]
+
+
+def _attr_preds(
+    names: list[str], mvs: list[str], envs: Iterable[dict]
+) -> list[tuple]:
+    """Attr-level predicates, including observed ``attr-eq`` values."""
+    bank: list[tuple] = []
+    for n in names:
+        for kind in ("int", "float", "number", "bool", "str", "tuple"):
+            bank.append(("attr-type", n, kind))
+        bank += [
+            ("attr-is", n, None),
+            ("attr-is", n, True),
+            ("attr-is", n, False),
+        ]
+        for cmp_ in ("==", ">=", "<="):
+            for k in (0, 1, 2, 3):
+                bank.append(("attr-len", n, cmp_, k))
+        bank += _attr_shape_preds(n, mvs)
+        bank += _attr_observed_preds(n, envs)
+    for n1, n2 in itertools.combinations(names, 2):
+        bank.append(("attr-eq-attr", n1, n2))
+    for n1 in names:
+        for n2 in names:
+            for a, b in itertools.combinations(mvs, 2):
+                bank.append(("dim-eq-attr", a, n1, b, n2))
+            for t in mvs:
+                for cmp_ in (">=", "<=", "==", "!="):
+                    bank.append(("attr-cmp-dim", n1, cmp_, t, n2))
+    return bank
+
+
+def _op_in_preds(mvs: list[str], envs: Iterable[dict]) -> list[tuple]:
+    """``op-in``/``not op-in`` over ops actually observed bound."""
+    bank: list[tuple] = []
+    for t in mvs:
+        ops = tuple(
+            sorted({e[t].op for e in envs if isinstance(e.get(t), Op)})
+        )
+        if ops:
+            bank.append(("op-in", t, ops))
+            bank.append(("not", ("op-in", t, ops)))
+    return bank
+
+
+def _view_pred_unsqueeze(
+    u: str, amv: dict, mvs: list[str], reshape_specs: list
+) -> list[tuple]:
+    """Emit the unsqueeze strip/naturality guard vocabulary."""
+    bank = [("ones-before", u, amv["dim"])]
+    for m in mvs:
+        if m == u:
+            continue
+        for s in reshape_specs:
+            bank.append(("flat-pair-unsq", u, amv["dim"], m, s))
+            bank.append(("flat-map-unsq", u, amv["dim"], m, s))
+    return bank
+
+
+def _view_pred_axes(
+    u: str, amv: dict, _mvs: list, _rs: list
+) -> list[tuple]:
+    """Transpose-pair guards — last-two, distinct, no-op axes."""
+    d0, d1 = amv["dim0"], amv["dim1"]
+    return [
+        ("axes-last2", u, d0, d1),
+        ("axes-distinct", u, d0, d1),
+        ("axes-noop", u, d0, d1),
+    ]
+
+
+def _view_pred_getitem(
+    u: str, amv: dict, _mvs: list, _rs: list
+) -> list[tuple]:
+    """Getitem strip guards — the scalar-index corner."""
+    return [
+        ("attr-in", amv["index"], (0, -1)),
+        ("dim-eq-const", u, 0, 1),
+    ]
+
+
+def _view_pred_slice(
+    u: str, amv: dict, _mvs: list, _rs: list
+) -> list[tuple]:
+    """Slice strip guards — the no-op/extent corner."""
+    bank: list[tuple] = []
+    if "start" in amv:
+        bank += [
+            ("attr-is", amv["start"], None),
+            ("attr-eq", amv["start"], 0),
+        ]
+    if "end" in amv:
+        bank += [
+            ("attr-is", amv["end"], None),
+            ("attr-cmp-dim", amv["end"], ">=", u, amv["dim"]),
+        ]
+    return bank
+
+
+def _view_pred_select(
+    u: str, amv: dict, mvs: list[str], _rs: list
+) -> list[tuple]:
+    """Select naturality guards — aligned pick on the other operand."""
+    return [
+        ("dim-eq-attr", u, amv["dim"], b, amv["dim"])
+        for b in mvs
+        if b != u
+    ]
+
+
+#: Per-view-op guard vocabulary — ``(required str-attr keys, fn)``.
+_VIEW_NODE_PREDS = {
+    "unsqueeze": (("dim",), _view_pred_unsqueeze),
+    "transpose": (("dim0", "dim1"), _view_pred_axes),
+    "t": (("dim0", "dim1"), _view_pred_axes),
+    "getitem": (("index",), _view_pred_getitem),
+    "slice": (("dim",), _view_pred_slice),
+    "select": (("dim",), _view_pred_select),
+}
+
+
+def _view_preds(
+    nodes: Iterable[Op], mvs: list[str], specs: list[tuple[str, tuple]]
+) -> list[tuple]:
+    """View-node predicates — the strip/commute guard vocabulary."""
+    bank: list[tuple] = []
+    reshape_specs = [s for _u, s in specs if s[0] == "reshape-out"]
+    for n in nodes:
+        u = n.args[0] if n.args and isinstance(n.args[0], str) else None
+        entry = _VIEW_NODE_PREDS.get(n.op)
+        if u is None or entry is None:
+            continue
+        req, fn = entry
+        amv = {k: v for k, v in n.attrs.items() if isinstance(v, str)}
+        if not set(req) <= set(amv):
+            continue
+        bank += fn(u, amv, mvs, reshape_specs)
+    return bank
+
+
+def _pred_bank(
+    lhs: Any, rhs: Any, envs: list[tuple[dict, str]]
+) -> list[tuple]:
+    """Enumerate the declarative guard vocabulary over the patterns.
+
+    The bank is the cond DSL's own predicates instantiated over the
+    pattern's metavariables and attr metavariables — the same atoms
+    shipped ``cond=`` laws carry — plus the observed attr values and
+    bound-op names the measured domain supplies.  Deduped by spelling;
+    the search dedupes by verdict vector afterwards.
+    """
+    from catopt_discovery import oracle as lvo
+
+    mvs = _mv_names(lhs, rhs)
+    names = _attr_mvs(lhs, rhs)
+    nodes = [n for n in lvo._view_nodes([lhs, rhs]) if n.args]
+    specs = _view_specs(nodes)
+    env_maps = [e for e, _o in envs]
+    bank = (
+        _mv_preds(mvs)
+        + _mv_pair_preds(mvs)
+        + _spec_preds(mvs, specs)
+        + _attr_preds(names, mvs, env_maps)
+        + _op_in_preds(mvs, env_maps)
+        + _view_preds(nodes, mvs, specs)
+    )
+    seen: set = set()
+    out: list[tuple] = []
+    for p in bank:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Auto-cond — measurement and the minimal cover
+# ---------------------------------------------------------------------------
+
+
+def _env_key(env: dict) -> str:
+    """Content key for a binding env — dedups identical measurements.
+
+    ``Var`` reprs are name-only, so the shape rides the key through
+    ``oracle._bind_desc`` — the same signature the oracle's instance
+    dedup uses.
+    """
+    from catopt_discovery import oracle as lvo
+
+    return repr(
+        sorted(
+            (k, lvo._bind_desc(v))
+            for k, v in env.items()
+            if not k.startswith("$attr:")
+        )
+        + sorted(
+            (k, repr(v))
+            for k, v in env.items()
+            if k.startswith("$attr:")
+        )
+    )
+
+
+def _oracle_sites(
+    lhs_pat: Any, rhs_pat: Any, derive: Any, limit: int
+) -> Iterable:
+    """Yield ``(env, lhs_i)`` deduped on the oracle's instance signature.
+
+    The second enumeration window: ``_synth_sites`` dedups the
+    instantiated pair *before* ``derive`` runs — a derive-vetoed or
+    attr-collapsed env still burns a slot, so its 360-window ends
+    shallower.  ``oracle.synthesize`` dedups on the post-derive
+    instance sig (binds included), reaching different corners of the
+    same domain — measured: the no-op-transpose counterexample corner
+    of the ``_g`` twin lies inside this window, outside the other.
+    The union of the two windows is the measured domain.
+    """
+    from catopt_core.ir import op_repr
+
+    from catopt_discovery import oracle as lvo
+
+    def sig(inst: dict, lhs_i: Any, rhs_i: Any) -> tuple:
+        """Return the ``synthesize`` instance signature — the dedup key."""
+        return (
+            op_repr(lhs_i),
+            op_repr(rhs_i),
+            tuple(
+                sorted(
+                    (k, lvo._bind_desc(v))
+                    for k, v in inst.items()
+                    if not k.startswith("$attr:")
+                )
+                + sorted(
+                    (k, repr(v))
+                    for k, v in inst.items()
+                    if k.startswith("$attr:")
+                )
+            ),
+        )
+
+    seen: set[tuple] = set()
+    for full in lvo._binding_envs(lhs_pat, rhs_pat):
+        inst = full
+        if derive is not None:
+            try:
+                extra = derive(full)
+            except Exception:
+                continue
+            if extra is None:
+                continue
+            inst = {**full, **extra}
+        try:
+            lhs_i = _term_instantiate(lhs_pat, inst)
+            rhs_i = _term_instantiate(rhs_pat, inst)
+        except Exception:
+            continue
+        s = sig(inst, lhs_i, rhs_i)
+        if s in seen:
+            continue
+        seen.add(s)
+        yield full, lhs_i
+        if len(seen) >= limit:
+            return
+
+
+def _measure_domain(
+    rule: Rewrite,
+    corpus_terms: Iterable,
+    synth_limit: int,
+) -> list[tuple[dict, str]]:
+    """Measure ``(bound-env, outcome)`` over the synthesized+real domain.
+
+    The probe is the candidate's *bare* pattern — the existing
+    ``cond``/``check`` is dropped so the found guard is measured as a
+    complete claim, not a strengthening of a partially-written one
+    (``derive`` stays: it is part of how the rule instantiates, and a
+    veto is a firing abort, not a site).  Real corpus matches are
+    measured the same way — a real ``unequal`` is a site the found
+    guard must decline exactly like a synthesized one.  The synth
+    domain unions two windows of the same enumeration —
+    :func:`evidence._synth_sites` (pair-dedup) and
+    :func:`_oracle_sites` (instance-sig dedup, the ``synthesize``
+    convention) — since the capped windows expose different corners.
+    """
+    from catopt_discovery import evidence as ev
+    from catopt_discovery.shape_proposal import Schema, real_matches
+
+    probe = Rewrite(rule.name, rule.lhs, rule.rhs, derive=rule.derive)
+    out: list[tuple[dict, str]] = []
+    seen: set[str] = set()
+
+    def record(env: dict, lhs_i: Any) -> None:
+        key = _env_key(env)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((env, _stable_outcome(probe, env, lhs_i)))
+
+    try:
+        for subst, lhs_i in ev._synth_sites(
+            rule.lhs, rule.rhs, limit=synth_limit
+        ):
+            record(subst, lhs_i)
+        for env, lhs_i in _oracle_sites(
+            rule.lhs, rule.rhs, rule.derive, synth_limit
+        ):
+            record(env, lhs_i)
+    except (TypeError, ValueError, KeyError):
+        # The enumerator's honest boundary (nested views and friends
+        # raise in ``_attr_domains`` — see oracle's pinned edge):
+        # whatever sites were collected still measure, plus the real
+        # matches below.
+        pass
+    schema = Schema(rule.name, rule.lhs, rule.rhs)
+    for m in real_matches(list(corpus_terms), schema):
+        subst = _term_match(rule.lhs, m)
+        if subst is not None:
+            record(subst, m)
+    return out
+
+
+def _stable_outcome(probe: Rewrite, env: dict, lhs_i: Any) -> str:
+    """Score one site, twice — ``unstable`` when the verdicts differ.
+
+    ``eval_instance`` fills leaves with ambient ``torch.randn`` draws,
+    so a binding whose evaluative verdict is value-sensitive — a real
+    term holding ``pow(param, -0.25)`` that NaNs on a negative draw is
+    the measured case — reports a different outcome per draw.  Such a
+    site is *not stably measured*: it goes into the must-decline
+    class, so the minted guard never admits a firing region whose
+    verdict is a coin flip.  ``declined``/``guard-err`` (no numeric
+    eval) and the deterministic error outcomes take a single pass.
+    """
+    from catopt_discovery import evidence as ev
+
+    o1 = ev._site_outcome(probe, env, lhs_i)
+    if o1 in ("declined", "guard-err", "env-err"):
+        return o1
+    o2 = ev._site_outcome(probe, env, lhs_i)
+    return o1 if o1 == o2 else "unstable"
+
+
+def _pred_masks(
+    bank: list[tuple], envs: list[dict]
+) -> list[tuple[tuple, int]]:
+    """Evaluate every predicate on every env; return ``(pred, mask)``.
+
+    A predicate that raises on any env is dropped entirely — a
+    non-total guard is not admissible data (it would surface as
+    ``guard-err`` at sweep time).  Masks dedupe: two spellings with
+    the same verdict vector keep the lexicographically first.
+    """
+    out: dict[int, tuple] = {}
+    for pred in bank:
+        mask = 0
+        try:
+            for i, env in enumerate(envs):
+                if eval_cond(pred, env):
+                    mask |= 1 << i
+        except (ValueError, TypeError, KeyError):
+            continue
+        prev = out.get(mask)
+        if prev is None or repr(prev) > repr(pred):
+            out[mask] = pred
+    return [
+        (p, m)
+        for m, p in sorted(out.items(), key=lambda kv: repr(kv[1]))
+    ]
+
+
+def _min_cover(
+    useful: list[tuple[tuple, int, int]],
+    eq_mask: int,
+    bad_mask: int,
+    n_sites: int,
+    max_clauses: int,
+) -> tuple | None:
+    """Smallest conjunction covering *eq_mask* and declining *bad_mask*.
+
+    *useful* is ``(pred, accept_mask, kill_mask)`` — every pred covers
+    all equal sites and declines ≥1 bad site.  Iterative deepening
+    over clause count (a smaller solution is impossible at level *k*
+    iff levels below it returned nothing); at each level DFS branches
+    on the uncovered bad site with the fewest killers, keeping the
+    combination admitting the fewest non-equal sites, determinism via
+    sorted order.  ``None`` = no declarable cover of ≤ *max_clauses*.
+    """
+    killers: dict[int, list[int]] = {}
+    for i, (_p, _m, km) in enumerate(useful):
+        for site in _bit_sites(km):
+            killers.setdefault(site, []).append(i)
+    if any(s not in killers for s in _bit_sites(bad_mask)):
+        return None
+    all_mask = (1 << n_sites) - 1
+    state: dict[str, Any] = {
+        "key": None,
+        "combo": None,
+        "cap": _AUTO_VISIT_CAP,
+    }
+
+    def visit(
+        uncovered: int, acc: int, chosen: tuple, limit: int
+    ) -> None:
+        if state["cap"] <= 0:
+            return
+        state["cap"] -= 1
+        if not uncovered:
+            extra = (acc & ~eq_mask & all_mask).bit_count()
+            key = (
+                extra,
+                tuple(sorted(repr(useful[i][0]) for i in chosen)),
+            )
+            if state["key"] is None or key < state["key"]:
+                state["key"], state["combo"] = key, chosen
+            return
+        if len(chosen) >= limit:
+            return
+        site = min(
+            (s for s in killers if (uncovered >> s) & 1),
+            key=lambda s: len(killers[s]),
+        )
+        for i in killers[site]:
+            if i not in chosen:
+                visit(
+                    uncovered & ~useful[i][2],
+                    acc & useful[i][1],
+                    (*chosen, i),
+                    limit,
+                )
+
+    for limit in range(1, max_clauses + 1):
+        state["key"], state["combo"] = None, None
+        visit(bad_mask, all_mask, (), limit)
+        if state["combo"] is not None:
+            return tuple(useful[i][0] for i in state["combo"])
+    return None
+
+
+def _bit_sites(mask: int) -> Iterable[int]:
+    """Yield the set-bit indices of *mask*, lowest first."""
+    while mask:
+        low = mask & -mask
+        yield low.bit_length() - 1
+        mask ^= low
+
+
+def _outcome_bitsets(
+    envs: list[tuple[dict, str]],
+) -> tuple[int, int, int, int]:
+    """Partition outcomes into ``(equal, bad, other, declined)`` masks.
+
+    ``bad`` = ``unequal`` + ``rhs-err`` + ``unstable`` — the sites a
+    minted guard MUST decline (the guarded-region sweep refuses them,
+    and an ``unstable`` site's verdict is a coin flip); ``other``
+    (``lhs-err``/``both-err``/``env-err``) is don't-care, counted for
+    the report; ``declined`` sites (``derive`` vetoes) sit outside
+    the firing region and play no role in the cover.
+    """
+    eq = bad = other = declined = 0
+    for i, (_e, outcome) in enumerate(envs):
+        if outcome == "equal":
+            eq |= 1 << i
+        elif outcome in ("unequal", "rhs-err", "unstable"):
+            bad |= 1 << i
+        elif outcome in ("declined", "guard-err"):
+            declined |= 1 << i
+        else:
+            other |= 1 << i
+    return eq, bad, other, declined
+
+
+def _auto_refuse(
+    measured: int,
+    eq: int,
+    bad: int,
+    other: int,
+    declined: int,
+    detail: str,
+    unstable: int = 0,
+) -> AutoCond:
+    """Return the honest refusal — reason recorded, no object minted."""
+    return AutoCond(
+        object=None,
+        measured=measured,
+        equal=eq.bit_count(),
+        bad=bad.bit_count(),
+        unstable=unstable,
+        other=other.bit_count(),
+        declined=declined,
+        detail=detail,
+    )
+
+
+def _cover_clauses(
+    lhs: Any,
+    rhs: Any,
+    universe: list[tuple[dict, str]],
+    u_eq: int,
+    u_bad: int,
+    max_clauses: int,
+) -> tuple[tuple, dict]:
+    """Search the predicate bank for the minimal cover.
+
+    Returns ``(clauses, {pred: accept-mask})`` — ``clauses`` empty
+    when no declarable conjunction of ≤ *max_clauses* separates the
+    measured classes.
+    """
+    bank = _pred_bank(lhs, rhs, universe)
+    masks = _pred_masks(bank, [e for e, _ in universe])
+    useful = [
+        (p, m, u_bad & ~m)
+        for p, m in masks
+        if (m & u_eq) == u_eq and (u_bad & ~m)
+    ]
+    clauses = (
+        _min_cover(useful, u_eq, u_bad, len(universe), max_clauses)
+        or ()
+    )
+    return clauses, {p: m for p, m, _k in useful}
+
+
+def _mint_guarded(
+    rule: Any, cond: Any, *, name: str | None, kind: str, detail: str
+) -> ConstructedObject:
+    """Mint the found guard as a constructed object — declarative data.
+
+    The minted ``Rewrite`` carries the found ``cond`` — *replacing*
+    any declarative guard the candidate had (the measurement ran on
+    the bare domain, so the found cond is the complete claim) — and
+    keeps the candidate's ``dspec`` plus its *procedural* remainders:
+    a callable ``check``/``derive`` the serializer flags as missing
+    rides the rebuilt rule (the store marks it honestly).
+    """
+    from catopt_core.laws.serialize import _proc_check, _proc_derive
+
+    new_rule = Rewrite(
+        name=name or rule.name,
+        lhs=rule.lhs,
+        rhs=rule.rhs,
+        law=rule.law or "auto-cond guarded candidate",
+        check=rule.check if _proc_check(rule) else None,
+        derive=rule.derive if _proc_derive(rule) else None,
+        tags=rule.tags,
+        error_bound=rule.error_bound,
+        bound_norm=rule.bound_norm,
+        derivation=rule.derivation,
+        cond=cond,
+        dspec=rule.dspec,
+    )
+    return ConstructedObject(
+        rule=new_rule,
+        kind=kind,
+        construction=("auto-cond", rule.name),
+        note=detail,
+    )
+
+
+def _prelude_refusal(
+    envs: list, universe: list, masks: tuple[int, int, int], n_uns: int
+) -> AutoCond | None:
+    """Return the early refusal — an empty domain or an empty equal class."""
+    n_dec = len(envs) - len(universe)
+    _eq, bad, other = masks
+    if not universe:
+        return _auto_refuse(
+            len(envs),
+            0,
+            0,
+            0,
+            n_dec,
+            "no evaluable site in the measured domain",
+        )
+    if not _eq:
+        return _auto_refuse(
+            len(envs),
+            0,
+            bad,
+            other,
+            n_dec,
+            "no equal site in the measured domain",
+            n_uns,
+        )
+    return None
+
+
+def _fold_cond(clauses: tuple) -> Any:
+    """Fold the clause tuple into a ``cond`` datum."""
+    if not clauses:
+        return True
+    if len(clauses) == 1:
+        return clauses[0]
+    return ("and", *clauses)
+
+
+def auto_cond_object(
+    rule: Any,
+    *,
+    corpus_terms: Iterable = (),
+    synth_limit: int = 360,
+    max_clauses: int = _AUTO_MAX_CLAUSES,
+    name: str | None = None,
+    kind: str = "abstraction",
+) -> AutoCond:
+    """Mint the smallest declarative guard making *rule* measured-true.
+
+    *rule* is the conditional candidate — a ``Rewrite`` (or any object
+    with the ``Rewrite`` fields).  The search measures the bare
+    pattern's domain (the oracle's synthesized envs at *synth_limit*
+    plus every real match in *corpus_terms*), enumerates the cond-DSL
+    predicate bank over its metavariables, and picks the smallest
+    conjunction covering every equal site and declining every
+    ``unequal``/``rhs-err``/``unstable`` site.  ``object=None`` inside
+    the result is the refusal: no equal site measured, or no
+    declarable cover of ≤ *max_clauses*.
+    """
+    envs = _measure_domain(rule, corpus_terms, synth_limit)
+    universe = [
+        (e, o) for e, o in envs if o not in ("declined", "guard-err")
+    ]
+    u_eq, u_bad, u_other, _unf = _outcome_bitsets(universe)
+    n_dec = len(envs) - len(universe)
+    n_uns = sum(1 for _e, o in universe if o == "unstable")
+    refused = _prelude_refusal(
+        envs, universe, (u_eq, u_bad, u_other), n_uns
+    )
+    if refused is not None:
+        return refused
+    clauses: tuple = ()
+    acc = (1 << len(universe)) - 1
+    detail = (
+        f"vacuous cover — no bad site among "
+        f"{len(universe)} measured; cond=True"
+    )
+    if u_bad:
+        clauses, accept_masks = _cover_clauses(
+            rule.lhs, rule.rhs, universe, u_eq, u_bad, max_clauses
+        )
+        if not clauses:
+            return _auto_refuse(
+                len(envs),
+                u_eq,
+                u_bad,
+                u_other,
+                n_dec,
+                f"no declarable conjunction of <= {max_clauses} "
+                f"covers {u_eq.bit_count()} equal / "
+                f"{u_bad.bit_count()} bad sites "
+                f"({len(accept_masks)} covering predicates)",
+                n_uns,
+            )
+        for c in clauses:
+            acc &= accept_masks[c]
+        detail = (
+            f"{len(clauses)}-clause guard: covers "
+            f"{u_eq.bit_count()} equal, declines "
+            f"{u_bad.bit_count()} bad"
+            + (
+                f", accepts {(acc & u_other).bit_count()} other-err"
+                if acc & u_other
+                else ""
+            )
+        )
+    cond = _fold_cond(clauses)
+    return AutoCond(
+        object=_mint_guarded(
+            rule, cond, name=name, kind=kind, detail=detail
+        ),
+        cond=cond,
+        clauses=clauses,
+        measured=len(envs),
+        equal=u_eq.bit_count(),
+        bad=u_bad.bit_count(),
+        unstable=n_uns,
+        other=u_other.bit_count(),
+        declined=n_dec,
+        accepted=acc.bit_count(),
+        accepted_other=(acc & u_other).bit_count(),
+        detail=detail,
+    )
