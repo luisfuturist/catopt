@@ -26,7 +26,7 @@ every projection is *byte-identical* to the literal it replaced
 | `table` | `signature._TABLE_OPS` | 10 |
 | `commutative` | `typing._COMMUTATIVE_BROADCAST` | 4 |
 
-The registry itself is **165 ops**, composed from three declared
+The registry itself is **166 ops**, composed from three declared
 sources: the attr schema (`ATTR_SCHEMA`, indexed not copied), the
 classification table (`_CLASSIFIED`, keyed by op), and a short
 IR-only vocabulary (`_IR_ONLY_OPS`).

@@ -104,7 +104,7 @@ structure: the derived layer of `ALL_RULES` is *flat* — zero laws
 derivable from the primitives alone, every derivation a
 self-supporting cycle (ten inverse pairs plus the 4-member matmul
 class) plus one emergent law (`silu_mul_form`); the effective
-basis is 40 = 29 primitives + 11 cycle seeds, marked on the rules
+basis is 32 independent primitives (27 derivable), marked on the rules
 by `--emit-basis`.  Two honest findings: **derivable ≠
 disposable** — removing a derivable law costs real bounded reach
 (the twin proves the *equality*; only this direction's LHS fires
@@ -114,8 +114,8 @@ found and mediated** — `silu_fold` shipped to restore confluence
 where `silu_expand` destroyed the `swiglu_fuse` redex, and it pays.
 
 **Discovery — the closed loop.**  `catopt_discovery.pipeline` runs the
-whole pipeline on a corpus of real exported models (94 terms / 163
-op-tuples today): **census** the op-shape tuples that occur →
+whole pipeline on a corpus of real exported models (364 terms /
+725 op-tuples today): **census** the op-shape tuples that occur →
 **propose** candidates (census-naturality, mixed-view,
 pattern-recognition and grammar schemas — and the proposers' op
 alphabet is itself property-derived by `catopt_discovery.vocab`, not

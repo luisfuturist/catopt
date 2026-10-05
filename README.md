@@ -5,44 +5,96 @@
 ![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-**A program optimizer's reachable set is bounded by its semantic
-language, not its search strategy.**  Tensor-level compilers rewrite
-*ops*; catopt rewrites over *algebraic structure* — monoid carriers,
-traced-monoidal fixpoints, products as `⟨f₁,…,f_k⟩ = (×fᵢ)∘Δ` — so it
-reaches programs no op-level pattern composes to.  Every delivered
-program carries a **replayable certificate** of equivalence, re-checked
-on real terms.  The engine separates four independent dimensions —
-semantics, search, evaluation and execution
-([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md))
-— and how a candidate actually runs on a target is *measured*, never
-assumed.
+**catopt rewrites neural-network computation graphs over algebraic
+structure — monoid carriers, traced-monoidal fixpoints, products — not
+over op patterns, and ships every result with a replayable certificate
+of equivalence.**  It is a research-grade optimizer and a worked
+example of one thesis, aimed at people who build compilers, tensor-graph
+superoptimizers, and verified rewriting systems.
+
+The claim is falsifiable and stated up front: **a program optimizer's
+reachable set is bounded by its semantic language, not its search
+strategy.**  Op-level compilers rewrite *generators*; catopt rewrites
+*morphisms up to structure*, so its reach is the closure of its law
+library — strictly larger than any fixed pass list.  The engine keeps
+four dimensions independent and measures how a candidate runs instead
+of assuming it.
+
+## The thesis
+
+A tensor program is a morphism in a hypergraph monoidal category.
+Optimization is search in the quotient of the free category on the IR's
+generators, by the laws of the structures the program instantiates —
+monoids, comonoids, traces, contraction
+([ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md)).
+The interpretation is not unique, and choosing the richest one is the
+creative act: the same graph reads as plain composition, a shared-input
+comonoid (pairing), a low-rank approximation (bounded), or a contraction
+problem, each exposing different laws.  The deliverable is always a
+cheaper program **and its proof** — exact equivalence, or a certified
+bound, never silent approximation.
+
+## Architecture
+
+Four independent dimensions ([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md)).
+No layer answers another's question: a cost model must not change
+semantics, a policy must not decide equivalence, a profiler must not run
+on the target.
+
+```text
+SEMANTICS ──▶ SEARCH ──▶ EVALUATION ──▶ EXECUTION
+ "equivalent?" "explore?"  "how does it   "what actually
+                            look / run?"    ran?"
+```
+
+| Dimension | Question | Reach it with |
+|---|---|---|
+| semantics | Is it equivalent? | `verify_certificate(ir.root, cert, strict=True)` — every delivered program ships a replayable derivation |
+| search | What should we explore? | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned) orders the rules each iteration |
+| evaluation | What does it look like / what might run well? | `criteria=PredictedCriterion(model)`; `SearchResult.frontier({...})`; `StaticProfiler` describes a program without running it |
+| execution | What actually ran? | the `Sink` / `Runner` / `Meter` ports; `catopt_core.failures` classifies what went wrong |
+
+**Package map** (a uv-workspace monorepo; there is no `catopt` façade —
+import the domain packages directly, plan 0008):
+
+| package | role |
+|---|---|
+| `catopt-core` | the torch-free engine: IR, e-graph, laws, cost, ports, features |
+| `catopt-torch` | PyTorch adapters: export/import bridge, `TorchSink`, the contraction player |
+| `catopt-carriers` | carrier laws and executors (scan, attention) |
+| `catopt-cuda` | the CUDA-graph runner (`CudaGraphRunner`) |
+| `catopt-orchestrator` | the backend-neutral pipeline: `Optimizer`, strategies, morphisms |
+| `catopt-discovery` | the law-discovery engine — invoke as `python -m catopt_discovery.<mod>` |
+| `catopt-native` | optional PyO3/Rust search engine (excluded from the workspace; opt-in via `engine=`) |
+
+The dependency arrow points core ◀ adapter, never core ▶ CUDA.  The
+hexagonal boundary is pinned by import-linter:
+`catopt_cuda` ▶ {`catopt_torch`, `catopt_carriers`} ▶ `catopt_orchestrator`
+▶ `catopt_native` ▶ `catopt_core`.  `catopt_core` imports no `torch`,
+`numpy`, or GPU library — it is a *sink* for adapter-pushed state, never
+a puller.  A new backend implements `Sink`; nothing in core changes.
 
 ## Game
 
 catopt is, structurally, **a game**.
 
-**Rules.**  The rewrite laws are *derived from category theory*, not
-enumerated as op patterns: associativity of composition, the unit and
-interchange laws, the traced-monoidal axioms, products, and monoid
-carriers.  A rewrite is a **2-cell**; a law *about* rewrites is a
-**3-cell** (coherence); the e-graph is the **higher-categorical board**
-those cells live on ([ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md)).
-
-**Moves.**  Applying a law — a rewrite.
-
-**Board.**  The e-graph: every program *known equal* to yours, in one
-place.  The board is the whole equivalence class, not one term.
-
-**Referee.**  The **certificate**.  `verify_certificate` replays the
-derivation on real terms, so whatever the player does, the output is
-provably the same function.  **This is the differentiator.**  egglog has
-proof-carrying rewriting and Catlab / AlgebraicJulia does categorical
-rewriting, but the *combination* — derived laws + machine-checked
-replay + a learned player + a compiler IR — is the claim.
-
-**Score.**  A pluggable, per-target cost model.  Evaluation is an
-independent dimension ([ADR 0003](project/adrs/0003-evaluation-is-an-independent-dimension.md)),
-so the score never decides semantics.
+- **Rules.**  The rewrite laws are *derived from category theory*, not
+  enumerated as op patterns: associativity of composition, the unit and
+  interchange laws, the traced-monoidal axioms, products, and monoid
+  carriers.  A rewrite is a **2-cell**; a law *about* rewrites is a
+  **3-cell** (coherence); the e-graph is the **higher-categorical board**
+  those cells live on ([ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md)).
+- **Moves.**  Applying a law — a rewrite.
+- **Board.**  The e-graph: every program *known equal* to yours, in one
+  place.  The board is the whole equivalence class, not one term.
+- **Referee.**  The **certificate**.  `verify_certificate` replays the
+  derivation on real terms, so whatever the player does, the output is
+  provably the same function.  egglog has proof-carrying rewriting and
+  Catlab/AlgebraicJulia does categorical rewriting, but the *combination*
+  — derived laws + machine-checked replay + a learned player + a
+  compiler IR — is the claim.
+- **Score.**  A pluggable, per-target cost model.  Evaluation is an
+  independent dimension, so the score never decides semantics.
 
 One call runs the whole game:
 
@@ -54,203 +106,10 @@ opt, stats = Optimizer(backend=TorchBackend()).optimize(model, x)
 out = opt(x)        # the same function as model(x) — verified, not spot-checked
 ```
 
-The game pays off concretely on attention: from associativity alone, the
-board reaches `(Q·Kᵀ)·V → Q·(Kᵀ·V)`, turning an O(T²d) intermediate into
-an O(Td²) one — a transform **nobody wrote down** (the details are
-[below](#the-transformation-it-found)).
+### The transformation it found
 
-## The learned player
-
-The player is a **`Policy`**, and it may only **reorder legal moves**.
-It can never change equivalence: a random player reaches the *identical*
-equivalence class, and the certificate still replays.  That safety
-property — a policy that cannot make a program wrong — is what makes a
-learned player admissible at all.
-
-**It ships.**  The contraction player is a bundled artifact — ~25 KiB
-of weights, trained once, loaded lazily:
-
-```python
-import catopt_torch
-policy = catopt_torch.load_contraction_policy()   # the trained player
-order = policy.order(tensors, sizes)               # one deterministic pass
-```
-
-**The expectation: outperform humans.**  "Humans" means the hand-written
-heuristics — our `greedy`/`search`/`restart` players and `opt_einsum`'s
-orderings.  **The measured reality: it now wins.**
-
-- **Beats `opt_einsum`'s randomised greedy at n = 40, equal wall-clock**
-  — 0.91–0.98× oe-cost at fed budgets across three seeds (best cell
-  0.888), the first outright win over the field's best cheap player.
-  The bundled player is **distilled from the teacher's trial
-  distribution** (`oe-all` supervision): ~parity quality per rollout,
-  and the vectorised lockstep driver gives it ~2× the teacher's trial
-  rate — best-of-more at parity beats best-of-fewer
-  ([contraction-synthesis.md](project/retros/contraction-synthesis.md)).
-- **Beats the deterministic external greedy everywhere** under the
-  guided protocol (0.51–0.90× pairwise at fed budgets); its own single
-  argmax pass is a fallback, not the player — best-of-N sampled
-  rollouts are the point.
-- **Honest edges.**  Throughput-starved under ~50 ms budgets (the
-  affine prior can starve it to one episode), and the short-budget wins
-  partially overspent.  The earlier curriculum-RL weights
-  (`contraction_policy_curriculum.pt`) stay bundled as an alternate —
-  under the identical driver they never cross below 1.0× at n = 40, so
-  the win is attributable to the distilled proposal quality.
-- **Two structural limits, both measured.**  In catopt's own e-graph,
-  reordering **cannot change extracted cost** (the fixed point is
-  order-invariant — a random player reaches identical cost); and as a
-  *law proposer* the learned player loses ~10× to enumeration —
-  **corpus knowledge is the discovery**
-  ([law-meta-game.md](project/retros/law-meta-game.md)).
-
-So the player's value lives where the choice is **not** order-invariant:
-contraction ordering (shipped), extraction/coordination — not rule
-reordering and not law invention.
-
-## Player Finds
-
-What the machine has found, verified and shipped — six fold laws
-plus the canonicalization bridges that make them reachable, all in
-`DEFAULT`:
-
-**`select_mul`** — the first machine-discovered law (census-naturality
-proposer).  `mul(select(u,D,I), select(v,D,I)) →
-select(mul(u,v),D,I)` fires 24× across 5 models,
-**17–26% modeled cost drop**, cert replays — and the view/index oracle
-then proved it **latently unsound**: `mul` can broadcast along the
-selected axis (`u=(4,), v=(2,4), D=0` falsifies it), a condition no
-gate checked because all 13 real sites happened to satisfy it — so it
-never bit.  Now guarded by the declarative `dim-eq-attr` cond: still
-in `DEFAULT`, now sound
-([law-shape-aware.md](project/retros/law-shape-aware.md),
-[select-mul-broadcast.md](project/retros/select-mul-broadcast.md)).
-
-**`softmax_fold`** — `div(exp(u), sum(exp(u),dim,keepdim)) →
-softmax(u,dim)`: the manual normalization is the kernel's definition
-spelled out.  Found by *pattern recognition* over the corpus's composed-
-then-reduced chains; −19% cost, and **+13–48% measured wall-clock** on
-the real model
-([law-softmax-fold-shipped.md](project/retros/law-softmax-fold-shipped.md),
-[law-wallclock-verification.md](project/retros/law-wallclock-verification.md)).
-
-**`silu_fold`** — `mul(x, sigmoid(x)) → silu(x)`: a **3-cell mediator**.
-The coherence catalogue — pairwise relations over all 61 laws — found
-two genuinely divergent pairs (`silu` expansion destroys the
-`swiglu_fuse` redex).  This law restores confluence **and pays**
-(1.43–2.62× on the bench case)
-([three-cell-mediator.md](project/retros/three-cell-mediator.md)).
-
-**`rms_norm_fold`** (+`_nogain`) — `x·rsqrt(mean(x²)+eps) →
-rms_norm`: the manual RMSNorm spelling becomes one dispatched kernel
-— **−83.3% cost, bitwise fp64-identical**, 2.70× on the bench case.
-**`glu_fold`** — `chunk+sigmoid → glu` (−40%, bench-verified).  The
-fold recipe ran three times: put the manual spelling in the corpus,
-the fold law lands it as one dispatched op, the certificate proves
-it.
-
-**Canonicalization bridges** — `mul(u,u) → square(u)` plus three
-rsqrt spellings (`div_sqrt`, `pow`, `recip_sqrt`) — machinery-
-motivated bridges that make noncanonical RMSNorm spellings reach
-the fold.  And the workload intake itself is machine-driven:
-`catopt_discovery.intake` feeds **166 real `nn.*` workloads** through
-the export boundary — 114 fp64-verified — and caught **three real
-lowering defects** no test caught
-([intake-round-2.md](project/retros/intake-round-2.md)).
-
-**The loop is closed.**  `catopt_discovery.pipeline` runs
-census → propose → verify → measure → rank → **emit** end to end:
-
-- **Validated by held-out rediscovery** — a shipped winner re-ranks
-  #1, shippable, every run.
-- **The op vocabulary is machine-derived too** — ops are classified by
-  property tests (commutes-with-views, value-preserving), not human
-  tables; the derived alphabet recovers every hand entry *plus* the
-  ones humans missed
-  ([law-vocab-derived.md](project/retros/law-vocab-derived.md)).
-- **`--emit-admission` emits the `R(...)` + tests** as a `git apply`
-  patch; the emitted law is bytecode-identical to the hand-written one
-  ([automated-admission.md](project/retros/automated-admission.md)).
-- **The referee catches its own pool**: `reshape_transpose` fires 23×
-  and cost-lowers yet is **numerically false** — the oracle rejects it;
-  an oracle rank-mismatch hole was found by the meta-game and closed
-  in both oracles ([oracle-rank-mismatch-fix.md](project/retros/oracle-rank-mismatch-fix.md)).
-- **The referee audits the library too.**  Adversarial witness
-  generation found a **human-written unsoundness**: three shipped
-  matmul laws are false on mixed-rank bindings — guarded now
-  ([matmul-unsound-fix.md](project/retros/matmul-unsound-fix.md)).
-- **The referee referees itself — the biggest example yet.**  The
-  view/index oracle (`catopt_discovery.oracle`) resolved every
-  "unproven" candidate — **1 true / 29 conditional / 5 false / 0
-  unproven** over the 35 view-family proposals — and flagged the
-  *already-shipped* `select_mul` as conditional, not true (above)
-  ([view-index-oracle.md](project/retros/view-index-oracle.md)).
-- **"Pays" now means pays on well-typed programs.**  The typed-pay
-  gate replays every firing and discounts mints that don't denote:
-  **19 of 33 firing candidates mint ≥1 ill-typed member**, and the
-  −40% top candidate's pay was *entirely* ill-typed.  Current pipeline
-  status on the 276-term corpus (66 bench + 44 models + 166 intake):
-  **shippable = 0**
-  ([typed-pay-gate.md](project/retros/typed-pay-gate.md)).
-- **The kernel is measured, not assumed.**  Every shipped law is marked
-  by kind — **46 axioms / 13 lemmas / 2 redundant** (of 61) — generated
-  by the coherence tool, not by hand
-  ([axiom-lemma-split.md](project/retros/axiom-lemma-split.md)).
-- **Laws are data, not just code.**  57/61 laws are fully
-  serializable — pattern + declarative `cond`/`dspec` guards + tags
-  + derivation, no Python — and `derivation=` metadata now replays
-  into real `Certificate`s (`catopt_discovery.lemma_cert`)
-  ([derive-declarative.md](project/retros/derive-declarative.md),
-  [lemma-certificates.md](project/retros/lemma-certificates.md)).
-- **Verdicts are cached.**  `--evidence-db` persists them keyed by
-  candidate × corpus × rules × code revision — second run is 19×
-  faster ([evidence-store.md](project/retros/evidence-store.md)).
-- **Costs are measured too.**  `calibrate_profile.py` + a `profile=`
-  on the cost fn route the delivered-executor price by wall-clock,
-  not syntax ([calibrate-profile.md](project/retros/calibrate-profile.md)).
-- **Honest limits**: learned-proposal loses to enumeration; workload
-  resampling can't feed self-play — law-bearing shapes come from
-  architecture semantics, not op marginals
-  ([law-workload-gen.md](project/retros/law-workload-gen.md)).
-
-## Benchmark
-
-Every number below is measured on the dev box (RTX 2050, fp64,
-launch-bound sizes — see [Limits](#limits)):
-
-| measurement | result | source |
-|---|---|---|
-| `softmax_fold` on `ManualSoftmaxAttention` | **+13–27% eager, +29–48% CUDA-graph** vs raw | `tools/law_wallclock.py` |
-| `select_mul` marginal (optimized vs law-ablated) | **faster in 19/20 measurements** | `tools/law_wallclock.py` |
-| executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (was 2–3× slower) | `tools/executor_cost_probe.py` |
-| `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
-| contraction player n=40 vs `opt_einsum` | **0.91–0.98× randomised greedy at equal wall-clock** (0.51–0.90× deterministic) | `tools/contraction_guided_restart.py` |
-| pipeline held-out rediscovery | **winner re-ranks #1, every run** | `catopt_discovery.pipeline` |
-| pipeline on the 276-term corpus | **shippable = 0** — 19/33 firing candidates mint ill-typed members (typed-pay gate); the oracle emptied "unproven" | `catopt_discovery.pipeline` |
-| coherence catalogue | **46 axioms / 13 lemmas / 2 redundant; divergence 0** | `catopt_discovery.coherence` |
-| workload intake | **166 real `nn.*` workloads, 114 fp64-verified** (corpus 290→588 op-tuples) | `catopt_discovery.intake` |
-| laws as data | **57/61 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_discovery.pipeline` |
-| bounded rewrites, real checkpoint | **up to 1.32× vs eager, 1.25× vs Inductor** (0.94–1.25) | `bench/suites` |
-
-Full measured picture and provenance: [`docs/results.md`](docs/results.md).
-
----
-
-## The transformation it found
-
-`(Q·Kᵀ)·V → Q·(Kᵀ·V)`: the intermediate goes from T×T to d×d — an
-asymptotic change (O(T²d) → O(Td²)), not a tuning.
-
-**Reassociation itself is not the novelty.**  Matrix-chain
-parenthesization is a compiler optimization from 1975 (Sethi–Ullman),
-and any optimizer that reassociates can reach this shape.  What catopt
-adds is that nobody wrote *this* transform down: the e-graph derives it
-from associativity plus a shape-aware cost model, the certificate
-proves it, and the pipeline delivers it end to end.  **There is no
-hand-written "reassociate attention" rule** — the attention-specific
-laws that do exist (`laws/attention.py`) are *folds* into `sdpa`, not
-this reassociation.
+From associativity alone, the board reaches `(Q·Kᵀ)·V → Q·(Kᵀ·V)`,
+turning an O(T²d) intermediate into an O(Td²) one.
 
 ```mermaid
 flowchart TB
@@ -270,32 +129,259 @@ flowchart TB
   end
 ```
 
-The novelty is not the algebra — it is that the optimizer *discovered*
-and *certified* it, and delivers it end to end, without an
-attention-specific rule.
+**Reassociation itself is not the novelty.**  Matrix-chain
+parenthesization is a compiler optimization from 1975 (Sethi–Ullman),
+and any optimizer that reassociates can reach this shape.  What catopt
+adds is that nobody wrote *this* transform down: the e-graph derives it
+from associativity plus a shape-aware cost model, the certificate proves
+it, and the pipeline delivers it end to end.  There is no hand-written
+"reassociate attention" rule.
 
-## The idea in three steps
+## What's data
 
-1. **Lift.**  The model *and its weights* export into one typed term
-   (torch: `torch.export`); parameters are ordinary leaves.
-2. **Search.**  Equality saturation closes that term under equational
-   *and* categorical laws — associativity, homomorphism, the traced
-   monoidal axioms, the product law — enumerating the equivalence class
-   rather than applying a fixed pass list.
-3. **Prove and deliver.**  A cost model extracts the cheapest
-   representative the backend can actually lower; the derivation is
-   verified; you get back a runnable `torch.nn.Module` plus a stats dict
-   (`stats["rule_fires"]`, `stats["lowering"]`, `stats["runner"]`, …).
+The core design claim is that **laws, guards, objects and the op
+vocabulary are data**, not code — so the machine can grow the object
+language without growing a pile of Python.
 
-→ The conceptual pipeline is in [`docs/mechanism.md`](docs/mechanism.md);
-the thesis it implements is
-[ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md).
+- **Laws.**  `catopt_core.laws.ALL_RULES` holds **61** rules, each an
+  `R(name, lhs, rhs, law=, cond=, dspec=, tags=, derivation=)`.  The
+  kernel taxonomy is *measured*, not asserted:
+  `catopt_discovery.coherence --emit-basis` reports **46 axioms / 13
+  lemmas / 2 redundant**.  **All 61 serialize completely** — pattern +
+  declarative `cond`/`dspec` guards + tags + derivation, no Python — and
+  `derivation=` replays into real `Certificate`s.
+- **Guards.**  Side conditions prefer the declarative `cond` DSL
+  (`catopt_core.laws.cond`, pure data such as
+  `("and", ("rank-eq", "a", "b"), ("rank-ge", "a", 2))`, JSON-serializable;
+  **36 of 61** rules use it) over procedural `check`/`derive` hooks — the
+  escape hatch for conditions the DSL cannot express (**16 of 61** use
+  `dspec`).  A record that cannot carry a hook flags it in
+  `missing_hooks` rather than weakening silently.
+- **Objects.**  The unit of invention is a *declared object* — data the
+  referee replays, not an arbitrary rewrite
+  ([ADR 0004](project/adrs/0004-abstraction-as-move.md)).  `evidence.py`
+  stores objects (`--add-object`) and admits them (`--admit-object KEY
+  --gauntlet`); the first inhabitants are `mul_unsqueeze_l_id` and
+  `sub_unsqueeze_l_id`.
+- **Op vocabulary.**  `catopt_core.opmeta` is a single registry of
+  **166 ops**; the thirteen op sets that used to be hand-duplicated
+  across modules are now named projections of it, with the subset
+  relations machine-checked.  The discovery generator's alphabet is
+  itself *derived by property test* (`catopt_discovery.vocab`) — an op
+  is classified by what it *does* (commutes-with-views, value-preserving),
+  not by a lookup table.
+
+## The referee
+
+Discovery is cheap; pricing is hard; **proof is what keeps it honest.**
+Every extracted program ships with an ordered, replayable derivation
+`original → optimized`, and `verify_certificate` re-checks *derivational
+equivalence* on real terms (fp64) — not numerical spot-checks.  The
+certificate is a hard accept/reject filter, never a soft reward.
+
+```python
+from catopt_core.egraph import verify_certificate
+
+verify_certificate(ir.root, cert, strict=True)   # replay every step
+```
+
+The referee earns its keep by finding bugs — **including in the shipped
+library** (all regression-tested):
+
+| caught | how |
+|---|---|
+| three shipped matmul laws false on mixed-rank bindings | adversarial witness generation; now guarded |
+| `select_mul` latently unsound — `mul` broadcasts along the *selected* axis (`u=(4,), v=(2,4), D=0` falsifies it) | the view/index oracle; now guarded by `dim-eq-attr` |
+| `reshape_transpose` fires 23× and cost-lowers yet is numerically false | the oracle rejects it |
+| seven shipped guarded laws with measured-unclean regions | the derivable-gate audit; a measured counterexample now outranks a derivation; all tightened |
+| `gqa_absorb_repeat` sweep crash (a `str` attr metavar reaching `_infer_op_shape`) | the guarded-region sweep; fixed |
+| a shape misinference that fabricated a 1.98× "win"; a well-typed but wrong program; a launch-time-vs-execution timing bug | the certificate and the equivalence gate |
+| three real `nn.*` lowering defects | the workload intake corpus |
+
+### The admission gauntlet
+
+A synthesized object earns the verdict **`usable`** only by clearing the
+same eight-stage gauntlet a shipped law faces — a failing gate stops the
+run, it does not skip:
+
+> reconstruct → full-data → measure → truth → novelty → typed-pay →
+> closure → cert
+
+`truth` is the interesting stage for a conditional candidate: the
+pipeline's oracles verify *patterns*, but a stored object carries its own
+guard, so the gauntlet sweeps the guarded region itself.  `--auto-cond`
+mints the smallest declarative `cond` covering the measured domain and
+re-runs.  `usable` means *admitted through the gauntlet, usable by the
+pipeline* — **not a shipped law**; promotion to `laws/` stays manual.
+See [`admission-gauntlet.md`](project/retros/admission-gauntlet.md) and
+[`auto-cond.md`](project/retros/auto-cond.md).
+
+## Results
+
+Every number is measured on the dev box (RTX 2050, fp64, launch-bound
+sizes — see [Limits](#limits)); provenance is in
+[`docs/results.md`](docs/results.md).
+
+| measurement | result | source |
+|---|---|---|
+| `softmax_fold` on `ManualSoftmaxAttention` | **+13–27% eager, +29–48% CUDA-graph** vs raw | `tools/law_wallclock.py` |
+| `select_mul` marginal (optimized vs law-ablated) | **faster in 19/20 measurements** | `tools/law_wallclock.py` |
+| `rms_norm_fold` on the bench case | **−83.3% modeled cost, bitwise fp64-identical, 2.70× wall-clock** | `bench run law_bench` |
+| `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
+| executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (was 2–3× slower) | `tools/executor_cost_probe.py` |
+| morphism windows (`chain_x4@4096×128`) | **best 14.83× vs eager** | `bench run morphism_e2e` |
+| weight-chain reassociation vs Inductor | **17.12× vs Inductor** (18.63× vs eager) at (k,d,B·T)=(16,512,4096) | `bench run reassoc_scale` |
+| bounded rewrites on a real checkpoint | **up to 1.32× vs eager / 1.25× vs Inductor** (stories15M) | `bench run bounded_e2e` |
+| contraction player n=40 vs `opt_einsum` | **0.87–0.99× randomised greedy at equal wall-clock** (0.44–0.60× deterministic) | `tools/contraction_guided_restart.py` |
+| pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `catopt_discovery.pipeline --holdout` |
+| pipeline on the 364-term corpus | **shippable = 11** (was 0 before round 4; corpus-circular — see negatives) | `catopt_discovery.pipeline` |
+| coherence catalogue over `ALL_RULES` | **46 axioms / 13 lemmas / 2 redundant; divergence 0** | `catopt_discovery.coherence` |
+| workload intake | **254 real `nn.*` workloads, 201 fp64-verified** (corpus 211→725 op-tuples) | `catopt_discovery.intake` |
+| laws as data | **61/61 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_core.laws.serialize` |
+| evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
+
+### What it finds — and what it doesn't
+
+| Regime | Verdict | Why |
+|---|---|---|
+| Deep weight chains (`reassoc_scale`) | **WIN** | the e-graph reaches a weights-first form Inductor's post-grad graph cannot express |
+| Shared-input projections / gated blocks | **WIN** | pairing fuses k projections into one GEMM + split views |
+| Linear-attention scan lift | **WIN** | the affine-monoid scan lift fires and verifies fp64-exact |
+| Morphism windows | **WIN** | term-FLOP reduction converts to wall time at GEMM-bound sizes |
+| Whole-model E2E | **PARITY** | pairing fires per block and verifies fp64-exact, but wall time is ~parity |
+| Real trained checkpoints, exact mode | **PARITY** | dense weights carry ~zero exploitable bitwise structure |
+| Launch-bound decode | **NEGATIVE** | fewer launches don't pay where launch overhead already dominates — the hypothesis is falsified |
+| Bounded rewrites on a real checkpoint | **WIN (bounded)** | `error_budget=` delivers a certified member; bounds propagate to outputs, KL≈0 at τ=1e-4 |
+
+This is **not a universal speedup.**  Attention- and GEMM-bound code is
+already optimal — expect a parity floor there — and the losses are
+measured too.  The wins live where structure exists.
+
+### The learned player (RL)
+
+The player is a **`Policy`**, and it may only **reorder legal moves**.
+It can never change equivalence: a random player reaches the *identical*
+equivalence class, and the certificate still replays.  That safety
+property — a policy that cannot make a program wrong — is what makes a
+learned player admissible at all.
+
+**It ships.**  The contraction player is a bundled artifact — 24.9 KiB
+of weights, trained once, loaded lazily:
+
+```python
+import catopt_torch
+policy = catopt_torch.load_contraction_policy()   # the trained player
+order = policy.order(tensors, sizes)               # one deterministic pass
+```
+
+**The measured reality: it wins.**  Under the guided protocol the
+bundled player beats `opt_einsum`'s randomised greedy at n = 40 at equal
+wall-clock — **0.87–0.99× oe-cost** across two board sets, three
+temperatures and two budgets (best cell 0.868) — and **0.44–0.60×** the
+deterministic greedy.  It is distilled from the teacher's trial
+distribution; the vectorised lockstep driver gives it ~2× the teacher's
+trial rate, and best-of-more at parity beats best-of-fewer.  Honest
+edges: throughput-starved under ~50 ms budgets, and the short-budget wins
+partially overspent.  The curriculum-RL weights stay bundled as an
+alternate.  ([contraction-player-shipped.md](project/retros/contraction-player-shipped.md))
+
+**Rule, not policy — the verdict that defines the project.**  As a *law
+proposer* the learned player loses ~10× to enumeration (yield per oracle
+call 0.007–0.030 vs 0.292), and on the real discovery board the optimal
+schedule is a fixed rule — the trained guide converged to it
+(`gap_gen` when a target exists, `workload_gen` when loose, `build`
+never), and `usable: yes` was **0 for every guide**.  The learned
+schedule is a noisy approximation of the rule, occasionally lucky, losing
+on the mean.  **Corpus knowledge is the discovery**
+([law-meta-game.md](project/retros/law-meta-game.md),
+[guide-real-run.md](project/retros/guide-real-run.md)).  The player's
+value lives where the choice is *not* order-invariant: contraction
+ordering (shipped), not rule reordering and not law invention.
+
+### Player Finds
+
+What the machine has found, verified and shipped — fold laws plus the
+canonicalization bridges that make them reachable:
+
+- **`select_mul`** — the first machine-discovered law
+  (`mul(select(u,D,I), select(v,D,I)) → select(mul(u,v),D,I)`): fires
+  24× across 5 models, **~26% modeled cost drop**, cert replays.  The
+  view/index oracle then proved it **latently unsound** (broadcast along
+  the selected axis), so it now carries the declarative `dim-eq-attr`
+  guard — still in `DEFAULT`, now sound
+  ([select-mul-broadcast.md](project/retros/select-mul-broadcast.md)).
+- **`softmax_fold`** — `div(exp(u), sum(exp(u))) → softmax(u)`: −19%
+  cost, **+13–48% measured wall-clock** on the real model.
+- **`silu_fold`** — `mul(x, sigmoid(x)) → silu(x)`: a **3-cell
+  mediator** that restores confluence where `silu` expansion destroyed
+  the `swiglu_fuse` redex — and pays (1.43–2.62×).
+- **`rms_norm_fold`** (+`_nogain`) — the manual RMSNorm spelling becomes
+  one dispatched kernel: **−83.3% cost, bitwise fp64-identical**, 2.70×
+  on the bench case.
+- **`glu_fold`** — `chunk + sigmoid → glu` (−40%, bench-verified).
+- **Canonicalization bridges** — `mul(u,u) → square(u)` plus three
+  `rsqrt` spellings, machinery-motivated bridges that make noncanonical
+  RMSNorm spellings reach the fold.
+
+**The loop is closed.**  `catopt_discovery.pipeline` runs
+census → propose → verify → measure → rank → **emit** end to end:
+validated by held-out rediscovery; `--emit-admission` emits the `R(...)`
+plus generated tests as a `git apply` patch (bytecode-identical to the
+hand-written law); verdicts cached in a sqlite store.
+
+### Honest negatives
+
+The negatives are load-bearing, not footnotes:
+
+- **The learned player is a guide, not an inventor** (above).
+- **`shippable` ≠ `usable`.**  A `shippable` candidate passed the corpus
+  gates; a `usable` object cleared the admission gauntlet and is usable
+  *by the pipeline*.  Neither is a shipped law — promotion is manual.
+- **"Pays" means pays on well-typed programs.**  The typed-pay gate
+  replays every firing and discounts mints that don't denote; before
+  round 4 the corpus had **shippable = 0** precisely because ill-typed
+  pays were being suppressed.  Round 4's spelling expansion shipped 11
+  rules through the whole gate stack
+  ([typed-pay-gate.md](project/retros/typed-pay-gate.md),
+  [corpus-round-4.md](project/retros/corpus-round-4.md)).
+- **`shippable = 11` is corpus-circular — read it carefully.**  All 11
+  clear the full gauntlet (zero refusals) but they are *unguarded*, so
+  the one stricter stage never runs; and against the **baseline** corpus
+  (no intake) every one of them measures `fires = 0`.  Each firing site
+  is a round-4 workload written to spell that pattern.  The 11 are real
+  *library* additions (elementwise factoring — `x−x=0`, `x**1=x`,
+  `(−x)²=x²`, `eˣeʸ=eˣ⁺ʸ`, `x·y±x·z=x·(y±z)` — the library had only the
+  matmul/linear controls), but the number measures the corpus's new
+  *spellings*, not real-network relevance
+  ([shippable-audit.md](project/retros/shippable-audit.md)).
+- **Guards that can never fire on exported graphs.**  Seven minted
+  guards are *boundary facts*, not corpus gaps: `torch.export` folds
+  every full-extent slice to `alias`, `x[0]` exports as `select` (never
+  `getitem`), and `0 * x` canonicalises to `mul(x, 0)`.  No workload can
+  reach them as spelled
+  ([corpus-round-4.md](project/retros/corpus-round-4.md)).
+- **The framework is general; the law library is narrow.**  Like every
+  rule-based optimizer, catopt finds the structures its laws describe —
+  an unmatched block is an opaque boundary, never a wrong answer.
+- **Compile-time, inference-only.**  Search is seconds per block;
+  weight folding destroys per-layer gradients, so there is no backward
+  rewrite.
 
 ## Quickstart
+
+Python ≥3.11 (developed on 3.13), `torch>=2.0`, `numpy>=1.24`.
 
 ```bash
 uv sync                 # dev env — all workspace members editable
 python demo.py          # ~60-second end-to-end run on CPU
+```
+
+Or with pip (`catopt-core` alone is the zero-dependency engine):
+
+```bash
+pip install -e packages/catopt-core -e packages/catopt-torch \
+    -e packages/catopt-carriers -e packages/catopt-cuda \
+    -e packages/catopt-orchestrator -e packages/catopt-discovery
 ```
 
 `demo.py` walks one gated projection block through the whole pipeline:
@@ -304,123 +390,124 @@ verifier, the extracted op tree, and a synced median race against eager
 and `torch.compile`.  It re-execs under `PYTHONHASHSEED=0`, so the
 search, extraction and certificate are bit-for-bit reproducible.
 
-## The four dimensions, in the API
+**Run one law** on its registered synthetic case (fires / picked /
+verified / cost & ms before→after):
 
-Semantics, search, evaluation and execution are separate — and each is
-reached from a real call, not a promise:
-
-| Dimension | Reach it with |
-|---|---|
-| semantics | `verify_certificate(ir.root, cert, strict=True)` — every delivered program ships a replayable derivation |
-| search | `policy=` on `search` / `Optimizer.optimize`: a `Policy` (random / greedy / learned / RL) orders the rules each iteration — see [The learned player](#the-learned-player) |
-| evaluation | `criteria=PredictedCriterion(model)` prices extraction through a `PerformanceModel`; `SearchResult.frontier({...})` returns the non-dominated set; `StaticProfiler` describes a program without running it |
-| execution | the `Sink` / `Runner` / `Meter` ports — and `catopt_core.failures` classifies what went wrong |
-
-```python
-from catopt_core.perf_model import AnalyticalPerformanceModel
-from catopt_core.policies import GreedyPolicy
-from catopt_orchestrator import Optimizer, PredictedCriterion
-from catopt_torch import TorchBackend
-
-opt = Optimizer(backend=TorchBackend())
-mod, stats = opt.optimize(
-    model, x,
-    criteria=PredictedCriterion(AnalyticalPerformanceModel()),  # a model prices extraction
-    policy=GreedyPolicy(),                                      # a policy picks the order
-)
-stats["criteria"], stats["policy"]      # {'predicted': 1.0}, 'greedy'
+```bash
+python -m bench.suites.correctness.law_bench --laws rms_norm_fold
 ```
 
-A policy may only **reorder** — every rule still runs, so the fixed
-point and the certificate are unchanged (a random player reaches the
-identical equivalence class).  A model may only **rank** — feasibility
-(`supported_ops`) still decides what is reachable at all.
+**Run the discovery loop** over the real corpus:
 
-Train a policy on your own programs:
+```bash
+python -m catopt_discovery.intake        # feed 254 real nn.* workloads
+python -m catopt_discovery.pipeline      # census → propose → verify → measure → rank
+python -m catopt_discovery.pipeline --emit-admission <candidate>   # emit R(...) + tests as a patch
+```
+
+**Run the admission gauntlet** on a stored object:
+
+```bash
+python -m catopt_discovery.evidence --report /tmp/laws.db \
+    --add-object silu_mul_form --kind abstraction
+python -m catopt_discovery.evidence --report /tmp/laws.db \
+    --admit-object '<alpha_key>' --gauntlet --auto-cond
+```
+
+**Train a search policy** on your own programs:
 
 ```bash
 python tools/train_search_policy.py --device cuda   # supervised rule value
 python tools/train_rl_policy.py     --device cuda   # REINFORCE over the search env
 ```
 
-→ [`docs/evaluation.md`](docs/evaluation.md) for the whole dimension.
+→ [`docs/mechanism.md`](docs/mechanism.md) for the conceptual pipeline,
+[`docs/evaluation.md`](docs/evaluation.md) for the evaluation dimension.
 
-## What it finds — and what it doesn't
+## Repository layout
 
-The measured picture is generated from the pinned baselines — see
-[`docs/results.md`](docs/results.md) for magnitudes, hardware and
-provenance.  The verdicts:
-
-| Regime | Verdict | Why |
-|---|---|---|
-| Deep weight chains (`reassoc_scale`) | **WIN** | the e-graph reaches a weights-first form Inductor's post-grad graph provably cannot express |
-| Shared-input projections / gated blocks (`real_win_hunt`, `killer_demo`) | **WIN** | pairing fuses k projections into one GEMM + split views |
-| Linear-attention scan lift (`real_linear_attn`) | **WIN** | the affine-monoid scan lift fires and verifies fp64-exact |
-| Morphism windows (`morphism_e2e`) | **WIN** | term-FLOP reduction converts to wall time at GEMM-bound sizes |
-| Whole-model E2E (`e2e_model`, `e2e_models2`) | **PARITY** | pairing fires per block and verifies fp64-exact, but wall time is ~parity |
-| Real trained checkpoints, exact mode (`structure_census`) | **PARITY** | dense weights carry ~zero exploitable bitwise structure |
-| Launch-bound decode (`decode_bench`) | **NEGATIVE** | fewer launches don't pay where launch overhead already dominates — the hypothesis is falsified |
-| Bounded rewrites on a real checkpoint (`bounded_e2e`) | **WIN (bounded)** | `error_budget=` delivers **up to 1.32× vs eager / 1.25× vs Inductor** on stories15M via certified elision of near-duplicate tied-head rows — bounds propagate to outputs, verified-with-tolerance, KL≈0 at τ=1e-4 |
-
-This is **not a universal speedup**.  Attention- and GEMM-bound code is
-already optimal — expect a parity floor there — and the losses are
-measured too.  The wins live where structure exists: shared-input
-projections, foldable weight chains, unnormalized attention,
-recurrences.
-
-## Verification is the point
-
-Discovery is cheap; pricing is hard; proof is what keeps it honest.
-Every extracted program ships with an ordered, replayable derivation
-`original → optimized`, and `verify_certificate` re-checks
-*derivational equivalence* on real terms (fp64) — not numerical
-spot-checks:
-
-```python
-from catopt_core.egraph import verify_certificate
-
-verify_certificate(ir.root, cert, strict=True)   # replay every step
+```text
+packages/
+  catopt-core/         torch-free engine (IR, e-graph, laws, cost, ports)
+  catopt-torch/        PyTorch adapters + bundled contraction policy
+  catopt-carriers/     carrier laws / executors (scan, attention)
+  catopt-cuda/         CUDA-graph runner
+  catopt-orchestrator/ backend-neutral pipeline + morphisms
+  catopt-discovery/    law discovery (python -m catopt_discovery.<mod>)
+  catopt-native/       optional PyO3/Rust search engine
+tests/                 pytest suite (100% coverage on the engine packages)
+bench/                 benchmark suites + registry (python -m bench)
+tools/                 ratchets, probes, trainers, calibrators
+docs/                  mechanism / evaluation / api / results
+project/               ADRs, plans, retros (the design record)
+demo.py                the ~60-second end-to-end tour
 ```
 
-It has caught a false-proof matcher bug, a shape misinference that
-fabricated a 1.98× "win", a well-typed but wrong program, and a
-launch-time-vs-execution timing bug — all regression-tested.
+## Verification
 
-## Generality — the honest split
+Run these before finishing any change; all must pass.  The suite is
+single-process by design — do **not** run it under `pytest -n auto`
+(the `torch.compile` tests spawn a 16-worker inductor pool per process).
 
-The **framework** is general: e-graph saturation, verification, cost
-extraction, backends, strategies, runners and rule sets are all
-pluggable and model-agnostic.  What is **narrow** is the *law library*:
-like every rule-based optimizer (Halide, TASO, verified compilers),
-catopt finds the structures its laws describe — an unmatched block is an
-opaque boundary, never a wrong answer.  The morphism engine is the
-generality mechanism: laws target signature *classes* (any residual
-chain, any shared-projection family) rather than specific op trees.
+```sh
+uv run pytest                 # full test suite (~7.5 min, serial)
+.venv/bin/ty check            # typecheck — 0 errors required
+.venv/bin/ruff check          # lint
+.venv/bin/ruff format --check # formatting
+.venv/bin/vulture             # dead code
+.venv/bin/lint-imports        # hexagonal boundary contracts
+.venv/bin/bandit -c .bandit.yaml -r packages   # security SAST
+.venv/bin/semgrep --config .semgrep.yml packages   # dataflow (offline)
+.venv/bin/python tools/radon_ratchet.py   # complexity ratchet
+```
+
+Coverage is pinned at 100% on the five engine packages; `catopt-discovery`
+sits at ~99% under a ratchet floor that only tightens.  The gates are
+ratchets, not rewrites — pin the current state, never regress.  Manual
+stages (network/slower): `pip-audit`, the semgrep registry scan,
+`tools/runtime_types.sh` (typeguard), and `tools/mutmut.sh` (mutation).
+Full details in [`AGENTS.md`](AGENTS.md).
+
+## Docs, ADRs, and plans
+
+| Doc | What it is |
+|---|---|
+| [`docs/mechanism.md`](docs/mechanism.md) | the conceptual pipeline — syntax → structure → search → certificate |
+| [`docs/evaluation.md`](docs/evaluation.md) | the evaluation dimension — features, frontier, policies |
+| [`docs/api.md`](docs/api.md) | the API surface — `Optimizer`, strategies, runners, criteria, ports |
+| [`docs/results.md`](docs/results.md) | measured results, generated from the pinned baselines |
+| [`bench/README.md`](bench/README.md) | the benchmark harness and its suite catalog |
+| [`AGENTS.md`](AGENTS.md) | repo layout, verification commands, port contracts |
+| [`project/adrs/`](project/adrs/) | 0002 the thesis · 0003 evaluation is a dimension · 0004 abstraction as a move |
+| [`project/plans/`](project/plans/) | the staged rollout (0009 rule sets → 0018 de-hardcoding) |
+| [`project/retros/`](project/retros/) | the measured record — wins and negatives alike |
+| [`project/RESEARCH_WRITEUP.md`](project/RESEARCH_WRITEUP.md) | the claim, the verified results, the honest negatives |
+| [`project/REPORT.md`](project/REPORT.md) | the research report — weights as programs, what was falsified |
 
 ## Related work
 
-Catopt sits at the intersection of equality saturation, tensor-graph
+catopt sits at the intersection of equality saturation, tensor-graph
 superoptimization, and verified rewriting.  The contribution is not new
 algebra — it is *automatic discovery + certified equivalence + per-shape
-selection*, delivered end to end.  How it relates:
+selection*, delivered end to end.
 
 | Line of work | Shares | Differs |
 |---|---|---|
-| **egg / egglog** | e-graph, saturation, cost-guided extraction | catopt's laws are *categorical* (monoid carriers, traced monoidal, products), not op patterns, and it delivers a runnable module plus a certificate rather than a term.  A differential oracle cross-checks its search against egglog on a law subset (`tests/test_egglog_oracle.py`). |
-| **TASO** (tensor superoptimization) | equivalence-preserving graph rewrites, verified candidates | backtracking substitution search vs e-graph closure; catopt reaches non-local forms (scan lifts, weight folds) and ships a replayable derivation. |
-| **Tensat** | cost-based extraction over an e-graph | Tensat searches op-level tensor equivalence; catopt's laws are over algebraic structure, and extraction is bounded by the backend's `supported_ops`. |
-| **TVM / Ansor / Halide** | schedule search, cost models, target tuning | they search *schedules over a fixed algorithm*; catopt searches *across algorithms* via algebraic laws, then hands the result to a backend. |
+| **egg / egglog** | e-graph, saturation, cost-guided extraction | catopt's laws are *categorical*, not op patterns, and it delivers a runnable module plus a certificate rather than a term.  A differential oracle cross-checks its search against egglog on a law subset (`tests/test_egglog_oracle.py`). |
+| **TASO / Tensat** | equivalence-preserving graph rewrites, cost-based extraction | backtracking substitution vs e-graph closure; catopt's laws are over algebraic structure and it reaches non-local forms (scan lifts, weight folds). |
+| **TVM / Ansor / Halide** | schedule search, cost models, target tuning | they search *schedules over a fixed algorithm*; catopt searches *across algorithms* via algebraic laws. |
 | **Herbie** | e-graph rewrite search | different objective (numerical accuracy, not cost); same saturation lineage. |
-| **Verified rewriting** (Alive2, CompCert) | machine-checked equivalence | catopt's certificate is per-program *derivational replay* on real terms, not a whole-compiler proof. |
+| **Alive2 / CompCert** | machine-checked equivalence | catopt's certificate is per-program *derivational replay* on real terms, not a whole-compiler proof. |
 | **torch.compile / Inductor** | the baseline measured against | op-level fusion cannot express transforms across runtime parameters (weight folding, reassociation) — which is where catopt's wins live. |
 
 ## Limits
 
 - **Wins are regime-dependent** — the transform set is structural:
-  pairing, folds, reassociation, carrier lifts.  A model that is already
+  pairing, folds, reassociation, carrier lifts.  A model already
   dense-GEMM-bound with no shared structure should expect parity.
-- **Search is compile-time work** — seconds per block; monolithic eqsat
-  slows past ~8 blocks, which is why the `Compositional` strategy exists.
+- **Search is compile-time work** — seconds per block; monolithic
+  saturation slows past ~8 blocks, which is why the `Compositional`
+  strategy exists.
 - **Inference only** — weight folding destroys per-layer gradients; no
   backward-graph rewriting.
 - **Coverage gaps** — `matmul`+bias and grouped convs aren't pairable;
@@ -429,65 +516,3 @@ selection*, delivered end to end.  How it relates:
 - **Dev-box numbers** — measured on an RTX 2050 (4 GB) / CPU.
   `calibrate()` re-targets the cost model, but magnitudes do not
   extrapolate to datacenter hardware.
-
-## Install
-
-Python ≥3.11 (developed on 3.13), `torch>=2.0`, `numpy>=1.24`.
-uv-workspace monorepo: `packages/catopt-core` (zero-dependency engine),
-`catopt-torch` (PyTorch adapters), `catopt-carriers` (scan/attention
-carriers), `catopt-cuda` (the CUDA-graph runner), `catopt-orchestrator`
-(the backend-neutral pipelines), `catopt-discovery` (the law-discovery
-engine — `python -m catopt_discovery.<mod>`).  There is no `catopt`
-façade package — import the domain packages directly.  Coverage is
-pinned at 100% on the five engine packages; `catopt-discovery` sits at
-~99% under a ratchet floor that only tightens
-([discovery-package.md](project/retros/discovery-package.md),
-[discovery-coverage-climb.md](project/retros/discovery-coverage-climb.md)).
-
-```bash
-uv sync                                  # everything, editable
-
-# or with pip:
-pip install -e packages/catopt-core -e packages/catopt-torch \
-    -e packages/catopt-carriers -e packages/catopt-cuda \
-    -e packages/catopt-orchestrator -e packages/catopt-discovery
-
-pip install -e packages/catopt-core      # engine only, zero deps
-```
-
-Optional: `packages/catopt-native` is the PyO3/Rust search engine
-(build with maturin; opt-in via `engine=` — never auto-detected).
-
-## Benchmarks
-
-Every claim above is a runnable suite under `bench/`, and the harness is
-a system rather than a pile of scripts: each suite states its conclusion
-as a typed **finding** (`win` / `parity` / `regression` / `negative` /
-`inconclusive`), and every surface — JSON, Markdown, HTML, plots,
-Quarto, Slidev — is rendered from one canonical `Report`.
-
-```bash
-python -m bench list                        # the catalog
-python -m bench run reassoc_scale           # one suite → JSON+MD+HTML+plots
-python -m bench run-all                     # every harnessed suite
-python -m bench results                     # regenerate docs/results.md
-python -m bench dashboard                   # cross-suite HTML index
-```
-
-Suites are organized by **intent** — the question each answers.
-`bench/registry.py` is the single source of truth; `bench/README.md`
-carries the generated catalog with expected verdicts.  Per-suite
-protocols, flags and expected outcomes: [`bench/README.md`](bench/README.md).
-
-## Docs
-
-| Doc | What it is |
-|---|---|
-| [`docs/mechanism.md`](docs/mechanism.md) | the conceptual pipeline — syntax → structure → search → certificate |
-| [`docs/evaluation.md`](docs/evaluation.md) | the evaluation dimension — features, frontier, policies, learned policy |
-| [`docs/results.md`](docs/results.md) | measured results, generated from the pinned baselines |
-| [`docs/api.md`](docs/api.md) | the API surface — `Optimizer`, strategies, runners, criteria, ports |
-| [`bench/README.md`](bench/README.md) | the benchmark harness and its suite catalog |
-| [`project/RESEARCH_WRITEUP.md`](project/RESEARCH_WRITEUP.md) | the claim, the verified results, the honest negatives |
-| [`project/REPORT.md`](project/REPORT.md) | the research report — weights as programs, the ε axis, what was falsified |
-| [`AGENTS.md`](AGENTS.md) | repo layout, verification commands, port contracts |
