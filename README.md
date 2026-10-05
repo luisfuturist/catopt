@@ -226,12 +226,12 @@ sizes — see [Limits](#limits)); provenance is in
 |---|---|---|
 | `softmax_fold` on `ManualSoftmaxAttention` | **+13–27% eager, +29–48% CUDA-graph** vs raw | `tools/law_wallclock.py` |
 | `select_mul` marginal (optimized vs law-ablated) | **faster in 19/20 measurements** | `tools/law_wallclock.py` |
-| `rms_norm_fold` on the bench case | **−83.3% modeled cost, bitwise fp64-identical, 2.70× wall-clock** | `bench run law_bench` |
-| `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
+| `rms_norm_fold` on the bench case | **−83.3% modeled cost, bitwise fp64-identical, 2.70× wall-clock** | `bench.suites.correctness.law_bench` |
+| `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench.suites.correctness.law_bench` |
 | executor routing after measured pricing | **12/12 cases ship the measured-fastest member** (was 2–3× slower) | `tools/executor_cost_probe.py` |
-| morphism windows (`chain_x4@4096×128`) | **best 14.83× vs eager** | `bench run morphism_e2e` |
-| weight-chain reassociation vs Inductor | **17.12× vs Inductor** (18.63× vs eager) at (k,d,B·T)=(16,512,4096) | `bench run reassoc_scale` |
-| bounded rewrites on a real checkpoint | **up to 1.32× vs eager / 1.25× vs Inductor** (stories15M) | `bench run bounded_e2e` |
+| morphism windows (`chain_x4@4096×128`) | **best 14.83× vs eager** | `bench.suites.speedup.morphism_e2e` |
+| weight-chain reassociation vs Inductor | **17.12× vs Inductor** (18.63× vs eager) at (k,d,B·T)=(16,512,4096) | `bench.suites.speedup.reassoc_scale` |
+| bounded rewrites on a real checkpoint | **up to 1.32× vs eager / 1.25× vs Inductor** (stories15M) | `bench.suites.bounded.bounded_e2e` |
 | contraction player n=40 vs `opt_einsum` | **0.87–0.99× randomised greedy at equal wall-clock** (0.44–0.60× deterministic) | `tools/contraction_guided_restart.py` |
 | pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `catopt_discovery.pipeline --holdout` |
 | pipeline on the 364-term corpus | **shippable = 11** (was 0 before round 4; corpus-circular — see negatives) | `catopt_discovery.pipeline` |

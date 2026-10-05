@@ -347,8 +347,8 @@ materializes each recorded derivation as a replayable `Certificate`
 see `project/retros/lemma-certificates.md`).  The composable `RuleSet`
 presets live in `catopt_core.laws.ruleset`.
 
-Measure it: `python -m bench run law_bench --laws <name[,name|group]>`
-(or directly `python -m bench.suites.core.law_bench --sizes <d[,d]>`) —
+Measure it: `python -m bench.suites.correctness.law_bench --laws <name[,name|group]>`
+(`--sizes <d[,d]>` selects sizes; the suite's own CLI is the entry point) —
 per law: registered synthetic term → `eg.run` on that rule alone →
 extraction (pipeline cost model) → `_lower_extracted` → `sink.verify` →
 timed before/after.  Table shows fired / rhs-member / picked / verified /
