@@ -15,8 +15,10 @@ import random
 
 import pytest
 from catopt_core.ir import Const, Op, Param, TensorType, Var
+from catopt_discovery import evidence as ev_store
 from catopt_discovery import meta_game as mg
 from catopt_discovery import pipeline as lpl
+from catopt_discovery import proposal as lp
 from catopt_discovery.census import (
     CorpusTerm,
     op_tuple_census,
@@ -644,3 +646,335 @@ def test_print_guide_report_branches(capsys):
     assert "first true at draw 1" in out
     assert "first shippable at draw 3" in out
     assert "(1.00x enum)" in out
+
+
+# ---------------------------------------------------------------------------
+#  Corpus arms — scope rotation, legality, the gap re-adjudication
+# ---------------------------------------------------------------------------
+
+
+def _corpus_arena(cases=(), pools=None, **kw):
+    """An arena with the corpus arms armed (real sink, real corpus)."""
+    from catopt_discovery.impact import _cost_fn
+    from catopt_discovery.shape_proposal import _sink
+
+    sink = _sink()
+    ref = mg.Referee(
+        _tiny_terms(), list(cases), sink, _cost_fn(sink), []
+    )
+    cts = [
+        CorpusTerm("t", f"m{i}", t)
+        for i, t in enumerate(_tiny_terms())
+    ]
+    kw.setdefault("gen_cap", 6)
+    kw.setdefault("gen_rng", random.Random(0))
+    kw.setdefault("corpus", cts)
+    return mg.GuideArena(
+        pools if pools is not None else _pools(),
+        ref,
+        meta=dict(_META),
+        **kw,
+    )
+
+
+def _gap_proposal() -> lpl.Proposal:
+    """A candidate whose LHS never matches the tiny corpus."""
+    return lpl.Proposal(
+        name="gaptest",
+        lhs=_p("tanh", _p("div", "U", "V")),
+        rhs=_p("sigmoid", _p("div", "U", "V")),
+        family="t",
+        sources=("t",),
+    )
+
+
+def test_corpus_arms_need_supported_ops():
+    """Corpus arms without a sink's op table are a caller error."""
+    with pytest.raises(ValueError, match="supported_ops"):
+        _arena(gen_cap=2)
+
+
+def test_workload_arm_ingests_and_rotates_scope():
+    arena = _corpus_arena()
+    assert set(mg.CORPUS_ARMS) <= set(arena.arms)
+    obs = arena.observation(10)
+    assert obs.remaining["workload_gen"] == 6
+    # gap_gen is targeted: no no-instance candidate yet -> not live.
+    assert obs.remaining["gap_gen"] == 0
+    assert obs.corpus_size == len(_tiny_terms())
+
+    old_hash = arena.meta["corpus_hash"]
+    vs = arena.invest(mg.Allocation("workload_gen", 2))
+    assert [v.reason for v in vs] == ["generated", "generated"]
+    # the draws minted real workloads: both lists grew, the scope
+    # rotated once per ingestion, and the run_id is stable.
+    assert arena.generated == 2
+    assert len(arena.ref.terms) == obs.corpus_size + 2
+    assert len(arena.ref.cases) == 2  # nothing fired yet; cases grew
+    assert arena.scope_epoch == 2
+    assert arena.meta["corpus_hash"] != old_hash
+    assert arena.meta["run_id"] == _META["run_id"]
+    # a corpus draw is a draw, not an oracle call.
+    assert arena.arms["workload_gen"].drawn == 2
+    assert arena.arms["workload_gen"].oracle_calls == 0
+
+
+def test_workload_arm_mints_legal_terms():
+    """Ingested terms are verified workloads, not raw samples."""
+    from catopt_core.typing import INVALID, _shape_of
+    from catopt_discovery import workload_gen as wg
+
+    arena = _corpus_arena(cases=_tiny_cases())
+    arena.invest(mg.Allocation("workload_gen", 1))
+    case = arena.ref.cases[-1]
+    # the term passed the same gates the intake path enforces: an
+    # op term, well-typed, Var-bearing, lowerable, and novel.
+    assert isinstance(case.term, Op)
+    assert _shape_of(case.term) is not INVALID
+    assert case.feed  # a real measurable TermCase
+    st = wg.corpus_stats(_tiny_cases())
+    assert wg.shape_key(case.term) not in st.root_keys
+
+
+def test_scope_rotation_isolates_verdicts():
+    """A verdict under corpus_A is not served as corpus_B evidence."""
+    arena = _corpus_arena()
+    old_hash = arena.meta["corpus_hash"]
+    arena.invest(mg.Allocation("algebraic-grammar", 2))
+    n_scoped = len(arena.observation(10).verdicts)
+    assert n_scoped >= 1  # rows recorded under corpus_A
+    arena.invest(mg.Allocation("workload_gen", 1))
+    obs = arena.observation(10)
+    # the grown corpus is a new scope: only post-mutation rows serve.
+    assert obs.verdicts == {}
+    assert obs.scope_epoch == 1
+    # ... but the corpus_A rows remain attributable under their hash.
+    old_rows = ev_store.latest_verdicts(
+        arena.conn, old_hash, "r", "test"
+    )
+    assert len(old_rows) == n_scoped
+    # and a fresh adjudication lands under the new scope.
+    arena.invest(mg.Allocation("algebraic-grammar", 3))
+    new_hash = arena.meta["corpus_hash"]
+    for row in arena.observation(10).verdicts.values():
+        assert row["corpus_hash"] == new_hash
+
+
+def test_gap_arm_witnesses_no_instance_candidate():
+    cases = _tiny_cases()
+    prop = _gap_proposal()
+    arena = _corpus_arena(
+        cases=cases, pools={"shape-aware": [prop]}
+    )
+    vs = arena.invest(mg.Allocation("shape-aware", 1))
+    assert vs[0].reason == "no-instance"
+    assert arena._remaining("gap_gen") == 1
+
+    old_hash = arena.meta["corpus_hash"]
+    vs2 = arena.invest(mg.Allocation("gap_gen", 1))
+    v = vs2[0]
+    assert arena.arms["gap_gen"].drawn == 1
+    # synthesis ingested witness case(s) and rotated the scope; the
+    # candidate was re-adjudicated under the grown corpus — the
+    # verdict is re-measured (an oracle call was honestly spent).
+    assert arena.generated >= 1
+    assert arena.scope_epoch >= 1
+    assert arena.meta["corpus_hash"] != old_hash
+    assert v.reason != "no-instance"
+    assert arena.arms["gap_gen"].oracle_calls >= 1
+    # the target is spent: gap_gen is not live for it again.
+    assert arena._remaining("gap_gen") == 0
+    # the re-measured verdict sits under the *new* scope only.
+    new_rows = arena.observation(10).verdicts
+    assert len(new_rows) == 1
+    assert next(iter(new_rows.values()))["corpus_hash"] == (
+        arena.meta["corpus_hash"]
+    )
+    old_rows = ev_store.latest_verdicts(
+        arena.conn, old_hash, "r", "test"
+    )
+    assert len(old_rows) == 1  # the corpus_A no-instance row remains
+
+
+def test_gap_arm_no_target_is_honest_miss():
+    """An untargetable gap draw spends the draw, not a verdict."""
+    arena = _corpus_arena()
+    # the arm's own remaining is 0 — invest drains nothing, and a
+    # forced draw reports honestly instead of inventing a target.
+    assert arena._remaining("gap_gen") == 0
+    assert arena.invest(mg.Allocation("gap_gen", 1)) == []
+    v = arena._draw_gap()
+    assert v.reason == "no-target"
+
+
+def test_gap_arm_synthesis_miss(monkeypatch):
+    """A failed synthesis is a ``gap-miss`` draw — no free verdict."""
+    arena = _corpus_arena(pools={"shape-aware": [_gap_proposal()]})
+    arena.invest(mg.Allocation("shape-aware", 1))
+    assert arena._remaining("gap_gen") == 1
+    monkeypatch.setattr(
+        mg.lgg, "gen_cases_for", lambda *a, **k: ([], {})
+    )
+    vs = arena.invest(mg.Allocation("gap_gen", 1))
+    assert vs[0].reason == "gap-miss"
+    assert arena.generated == 0 and arena.scope_epoch == 0
+
+
+def test_workload_arm_gen_miss(monkeypatch):
+    """When no candidate survives the gates the draw is a miss."""
+    arena = _corpus_arena(gen_cap=1)
+    monkeypatch.setattr(mg.lwg._Resampler, "sample", lambda s: None)
+    monkeypatch.setattr(mg.lwg, "mutant_term", lambda *a: None)
+    vs = arena.invest(mg.Allocation("workload_gen", 1))
+    assert vs[0].reason == "gen-miss"
+    assert arena.generated == 0 and arena.scope_epoch == 0
+    assert arena.arms["workload_gen"].drawn == 1
+
+
+def test_workload_arm_gate_and_case_rejects(monkeypatch):
+    """The intake gates run per draw; rejections stay uningested."""
+    arena = _corpus_arena(gen_cap=2)
+    monkeypatch.setattr(mg.lwg, "valid_term", lambda *a: None)
+    assert (
+        arena.invest(mg.Allocation("workload_gen", 1))[0].reason
+        == "gen-miss"
+    )
+    monkeypatch.setattr(
+        mg.lwg,
+        "valid_term",
+        lambda c, st, seen, sup: {},  # gates pass vacuously
+    )
+    monkeypatch.setattr(mg.lwg, "term_to_case", lambda *a: None)
+    assert (
+        arena.invest(mg.Allocation("workload_gen", 1))[0].reason
+        == "gen-miss"
+    )
+    assert arena.generated == 0
+
+
+def test_corpus_defaults_to_referee_terms():
+    """``corpus=None`` wraps the referee's own terms."""
+    arena = _corpus_arena(corpus=None)
+    assert [c.term for c in arena._corpus_terms] == _tiny_terms()
+
+
+def test_corpus_arms_explicit_supported():
+    """``supported=`` overrides the referee sink's op table."""
+    sup = frozenset({"mul", "add", "sigmoid"})
+    arena = _corpus_arena(supported=sup)
+    assert arena._supported == sup
+    assert arena._remaining("workload_gen") == 6
+
+
+def test_pool_regrowth_only_appends_novel_keys(monkeypatch):
+    arena = _corpus_arena()
+    before = {k: len(q) for k, q in arena.pools.items()}
+    arena._regrow_pools()
+    arena._regrow_pools()  # idempotent — nothing re-queued
+    assert {k: len(q) for k, q in arena.pools.items()} == before
+    keys = set()
+    for q in arena.pools.values():
+        for p in q:
+            keys.add(lp._key(p.lhs, p.rhs))
+    assert len(keys) == sum(len(q) for q in arena.pools.values())
+
+    # a genuinely novel candidate IS appended — the grown census
+    # feeds the corpus-derived arms; queued and adjudicated keys
+    # are both skipped.
+    fresh = _gap_proposal()
+    assert lp._key(fresh.lhs, fresh.rhs) not in keys
+    monkeypatch.setattr(
+        mg.lpl, "_census_naturality", lambda *a: [fresh]
+    )
+    arena._vocab_sets = None
+    arena._regrow_pools()
+    assert arena.pools["census-naturality"][-1] is fresh
+    assert arena.arms["census-naturality"].emitted == 1
+    arena._regrow_pools()  # queued key — no double-queue
+    assert len(arena.pools["census-naturality"]) == 1
+    # an already-adjudicated key is skipped via the referee's dedup.
+    arena._queued.discard(lp._key(fresh.lhs, fresh.rhs))
+    arena.ref.dedup.add(lp._key(fresh.lhs, fresh.rhs))
+    arena._regrow_pools()
+    assert len(arena.pools["census-naturality"]) == 1
+
+
+def test_enumeration_drains_corpus_arms_last():
+    """The control's order is fixed-inventory-first, corpus last."""
+    pools = {
+        "shape-aware": _pools()["shape-aware"][:1],
+    }
+    arena = _corpus_arena(pools=pools, gen_cap=2)
+    g = mg.EnumerationGuide(
+        order=mg.ENUMERATION_ORDER + mg.CORPUS_ARMS, step=4
+    )
+    a1 = g.choose(arena.observation(10))
+    assert a1.generator == "shape-aware"
+    arena.invest(a1)
+    a2 = g.choose(arena.observation(10))
+    assert a2.generator == "workload_gen"
+    arena.invest(a2)
+    a3 = g.choose(arena.observation(10))
+    # workload_gen is drained; gap_gen is live only if the earlier
+    # draws left a no-instance candidate on the board.
+    assert a3 is None or a3.generator == "gap_gen"
+
+
+def test_corpus_arms_in_a_guided_run():
+    """A run over corpus arms terminates and accounts honestly."""
+    arena = _corpus_arena(
+        pools={"shape-aware": _pools()["shape-aware"][:2]},
+        gen_cap=2,
+    )
+
+    class _Grower(mg.Guide):
+        def choose(self, obs):
+            for name in ("workload_gen", "shape-aware"):
+                if obs.remaining.get(name, 0) > 0:
+                    return mg.Allocation(name, 1)
+            return None
+
+    s = mg.run_guide(arena, _Grower(), budget=6)
+    assert s["draws"] <= 6
+    assert s["generated"] >= 1
+    assert s["scope_epoch"] == s["generated"]
+    assert "workload_gen" in s["arms"]
+    assert s["arms"]["workload_gen"]["drawn"] >= 1
+
+
+def test_guide_corpus_cli(monkeypatch, tmp_path, capsys):
+    """``--guide --guide-corpus`` end to end on the tiny corpus."""
+    cases = _tiny_cases()
+    monkeypatch.setattr(mg, "_bench_cases", lambda: (cases[:4], []))
+    monkeypatch.setattr(mg, "model_cases", lambda: (cases[4:], []))
+    out = tmp_path / "guide.json"
+    rc = mg.main(
+        [
+            "--guide",
+            "--budget",
+            "10",
+            "--guide-step",
+            "3",
+            "--guide-corpus",
+            "2",
+            "--plays-cap",
+            "2",
+            "--top-seeds",
+            "3",
+            "--json",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    # corpus arms armed -> the corpus-first control joins the board.
+    assert set(payload["results"]) == {
+        "enumeration",
+        "enum-corpus-first",
+        "uniform",
+        "learned",
+    }
+    for s in payload["results"].values():
+        assert "workload_gen" in s["arms"]
+        assert "gap_gen" in s["arms"]
+        assert "corpus_size" in s and "scope_epoch" in s

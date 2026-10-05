@@ -115,6 +115,20 @@ and returns the next allocation.  Three baselines ship:
 arm), ``RandomGuide`` (uniform arm selection) and ``LearnedGuide``
 (the ``_PolicyNet`` + REINFORCE machinery, re-pointed at arms).
 
+The corpus itself is on the board too: the ``CORPUS_ARMS``
+(``workload_gen``, ``gap_gen``) mutate the arena corpus mid-game —
+one draw is one verified workload ingested (``workload_gen``'s
+five-gate ``valid_term``; ``gap_gen``'s pattern-targeted
+``synthesize``).  A mutated corpus is a different evidence context,
+so ingestion **rotates the scope**: ``meta["corpus_hash"]`` is
+recomputed over the grown corpus and every later ``record_run``
+writes under the new scope, while ``GuideObs.verdicts`` reads
+``latest_verdicts`` at the *current* hash — a verdict measured on
+corpus_A is never served as corpus_B evidence.  ``gap_gen`` then
+re-adjudicates the ``no-instance`` candidate it witnessed under the
+new scope, which is where a corpus draw's payoff can become a real
+verdict.
+
 Run::
 
     .venv/bin/python -m catopt_discovery.meta_game
@@ -134,7 +148,7 @@ import random
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from catopt_core.egraph import Rewrite
@@ -146,12 +160,15 @@ from torch.distributions import Categorical
 
 # Sibling tools own the corpus, the oracles and the measurements.
 from catopt_discovery import evidence as ev_store
+from catopt_discovery import gap_gen as lgg
 from catopt_discovery import pipeline as lpl
 from catopt_discovery import proposal as lp
+from catopt_discovery import workload_gen as lwg
 from catopt_discovery.census import (
     CorpusTerm,
     op_tuple_census,
     shape_census,
+    shape_key,
 )
 from catopt_discovery.impact import (
     TermCase,
@@ -165,6 +182,8 @@ from catopt_discovery.shape_proposal import _sink
 from catopt_discovery.vocab import classify, corpus_ops
 
 __all__ = [
+    "CORPUS_ARMS",
+    "ENUMERATION_ORDER",
     "Allocation",
     "ArmStat",
     "BuildGame",
@@ -1370,11 +1389,7 @@ def eval_baseline(
 
 #: The generator inventory in its fixed enumeration order — the
 #: five ``pipeline.propose`` sources plus ``"build"`` (the
-#: construction player; one draw is one play).  Workload and gap
-#: generation are deliberately absent: those generators mutate the
-#: corpus mid-game, and a mutated corpus invalidates the evidence
-#: store's scope keys — a corpus-mutating action needs a re-scoped
-#: observation, not another queue.
+#: construction player; one draw is one play).
 ENUMERATION_ORDER = (
     "census-naturality",
     "census-mixed-view",
@@ -1383,6 +1398,16 @@ ENUMERATION_ORDER = (
     "algebraic-grammar",
     "build",
 )
+
+#: The corpus-mutating arms — a draw is one verified generated
+#: workload ingested into the arena corpus (``workload_gen``:
+#: undirected resample/mutate; ``gap_gen``: a witness workload
+#: synthesized for a ``no-instance`` candidate, which is then
+#: re-adjudicated under the grown corpus).  They mutate the
+#: evidence scope, so they sit outside the pipeline's enumeration;
+#: the enumeration control schedules them last (fixed inventory
+#: first, then corpus growth).
+CORPUS_ARMS = ("workload_gen", "gap_gen")
 
 
 @dataclass(frozen=True)
@@ -1417,10 +1442,13 @@ class GuideObs:
     """What a guide sees before each allocation.
 
     ``verdicts`` is the evidence store's ``latest_verdicts`` for the
-    arena's scope — the observation source is the store itself, so a
-    guide reads exactly what a later audit would.  ``arms`` carries
-    the per-generator tallies (copies — an observation cannot mutate
-    the board).
+    arena's *current* scope — after a corpus arm ingests a workload
+    the ``corpus_hash`` rotates and only verdicts measured under the
+    grown corpus are served, so a guide reads exactly what a later
+    audit would attribute to this corpus.  ``corpus_size`` /
+    ``scope_epoch`` mark the growth (each ingestion is one epoch).
+    ``arms`` carries the per-generator tallies (copies — an
+    observation cannot mutate the board).
     """
 
     round: int
@@ -1430,6 +1458,8 @@ class GuideObs:
     remaining: dict[str, int]
     arms: dict[str, ArmStat]
     verdicts: dict[str, dict]
+    corpus_size: int = 0
+    scope_epoch: int = 0
 
 
 def generator_pools(
@@ -1500,6 +1530,18 @@ class GuideArena:
     ``latest_verdicts``.  ``game``/``model`` arm the ``"build"``
     generator — one draw is one ``_play_once`` — and ``plays_cap``
     bounds its queue.
+
+    ``gen_cap`` arms the corpus-mutating ``CORPUS_ARMS`` — one draw
+    mints one verified workload (``workload_gen.valid_term`` gates)
+    and ingests it into the referee's match/probe corpus, rotating
+    the evidence scope (``meta["corpus_hash"]`` is recomputed per
+    ingestion, so every later verdict is attributable to the corpus
+    it was measured on and the observation re-scopes itself).
+    ``corpus`` is the census corpus the pools derive from — pool
+    queues regrow over the enlarged corpus after each ingestion —
+    and defaults to the referee's terms.  Corpus arms need the
+    sink's ``supported_ops`` (the lowering gate), taken from the
+    referee's sink unless ``supported=`` overrides it.
     """
 
     def __init__(
@@ -1514,6 +1556,11 @@ class GuideArena:
         plays_cap: int = 60,
         conn: Any = None,
         meta: dict[str, str] | None = None,
+        gen_cap: int = 0,
+        gen_rng: random.Random | None = None,
+        corpus: Iterable[CorpusTerm] | None = None,
+        vocab: str = "hand",
+        supported: frozenset | None = None,
     ) -> None:
         """Bind the inventory, the referee and the evidence scope."""
         self.pools = {k: list(v) for k, v in pools.items()}
@@ -1552,15 +1599,94 @@ class GuideArena:
         self.first_ship_at: int | None = None
         self.best: Verdict | None = None
         self.best_arm = ""
+        # -- corpus-mutating arms --------------------------------
+        self._init_corpus(gen_cap, gen_rng, corpus, vocab, supported)
+
+    def _init_corpus(
+        self,
+        gen_cap: int,
+        gen_rng: random.Random | None,
+        corpus: Iterable[CorpusTerm] | None,
+        vocab: str,
+        supported: frozenset | None,
+    ) -> None:
+        """Bind the corpus-arm state; arm ``CORPUS_ARMS`` if capped.
+
+        ``corpus`` defaults to the referee's terms wrapped as
+        ``CorpusTerm``s.  When armed (``gen_cap > 0``) the sink's
+        ``supported_ops`` is required — the lowering gate is what
+        makes an ingested workload a legal one.
+        """
+        self.gen_left = {a: gen_cap for a in CORPUS_ARMS}
+        self._gen_rng = (
+            gen_rng if gen_rng is not None else random.Random()
+        )
+        self._corpus_terms = (
+            list(corpus)
+            if corpus is not None
+            else [
+                CorpusTerm("arena", f"c{i}", t)
+                for i, t in enumerate(self.ref.terms)
+            ]
+        )
+        self._vocab_arg = vocab
+        self._vocab_sets: tuple | None = None
+        self._stats: Any = None
+        self._resampler: Any = None
+        self._gen_seen: set = set()
+        self.generated = 0
+        self.scope_epoch = 0
+        #: Candidate keys ever queued — regrown pools must not
+        #: re-emit an already-seen candidate.
+        self._queued = {
+            lp._key(p.lhs, p.rhs)
+            for q in self.pools.values()
+            for p in q
+        }
+        #: Adjudicated candidates by alpha key — the ``gap_gen``
+        #: target set is those whose latest verdict is
+        #: ``no-instance`` (the corpus never gave them a match).
+        self._candidates: dict = {}
+        self._gap_targets: dict = {}
+        self._gap_done: set = set()
+        if not gen_cap:
+            self._supported = frozenset()
+            return
+        if supported is None:
+            supported = getattr(self.ref.sink, "supported_ops", None)
+        if supported is None:
+            raise ValueError(
+                "corpus arms need supported_ops "
+                "(a referee bound to a sink, or supported=)"
+            )
+        self._supported = supported
+        for a in CORPUS_ARMS:
+            self.arms[a] = ArmStat(emitted=gen_cap)
 
     def _remaining(self, name: str) -> int:
-        """Return the arm's undrawn queue length."""
+        """Return the arm's undrawn queue length.
+
+        ``gap_gen`` is live only while an untargeted ``no-instance``
+        candidate exists — it is a *targeted* generator, not a tap.
+        """
         if name == "build":
             return self.plays_left
+        if name == "workload_gen":
+            return self.gen_left.get(name, 0)
+        if name == "gap_gen":
+            live = sum(
+                1 for k in self._gap_targets if k not in self._gap_done
+            )
+            return min(self.gen_left.get(name, 0), live)
         return len(self.pools[name]) - self.pos[name]
 
     def observation(self, budget: int) -> GuideObs:
-        """Return the current observation for a guide."""
+        """Return the current observation for a guide.
+
+        The verdict rows are scoped by the *current*
+        ``meta["corpus_hash"]`` — after a corpus mutation only
+        evidence attributable to the grown corpus is served.
+        """
         verdicts = ev_store.latest_verdicts(
             self.conn,
             self.meta["corpus_hash"],
@@ -1575,6 +1701,8 @@ class GuideArena:
             remaining={k: self._remaining(k) for k in self.arms},
             arms={k: replace(s) for k, s in self.arms.items()},
             verdicts=verdicts,
+            corpus_size=len(self.ref.terms),
+            scope_epoch=self.scope_epoch,
         )
 
     def invest(self, alloc: Allocation) -> list[Verdict]:
@@ -1588,6 +1716,10 @@ class GuideArena:
             self.spent += 1
             if alloc.generator == "build":
                 out.append(self._draw_build())
+            elif alloc.generator == "workload_gen":
+                out.append(self._draw_workload())
+            elif alloc.generator == "gap_gen":
+                out.append(self._draw_gap())
             else:
                 p = self.pools[alloc.generator][
                     self.pos[alloc.generator]
@@ -1641,11 +1773,195 @@ class GuideArena:
         self.plays_left -= 1
         cand = g.candidate()
         lhs, rhs = cand[:2] if cand is not None else (None, None)
+        check, derive = cand[2:] if cand is not None else (None, None)
         self._account(
             "build",
             v,
             lhs,
             rhs,
+            calls=self.ref.oracle_calls - before,
+            check=check,
+            derive=derive,
+        )
+        return v
+
+    # -- corpus arms -------------------------------------------------
+
+    def _gen_stats(self) -> Any:
+        """Return the corpus statistics, rebuilt after each mutation."""
+        if self._stats is None:
+            # ``corpus_stats`` reads only ``.term`` — CorpusTerm and
+            # TermCase are interchangeable for it.
+            self._stats = lwg.corpus_stats(
+                cast(list[TermCase], self._corpus_terms)
+            )
+            self._resampler = lwg._Resampler(self._stats, self._gen_rng)
+        return self._stats
+
+    def _ingest(self, case: TermCase) -> None:
+        """Append a verified workload to the corpus; rotate the scope.
+
+        The term joins the referee's instance-search list and firing
+        probe *and* the census corpus the pools derive from — a
+        mutated corpus is a different evidence context, so the
+        ``corpus_hash`` scope key rotates and every later
+        ``record_run`` writes under the new scope.  The ``shape_key``
+        goes into ``_gen_seen`` so the generators cannot re-emit it.
+        """
+        self.ref.cases.append(case)
+        self.ref.terms.append(case.term)
+        self._corpus_terms.append(
+            CorpusTerm("gen", case.name, case.term)
+        )
+        self._gen_seen.add(shape_key(case.term))
+        self.generated += 1
+        self.meta["corpus_hash"] = ev_store.corpus_hash(
+            op_repr(t) for t in self.ref.terms
+        )
+        self.meta["ts"] = ev_store.now()
+        self.scope_epoch += 1
+        self._stats = None  # gen stats must cover the grown corpus
+        self._regrow_pools()
+
+    def _regrow_pools(self) -> None:
+        """Re-derive the census pools over the grown corpus.
+
+        The corpus-derived generators are exactly where new
+        workloads can pay: a new op-tuple can mint a naturality
+        candidate that was unproposable before.  Only *novel* keys
+        are appended — a candidate already queued or adjudicated
+        stays unique under ``propose``'s merged-pool semantics.
+        """
+        if self._vocab_sets is None:
+            self._vocab_sets = lpl._vocab_sets(self._vocab_arg)
+        pointwise, views = self._vocab_sets
+        counts, _ = op_tuple_census(self._corpus_terms)
+        census_op = {k: v for k, v in counts.items()}
+        terms = [c.term for c in self._corpus_terms]
+        fresh = {
+            "census-naturality": lpl._census_naturality(
+                census_op, terms, pointwise, views
+            ),
+            "census-mixed-view": lpl._census_mixed_naturality(
+                census_op, terms, pointwise, views
+            ),
+            "pattern-recognition": lpl._pattern_recognition(census_op),
+        }
+        for arm, queue in fresh.items():
+            if arm not in self.pools:
+                continue
+            st = self.arms[arm]
+            for p in queue:
+                key = lp._key(p.lhs, p.rhs)
+                if key in self._queued or key in self.ref.dedup:
+                    continue
+                self._queued.add(key)
+                self.pools[arm].append(p)
+                st.emitted += 1
+
+    def _draw_workload(self) -> Verdict:
+        """Mint one valid, novel workload and ingest it.
+
+        A draw costs a draw (not an oracle call — the term faces the
+        five ``valid_term`` gates, never the equality oracle) and
+        returns a ``generated`` verdict scored 0: the payoff is
+        indirect — a grown corpus for later draws to referee
+        against — not an immediate score.
+        """
+        self.gen_left["workload_gen"] -= 1
+        st = self._gen_stats()
+        rng = self._gen_rng
+        for _ in range(lwg._ATTEMPTS_PER_TERM):
+            if rng.random() < 0.5 or not self.ref.cases:
+                cand = self._resampler.sample()
+            else:
+                cand = lwg.mutant_term(
+                    rng.choice(self.ref.cases), st, rng
+                )
+            if cand is None:
+                continue
+            env = lwg.valid_term(
+                cand, st, self._gen_seen, self._supported
+            )
+            if env is None:
+                continue
+            case = lwg.term_to_case(
+                cand,
+                f"gen:wg:{self.generated}",
+                "gen-workload",
+                env,
+            )
+            if case is None:
+                continue
+            self._ingest(case)
+            v = Verdict(name=case.name, reason="generated")
+            self._account("workload_gen", v, None, None)
+            return v
+        v = Verdict(name="workload_gen", reason="gen-miss")
+        self._account("workload_gen", v, None, None)
+        return v
+
+    def _draw_gap(self) -> Verdict:
+        """Witness the oldest unwitnessed ``no-instance`` candidate.
+
+        ``gap_gen.gen_cases_for`` synthesizes a term matching the
+        candidate's own LHS (through the same five-gate validity the
+        intake path uses) and embeds it; the cases ingest, and the
+        candidate is then **re-adjudicated under the grown corpus** —
+        the ``no-instance`` cache entry is dropped so the referee
+        re-searches, and the new verdict lands under the rotated
+        scope.  A failed synthesis is a ``gap-miss`` draw.
+        """
+        self.gen_left["gap_gen"] -= 1
+        key = next(
+            (k for k in self._gap_targets if k not in self._gap_done),
+            None,
+        )
+        if key is None:
+            v = Verdict(name="gap_gen", reason="no-target")
+            self._account("gap_gen", v, None, None)
+            return v
+        self._gap_done.add(key)
+        lhs, rhs, check, derive = self._candidates[key]
+        proposal = lpl.Proposal(
+            name=f"gap:{len(self._gap_done)}",
+            lhs=lhs,
+            rhs=rhs,
+            family="gap_gen",
+            sources=("gap_gen",),
+            check=check,
+            derive=derive,
+        )
+        cases, _prov = lgg.gen_cases_for(
+            proposal,
+            list(self.ref.cases),
+            self._gen_stats(),
+            self._supported,
+            self._gen_seen,
+            self._gen_rng,
+        )
+        for case in cases:
+            self._ingest(case)
+        if not cases:
+            v = Verdict(name=proposal.name, reason="gap-miss")
+            self._account("gap_gen", v, None, None)
+            return v
+        # Re-adjudicate under the grown corpus: drop the stale
+        # (corpus_A) dedup/by_key entry so the referee re-searches —
+        # the verdict is re-measured, not carried over.
+        self.ref.dedup.discard(key)
+        self.ref.dedup.discard((key[1], key[0]))
+        self.ref.by_key.pop(key, None)
+        before = self.ref.oracle_calls
+        v = self.ref.evaluate(
+            lhs, rhs, check, derive, name=proposal.name
+        )
+        self._account(
+            "gap_gen",
+            v,
+            lhs,
+            rhs,
+            proposal=proposal,
             calls=self.ref.oracle_calls - before,
         )
         return v
@@ -1659,6 +1975,8 @@ class GuideArena:
         *,
         proposal: lpl.Proposal | None = None,
         calls: int = 0,
+        check: Any = None,
+        derive: Any = None,
     ) -> None:
         """Tally one draw and record its verdict to the store."""
         st = self.arms[arm]
@@ -1666,10 +1984,17 @@ class GuideArena:
         st.oracle_calls += calls
         self._tally(arm, st, v)
         if lhs is None or rhs is None:
-            return  # mint-error — nothing was adjudicated
+            return  # mint-error / corpus draw — nothing adjudicated
         key = lp._key(lhs, rhs)
         if self.ref.by_key.get(key) is not v:
             return  # tautology/repeat — a dedup artifact, not evidence
+        if proposal is not None:
+            check, derive = proposal.check, proposal.derive
+        self._candidates[key] = (lhs, rhs, check, derive)
+        if v.reason == "no-instance":
+            self._gap_targets[key] = None
+        else:
+            self._gap_targets.pop(key, None)
         if proposal is None:
             proposal = lpl.Proposal(
                 name=v.name,
@@ -1728,6 +2053,9 @@ class GuideArena:
             "rounds": self.rounds,
             "budget": budget,
             "oracle_calls": self.ref.oracle_calls,
+            "generated": self.generated,
+            "corpus_size": len(self.ref.terms),
+            "scope_epoch": self.scope_epoch,
             "probes": self.ref.probes,
             "arms": {
                 k: {
@@ -1830,7 +2158,7 @@ class LearnedGuide(Guide):
     """
 
     _SDIM = 6
-    _ADIM = 7
+    _ADIM = 8
 
     def __init__(
         self,
@@ -1872,6 +2200,7 @@ class LearnedGuide(Guide):
             s.firing / drawn,
             s.best / 10.0,
             1.0 if name == "build" else 0.0,
+            1.0 if name in CORPUS_ARMS else 0.0,
         ]
 
     def choose(self, obs: GuideObs) -> Allocation | None:
@@ -1949,7 +2278,9 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
     policy find — and does any beat the fixed enumeration?  The
     ``build`` arm is the construction player (uniform, or trained
     for ``--guide-train`` episodes first — the existing ``train``
-    loop, no new trainer).
+    loop, no new trainer).  ``--guide-corpus`` arms the corpus arms
+    (``workload_gen`` / ``gap_gen``, ``args.guide_corpus`` draws
+    each), putting the corpus itself on the board.
     """
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -2001,15 +2332,30 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
             model=build_model,
             seed_frac=args.seed_frac,
             plays_cap=args.plays_cap,
+            gen_cap=args.guide_corpus,
+            gen_rng=random.Random(args.seed + 7919),
+            corpus=cts,
+            vocab=args.vocab,
         )
 
     guides = {
-        "enumeration": lambda: EnumerationGuide(step=args.guide_step),
+        "enumeration": lambda: EnumerationGuide(
+            order=ENUMERATION_ORDER + CORPUS_ARMS,
+            step=args.guide_step,
+        ),
         "uniform": lambda: RandomGuide(
             random.Random(args.seed), step=args.guide_step
         ),
         "learned": lambda: LearnedGuide(step=args.guide_step),
     }
+    if args.guide_corpus:
+        # a second control: the same fixed schedule with the corpus
+        # arms *first* — separates "corpus arms pay" from "a policy
+        # allocated better".
+        guides["enum-corpus-first"] = lambda: EnumerationGuide(
+            order=CORPUS_ARMS + ENUMERATION_ORDER,
+            step=args.guide_step,
+        )
     results = compare_guides(make_arena, guides, args.budget)
     enum_tf = results["enumeration"]["referee"]["yield_tf_per_call"]
     ratios = {
@@ -2045,6 +2391,12 @@ def _print_guide_report(result: dict) -> None:
             f"ship~={r['shippable']:>2} "
             f"yield_tf={r['yield_tf_per_call']:.3f}"
         )
+        if s.get("generated"):
+            line += (
+                f" gen={s['generated']}"
+                f" corpus={s['corpus_size']}"
+                f" scope={s['scope_epoch']}"
+            )
         if ratio is not None:
             line += f" ({ratio:.2f}x enum)"
         print(line)
@@ -2337,6 +2689,13 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="episodes to pre-train the build arm's player policy",
+    )
+    p.add_argument(
+        "--guide-corpus",
+        type=int,
+        default=0,
+        help="draw cap per corpus-mutating arm "
+        "(workload_gen, gap_gen); 0 disables them",
     )
     p.add_argument("--episodes", type=int, default=600)
     p.add_argument(
