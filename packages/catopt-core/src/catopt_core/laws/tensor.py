@@ -667,8 +667,18 @@ RECIP_SQRT_TO_RSQRT = R(
 #: that broadcast (``a=(1,)``, ``b=(4,)``) still mint a RHS whose
 #: ``matmul(W, a)``/``matmul(W, b)`` cannot both contract — 4
 #: rhs-err sites the old ``rank-eq``-only guard accepted (the
-#: derivable-gate audit).  Rank>=2 differing extents stay covered by
-#: the second branch.
+#: derivable-gate audit).
+#:
+#: The rank>=2 branch additionally requires ``dim-eq(a, -2, b, -2)``
+#: — the two addends must share the CONTRACTION axis.  The old
+#: leading-axis-padding argument ("rank>=2 broadcast never realigns
+#: axis -2") is only true when the contraction axes already agree:
+#: ``a=(3,5)``, ``b=(1,5)`` broadcasts the *contraction* axis too
+#: (1 -> 3), and ``matmul(W, b)`` then cannot contract with the same
+#: ``W`` that ``matmul(W, a)`` needs — a measured rhs-err the
+#: rank>=2 branch accepted.  ``dim-eq`` is the minimal closure: the
+#: rank-equal branch's ``shape-eq`` already implies it, so this only
+#: tightens the mixed-extent corner, never an equal site.
 _COND_MM_ADDENDS = (
     "or",
     (
@@ -677,16 +687,22 @@ _COND_MM_ADDENDS = (
         ("rank", "a", ">=", 1),
         ("shape-eq", "a", "b"),
     ),
-    ("and", ("rank", "a", ">=", 2), ("rank", "b", ">=", 2)),
+    (
+        "and",
+        ("rank", "a", ">=", 2),
+        ("rank", "b", ">=", 2),
+        ("dim-eq", "a", -2, "b", -2),
+    ),
 )
 
-#: The same alignment on the summed weights ``W``/``W2`` — applied to
-#: the ``linear`` spellings too (mathematically safe there, but a
-#: rank-mixed weight sum mints a member ``F.linear`` cannot lower).
-#: As above, the rank-equal branch also demands ``shape-eq(W, W2)``:
-#: two rank-1 weights of different extent broadcast but the minted
-#: ``linear(x,W)+linear(x,W2)`` cannot denote (4 rhs-err sites, the
-#: derivable-gate audit).
+#: The same alignment on the summed weights ``W``/``W2`` for the
+#: ``matmul`` spellings (``matmul(x, W)`` contracts ``x[-1]`` with
+#: ``W[-2]``).  As above, the rank-equal branch demands
+#: ``shape-eq(W, W2)`` and the rank>=2 branch ``dim-eq(W, -2, W2,
+#: -2)``: two rank-1 weights of different extent broadcast but the
+#: minted ``matmul(x, W)+matmul(x, W2)`` cannot denote (the
+#: derivable-gate audit); two rank>=2 weights whose contraction axes
+#: disagree (``W=(2,3)``, ``W2=(1,3)``) are the same rhs-err.
 _COND_MM_WEIGHTS = (
     "or",
     (
@@ -695,7 +711,36 @@ _COND_MM_WEIGHTS = (
         ("rank", "W", ">=", 1),
         ("shape-eq", "W", "W2"),
     ),
-    ("and", ("rank", "W", ">=", 2), ("rank", "W2", ">=", 2)),
+    (
+        "and",
+        ("rank", "W", ">=", 2),
+        ("rank", "W2", ">=", 2),
+        ("dim-eq", "W", -2, "W2", -2),
+    ),
+)
+
+#: The ``linear`` spelling of the weight guard.  ``F.linear(x, W)``
+#: is ``x @ W.T``, so its contraction axis is ``W[-1]`` (the
+#: transpose moves ``W``'s last axis to -2), NOT ``W[-2]`` as in the
+#: ``matmul`` spelling.  A rank>=2 weight pair whose contraction axes
+#: disagree (``W=(2,3)``, ``W2=(2,1)``) is the same rhs-err; the
+#: shared ``matmul`` clause would both over-accept it (``W[-2]``
+#: agrees) and over-decline a sound pair (``W[-2]`` disagrees while
+#: ``W[-1]`` agrees), so the linear rules carry this variant.
+_COND_MM_WEIGHTS_LINEAR = (
+    "or",
+    (
+        "and",
+        ("rank-eq", "W", "W2"),
+        ("rank", "W", ">=", 1),
+        ("shape-eq", "W", "W2"),
+    ),
+    (
+        "and",
+        ("rank", "W", ">=", 2),
+        ("rank", "W2", ">=", 2),
+        ("dim-eq", "W", -1, "W2", -1),
+    ),
 )
 
 #: Compat aliases — the test-facing hooks (see ``_check_sum_keepdim``).
@@ -804,7 +849,7 @@ WEIGHT_FACTOR_LINEAR = R(
     Op.make("linear", "x", Op.make("add", "W", "W2")),
     law="Merge shared-input nn.Linears: linear(x,W1)+linear(x,W2)"
     " = linear(x, W1+W2)  (transpose distributes over +).",
-    cond=_COND_MM_WEIGHTS,
+    cond=_COND_MM_WEIGHTS_LINEAR,
     tags=_CAT,
     # inverse-pair twin of the axiom weight_distribute_linear (the
     # alphabetical-first member of the {distribute, factor}_linear
@@ -957,7 +1002,7 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
         "add", Op.make("linear", "x", "W"), Op.make("linear", "x", "W2")
     ),
     law="Expand a merged nn.Linear so eqsat can compare both forms.",
-    cond=_COND_MM_WEIGHTS,
+    cond=_COND_MM_WEIGHTS_LINEAR,
     tags=_CAT,
 )
 
@@ -1105,6 +1150,14 @@ _SPEC_WT = ("transpose-out", "W", None, None)
 #: ``linear(x, W)`` is well-typed: ``x @ W.T`` denotes.
 _COND_LINEAR_XW = ("mm-shape-ok", "x", _SPEC_WT)
 
+#: ``F.linear``'s weight arity: ``(out, in)`` or ``(in,)`` only.  A
+#: rank>=3 weight raises (``t() expects a tensor with <= 2
+#: dimensions``), yet the ``mm-shape-ok`` / ``mm-out`` reads above
+#: happily resolve a rank>=3 ``W.T`` — so both ``linear`` guards
+#: conjoin this rank ceiling.  Measured: the sole site it declines is
+#: a rank-3-``W`` ``both-err``; every equal site keeps.
+_COND_LINEAR_WT = ("rank", "W", "<=", 2)
+
 #: ``linear(x, W)``'s output shape — the row scale must broadcast
 #: INTO it (add no axes).
 _SPEC_LINEAR_OUT = ("mm-out", "x", _SPEC_WT)
@@ -1120,10 +1173,12 @@ _SPEC_LINEAR_OUT = ("mm-out", "x", _SPEC_WT)
 #: denote.  A scalar ``x`` (``()``) or a rank-1 ``W`` whose extent
 #: disagrees with ``x``'s in-feature axis mints a RHS ``F.linear``
 #: cannot lower — 16 ``rhs-err`` sites the old guard accepted (the
-#: derivable-gate audit).
+#: derivable-gate audit).  ``_COND_LINEAR_WT`` adds the rank ceiling
+#: ``F.linear`` enforces (a rank>=3 weight has no image).
 _COND_CHANNEL_SCALE = (
     "and",
     _COND_LINEAR_XW,
+    _COND_LINEAR_WT,
     ("shaped", "c"),
     ("rank", "W", ">=", 1),
     (
@@ -1140,11 +1195,12 @@ _COND_CHANNEL_SCALE = (
 #: ``mul(linear(x,W), r)`` by an axis while ``linear(mul(x,r), W)``
 #: stayed scalar — 3 ``unequal`` sites, plus 9 ``rhs-err`` where
 #: ``linear(x, W)`` itself could not denote (the derivable-gate
-#: audit).  (Same verdict as ``base._is_row_scale``, tightened.)
+#: audit).  ``_COND_LINEAR_WT`` again caps the weight arity.
 _COND_ROW_SCALE = (
     "and",
     ("or", ("scalar", "r"), ("dim-eq-const", "r", -1, 1)),
     ("bcast-into", "r", _SPEC_LINEAR_OUT),
+    _COND_LINEAR_WT,
 )
 
 LINEAR_CHANNEL_SCALE = R(

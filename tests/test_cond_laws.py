@@ -916,9 +916,68 @@ def test_mm_addends_rank_equal_requires_shape_eq():
     assert DISTRIBUTE_MUL.check(good)
     assert not DISTRIBUTE_MUL.check(bad)
     assert not FACTOR_MUL.check(bad)
-    # rank>=2 differing extents stay covered by the second branch.
-    batched = {"W": _p("W", 4, 3), "a": _v("a", 3, 5), "b": _v("b", 1, 5)}
+    # rank>=2 with the SAME contraction axis (-2) stays covered by the
+    # second branch (a rank-2 + rank-3 batch broadcast).
+    batched = {
+        "W": _p("W", 5, 4),
+        "a": _v("a", 4, 3),
+        "b": _v("b", 2, 4, 3),
+    }
     assert DISTRIBUTE_MUL.check(batched)
+
+
+def test_mm_addends_rank_ge2_requires_contraction_axis():
+    """The rank>=2 branch must align the CONTRACTION axis (-2), not
+    merely the rank: ``a=(3,5)``, ``b=(1,5)`` broadcasts the
+    contraction axis (1 -> 3) yet ``matmul(W, a)``/``matmul(W, b)``
+    cannot contract with one ``W`` — a measured rhs-err the old
+    leading-axis-padding argument accepted.  The minimal closure
+    ``dim-eq(a, -2, b, -2)`` declines it and keeps every sound
+    rank>=2 mixed-rank binding."""
+    from catopt_core.egraph.terms import _term_instantiate
+    from catopt_discovery import oracle as vo
+
+    bad = {"W": _p("W", 4, 3), "a": _v("a", 3, 5), "b": _v("b", 1, 5)}
+    assert not DISTRIBUTE_MUL.check(bad)
+    assert not FACTOR_MUL.check(bad)
+    # the same binding is a measured rhs-err, not an equal site.
+    lhs = _term_instantiate(DISTRIBUTE_MUL.lhs, bad)
+    rhs = _term_instantiate(DISTRIBUTE_MUL.rhs, bad)
+    assert vo.eval_instance(lhs, rhs)[0] == "rhs-err"
+    # a sound rank>=2 mixed-rank pair (shared -2) still clears.
+    good = {
+        "W": _p("W", 5, 4),
+        "a": _v("a", 4, 3),
+        "b": _v("b", 2, 4, 3),
+    }
+    assert DISTRIBUTE_MUL.check(good)
+    lhs = _term_instantiate(DISTRIBUTE_MUL.lhs, good)
+    rhs = _term_instantiate(DISTRIBUTE_MUL.rhs, good)
+    assert vo.eval_instance(lhs, rhs)[0] == "equal"
+
+
+def test_mm_weights_rank_ge2_uses_the_spelling_axis():
+    """The summed weights' contraction axis differs by spelling:
+    ``matmul(x, W)`` contracts ``W[-2]``, ``linear(x, W)`` (= ``x @
+    W.T``) contracts ``W[-1]``.  The matmul guard declines a
+    ``W=(2,3)``/``W2=(1,3)`` pair; the linear guard declines
+    ``W=(2,3)``/``W2=(2,1)`` — and each accepts the other's sound
+    case, so a single shared clause could not be correct."""
+    w_mm_bad = {"x": _v("x", 4, 2), "W": _v("W", 2, 3), "W2": _v("W2", 1, 3)}
+    assert not WEIGHT_FACTOR.check(w_mm_bad)
+    assert not WEIGHT_DISTRIBUTE.check(w_mm_bad)
+    w_lin_bad = {
+        "x": _v("x", 4, 3),
+        "W": _v("W", 2, 3),
+        "W2": _v("W2", 2, 1),
+    }
+    assert not WEIGHT_FACTOR_LINEAR.check(w_lin_bad)
+    assert not WEIGHT_DISTRIBUTE_LINEAR.check(w_lin_bad)
+    # each spelling keeps its own sound rank>=2 mixed-extent case.
+    w_mm_ok = {"x": _v("x", 5, 4), "W": _v("W", 4, 3), "W2": _v("W2", 2, 4, 3)}
+    assert WEIGHT_DISTRIBUTE.check(w_mm_ok)
+    w_lin_ok = {"x": _v("x", 2, 5), "W": _v("W", 3, 5), "W2": _v("W2", 1, 5)}
+    assert WEIGHT_DISTRIBUTE_LINEAR.check(w_lin_ok)
 
 
 def test_mm_weights_rank_equal_requires_shape_eq():
@@ -966,6 +1025,27 @@ def test_linear_row_scale_requires_r_broadcasts_into_output():
     bad = {"x": _v("x", 1), "r": _v("r", 1), "W": _p("W", 1)}
     assert not LINEAR_ROW_SCALE.check(bad)
     assert not LINEAR_ROW_SCALE_REV.check(bad)
+
+
+def test_linear_scale_guards_cap_the_weight_arity():
+    """``F.linear`` refuses a rank>=3 weight (``t() expects a tensor
+    with <= 2 dimensions``), but ``mm-shape-ok`` / ``mm-out`` over
+    ``W.T`` resolve a rank>=3 ``W.T`` happily — so both linear-scale
+    guards conjoin the ``rank(W) <= 2`` ceiling.  Measured: the only
+    site it declines is a rank-3-``W`` ``both-err``; every equal site
+    keeps."""
+    ch3 = {"x": _v("x", 4, 3), "c": _v("c", 3), "W": _p("W", 2, 4, 3)}
+    assert not LINEAR_CHANNEL_SCALE.check(ch3)
+    row3 = {"x": _v("x", 2, 2, 3), "r": _v("r", 2, 2, 1), "W": _p("W", 2, 3, 4)}
+    assert not LINEAR_ROW_SCALE.check(row3)
+    assert not LINEAR_ROW_SCALE_REV.check(row3)
+    # rank-2 weights still clear.
+    assert LINEAR_CHANNEL_SCALE.check(
+        {"x": _v("x", 4, 3), "c": _v("c", 3), "W": _p("W", 4, 3)}
+    )
+    assert LINEAR_ROW_SCALE.check(
+        {"x": _v("x", 2, 2, 3), "r": _v("r", 2, 2, 1), "W": _p("W", 4, 3)}
+    )
 
 
 # ---------------------------------------------------------------------------
