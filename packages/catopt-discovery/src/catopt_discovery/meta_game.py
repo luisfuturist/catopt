@@ -203,6 +203,7 @@ __all__ = [
     "run_guide_experiment",
     "run_player",
     "train",
+    "train_guide",
 ]
 
 #: Maximum op nodes on one side of a candidate (the task bound).
@@ -981,9 +982,15 @@ class Referee:
         cost_fn: Any,
         lib: list,
     ) -> None:
-        """Bind the corpus slice, the measurement machinery, the lib."""
-        self.terms = terms
-        self.cases = cases
+        """Bind the corpus slice, the measurement machinery, the lib.
+
+        The slice lists are *copied*: corpus arms mutate them
+        mid-game (``_ingest`` appends), and two arenas sharing one
+        list would let one run's generated workloads leak into the
+        next run's board — the same per-run isolation ``dedup`` has.
+        """
+        self.terms = list(terms)
+        self.cases = list(cases)
         self.sink = sink
         self.cost_fn = cost_fn
         self.lib = lib
@@ -1409,6 +1416,13 @@ ENUMERATION_ORDER = (
 #: first, then corpus growth).
 CORPUS_ARMS = ("workload_gen", "gap_gen")
 
+#: Canonical arm order for the learned guide's identity one-hot —
+#: the fixed pipeline inventory (incl. ``build``), then the corpus
+#: arms.  Identity is what separates ``gap_gen`` (re-adjudicated
+#: ``no-instance`` candidates — an immediate score) from
+#: ``workload_gen`` (always scored 0; the payoff is indirect).
+_ARM_NAMES = ENUMERATION_ORDER + CORPUS_ARMS
+
 
 @dataclass(frozen=True)
 class Allocation:
@@ -1798,6 +1812,24 @@ class GuideArena:
             self._resampler = lwg._Resampler(self._stats, self._gen_rng)
         return self._stats
 
+    def _stats_safe(self, term: Any) -> bool:
+        """Return whether every attr value in *term* is hashable.
+
+        ``workload_gen.corpus_stats`` keys its attr tables on
+        ``tuple(sorted(attrs.items()))`` — a generated term carrying
+        an unhashable (list) attr value passes ``valid_term`` but
+        poisons every later stats rebuild.  Ingestion refuses such
+        terms: the draw becomes a miss rather than a dead arm.
+        """
+        for s in _iter_subterms(term):
+            if isinstance(s, Op):
+                for v in s.attrs.values():
+                    try:
+                        hash(v)
+                    except TypeError:
+                        return False
+        return True
+
     def _ingest(self, case: TermCase) -> None:
         """Append a verified workload to the corpus; rotate the scope.
 
@@ -1872,26 +1904,32 @@ class GuideArena:
         st = self._gen_stats()
         rng = self._gen_rng
         for _ in range(lwg._ATTEMPTS_PER_TERM):
-            if rng.random() < 0.5 or not self.ref.cases:
-                cand = self._resampler.sample()
-            else:
-                cand = lwg.mutant_term(
-                    rng.choice(self.ref.cases), st, rng
+            try:
+                if rng.random() < 0.5 or not self.ref.cases:
+                    cand = self._resampler.sample()
+                else:
+                    cand = lwg.mutant_term(
+                        rng.choice(self.ref.cases), st, rng
+                    )
+                if cand is None:
+                    continue
+                env = lwg.valid_term(
+                    cand, st, self._gen_seen, self._supported
                 )
-            if cand is None:
+                if env is None:
+                    continue
+                case = lwg.term_to_case(
+                    cand,
+                    f"gen:wg:{self.generated}",
+                    "gen-workload",
+                    env,
+                )
+            except Exception:
+                # a malformed sampled term crashing a gate (e.g. a
+                # zero-stride conv in ``_shape_of``) is a failed
+                # mint attempt, not a run abort
                 continue
-            env = lwg.valid_term(
-                cand, st, self._gen_seen, self._supported
-            )
-            if env is None:
-                continue
-            case = lwg.term_to_case(
-                cand,
-                f"gen:wg:{self.generated}",
-                "gen-workload",
-                env,
-            )
-            if case is None:
+            if case is None or not self._stats_safe(case.term):
                 continue
             self._ingest(case)
             v = Verdict(name=case.name, reason="generated")
@@ -1932,16 +1970,23 @@ class GuideArena:
             check=check,
             derive=derive,
         )
-        cases, _prov = lgg.gen_cases_for(
-            proposal,
-            list(self.ref.cases),
-            self._gen_stats(),
-            self._supported,
-            self._gen_seen,
-            self._gen_rng,
-        )
+        try:
+            cases, _prov = lgg.gen_cases_for(
+                proposal,
+                list(self.ref.cases),
+                self._gen_stats(),
+                self._supported,
+                self._gen_seen,
+                self._gen_rng,
+            )
+        except Exception:
+            # a synthesized term crashing its own gates (e.g. a
+            # zero-stride conv in ``_shape_of``) is a failed
+            # synthesis — the ``gap-miss`` path below, honestly
+            cases = []
         for case in cases:
-            self._ingest(case)
+            if self._stats_safe(case.term):
+                self._ingest(case)
         if not cases:
             v = Verdict(name=proposal.name, reason="gap-miss")
             self._account("gap_gen", v, None, None)
@@ -2155,26 +2200,59 @@ class LearnedGuide(Guide):
     the REINFORCE step with the same running-mean baseline ``train``
     uses.  The reward is the batch's mean verdict score — the guide
     inherits the referee's own currency.
+
+    The arm features pair the running tallies with a one-hot
+    *identity* over ``_ARM_NAMES`` — without it the two corpus arms
+    are indistinguishable until their tallies diverge (``gap_gen``
+    and ``workload_gen`` share every other feature at game start),
+    and the two proposal arms likewise.  ``learn=False`` (see
+    :meth:`frozen`) samples from the policy but never updates — the
+    eval-time form of a guide trained by :func:`train_guide`.
     """
 
-    _SDIM = 6
-    _ADIM = 8
+    _SDIM = 8
+    _ADIM = 6 + len(ENUMERATION_ORDER) + len(CORPUS_ARMS)
 
     def __init__(
         self,
         step: int = 8,
         hidden: int = 16,
         lr: float = 3e-3,
+        *,
+        learn: bool = True,
     ) -> None:
         """Build the arm-scoring net and the optimizer."""
         self.step = step
+        self.hidden = hidden
+        self.learn = learn
         self.net = _PolicyNet(self._SDIM, self._ADIM, hidden)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
         self.baseline = 0.0
         self._logp: torch.Tensor | None = None
 
+    def frozen(self) -> LearnedGuide:
+        """Return a copy sharing the trained net that never updates.
+
+        The eval-time form of a trained guide: same arm policy, no
+        gradient — measured yield is attributable to the learned
+        weights, not to in-run adaptation.
+        """
+        g = LearnedGuide(
+            step=self.step, hidden=self.hidden, learn=False
+        )
+        g.net.load_state_dict(self.net.state_dict())
+        g.net.eval()
+        g.baseline = self.baseline
+        return g
+
     def _state_vec(self, obs: GuideObs) -> list[float]:
-        """Featurize the board: budget spent, queues left, progress."""
+        """Featurize the board: budget, queues, progress, corpus.
+
+        ``corpus_size`` / ``scope_epoch`` are what let the net
+        condition on corpus growth — a ``gap_gen`` draw pays only
+        after witnesses rotate the scope, a fact invisible to a
+        tally-only observation.
+        """
         total = max(sum(obs.emitted.values()), 1)
         drained = sum(1 for r in obs.remaining.values() if r == 0)
         best = max((s.best for s in obs.arms.values()), default=0.0)
@@ -2185,10 +2263,12 @@ class LearnedGuide(Guide):
             drained / max(len(obs.arms), 1),
             best / 10.0,
             sum(s.true for s in obs.arms.values()) / 10.0,
+            obs.corpus_size / 64.0,
+            obs.scope_epoch / 16.0,
         ]
 
     def _arm_vec(self, obs: GuideObs, name: str) -> list[float]:
-        """Featurize one arm: exhaustion, hit rates, best score."""
+        """Featurize one arm: tallies plus a name one-hot."""
         s = obs.arms[name]
         emitted = max(obs.emitted.get(name, 0), 1)
         drawn = max(s.drawn, 1)
@@ -2199,8 +2279,7 @@ class LearnedGuide(Guide):
             s.true / drawn,
             s.firing / drawn,
             s.best / 10.0,
-            1.0 if name == "build" else 0.0,
-            1.0 if name in CORPUS_ARMS else 0.0,
+            *[1.0 if name == a else 0.0 for a in _ARM_NAMES],
         ]
 
     def choose(self, obs: GuideObs) -> Allocation | None:
@@ -2220,15 +2299,18 @@ class LearnedGuide(Guide):
 
     def update(self, reward: float, verdicts: list[Verdict]) -> None:
         """REINFORCE step on the last allocation's log-prob."""
-        if self._logp is None:
+        logp = self._logp
+        self._logp = None
+        if logp is None:
             return
+        if not self.learn:
+            return  # frozen guide: sample the policy, never update
         adv = reward - self.baseline
         self.baseline = 0.95 * self.baseline + 0.05 * reward
-        loss = -(self._logp * adv)
+        loss = -(logp * adv)
         self.opt.zero_grad()
         loss.backward()
         self.opt.step()
-        self._logp = None
 
 
 def run_guide(arena: GuideArena, guide: Guide, budget: int) -> dict:
@@ -2270,6 +2352,51 @@ def compare_guides(
     }
 
 
+def train_guide(
+    make_arena: Callable[[], GuideArena],
+    guide: LearnedGuide,
+    episodes: int,
+    budget: int,
+) -> list[float]:
+    """Train the arm policy over whole guide games; return yields.
+
+    Each episode is one full :func:`run_guide` over a fresh arena —
+    the guide's own ``update`` is the trainer (REINFORCE on each
+    allocation's batch-mean verdict score), so this helper only
+    re-rolls the board; no new optimizer, no second reward
+    definition.  *budget* should match the eval budget: the state
+    features normalize ``spent`` by it.  Returns the per-episode
+    ``yield_tf_per_call`` — the training curve in the metric the
+    comparison reports.
+    """
+    hist: list[float] = []
+    for _ in range(episodes):
+        s = run_guide(make_arena(), guide, budget)
+        hist.append(s["referee"]["yield_tf_per_call"])
+    return hist
+
+
+def _pretrain_arm_guide(
+    make_arena: Callable[[], GuideArena],
+    args: argparse.Namespace,
+) -> tuple[list[float] | None, dict[str, Callable[[], Guide]]]:
+    """Run the ``--guide-episodes`` hook: train, freeze, register.
+
+    Returns ``(per-episode yield hist, extra guide entries)`` — the
+    frozen trained policy joins the comparison as
+    ``learned-trained``, so its measured yield is attributable to
+    the learned weights rather than in-run adaptation.
+    """
+    if not args.guide_episodes:
+        return None, {}
+    guide = LearnedGuide(step=args.guide_step)
+    hist = train_guide(
+        make_arena, guide, args.guide_episodes, args.budget
+    )
+    frozen = guide.frozen()
+    return hist, {"learned-trained": lambda g=frozen: g}
+
+
 def run_guide_experiment(args: argparse.Namespace) -> dict:
     """Run guide-vs-enumeration over the real corpus slice.
 
@@ -2281,6 +2408,11 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
     loop, no new trainer).  ``--guide-corpus`` arms the corpus arms
     (``workload_gen`` / ``gap_gen``, ``args.guide_corpus`` draws
     each), putting the corpus itself on the board.
+    ``--guide-episodes`` pre-trains the *arm* policy over whole
+    games (:func:`train_guide`) — the learned guide otherwise sees
+    only ``budget/step`` reward observations per run — and the
+    trained net joins the board as ``learned-trained``, frozen for
+    the measurement.
     """
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -2338,7 +2470,9 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
             vocab=args.vocab,
         )
 
-    guides = {
+    guide_train_hist, trained = _pretrain_arm_guide(make_arena, args)
+
+    guides: dict[str, Callable[[], Guide]] = {
         "enumeration": lambda: EnumerationGuide(
             order=ENUMERATION_ORDER + CORPUS_ARMS,
             step=args.guide_step,
@@ -2348,6 +2482,7 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
         ),
         "learned": lambda: LearnedGuide(step=args.guide_step),
     }
+    guides.update(trained)
     if args.guide_corpus:
         # a second control: the same fixed schedule with the corpus
         # arms *first* — separates "corpus arms pay" from "a policy
@@ -2371,7 +2506,20 @@ def run_guide_experiment(args: argparse.Namespace) -> dict:
         "pools": {k: len(v) for k, v in pools.items()},
         "results": results,
         "yield_tf_ratio_vs_enumeration": ratios,
+        "guide_train_hist": guide_train_hist,
     }
+
+
+def _print_train_line(hist: list[float] | None) -> None:
+    """Print the arm-policy training curve, when one was run."""
+    if not hist:
+        return
+    tail = hist[-10:]
+    print(
+        f"   arm-policy training: {len(hist)} episodes, "
+        f"yield_tf first {hist[0]:.3f} -> "
+        f"last-10 mean {sum(tail) / len(tail):.3f}"
+    )
 
 
 def _print_guide_report(result: dict) -> None:
@@ -2381,6 +2529,7 @@ def _print_guide_report(result: dict) -> None:
         "   pool: "
         + ", ".join(f"{k}={n}" for k, n in result["pools"].items())
     )
+    _print_train_line(result.get("guide_train_hist"))
     for label, s in result["results"].items():
         r = s["referee"]
         ratio = result["yield_tf_ratio_vs_enumeration"][label]
@@ -2689,6 +2838,14 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="episodes to pre-train the build arm's player policy",
+    )
+    p.add_argument(
+        "--guide-episodes",
+        type=int,
+        default=0,
+        help="whole-game episodes to pre-train the learned guide's "
+        "arm policy; the frozen net is evaluated as "
+        "'learned-trained'",
     )
     p.add_argument(
         "--guide-corpus",

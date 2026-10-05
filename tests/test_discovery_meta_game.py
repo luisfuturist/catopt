@@ -389,6 +389,57 @@ def test_learned_guide_feature_shapes():
         assert len(g._arm_vec(obs, name)) == g._ADIM
 
 
+def test_learned_guide_arm_identity_one_hot():
+    """The corpus arms are distinguishable by feature, not luck —
+    ``workload_gen`` and ``gap_gen`` share every tally-derived
+    feature at game start; the identity one-hot is what separates
+    them."""
+    g = mg.LearnedGuide(step=1)
+    obs = _corpus_arena().observation(10)
+    wv = g._arm_vec(obs, "workload_gen")
+    gv = g._arm_vec(obs, "gap_gen")
+    assert len(wv) == g._ADIM
+    assert wv != gv
+
+
+def test_frozen_guide_samples_but_never_updates():
+    """``frozen`` shares the trained net; ``update`` is a no-op —
+    the eval-time form of a trained guide."""
+    import torch
+
+    g = mg.LearnedGuide(step=2, hidden=8)
+    f = g.frozen()
+    assert f.learn is False
+    for k, v in f.net.state_dict().items():
+        assert torch.equal(v, g.net.state_dict()[k])
+    arena = _arena()
+    a = f.choose(arena.observation(6))
+    assert a is not None
+    f.update(5.0, [])
+    assert f.baseline == 0.0  # no running-mean update either
+    for k, v in f.net.state_dict().items():
+        assert torch.equal(v, g.net.state_dict()[k])
+
+
+def test_train_guide_plays_whole_games():
+    """``train_guide`` re-rolls fresh arenas; the guide's own
+    ``update`` is the trainer — no second reward definition."""
+    g = mg.LearnedGuide(step=2, hidden=8)
+    calls: list[float] = []
+    orig = g.update
+
+    def spy(r, vs):
+        calls.append(r)
+        return orig(r, vs)
+
+    g.update = spy
+    hist = mg.train_guide(lambda: _arena(), g, episodes=2, budget=6)
+    assert len(hist) == 2
+    assert all(isinstance(y, float) for y in hist)
+    assert calls  # every allocation produced an update
+    assert g._logp is None
+
+
 # ---------------------------------------------------------------------------
 #  run_guide / compare_guides — the comparison harness
 # ---------------------------------------------------------------------------
@@ -978,3 +1029,39 @@ def test_guide_corpus_cli(monkeypatch, tmp_path, capsys):
         assert "workload_gen" in s["arms"]
         assert "gap_gen" in s["arms"]
         assert "corpus_size" in s and "scope_epoch" in s
+
+
+def test_guide_episodes_cli_trains_arm_policy(
+    monkeypatch, tmp_path, capsys
+):
+    """``--guide-episodes`` pre-trains the arm policy over whole
+    games; the frozen net joins the board as ``learned-trained``."""
+    cases = _tiny_cases()
+    monkeypatch.setattr(mg, "_bench_cases", lambda: (cases[:4], []))
+    monkeypatch.setattr(mg, "model_cases", lambda: (cases[4:], []))
+    out = tmp_path / "guide.json"
+    rc = mg.main(
+        [
+            "--guide",
+            "--guide-episodes",
+            "2",
+            "--budget",
+            "8",
+            "--guide-step",
+            "3",
+            "--guide-corpus",
+            "1",
+            "--plays-cap",
+            "2",
+            "--top-seeds",
+            "3",
+            "--json",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    assert "learned-trained" in payload["results"]
+    assert len(payload["guide_train_hist"]) == 2
+    printed = capsys.readouterr().out
+    assert "arm-policy training" in printed
