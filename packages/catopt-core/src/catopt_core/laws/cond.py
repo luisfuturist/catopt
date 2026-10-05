@@ -58,6 +58,13 @@ Grammar
           | ("axes-noop", T, D0, D1) # transpose pair is a semantic
                                      #   no-op on T (same axis, or both
                                      #   swapped extents are 1)
+          | ("axis-align-eq", A,B,K) # $attr:K sits at the same
+                                     #   right-aligned axis position in
+                                     #   both A and B (the index view
+                                     #   commutes with the broadcast)
+          | ("bcast-dim-inv", V,U,K) # V is broadcast-invariant along
+                                     #   U's $attr:K axis (no such axis,
+                                     #   or its aligned extent is 1)
           | ("flat-pair-unsq", T,K,G,S)  # flat-read pairing of T's dims
                                      #   agrees between broadcast-into-G
                                      #   and unsq-into-S (the wr guard)
@@ -82,6 +89,17 @@ Grammar
                                      #   under $attr:NAME (-1 folded,
                                      #   numel checked — invalid→None)
           | ("getitem-out", T)       # tensor-index output: s[1:]
+          | ("select-out", T, D)     # select output: drop axis $attr:D
+          | ("slice-out", T, D, S, E, STEP)
+                                     # slice output: axis $attr:D
+                                     #   replaced by the sliced extent
+                                     #   (defaults 0 / dim / 1 for a
+                                     #   None S/E/STEP)
+          | ("chunk-out", T, C, D)   # chunk element shape:
+                                     #   s[$attr:D] // $attr:C
+          | ("transpose-out", T, D0, D1)
+                                     # transpose output: swap axes
+                                     #   $attr:D0 / $attr:D1
           | ("tail-block", T, NAME)  # the trailing block attr NAME's
                                      #   reduce dims prove — su[-k:]
                                      #   when they name exactly T's
@@ -325,6 +343,131 @@ def _attr_dims(bound: dict, name: str) -> tuple | None:
     return tuple(dims)
 
 
+def _bound_attr(bound: dict, name: Any, default: Any) -> Any:
+    """Resolve an optional attr-metavar spec arg to its bound value.
+
+    ``name`` is an attr metavar name (looked up under ``"$attr:"``) or
+    ``None``; an absent or ``None``-valued binding yields *default*.
+    Used by the view-output specs whose torch attr is optional
+    (``slice``'s ``start``/``end``/``step``, ``transpose``'s axes).
+    """
+    if name is None:
+        return default
+    v = bound.get(f"$attr:{name}")
+    return default if v is None else v
+
+
+def _s_select_out(args: tuple, bound: dict) -> Any:
+    """``("select-out", T, D)`` — the ``select`` output shape.
+
+    Mirrors the ``select`` branch of ``_infer_op_shape``: the axis the
+    bound ``$attr:D`` names is dropped (normalized ``mod rank``).  A
+    rank-0 operand, an unbound/non-int axis or an unknown shape
+    resolves to ``None`` — the strictness contract declines.
+    """
+    if len(args) != 2:
+        return None
+    s = _tshape(bound, args[0])
+    d = bound.get(f"$attr:{args[1]}")
+    if s is None or not s or not isinstance(d, int):
+        return None
+    nd = d % len(s)
+    return (*s[:nd], *s[nd + 1 :])
+
+
+def _s_slice_out(args: tuple, bound: dict) -> Any:
+    """``("slice-out", T, D, S, E, STEP)`` — the ``slice`` output shape.
+
+    Mirrors the ``slice`` branch of ``_infer_op_shape``: the axis
+    ``$attr:D`` is replaced by the sliced extent
+    ``ceil((min(end, s[d]) - start) / step)`` clamped at ``0``.
+    ``S``/``E``/``STEP`` are attr names or ``None`` for the torch
+    defaults (``0`` / the dim / ``1``).  An unknown shape, a rank-0
+    operand or an unbound/non-int axis declines; a non-int extent
+    leaves that dim unchanged (the mirror of the typing rule, which
+    only rewrites a concrete ``int`` dim).
+    """
+    if len(args) != 5:
+        return None
+    s = _tshape(bound, args[0])
+    d = bound.get(f"$attr:{args[1]}")
+    if s is None or not s or not isinstance(d, int):
+        return None
+    lo = _bound_attr(bound, args[2], 0)
+    hi = _bound_attr(bound, args[3], None)
+    step = _bound_attr(bound, args[4], 1)
+    nd = d % len(s)
+    bd = s[nd]
+    out = list(s)
+    if (
+        isinstance(bd, int)
+        and isinstance(lo, int)
+        and isinstance(step, int)
+        and step > 0
+    ):
+        n = (min(hi, bd) if isinstance(hi, int) else bd) - lo
+        out[nd] = max(0, -(-n // step))
+    return tuple(out)
+
+
+def _s_chunk_out(args: tuple, bound: dict) -> Any:
+    """``("chunk-out", T, C, D)`` — the ``chunk`` element shape.
+
+    Mirrors the ``chunk`` branch of ``_infer_op_shape``:
+    ``s[$attr:D] // $attr:C`` (catopt's rule reports the same size for
+    every chunk — the index is not part of the shape).  A rank-0
+    operand, an unbound/non-int axis or chunk count, or a non-positive
+    chunk count declines; an unknown (``None``) axis extent is left
+    unchanged rather than read as the typing rule's ``or 0`` — the
+    guard declines on an unproven extent.
+    """
+    if len(args) != 3:
+        return None
+    s = _tshape(bound, args[0])
+    c = bound.get(f"$attr:{args[1]}")
+    d = bound.get(f"$attr:{args[2]}")
+    if (
+        s is None
+        or not s
+        or not isinstance(c, int)
+        or not isinstance(d, int)
+        or c <= 0
+    ):
+        return None
+    nd = d % len(s)
+    out = list(s)
+    if isinstance(s[nd], int):
+        out[nd] = s[nd] // c
+    return tuple(out)
+
+
+def _s_transpose_out(args: tuple, bound: dict) -> Any:
+    """``("transpose-out", T, D0, D1)`` — the ``transpose`` output shape.
+
+    Mirrors the ``transpose`` branch of ``_infer_op_shape``: the axes
+    ``$attr:D0``/``$attr:D1`` name are swapped (normalized ``mod
+    rank``; ``D0``/``D1`` default ``-2``/``-1``).  A rank-0 operand or
+    an unbound/non-int axis declines.
+    """
+    if len(args) != 3:
+        return None
+    s = _tshape(bound, args[0])
+    d0 = _bound_attr(bound, args[1], -2)
+    d1 = _bound_attr(bound, args[2], -1)
+    if (
+        s is None
+        or not s
+        or not isinstance(d0, int)
+        or not isinstance(d1, int)
+    ):
+        return None
+    n = len(s)
+    a, b = d0 % n, d1 % n
+    out = list(s)
+    out[a], out[b] = out[b], out[a]
+    return tuple(out)
+
+
 def _s_tail_block(args: tuple, bound: dict) -> Any:
     """``("tail-block", T, NAME)`` — the trailing block NAME proves.
 
@@ -377,6 +520,10 @@ _SPEC_OPS: dict = {
     "unsq-out": _s_unsq_out,
     "reshape-out": _s_reshape_out,
     "getitem-out": _s_getitem_out,
+    "select-out": _s_select_out,
+    "slice-out": _s_slice_out,
+    "chunk-out": _s_chunk_out,
+    "transpose-out": _s_transpose_out,
     "tail-block": _s_tail_block,
 }
 
@@ -387,7 +534,11 @@ def _shape(bound: dict, ref: Any) -> Any:
     ``ref`` is a metavar name (looked up in ``bound`` and inferred via
     ``_shape_of``) or a tuple spec dispatched through ``_SPEC_OPS`` —
     ``("mm-out", a, b)``, ``("bcast", a, b)``, ``("unsq-out", a, K)``,
-    ``("reshape-out", a, NAME)`` and ``("getitem-out", a)``.
+    ``("reshape-out", a, NAME)``, ``("getitem-out", a)``,
+    ``("select-out", a, D)``, ``("slice-out", a, D, S, E, STEP)``,
+    ``("chunk-out", a, C, D)``, ``("transpose-out", a, D0, D1)`` and
+    ``("tail-block", a, NAME)``.  Specs compose — an operand may itself
+    be a spec (``("select-out", ("bcast", a, b), D)``).
     Anything else resolves to ``None`` (unknown), which every
     predicate treats as a decline.
     """
@@ -992,6 +1143,54 @@ def _p_repeat_heads(args: tuple, bound: dict) -> bool:
     return r is not None and sa[-2] == sb[-2] * r
 
 
+def _p_axis_align_eq(args: tuple, bound: dict) -> bool:
+    """``("axis-align-eq", A, B, K)`` — the ``$attr:K`` axis is aligned.
+
+    True when the bound ``$attr:K`` axis sits at the same right-aligned
+    position in both shapes: ``d % rank - rank`` agrees.  Right-
+    alignment is how ``_broadcast`` maps a lower-rank operand's axes
+    onto the common grid, so equal offsets mean axis ``K`` of ``A`` and
+    of ``B`` land on the *same* grid axis — the condition an index view
+    (``select``/``slice``/``chunk``) needs to commute with the
+    broadcast of ``A`` into ``B``.  Rank-0 or unknown shapes, and an
+    unbound/non-int ``K``, decline.
+    """
+    sa, sb = _tshape(bound, args[0]), _tshape(bound, args[1])
+    d = bound.get(f"$attr:{args[2]}")
+    if (
+        sa is None
+        or sb is None
+        or not sa
+        or not sb
+        or not isinstance(d, int)
+    ):
+        return False
+    return d % len(sa) - len(sa) == d % len(sb) - len(sb)
+
+
+def _p_bcast_dim_inv(args: tuple, bound: dict) -> bool:
+    """``("bcast-dim-inv", V, U, K)`` — *V* is invariant along U's axis.
+
+    ``V`` right-aligns into ``U``'s grid; the axis ``$attr:K`` of ``U``
+    maps to a position of ``V`` (or past its rank).  True when ``V``
+    has no such axis — it broadcasts the constant along it — or that
+    extent is exactly ``1``: then pushing an index view
+    (``select``/``slice``/``chunk``) of ``U`` past ``V`` changes
+    nothing, the value-level half of the ``f(view(U), V) ==
+    view(f(U, V))`` guard.  Unknown shapes, a rank-0 ``U`` or an
+    unbound/non-int ``K`` decline; a ``None`` extent at the mapped
+    position declines too (not provably ``1``).
+    """
+    sv, su = _tshape(bound, args[0]), _tshape(bound, args[1])
+    d = bound.get(f"$attr:{args[2]}")
+    if sv is None or su is None or not su or not isinstance(d, int):
+        return False
+    pos = d % len(su) - len(su) + len(sv)
+    if not (0 <= pos < len(sv)):
+        return True
+    return sv[pos] == 1
+
+
 _OPS: dict = {
     "and": None,  # combinators are handled in eval_cond directly
     "or": None,
@@ -1032,6 +1231,8 @@ _OPS: dict = {
     "bcast-eq": _p_bcast_eq,
     "ones-before": _p_ones_before,
     "axes-noop": _p_axes_noop,
+    "axis-align-eq": _p_axis_align_eq,
+    "bcast-dim-inv": _p_bcast_dim_inv,
     "flat-pair-unsq": _p_flat_pair_unsq,
     "flat-map-unsq": _p_flat_map_unsq,
     "repeat-chain": _p_repeat_chain,

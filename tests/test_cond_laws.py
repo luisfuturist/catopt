@@ -345,6 +345,261 @@ def test_axis_attr_normalizes_against_rank():
 
 
 # ---------------------------------------------------------------------------
+#  View-output shape specs — select / slice / chunk / transpose
+# ---------------------------------------------------------------------------
+
+
+def test_select_out_spec():
+    """``select-out`` drops the bound axis (mirrors typing.select)."""
+    b = {
+        "u": _v("u", 2, 3, 4),
+        "$attr:D": 1,
+        "s": _v("s", 2, 4),
+    }
+    assert eval_cond(("shape-eq", ("select-out", "u", "D"), "s"), b)
+    assert not eval_cond(
+        ("shape-eq", ("select-out", "u", "D"), "s"),
+        dict(b, s=_v("s", 2, 3)),
+    )
+    # a negative axis normalizes mod rank
+    neg = {"u": _v("u", 2, 3), "$attr:D": -1, "s": _v("s", 2)}
+    assert eval_cond(("shape-eq", ("select-out", "u", "D"), "s"), neg)
+    # rank-0 / unbound axis / non-int axis / bad arity decline
+    assert not eval_cond(
+        ("shaped", ("select-out", "z", "D")),
+        {"z": _v("z"), "$attr:D": 0},
+    )
+    assert not eval_cond(
+        ("shaped", ("select-out", "u", "D")),
+        {"u": _v("u", 2, 3)},
+    )
+    assert not eval_cond(
+        ("shaped", ("select-out", "u", "D")),
+        {"u": _v("u", 2, 3), "$attr:D": "x"},
+    )
+    # bad arity (one arg) declines
+    assert not eval_cond(
+        ("shaped", ("select-out", "u")),
+        {"u": _v("u", 2, 3), "$attr:D": 0},
+    )
+
+
+def test_slice_out_spec():
+    """``slice-out`` replaces the axis with the sliced extent."""
+    b = {
+        "u": _v("u", 4, 6),
+        "$attr:D": -1,
+        "$attr:S": 0,
+        "$attr:E": 2,
+        "$attr:ST": 1,
+        "s": _v("s", 4, 2),
+    }
+    assert eval_cond(("shape-eq", ("slice-out", "u", "D", "S", "E", "ST"), "s"), b)
+    # None start/end/step take the torch defaults 0 / dim / 1
+    full = {"u": _v("u", 4, 6), "$attr:D": 0, "s": _v("s", 4, 6)}
+    assert eval_cond(
+        ("shape-eq", ("slice-out", "u", "D", None, None, None), "s"), full
+    )
+    # a stepped slice: ceil(extent / step)
+    stepped = {
+        "u": _v("u", 8),
+        "$attr:D": 0,
+        "$attr:S": 0,
+        "$attr:E": 8,
+        "$attr:ST": 2,
+        "s": _v("s", 4),
+    }
+    assert eval_cond(
+        ("shape-eq", ("slice-out", "u", "D", "S", "E", "ST"), "s"), stepped
+    )
+    # unbound axis / rank-0 / bad arity decline
+    assert not eval_cond(
+        ("shaped", ("slice-out", "u", "D", None, None, None)),
+        {"u": _v("u", 4)},
+    )
+    assert not eval_cond(
+        ("shaped", ("slice-out", "z", "D", None, None, None)),
+        {"z": _v("z"), "$attr:D": 0},
+    )
+    assert not eval_cond(("shaped", ("slice-out", "u", "D")), b)
+
+
+def test_chunk_out_spec():
+    """``chunk-out`` divides the axis by the chunk count."""
+    b = {"u": _v("u", 4, 6), "$attr:C": 2, "$attr:D": -1, "s": _v("s", 4, 3)}
+    assert eval_cond(("shape-eq", ("chunk-out", "u", "C", "D"), "s"), b)
+    assert not eval_cond(
+        ("shape-eq", ("chunk-out", "u", "C", "D"), "s"),
+        dict(b, **{"$attr:C": 3}),
+    )
+    # non-positive chunk count / rank-0 / unbound axis / bad arity decline
+    assert not eval_cond(
+        ("shaped", ("chunk-out", "u", "C", "D")),
+        {"u": _v("u", 4, 6), "$attr:C": 0, "$attr:D": -1},
+    )
+    assert not eval_cond(
+        ("shaped", ("chunk-out", "z", "C", "D")),
+        {"z": _v("z"), "$attr:C": 2, "$attr:D": 0},
+    )
+    # bad arity (two args) declines
+    assert not eval_cond(
+        ("shaped", ("chunk-out", "u", "C")),
+        {"u": _v("u", 4, 6), "$attr:C": 2, "$attr:D": -1},
+    )
+
+
+def test_transpose_out_spec():
+    """``transpose-out`` swaps the bound axes (defaults -2 / -1)."""
+    b = {
+        "u": _v("u", 2, 3, 4),
+        "$attr:D0": 0,
+        "$attr:D1": -1,
+        "s": _v("s", 4, 3, 2),
+    }
+    assert eval_cond(("shape-eq", ("transpose-out", "u", "D0", "D1"), "s"), b)
+    # None args take the bare last-two swap (d0=-2, d1=-1)
+    last2 = {"u": _v("u", 2, 3, 4), "s": _v("s", 2, 4, 3)}
+    assert eval_cond(
+        ("shape-eq", ("transpose-out", "u", None, None), "s"), last2
+    )
+    # rank-0 / unbound axis / bad arity decline
+    assert not eval_cond(
+        ("shaped", ("transpose-out", "z", "D0", "D1")),
+        {"z": _v("z"), "$attr:D0": 0, "$attr:D1": 1},
+    )
+    # bad arity (two args) declines
+    assert not eval_cond(
+        ("shaped", ("transpose-out", "u", "D0")),
+        {"u": _v("u", 2, 3), "$attr:D0": 0, "$attr:D1": 1},
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Broadcast-alignment predicates — the view-commute guard vocabulary
+# ---------------------------------------------------------------------------
+
+
+def test_axis_align_eq():
+    """``axis-align-eq``: the bound axis is the same grid axis."""
+    # rank-2 vs rank-1: axis -1 right-aligns identically
+    assert eval_cond(
+        ("axis-align-eq", "a", "b", "D"),
+        {"a": _v("a", 2, 3), "b": _v("b", 3), "$attr:D": -1},
+    )
+    # axis 0 of a rank-1 operand maps past a rank-2 partner's axis 0
+    assert not eval_cond(
+        ("axis-align-eq", "a", "b", "D"),
+        {"a": _v("a", 4), "b": _v("b", 3, 4), "$attr:D": 0},
+    )
+    # equal ranks always align
+    assert eval_cond(
+        ("axis-align-eq", "a", "b", "D"),
+        {"a": _v("a", 2, 3), "b": _v("b", 5, 6), "$attr:D": 1},
+    )
+    # unknown side / rank-0 / unbound axis decline
+    assert not eval_cond(
+        ("axis-align-eq", "a", "z", "D"),
+        {"a": _v("a", 2, 3), "$attr:D": 0},
+    )
+    assert not eval_cond(
+        ("axis-align-eq", "a", "b", "D"),
+        {"a": _v("a"), "b": _v("b", 3), "$attr:D": 0},
+    )
+    assert not eval_cond(
+        ("axis-align-eq", "a", "b", "D"),
+        {"a": _v("a", 2, 3), "b": _v("b", 4)},
+    )
+
+
+def test_bcast_dim_inv():
+    """``bcast-dim-inv``: the partner is constant along the axis."""
+    # V's rank is too low to reach U's axis 0 -> invariant
+    assert eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v", 8), "u": _v("u", 4, 8), "$attr:D": 0},
+    )
+    # V's aligned extent at U's axis -1 is 2 (>1) -> varies
+    assert not eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v", 2), "u": _v("u", 2, 2), "$attr:D": -1},
+    )
+    # extent exactly 1 -> invariant
+    assert eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v", 1), "u": _v("u", 2, 2), "$attr:D": -1},
+    )
+    # a scalar V is invariant everywhere
+    assert eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v"), "u": _v("u", 2, 3), "$attr:D": -1},
+    )
+    # rank-0 U / unknown V / unbound axis decline
+    assert not eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v", 3), "u": _v("u"), "$attr:D": 0},
+    )
+    assert not eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"u": _v("u", 2, 3), "$attr:D": 0},
+    )
+    assert not eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v", 3), "u": _v("u", 2, 3)},
+    )
+    # a None extent at the mapped position is not provably 1 -> decline
+    assert not eval_cond(
+        ("bcast-dim-inv", "v", "u", "D"),
+        {"v": _v("v", None), "u": _v("u", 2, 3), "$attr:D": -1},
+    )
+
+
+def test_view_commute_guard_composes_and_roundtrips():
+    """The wrap-form guard the auto-cond bank mints for an index view."""
+    cond = (
+        "and",
+        ("bcast-dim-inv", "V", "U", "A_dim"),
+        (
+            "bcast-eq",
+            ("select-out", "U", "A_dim"),
+            "V",
+            ("select-out", ("bcast", "U", "V"), "A_dim"),
+            ("select-out", ("bcast", "U", "V"), "A_dim"),
+        ),
+    )
+    # accepts: scalar V (invariant), U/V broadcastable
+    ok = {
+        "U": _v("U", 2, 3),
+        "V": _v("V"),
+        "$attr:A_dim": -1,
+        "$attr:A_index": 0,
+    }
+    assert eval_cond(cond, ok)
+    # declines: V varies along the selected axis
+    bad = {
+        "U": _v("U", 2, 2),
+        "V": _v("V", 2),
+        "$attr:A_dim": -1,
+        "$attr:A_index": 0,
+    }
+    assert not eval_cond(cond, bad)
+    # the guard is pure data — the lemma-store round-trip
+    data = cond_to_data(cond)
+    assert cond_from_data(json.loads(json.dumps(data))) == cond
+
+
+def test_shaped_bcast_is_the_broadcastable_predicate():
+    """``shaped(("bcast", A, B))`` composes into ``bcast-ok``."""
+    ok = {"a": _v("a", 4), "b": _v("b", 3, 4)}
+    fail = {"a": _v("a", 4), "b": _v("b", 3, 3)}
+    assert eval_cond(("shaped", ("bcast", "a", "b")), ok)
+    assert not eval_cond(("shaped", ("bcast", "a", "b")), fail)
+    # an unbound side is a wildcard — ``_broadcast`` returns the known
+    # shape, so the composite still resolves (and declines only on a
+    # *provable* mismatch)
+    assert eval_cond(("shaped", ("bcast", "a", "z")), ok)
+
+
+# ---------------------------------------------------------------------------
 #  Term / attr predicates
 # ---------------------------------------------------------------------------
 

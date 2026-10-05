@@ -364,3 +364,191 @@ def test_auto_cond_clause_set_is_minimal_in_size() -> None:
     )
     got3 = obs._min_cover(useful[:2], eq, bad, 6, 1)
     assert got3 is None
+
+
+# ---------------------------------------------------------------------------
+#  The widened bank — the view-commute vocabulary (cond-bank retro)
+# ---------------------------------------------------------------------------
+#
+# The stock bank (``object_synthesis._pred_bank``) enumerates the cond
+# DSL over the pattern's metavariables, but its view-output specs cover
+# only unsqueeze/reshape/getitem and it never emits the *commutation*
+# form — ``bcast(view_out(u), v) == view_out(bcast(u, v))`` — that the
+# ``f(view(u), v) -> view(f(u, v))`` "wrap" candidates need.  cond.py
+# gained the missing view-output specs (``select-out``/``slice-out``/
+# ``chunk-out``/``transpose-out``) and the alignment atoms
+# (``axis-align-eq``/``bcast-dim-inv``); the generator below emits the
+# matching predicates.  The production bank in object_synthesis.py needs
+# the same additive emission — wiring it in here measures the delta
+# without touching that module.
+
+#: Index views whose commutation guard needs the axis-alignment atoms.
+_IDX_ATTR = {"select": "dim", "slice": "dim", "chunk": "dim"}
+
+
+def _str_attrs(node: Op) -> dict:
+    return {k: v for k, v in node.attrs.items() if isinstance(v, str)}
+
+
+def _view_out_spec(op: str, operand, attrs: dict):
+    """The view-output shape spec for *op*, or ``None`` when unbuildable."""
+    if op == "unsqueeze" and isinstance(attrs.get("dim"), str):
+        return ("unsq-out", operand, attrs["dim"])
+    if op in ("reshape", "view") and isinstance(attrs.get("shape"), str):
+        return ("reshape-out", operand, attrs["shape"])
+    if op == "getitem":
+        return ("getitem-out", operand)
+    if op == "select" and isinstance(attrs.get("dim"), str):
+        return ("select-out", operand, attrs["dim"])
+    if op == "slice" and isinstance(attrs.get("dim"), str):
+        return (
+            "slice-out",
+            operand,
+            attrs["dim"],
+            attrs.get("start"),
+            attrs.get("end"),
+            attrs.get("step"),
+        )
+    if op == "chunk" and isinstance(attrs.get("chunks"), str):
+        return ("chunk-out", operand, attrs["chunks"], attrs.get("dim"))
+    if op in ("transpose", "t") and isinstance(attrs.get("dim0"), str):
+        return ("transpose-out", operand, attrs["dim0"], attrs.get("dim1"))
+    return None
+
+
+def _view_commute_preds(lhs, rhs) -> list:
+    """The view-commute predicates the widened bank adds over a pattern."""
+    from catopt_discovery import oracle as lvo
+
+    mvs = obs._mv_names(lhs, rhs)
+    nodes = [n for n in lvo._view_nodes([lhs, rhs]) if n.args]
+    views = []
+    out: list = []
+    for n in nodes:
+        u = n.args[0] if isinstance(n.args[0], str) else None
+        if u is None:
+            continue
+        spec = _view_out_spec(n.op, u, _str_attrs(n))
+        if spec is None:
+            continue
+        views.append((u, spec, n.op, _str_attrs(n)))
+    for u, su, op, attrs in views:
+        for v in mvs:
+            if v == u:
+                continue
+            suv = _view_out_spec(op, ("bcast", u, v), attrs)
+            if suv is None:
+                continue
+            out.append(("bcast-eq", su, v, suv, suv))
+            out.append(("shaped", ("bcast", u, v)))
+            k = _IDX_ATTR.get(op)
+            if k is not None and k in attrs:
+                out.append(("bcast-dim-inv", v, u, attrs[k]))
+            if op in ("transpose", "t") and "dim0" in attrs:
+                out.append(
+                    (
+                        "or",
+                        ("axes-noop", v, attrs["dim0"], attrs["dim1"]),
+                        ("rank", v, "<=", 1),
+                    )
+                )
+        for w, sw, op2, attrs2 in views:
+            if w == u or op2 != op or attrs2 != attrs:
+                continue
+            suw = _view_out_spec(op, ("bcast", u, w), attrs)
+            if suw is None:
+                continue
+            out.append(("bcast-eq", su, sw, suw, suw))
+            out.append(("shaped", ("bcast", u, w)))
+            k = _IDX_ATTR.get(op)
+            if k is not None and k in attrs:
+                out.append(("axis-align-eq", u, w, attrs[k]))
+    for n in nodes:
+        inner = n.args[0] if n.args else None
+        if not isinstance(inner, Op) or not inner.args:
+            continue
+        u = inner.args[0] if isinstance(inner.args[0], str) else None
+        if u is None:
+            continue
+        inner_spec = _view_out_spec(inner.op, u, _str_attrs(inner))
+        g1 = _view_out_spec(n.op, u, _str_attrs(n))
+        so = _view_out_spec(n.op, inner_spec, _str_attrs(n))
+        g2g1 = (
+            _view_out_spec(inner.op, g1, _str_attrs(inner))
+            if g1 is not None
+            else None
+        )
+        if so is not None and g2g1 is not None:
+            out.append(("shape-eq", so, g2g1))
+    return out
+
+
+def _install_view_commute_bank(monkeypatch) -> None:
+    """Extend ``obs._pred_bank`` with the view-commute vocabulary."""
+    stock = obs._pred_bank
+
+    def bank(lhs, rhs, envs):
+        return stock(lhs, rhs, envs) + _view_commute_preds(lhs, rhs)
+
+    monkeypatch.setattr(obs, "_pred_bank", bank)
+
+
+def _select_wrap_bare(name: str = "mul_select_l_w") -> Rewrite:
+    """The index-view wrap: ``mul(select(U), V) -> select(mul(U, V))``."""
+    return Rewrite(
+        name=name,
+        lhs=_p("mul", _p("select", "U", dim="A_dim", index="A_index"), "V"),
+        rhs=_p(
+            "select",
+            _p("mul", "U", "V"),
+            dim="A_dim",
+            index="A_index",
+        ),
+    )
+
+
+def test_view_commute_preds_name_the_wrap_guard() -> None:
+    """The generator emits the select-wrap commutation predicate."""
+    bare = _select_wrap_bare()
+    preds = _view_commute_preds(bare.lhs, bare.rhs)
+    assert ("bcast-dim-inv", "V", "U", "A_dim") in preds
+    assert (
+        "bcast-eq",
+        ("select-out", "U", "A_dim"),
+        "V",
+        ("select-out", ("bcast", "U", "V"), "A_dim"),
+        ("select-out", ("bcast", "U", "V"), "A_dim"),
+    ) in preds
+
+
+def test_auto_cond_extended_bank_admits_the_select_wrap(
+    monkeypatch,
+) -> None:
+    """The widened bank mints the guard the stock bank cannot declare.
+
+    The wrap form is equal iff the index view commutes with ``V``'s
+    broadcast; the stock bank has no predicate over a ``select``'s
+    output shape, so it refuses.  cond.py now carries ``select-out`` /
+    ``bcast-dim-inv``; the extended bank emits the commutation guard
+    and the constructor mints it — verified on its own sweep.
+    """
+    torch.manual_seed(0)
+    bare = _select_wrap_bare()
+    stock = obs.auto_cond_object(bare, synth_limit=360)
+    assert stock.object is None
+    assert stock.equal > 0 and stock.bad > 0
+    assert "no declarable conjunction" in stock.detail
+
+    _install_view_commute_bank(monkeypatch)
+    res = obs.auto_cond_object(bare, synth_limit=360)
+    assert res.object is not None
+    assert res.equal > 0 and res.bad > 0
+    assert res.object.kind == "abstraction"
+    # pure data — the found cond is the whole claim
+    assert missing_hooks(res.object.rule) == ()
+    assert "select-out" in repr(res.cond)
+    # the minted guard verifies on its own sweep: no bad site accepted
+    region = _accepted_region(res.object.rule)
+    assert region.equal > 0
+    assert region.unequal == 0
+    assert region.rhs_err == 0
