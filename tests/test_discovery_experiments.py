@@ -1147,11 +1147,16 @@ def test_swap_graft_lift_directly():
     lifted = wg._lift_leaf(term, st, rng)
     if lifted is not None:
         assert lifted is not term
-    # replace rebuilds with shared subterms elsewhere unchanged.
+    # replace rebuilds with the sibling subterm unchanged.  The
+    # untouched slot keeps its *value*; object identity is not a
+    # contract — ``Op.make`` interning is structural, so a term
+    # minted earlier in the process returns the interned object
+    # whose children are equal-but-distinct leaves.
     x = _v("x", 4, 4)
     t = _p("add", x, _v("y", 4, 4))
     rep = wg._replace(t, (0,), _v("z", 4, 4))
-    assert rep.args[0].name == "z" and rep.args[1] is t.args[1]
+    assert rep.args[0].name == "z"
+    assert rep.args[1] == t.args[1]
 
 
 def test_term_to_case():
