@@ -92,11 +92,35 @@ the shippable proxy) per call, for
 Sanity check: does the player rediscover ``select_mul``- or
 ``softmax``-shaped equalities in-budget?
 
+The guide seam (ADR 0004, plan 0017 stage 2)
+--------------------------------------------
+
+The construction player above is itself only one move-generator.
+ADR 0004 §3 makes this module's real role the *meta*-game: the
+policy does not pick rewrites, it picks **which generator invests
+compute where**.  The investable inventory is the pipeline's own
+proposal sources — census naturality, mixed-view naturality,
+pattern recognition, the shape-aware schemas, the algebraic grammar
+— plus ``"build"``, the construction player itself (one draw is one
+play).
+
+An action is an :class:`Allocation` — a generator name plus a draw
+count.  The currency is *proposals drawn*, each costing the shared
+:class:`Referee` at most one oracle call — the same unit the yield
+tables already count.  A :class:`Guide` reads a :class:`GuideObs` —
+per-arm tallies plus the evidence store's ``latest_verdicts`` rows
+(the observation source is the store, not a parallel accounting) —
+and returns the next allocation.  Three baselines ship:
+``EnumerationGuide`` (the pipeline's fixed order — the control
+arm), ``RandomGuide`` (uniform arm selection) and ``LearnedGuide``
+(the ``_PolicyNet`` + REINFORCE machinery, re-pointed at arms).
+
 Run::
 
     .venv/bin/python -m catopt_discovery.meta_game
     .venv/bin/python -m catopt_discovery.meta_game --episodes 600 --json /tmp/g.json
     .venv/bin/python -m catopt_discovery.meta_game --holdout select_mul
+    .venv/bin/python -m catopt_discovery.meta_game --guide --budget 80
 
 CPU-only, bounded to a few minutes.
 """
@@ -107,7 +131,8 @@ import argparse
 import json
 import math
 import random
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +145,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 # Sibling tools own the corpus, the oracles and the measurements.
+from catopt_discovery import evidence as ev_store
 from catopt_discovery import pipeline as lpl
 from catopt_discovery import proposal as lp
 from catopt_discovery.census import (
@@ -139,11 +165,23 @@ from catopt_discovery.shape_proposal import _sink
 from catopt_discovery.vocab import classify, corpus_ops
 
 __all__ = [
+    "Allocation",
+    "ArmStat",
     "BuildGame",
+    "EnumerationGuide",
+    "Guide",
+    "GuideArena",
+    "GuideObs",
+    "LearnedGuide",
+    "RandomGuide",
     "Referee",
     "Verdict",
+    "compare_guides",
     "eval_baseline",
+    "generator_pools",
     "main",
+    "run_guide",
+    "run_guide_experiment",
     "run_player",
     "train",
 ]
@@ -1317,6 +1355,708 @@ def eval_baseline(
 
 
 # ---------------------------------------------------------------------------
+#  The guide seam — which generator invests compute where
+# ---------------------------------------------------------------------------
+#
+#  ``eval_baseline`` is one fixed schedule over the generator
+#  inventory; the guide makes the schedule the action space.  An
+#  action is an ``Allocation`` — a generator name plus a draw count —
+#  and the currency is proposals drawn, each costing the shared
+#  ``Referee`` at most one oracle call.  A ``Guide`` reads a
+#  ``GuideObs`` and answers "which generator gets the next draws".
+#  It steers compute only: every draw still faces the same referee,
+#  so the guide can never mint semantics (ADR 0002 Rule 3).
+
+
+#: The generator inventory in its fixed enumeration order — the
+#: five ``pipeline.propose`` sources plus ``"build"`` (the
+#: construction player; one draw is one play).  Workload and gap
+#: generation are deliberately absent: those generators mutate the
+#: corpus mid-game, and a mutated corpus invalidates the evidence
+#: store's scope keys — a corpus-mutating action needs a re-scoped
+#: observation, not another queue.
+ENUMERATION_ORDER = (
+    "census-naturality",
+    "census-mixed-view",
+    "pattern-recognition",
+    "shape-aware",
+    "algebraic-grammar",
+    "build",
+)
+
+
+@dataclass(frozen=True)
+class Allocation:
+    """One guide move: draw up to ``n`` proposals from a generator."""
+
+    generator: str
+    n: int
+
+
+@dataclass
+class ArmStat:
+    """The running tally for one generator arm.
+
+    ``oracle_calls`` is the honest cost attribution — a proposal that
+    never reaches the referee (no instance, repeat, tautology) spent
+    a draw but no call.
+    """
+
+    emitted: int = 0
+    drawn: int = 0
+    oracle_calls: int = 0
+    true: int = 0
+    firing: int = 0
+    new_tf: int = 0
+    shippable: int = 0
+    best: float = 0.0
+
+
+@dataclass(frozen=True)
+class GuideObs:
+    """What a guide sees before each allocation.
+
+    ``verdicts`` is the evidence store's ``latest_verdicts`` for the
+    arena's scope — the observation source is the store itself, so a
+    guide reads exactly what a later audit would.  ``arms`` carries
+    the per-generator tallies (copies — an observation cannot mutate
+    the board).
+    """
+
+    round: int
+    spent: int
+    budget: int
+    emitted: dict[str, int]
+    remaining: dict[str, int]
+    arms: dict[str, ArmStat]
+    verdicts: dict[str, dict]
+
+
+def generator_pools(
+    census_op: dict, terms: list[Any], vocab: str = "derived"
+) -> dict[str, list[lpl.Proposal]]:
+    """Return the investable inventory: ``{arm: proposal queue}``.
+
+    The five ``pipeline.propose`` sources, one arm each, deduplicated
+    under ``propose``'s own merged-pool semantics — a candidate
+    reachable from two generators queues on the first — so the
+    enumeration arm replays ``propose``'s order exactly.
+    """
+    pointwise, views = lpl._vocab_sets(vocab)
+    pools: dict[str, list[lpl.Proposal]] = {
+        "census-naturality": lpl._census_naturality(
+            census_op, terms, pointwise, views
+        ),
+        "census-mixed-view": lpl._census_mixed_naturality(
+            census_op, terms, pointwise, views
+        ),
+        "pattern-recognition": lpl._pattern_recognition(census_op),
+        "shape-aware": lpl._shape_aware(),
+        "algebraic-grammar": lpl._grammar(),
+    }
+    seen: set = set()
+    for queue in pools.values():
+        kept: list[lpl.Proposal] = []
+        for p in queue:
+            key = lp._key(p.lhs, p.rhs)
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(p)
+        queue[:] = kept
+    return pools
+
+
+def _verdict_evidence(proposal: lpl.Proposal, v: Verdict) -> Any:
+    """Shape a referee ``Verdict`` as the pipeline's ``Evidence``.
+
+    ``evidence.verdict_row`` duck-types this record, so the guide's
+    store rows are the pipeline's own schema.  Fields the referee
+    does not measure — derivability, census sites, the reach sweep —
+    stay at their honest defaults; a stored ``SHIP`` therefore means
+    "cleared the referee's bar" and no more.
+    """
+    ev = lpl.Evidence(proposal=proposal)
+    ev.num_true = (
+        True if v.truth else (False if v.reason == "false" else None)
+    )
+    ev.matches = int(v.instance)
+    ev.relation = v.relation or "new"
+    ev.fires = v.fires
+    ev.changed = v.changed
+    ev.paid = v.paid
+    ev.verify_fail = v.verify_fail
+    ev.cost_drop = v.rel_drop
+    return ev
+
+
+class GuideArena:
+    """The board the guide plays on: generator queues + referee.
+
+    ``invest`` draws up to ``n`` proposals from an arm and referees
+    each through the shared :class:`Referee`; adjudicated verdicts
+    (never dedup artifacts) are written to the evidence store via
+    ``record_run``, and :meth:`observation` reads them back through
+    ``latest_verdicts``.  ``game``/``model`` arm the ``"build"``
+    generator — one draw is one ``_play_once`` — and ``plays_cap``
+    bounds its queue.
+    """
+
+    def __init__(
+        self,
+        pools: dict[str, list[lpl.Proposal]],
+        referee: Referee,
+        *,
+        game: BuildGame | None = None,
+        model: nn.Module | None = None,
+        prior: bool = True,
+        seed_frac: float = 0.55,
+        plays_cap: int = 60,
+        conn: Any = None,
+        meta: dict[str, str] | None = None,
+    ) -> None:
+        """Bind the inventory, the referee and the evidence scope."""
+        self.pools = {k: list(v) for k, v in pools.items()}
+        self.ref = referee
+        self.game = game
+        self.model = model
+        self.prior = prior
+        self.seed_frac = seed_frac
+        self.plays_left = plays_cap if game is not None else 0
+        self.pos = {k: 0 for k in pools}
+        self.spent = 0
+        self.rounds = 0
+        self.arms = {
+            k: ArmStat(emitted=len(v)) for k, v in pools.items()
+        }
+        if game is not None:
+            self.arms["build"] = ArmStat(emitted=plays_cap)
+        self.conn = (
+            conn if conn is not None else ev_store.connect(":memory:")
+        )
+        if meta is None:
+            meta = {
+                "corpus_hash": ev_store.corpus_hash(
+                    op_repr(t) for t in referee.terms
+                ),
+                "rules_hash": ev_store.rules_hash(
+                    repr(k) for k in referee.lib
+                ),
+                "code_rev": ev_store.code_rev(),
+                "run_id": ev_store.new_run_id(),
+                "holdout": "",
+                "ts": ev_store.now(),
+            }
+        self.meta = meta
+        self.first_true_at: int | None = None
+        self.first_ship_at: int | None = None
+        self.best: Verdict | None = None
+        self.best_arm = ""
+
+    def _remaining(self, name: str) -> int:
+        """Return the arm's undrawn queue length."""
+        if name == "build":
+            return self.plays_left
+        return len(self.pools[name]) - self.pos[name]
+
+    def observation(self, budget: int) -> GuideObs:
+        """Return the current observation for a guide."""
+        verdicts = ev_store.latest_verdicts(
+            self.conn,
+            self.meta["corpus_hash"],
+            self.meta["rules_hash"],
+            self.meta["code_rev"],
+        )
+        return GuideObs(
+            round=self.rounds,
+            spent=self.spent,
+            budget=budget,
+            emitted={k: s.emitted for k, s in self.arms.items()},
+            remaining={k: self._remaining(k) for k in self.arms},
+            arms={k: replace(s) for k, s in self.arms.items()},
+            verdicts=verdicts,
+        )
+
+    def invest(self, alloc: Allocation) -> list[Verdict]:
+        """Draw and referee up to ``alloc.n`` proposals from the arm."""
+        if alloc.generator not in self.arms:
+            raise KeyError(f"unknown generator {alloc.generator!r}")
+        out: list[Verdict] = []
+        while (
+            len(out) < alloc.n and self._remaining(alloc.generator) > 0
+        ):
+            self.spent += 1
+            if alloc.generator == "build":
+                out.append(self._draw_build())
+            else:
+                p = self.pools[alloc.generator][
+                    self.pos[alloc.generator]
+                ]
+                self.pos[alloc.generator] += 1
+                out.append(self._draw_proposal(alloc.generator, p))
+        self.rounds += 1
+        return out
+
+    def _draw_proposal(self, arm: str, p: lpl.Proposal) -> Verdict:
+        """Referee one queued proposal and account for it."""
+        before = self.ref.oracle_calls
+        v = self.ref.evaluate(
+            p.lhs,
+            p.rhs,
+            p.check,
+            p.derive,
+            name=p.name,
+            instance=p.instance,
+        )
+        self._account(
+            arm,
+            v,
+            p.lhs,
+            p.rhs,
+            proposal=p,
+            calls=self.ref.oracle_calls - before,
+        )
+        return v
+
+    def _draw_build(self) -> Verdict:
+        """Play one construction and account for it."""
+        g = self.game
+        if g is None:
+            # unreachable — the "build" arm exists only when a game
+            # was bound — but never silently.
+            raise RuntimeError("build arm drawn with no game")
+        seeds = g.v.seeds
+        seed = (
+            g.rng.choices(
+                seeds, weights=[math.log1p(n) for _, n in seeds], k=1
+            )[0][0]
+            if seeds and g.rng.random() < self.seed_frac
+            else None
+        )
+        g.reset(_clone(seed), _seed_name(seed))
+        before = self.ref.oracle_calls
+        v, _ = _play_once(
+            g, self.ref, self.model, g.rng, prior=self.prior
+        )
+        self.plays_left -= 1
+        cand = g.candidate()
+        lhs, rhs = cand[:2] if cand is not None else (None, None)
+        self._account(
+            "build",
+            v,
+            lhs,
+            rhs,
+            calls=self.ref.oracle_calls - before,
+        )
+        return v
+
+    def _account(
+        self,
+        arm: str,
+        v: Verdict,
+        lhs: Any,
+        rhs: Any,
+        *,
+        proposal: lpl.Proposal | None = None,
+        calls: int = 0,
+    ) -> None:
+        """Tally one draw and record its verdict to the store."""
+        st = self.arms[arm]
+        st.drawn += 1
+        st.oracle_calls += calls
+        ship = (
+            v.truth
+            and v.relation == "new"
+            and v.fires > 0
+            and v.paid > 0
+            and v.verify_fail == 0
+        )
+        if v.truth:
+            st.true += 1
+            if self.first_true_at is None:
+                self.first_true_at = self.spent
+        if v.fires:
+            st.firing += 1
+        if v.truth and v.fires and v.relation == "new":
+            st.new_tf += 1
+        if ship:
+            st.shippable += 1
+            if self.first_ship_at is None:
+                self.first_ship_at = self.spent
+        if v.score > st.best:
+            st.best = v.score
+        if self.best is None or v.score > self.best.score:
+            self.best = v
+            self.best_arm = arm
+        if lhs is None or rhs is None:
+            return  # mint-error — nothing was adjudicated
+        key = lp._key(lhs, rhs)
+        if self.ref.by_key.get(key) is not v:
+            return  # tautology/repeat — a dedup artifact, not evidence
+        if proposal is None:
+            proposal = lpl.Proposal(
+                name=v.name,
+                lhs=lhs,
+                rhs=rhs,
+                family=arm,
+                sources=(arm,),
+            )
+        row = ev_store.verdict_row(
+            repr(key),
+            _verdict_evidence(proposal, v),
+            v.lhs_repr,
+            v.rhs_repr,
+        )
+        ev_store.record_run(self.conn, self.meta, [row])
+
+    def summary(self, budget: int = 0) -> dict:
+        """Aggregate the run: yields, per-arm tallies, the best find."""
+        return {
+            "draws": self.spent,
+            "rounds": self.rounds,
+            "budget": budget,
+            "oracle_calls": self.ref.oracle_calls,
+            "probes": self.ref.probes,
+            "arms": {
+                k: {
+                    "emitted": s.emitted,
+                    "drawn": s.drawn,
+                    "oracle_calls": s.oracle_calls,
+                    "true": s.true,
+                    "firing": s.firing,
+                    "new_tf": s.new_tf,
+                    "shippable": s.shippable,
+                    "best": s.best,
+                }
+                for k, s in self.arms.items()
+            },
+            "referee": self.ref.summary(),
+            "best": (
+                {
+                    "name": self.best.name,
+                    "score": self.best.score,
+                    "generator": self.best_arm,
+                    "lhs": self.best.lhs_repr,
+                    "rhs": self.best.rhs_repr,
+                }
+                if self.best is not None
+                else None
+            ),
+            "first_true_at": self.first_true_at,
+            "first_ship_at": self.first_ship_at,
+        }
+
+
+# ---------------------------------------------------------------------------
+#  Guides — policies over the arm inventory
+# ---------------------------------------------------------------------------
+
+
+class Guide:
+    """A policy over generator arms — the guide, never the referee.
+
+    ``choose`` reads the observation and returns the next
+    :class:`Allocation` (``None`` ends the game); ``update`` is the
+    learning hook, called with the allocation's payoff after each
+    invest.  The guide never sees a candidate before the referee
+    does — it steers compute, not semantics.
+    """
+
+    def choose(self, obs: GuideObs) -> Allocation | None:
+        """Return the next allocation; ``None`` ends the game."""
+        raise NotImplementedError
+
+    def update(self, reward: float, verdicts: list[Verdict]) -> None:
+        """Observe the payoff of the last allocation."""
+
+
+class EnumerationGuide(Guide):
+    """The control arm — the pipeline's fixed generator order."""
+
+    def __init__(
+        self,
+        order: Iterable[str] = ENUMERATION_ORDER,
+        step: int = 8,
+    ) -> None:
+        """Bind the drain order and the per-allocation draw count."""
+        self.order = tuple(order)
+        self.step = step
+
+    def choose(self, obs: GuideObs) -> Allocation | None:
+        """Return the next non-drained arm in fixed order."""
+        for name in self.order:
+            if obs.remaining.get(name, 0) > 0:
+                return Allocation(name, self.step)
+        return None
+
+
+class RandomGuide(Guide):
+    """Uniform arm selection — the no-knowledge control."""
+
+    def __init__(self, rng: random.Random, step: int = 8) -> None:
+        """Bind the RNG and the per-allocation draw count."""
+        self.rng = rng
+        self.step = step
+
+    def choose(self, obs: GuideObs) -> Allocation | None:
+        """Return a uniform pick among arms with draws left."""
+        live = [k for k, r in obs.remaining.items() if r > 0]
+        if not live:
+            return None
+        return Allocation(self.rng.choice(live), self.step)
+
+
+class LearnedGuide(Guide):
+    """A learned arm policy — ``_PolicyNet`` re-pointed at arms.
+
+    The same ``(state ⊕ action) -> logit`` net the construction
+    player uses: each live arm is featurized from the observation, a
+    ``Categorical`` samples the investment, and ``update`` applies
+    the REINFORCE step with the same running-mean baseline ``train``
+    uses.  The reward is the batch's mean verdict score — the guide
+    inherits the referee's own currency.
+    """
+
+    _SDIM = 6
+    _ADIM = 7
+
+    def __init__(
+        self,
+        step: int = 8,
+        hidden: int = 16,
+        lr: float = 3e-3,
+    ) -> None:
+        """Build the arm-scoring net and the optimizer."""
+        self.step = step
+        self.net = _PolicyNet(self._SDIM, self._ADIM, hidden)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.baseline = 0.0
+        self._logp: torch.Tensor | None = None
+
+    def _state_vec(self, obs: GuideObs) -> list[float]:
+        """Featurize the board: budget spent, queues left, progress."""
+        total = max(sum(obs.emitted.values()), 1)
+        drained = sum(1 for r in obs.remaining.values() if r == 0)
+        best = max((s.best for s in obs.arms.values()), default=0.0)
+        return [
+            1.0,
+            obs.spent / max(obs.budget, 1),
+            sum(obs.remaining.values()) / total,
+            drained / max(len(obs.arms), 1),
+            best / 10.0,
+            sum(s.true for s in obs.arms.values()) / 10.0,
+        ]
+
+    def _arm_vec(self, obs: GuideObs, name: str) -> list[float]:
+        """Featurize one arm: exhaustion, hit rates, best score."""
+        s = obs.arms[name]
+        emitted = max(obs.emitted.get(name, 0), 1)
+        drawn = max(s.drawn, 1)
+        return [
+            1.0,
+            s.drawn / emitted,
+            obs.remaining.get(name, 0) / emitted,
+            s.true / drawn,
+            s.firing / drawn,
+            s.best / 10.0,
+            1.0 if name == "build" else 0.0,
+        ]
+
+    def choose(self, obs: GuideObs) -> Allocation | None:
+        """Sample an arm from the policy over live arms."""
+        live = [k for k, r in obs.remaining.items() if r > 0]
+        if not live:
+            return None
+        sv = torch.tensor(self._state_vec(obs), dtype=torch.float32)
+        av = torch.tensor(
+            [self._arm_vec(obs, k) for k in live],
+            dtype=torch.float32,
+        )
+        dist = Categorical(logits=self.net(sv, av))
+        a = dist.sample()
+        self._logp = dist.log_prob(a)
+        return Allocation(live[int(a.item())], self.step)
+
+    def update(self, reward: float, verdicts: list[Verdict]) -> None:
+        """REINFORCE step on the last allocation's log-prob."""
+        if self._logp is None:
+            return
+        adv = reward - self.baseline
+        self.baseline = 0.95 * self.baseline + 0.05 * reward
+        loss = -(self._logp * adv)
+        self.opt.zero_grad()
+        loss.backward()
+        self.opt.step()
+        self._logp = None
+
+
+def run_guide(arena: GuideArena, guide: Guide, budget: int) -> dict:
+    """Play the guide game until *budget* proposals are drawn.
+
+    Each round the guide allocates ``(generator, n)``; the arena
+    draws and referees them; the guide observes the mean verdict
+    score as reward.  The game ends when the budget is spent, the
+    guide stops (``None``), or it allocates to a drained arm.
+    """
+    while arena.spent < budget:
+        alloc = guide.choose(arena.observation(budget))
+        if alloc is None:
+            break
+        n = min(alloc.n, budget - arena.spent)
+        verdicts = arena.invest(Allocation(alloc.generator, n))
+        if not verdicts:
+            break
+        reward = sum(v.score for v in verdicts) / len(verdicts)
+        guide.update(reward, verdicts)
+    return arena.summary(budget)
+
+
+def compare_guides(
+    make_arena: Callable[[], GuideArena],
+    guides: Mapping[str, Callable[[], Guide]],
+    budget: int,
+) -> dict:
+    """Run each guide factory on a fresh arena; return the summaries.
+
+    ``make_arena`` must rebuild the referee as well as the board —
+    dedup state is per-run — while the proposal queues themselves
+    are shared (they are read-only).  ``guides`` maps a label to a
+    *factory*, so every arm plays a fresh policy.
+    """
+    return {
+        label: run_guide(make_arena(), make(), budget)
+        for label, make in guides.items()
+    }
+
+
+def run_guide_experiment(args: argparse.Namespace) -> dict:
+    """Run guide-vs-enumeration over the real corpus slice.
+
+    The bounded task: within ``args.budget`` total proposals drawn
+    from the generator inventory, how much does each allocation
+    policy find — and does any beat the fixed enumeration?  The
+    ``build`` arm is the construction player (uniform, or trained
+    for ``--guide-train`` episodes first — the existing ``train``
+    loop, no new trainer).
+    """
+    torch.manual_seed(args.seed)
+    rng = random.Random(args.seed)
+
+    bench, _be = _bench_cases()
+    models, _me = model_cases()
+    cts = [
+        CorpusTerm(c.source, c.name, c.term) for c in [*bench, *models]
+    ]
+    counts, _tc = op_tuple_census(cts)
+    sh_counts, _st = shape_census(cts)
+    all_terms = [c.term for c in [*bench, *models]]
+    census_op = {k: v for k, v in counts.items()}
+
+    cases = _slice_cases(bench, models)
+    slice_terms = [c.term for c in cases]
+    pools = generator_pools(census_op, all_terms, args.vocab)
+    vocab = build_vocab(all_terms, counts, sh_counts, args.top_seeds)
+
+    sink = _sink()
+    cost_fn = _cost_fn(sink)
+    lib = [lp._key(r.lhs, r.rhs) for r in _search_rules(args.holdout)]
+
+    build_model = None
+    if args.guide_train:
+        tgame = BuildGame(vocab, rng)
+        tref = Referee(slice_terms, cases, sink, cost_fn, lib)
+        build_model, _hist = train(
+            tgame,
+            tref,
+            args.guide_train,
+            hidden=args.hidden,
+            lr=args.lr,
+            seed_frac=args.seed_frac,
+            log_every=0,
+        )
+
+    def make_arena() -> GuideArena:
+        ref = Referee(slice_terms, cases, sink, cost_fn, lib)
+        game = (
+            BuildGame(vocab, random.Random(args.seed))
+            if args.guide_build
+            else None
+        )
+        return GuideArena(
+            pools,
+            ref,
+            game=game,
+            model=build_model,
+            seed_frac=args.seed_frac,
+            plays_cap=args.plays_cap,
+        )
+
+    guides = {
+        "enumeration": lambda: EnumerationGuide(step=args.guide_step),
+        "uniform": lambda: RandomGuide(
+            random.Random(args.seed), step=args.guide_step
+        ),
+        "learned": lambda: LearnedGuide(step=args.guide_step),
+    }
+    results = compare_guides(make_arena, guides, args.budget)
+    enum_tf = results["enumeration"]["referee"]["yield_tf_per_call"]
+    ratios = {
+        label: (
+            s["referee"]["yield_tf_per_call"] / enum_tf
+            if enum_tf
+            else None
+        )
+        for label, s in results.items()
+    }
+    return {
+        "args": vars(args),
+        "pools": {k: len(v) for k, v in pools.items()},
+        "results": results,
+        "yield_tf_ratio_vs_enumeration": ratios,
+    }
+
+
+def _print_guide_report(result: dict) -> None:
+    """Print the guide comparison table."""
+    print("== guide seam — which generator invests compute where ==")
+    print(
+        "   pool: "
+        + ", ".join(f"{k}={n}" for k, n in result["pools"].items())
+    )
+    for label, s in result["results"].items():
+        r = s["referee"]
+        ratio = result["yield_tf_ratio_vs_enumeration"][label]
+        line = (
+            f"  {label:<12} draws={s['draws']:>4} "
+            f"calls={s['oracle_calls']:>4} true={r['true']:>3} "
+            f"tf={r['true_firing']:>3} new_tf={r['new_true_firing']:>3} "
+            f"ship~={r['shippable']:>2} "
+            f"yield_tf={r['yield_tf_per_call']:.3f}"
+        )
+        if ratio is not None:
+            line += f" ({ratio:.2f}x enum)"
+        print(line)
+        arms = ", ".join(
+            f"{k}:{a['drawn']}d/{a['true']}t"
+            for k, a in s["arms"].items()
+            if a["drawn"]
+        )
+        if arms:
+            print(f"      arms: {arms}")
+        best = s["best"]
+        if best is not None:
+            print(
+                f"      best {best['score']:.2f} "
+                f"[{best['generator']}] "
+                f"{best['lhs']} -> {best['rhs']}"
+            )
+        if s["first_ship_at"] is not None:
+            print(f"      first shippable at draw {s['first_ship_at']}")
+        elif s["first_true_at"] is not None:
+            print(f"      first true at draw {s['first_true_at']}")
+
+
+# ---------------------------------------------------------------------------
 #  Driver
 # ---------------------------------------------------------------------------
 
@@ -1563,6 +2303,29 @@ def _dump_json(path: str, result: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Run the game vs the enumerative baseline; print the yields."""
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--guide",
+        action="store_true",
+        help="run the guide-seam comparison instead of the player game",
+    )
+    p.add_argument(
+        "--guide-step",
+        type=int,
+        default=8,
+        help="proposals per guide allocation",
+    )
+    p.add_argument(
+        "--guide-build",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="include the construction player as a 'build' arm",
+    )
+    p.add_argument(
+        "--guide-train",
+        type=int,
+        default=0,
+        help="episodes to pre-train the build arm's player policy",
+    )
     p.add_argument("--episodes", type=int, default=600)
     p.add_argument(
         "--budget",
@@ -1610,6 +2373,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--json", help="write machine-readable results")
     args = p.parse_args(argv)
+
+    if args.guide:
+        r = run_guide_experiment(args)
+        _print_guide_report(r)
+        if args.json:
+            _dump_json(args.json, r)
+            print(f"\nwrote {args.json}")
+        return 0
 
     r = run_experiment(args)
 
