@@ -453,6 +453,14 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             ):  # pragma: no cover — dispatch filters None shapes
                 return None
             d = attr_of(op, "dim", default=-1)
+            if not isinstance(d, int):
+                # A law pattern binds ``dim`` as an attr metavariable
+                # (``Op.make("unsqueeze", u, dim="UDk")``) — until
+                # instantiation the axis is the *string* metavar name,
+                # not a ``d % (rank+1)`` operand.  The shape is simply
+                # unknown, so decline (the contract's unprovable→None),
+                # never raise (``str % tuple`` is a TypeError).
+                return None
             d = d % (len(base) + 1)
             return (*tuple(base[:d]), 1, *tuple(base[d:]))
         case "squeeze":

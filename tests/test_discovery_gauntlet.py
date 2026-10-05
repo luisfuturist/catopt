@@ -925,19 +925,55 @@ def test_region_detail_reports_the_env_cost():
 #
 #  The hole: the truth gate was ``derivable or (region checks)``, so a
 #  rule the saturation *derived* passed without a clean region sweep.
-#  ``channel_then_row`` (compose of two shipped premises) is derivable
-#  yet inherits ``linear_row_scale``'s blind spot — a measured
-#  ``unequal`` site.  The fix: the measured site blocks regardless of
-#  derivability; ``derivable`` may only waive the *starvation* case
-#  (no equal site measured).
+#  The fix: the measured site blocks regardless of derivability;
+#  ``derivable`` may only waive the *starvation* case (no equal site
+#  measured).
+#
+#  The gate's logic is pinned on *purpose-built* unclean guards — the
+#  pre-tightening guards the derivable-gate audit's fixes replaced (see
+#  ``project/retros/shipped-guard-tightening.md``).  A deliberately
+#  loose guard keeps the pin independent of the shipped library's
+#  regions: the seven laws the audit found unclean are now clean, so
+#  the gate must be shown to bite on a guard that still accepts a
+#  counterexample.
+
+
+#: The pre-tightening ``linear_row_scale`` guard (before the
+#: ``bcast-into`` clause): accepts ``W=(1,)``, ``r=(1,)``, ``x=(1,)`` —
+#: a binding where the two sides differ (the law mis-evaluates a rank-1
+#: degenerate output scale).
+_LOOSE_ROW_SCALE = Rewrite(
+    name="loose_row_scale",
+    lhs=_p("linear", _p("mul", "x", "r"), "W"),
+    rhs=_p("mul", _p("linear", "x", "W"), "r"),
+    cond=("or", ("scalar", "r"), ("dim-eq-const", "r", -1, 1)),
+)
+
+
+#: The pre-tightening ``select_mul`` guard (before the ``bcast``
+#: clause): accepts ``u=(2,3)``, ``v=(2,3,1)``, ``D=0`` — a binding
+#: whose ``mul(u,v)`` RHS cannot denote (rhs-err).
+_LOOSE_SELECT_MUL = Rewrite(
+    name="loose_select_mul",
+    lhs=_p(
+        "mul",
+        _p("select", "u", dim="D", index="I"),
+        _p("select", "v", dim="D", index="I"),
+    ),
+    rhs=_p("select", _p("mul", "u", "v"), dim="D", index="I"),
+    cond=("dim-eq-attr", "u", "D", "v", "D"),
+)
 
 
 def _channel_then_row() -> synth.ConstructedObject:
     """``compose(linear_channel_scale_rev, linear_row_scale)``.
 
     Derivable (both premises are shipped), fully declarative (pure
-    data) — and unclean: the transported guard inherits
-    ``linear_row_scale``'s rank-1 blind spot.
+    data).  Its guard is the premises' conjunction, so the audit's
+    guard tightening propagated to it: the composite that once
+    inherited ``linear_row_scale``'s rank-1 blind spot now sweeps
+    clean — see
+    :func:`test_tightened_premise_cures_the_composite`.
     """
     obj = synth.compose_objects(
         "channel_then_row_scale",
@@ -946,6 +982,19 @@ def _channel_then_row() -> synth.ConstructedObject:
     )
     assert obj is not None
     return obj
+
+
+def test_tightened_premise_cures_the_composite():
+    """Tightening ``linear_row_scale``'s guard cured the composite that
+    inherited its blind spot: ``channel_then_row``'s guarded region now
+    sweeps clean (0 unequal / 0 rhs-err), where the derivable-gate audit
+    measured 1 unequal."""
+    rule = _channel_then_row().rule
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=400)
+    )
+    assert region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
 
 
 def _stub_evidence(*, derivable: bool, num_true=None) -> object:
@@ -960,27 +1009,20 @@ def _stub_evidence(*, derivable: bool, num_true=None) -> object:
     )
 
 
-def test_derivation_does_not_override_a_measured_counterexample(
-    tmp_path,
-):
-    """The channel_then_row composite is derivable — and refused.
+def test_derivation_does_not_override_a_measured_counterexample():
+    """A derivable rule whose guard-accepted region carries a measured
+    ``unequal`` site is refused, and the override is visible in the
+    gate detail.
 
-    Its guard-accepted region carries one ``unequal`` site (the
-    inherited premise blind spot), so the truth gate blocks on the
-    measured counterexample even though ``derivable`` is True.
+    The unclean guard is purpose-built (the pre-tightening
+    ``linear_row_scale`` guard), so the pin survives the shipped
+    library's regions changing.
     """
-    conn = ev.connect(str(tmp_path / "s.db"))
-    key = synth.store_constructed(conn, _channel_then_row())
-    x, w = _v("x", 2, 4), _v("W", 3, 4)
-    term = _p("linear", x, _p("mul", w, Const(2.0)))
-    rep = ev.run_gauntlet(
-        conn, key, corpus=_corpus(_case("chrev", term, x, w))
+    rep = ev.Gauntlet(
+        alpha_key="k", evidence=_stub_evidence(derivable=True)
     )
-    conn.close()
-    assert not rep.usable
-    assert rep.reason.startswith("truth:")
-    assert rep.evidence.derivable
-    # measured 1 at the 360-site window; the count rides the bank, the
+    assert not ev._truth_gate(rep, _LOOSE_ROW_SCALE, _corpus(), None)
+    # measured 3 at the 360-site window; the count rides the bank, the
     # *presence* of the counterexample is the pin.
     assert rep.synth_region.unequal >= 1
     assert "derivation overridden" in _stages(rep)["truth"].detail
@@ -1029,26 +1071,22 @@ def test_derivable_waives_only_the_starvation_requirement():
 def test_derivation_cannot_override_a_measured_rhs_err():
     """``rhs_err`` — an accepted binding whose minted RHS cannot
     denote — is a measured counterexample too: derivability does not
-    waive it (``linear_channel_scale`` carries 16)."""
+    waive it.  (Purpose-built unclean guard.)"""
     rep = ev.Gauntlet(
         alpha_key="k", evidence=_stub_evidence(derivable=True)
     )
-    assert not ev._truth_gate(
-        rep, _BY_NAME["linear_channel_scale"], _corpus(), None
-    )
+    assert not ev._truth_gate(rep, _LOOSE_SELECT_MUL, _corpus(), None)
     assert rep.synth_region.rhs_err > 0
 
 
 def test_derivation_cannot_override_an_unequal_site():
     """``unequal`` (the two sides differ on an accepted binding)
-    blocks regardless of derivability (``linear_row_scale`` carries
-    3)."""
+    blocks regardless of derivability.  (Purpose-built unclean
+    guard.)"""
     rep = ev.Gauntlet(
         alpha_key="k", evidence=_stub_evidence(derivable=True)
     )
-    assert not ev._truth_gate(
-        rep, _BY_NAME["linear_row_scale"], _corpus(), None
-    )
+    assert not ev._truth_gate(rep, _LOOSE_ROW_SCALE, _corpus(), None)
     assert rep.synth_region.unequal > 0
 
 

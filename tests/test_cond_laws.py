@@ -45,9 +45,16 @@ from catopt_core.laws.cond import (
     eval_cond,
 )
 from catopt_core.laws.tensor import (
+    DISTRIBUTE_MUL,
     FACTOR_MUL,
+    LINEAR_CHANNEL_SCALE,
+    LINEAR_ROW_SCALE,
+    LINEAR_ROW_SCALE_REV,
     SOFTMAX_FOLD,
+    WEIGHT_DISTRIBUTE,
+    WEIGHT_DISTRIBUTE_LINEAR,
     WEIGHT_FACTOR,
+    WEIGHT_FACTOR_LINEAR,
     _check_sum_keepdim,
 )
 from catopt_core.rulecache import ruleset_fingerprint
@@ -897,6 +904,68 @@ def test_weight_factor_cond_verdicts():
     assert not WEIGHT_FACTOR.check({"W": vec[0], "W2": vec[1]})
     assert not WEIGHT_FACTOR.check({"W": scalar[0], "W2": scalar[1]})
     assert not WEIGHT_FACTOR.check({"W": w})  # unshaped W2 declines
+
+
+def test_mm_addends_rank_equal_requires_shape_eq():
+    """Equal rank does not align the addends: two rank-1 addends that
+    broadcast (``a=(1,)``, ``b=(4,)``) mint a RHS whose ``matmul(W, a)``
+    / ``matmul(W, b)`` cannot both contract — the derivable-gate audit's
+    rhs-err fix (``shape-eq`` on the rank-equal branch)."""
+    good = {"W": _v("W", 4), "a": _v("a", 4), "b": _v("b", 4)}
+    bad = {"W": _v("W", 4), "a": _v("a", 1), "b": _v("b", 4)}
+    assert DISTRIBUTE_MUL.check(good)
+    assert not DISTRIBUTE_MUL.check(bad)
+    assert not FACTOR_MUL.check(bad)
+    # rank>=2 differing extents stay covered by the second branch.
+    batched = {"W": _p("W", 4, 3), "a": _v("a", 3, 5), "b": _v("b", 1, 5)}
+    assert DISTRIBUTE_MUL.check(batched)
+
+
+def test_mm_weights_rank_equal_requires_shape_eq():
+    """The summed weights: two rank-1 weights of different extent
+    broadcast but the minted ``linear``/``matmul`` RHS cannot denote —
+    the audit's rhs-err fix, on the shared weight guard."""
+    good = {"x": _v("x", 4), "W": _v("W", 4), "W2": _v("W2", 4)}
+    bad = {"x": _v("x", 4), "W": _v("W", 1), "W2": _v("W2", 4)}
+    assert WEIGHT_FACTOR.check(good)
+    for rule in (
+        WEIGHT_FACTOR,
+        WEIGHT_DISTRIBUTE,
+        WEIGHT_FACTOR_LINEAR,
+        WEIGHT_DISTRIBUTE_LINEAR,
+    ):
+        assert not rule.check(bad), rule.name
+
+
+def test_linear_channel_scale_requires_linear_well_typed():
+    """The channel fold is a value identity only where ``F.linear(x,
+    W)`` denotes: a scalar ``x`` or a rank-1 ``W`` disagreeing with
+    ``x``'s in-feature axis mints an ill-typed RHS — the audit's
+    rhs-err fix."""
+    good = {"x": _v("x", 2, 3), "c": _v("c", 3), "W": _p("W", 4, 3)}
+    assert LINEAR_CHANNEL_SCALE.check(good)
+    scalar_x = {"x": _v("x"), "c": _v("c", 4), "W": _p("W", 4)}
+    assert not LINEAR_CHANNEL_SCALE.check(scalar_x)
+    mismatch = {"x": _v("x", 1), "c": _v("c", 4), "W": _p("W", 4)}
+    assert not LINEAR_CHANNEL_SCALE.check(mismatch)
+
+
+def test_linear_row_scale_requires_r_broadcasts_into_output():
+    """The row scale must broadcast INTO ``linear(x, W)``'s output
+    without adding axes: a rank-1 ``r=(1,)`` against a scalar output
+    grows ``mul(linear(x,W), r)`` by an axis — the audit's unequal
+    fix."""
+    good = {
+        "x": _v("x", 2, 2, 3),
+        "r": _v("r", 2, 2, 1),
+        "W": _p("W", 4, 3),
+    }
+    assert LINEAR_ROW_SCALE.check(good)
+    assert LINEAR_ROW_SCALE_REV.check(good)
+    # r=(1,) against a scalar output: mul(out, r) gains an axis.
+    bad = {"x": _v("x", 1), "r": _v("r", 1), "W": _p("W", 1)}
+    assert not LINEAR_ROW_SCALE.check(bad)
+    assert not LINEAR_ROW_SCALE_REV.check(bad)
 
 
 # ---------------------------------------------------------------------------

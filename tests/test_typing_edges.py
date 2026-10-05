@@ -157,6 +157,15 @@ SHAPE_CASES = [
         (1,),
         id="unsqueeze/scalar-to-vector",
     ),
+    # A law pattern's attr metavariable bound as a string (an
+    # uninstantiated ``dim="UDk"``): the axis is unknown, so the shape
+    # declines — never ``str % tuple`` (the ``gqa_absorb_repeat`` sweep
+    # crash, ``typing._infer_op_shape``).
+    pytest.param(
+        Op.make("unsqueeze", x234, dim="UDk"),
+        None,
+        id="unsqueeze/str-attr-metavar-declines",
+    ),
     # --- getitem / select / unbind ------------------------------------
     pytest.param(
         Op.make(

@@ -264,6 +264,13 @@ SILU_FOLD = R(
 # real sites all happened to have agreeing D-dims, so it never bit).
 # The cond requires shape(u)[D] == shape(v)[D]; broadcasting on other
 # axes is safe (both sides broadcast identically after selection).
+# It ALSO requires u and v to broadcast at all: the RHS is
+# sel(mul(u,v), D, I), and when u/v disagree off the selected axis
+# `mul(u,v)` is ill-typed and the minted RHS cannot denote (the
+# derivable-gate audit caught 8 such rhs-err sites — e.g. u=(2,3),
+# v=(2,3,1) with D=0, where u[D]==v[D] holds but u⊙v does not
+# broadcast).  `("shaped", ("bcast", u, v))` is exactly "mul(u,v)
+# denotes".
 SELECT_MUL = R(
     "select_mul",
     Op.make(
@@ -276,7 +283,11 @@ SELECT_MUL = R(
     "elementwise product of two slices is the slice of the product "
     "(naturality of the elementwise action over the select view).  "
     "Removes one dispatched op per site.",
-    cond=("dim-eq-attr", "u", "D", "v", "D"),
+    cond=(
+        "and",
+        ("dim-eq-attr", "u", "D", "v", "D"),
+        ("shaped", ("bcast", "u", "v")),
+    ),
     tags=_SIM,
 )
 
@@ -650,18 +661,40 @@ RECIP_SQRT_TO_RSQRT = R(
 #: binding of that shape.  Scalar addends can never feed matmul, and
 #: an unshaped member cannot prove alignment — every rank op declines
 #: it (the same strict posture as layout's axes predicates).
+#:
+#: The rank-equal branch additionally requires ``shape-eq(a, b)``:
+#: equal rank does NOT mean equal extents, and two rank-1 addends
+#: that broadcast (``a=(1,)``, ``b=(4,)``) still mint a RHS whose
+#: ``matmul(W, a)``/``matmul(W, b)`` cannot both contract — 4
+#: rhs-err sites the old ``rank-eq``-only guard accepted (the
+#: derivable-gate audit).  Rank>=2 differing extents stay covered by
+#: the second branch.
 _COND_MM_ADDENDS = (
     "or",
-    ("and", ("rank-eq", "a", "b"), ("rank", "a", ">=", 1)),
+    (
+        "and",
+        ("rank-eq", "a", "b"),
+        ("rank", "a", ">=", 1),
+        ("shape-eq", "a", "b"),
+    ),
     ("and", ("rank", "a", ">=", 2), ("rank", "b", ">=", 2)),
 )
 
 #: The same alignment on the summed weights ``W``/``W2`` — applied to
 #: the ``linear`` spellings too (mathematically safe there, but a
 #: rank-mixed weight sum mints a member ``F.linear`` cannot lower).
+#: As above, the rank-equal branch also demands ``shape-eq(W, W2)``:
+#: two rank-1 weights of different extent broadcast but the minted
+#: ``linear(x,W)+linear(x,W2)`` cannot denote (4 rhs-err sites, the
+#: derivable-gate audit).
 _COND_MM_WEIGHTS = (
     "or",
-    ("and", ("rank-eq", "W", "W2"), ("rank", "W", ">=", 1)),
+    (
+        "and",
+        ("rank-eq", "W", "W2"),
+        ("rank", "W", ">=", 1),
+        ("shape-eq", "W", "W2"),
+    ),
     ("and", ("rank", "W", ">=", 2), ("rank", "W2", ">=", 2)),
 )
 
@@ -1062,12 +1095,35 @@ PARALLEL_MUL_FUSE = R(
 #  they can never win, and the verifier is the last line of defence.
 # ---------------------------------------------------------------------------
 
+#: ``F.linear``'s weight transpose as a shape spec: ``W.T`` (identity
+#: on a 1-D weight, matching torch's ``x.matmul(W.t())`` lowering).
+#: Composed with ``mm-shape-ok`` it is exactly "``F.linear(x, W)``
+#: denotes" — the contraction ``x[-1] == W.T[-2]`` and the batch
+#: broadcast — reused by the ``linear`` family's guards.
+_SPEC_WT = ("transpose-out", "W", None, None)
+
+#: ``linear(x, W)`` is well-typed: ``x @ W.T`` denotes.
+_COND_LINEAR_XW = ("mm-shape-ok", "x", _SPEC_WT)
+
+#: ``linear(x, W)``'s output shape — the row scale must broadcast
+#: INTO it (add no axes).
+_SPEC_LINEAR_OUT = ("mm-out", "x", _SPEC_WT)
+
 #: Per-CHANNEL scale as data: c broadcasts over the weight's input
 #: dim — scalar, ``(in,)``, or ``(1,...,1,in)`` — i.e. every non-last
 #: dim of ``c`` is 1 and the last equals ``W``'s last.  (Same verdict
 #: as ``base._is_channel_scale``; unshaped ``c``/``W`` declines.)
+#:
+#: The guard also conjoins ``F.linear(x, W)``'s well-typedness
+#: (:data:`_COND_LINEAR_XW`): the channel fold is a *value* identity
+#: only where both ``linear(mul(x,c), W)`` and ``linear(x, mul(W,c))``
+#: denote.  A scalar ``x`` (``()``) or a rank-1 ``W`` whose extent
+#: disagrees with ``x``'s in-feature axis mints a RHS ``F.linear``
+#: cannot lower — 16 ``rhs-err`` sites the old guard accepted (the
+#: derivable-gate audit).
 _COND_CHANNEL_SCALE = (
     "and",
+    _COND_LINEAR_XW,
     ("shaped", "c"),
     ("rank", "W", ">=", 1),
     (
@@ -1078,8 +1134,18 @@ _COND_CHANNEL_SCALE = (
 )
 
 #: Per-ROW scale as data: broadcasts to ``(B,T,1)`` — scalar or last
-#: dim 1.  (Same verdict as ``base._is_row_scale``.)
-_COND_ROW_SCALE = ("or", ("scalar", "r"), ("dim-eq-const", "r", -1, 1))
+#: dim 1 — *and* must broadcast INTO ``linear(x, W)``'s output
+#: (:data:`_SPEC_LINEAR_OUT`) without adding axes.  The last-dim-only
+#: check let a rank-1 ``r=(1,)`` against a scalar output grow
+#: ``mul(linear(x,W), r)`` by an axis while ``linear(mul(x,r), W)``
+#: stayed scalar — 3 ``unequal`` sites, plus 9 ``rhs-err`` where
+#: ``linear(x, W)`` itself could not denote (the derivable-gate
+#: audit).  (Same verdict as ``base._is_row_scale``, tightened.)
+_COND_ROW_SCALE = (
+    "and",
+    ("or", ("scalar", "r"), ("dim-eq-const", "r", -1, 1)),
+    ("bcast-into", "r", _SPEC_LINEAR_OUT),
+)
 
 LINEAR_CHANNEL_SCALE = R(
     "linear_channel_scale",

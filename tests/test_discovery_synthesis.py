@@ -1085,19 +1085,18 @@ def test_declarative_guards_transport_as_cond_clauses():
     assert not eval_cond(obj.rule.cond, dict(good, c=_v("c", 3)))
 
 
-def test_declarative_transport_refused_by_an_inherited_counterexample(
+def test_declarative_transport_cleared_by_the_tightened_premise(
     tmp_path,
 ):
-    """A declaratively transported composite is *not* admissible when
-    its guard-accepted region carries a measured counterexample — even
-    though the composite is *derivable*.
+    """The derivable composite is now admitted: tightening
+    ``linear_row_scale``'s guard (the derivable-gate audit) removed the
+    counterexample the composite used to inherit.
 
-    The composite's guard is the premises' conjunction, so it inherits
-    ``linear_row_scale``'s own blind spot (a rank-1 degenerate weight
-    where ``linear`` mis-evaluates); the sweep measures that one
-    ``unequal`` site, and the truth gate now blocks on it: a measured
-    counterexample outranks the derivation.  Construction is a claim;
-    the gauntlet is the referee.
+    The composite's guard is the premises' conjunction, so the premise
+    fix propagated: the sweep now measures 0 ``unequal`` / 0
+    ``rhs_err`` where the audit found 1, and the truth gate passes on
+    the derivation-backed clean region.  Construction is a claim; the
+    gauntlet is the referee — and here it clears.
     """
     conn = ev.connect(str(tmp_path / "s.db"))
     key = synth.store_constructed(conn, _channel_then_row())
@@ -1107,44 +1106,29 @@ def test_declarative_transport_refused_by_an_inherited_counterexample(
         conn, key, corpus=_corpus(_case("chrev", term, x, w))
     )
     conn.close()
-    assert not rep.usable
-    assert rep.reason.startswith("truth:")
-    assert rep.evidence.derivable  # provable — and overridden
-    # measured 1 at the 360-site window; the count rides the bank, the
-    # *presence* of the inherited counterexample is the pin.
-    assert rep.synth_region.unequal >= 1
+    assert rep.evidence.derivable
+    assert rep.synth_region.unequal == 0
     assert rep.synth_region.rhs_err == 0
-    assert "derivation overridden" in _stages(rep)["truth"].detail
+    assert _stages(rep)["truth"].passed
+    assert "derivation overridden" not in _stages(rep)["truth"].detail
 
 
-def test_transport_inherits_the_premise_blind_spot():
+def test_transport_carries_the_tightened_premise_guard():
     """Transport is faithful: the composite's guard IS the premises'
-    conjunction, so it inherits their blind spots rather than adding new
-    ones.  ``linear_row_scale`` accepts a rank-1 degenerate weight where
-    the law mis-evaluates; the composite's one unequal synth site is
-    exactly that premise's own site."""
-    from catopt_core.egraph.terms import _term_instantiate
-
+    conjunction, so the tightened ``linear_row_scale`` clause rides the
+    composite.  The composite *declines* the rank-1 degenerate binding
+    the premise now declines, and its guarded region carries no
+    counterexample (the audit's fix cured the inherited blind spot)."""
     rule = _channel_then_row().rule
-    uneq = [
-        subst
-        for subst, lhs_i in ev._synth_sites(
-            rule.lhs, rule.rhs, limit=400
-        )
-        if ev._site_outcome(rule, subst, lhs_i) == "unequal"
-    ]
-    assert uneq, "expected the inherited blind-spot site"
-    row = _BY_NAME["linear_row_scale"]
-    for subst in uneq:
-        # the same binding as linear_row_scale's own (x, W, r := c)
-        psubst = {"x": subst["x"], "W": subst["W"], "r": subst["c"]}
-        assert row.check(psubst)
-        assert (
-            ev._site_outcome(
-                row, psubst, _term_instantiate(row.lhs, psubst)
-            )
-            == "unequal"
-        )
+    # linear_row_scale's old blind-spot binding (x=(1,), W=(1,),
+    # r := c = (1,)) — the transported ``bcast-into`` clause declines it.
+    bad = {"x": _v("x", 1), "W": _v("W", 1), "c": _v("c", 1)}
+    assert not eval_cond(rule.cond, bad)
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=400)
+    )
+    assert region.equal > 0
+    assert region.unequal == 0 and region.rhs_err == 0
 
 
 # ---------------------------------------------------------------------------

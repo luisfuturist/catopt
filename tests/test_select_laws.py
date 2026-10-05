@@ -196,6 +196,36 @@ def test_select_mul_broadcast_axis_guard():
     assert torch.equal(u2[0] * v2[0], (u2 * v2)[0])
 
 
+def test_select_mul_declines_when_operands_do_not_broadcast():
+    """The ``bcast`` clause declines operands whose product cannot
+    denote — the derivable-gate audit's 8 rhs-err fix.
+
+    ``u=(2,3)``, ``v=(2,3,1)``, ``D=0``: ``u[D] == v[D]`` (both 2), so
+    the old ``dim-eq-attr``-only guard accepted it, yet ``mul(u, v)``
+    cannot broadcast (``3`` vs ``3`` then ``2`` vs ``3``) — the minted
+    RHS ``sel(u ⊙ v)`` is ill-typed.  ``("shaped", ("bcast", u, v))``
+    is exactly "``mul(u, v)`` denotes".
+    """
+    from catopt_core.laws.cond import eval_cond
+
+    bad = {
+        "u": Var("u", TensorType((2, 3))),
+        "v": Var("v", TensorType((2, 3, 1))),
+        "$attr:D": 0,
+        "$attr:I": 0,
+    }
+    assert not eval_cond(SELECT_MUL.cond, bad)
+    assert not SELECT_MUL.check(bad)
+    # same-rank operands that DO broadcast stay accepted.
+    good = {
+        "u": Var("u", TensorType((2, 3))),
+        "v": Var("v", TensorType((2, 3))),
+        "$attr:D": 0,
+        "$attr:I": 0,
+    }
+    assert SELECT_MUL.check(good)
+
+
 # ---------------------------------------------------------------------------
 #  Firing + the matcher precondition
 # ---------------------------------------------------------------------------
