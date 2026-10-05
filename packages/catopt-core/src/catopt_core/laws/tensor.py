@@ -955,7 +955,16 @@ WEIGHT_DISTRIBUTE_LINEAR = R(
 #: B (1,i)) — whose LHS DOES evaluate — minted a member whose mul
 #: operands do not even broadcast (the same matcher-cannot-see-shapes
 #: class as the matmul-addend rank guard above).
-_COND_FUSE_PAIR = ("shape-compat", "A", "B")
+# shape-compat alone let rank-1 "weights" through: linear(x, A) with
+# A a vector mints a dot product, and the fused RHS's concat+chunk
+# can't denote — the guarded sweep caught 4 rhs-err sites.  A linear
+# weight is a matrix (F.linear contract): rank >= 2.
+_COND_FUSE_PAIR = (
+    "and",
+    ("shape-compat", "A", "B"),
+    ("rank", "A", ">=", 2),
+    ("rank", "B", ">=", 2),
+)
 
 #: Compat alias — the test-facing hook (see ``_check_sum_keepdim``).
 _check_fuse_pair = as_check(_COND_FUSE_PAIR)
