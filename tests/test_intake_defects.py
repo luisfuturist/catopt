@@ -22,8 +22,10 @@ Each case exports + lowers + verifies through the same
 ``TorchSink.lower``/``verify`` path ``law_intake._verify`` runs.
 """
 
+import pytest
 import torch
 from catopt_core.ir import IR, Op
+from catopt_discovery import intake as li
 from catopt_torch.adapters import TorchSink
 from catopt_torch.torch_bridge import export_to_ir, ir_to_torch_module
 
@@ -568,3 +570,137 @@ def test_attr_match_stays_numerically_lenient():
     root = eg.add_term(term)
     subs = list(eg.matches(Op.make("clamp", "v", min="m"), root))
     assert subs and subs[0]["$attr:m"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+#  Round 5 — corpus round 3: view-identity spellings + absent ops
+# ---------------------------------------------------------------------------
+
+#: Round-3 workloads whose term carries a *view* under an elementwise
+#: op — the spellings the auto-cond retro's inert guards need.
+_R3_VIEW_CASES = {
+    "BroadcastPadLeft": {"unsqueeze", "mul"},
+    "BroadcastPadRight": {"unsqueeze", "mul"},
+    "BroadcastPadSub": {"unsqueeze", "sub"},
+    "NoopTransposeScale": {"transpose", "mul"},
+    "NoopTransposeAdd": {"transpose", "add"},
+    "InertReshapeScale": {"reshape", "mul"},
+    "SingleChunkScale": {"chunk", "mul"},
+    "SquaredDistance": {"mul", "sub"},
+}
+
+#: Round-3 workloads introducing ops the pre-round-3 census lacked.
+_R3_OP_CASES = {
+    "ErfFeatures": {"erf", "erfc", "erfinv"},
+    "GeluErf": {"erf", "sqrt"},
+    "Relu6Head": {"relu6"},
+    "SqrtHead": {"sqrt"},
+    "ScatterReduce": {"scatter_reduce"},
+    "MinPair": {"minimum", "fmin"},
+    "ClampMaxHead": {"clamp_max"},
+    "ComparisonHead": {"isclose", "le", "ge", "ne"},
+    "AllReduce": {"all"},
+    "MatrixInverse": {"inv"},
+}
+
+
+def _round3(name):
+    """Build the named round-3 candidate's ``(model, feed)``."""
+    w = {x.name: x for x in li.candidates()}[name]
+    model, x = w.build()
+    return model, (x if isinstance(x, tuple) else (x,))
+
+
+@pytest.mark.parametrize("name,ops", sorted(_R3_VIEW_CASES.items()))
+def test_round3_view_identity_workloads_verify(name, ops):
+    """A view-identity elementwise spelling exports + fp64-verifies."""
+    model, feed = _round3(name)
+    ir, vr = _export_lower_verify(model, feed)
+    present = {t.op for t in _ops_of(ir.root)}
+    assert ops <= present, (name, present)
+    assert vr.passed, vr
+
+
+@pytest.mark.parametrize("name,ops", sorted(_R3_OP_CASES.items()))
+def test_round3_absent_ops_are_bound(name, ops):
+    """Each previously-absent op is bound, lowers and verifies."""
+    model, feed = _round3(name)
+    ir, vr = _export_lower_verify(model, feed)
+    present = {t.op for t in _ops_of(ir.root)}
+    assert ops <= present, (name, present)
+    assert vr.passed, vr
+
+
+def test_round3_transpose_noop_guard_now_fires():
+    """A previously-inert auto-cond guard fires on a round-3 term.
+
+    ``mul_transpose_l_id``'s minted guard (project/retros/auto-cond.md)
+    is ``axes-noop`` — the swap is a semantic no-op.  No pre-round-3
+    corpus term had a no-op transpose under an elementwise op, so the
+    guard's region was empty and ``typed-pay`` refused it.  The
+    ``NoopTransposeScale`` workload (``u.transpose(-1, -2) * v`` on
+    ``(C, 1, 1)``) supplies exactly that site: the guard now accepts
+    it and the guarded equality holds.
+    """
+    from catopt_core.egraph import Rewrite
+    from catopt_core.egraph.terms import _term_match
+    from catopt_discovery import evidence as ev
+    from catopt_discovery.shape_proposal import Schema, real_matches
+
+    guard = Rewrite(
+        name="mul_transpose_l_id",
+        lhs=Op.make(
+            "mul",
+            Op.make("transpose", "U", dim0="A_dim0", dim1="A_dim1"),
+            "V",
+        ),
+        rhs=Op.make("mul", "U", "V"),
+        cond=("axes-noop", "U", "A_dim0", "A_dim1"),
+    )
+    model, feed = _round3("NoopTransposeScale")
+    ir, _ = export_to_ir(model.eval().double(), feed)
+    schema = Schema(guard.name, guard.lhs, guard.rhs)
+    matches = real_matches([ir.root], schema)
+    assert matches, "expected a transpose-under-mul site"
+    sites = [
+        (s, m) for m in matches if (s := _term_match(guard.lhs, m))
+    ]
+    region = ev._guarded_evals(guard, iter(sites))
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0
+
+
+def test_round3_chunk_noop_guard_now_fires():
+    """``mul_chunk_l_id``'s ``chunks==1`` guard fires on a round-3 term."""
+    from catopt_core.egraph import Rewrite
+    from catopt_core.egraph.terms import _term_match
+    from catopt_discovery import evidence as ev
+    from catopt_discovery.shape_proposal import Schema, real_matches
+
+    guard = Rewrite(
+        name="mul_chunk_l_id",
+        lhs=Op.make(
+            "mul",
+            Op.make(
+                "chunk",
+                "U",
+                chunks="A_chunks",
+                dim="A_dim",
+                index="A_index",
+            ),
+            "V",
+        ),
+        rhs=Op.make("mul", "U", "V"),
+        cond=("attr-eq", "A_chunks", 1),
+    )
+    model, feed = _round3("SingleChunkScale")
+    ir, _ = export_to_ir(model.eval().double(), feed)
+    schema = Schema(guard.name, guard.lhs, guard.rhs)
+    matches = real_matches([ir.root], schema)
+    assert matches, "expected a chunk-under-mul site"
+    sites = [
+        (s, m) for m in matches if (s := _term_match(guard.lhs, m))
+    ]
+    region = ev._guarded_evals(guard, iter(sites))
+    assert region.accepted >= 1 and region.equal >= 1
+    assert region.unequal == 0 and region.rhs_err == 0

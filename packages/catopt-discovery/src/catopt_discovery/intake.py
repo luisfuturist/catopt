@@ -1100,6 +1100,732 @@ class _DepthwiseConv2d(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+#  Round 3 — transformer variants, norm variants, conv/attn hybrids, scans
+# ---------------------------------------------------------------------------
+
+
+def _rope_freqs(
+    t: int, d: int, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the (cos, sin) rotary tables for *t* positions, *d* dims."""
+    inv = torch.pow(
+        torch.tensor(10000.0, dtype=dtype),
+        -torch.arange(0, d, 2, dtype=dtype) / d,
+    )
+    freqs = torch.outer(torch.arange(t, dtype=dtype), inv)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
+def _rope_apply(
+    z: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Rotate *z* by the (cos, sin) tables (interleaved-pair form)."""
+    half = z[..., : z.shape[-1] // 2]
+    rot = torch.cat([-z[..., z.shape[-1] // 2 :], half], dim=-1)
+    return z * cos + rot * sin
+
+
+class _RotaryEmbedding(nn.Module):
+    """RoPE applied to a (B, H, T, D) tensor — the rotate-half spine."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotate q/k-style features by their positions."""
+        cos, sin = _rope_freqs(x.shape[-2], x.shape[-1], x.dtype)
+        return _rope_apply(x, cos, sin)
+
+
+class _RoPEAttention(nn.Module):
+    """Multi-head attention with rotary q/k — the modern decoder block."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build the qkv projection and the output projection."""
+        super().__init__()
+        self.qkv = nn.Linear(d, 3 * d)
+        self.proj = nn.Linear(d, d)
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotate q/k, attend, project back."""
+        b, t, d = x.shape
+        h = self.heads
+        qkv = self.qkv(x).reshape(b, t, 3, h, d // h)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        cos, sin = _rope_freqs(t, d // h, x.dtype)
+        q = _rope_apply(q, cos, sin)
+        k = _rope_apply(k, cos, sin)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(b, t, d)
+        return self.proj(out)
+
+
+class _MQAAttention(nn.Module):
+    """Multi-query attention — one shared kv head broadcast over q."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build the q and packed kv projections."""
+        super().__init__()
+        self.q = nn.Linear(d, d)
+        self.kv = nn.Linear(d, 2 * (d // heads))
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Expand the single kv head over all query heads, then attend."""
+        b, t, d = x.shape
+        h = self.heads
+        hd = d // h
+        q = self.q(x).reshape(b, t, h, hd).transpose(1, 2)
+        kv = self.kv(x).reshape(b, t, 2, hd).transpose(1, 2)
+        k, v = kv[:, 0], kv[:, 1]
+        k = k.unsqueeze(1).expand(b, h, t, hd)
+        v = v.unsqueeze(1).expand(b, h, t, hd)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return out.transpose(1, 2).reshape(b, t, d)
+
+
+class _RelativePositionBias(nn.Module):
+    """T5-style bucketed relative position bias added to scores."""
+
+    def __init__(self, heads: int, n: int) -> None:
+        """Build the per-head bias table."""
+        super().__init__()
+        self.bias = nn.Parameter(torch.randn(heads, n))
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Look up the bucketed bias and add it to the scores."""
+        t = x.shape[-2]
+        idx = torch.arange(t)
+        rel = (idx[None, :] - idx[:, None]).clamp(min=0)
+        b = self.bias[:, rel]
+        return x + b.unsqueeze(0)
+
+
+class _MoEGate(nn.Module):
+    """Top-2 softmax gating over a routed expert bank."""
+
+    def __init__(self, d: int, n_exp: int) -> None:
+        """Build the gate and the experts."""
+        super().__init__()
+        self.gate = nn.Linear(d, n_exp)
+        self.experts = nn.ModuleList(
+            nn.Linear(d, d) for _ in range(n_exp)
+        )
+        self.n_exp = n_exp
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Dispatch to the top-2 experts by their softmax weights."""
+        w = torch.softmax(self.gate(x), dim=-1)
+        _, idx = torch.topk(w, 2, dim=-1)
+        out = torch.zeros_like(x)
+        for i, e in enumerate(self.experts):
+            sel = (idx == i).any(dim=-1, keepdim=True).to(x.dtype)
+            out = out + sel * w[:, i : i + 1] * e(x)
+        return out
+
+
+class _PreNormBlock(nn.Module):
+    """Pre-norm transformer block: norm before attention and MLP."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build the two norms, attention and the MLP."""
+        super().__init__()
+        self.n1 = nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.n2 = nn.LayerNorm(d)
+        self.mlp = nn.Sequential(
+            nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply pre-norm attention then a pre-norm MLP."""
+        y, _ = self.attn(self.n1(x), self.n1(x), self.n1(x))
+        x = x + y
+        return x + self.mlp(self.n2(x))
+
+
+class _PostNormBlock(nn.Module):
+    """Post-norm block: norm after each residual add."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build attention, norms and the MLP."""
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.n1 = nn.LayerNorm(d)
+        self.mlp = nn.Sequential(
+            nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d)
+        )
+        self.n2 = nn.LayerNorm(d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Attend then norm, MLP then norm."""
+        y, _ = self.attn(x, x, x)
+        x = self.n1(x + y)
+        return self.n2(x + self.mlp(x))
+
+
+class _SwiGLUBlock(nn.Module):
+    """Pre-norm block with sdpa attention and a SwiGLU feed-forward."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build the fused qkv, output, and gated MLP projections."""
+        super().__init__()
+        self.n = nn.LayerNorm(d)
+        self.qkv = nn.Linear(d, 3 * d)
+        self.proj = nn.Linear(d, d)
+        self.w = nn.Linear(d, 2 * d)
+        self.v = nn.Linear(d, d)
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Self-attend then apply the gated MLP."""
+        b, t, d = x.shape
+        h = self.heads
+        qkv = self.qkv(x).reshape(b, t, 3, h, d // h)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn = attn.transpose(1, 2).reshape(b, t, d)
+        x = x + self.proj(attn)
+        a, bb = self.w(self.n(x)).chunk(2, dim=-1)
+        return x + self.v(F.silu(a) * bb)
+
+
+class _CrossAttentionBlock(nn.Module):
+    """Decoder cross-attention: q from x, kv from a context tensor."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build the q, packed kv and output projections."""
+        super().__init__()
+        self.q = nn.Linear(d, d)
+        self.kv = nn.Linear(d, 2 * d)
+        self.o = nn.Linear(d, d)
+        self.heads = heads
+
+    def forward(
+        self, x: torch.Tensor, ctx: torch.Tensor
+    ) -> torch.Tensor:
+        """Attend x over ctx."""
+        b, t, d = x.shape
+        h = self.heads
+        q = self.q(x).reshape(b, t, h, d // h).transpose(1, 2)
+        kv = self.kv(ctx).reshape(b, ctx.shape[1], 2, h, d // h)
+        k, v = kv.permute(2, 0, 3, 1, 4)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return self.o(out.transpose(1, 2).reshape(b, t, d))
+
+
+class _SlidingWindowMask(nn.Module):
+    """Banded sliding-window attention mask over a local neighbourhood."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend within a window of ±2 positions."""
+        n = q.shape[-2]
+        idx = torch.arange(n)
+        band = (idx[None, :] - idx[:, None]).abs() <= 2
+        mask = torch.zeros(n, n, dtype=q.dtype).masked_fill(
+            band.logical_not(), float("-inf")
+        )
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
+class _MultiLatentAttention(nn.Module):
+    """MLA-style attention: kv compressed through a low-rank latent."""
+
+    def __init__(self, d: int, heads: int, rank: int) -> None:
+        """Build the q, down- and up-projection for the kv latent."""
+        super().__init__()
+        self.q = nn.Linear(d, d)
+        self.dkv = nn.Linear(d, 2 * rank)
+        self.ukv = nn.Linear(2 * rank, 2 * d)
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compress kv to the latent, expand back, attend."""
+        b, t, d = x.shape
+        h = self.heads
+        q = self.q(x).reshape(b, t, h, d // h).transpose(1, 2)
+        c = self.ukv(self.dkv(x))
+        k, v = c.reshape(b, t, 2, h, d // h).permute(2, 0, 3, 1, 4)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return out.transpose(1, 2).reshape(b, t, d)
+
+
+class _ManualRMSNorm(nn.Module):
+    """RMSNorm spelled out: ``x * rsqrt(mean(x²)+eps) * g``."""
+
+    def __init__(self, d: int, eps: float = 1e-5) -> None:
+        """Build the gain and record eps."""
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalise by the root mean square."""
+        ms = x.pow(2).mean(dim=-1, keepdim=True)
+        return x * torch.rsqrt(ms + self.eps) * self.w
+
+
+class _QKNorm(nn.Module):
+    """Per-head RMS normalisation of q and k before attention."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalise q/k by their RMS, then attend."""
+
+        def nrm(z: torch.Tensor) -> torch.Tensor:
+            rms = z.pow(2).mean(dim=-1, keepdim=True)
+            return z * torch.rsqrt(rms + 1e-6)
+
+        return F.scaled_dot_product_attention(nrm(q), nrm(k), v)
+
+
+class _DeepNorm(nn.Module):
+    """DeepNorm residual: ``norm(alpha*x + res)``."""
+
+    def __init__(self, d: int, alpha: float = 1.5) -> None:
+        """Build the norm and record the residual scale."""
+        super().__init__()
+        self.n = nn.LayerNorm(d)
+        self.alpha = alpha
+
+    def forward(
+        self, x: torch.Tensor, res: torch.Tensor
+    ) -> torch.Tensor:
+        """Scale the branch, add the residual, normalise."""
+        return self.n(self.alpha * x + res)
+
+
+class _CenterNorm(nn.Module):
+    """Mean-centering only — no variance rescaling."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Subtract the per-row mean."""
+        return x - x.mean(dim=-1, keepdim=True)
+
+
+class _ScaleNorm(nn.Module):
+    """Scale-only norm: ``g * x / ||x||``."""
+
+    def __init__(self, d: int) -> None:
+        """Build the gain."""
+        super().__init__()
+        self.g = nn.Parameter(torch.ones(d))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Divide by the row norm then scale."""
+        return self.g * x / x.norm(dim=-1, keepdim=True)
+
+
+class _ConvNeXtBlock(nn.Module):
+    """ConvNeXt block: depthwise 7x7, LN, inverted bottleneck."""
+
+    def __init__(self, ch: int) -> None:
+        """Build the depthwise conv and the pointwise pair."""
+        super().__init__()
+        self.dw = nn.Conv2d(ch, ch, 7, padding=3, groups=ch)
+        self.n = nn.LayerNorm(ch, eps=1e-6)
+        self.pw1 = nn.Linear(ch, 4 * ch)
+        self.pw2 = nn.Linear(4 * ch, ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Depthwise conv, channel-last norm, GELU MLP, residual."""
+        y = self.dw(x).permute(0, 2, 3, 1)
+        y = self.n(y)
+        y = self.pw2(F.gelu(self.pw1(y))).permute(0, 3, 1, 2)
+        return x + y
+
+
+class _SqueezeExcitation(nn.Module):
+    """SE block: global average pool, bottleneck gate, channel scale."""
+
+    def __init__(self, ch: int, r: int = 4) -> None:
+        """Build the squeeze/expand linears."""
+        super().__init__()
+        self.fc1 = nn.Linear(ch, ch // r)
+        self.fc2 = nn.Linear(ch // r, ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Re-weight channels by the pooled gate."""
+        b, c, _h, _w = x.shape
+        s = x.mean(dim=(2, 3))
+        s = torch.sigmoid(self.fc2(F.relu(self.fc1(s))))
+        return x * s.reshape(b, c, 1, 1)
+
+
+class _MBConvBlock(nn.Module):
+    """MobileNet inverted-bottleneck block with squeeze-excitation."""
+
+    def __init__(self, ch: int) -> None:
+        """Build expand, depthwise, SE and project stages."""
+        super().__init__()
+        self.exp = nn.Conv2d(ch, 4 * ch, 1)
+        self.dw = nn.Conv2d(4 * ch, 4 * ch, 3, padding=1, groups=4 * ch)
+        self.se = _SqueezeExcitation(4 * ch)
+        self.proj = nn.Conv2d(4 * ch, ch, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Expand, depthwise, excite, project, residual."""
+        y = F.silu(self.exp(x))
+        y = self.se(F.silu(self.dw(y)))
+        return x + self.proj(y)
+
+
+class _GRN(nn.Module):
+    """Global Response Norm — a conv-native spatial normaliser."""
+
+    def __init__(self, ch: int) -> None:
+        """Build the learned gain and bias."""
+        super().__init__()
+        self.g = nn.Parameter(torch.zeros(1, ch, 1, 1))
+        self.b = nn.Parameter(torch.zeros(1, ch, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Aggregate the spatial L2 norm and re-scale."""
+        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)
+        return self.g * (nx * x) + self.b + x
+
+
+class _ConformerBlock(nn.Module):
+    """Conformer block: FFN, self-attention and a depthwise conv module."""
+
+    def __init__(self, d: int, heads: int) -> None:
+        """Build the two FFNs, attention and the conv module."""
+        super().__init__()
+        self.ff1 = nn.Sequential(
+            nn.Linear(d, 2 * d), nn.SiLU(), nn.Linear(2 * d, d)
+        )
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.conv = nn.Conv1d(d, d, 5, padding=2, groups=d)
+        self.ff2 = nn.Sequential(
+            nn.Linear(d, 2 * d), nn.SiLU(), nn.Linear(2 * d, d)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Half FFN, attention, conv, half FFN — all residual."""
+        x = x + 0.5 * self.ff1(x)
+        a, _ = self.attn(x, x, x)
+        x = x + a
+        c = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        x = x + c
+        return x + 0.5 * self.ff2(x)
+
+
+class _AxialAttention(nn.Module):
+    """Axial attention — rows then columns of a feature map."""
+
+    def __init__(self, ch: int, heads: int) -> None:
+        """Build the shared attention module."""
+        super().__init__()
+        self.attn = nn.MultiheadAttention(ch, heads, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Attend across width, then across height."""
+        b, c, h, w = x.shape
+        rows = x.permute(0, 2, 3, 1).reshape(b * h, w, c)
+        a, _ = self.attn(rows, rows, rows)
+        a = (
+            a.reshape(b, h, w, c)
+            .permute(0, 2, 1, 3)
+            .reshape(b * w, h, c)
+        )
+        a2, _ = self.attn(a, a, a)
+        return a2.reshape(b, w, h, c).permute(0, 3, 2, 1)
+
+
+class _PatchMerging(nn.Module):
+    """ViT patch-merging: 2x2 reshape, concat, norm, linear reduce."""
+
+    def __init__(self, d: int) -> None:
+        """Build the norm and the reduction linear."""
+        super().__init__()
+        self.n = nn.LayerNorm(4 * d)
+        self.red = nn.Linear(4 * d, 2 * d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Merge 2x2 patches."""
+        b, n, c = x.shape
+        s = int(n**0.5)
+        y = x.reshape(b, s, s, c)
+        y = torch.cat(
+            [
+                y[:, 0::2, 0::2],
+                y[:, 1::2, 0::2],
+                y[:, 0::2, 1::2],
+                y[:, 1::2, 1::2],
+            ],
+            dim=-1,
+        )
+        return self.red(self.n(y.reshape(b, -1, 4 * c)))
+
+
+class _SelectiveScan(nn.Module):
+    """Mamba-style selective scan as a parallel cumulative decay."""
+
+    def __init__(self, d: int) -> None:
+        """Build the gate and input projections."""
+        super().__init__()
+        self.a = nn.Linear(d, d)
+        self.b = nn.Linear(d, d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the linear recurrence through cumprod/cumsum."""
+        g = torch.sigmoid(self.a(x))
+        u = self.b(x)
+        decay = torch.cumprod(g, dim=1)
+        return decay * torch.cumsum(u / decay.clamp_min(1e-6), dim=1)
+
+
+class _LinearAttention(nn.Module):
+    """Linear attention via a cumsum over keys and values."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Feature-map attention with prefix sums."""
+        q = F.elu(q) + 1.0
+        k = F.elu(k) + 1.0
+        kv = torch.cumsum(k.unsqueeze(-1) * v.unsqueeze(-2), dim=1)
+        num = torch.einsum("btd,btdv->btv", q, kv)
+        den = torch.cumsum(k, dim=1)
+        den = torch.einsum("btd,btd->bt", q, den).unsqueeze(-1)
+        return num / den.clamp_min(1e-6)
+
+
+class _CumulativeGateRNN(nn.Module):
+    """Elementwise recurrence spelled as a cumulative gate product."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale by the running product of sigmoid gates."""
+        g = torch.sigmoid(x)
+        return torch.cumprod(g, dim=1) * x
+
+
+class _RunningNorm(nn.Module):
+    """Running (prefix) normalisation through cumsum moments."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalise each step by the prefix mean/variance."""
+        s = torch.cumsum(x, dim=1)
+        ss = torch.cumsum(x * x, dim=1)
+        n = torch.arange(1, x.shape[1] + 1, dtype=x.dtype)
+        n = n.reshape(1, -1, 1)
+        m = s / n
+        var = ss / n - m * m
+        return (x - m) / torch.sqrt(var.clamp_min(1e-6))
+
+
+class _BroadcastPadLeft(nn.Module):
+    """``u.unsqueeze(0) * v`` — broadcast-pad multiply (left)."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Multiply the front-padded operand into the batched one."""
+        return u.unsqueeze(0) * v
+
+
+class _BroadcastPadRight(nn.Module):
+    """``u * v.unsqueeze(0)`` — broadcast-pad multiply (right)."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Multiply the batched operand by a front-padded one."""
+        return u * v.unsqueeze(0)
+
+
+class _BroadcastPadSub(nn.Module):
+    """``u.unsqueeze(0) - v`` — broadcast-pad subtract."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Subtract the batched operand from the padded one."""
+        return u.unsqueeze(0) - v
+
+
+class _FullSliceScale(nn.Module):
+    """``u[:, :n, :] * v`` — a full-extent slice in an elementwise op."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Scale by a slice covering the whole axis."""
+        n = u.shape[1]
+        return u[:, :n, :] * v
+
+
+class _NoopTransposeScale(nn.Module):
+    """``u.transpose(-1, -2) * v`` — a semantic-noop transpose."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Scale by the swapped trailing singleton axes."""
+        return u.transpose(-1, -2) * v
+
+
+class _NoopTransposeAdd(nn.Module):
+    """``u.transpose(-1, -2) + v`` — the additive no-op transpose."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Add the swapped trailing singleton axes."""
+        return u.transpose(-1, -2) + v
+
+
+class _InertReshapeScale(nn.Module):
+    """``u.reshape(1, h, w) * v`` — a broadcast-inert reshape."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Scale by the reshape that inserts a leading singleton."""
+        return u.reshape(1, u.shape[0], u.shape[1]) * v
+
+
+class _SingleChunkScale(nn.Module):
+    """``u.chunk(1, -1)[0] * v`` — a one-chunk no-op split."""
+
+    def forward(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Scale by the sole chunk."""
+        (a,) = u.chunk(1, dim=-1)
+        return a * v
+
+
+class _SquaredDistance(nn.Module):
+    """``(a-b)*(a-b)`` — the ``mul(t, t)`` self-product spelling."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Return the per-row squared distance."""
+        d = a - b
+        return (d * d).sum(dim=-1)
+
+
+class _ErfFeatures(nn.Module):
+    """``erf``/``erfc``/``erfinv`` — error-function features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the three error-function maps."""
+        return (
+            torch.erf(x)
+            + torch.erfc(x)
+            + torch.erfinv(x.clamp(-0.9, 0.9))
+        )
+
+
+class _GeluErf(nn.Module):
+    """GELU spelled exactly with ``erf`` and ``sqrt``."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the exact (non-tanh) GELU."""
+        c = torch.sqrt(torch.tensor(2.0, dtype=x.dtype))
+        return 0.5 * x * (1.0 + torch.erf(x / c))
+
+
+class _SoftsignHead(nn.Module):
+    """``softsign`` — the bounded rational activation."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``x / (1 + |x|)`` via the dedicated op."""
+        return F.softsign(x)
+
+
+class _Relu6Head(nn.Module):
+    """``relu6`` — the dedicated bounded-ReLU op."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``min(max(x, 0), 6)`` via the op spelling."""
+        return F.relu6(x)
+
+
+class _SqrtHead(nn.Module):
+    """``sqrt`` — an explicit square root in the graph."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return two square roots."""
+        a = x.abs()
+        return torch.sqrt(a) + torch.sqrt(a + 1.0)
+
+
+class _TraceNorm(nn.Module):
+    """``trace`` — the diagonal sum of a square matrix."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the trace of ``x @ x``."""
+        return torch.trace(x @ x)
+
+
+class _ScatterReduce(nn.Module):
+    """``scatter_reduce`` — index accumulation with an explicit reduce."""
+
+    def forward(
+        self, x: torch.Tensor, idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter rows into a 4-row base, summing collisions."""
+        base = torch.zeros(4, x.shape[1], dtype=x.dtype)
+        j = idx.unsqueeze(-1).expand(-1, x.shape[1])
+        return base.scatter_reduce(0, j, x, reduce="sum")
+
+
+class _MinPair(nn.Module):
+    """``minimum``/``fmin`` — the two elementwise-min spellings."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return the NaN-aware and propagating minima."""
+        return torch.minimum(x, y) + torch.fmin(x, y)
+
+
+class _ClampMaxHead(nn.Module):
+    """``clamp_max`` — the one-sided upper clamp spelling."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Clamp above and below through the two-sided ops."""
+        return x.clamp_max(1.0) + x.clamp_min(-1.0)
+
+
+class _ComparisonHead(nn.Module):
+    """``isclose``/``le``/``ge``/``ne`` — the comparison-op family."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Sum the four boolean predicates as floats."""
+        return (
+            torch.isclose(x, y).to(x.dtype)
+            + (x <= y).to(x.dtype)
+            + (x >= y).to(x.dtype)
+            + (x != y).to(x.dtype)
+        )
+
+
+class _AllReduce(nn.Module):
+    """``all`` — a global boolean reduction."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mask the row unless every element is positive."""
+        m = torch.all(x > 0, dim=-1, keepdim=True).to(x.dtype)
+        return x * m
+
+
+class _BroadcastTensors(nn.Module):
+    """``broadcast_tensors`` — an explicit multi-tensor broadcast."""
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Broadcast both operands to a common shape and add."""
+        a, b = torch.broadcast_tensors(x.unsqueeze(-1), y)
+        return a + b
+
+
+class _MatrixInverse(nn.Module):
+    """``linalg.inv`` — an explicit matrix inverse (preconditioner)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Invert the regularised batch of matrices."""
+        d = x.shape[-1]
+        reg = x + torch.eye(d, dtype=x.dtype)
+        return torch.linalg.inv(reg)
+
+
+# ---------------------------------------------------------------------------
 #  The candidate registry — thunks so import constructs nothing
 # ---------------------------------------------------------------------------
 
@@ -1985,6 +2711,287 @@ def candidates() -> list[Workload]:
         Workload(
             "DepthwiseConv2d",
             lambda: (_DepthwiseConv2d(), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        # --- round 3 — torch-native norm gaps ----------------------
+        Workload("nn.RMSNorm", lambda: (nn.RMSNorm(d), _r(4, d))),
+        Workload(
+            "nn.BatchNorm3d",
+            lambda: (nn.BatchNorm3d(4), _r(1, 4, 4, 4, 4)),
+        ),
+        Workload(
+            "nn.TransformerEncoderLayer(norm_first)",
+            lambda: (
+                nn.TransformerEncoderLayer(
+                    d,
+                    4,
+                    2 * d,
+                    batch_first=True,
+                    dropout=0.0,
+                    norm_first=True,
+                ),
+                _r(2, 8, d),
+            ),
+        ),
+        # --- round 3 — transformer variants ------------------------
+        Workload(
+            "RotaryEmbedding",
+            lambda: (_RotaryEmbedding(), _r(1, 4, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "RoPEAttention",
+            lambda: (_RoPEAttention(d, 4), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "MQAAttention",
+            lambda: (_MQAAttention(d, 4), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "RelativePositionBias",
+            lambda: (_RelativePositionBias(4, 8), _r(2, 4, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "MoEGate",
+            lambda: (_MoEGate(d, 4), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "PreNormBlock",
+            lambda: (_PreNormBlock(d, 4), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "PostNormBlock",
+            lambda: (_PostNormBlock(d, 4), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SwiGLUBlock",
+            lambda: (_SwiGLUBlock(d, 4), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "CrossAttentionBlock",
+            lambda: (
+                _CrossAttentionBlock(d, 4),
+                (_r(2, 8, d), _r(2, 6, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "SlidingWindowMask",
+            lambda: (
+                _SlidingWindowMask(),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "MultiLatentAttention",
+            lambda: (_MultiLatentAttention(d, 4, 8), _r(2, 8, d)),
+            kind="compound",
+        ),
+        # --- round 3 — normalisation variants ----------------------
+        Workload(
+            "ManualRMSNorm",
+            lambda: (_ManualRMSNorm(d), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "QKNorm",
+            lambda: (
+                _QKNorm(),
+                (_r(1, 4, 8, d), _r(1, 4, 8, d), _r(1, 4, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "DeepNorm",
+            lambda: (_DeepNorm(d), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "CenterNorm",
+            lambda: (_CenterNorm(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ScaleNorm",
+            lambda: (_ScaleNorm(d), _r(4, d)),
+            kind="compound",
+        ),
+        # --- round 3 — conv/attention hybrids ----------------------
+        Workload(
+            "ConvNeXtBlock",
+            lambda: (_ConvNeXtBlock(8), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "MBConvBlock",
+            lambda: (_MBConvBlock(8), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "GRN",
+            lambda: (_GRN(8), _r(1, 8, 8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "ConformerBlock",
+            lambda: (_ConformerBlock(d, 4), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "AxialAttention",
+            lambda: (_AxialAttention(8, 2), _r(1, 8, 4, 4)),
+            kind="compound",
+        ),
+        Workload(
+            "PatchMerging",
+            lambda: (_PatchMerging(d), _r(1, 4, d)),
+            kind="compound",
+        ),
+        # --- round 3 — recurrent / scan-heavy ----------------------
+        Workload(
+            "SelectiveScan",
+            lambda: (_SelectiveScan(d), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "LinearAttention",
+            lambda: (
+                _LinearAttention(),
+                (_r(2, 8, d), _r(2, 8, d), _r(2, 8, d)),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "CumulativeGateRNN",
+            lambda: (_CumulativeGateRNN(), _r(2, 8, d)),
+            kind="compound",
+        ),
+        Workload(
+            "RunningNorm",
+            lambda: (_RunningNorm(), _r(2, 8, d)),
+            kind="compound",
+        ),
+        # --- round 3 — view-identity elementwise spellings ---------
+        Workload(
+            "BroadcastPadLeft",
+            lambda: (_BroadcastPadLeft(), (_r(4, 8), _r(1, 4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "BroadcastPadRight",
+            lambda: (_BroadcastPadRight(), (_r(1, 4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "BroadcastPadSub",
+            lambda: (_BroadcastPadSub(), (_r(4, 8), _r(1, 4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "FullSliceScale",
+            lambda: (_FullSliceScale(), (_r(2, 4, 8), _r(2, 4, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "NoopTransposeScale",
+            lambda: (_NoopTransposeScale(), (_r(8, 1, 1), _r(8, 1, 1))),
+            kind="compound",
+        ),
+        Workload(
+            "NoopTransposeAdd",
+            lambda: (_NoopTransposeAdd(), (_r(8, 1, 1), _r(8, 1, 1))),
+            kind="compound",
+        ),
+        Workload(
+            "InertReshapeScale",
+            lambda: (_InertReshapeScale(), (_r(8, 8), _r(1, 8, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "SingleChunkScale",
+            lambda: (_SingleChunkScale(), (_r(2, 8), _r(2, 8))),
+            kind="compound",
+        ),
+        Workload(
+            "SquaredDistance",
+            lambda: (_SquaredDistance(), (_r(4, 8), _r(4, 8))),
+            kind="compound",
+        ),
+        # --- round 3 — ops absent from the census ------------------
+        Workload(
+            "ErfFeatures",
+            lambda: (_ErfFeatures(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "GeluErf",
+            lambda: (_GeluErf(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SoftsignHead",
+            lambda: (_SoftsignHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "Relu6Head",
+            lambda: (_Relu6Head(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "SqrtHead",
+            lambda: (_SqrtHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "TraceNorm",
+            lambda: (_TraceNorm(), _r(8, 8)),
+            kind="compound",
+        ),
+        Workload(
+            "ScatterReduce",
+            lambda: (
+                _ScatterReduce(),
+                (_r(8, 8), torch.randint(0, 4, (8,))),
+            ),
+            kind="compound",
+        ),
+        Workload(
+            "MinPair",
+            lambda: (_MinPair(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "ClampMaxHead",
+            lambda: (_ClampMaxHead(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "ComparisonHead",
+            lambda: (_ComparisonHead(), (_r(4, d), _r(4, d))),
+            kind="compound",
+        ),
+        Workload(
+            "AllReduce",
+            lambda: (_AllReduce(), _r(4, d)),
+            kind="compound",
+        ),
+        Workload(
+            "BroadcastTensors",
+            lambda: (_BroadcastTensors(), (_r(4, 8), _r(4, 8, 3))),
+            kind="compound",
+        ),
+        Workload(
+            "MatrixInverse",
+            lambda: (_MatrixInverse(), _r(2, 8, 8)),
             kind="compound",
         ),
     ]
