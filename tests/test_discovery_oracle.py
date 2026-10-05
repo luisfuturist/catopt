@@ -280,6 +280,95 @@ def test_viewed_bindings_and_derived_free_shapes():
     assert (2, 3, 1, 1) not in derived
 
 
+# ---------------------------------------------------------------------------
+#  Per-op constant domain — the value-bank rescue (value-bank retro)
+# ---------------------------------------------------------------------------
+#
+#  The generic leaf bank mints one ``Const(0.5)`` for a free operand;
+#  a shipped guard can demand a *specific* literal the corner never
+#  reaches (``pow``'s exponent, the softmax mask sentinel, ``div``'s
+#  unit numerator).  ``_CONST_DOMAIN`` is the small per-op table that
+#  mints them; these tests pin the table, the bank placement, and one
+#  rule the widening rescues (``pow_to_rsqrt``).
+
+
+def test_const_domain_keyed_by_parent_op():
+    """``_const_domain`` reads the parent op's tabulated literals."""
+    assert vo._const_domain({"pow"}) == [
+        Const(2),
+        Const(-0.5),
+        Const(0.5),
+        Const(1),
+    ]
+    # the masked_fill sentinel: ``-inf`` is the one that clears the
+    # strict ``const-cmp F < -1e30``; the finite analogues ride along.
+    sentinel = [c.value for c in vo._const_domain({"masked_fill"})]
+    assert sentinel[0] == float("-inf")
+    assert -1e30 in sentinel and 1e9 in sentinel
+    assert vo._const_domain({"div"}) == [Const(1), Const(0)]
+
+
+def test_const_domain_generic_fallback_and_ordering():
+    """An op with no entry — or no parent at all — keeps the generic
+    ``Const(0.5)`` corner; several parents resolve in sorted-op order,
+    deduped across the shared ``0.5`` / ``1``."""
+    assert vo._const_domain(set()) == [Const(0.5)]
+    assert vo._const_domain({"frobnicate"}) == [Const(0.5)]
+    # sorted({"div","pow"}) -> div then pow; the shared 1 / 0.5 drop.
+    assert [c.value for c in vo._const_domain({"div", "pow"})] == [
+        1,
+        0,
+        2,
+        -0.5,
+        0.5,
+    ]
+
+
+def test_leaf_bindings_op_constants_follow_the_generic_corner():
+    """The op literals ride just past the documented index-0/1/2
+    corner — the generic ``Const(0.5)`` and scalar ``Var`` keep their
+    seats, so an existing accepted corner is never shifted."""
+    free = vo._leaf_bindings("P", {"pow"}, ((9, 9),))
+    assert isinstance(free[0], Var) and free[0].typ.shape == (9, 9)
+    assert free[1] == Const(0.5)
+    assert isinstance(free[2], Var) and free[2].typ.shape == ()
+    assert Const(2) in free and Const(-0.5) in free and Const(1) in free
+    # an untabulated parent op keeps only the generic corner.
+    plain = vo._leaf_bindings("V", {"mul"}, ((9, 9),))
+    assert [c for c in plain if isinstance(c, Const)] == [Const(0.5)]
+
+
+def test_pow_to_rsqrt_now_measures_a_region():
+    """The rescued domain gap: ``pow``'s exponent bank mints ``-0.5``,
+    so the shipped ``pow_to_rsqrt`` guard accepts sites the bank
+    previously declined (the window was starved)."""
+    from catopt_core.laws import ALL_RULES
+    from catopt_discovery import evidence as ev
+
+    rule = {r.name: r for r in ALL_RULES}["pow_to_rsqrt"]
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+    )
+    assert region.accepted > 0
+    assert region.equal > 0
+    # exponents other than -0.5 still decline — the guard still bites.
+    assert region.declined > 0
+
+
+def test_div_sqrt_to_rsqrt_now_measures_a_region():
+    """``div``'s identity bank mints the unit numerator ``1``, so the
+    ``1 / sqrt(x)`` spelling's guard accepts sites now."""
+    from catopt_core.laws import ALL_RULES
+    from catopt_discovery import evidence as ev
+
+    rule = {r.name: r for r in ALL_RULES}["div_sqrt_to_rsqrt"]
+    region = ev._guarded_evals(
+        rule, ev._synth_sites(rule.lhs, rule.rhs, limit=360)
+    )
+    assert region.accepted > 0
+    assert region.equal > 0
+
+
 def test_attr_domains_groups_and_vetoes():
     node = _p("select", "U", dim="D", index="I")
     # A fabricated node with no str attrs is skipped (not a group).

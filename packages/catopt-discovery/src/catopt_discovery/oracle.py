@@ -705,6 +705,74 @@ _VIEWED_SHAPES: tuple = (
 )
 
 
+#: Per-op literal-constant domain — the values a metavariable's
+#: *parent op* admits, keyed by the op name.  The leaf bank's generic
+#: scalar corner mints a single ``Const(0.5)``; a shipped guard can
+#: demand a specific literal that corner never reaches, so the
+#: guarded-region sweep can never construct the site — the
+#: *domain-gapped* class of ``project/retros/cap-policy.md``.  Each
+#: entry is a measured widening:
+#:
+#: * ``pow`` — the exponent (``2`` for the square/RMSNorm spelling,
+#:   ``-0.5`` for the reciprocal-root; ``0.5`` / ``1`` round it out).
+#: * ``masked_fill`` — the softmax mask sentinel; ``-inf`` is the one
+#:   that clears the strict ``const-cmp F < -1e30`` (``-1e30`` itself
+#:   does not: the comparison is strict), the other two are the
+#:   finite analogues.
+#: * ``div`` — the scalar identities (``1`` for the numerator of the
+#:   ``1 / sqrt(x)`` spelling, ``0`` for the additive-identity probe).
+#:
+#: Only the ops a shipped guard actually constrains carry an entry.
+#: ``mul`` / ``add`` identities were measured too: no domain-gapped
+#: guard needs them, and minting them into every free operand under
+#: those ops perturbs the enumeration enough to push an *already*
+#: rescued corner out of the window (``mul_unsqueeze_l_id``'s equal
+#: count moves 23 → 21) — the bank feeds the enumeration, so a
+#: widening with no rescue to show for it is left out.  See
+#: ``project/retros/value-bank.md`` for the measured cost.
+_CONST_DOMAIN: dict[str, tuple[int | float, ...]] = {
+    "pow": (2, -0.5, 0.5, 1),
+    "masked_fill": (-float("inf"), -1e30, 1e9),
+    "div": (1, 0),
+}
+
+
+def _const_domain(parents: set[str]) -> list[Const]:
+    """Return the literal ``Const`` bindings *parents*' ops admit.
+
+    Keyed by the metavariable's parent op — the op the leaf is an
+    operand of.  The values are tabulated in :data:`_CONST_DOMAIN`;
+    a metavariable whose parents carry no entry keeps the generic
+    ``Const(0.5)`` corner the free bank always carried.  Order is
+    stable (sorted op, then the table's order) so the enumeration
+    stays deterministic.
+    """
+    vals: list[int | float] = []
+    for op in sorted(parents):
+        for v in _CONST_DOMAIN.get(op, ()):
+            if v not in vals:
+                vals.append(v)
+    if not vals:
+        vals = [0.5]
+    return [Const(v) for v in vals]
+
+
+def _insert_op_consts(out: list[Any], parents: set[str]) -> None:
+    """Splice the op-specific literals just past the generic corner.
+
+    The generic ``Const(0.5)`` (index 1) and scalar ``Var`` (index 2)
+    keep their documented seats — a widening must not shift an
+    existing accepted corner — so the op literals follow them,
+    deduped against the corner (``pow``'s ``0.5`` does not double).
+    """
+    pos = 3
+    for c in _const_domain(parents):
+        if any(isinstance(t, Const) and t == c for t in out):
+            continue
+        out.insert(pos, c)
+        pos += 1
+
+
 def _tuple_sources(mv: str) -> list[Any]:
     """Tuple-producing terms for a metavar under ``getitem``.
 
@@ -742,12 +810,18 @@ def _leaf_bindings(
     for s in itertools.chain(derived, _VIEWED_SHAPES):
         out.append(Var(mv, TensorType(tuple(s))))
     if not parents or all(p not in _VIEWISH for p in parents):
-        # A free operand may bind a literal scalar — the corpus does.
-        # The ``Const`` rides at index 1 and the scalar ``Var`` at
-        # index 2: the only non-``Var`` binding and the degenerate
-        # corner both stay early under a capped enumeration.
+        # A free operand may bind a literal scalar — the corpus does,
+        # and a shipped guard may demand a *specific* literal the
+        # generic corner never reaches (:func:`_const_domain`).  The
+        # generic ``Const(0.5)`` keeps its documented index-1 seat and
+        # the scalar ``Var`` its index 2; the op-specific constants
+        # follow them (:func:`_insert_op_consts`), so an existing
+        # accepted corner is never shifted past the cap (the bank
+        # feeds the enumeration — a widening must not bury a corner
+        # that already measured).
         out.insert(1, Var(mv, TensorType(())))
         out.insert(1, Const(0.5))
+        _insert_op_consts(out, parents)
     return out
 
 
@@ -1008,7 +1082,7 @@ def _binding_envs(lhs_pat: Any, rhs_pat: Any) -> Iterable[dict]:
     entries: list[list] = []
     for base, u_shapes, out_shapes in _synth_bases(lhs_pat, rhs_pat):
         derived = _derived_free_shapes(u_shapes, out_shapes)
-        lists = [_leaf_bindings(m, set(), derived) for m in free]
+        lists = [_leaf_bindings(m, parents[m], derived) for m in free]
         entries.append([base, _diag_product(lists), True])
     total = 0
     live = len(entries)
