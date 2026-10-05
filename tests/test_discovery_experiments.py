@@ -22,6 +22,7 @@ import torch
 from catopt_core.egraph.terms import _term_match
 from catopt_core.ir import Const, Op, Param, TensorType, Var
 from catopt_core.laws import ALL_RULES
+from catopt_core.typing import INVALID, _shape_of
 from catopt_discovery import gap_gen as gg
 from catopt_discovery import grammar as gm
 from catopt_discovery import meta_game as mg
@@ -944,6 +945,73 @@ def test_corpus_stats_tables():
     assert st.pool_by_shape[(4, 4)]
     assert st.root_keys and st.sub_keys
     assert st.arity["select"] == 1
+
+
+def test_corpus_stats_list_attr():
+    """A term carrying a list-valued attr counts through
+    ``census._attr_key``'s repr stand-in — the crash-on-hash defect —
+    and resampling reads the observed dict back verbatim."""
+    term = _p("relu", _p("pad", _v("lv", 2, 3), pad=[1, 1]))
+    st = wg.corpus_stats([TermCase("bench", "padcase", term, (), (), {})])
+    assert len(st.attr_dicts["pad"]) == 1
+    key = next(iter(st.attr_dicts["pad"]))
+    assert st.attr_dicts["pad"][key] == 1
+    # the repr stand-in ("[1, 1]") is not a value — the exemplar
+    # table returns the real list, not the string.
+    sampled = wg._sample_attrs(st, "pad", random.Random(0))
+    assert sampled == {"pad": [1, 1]}
+    assert isinstance(sampled["pad"], list)
+    # the resampler's own consumer path agrees.
+    sampler = wg._Resampler(st, random.Random(0))
+    assert sampler._attrs("pad") == {"pad": [1, 1]}
+
+
+def test_conv_nonpositive_stride_invalid():
+    """A conv with a non-positive stride can never lower — torch
+    refuses it at runtime — so ``_shape_of`` reports ``INVALID``
+    (the provably-ill-typed verdict) instead of dividing by zero."""
+    x1 = _v("cx", 1, 1, 10)
+    w1 = Param("cw", TensorType((1, 1, 3)))
+    bad1 = _p("conv1d", x1, w1, stride=0)
+    assert _shape_of(bad1) is INVALID
+    # the verdict poisons enclosing ops — it cannot wash out as
+    # "unknown" under a broadcast parent.
+    assert _shape_of(_p("add", bad1, _v("cy", 1, 1, 8))) is INVALID
+    x2 = _v("dx", 1, 1, 8, 8)
+    w2 = Param("dw", TensorType((1, 1, 3, 3)))
+    assert _shape_of(_p("conv2d", x2, w2, stride=0)) is INVALID
+    assert _shape_of(_p("conv2d", x2, w2, stride=[0, 1])) is INVALID
+    assert _shape_of(_p("conv2d", x2, w2, stride=(1, -2))) is INVALID
+    # non-positive dilation is the same class.
+    assert _shape_of(_p("conv1d", x1, w1, dilation=0)) is INVALID
+    # a metavar stride is merely unknown — the degraded return.
+    assert _shape_of(_p("conv1d", x1, w1, stride="s")) == (1, 1, None)
+    # a wrong-length conv2d window tuple declines the same way.
+    assert _shape_of(_p("conv2d", x2, w2, stride=[2])) == (
+        1,
+        1,
+        None,
+        None,
+    )
+    # an unknown operand extent with concrete attrs: unknown, not
+    # ill-typed — the divide never runs.
+    ux = Var("ux", TensorType((1, 1, None)))
+    uw = Param("uw", TensorType((1, 1, 3)))
+    assert _shape_of(_p("conv1d", ux, uw, stride=2)) == (1, 1, None)
+    # and well-formed convs still shape.
+    assert _shape_of(_p("conv1d", x1, w1, stride=2)) == (1, 1, 4)
+    assert _shape_of(_p("conv1d", x1, w1, stride=[2])) == (1, 1, 4)
+    assert _shape_of(_p("conv2d", x2, w2, stride=(2, 2))) == (
+        1,
+        1,
+        3,
+        3,
+    )
+    # the generation gate declines the term, never mints it.
+    assert (
+        wg.valid_term(bad1, _stats(), set(), _SUPPORTED | {"conv1d"})
+        is None
+    )
 
 
 def test_weighted_and_leaves():

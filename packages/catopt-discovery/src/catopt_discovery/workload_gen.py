@@ -100,6 +100,7 @@ from catopt_discovery import pipeline as lpipe
 from catopt_discovery import proposal as lp
 from catopt_discovery.census import (
     CorpusTerm,
+    _attr_key,
     op_tuple_census,
     shape_census,
     shape_key,
@@ -194,8 +195,14 @@ class CorpusStats:
     root_tuples: Counter = field(default_factory=Counter)
     # (parent op, position) -> typed child-marker multiset.
     child_at: dict = field(default_factory=dict)
-    # op -> [(attrs dict, count), ...] — observed attr combinations.
+    # op -> {attr-key: count} — observed attr combinations.  The key
+    # is ``census._attr_key``'s: raw values where hashable, ``repr``
+    # stand-ins where not (a ``pad=[1,1]`` attr is unhashable).
     attr_dicts: dict[str, Counter] = field(default_factory=dict)
+    # attr-key -> the attrs dict it was keyed from.  A repr stand-in
+    # is not a value — resampling needs the observed dict back, so
+    # every counted key keeps one exemplar.
+    attr_exemplars: dict = field(default_factory=dict)
     const_vals: Counter = field(default_factory=Counter)
     # (parent op, position) -> [(kind, shape), ...] for leaf slots.
     leaf_at: dict = field(default_factory=dict)
@@ -228,9 +235,9 @@ def corpus_stats(cases: list[TermCase]) -> CorpusStats:
             st.tuples_of.setdefault(s.op, Counter())[kids] += 1
             st.arity[s.op] = len(s.args)
             if s.attrs:
-                st.attr_dicts.setdefault(s.op, Counter())[
-                    tuple(sorted(s.attrs.items()))
-                ] += 1
+                key = _attr_key(s.attrs)
+                st.attr_dicts.setdefault(s.op, Counter())[key] += 1
+                st.attr_exemplars.setdefault(key, dict(s.attrs))
             st.sub_keys.add(shape_key(s))
             sh = _concrete_shape(s)
             if sh is not None:
@@ -278,6 +285,26 @@ def _weighted(rng: random.Random, counter: Counter) -> Any:
         if r <= 0:
             return k
     return next(iter(counter))
+
+
+def _sample_attrs(
+    st: CorpusStats, op: str, rng: random.Random
+) -> dict | None:
+    """Sample one corpus-observed attrs dict for *op*, verbatim.
+
+    ``None`` when *op* was never seen attributed.  The distribution
+    keys are ``census._attr_key`` tuples — a repr stand-in for an
+    unhashable value is not a value, so the sampled key reads back
+    through ``attr_exemplars``; the ``dict(key)`` fallback covers
+    hand-built stats that carry no exemplar (their keys are raw
+    values by construction).
+    """
+    dist = st.attr_dicts.get(op)
+    if not dist:
+        return None
+    key = _weighted(rng, dist)
+    exemplar = st.attr_exemplars.get(key)
+    return dict(exemplar if exemplar is not None else key)
 
 
 # ---------------------------------------------------------------------------
@@ -388,10 +415,7 @@ class _Resampler:
 
     def _attrs(self, op: str) -> dict:
         """Sample an observed attrs dict for *op* verbatim."""
-        dist = self.st.attr_dicts.get(op)
-        if not dist:
-            return {}
-        return dict(_weighted(self.rng, dist))
+        return _sample_attrs(self.st, op, self.rng) or {}
 
     def _expand(self, op: str, depth: int) -> Any:
         """Expand *op* by sampling one of its corpus tuples."""
@@ -503,8 +527,7 @@ def _swap(
     if not cands:
         return None
     new_op = rng.choice(cands)
-    dist = st.attr_dicts.get(new_op)
-    attrs = dict(_weighted(rng, dist)) if dist else {}
+    attrs = _sample_attrs(st, new_op, rng) or {}
     try:
         return _replace(
             term, path, Op.make(new_op, *node.args, **attrs)

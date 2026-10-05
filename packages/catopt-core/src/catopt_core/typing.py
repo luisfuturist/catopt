@@ -705,15 +705,12 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                     )
                     else (x or None)
                 )
-            st = op.attrs.get("stride", 1)
-            pd = op.attrs.get("padding", 0)
-            dl = op.attrs.get("dilation", 1)
-            st = st[0] if isinstance(st, (tuple, list)) else st
-            pd = pd[0] if isinstance(pd, (tuple, list)) else pd
-            dl = dl[0] if isinstance(dl, (tuple, list)) else dl
-            ol = None
-            if x[2] is not None and w[2] is not None:
-                ol = (x[2] + 2 * pd - dl * (w[2] - 1) - 1) // st + 1
+            st = _conv_scalar(op.attrs.get("stride", 1))
+            pd = _conv_scalar(op.attrs.get("padding", 0))
+            dl = _conv_scalar(op.attrs.get("dilation", 1))
+            ol = _conv_window(x[2], w[2], st, pd, dl)
+            if ol is _INVALID:
+                return _INVALID
             return (x[0], w[0], ol)
         case "tensor_split":
             # Folded like split: ``sections`` is the count (or index
@@ -844,23 +841,13 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                     )
                     else (x or None)
                 )
-            st = op.attrs.get("stride", 1)
-            pd = op.attrs.get("padding", 0)
-            dl = op.attrs.get("dilation", 1)
-            st = st if isinstance(st, (tuple, list)) else (st, st)
-            pd = pd if isinstance(pd, (tuple, list)) else (pd, pd)
-            dl = dl if isinstance(dl, (tuple, list)) else (dl, dl)
-            oh = ow = None
-            xh, xw = x[2], x[3]
-            wh, ww = w[2], w[3]
-            if xh is not None and wh is not None:
-                oh = (xh + 2 * pd[0] - dl[0] * (wh - 1) - 1) // st[
-                    0
-                ] + 1
-            if xw is not None and ww is not None:
-                ow = (xw + 2 * pd[1] - dl[1] * (ww - 1) - 1) // st[
-                    1
-                ] + 1
+            st = _conv_pair(op.attrs.get("stride", 1))
+            pd = _conv_pair(op.attrs.get("padding", 0))
+            dl = _conv_pair(op.attrs.get("dilation", 1))
+            oh = _conv_window(x[2], w[2], st[0], pd[0], dl[0])
+            ow = _conv_window(x[3], w[3], st[1], pd[1], dl[1])
+            if oh is _INVALID or ow is _INVALID:
+                return _INVALID
             return (x[0], w[0], oh, ow)
         case "inv":
             return shapes[0]
@@ -948,6 +935,42 @@ def _broadcast(a, b):
         else:
             return _INVALID  # provably ill-typed
     return tuple(out)
+
+
+def _conv_scalar(v: Any) -> Any:
+    """Read a 1-D conv window attr: a sequence's first element, else *v*."""
+    return v[0] if isinstance(v, (tuple, list)) and v else v
+
+
+def _conv_pair(v: Any) -> tuple:
+    """Read a 2-D conv window attr as a pair; ``(None, None)`` if malformed."""
+    if isinstance(v, (tuple, list)):
+        return tuple(v) if len(v) == 2 else (None, None)
+    return (v, v)
+
+
+def _conv_window(n: Any, k: Any, st: Any, pd: Any, dl: Any):
+    """One conv output extent: ``(n + 2*pd - dl*(k-1) - 1) // st + 1``.
+
+    Three honest answers: the extent when every dim and window attr
+    is concrete; ``_INVALID`` when the stride or dilation is a
+    *concrete* non-positive int — torch refuses both at runtime, so
+    the term is provably ill-typed, not merely unknown (a ``None``
+    would be absorbed by the unknown-shape fallbacks and let a term
+    that can never lower price like a real one); and ``None`` when
+    the extent is undecidable — an unknown operand dim, a malformed
+    spelling, or an attr metavar (law patterns bind window attrs as
+    strings until instantiate time).
+    """
+    if isinstance(st, int) and st <= 0:
+        return _INVALID
+    if isinstance(dl, int) and dl <= 0:
+        return _INVALID
+    if not all(isinstance(v, int) for v in (st, pd, dl)):
+        return None
+    if n is None or k is None:
+        return None
+    return (n + 2 * pd - dl * (k - 1) - 1) // st + 1
 
 
 def _dim_eq(x, y) -> bool:
