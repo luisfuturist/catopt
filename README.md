@@ -116,10 +116,16 @@ plus the canonicalization bridges that make them reachable, all in
 `DEFAULT`:
 
 **`select_mul`** — the first machine-discovered law (census-naturality
-proposer).  `mul(select(u,D,I), select(v,D,I)) → select(mul(u,v),D,I)`:
-true on all 24 real sites, fires 24× across 5 models, **17–26% modeled
-cost drop**, cert replays
-([law-shape-aware.md](project/retros/law-shape-aware.md)).
+proposer).  `mul(select(u,D,I), select(v,D,I)) →
+select(mul(u,v),D,I)` fires 24× across 5 models,
+**17–26% modeled cost drop**, cert replays — and the view/index oracle
+then proved it **latently unsound**: `mul` can broadcast along the
+selected axis (`u=(4,), v=(2,4), D=0` falsifies it), a condition no
+gate checked because all 13 real sites happened to satisfy it — so it
+never bit.  Now guarded by the declarative `dim-eq-attr` cond: still
+in `DEFAULT`, now sound
+([law-shape-aware.md](project/retros/law-shape-aware.md),
+[select-mul-broadcast.md](project/retros/select-mul-broadcast.md)).
 
 **`softmax_fold`** — `div(exp(u), sum(exp(u),dim,keepdim)) →
 softmax(u,dim)`: the manual normalization is the kernel's definition
@@ -130,7 +136,7 @@ the real model
 [law-wallclock-verification.md](project/retros/law-wallclock-verification.md)).
 
 **`silu_fold`** — `mul(x, sigmoid(x)) → silu(x)`: a **3-cell mediator**.
-The coherence catalogue — pairwise relations over all 53 laws — found
+The coherence catalogue — pairwise relations over all 61 laws — found
 two genuinely divergent pairs (`silu` expansion destroys the
 `swiglu_fuse` redex).  This law restores confluence **and pays**
 (1.43–2.62× on the bench case)
@@ -174,6 +180,19 @@ census → propose → verify → measure → rank → **emit** end to end:
   generation found a **human-written unsoundness**: three shipped
   matmul laws are false on mixed-rank bindings — guarded now
   ([matmul-unsound-fix.md](project/retros/matmul-unsound-fix.md)).
+- **The referee referees itself — the biggest example yet.**  The
+  view/index oracle (`catopt_discovery.oracle`) resolved every
+  "unproven" candidate — **1 true / 29 conditional / 5 false / 0
+  unproven** over the 35 view-family proposals — and flagged the
+  *already-shipped* `select_mul` as conditional, not true (above)
+  ([view-index-oracle.md](project/retros/view-index-oracle.md)).
+- **"Pays" now means pays on well-typed programs.**  The typed-pay
+  gate replays every firing and discounts mints that don't denote:
+  **19 of 33 firing candidates mint ≥1 ill-typed member**, and the
+  −40% top candidate's pay was *entirely* ill-typed.  Current pipeline
+  status on the 276-term corpus (66 bench + 44 models + 166 intake):
+  **shippable = 0**
+  ([typed-pay-gate.md](project/retros/typed-pay-gate.md)).
 - **The kernel is measured, not assumed.**  Every shipped law is marked
   by kind — **46 axioms / 13 lemmas / 2 redundant** (of 61) — generated
   by the coherence tool, not by hand
@@ -208,6 +227,7 @@ launch-bound sizes — see [Limits](#limits)):
 | `silu_fold` on the bench case | **−53–55% cost, 1.43–2.62× wall-clock** | `bench run law_bench` |
 | contraction player n=40 vs `opt_einsum` | **0.91–0.98× randomised greedy at equal wall-clock** (0.51–0.90× deterministic) | `tools/contraction_guided_restart.py` |
 | pipeline held-out rediscovery | **winner re-ranks #1, every run** | `catopt_discovery.pipeline` |
+| pipeline on the 276-term corpus | **shippable = 0** — 19/33 firing candidates mint ill-typed members (typed-pay gate); the oracle emptied "unproven" | `catopt_discovery.pipeline` |
 | coherence catalogue | **46 axioms / 13 lemmas / 2 redundant; divergence 0** | `catopt_discovery.coherence` |
 | workload intake | **166 real `nn.*` workloads, 114 fp64-verified** (corpus 290→588 op-tuples) | `catopt_discovery.intake` |
 | laws as data | **57/61 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_discovery.pipeline` |
@@ -416,8 +436,13 @@ Python ≥3.11 (developed on 3.13), `torch>=2.0`, `numpy>=1.24`.
 uv-workspace monorepo: `packages/catopt-core` (zero-dependency engine),
 `catopt-torch` (PyTorch adapters), `catopt-carriers` (scan/attention
 carriers), `catopt-cuda` (the CUDA-graph runner), `catopt-orchestrator`
-(the backend-neutral pipelines).  There is no `catopt` façade package —
-import the domain packages directly.
+(the backend-neutral pipelines), `catopt-discovery` (the law-discovery
+engine — `python -m catopt_discovery.<mod>`).  There is no `catopt`
+façade package — import the domain packages directly.  Coverage is
+pinned at 100% on the five engine packages; `catopt-discovery` sits at
+~99% under a ratchet floor that only tightens
+([discovery-package.md](project/retros/discovery-package.md),
+[discovery-coverage-climb.md](project/retros/discovery-coverage-climb.md)).
 
 ```bash
 uv sync                                  # everything, editable
@@ -425,7 +450,7 @@ uv sync                                  # everything, editable
 # or with pip:
 pip install -e packages/catopt-core -e packages/catopt-torch \
     -e packages/catopt-carriers -e packages/catopt-cuda \
-    -e packages/catopt-orchestrator
+    -e packages/catopt-orchestrator -e packages/catopt-discovery
 
 pip install -e packages/catopt-core      # engine only, zero deps
 ```
