@@ -496,22 +496,205 @@ def _attr_mvs(*pats: Any) -> list[str]:
     return sorted(out)
 
 
+#: Index views whose commutation guard needs the axis-alignment atoms.
+_IDX_ATTR = {"select": "dim", "slice": "dim", "chunk": "dim"}
+
+
+def _str_attrs(node: Op) -> dict:
+    """Return the node's str-valued attrs (attr-metavariable positions)."""
+    return {k: v for k, v in node.attrs.items() if isinstance(v, str)}
+
+
+def _spec_unsq(operand: Any, attrs: dict) -> tuple | None:
+    """``unsqueeze`` output spec (the inserted axis is an attr metavar)."""
+    d = attrs.get("dim")
+    return ("unsq-out", operand, d) if isinstance(d, str) else None
+
+
+def _spec_reshape(operand: Any, attrs: dict) -> tuple | None:
+    """``reshape``/``view`` output spec (the target shape is an attr)."""
+    s = attrs.get("shape")
+    return ("reshape-out", operand, s) if isinstance(s, str) else None
+
+
+def _spec_getitem(operand: Any, _attrs: dict) -> tuple | None:
+    """``getitem`` output spec (no attrs to carry)."""
+    return ("getitem-out", operand)
+
+
+def _spec_select(operand: Any, attrs: dict) -> tuple | None:
+    """``select`` output spec (the picked axis is an attr metavar)."""
+    d = attrs.get("dim")
+    return ("select-out", operand, d) if isinstance(d, str) else None
+
+
+def _spec_slice(operand: Any, attrs: dict) -> tuple | None:
+    """``slice`` output spec (axis + bounds/step metavariables)."""
+    d = attrs.get("dim")
+    if not isinstance(d, str):
+        return None
+    return (
+        "slice-out",
+        operand,
+        d,
+        attrs.get("start"),
+        attrs.get("end"),
+        attrs.get("step"),
+    )
+
+
+def _spec_chunk(operand: Any, attrs: dict) -> tuple | None:
+    """``chunk`` output spec (chunk count is an attr metavar)."""
+    c = attrs.get("chunks")
+    if not isinstance(c, str):
+        return None
+    return ("chunk-out", operand, c, attrs.get("dim"))
+
+
+def _spec_transpose(operand: Any, attrs: dict) -> tuple | None:
+    """``transpose``/``t`` output spec (the swapped axes are attrs)."""
+    d0 = attrs.get("dim0")
+    if not isinstance(d0, str):
+        return None
+    return ("transpose-out", operand, d0, attrs.get("dim1"))
+
+
+#: The view-output spec table — one entry per specifiable view op.
+#: Mirrors the ``_infer_op_shape`` branches the ``laws.cond`` shape
+#: specs implement; the bank's specs and the DSL's must agree.
+_VIEW_SPEC_FNS = {
+    "unsqueeze": _spec_unsq,
+    "reshape": _spec_reshape,
+    "view": _spec_reshape,
+    "getitem": _spec_getitem,
+    "select": _spec_select,
+    "slice": _spec_slice,
+    "chunk": _spec_chunk,
+    "transpose": _spec_transpose,
+    "t": _spec_transpose,
+}
+
+
+def _view_out_spec(op: str, operand: Any, attrs: dict) -> tuple | None:
+    """Return the view-output shape spec for *op*, or ``None``."""
+    fn = _VIEW_SPEC_FNS.get(op)
+    return fn(operand, attrs) if fn is not None else None
+
+
 def _view_specs(nodes: Iterable[Op]) -> list[tuple[str, tuple]]:
     """``(operand-mv, output-shape spec)`` per enumerable view node."""
     out: list[tuple[str, tuple]] = []
     for n in nodes:
         if not n.args or not isinstance(n.args[0], str):
             continue
-        u = n.args[0]
-        if n.op == "unsqueeze" and isinstance(n.attrs.get("dim"), str):
-            out.append((u, ("unsq-out", u, n.attrs["dim"])))
-        elif n.op in ("reshape", "view") and isinstance(
-            n.attrs.get("shape"), str
-        ):
-            out.append((u, ("reshape-out", u, n.attrs["shape"])))
-        elif n.op == "getitem":
-            out.append((u, ("getitem-out", u)))
+        spec = _view_out_spec(n.op, n.args[0], _str_attrs(n))
+        if spec is not None:
+            out.append((n.args[0], spec))
     return out
+
+
+def _view_commute_views(nodes: Iterable[Op]) -> list[tuple]:
+    """Return ``(operand-mv, spec, op, attrs)`` per view node."""
+    views: list[tuple[str, tuple, str, dict]] = []
+    for n in nodes:
+        if not n.args or not isinstance(n.args[0], str):
+            continue
+        u = n.args[0]
+        attrs = _str_attrs(n)
+        spec = _view_out_spec(n.op, u, attrs)
+        if spec is not None:
+            views.append((u, spec, n.op, attrs))
+    return views
+
+
+def _wrap_preds(views: list[tuple], mvs: list[str]) -> list[tuple]:
+    """Emit the wrap family: ``bcast(g(u), v) == g(bcast(u, v))``."""
+    out: list[tuple] = []
+    for u, su, op, attrs in views:
+        for v in mvs:
+            if v == u:
+                continue
+            suv = _view_out_spec(op, ("bcast", u, v), attrs)
+            if suv is None:
+                continue
+            out.append(("bcast-eq", su, v, suv, suv))
+            out.append(("shaped", ("bcast", u, v)))
+            k = _IDX_ATTR.get(op)
+            if k is not None and k in attrs:
+                out.append(("bcast-dim-inv", v, u, attrs[k]))
+            if op in ("transpose", "t") and "dim0" in attrs:
+                out.append(
+                    (
+                        "or",
+                        ("axes-noop", v, attrs["dim0"], attrs["dim1"]),
+                        ("rank", v, "<=", 1),
+                    )
+                )
+    return out
+
+
+def _pair_preds(views: list[tuple]) -> list[tuple]:
+    """Emit the pair family: ``bcast(g(a), g(b)) == g(bcast(a, b))``."""
+    out: list[tuple] = []
+    for u, su, op, attrs in views:
+        for w, sw, op2, attrs2 in views:
+            if w == u or op2 != op or attrs2 != attrs:
+                continue
+            suw = _view_out_spec(op, ("bcast", u, w), attrs)
+            if suw is None:
+                continue
+            out.append(("bcast-eq", su, sw, suw, suw))
+            out.append(("shaped", ("bcast", u, w)))
+            k = _IDX_ATTR.get(op)
+            if k is not None and k in attrs:
+                out.append(("axis-align-eq", u, w, attrs[k]))
+    return out
+
+
+def _viewview_preds(nodes: Iterable[Op]) -> list[tuple]:
+    """Emit the view-view family: ``g1(g2(a)) == g2(g1(a))``."""
+    out: list[tuple] = []
+    for n in nodes:
+        inner = n.args[0] if n.args else None
+        if not isinstance(inner, Op) or not inner.args:
+            continue
+        if not isinstance(inner.args[0], str):
+            continue
+        u = inner.args[0]
+        inner_attrs = _str_attrs(inner)
+        attrs = _str_attrs(n)
+        inner_spec = _view_out_spec(inner.op, u, inner_attrs)
+        g1 = _view_out_spec(n.op, u, attrs)
+        so = (
+            _view_out_spec(n.op, inner_spec, attrs)
+            if inner_spec is not None
+            else None
+        )
+        g2g1 = (
+            _view_out_spec(inner.op, g1, inner_attrs)
+            if g1 is not None
+            else None
+        )
+        if so is not None and g2g1 is not None:
+            out.append(("shape-eq", so, g2g1))
+    return out
+
+
+def _view_commute_preds(
+    nodes: Iterable[Op], mvs: list[str]
+) -> list[tuple]:
+    """Enumerate the view-commute guard vocabulary over view nodes.
+
+    Three families, all "a view must commute with a broadcast": the
+    *wrap* form, the *pair* form with axis alignment, and the
+    *view-view* form.
+    """
+    views = _view_commute_views(nodes)
+    return (
+        _wrap_preds(views, mvs)
+        + _pair_preds(views)
+        + _viewview_preds(nodes)
+    )
 
 
 def _mv_preds(mvs: list[str]) -> list[tuple]:
@@ -774,6 +957,7 @@ def _pred_bank(
         + _attr_preds(names, mvs, env_maps)
         + _op_in_preds(mvs, env_maps)
         + _view_preds(nodes, mvs, specs)
+        + _view_commute_preds(nodes, mvs)
     )
     seen: set = set()
     out: list[tuple] = []

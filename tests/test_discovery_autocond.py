@@ -521,25 +521,19 @@ def test_view_commute_preds_name_the_wrap_guard() -> None:
     ) in preds
 
 
-def test_auto_cond_extended_bank_admits_the_select_wrap(
-    monkeypatch,
-) -> None:
-    """The widened bank mints the guard the stock bank cannot declare.
+def test_auto_cond_extended_bank_admits_the_select_wrap() -> None:
+    """The production bank mints the select-wrap commutation guard.
 
     The wrap form is equal iff the index view commutes with ``V``'s
-    broadcast; the stock bank has no predicate over a ``select``'s
-    output shape, so it refuses.  cond.py now carries ``select-out`` /
-    ``bcast-dim-inv``; the extended bank emits the commutation guard
-    and the constructor mints it — verified on its own sweep.
+    broadcast.  cond.py carries ``select-out`` / ``bcast-dim-inv`` and
+    the production bank emits the commutation vocabulary, so the
+    constructor mints the guard — verified on its own sweep.  (The
+    generator lives in ``object_synthesis._view_commute_preds``; the
+    test-side ``_install_view_commute_bank`` is now redundant for
+    this case and kept only as the emission-shape reference.)
     """
     torch.manual_seed(0)
     bare = _select_wrap_bare()
-    stock = obs.auto_cond_object(bare, synth_limit=360)
-    assert stock.object is None
-    assert stock.equal > 0 and stock.bad > 0
-    assert "no declarable conjunction" in stock.detail
-
-    _install_view_commute_bank(monkeypatch)
     res = obs.auto_cond_object(bare, synth_limit=360)
     assert res.object is not None
     assert res.equal > 0 and res.bad > 0
