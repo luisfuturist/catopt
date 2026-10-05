@@ -723,6 +723,8 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
             idx = attr_of(op, "index", default=0) or 0
             out = list(base)
             if isinstance(sec, int):
+                if sec <= 0:
+                    return _INVALID  # sections must be positive
                 out[dim] = (
                     -(-base[dim] // sec)
                     if isinstance(base[dim], int)
@@ -871,6 +873,10 @@ def _infer_op_shape(op: Op, memo: dict | None = None):
                 return None
             dim = op.attrs.get("dim", -1) % len(base)
             n = op.attrs.get("chunks", 2)
+            if isinstance(n, int) and n <= 0:
+                return _INVALID  # chunks must be positive
+            if not isinstance(n, int):
+                return None  # metavar/undecidable
             out = list(base)
             out[dim] = (base[dim] or 0) // n
             return tuple(out)

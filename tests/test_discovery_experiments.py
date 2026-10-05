@@ -1014,6 +1014,28 @@ def test_conv_nonpositive_stride_invalid():
     )
 
 
+def test_chunk_split_nonpositive_counts_invalid():
+    """``chunks=0`` / ``sections=0`` divide by zero — the same class
+    as the conv zero-stride defect: decline ``INVALID``, don't crash.
+    A non-int count (``2.0``) declines to ``None`` rather than mint a
+    float dimension."""
+    x = _v("x", 8)
+    assert _shape_of(_p("chunk", x, chunks=0)) is INVALID
+    assert _shape_of(_p("tensor_split", x, sections=0, index=0)) is INVALID
+    assert (
+        _shape_of(_p("tensor_split", x, sections=-2, index=0))
+        is INVALID
+    )
+    assert _shape_of(_p("chunk", x, chunks=2.0)) is None
+    # valid spellings unchanged.
+    assert _shape_of(_p("chunk", x, chunks=2)) == (4,)
+    assert _shape_of(_p("tensor_split", x, sections=2, index=0)) == (4,)
+    # an index-list sections payload keeps the bounds path.
+    assert _shape_of(
+        _p("tensor_split", x, sections=[3, 5], index=1)
+    ) == (2,)
+
+
 def test_weighted_and_leaves():
     rng = random.Random(0)
     from collections import Counter
