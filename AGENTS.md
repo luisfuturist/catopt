@@ -34,8 +34,9 @@ uv run pytest                 # full test suite (~7.5 min, single-process —
 .venv/bin/bandit -c .bandit.yaml -r packages   # security SAST
 .venv/bin/semgrep --config .semgrep.yml packages   # dataflow (offline)
 .venv/bin/python tools/radon_ratchet.py   # complexity ratchet
-coverage run --source=catopt_core,catopt_torch,catopt_carriers,catopt_orchestrator,catopt_cuda -m pytest tests/ -q
-coverage report -m                                              # coverage (fail_under=100)
+coverage run -m pytest tests/ -q   # source list includes catopt_discovery
+coverage report -m --omit="*/catopt_discovery/*"   # the five: fail_under=100
+coverage report -m --include="*/catopt_discovery/*" --fail-under=96   # ratchet floor — tighten, never lower
 ```
 
 > **Parallel-warning (measured, not theoretical).**  Do *not* run this
@@ -274,8 +275,13 @@ on `catopt_cuda`; import `CudaGraphRunner` from `catopt_cuda`.
 - Line length 72 (ruff). E501/B008/SIM108 intentionally ignored — see
   `[tool.ruff.lint]` for rationale.
 - Coverage floor: `fail_under = 100` in `[tool.coverage.report]` —
-  the suite is pinned at 100%; new branches need tests (or a
-  justified `pragma: no cover`).
+  the suite is pinned at 100% for the five original packages; new
+  branches need tests (or a justified `pragma: no cover`).
+  `catopt_discovery` joined the source list after its staged climb
+  and sits under a **pinned ratchet floor** (`--fail-under=96` at
+  landing — tighten the number as the residual gaps close, never
+  lower it; the unreachable-defensive arcs are documented in
+  `project/retros/discovery-package.md`).
 - Tests allocating CUDA tensors use the `requires_cuda` marker
   (auto-skipped when CUDA is absent).  Tests that exercise the CPU
   no-op path of `capture_cuda_graph` force `torch.cuda.is_available()`

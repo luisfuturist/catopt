@@ -270,7 +270,11 @@ exclude = []
 error-on-warning = false
 
 [tool.coverage.run]
-source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_orchestrator", "catopt_cuda"]
+# catopt_discovery is measured but NOT under the fail_under=100 floor
+# yet — the move from tools/ staged its coverage climb (see
+# project/retros/discovery-package.md and the ratchet below); the
+# gate runs a second `coverage report` with the pinned discovery floor.
+source = ["catopt_core", "catopt_torch", "catopt_carriers", "catopt_orchestrator", "catopt_cuda", "catopt_discovery"]
 branch = true
 omit = ["*/tests/*"]
 
