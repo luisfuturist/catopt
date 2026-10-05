@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Protocol, cast
 
 from catopt_core.ir import Op
+from catopt_core.opmeta import COST_VIEW_OPS
 from catopt_core.typing import (
     _INVALID,
     _infer_op_shape,
@@ -94,22 +95,11 @@ _OP_FLOPS: dict[str, int] = {
 #: for consumers (priced via _STRIDE_PENALTY).  concat is NOT here: a
 #: runtime cat() is a real copy kernel — it is only free when the whole
 #: subtree is param-only (compile-time fold, handled by extraction).
-_VIEW_OPS = {
-    "transpose",
-    "reshape",
-    "broadcast",
-    "chunk",
-    "split",
-    "leaf",
-    "aff",
-    "om",
-    "aff_diag",
-    # Constant morphisms (catopt_carriers.trace): zero-arg ops that
-    # materialise a fixed matrix — compile-time constants,
-    # like the carrier-packaging ops above.
-    "eye",
-    "cswap",
-}
+#:
+#: The set is a *projection* of :mod:`catopt_core.opmeta` (the
+#: ``cost-view`` tag), so it can no longer drift from its siblings; see
+#: that module for the single source.
+_VIEW_OPS: frozenset[str] = COST_VIEW_OPS
 
 #: Small per-op penalty modeling kernel-launch / scheduling overhead.
 #: Two forms can have identical FLOPs yet differ in kernel count (e.g.

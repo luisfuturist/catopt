@@ -50,6 +50,7 @@ from typing import Any, cast
 
 from catopt_core.attrs import attr_of, is_positional_attr
 from catopt_core.ir import Const, Op, Param, Var
+from catopt_core.opmeta import COMMUTATIVE_OPS
 
 #: The public shape-inference surface.  The underscore-prefixed names
 #: above/below are the implementation; these are the stable spellings
@@ -114,7 +115,8 @@ def _shape_of(
 
 #: Ops whose result shape is invariant under operand swap — used to
 #: keep unknown-shape pricing symmetric for ``add``/``mul``/``eq``/``ne``.
-_COMMUTATIVE_BROADCAST = frozenset({"add", "mul", "eq", "ne"})
+#: A projection of :mod:`catopt_core.opmeta` (the ``commutative`` tag).
+_COMMUTATIVE_BROADCAST = COMMUTATIVE_OPS
 
 
 def _infer_op_shape(op: Op, memo: dict | None = None):

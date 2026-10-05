@@ -43,6 +43,10 @@ from catopt_core.ir import Op
 from catopt_core.laws import tags as _tags
 from catopt_core.laws.base import R as _R
 from catopt_core.laws.base import _shape_of
+from catopt_core.opmeta import (
+    POINTWISE_BINARY_OPS,
+    POINTWISE_UNARY_OPS,
+)
 from catopt_core.typing import _axis_pair, _broadcast
 
 
@@ -246,23 +250,13 @@ def _check_linear_is_mm_t(bound: dict) -> bool:
 
 #: Unary pointwise ops with a torch binding and no axis/scale attrs —
 #: ``f`` is applied elementwise, so any operand permutation commutes.
-_POINTWISE_UNARY: tuple[str, ...] = (
-    "neg",
-    "abs",
-    "silu",
-    "relu",
-    "sigmoid",
-    "tanh",
-    "gelu",
-    "exp",
-    "sqrt",
-    "rsqrt",
-    "square",
-    "log",
-)
+#: A projection of :mod:`catopt_core.opmeta` (the ``pointwise-unary``
+#: tag).
+_POINTWISE_UNARY: tuple[str, ...] = tuple(sorted(POINTWISE_UNARY_OPS))
 
-#: Binary pointwise ops — sound under the same-rank guard.
-_POINTWISE_BINARY: tuple[str, ...] = ("add", "mul", "sub", "div")
+#: Binary pointwise ops — sound under the same-rank guard.  A
+#: projection of :mod:`catopt_core.opmeta` (``pointwise-binary``).
+_POINTWISE_BINARY: tuple[str, ...] = tuple(sorted(POINTWISE_BINARY_OPS))
 
 
 def _commute_rules() -> list[Rewrite]:

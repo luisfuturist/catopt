@@ -70,6 +70,7 @@ import torch
 from catopt_core.attrs import ATTR_SCHEMA, is_positional_attr
 from catopt_core.egraph.terms import _term_instantiate, _term_match
 from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.opmeta import REDUCE_DIM_OPS, VIEWISH_OPS
 
 # Sibling tools own the corpus, the eval backend and the comparator;
 # reuse them, never duplicate.
@@ -92,28 +93,9 @@ _MAX_INSTANCES = 360
 
 #: View/index ops this oracle knows how to attribute-instantiate.
 #: Anything outside the table leaves the attr metavariables unbound —
-#: the instance is skipped, honestly.
-_VIEWISH = frozenset(
-    {
-        "getitem",
-        "select",
-        "slice",
-        "unsqueeze",
-        "squeeze",
-        "transpose",
-        "reshape",
-        "view",
-        "expand",
-        "broadcast_to",
-        "chunk",
-        "split",
-        "narrow",
-        "permute",
-        "unbind",
-        "movedim",
-        "flatten",
-    }
-)
+#: the instance is skipped, honestly.  A projection of
+#: :mod:`catopt_core.opmeta` (the ``viewish`` tag).
+_VIEWISH = VIEWISH_OPS
 
 
 # ---------------------------------------------------------------------------
@@ -559,29 +541,8 @@ _ATTR_KIND_OVERRIDES: dict[tuple[str, str], str] = {
 
 #: Ops whose ``dim`` attr accepts an axis OR a tuple of axes (the
 #: aten reduction signature) — the domain enumerates both spellings.
-_REDUCTION_DIM_OPS = frozenset(
-    {
-        "sum",
-        "mean",
-        "prod",
-        "amax",
-        "amin",
-        "max",
-        "min",
-        "argmax",
-        "argmin",
-        "median",
-        "mode",
-        "var",
-        "std",
-        "var_mean",
-        "std_mean",
-        "nansum",
-        "nanmean",
-        "count_nonzero",
-        "linalg_vector_norm",
-    }
-)
+#: A projection of :mod:`catopt_core.opmeta` (the ``reduce-dim`` tag).
+_REDUCTION_DIM_OPS = REDUCE_DIM_OPS
 
 #: Cap on one node's generic option dicts (the product over its
 #: metavar'd keys) — matches the view tables' per-node caps.

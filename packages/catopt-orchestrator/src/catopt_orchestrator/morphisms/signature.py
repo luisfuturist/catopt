@@ -15,6 +15,13 @@ from typing import Any
 
 from catopt_core.ir import IR, Op, Param, Var
 from catopt_core.laws.pairing import _is_tensor
+from catopt_core.opmeta import (
+    ACTIVATION_OPS,
+    POINTWISE_OPS,
+    RELAYOUT_OPS,
+    TABLE_OPS,
+    WRITE_OPS,
+)
 from catopt_core.typing import has_var_leaf, shape_of
 
 # ---------------------------------------------------------------------------
@@ -58,19 +65,9 @@ class NormSig:
     pre: bool
 
 
-#: Op names counted as activations on a block's spine.
-_ACT_OPS = frozenset(
-    {
-        "silu",
-        "gelu",
-        "tanh",
-        "sigmoid",
-        "relu",
-        "softmax",
-        "sdpa",
-        "exp",
-    }
-)
+#: Op names counted as activations on a block's spine.  A projection
+#: of :mod:`catopt_core.opmeta` (the ``activation`` tag).
+_ACT_OPS = ACTIVATION_OPS
 
 
 @dataclass(frozen=True)
@@ -113,122 +110,28 @@ class InputSig:
 
 
 #: Write ops — arg0 is the mutated base in the functionalised IR
-#: spelling (``copy_`` threads as ``copy``/``*_scatter``).
-_MUT_OPS = frozenset(
-    {
-        "copy",
-        "index_put",
-        "index_add",
-        "slice_scatter",
-        "select_scatter",
-        "scatter",
-        "scatter_add",
-        "scatter_reduce",
-    }
-)
+#: spelling (``copy_`` threads as ``copy``/``*_scatter``).  A
+#: projection of :mod:`catopt_core.opmeta` (the ``write`` tag).
+_MUT_OPS = WRITE_OPS
 
 #: Transparent view/read ops — a var passing through arg0 keeps its
 #: pending classification: the *terminal* (non-view) consumer decides
 #: the role (``unsqueeze(cos) → mul`` is still a table read;
-#: ``slice(x) → linear`` is still a stream entry).
-_VIEW_OPS = frozenset(
-    {
-        "slice",
-        "select",
-        "narrow",
-        "getitem",
-        "unsqueeze",
-        "squeeze",
-        "reshape",
-        "view",
-        "expand",
-        "expand_as",
-        "broadcast_to",
-        "permute",
-        "transpose",
-        "flatten",
-        "unflatten",
-        "movedim",
-        "contiguous",
-        "detach",
-        "detach_",
-        "clone",
-        "to",
-        "type_as",
-        "float",
-        "double",
-        "half",
-        "bfloat16",
-        "repeat",
-        "chunk",
-        "split",
-        "tensor_split",
-        "unbind",
-        "roll",
-        "flip",
-        "pad",
-        "triu",
-        "tril",
-        "alias",
-    }
-)
+#: ``slice(x) → linear`` is still a stream entry).  A projection of
+#: :mod:`catopt_core.opmeta` (the ``relayout`` tag) — the same source
+#: the discovery generator's ``pipeline._VIEW_OPS`` is drawn from.
+_VIEW_OPS = RELAYOUT_OPS
 
 #: Multi-operand pointwise ops — the "context position" test: a var
 #: operand whose sibling args carry a var is a factor/table riding
-#: the stream; one whose siblings are all var-free IS the stream.
-_POINTWISE_OPS = frozenset(
-    {
-        "mul",
-        "div",
-        "pow",
-        "fmod",
-        "remainder",
-        "maximum",
-        "minimum",
-        "fmax",
-        "fmin",
-        "atan2",
-        "xlogy",
-        "heaviside",
-        "isclose",
-        "eq",
-        "ne",
-        "lt",
-        "le",
-        "gt",
-        "ge",
-        "logical_and",
-        "logical_or",
-        "logical_xor",
-        "bitwise_and",
-        "bitwise_or",
-        "where",
-        "lerp",
-        "clamp",
-        "clamp_min",
-        "clamp_max",
-        "addcmul",
-        "addcdiv",
-        "masked_fill",
-    }
-)
+#: the stream; one whose siblings are all var-free IS the stream.  A
+#: projection of :mod:`catopt_core.opmeta` (the ``pointwise`` tag).
+_POINTWISE_OPS = POINTWISE_OPS
 
 #: Ops whose operand positions are all table/index roles — the var
-#: is read like a lookup table, never streamed.
-_TABLE_OPS = frozenset(
-    {
-        "embedding",
-        "index",
-        "index_select",
-        "gather",
-        "take_along_dim",
-        "searchsorted",
-        "one_hot",
-        "nonzero",
-        "item",
-        "numel",
-    }
-)
+#: is read like a lookup table, never streamed.  A projection of
+#: :mod:`catopt_core.opmeta` (the ``table`` tag).
+_TABLE_OPS = TABLE_OPS
 
 #: Ops where the var operand is a norm's *subject* at position 0 —
 #: stream entries.  A var at a later position is a runtime weight —

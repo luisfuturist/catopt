@@ -86,6 +86,10 @@ from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.egraph.terms import _term_instantiate, _term_match
 from catopt_core.ir import Const, Op, op_repr
 from catopt_core.laws import ALL_RULES
+from catopt_core.opmeta import (
+    GENERATOR_VIEW_OPS,
+    POINTWISE_BINARY_OPS,
+)
 from catopt_core.typing import _shape_of
 
 # Sibling tools own every stage; reuse them, never duplicate.
@@ -207,18 +211,16 @@ def _to_pattern(term: Any, mv: dict[str, str]) -> Any:
 
 
 #: Pointwise ops a view-naturality law may push through a view op.
-_POINTWISE = ("add", "sub", "mul", "div")
+#: A projection of :mod:`catopt_core.opmeta` (``pointwise-binary``).
+_POINTWISE = tuple(sorted(POINTWISE_BINARY_OPS))
 
-#: View / re-layout ops (the census's frequent inner ops).
-_VIEW_OPS = (
-    "select",
-    "slice",
-    "reshape",
-    "transpose",
-    "unsqueeze",
-    "squeeze",
-    "expand",
-)
+#: View / re-layout ops (the census's frequent inner ops).  A
+#: projection of :mod:`catopt_core.opmeta` (the ``generator-view``
+#: tag) — a documented *subset* of the ``relayout`` set
+#: ``catopt_orchestrator.morphisms.signature._VIEW_OPS`` reads, so the
+#: two no longer drift (the subset relation is machine-checked in
+#: ``tests/test_opmeta.py``).
+_VIEW_OPS = tuple(sorted(GENERATOR_VIEW_OPS))
 
 
 def _shape_aware() -> list[Proposal]:
