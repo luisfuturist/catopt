@@ -6,12 +6,28 @@ measured in, a re-measurement under a new ``run_id`` records "seen
 again", and a SHIP candidate can be *stored* as a lemma row and
 ``--admit``ted back into a live ``Rewrite`` — derivation-carrying
 laws materialize a replayable certificate into the record.
+
+The ``lemmas`` table is also the *declared-object* store (ADR 0004,
+plan 0017 stage 1): ``store_object`` / ``stored_object`` /
+``admit_object`` generalise the lemma seam, the record's ``"kind"``
+field marking the declaration's provenance — ``"law"`` (the
+default, and every pre-object record), ``"abstraction"`` or
+``"bridge"``.  The first inhabitants are laws-as-objects: a shipped
+law stored *as* an object record admits and fires identically.
 """
 
 import json
 
+import pytest
+from catopt_core.egraph import EGraph
+from catopt_core.ir import Op, TensorType, Var
 from catopt_core.laws import ALL_RULES
-from catopt_core.laws.serialize import alpha_key
+from catopt_core.laws.serialize import (
+    alpha_key,
+    object_from_data,
+    object_kind,
+    object_to_data,
+)
 from catopt_discovery import evidence as ev
 from catopt_discovery.pipeline import Evidence, Proposal
 
@@ -442,3 +458,234 @@ def test_main_admit_strict_replay_failure(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert "STRICT REPLAY FAILED" in out
+
+
+# ---------------------------------------------------------------------------
+#  Declared objects — the lemmas table as the object store (ADR 0004)
+# ---------------------------------------------------------------------------
+
+
+def _t(d=4):
+    return TensorType((d, d))
+
+
+def test_object_codec_marks_and_validates_kind():
+    """The record codec: kind stamped, defaulted, and validated."""
+    rule = _BY_NAME["id_add"]
+    data = object_to_data(rule, kind="law")
+    assert data["kind"] == "law" and object_kind(data) == "law"
+    # a non-law kind stamps provenance; every kind is Rewrite-shaped
+    abs_data = object_to_data(rule, kind="abstraction")
+    assert abs_data["kind"] == "abstraction"
+    assert object_from_data(json.loads(json.dumps(abs_data))).name == (
+        "id_add"
+    )
+    # a legacy record — no "kind" key — reads as a law
+    del abs_data["kind"]
+    assert object_kind(abs_data) == "law"
+    assert object_from_data(abs_data).name == "id_add"
+    # unknown kinds fail loudly at both ends — never a silent admit
+    with pytest.raises(ValueError, match="unknown object kind"):
+        object_to_data(rule, kind="widget")
+    with pytest.raises(ValueError, match="unknown object kind"):
+        object_from_data({"kind": "widget", "version": 2})
+
+
+def test_store_and_admit_object_roundtrip(tmp_path):
+    """store_object / stored_object / admit_object mirror the lemma
+    seam; the record carries its declared kind."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    rule = _BY_NAME["id_add"]
+    key = ev.store_object(conn, rule, corpus_hash="ctx", kind="law")
+    assert key == repr(alpha_key(rule.lhs, rule.rhs))
+    record = ev.stored_object(conn, key)
+    assert record["kind"] == "law"
+    assert record["serializable"] is True
+    rebuilt, data = ev.admit_object(conn, key)
+    assert rebuilt.name == "id_add" and data == record
+    assert ev.stored_object(conn, "no-such-key") is None
+    assert ev.admit_object(conn, "no-such-key") is None
+    conn.close()
+
+
+def test_store_object_nonlaw_kind_reads_back(tmp_path):
+    """The kind column-free store: provenance lives in the record."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(
+        conn, _BY_NAME["sub_to_add"], kind="abstraction"
+    )
+    assert ev.stored_object(conn, key)["kind"] == "abstraction"
+    rebuilt, record = ev.admit_object(conn, key)
+    assert rebuilt.name == "sub_to_add"
+    assert record["kind"] == "abstraction"
+    # a row whose record predates "kind" defaults to "law"
+    row = conn.execute(
+        "SELECT law_json FROM lemmas WHERE alpha_key = ?", (key,)
+    ).fetchone()
+    data = json.loads(row["law_json"])
+    del data["kind"]
+    conn.execute(
+        "UPDATE lemmas SET law_json = ? WHERE alpha_key = ?",
+        (json.dumps(data, sort_keys=True), key),
+    )
+    conn.commit()
+    assert ev.stored_object(conn, key)["kind"] == "law"
+    rebuilt, record = ev.admit_object(conn, key)
+    assert record["kind"] == "law"
+    conn.close()
+
+
+def test_admit_object_rejects_unknown_kind(tmp_path):
+    """A record claiming a kind the codec does not know is refused."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(conn, _BY_NAME["id_add"])
+    record = ev.stored_object(conn, key)
+    record["kind"] = "widget"
+    conn.execute(
+        "UPDATE lemmas SET law_json = ? WHERE alpha_key = ?",
+        (json.dumps(record, sort_keys=True), key),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="unknown object kind"):
+        ev.admit_object(conn, key)
+    # stored_object itself only reads — kind still surfaces
+    assert ev.stored_object(conn, key)["kind"] == "widget"
+    conn.close()
+
+
+def test_store_object_materializes_cert(tmp_path):
+    """Object rows materialize derivations the same way lemma rows
+    do — cert replay is part of the record, not the kind."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(
+        conn, _BY_NAME["silu_fold"], kind="abstraction"
+    )
+    record = ev.stored_object(conn, key)
+    assert record["kind"] == "abstraction"
+    cert = ev.stored_certificate(record)
+    assert cert is not None and cert.n_steps == 1
+    assert list(cert.rules_used) == ["silu_expand"]
+    conn.close()
+
+
+def test_admitted_object_fires_identically(tmp_path):
+    """The seam end-to-end: a shipped law stored AS an object record
+    admits into a Rewrite that fires identically — laws are the
+    object language's first inhabitants."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    rule = _BY_NAME["silu_mul_form"]
+    key = ev.store_object(conn, rule, kind="law")
+    got = ev.admit_object(conn, key)
+    assert got is not None
+    rebuilt, record = got
+    assert record["kind"] == "law" and record["serializable"] is True
+    g, u = Var("g", _t()), Var("u", _t())
+    src = Op.make("mul", Op.make("silu", g), u)
+    dst = Op.make("mul", Op.make("mul", g, Op.make("sigmoid", g)), u)
+    for r in (rule, rebuilt):
+        eg = EGraph()
+        root = eg.add_term(src)
+        eg.run([r], root, max_iterations=4, max_nodes=10_000)
+        assert eg.find(root) == eg.find(eg.add_term(dst)), r.name
+    # and the stored cert replays strictly off the same record
+    cert = ev.stored_certificate(record)
+    assert cert is not None and cert.replayable
+    assert [(s.rule, s.path) for s in cert.steps] == [
+        ("silu_expand", (0,))
+    ]
+    conn.close()
+
+
+def test_main_add_and_admit_object(tmp_path, capsys):
+    """``--add-object`` / ``--admit-object`` mirror the lemma CLI."""
+    db = str(tmp_path / "s.db")
+    assert ev.main(["--report", db, "--add-object", "id_add"]) == 0
+    out = capsys.readouterr().out
+    assert "stored id_add" in out and "full-data" in out
+    assert "kind: law" in out
+    key = repr(
+        alpha_key(_BY_NAME["id_add"].lhs, _BY_NAME["id_add"].rhs)
+    )
+    assert ev.main(["--report", db, "--admit-object", key]) == 0
+    out = capsys.readouterr().out
+    assert "admitted id_add" in out and "kind: law" in out
+    assert "cert: none" in out
+    assert ev.main(["--report", db, "--add-object", "no_such"]) == 1
+    assert ev.main(["--report", db, "--admit-object", "bogus"]) == 1
+    out = capsys.readouterr().out
+    assert "no shipped law" in out and "no lemma stored" in out
+
+
+def test_main_add_object_with_kind(tmp_path, capsys):
+    """``--kind`` stamps the declared provenance on the stored row."""
+    db = str(tmp_path / "s.db")
+    assert (
+        ev.main(
+            [
+                "--report",
+                db,
+                "--add-object",
+                "sub_to_add",
+                "--kind",
+                "bridge",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "stored sub_to_add" in out and "kind: bridge" in out
+    key = repr(
+        alpha_key(
+            _BY_NAME["sub_to_add"].lhs, _BY_NAME["sub_to_add"].rhs
+        )
+    )
+    assert ev.main(["--report", db, "--admit-object", key]) == 0
+    out = capsys.readouterr().out
+    assert "admitted sub_to_add" in out and "kind: bridge" in out
+
+
+def test_main_admit_object_replays_cert_strict(tmp_path, capsys):
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(
+        conn, _BY_NAME["silu_fold"], kind="abstraction"
+    )
+    conn.close()
+    db = str(tmp_path / "s.db")
+    assert ev.main(["--report", db, "--admit-object", key]) == 0
+    out = capsys.readouterr().out
+    assert "kind: abstraction" in out and "replayed strict" in out
+
+
+def test_main_admit_object_strict_replay_failure(tmp_path, capsys):
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(conn, _BY_NAME["silu_fold"])
+    record = ev.stored_object(conn, key)
+    record["cert"]["steps"][0]["rule"] = "no_such_rule"
+    conn.execute(
+        "UPDATE lemmas SET law_json = ? WHERE alpha_key = ?",
+        (json.dumps(record, sort_keys=True), key),
+    )
+    conn.commit()
+    conn.close()
+    db = str(tmp_path / "s.db")
+    assert ev.main(["--report", db, "--admit-object", key]) == 1
+    out = capsys.readouterr().out
+    assert "STRICT REPLAY FAILED" in out
+
+
+def test_main_admit_object_unknown_kind_cli(tmp_path, capsys):
+    """An unclassifiable record fails the CLI admit, not silently."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(conn, _BY_NAME["id_add"])
+    record = ev.stored_object(conn, key)
+    record["kind"] = "widget"
+    conn.execute(
+        "UPDATE lemmas SET law_json = ? WHERE alpha_key = ?",
+        (json.dumps(record, sort_keys=True), key),
+    )
+    conn.commit()
+    conn.close()
+    db = str(tmp_path / "s.db")
+    assert ev.main(["--report", db, "--admit-object", key]) == 1
+    out = capsys.readouterr().out
+    assert "unknown object kind" in out

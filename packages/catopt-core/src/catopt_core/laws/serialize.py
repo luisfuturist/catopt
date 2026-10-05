@@ -32,6 +32,17 @@ procedural remainder:
   the evidence store keys lemma rows by.  The same canonicalisation
   ``tools/law_proposal._key`` always used, lifted to core so the
   store needs no torch-side import to key a row.
+* the object record — :func:`object_to_data` / :func:`object_from_data`
+  / :func:`object_kind` generalise the law record into the *declared
+  object* of ADR 0004: the same fields a law record carries plus a
+  ``"kind"`` marking the declaration's provenance (``OBJECT_KINDS`` —
+  ``"law"`` for a shipped/admitted law, ``"abstraction"`` for an
+  introduced object, ``"bridge"`` for a spelling bridge).  Stage-1
+  objects are all ``Rewrite``-shaped, so every kind rebuilds through
+  the same codec; the kind is provenance the store reads, not part
+  of the 2-cell.  This record ``"kind"`` is *not*
+  :attr:`Rewrite.kind` — that property is the kernel taxonomy
+  (axiom/lemma/redundant) and stays derivable from ``derivation``.
 
 Not re-exported by ``catopt_core.laws.__init__`` — import it as
 ``catopt_core.laws.serialize`` (same posture as ``laws.cond``).
@@ -52,18 +63,32 @@ from catopt_core.laws.cond import (
 
 __all__ = [
     "LAW_FORMAT",
+    "OBJECT_KINDS",
     "alpha_key",
     "law_from_data",
     "law_to_data",
     "missing_hooks",
+    "object_from_data",
+    "object_kind",
+    "object_to_data",
 ]
 
 #: Bump when the record layout or reconstruction semantics change.
 #: v2 adds the ``"dspec"`` field (declarative derive specs are data)
 #: and the optional ``"cert"`` field.  ``"cert"`` needs no bump:
 #: :func:`law_from_data` reads explicit keys only, so older readers
-#: ignore it and older records (without the key) still load.
+#: ignore it and older records (without the key) still load.  The
+#: ``"kind"`` field (the object-record generalisation) follows the
+#: same precedent: absent means ``"law"``, so v2 covers it.
 LAW_FORMAT = 2
+
+#: The declaration kinds an object record may carry — the provenance
+#: mark distinguishing a shipped law (``"law"``) from a synthesized
+#: object (``"abstraction"``, ``"bridge"``).  Only ``"law"`` has
+#: shipped inhabitants today; the non-law kinds name what stage 3's
+#: admission gauntlet will mint.  Unrelated to :attr:`Rewrite.kind`,
+#: the kernel-taxonomy property.
+OBJECT_KINDS = frozenset(("law", "abstraction", "bridge"))
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +239,16 @@ def law_to_data(
     it.  The certificate proves the derivation replayed on ONE
     concrete instance, not the law's semantic validity, and it stays
     record-level: ``law_from_data`` never folds it into the Rewrite.
+
+    The record is a ``"law"``-kind object record: ``"kind"`` marks
+    the declaration's provenance (see :func:`object_to_data` for the
+    non-law kinds) — record-level metadata like ``"version"``, not
+    part of the 2-cell.
     """
     missing = missing_hooks(rule)
     return {
         "version": LAW_FORMAT,
+        "kind": "law",
         "name": rule.name,
         "law": rule.law,
         "lhs": term_to_data(rule.lhs),
@@ -262,3 +293,61 @@ def law_from_data(data: dict[str, Any]) -> Rewrite:
         cond=data.get("cond"),
         dspec=data.get("dspec"),
     )
+
+
+# ---------------------------------------------------------------------------
+#  The object record — a declared object's provenance mark
+# ---------------------------------------------------------------------------
+#
+#  An *introduced abstraction* (ADR 0004) is stored as the same
+#  record a law takes — pattern pair, ``cond``/``dspec`` guards, tags,
+#  derivation, cert — plus a ``"kind"`` field marking the
+#  declaration's provenance.  Stage-1 objects are all
+#  ``Rewrite``-shaped, so the codec below is the law codec with kind
+#  stamped/validated; when a kind grows a non-``Rewrite`` body the
+#  dispatch lands here, not in every reader.
+
+
+def object_kind(data: dict[str, Any]) -> str:
+    """Return the declaration kind a record claims.
+
+    ``"law"`` when the record carries no ``"kind"`` key — every
+    record written before the object generalisation is a law by
+    provenance, so absence defaults honestly rather than failing.
+    """
+    return data.get("kind", "law")
+
+
+def object_to_data(
+    rule: Rewrite, cert: Certificate | None = None, *, kind: str
+) -> dict[str, Any]:
+    """Serialise *rule* as a declared-object record of *kind*.
+
+    The object record is the law record with the declaration's
+    provenance stamped: *kind* must be one of :data:`OBJECT_KINDS`
+    (an explicit, required argument — a declaration must say what it
+    declares).  ``kind="law"`` reproduces :func:`law_to_data` output
+    exactly; the non-law kinds are for objects the admission path
+    synthesizes, declared as data rather than shipped as ``R(...)``.
+    """
+    if kind not in OBJECT_KINDS:
+        raise ValueError(f"unknown object kind: {kind!r}")
+    data = law_to_data(rule, cert=cert)
+    data["kind"] = kind
+    return data
+
+
+def object_from_data(data: dict[str, Any]) -> Rewrite:
+    """Rebuild a declared object from an object record.
+
+    Every kind in :data:`OBJECT_KINDS` is ``Rewrite``-shaped at this
+    stage — the object language's first inhabitants are
+    laws-as-objects — so admission reconstructs a ``Rewrite`` for any
+    known kind.  An unrecognised ``"kind"`` is a ``ValueError``, not
+    a silent admit: a record the codec cannot classify must not
+    rebuild into something trusted.
+    """
+    kind = object_kind(data)
+    if kind not in OBJECT_KINDS:
+        raise ValueError(f"unknown object kind: {kind!r}")
+    return law_from_data(data)

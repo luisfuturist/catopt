@@ -17,19 +17,28 @@ Three tables:
   ``(alpha_key, corpus_hash, rules_hash, code_rev, run_id)``.  The
   columns are exactly the fields the pipeline's ``Evidence`` record
   already computes — this module measures nothing, it persists.
-* ``lemmas`` — one row per *admitted law*: the full
+* ``lemmas`` — one row per *declared object*: the full
   ``laws.serialize.law_to_data`` record under the same alpha-normal
   key, so ``--admit`` rebuilds a live ``Rewrite`` straight from the
-  store.  The ``serializable`` / ``missing_hooks`` fields inside the
-  JSON record say honestly which laws are full-data and which are
-  pattern(+cond) with a ``check``/``derive`` remainder that still
-  needs code — see ``project/retros/lemma-store.md``.  When the law
-  carries a ``derivation`` annotation, :func:`store_lemma` also
+  store.  The record's ``"kind"`` field marks the declaration's
+  provenance — ``"law"`` for a shipped/admitted law (the object's
+  first inhabitants), ``"abstraction"`` / ``"bridge"`` for objects
+  the admission path synthesizes (ADR 0004 — see
+  ``project/retros/object-record.md``).  ``"kind"`` lives *inside*
+  the record, not a column: the record is the self-describing
+  document (the ``cert`` field set the precedent), and a record
+  written before the field existed reads as ``"law"`` — no schema
+  migration.  The ``serializable`` / ``missing_hooks`` fields inside
+  the JSON record say honestly which laws are full-data and which
+  are pattern(+cond) with a ``check``/``derive`` remainder that
+  still needs code — see ``project/retros/lemma-store.md``.  When
+  the law carries a ``derivation`` annotation, :func:`store_lemma`
+  (equivalently :func:`store_object` with ``kind="law"``) also
   materializes it as a replayable certificate
   (``catopt_discovery.lemma_cert.materialize``) and stores it in the
-  record's ``"cert"`` field — ``--admit`` replays it strictly, so a
-  stored lemma's derivation is a verifiable proof, not just
-  provenance metadata.
+  record's ``"cert"`` field — ``--admit`` / ``--admit-object``
+  replays it strictly, so a stored object's derivation is a
+  verifiable proof, not just provenance metadata.
 
 Scope keys — the honest boundary of a cached verdict:
 
@@ -56,6 +65,10 @@ CLI — history over the store, plus the lemma seam::
         --add-lemma softmax_fold
     .venv/bin/python -m catopt_discovery.evidence --report /tmp/laws.db \
         --admit '<alpha_key>'
+    .venv/bin/python -m catopt_discovery.evidence --report /tmp/laws.db \
+        --add-object silu_mul_form --kind abstraction
+    .venv/bin/python -m catopt_discovery.evidence --report /tmp/laws.db \
+        --admit-object '<alpha_key>'
 """
 
 from __future__ import annotations
@@ -369,17 +382,22 @@ def latest_verdicts(
 
 
 # ---------------------------------------------------------------------------
-#  Lemmas — laws as stored data, reconstructable into live rewrites
+#  Objects — declared objects as stored data, reconstructable into
+#  live rewrites
 # ---------------------------------------------------------------------------
 #
-#  A lemma row is the seam between the verdict cache and the library:
-#  a SHIP candidate the emit machinery wrote up can be *stored*, and
-#  ``--admit`` turns the stored record back into a ``Rewrite`` object
-#  that fires.  The heavy machinery stays lazy — the verdict-report
-#  path never imports catopt.
+#  A ``lemmas`` row is the seam between the verdict cache and the
+#  library: a SHIP candidate the emit machinery wrote up — or any
+#  declared object — can be *stored*, and ``--admit`` turns the
+#  stored record back into a ``Rewrite`` object that fires.  The
+#  table's name predates the generalisation: it is now the
+#  *declared-object* store, and the record's ``"kind"`` field marks
+#  what each row declares (ADR 0004, plan 0017 stage 1).  The heavy
+#  machinery stays lazy — the verdict-report path never imports
+#  catopt.
 
 
-#: Sentinel for :func:`store_lemma`'s ``cert=`` — distinguishes the
+#: Sentinel for :func:`store_object`'s ``cert=`` — distinguishes the
 #: default ("materialize the recorded derivation") from an explicit
 #: ``None`` ("store no certificate").
 _UNSET: Any = object()
@@ -407,38 +425,42 @@ def _materialize_cert(rule: Any, universe: Any) -> Any:
     return cert
 
 
-def store_lemma(
+def store_object(
     conn: sqlite3.Connection,
     rule: Any,
     corpus_hash: str = "",
     *,
+    kind: str = "law",
     cert: Any = _UNSET,
     universe: Any = None,
 ) -> str:
-    """Persist *rule*'s data form in ``lemmas``; return its alpha key.
+    """Persist *rule* as a declared-object row; return its alpha key.
 
-    The row's ``law_json`` is the full
-    ``catopt_core.laws.serialize.law_to_data`` record — pattern pair,
-    ``cond``, tags, derivation, error bound, and the
-    ``serializable`` / ``missing_hooks`` honesty flags.  A rule whose
-    ``check``/``derive`` needs code is stored *flagged*, not dropped:
-    the record says exactly which parts data cannot carry.
-    ``corpus_hash`` records which corpus context the law was measured
-    under (``""`` when none applies — e.g. storing a shipped law).
+    The row's ``law_json`` is the full object record
+    (``catopt_core.laws.serialize.object_to_data``) — pattern pair,
+    ``cond``, ``dspec``, tags, derivation, error bound, the
+    ``serializable`` / ``missing_hooks`` honesty flags, and the
+    ``"kind"`` field marking the declaration's provenance (one of
+    ``OBJECT_KINDS``; the codec raises ``ValueError`` on an
+    unrecognised kind).  A rule whose ``check``/``derive`` needs code
+    is stored *flagged*, not dropped: the record says exactly which
+    parts data cannot carry.  ``corpus_hash`` records which corpus
+    context the object was measured under (``""`` when none applies
+    — e.g. storing a shipped law).
 
     ``cert=`` controls the record's ``"cert"`` field: the default
     materializes the rule's recorded ``derivation`` as a replayable
-    certificate (through ``catopt_discovery.lemma_cert.materialize`` under
-    *universe*); an explicit :class:`Certificate` embeds as given;
-    an explicit ``None`` stores ``cert: null``.  Whatever the path,
-    the stored cert is the honest boundary — ``null`` where no
+    certificate (through ``catopt_discovery.lemma_cert.materialize``
+    under *universe*); an explicit :class:`Certificate` embeds as
+    given; an explicit ``None`` stores ``cert: null``.  Whatever the
+    path, the stored cert is the honest boundary — ``null`` where no
     derivation replays, never a stub.
     """
-    from catopt_core.laws.serialize import alpha_key, law_to_data
+    from catopt_core.laws.serialize import alpha_key, object_to_data
 
     if cert is _UNSET:
         cert = _materialize_cert(rule, universe)
-    data = law_to_data(rule, cert=cert)
+    data = object_to_data(rule, cert=cert, kind=kind)
     key = repr(alpha_key(rule.lhs, rule.rhs))
     with conn:
         conn.execute(
@@ -463,21 +485,42 @@ def store_lemma(
     return key
 
 
-def admit_lemma(
-    conn: sqlite3.Connection, alpha_key: str
-) -> tuple[Any, dict] | None:
-    """Rebuild a stored lemma as a live ``Rewrite``, or ``None``.
+def store_lemma(
+    conn: sqlite3.Connection,
+    rule: Any,
+    corpus_hash: str = "",
+    *,
+    cert: Any = _UNSET,
+    universe: Any = None,
+) -> str:
+    """Persist *rule*'s data form in ``lemmas``; return its alpha key.
 
-    Returns ``(rule, record)`` — the reconstructed rule plus the
-    parsed ``law_to_data`` record, so the caller can read
-    ``record["serializable"]`` / ``record["missing_hooks"]`` before
-    trusting the rule to fire identically to its source.  A
-    ``serializable: false`` record still rebuilds — pattern + cond —
-    but the reconstructed rule fires without the dropped hooks.  The
-    record's ``"cert"`` field stays on the record — decode + verify
-    it with :func:`stored_certificate`.
+    The law-flavoured spelling of :func:`store_object` with
+    ``kind="law"`` — a stored law is a ``"law"``-kind declared
+    object.  See :func:`store_object` for the record fields and the
+    ``cert=`` semantics.
     """
-    from catopt_core.laws.serialize import law_from_data
+    return store_object(
+        conn,
+        rule,
+        corpus_hash,
+        kind="law",
+        cert=cert,
+        universe=universe,
+    )
+
+
+def stored_object(
+    conn: sqlite3.Connection, alpha_key: str
+) -> dict | None:
+    """Return the stored object record for *alpha_key*, or ``None``.
+
+    The parsed ``law_json`` with ``record["kind"]`` made explicit —
+    a row written before the field existed defaults to ``"law"``
+    (``laws.serialize.object_kind``), since every pre-object record
+    is a law by provenance.
+    """
+    from catopt_core.laws.serialize import object_kind
 
     row = conn.execute(
         "SELECT law_json FROM lemmas WHERE alpha_key = ?",
@@ -486,11 +529,53 @@ def admit_lemma(
     if row is None:
         return None
     data = json.loads(row["law_json"])
-    return law_from_data(data), data
+    data["kind"] = object_kind(data)
+    return data
+
+
+def admit_object(
+    conn: sqlite3.Connection, alpha_key: str
+) -> tuple[Any, dict] | None:
+    """Rebuild a stored object as a live ``Rewrite``, or ``None``.
+
+    Returns ``(rule, record)`` — the reconstructed rule plus the
+    parsed object record, so the caller can read ``record["kind"]``,
+    ``record["serializable"]`` and ``record["missing_hooks"]`` before
+    trusting the rule to fire identically to its source.  A
+    ``serializable: false`` record still rebuilds — pattern + cond —
+    but the reconstructed rule fires without the dropped hooks.  A
+    record claiming a kind the codec does not know raises
+    ``ValueError`` — a declaration the store cannot classify is a
+    failure to surface, never a silent admit.  The record's
+    ``"cert"`` field stays on the record — decode + verify it with
+    :func:`stored_certificate`.
+    """
+    from catopt_core.laws.serialize import object_from_data
+
+    data = stored_object(conn, alpha_key)
+    if data is None:
+        return None
+    return object_from_data(data), data
+
+
+def admit_lemma(
+    conn: sqlite3.Connection, alpha_key: str
+) -> tuple[Any, dict] | None:
+    """Rebuild a stored lemma as a live ``Rewrite``, or ``None``.
+
+    The law-flavoured spelling of :func:`admit_object` — the record
+    shape and admission semantics are identical; ``"lemma"`` names
+    the ``kind="law"`` inhabitant of the object store.
+    """
+    return admit_object(conn, alpha_key)
 
 
 def lemma_rows(conn: sqlite3.Connection) -> list[dict]:
-    """Return every stored lemma row, newest first."""
+    """Return every stored object row in ``lemmas``, newest first.
+
+    The table predates the generalisation — each row is a declared
+    object whose ``law_json`` record carries its ``"kind"``.
+    """
     return [
         dict(r)
         for r in conn.execute(
@@ -500,10 +585,10 @@ def lemma_rows(conn: sqlite3.Connection) -> list[dict]:
 
 
 def stored_certificate(record: dict, rules: Any = None) -> Any:
-    """Rebuild + strictly verify the cert a lemma record carries.
+    """Rebuild + strictly verify the cert an object record carries.
 
-    *record* is the parsed ``law_to_data`` dict (the second half of
-    :func:`admit_lemma`'s return).  *rules* resolves the rule names
+    *record* is the parsed object-record dict (the second half of
+    :func:`admit_object`'s return).  *rules* resolves the rule names
     the steps reference — default the shipped ``ALL_RULES``, which
     covers a stored derivation's premises by construction (they are
     shipped laws).  Returns ``None`` when the record claims no
@@ -678,8 +763,10 @@ def render_report(
     return "\n".join(lines)
 
 
-def _store_lemma_cli(conn: sqlite3.Connection, name: str) -> int:
-    """Store a shipped ``ALL_RULES`` law by name as a lemma row."""
+def _store_object_cli(
+    conn: sqlite3.Connection, name: str, kind: str
+) -> int:
+    """Store a shipped ``ALL_RULES`` law by name as an object row."""
     from catopt_core.laws import ALL_RULES
 
     by_name = {r.name: r for r in ALL_RULES}
@@ -687,20 +774,19 @@ def _store_lemma_cli(conn: sqlite3.Connection, name: str) -> int:
     if rule is None:
         print(f"no shipped law named {name!r}")
         return 1
-    key = store_lemma(conn, rule)
-    data = json.loads(
-        conn.execute(
-            "SELECT law_json FROM lemmas WHERE alpha_key = ?", (key,)
-        ).fetchone()["law_json"]
-    )
+    key = store_object(conn, rule, kind=kind)
+    record = stored_object(conn, key)
+    if record is None:  # unreachable — the row was just written
+        return 1
     state = (
         "full-data"
-        if data["serializable"]
-        else "missing hooks: " + ", ".join(data["missing_hooks"])
+        if record["serializable"]
+        else "missing hooks: " + ", ".join(record["missing_hooks"])
     )
     print(f"stored {rule.name}  [{state}]")
+    print(f"  kind: {record['kind']}")
     print(f"  alpha_key = {key}")
-    cert = data.get("cert")
+    cert = record.get("cert")
     if cert is None:
         print("  cert: none recorded")
     else:
@@ -711,9 +797,13 @@ def _store_lemma_cli(conn: sqlite3.Connection, name: str) -> int:
     return 0
 
 
-def _admit_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
-    """Rebuild a stored lemma into a live ``Rewrite`` and show it."""
-    got = admit_lemma(conn, alpha_key)
+def _admit_object_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
+    """Rebuild a stored object into a live ``Rewrite`` and show it."""
+    try:
+        got = admit_object(conn, alpha_key)
+    except ValueError as exc:
+        print(f"cannot admit object under {alpha_key}: {exc}")
+        return 1
     if got is None:
         print(f"no lemma stored under {alpha_key}")
         return 1
@@ -724,6 +814,7 @@ def _admit_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
         else "missing hooks: " + ", ".join(data["missing_hooks"])
     )
     print(f"admitted {rule.name}  [{state}]")
+    print(f"  kind: {data['kind']}")
     print(f"  {rule!r}")
     try:
         cert = stored_certificate(data)
@@ -738,6 +829,32 @@ def _admit_cli(conn: sqlite3.Connection, alpha_key: str) -> int:
             " — replayed strict"
         )
     return 0
+
+
+#: The ``--kind`` choices the CLI accepts — mirrors
+#: ``laws.serialize.OBJECT_KINDS``, kept literal so the report path
+#: stays catopt-free; ``object_to_data`` validates authoritatively.
+_OBJECT_KIND_CHOICES = ("abstraction", "bridge", "law")
+
+
+def _op_dispatch(
+    args: argparse.Namespace, conn: sqlite3.Connection
+) -> int | None:
+    """Run a store/admit CLI op, or ``None`` when none was given.
+
+    ``--add-lemma`` / ``--admit`` are the law-flavoured spellings of
+    ``--add-object`` / ``--admit-object`` — the general seam is the
+    object one.
+    """
+    if args.add_lemma is not None:
+        return _store_object_cli(conn, args.add_lemma, args.kind)
+    if args.add_object is not None:
+        return _store_object_cli(conn, args.add_object, args.kind)
+    if args.admit is not None:
+        return _admit_object_cli(conn, args.admit)
+    if args.admit_object is not None:
+        return _admit_object_cli(conn, args.admit_object)
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -767,24 +884,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--add-lemma",
         metavar="NAME",
-        help="store a shipped ALL_RULES law as a lemma row",
+        help="store a shipped ALL_RULES law as a lemma row"
+        " (--add-object's law-flavoured spelling)",
     )
     parser.add_argument(
         "--admit",
         metavar="ALPHA_KEY",
-        help="rebuild a stored lemma into a live Rewrite",
+        help="rebuild a stored lemma into a live Rewrite"
+        " (--admit-object's law-flavoured spelling)",
+    )
+    parser.add_argument(
+        "--add-object",
+        metavar="NAME",
+        help="store a shipped ALL_RULES law as a declared-object row",
+    )
+    parser.add_argument(
+        "--admit-object",
+        metavar="ALPHA_KEY",
+        help="rebuild a stored declared object into a live Rewrite",
+    )
+    parser.add_argument(
+        "--kind",
+        metavar="KIND",
+        choices=_OBJECT_KIND_CHOICES,
+        default="law",
+        help="declaration kind for --add-object / --add-lemma"
+        " (default: law)",
     )
     args = parser.parse_args(argv)
-    lemma_op = args.add_lemma is not None or args.admit is not None
-    if not lemma_op and not Path(args.report).is_file():
+    ops = (
+        args.add_lemma,
+        args.add_object,
+        args.admit,
+        args.admit_object,
+    )
+    if (
+        not any(o is not None for o in ops)
+        and not Path(args.report).is_file()
+    ):
         print(f"no evidence store at {args.report}")
         return 1
     conn = connect(args.report)
     try:
-        if args.add_lemma is not None:
-            return _store_lemma_cli(conn, args.add_lemma)
-        if args.admit is not None:
-            return _admit_cli(conn, args.admit)
+        rc = _op_dispatch(args, conn)
+        if rc is not None:
+            return rc
         print(
             render_report(
                 conn,
