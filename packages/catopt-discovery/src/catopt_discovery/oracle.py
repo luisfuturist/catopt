@@ -305,6 +305,40 @@ def _shape_numel(shape: tuple) -> int:
     return n
 
 
+#: Cap on ``_reshape_targets`` — raised from 7 when interior adjacent
+#: merges joined the candidate list (rank >= 4 shapes): every existing
+#: seat keeps its index; the new candidates land past them.
+_RESHAPE_TARGET_CAP = 12
+
+
+def _interior_merges(shape: tuple) -> Iterable[tuple]:
+    """Yield the interior adjacent-pair merges of *shape*."""
+    for i in range(1, len(shape) - 2):
+        yield (*shape[:i], shape[i] * shape[i + 1], *shape[i + 2 :])
+
+
+def _expand_targets(sh: tuple, r: int) -> list[tuple]:
+    """Broadcastable target shapes for an ``expand`` metavariable."""
+    outs = [(2, *sh)] if r else [(2,)]
+    ones = [i for i, d in enumerate(sh) if d == 1]
+    if not ones:
+        return outs
+    grown = list(sh)
+    grown[ones[0]] = 3
+    outs.append(tuple(grown))
+    # Each 1-extent grown by a small factor — a repeat-chain's expand
+    # grows exactly the unsqueezed axis (the ``ES`` target in
+    # ``unsqueeze→expand→reshape``).  Appended after the original
+    # grown-first seat to keep domain indices.
+    for i in ones:
+        for f in (2, 3):
+            g = list(sh)
+            g[i] = f
+            if tuple(g) not in outs:
+                outs.append(tuple(g))
+    return outs
+
+
 def _reshape_targets(shape: tuple) -> list[tuple]:
     """Same-numel targets for a reshape ``shape`` metavariable."""
     n = _shape_numel(shape)
@@ -320,6 +354,11 @@ def _reshape_targets(shape: tuple) -> list[tuple]:
     if len(shape) >= 3:
         cands.append((shape[0] * shape[1], *shape[2:]))
         cands.append((*shape[:-2], shape[-2] * shape[-1]))
+        # Interior adjacent merges — a repeat-chain's reshape merges
+        # dims ``d-1``/``d`` (the ``head * r`` pair), which need not
+        # be an edge pair.  Appended after the edge merges so existing
+        # domain indices keep their seats.
+        cands.extend(_interior_merges(shape))
     out: list[tuple] = []
     for c in cands:
         if (
@@ -328,7 +367,7 @@ def _reshape_targets(shape: tuple) -> list[tuple]:
             and _shape_numel(c) == n
         ):
             out.append(c)
-    return out[:7]
+    return out[:_RESHAPE_TARGET_CAP]
 
 
 def _attr_options(
@@ -399,13 +438,7 @@ def _attr_options(
         case "reshape" | "view":
             return [{"shape": s} for s in _reshape_targets(sh)]
         case "expand" | "broadcast_to":
-            outs = [(2, *sh)] if r else [(2,)]
-            ones = [i for i, d in enumerate(sh) if d == 1]
-            if ones:
-                grown = list(sh)
-                grown[ones[0]] = 3
-                outs.append(tuple(grown))
-            return [{"shape": s} for s in outs]
+            return [{"shape": s} for s in _expand_targets(sh, r)]
         case "chunk":
             out = []
             for c in (1, 2):
@@ -704,6 +737,20 @@ _VIEWED_SHAPES: tuple = (
     (2, 3, 1),
 )
 
+#: Extra viewed-bank shapes for patterns that contain an
+#: operand-*chained* view (``reshape(expand(unsqueeze(...)))``) — the
+#: rank-4 ``(b, t, h_kv, d)`` / ``(b, t, h, d)`` pair.  The chain's
+#: intermediate tensors are rank-4+, and ``gqa_absorb_repeat``'s
+#: corner (``repeat-heads``: ``q[-2] == k[-2] * r``) needs the head-dim
+#: product only a rank-4 pair supplies.  Scoped to chained patterns so
+#: chain-free enumerations are byte-identical: appending to the
+#: universal bank would add free-operand cells at existing index sums
+#: and displace already-measured window-tail sites.
+_CHAIN_VIEWED_SHAPES: tuple = (
+    (2, 3, 2, 4),
+    (2, 3, 4, 4),
+)
+
 
 #: Per-op literal-constant domain — the values a metavariable's
 #: *parent op* admits, keyed by the op name.  The leaf bank's generic
@@ -790,12 +837,19 @@ def _tuple_sources(mv: str) -> list[Any]:
 
 
 def _leaf_bindings(
-    mv: str, parents: set[str], derived: Iterable[tuple]
+    mv: str,
+    parents: set[str],
+    derived: Iterable[tuple],
+    extra_viewed: tuple = (),
 ) -> list[Any]:
     """Candidate bindings for one leaf metavariable.
 
     ``derived`` is the extra shape list computed from *other* leaves'
     choices (filled in by the enumerator for the free operand).
+    ``extra_viewed`` appends pattern-scoped shapes just past the
+    viewed bank — the rank-4 pair a chained-view pattern needs
+    (:data:`_CHAIN_VIEWED_SHAPES`); it stays empty otherwise so a
+    chain-free enumeration is unchanged.
     """
     out: list[Any] = []
     if "getitem" in parents:
@@ -807,7 +861,7 @@ def _leaf_bindings(
     # (measured: for a three-free-operand pattern the first equal
     # site lay ~10⁴ sites into the scalar-led order, ~40 into the
     # operand-led one).
-    for s in itertools.chain(derived, _VIEWED_SHAPES):
+    for s in itertools.chain(derived, _VIEWED_SHAPES, extra_viewed):
         out.append(Var(mv, TensorType(tuple(s))))
     if not parents or all(p not in _VIEWISH for p in parents):
         # A free operand may bind a literal scalar — the corpus does,
@@ -892,10 +946,23 @@ def _diag_product(lists: list) -> Iterable[tuple]:
         yield from _combos_at_sum(tuple(lists), total)
 
 
-def _viewed_bindings(mvs: list[str], parents: dict) -> Iterable[dict]:
+def _has_chained_view(nodes: list[Op]) -> bool:
+    """Whether *nodes* contain an operand-linked view pair."""
+    ids = {id(n) for n in nodes}
+    return any(
+        n.op in _VIEWISH and n.args and id(n.args[0]) in ids
+        for n in nodes
+    )
+
+
+def _viewed_bindings(
+    mvs: list[str], parents: dict, extra_viewed: tuple = ()
+) -> Iterable[dict]:
     """Yield binding dicts for metavariables under a view node."""
     viewed = [m for m in mvs if parents.get(m, set()) & _VIEWISH]
-    lists = [_leaf_bindings(m, parents[m], ()) for m in viewed]
+    lists = [
+        _leaf_bindings(m, parents[m], (), extra_viewed) for m in viewed
+    ]
     for combo in _diag_product(lists):
         yield dict(zip(viewed, combo, strict=True))
 
@@ -929,55 +996,234 @@ def _pad_insertions(sh: tuple) -> Iterable[tuple]:
         yield (*sh[:i], 1, *sh[i:])
 
 
-def _attr_groups(nodes: list[Op]) -> list[tuple[str, Op]]:
-    """Group *nodes* by their sorted attr-metavar name sets.
+def _mv_names(node: Op) -> tuple:
+    """Return the node's sorted attr-metavariable name tuple."""
+    return tuple(
+        sorted(v for v in node.attrs.values() if isinstance(v, str))
+    )
 
-    Shared metavariable names across LHS/RHS resolve once — each
-    group carries one representative node.
+
+def _attr_components(nodes: list[Op]) -> Any:
+    """Union-find ``find`` over *nodes*' attr-metavar components.
+
+    Two merge rules:
+
+    * **shared name set** — nodes whose sorted attr-metavar name
+      tuples coincide resolve once (the LHS/RHS ``sdpa`` twin);
+    * **operand link** — a *view* node whose first operand *is*
+      another metavariable-attred node chains onto it
+      (``expand(unsqueeze(k, "UDk"), "ESk")``): the outer view's
+      domain depends on the inner draw, so the link enumerates the
+      chain's draws jointly.  Non-view consumers (``dropout`` over a
+      ``softmax``) keep their own group — their attr domains are
+      shape-independent, and linking them would only reshuffle the
+      diagonal order.
     """
-    groups: dict[str, Op] = {}
-    order: list[str] = []
-    for node in nodes:
-        names = tuple(
-            sorted(v for v in node.attrs.values() if isinstance(v, str))
-        )
+    idx = {id(n): i for i, n in enumerate(nodes)}
+    parent = list(range(len(nodes)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    seen: dict[tuple, int] = {}
+    for i, node in enumerate(nodes):
+        names = _mv_names(node)
+        # Nameless nodes bind nothing — keep them out of the groups
+        # (a fabricated literal-attr node must not mint a group).
         if not names:
             continue
-        key = "|".join(names)
-        if key not in groups:
-            groups[key] = node
-            order.append(key)
-    return [(key, groups[key]) for key in order]
+        if names in seen:
+            parent[find(i)] = find(seen[names])
+        else:
+            seen[names] = i
+        if (
+            node.op in _VIEWISH
+            and node.args
+            and id(node.args[0]) in idx
+        ):
+            parent[find(i)] = find(idx[id(node.args[0])])
+    return find
+
+
+def _attr_groups(nodes: list[Op]) -> list[list[Op]]:
+    """Group *nodes* into connected attr-metavar components."""
+    find = _attr_components(nodes)
+    comps: dict[int, list[Op]] = {}
+    order: list[int] = []
+    for i, node in enumerate(nodes):
+        if not _mv_names(node):
+            continue
+        r = find(i)
+        if r not in comps:
+            comps[r] = []
+            order.append(r)
+        comps[r].append(node)
+    return [comps[r] for r in order]
+
+
+def _chain_order(members: list[Op]) -> list[Op]:
+    """Order a chained group innermost-first (operand before consumer).
+
+    ``depth`` counts linked operands below a node; a member whose
+    operand is not in the group is a chain root.  The sort is stable,
+    so same-depth members keep discovery order.
+    """
+    ids = {id(n) for n in members}
+    depth: dict[int, int] = {}
+
+    def d(n: Op) -> int:
+        if id(n) not in depth:
+            depth[id(n)] = (
+                1 + d(n.args[0])
+                if n.args and id(n.args[0]) in ids
+                else 0
+            )
+        return depth[id(n)]
+
+    return sorted(members, key=d)
+
+
+@dataclass(frozen=True)
+class _ChainGroup:
+    """Pseudo-node for a chained attr group, for ``_attr_merge``.
+
+    A chained group's option dicts are keyed by *metavariable name*
+    (the draws are joint, not per-node), so ``attrs`` maps each
+    metavariable name to itself — the merge's ``$attr:name`` lookup
+    reads the value straight through.
+    """
+
+    attrs: dict
+
+
+def _chain_shape(node: Op, assign: dict, subst: dict) -> Any:
+    """Return the operand's shape under the partial chain draw.
+
+    Instantiating the operand under the drawn ``$attr:`` bindings
+    resolves the inner view's attrs, so ``_operand_shape`` returns the
+    real intermediate shape — the ``unsqueeze`` output, not the
+    pre-view leaf.
+    """
+    if not node.args:
+        return ()
+    try:
+        bound = _term_instantiate(
+            node.args[0],
+            {**subst, **{f"$attr:{m}": v for m, v in assign.items()}},
+        )
+    except Exception:
+        return ()
+    return _operand_shape(bound)
+
+
+def _chain_extend(node: Op, acc: list[dict], subst: dict) -> list[dict]:
+    """Extend each partial assignment by *node*'s consistent options.
+
+    An option that disagrees with an already-drawn metavariable
+    binding is dropped — resolve-once, as ``_attr_merge`` applies
+    across groups.  A partial assignment with no consistent option
+    dies with it.
+    """
+    mv_attrs = {
+        k: v for k, v in node.attrs.items() if isinstance(v, str)
+    }
+    nxt: list[dict] = []
+    for assign in acc:
+        shape = _chain_shape(node, assign, subst)
+        opts = _attr_options(node.op, tuple(mv_attrs), shape) or ()
+        for o in opts:
+            vals = {mv_attrs[k]: o[k] for k in mv_attrs if k in o}
+            if any(
+                assign[mv] != v
+                for mv, v in vals.items()
+                if mv in assign
+            ):
+                continue
+            nxt.append({**assign, **vals})
+    return nxt
+
+
+def _chain_domain(members: list[Op], subst: dict) -> list[dict] | None:
+    """Enumerate consistent joint attr assignments over a chain.
+
+    Members are processed innermost-first; each node's attr options
+    are computed against the operand shape the *drawn* inner attrs
+    produce (:func:`_chain_shape`) — the cond DSL's
+    ``unsq-out``/``reshape-out``/``transpose-out`` vocabulary made
+    concrete through the same typing engine the eval side uses — so
+    chained domains no longer fall back to the leaf shape that made
+    them unreachable.  ``None`` marks a member the oracle cannot
+    instantiate honestly — the whole binding is skipped.
+    """
+    acc: list[dict] = [{}]
+    for node in _chain_order(members):
+        acc = _chain_extend(node, acc, subst)
+        if not acc:
+            return None
+    return acc
+
+
+def _is_chained_group(members: list[Op], member_ids: set) -> bool:
+    """Return whether the group links a view onto an attred operand."""
+    return len(members) > 1 and any(
+        m.op in _VIEWISH and m.args and id(m.args[0]) in member_ids
+        for m in members
+    )
+
+
+def _single_domain(node: Op, subst: dict) -> list[dict] | None:
+    """Return one unchained node's option dicts, or ``None``.
+
+    For getitem over a tuple source the index domain is the
+    tuple arity, not an axis extent — options stay {0,1}.
+    Only the metavar'd keys are enumerated — a literal attr
+    contributes no binding and must not veto the domain.
+    """
+    try:
+        bound = (
+            _term_instantiate(node.args[0], subst)
+            if node.args
+            else None
+        )
+    except Exception:
+        bound = None
+    shape = _operand_shape(bound) if bound is not None else ()
+    mv_keys = tuple(
+        k for k, v in node.attrs.items() if isinstance(v, str)
+    )
+    return _attr_options(node.op, mv_keys, shape) or None
 
 
 def _attr_domains(
     nodes: list[Op], subst: dict
-) -> list[tuple[Op, list[dict]]] | None:
+) -> list[tuple[Any, list[dict]]] | None:
     """Return ``(node, option dicts)`` per distinct attr-metavar group.
 
-    Each group is one node's set of attr metavariable names; the
-    option dicts assign concrete values to the node's *attr keys*.
-    ``None`` marks a node the oracle cannot instantiate honestly.
+    Each group is a connected set of nodes — shared metavariable-name
+    sets or operand-chained views (:func:`_attr_groups`).  A single
+    representative node's option dicts assign concrete values to its
+    *attr keys*; a chained group's dicts are keyed by metavariable
+    name and carry the whole chain's consistent draw
+    (:func:`_chain_domain`).  ``None`` marks a node the oracle cannot
+    instantiate honestly.
     """
     out = []
-    for _key, node in _attr_groups(nodes):
-        try:
-            bound = (
-                _term_instantiate(node.args[0], subst)
-                if node.args
-                else None
+    member_ids = {id(n) for n in nodes}
+    for members in _attr_groups(nodes):
+        node = members[0]
+        if _is_chained_group(members, member_ids):
+            assigns = _chain_domain(members, subst)
+            if not assigns:
+                return None
+            mvs = sorted({v for m in members for v in _mv_names(m)})
+            out.append(
+                (_ChainGroup(attrs={m: m for m in mvs}), assigns)
             )
-        except Exception:
-            bound = None
-        shape = _operand_shape(bound) if bound is not None else ()
-        # For getitem over a tuple source the index domain is the
-        # tuple arity, not an axis extent — options stay {0,1}.
-        # Only the metavar'd keys are enumerated — a literal attr
-        # contributes no binding and must not veto the domain.
-        mv_keys = tuple(
-            k for k, v in node.attrs.items() if isinstance(v, str)
-        )
-        opts = _attr_options(node.op, mv_keys, shape)
+            continue
+        opts = _single_domain(node, subst)
         if not opts:
             return None
         out.append((node, opts))
@@ -1030,7 +1276,37 @@ def _metavar_parents(lhs_pat: Any, rhs_pat: Any) -> dict:
     return parents
 
 
-def _diag_groups(groups: list[list]) -> Iterable:
+class _LazySeq:
+    """Indexed pull over a generator — materializes on demand only.
+
+    ``get(i)`` returns the i-th yielded item or ``None`` once the
+    generator is exhausted.  The diag interleaves probe element *a* of
+    every group before any group's *a+1*, so the enumeration only ever
+    materializes the prefix a cap reaches — the eager ``list`` form
+    paid the whole ``(viewed x attr)`` product (plus a
+    ``_lhs_out_shapes`` per base) before the first env yielded, which
+    is what made deep-corner rules like ``gqa_absorb_repeat``
+    unmeasurable.
+    """
+
+    __slots__ = ("_it", "_items", "done")
+
+    def __init__(self, it: Any) -> None:
+        self._it = iter(it)
+        self._items: list = []
+        self.done = False
+
+    def get(self, i: int) -> Any:
+        """Return the i-th item, or ``None`` past the end."""
+        while len(self._items) <= i and not self.done:
+            try:
+                self._items.append(next(self._it))
+            except StopIteration:
+                self.done = True
+        return self._items[i] if i < len(self._items) else None
+
+
+def _diag_groups(groups: list) -> Iterable:
     """Yield ``groups[v][a]`` in increasing ``v + a`` (Cantor) order.
 
     The companion of :func:`_diag_product` for a *ragged* product of
@@ -1041,16 +1317,51 @@ def _diag_groups(groups: list[list]) -> Iterable:
     ahead of any group's deep tail, so a cap truncates a corner of the
     ``(viewed x attr)`` space rather than a whole viewed binding — the
     same fairness :func:`_binding_envs` applies one level up.
+
+    Groups may be plain lists or :class:`_LazySeq` pull sequences; a
+    probe past a group's end marks it done — the yielded order is
+    identical either way.
     """
-    n = len(groups)
+    lazies = [
+        g if isinstance(g, _LazySeq) else _LazySeq(g) for g in groups
+    ]
+    n = len(lazies)
     if not n:
         return
-    top = (n - 1) + max(len(g) for g in groups) - 1
-    for total in range(top + 1):
+    total = 0
+    while not all(g.done for g in lazies):
         for v in range(min(total, n - 1), -1, -1):
-            a = total - v
-            if a < len(groups[v]):
-                yield groups[v][a]
+            item = lazies[v].get(total - v)
+            if item is not None:
+                yield item
+        total += 1
+
+
+def _synth_bases_for(
+    domains: list,
+    viewed: dict,
+    u_shapes: list,
+    lhs_views: list,
+    need_out: bool,
+) -> Iterable:
+    """Yield ``(base, u_shapes, out_shapes)`` for one viewed binding.
+
+    The surviving attr merges of the binding's domain product, in
+    ``_diag_product`` order; the LHS view output shapes are computed
+    per surviving base — lazily, so a capped sweep never pays for the
+    combos it did not reach.  ``out_shapes`` feeds only the free
+    operand's derived bank, so ``need_out=False`` (no free
+    metavariables) leaves it empty — instantiating seven view nodes
+    per base for a dead value is measurable cost.
+    """
+    for combo in _diag_product([d[1] for d in domains]):
+        base = _attr_merge(domains, combo, viewed)
+        if base is None:
+            continue
+        out_shapes = (
+            _lhs_out_shapes(lhs_views, base) if need_out else []
+        )
+        yield (base, u_shapes, out_shapes)
 
 
 def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
@@ -1079,23 +1390,58 @@ def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
     parents = _metavar_parents(lhs_pat, rhs_pat)
     nodes = _view_nodes([lhs_pat, rhs_pat])
     lhs_views = [n for n in _view_nodes([lhs_pat]) if n.args]
-    groups: list[list] = []
-    for viewed in _viewed_bindings(mvs, parents):
+    need_out = bool(
+        [m for m in parents if not (parents.get(m, set()) & _VIEWISH)]
+    )
+    extra = _CHAIN_VIEWED_SHAPES if _has_chained_view(nodes) else ()
+    groups: list = []
+    for viewed in _viewed_bindings(mvs, parents, extra):
         domains = _attr_domains(nodes, viewed)
         if domains is None:
             continue
         u_shapes = [_operand_shape(t) for t in viewed.values()]
-        bases: list[tuple] = []
-        for combo in _diag_product([d[1] for d in domains]):
-            base = _attr_merge(domains, combo, viewed)
-            if base is None:
-                continue
-            bases.append(
-                (base, u_shapes, _lhs_out_shapes(lhs_views, base))
+        group = _LazySeq(
+            _synth_bases_for(
+                domains, viewed, u_shapes, lhs_views, need_out
             )
-        if bases:
-            groups.append(bases)
+        )
+        # A binding whose product is empty (or all merge-conflicts)
+        # contributes no group — the eager form's ``if bases:`` check;
+        # probing the first element preserves the group indexing (and
+        # therefore the yield order) exactly.
+        if group.get(0) is None:
+            continue
+        groups.append(group)
     yield from _diag_groups(groups)
+
+
+def _pull_bases(
+    src: _LazySeq,
+    entries: list[list],
+    total: int,
+    free: list[str],
+    parents: dict,
+    extra: tuple,
+) -> int:
+    """Pull every base due at round *total* into *entries*.
+
+    Returns the count appended.  A base's free-combo generator is
+    built lazily at pull time, so a capped sweep never materializes
+    bases it cannot yield.
+    """
+    added = 0
+    while not src.done and len(entries) <= total:
+        got = src.get(len(entries))
+        if got is None:
+            break
+        base, u_shapes, out_shapes = got
+        derived = _derived_free_shapes(u_shapes, out_shapes)
+        lists = [
+            _leaf_bindings(m, parents[m], derived, extra) for m in free
+        ]
+        entries.append([base, _diag_product(lists), True])
+        added += 1
+    return added
 
 
 def _binding_envs(lhs_pat: Any, rhs_pat: Any) -> Iterable[dict]:
@@ -1116,16 +1462,23 @@ def _binding_envs(lhs_pat: Any, rhs_pat: Any) -> Iterable[dict]:
         m for m in parents if not (parents.get(m, set()) & _VIEWISH)
     )
     # entries[i] = [base, free-combo generator, alive] — the i-th
-    # (viewed x attr) base.  The bases are a bounded few hundred at
-    # worst; materializing them keeps the diagonal loop simple.
+    # (viewed x attr) base.  Entries are pulled lazily: round `total`
+    # only reaches entries with index <= total, so a capped sweep
+    # never materializes bases it cannot yield — the eager form built
+    # every base up front (``gqa_absorb_repeat``'s deep corner made
+    # that unmeasurable).  The yield order is unchanged: entry *i*
+    # still contributes its (total-i)-th free combo at round `total`.
+    extra = (
+        _CHAIN_VIEWED_SHAPES
+        if _has_chained_view(_view_nodes([lhs_pat, rhs_pat]))
+        else ()
+    )
     entries: list[list] = []
-    for base, u_shapes, out_shapes in _synth_bases(lhs_pat, rhs_pat):
-        derived = _derived_free_shapes(u_shapes, out_shapes)
-        lists = [_leaf_bindings(m, parents[m], derived) for m in free]
-        entries.append([base, _diag_product(lists), True])
+    src = _LazySeq(_synth_bases(lhs_pat, rhs_pat))
     total = 0
-    live = len(entries)
-    while live:
+    live = 0
+    while live or not src.done:
+        live += _pull_bases(src, entries, total, free, parents, extra)
         for i in range(min(total, len(entries) - 1), -1, -1):
             entry = entries[i]
             if not entry[2]:

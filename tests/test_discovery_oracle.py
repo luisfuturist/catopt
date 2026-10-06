@@ -7,13 +7,12 @@ skip and veto paths, the mechanical guard features one by one, the
 real-match sweep's check/derive/dedup paths, the ``ill-formed`` /
 ``unproven`` verdicts and the ``--json`` driver.
 
-One honest limitation is pinned rather than fixed: a *nested*
-view-under-view candidate (``transpose(transpose(u,...),...)``)
-crashes ``_attr_domains`` — ``_operand_shape`` delegates to
-``catopt_core.typing._shape_of``, which raises ``TypeError`` on
-unresolved attr metavariables instead of reporting a non-int dim.
-The oracle is single-level-view only, as its docstring's candidate
-family implies; the ``pytest.raises`` test documents the boundary.
+View-under-view chains (``transpose(transpose(u,...),...)`` or the
+``unsqueeze -> expand -> reshape`` triple of ``gqa_absorb_repeat``)
+are grouped into chained attr domains: the outer node's options are
+computed against the operand shape the drawn inner attrs actually
+produce (:func:`catopt_discovery.oracle._chain_domain`), so the
+joint draws are consistent by construction.
 """
 
 import itertools
@@ -78,9 +77,7 @@ def test_leaf_metavars_order_dedup_and_non_str():
 
 
 def test_parents_maps_metavars_to_parent_ops():
-    pat = _p(
-        "mul", _p("select", "U", dim="D", index="I"), "U"
-    )
+    pat = _p("mul", _p("select", "U", dim="D", index="I"), "U")
     parents = vo._parents(pat)
     assert parents["U"] == {"select", "mul"}
 
@@ -118,11 +115,14 @@ def test_dims_norm_shape_numel():
 def test_reshape_targets_same_numel_deduped():
     for s in vo._reshape_targets((2, 3, 4)):
         assert vo._shape_numel(s) == 24
-    assert len(vo._reshape_targets((2, 3, 4))) <= 7
-    # rank >= 3 merges the leading dims; the trailing merge falls
-    # past the 7-entry cap for this shape.
+    assert len(vo._reshape_targets((2, 3, 4))) <= vo._RESHAPE_TARGET_CAP
+    # Edge merges for rank >= 3 (leading and trailing pairs).
     assert (6, 4) in vo._reshape_targets((2, 3, 4))
-    assert (2, 12) not in vo._reshape_targets((2, 3, 4))
+    assert (2, 12) in vo._reshape_targets((2, 3, 4))
+    # Interior adjacent merges — a repeat-chain's head*r pair is
+    # interior for a rank-5 operand.
+    assert (2, 3, 4, 4) in vo._reshape_targets((2, 3, 2, 2, 4))
+    assert (2, 6, 4) in vo._reshape_targets((2, 3, 2, 4))
     # rank >= 2 with an even first dim splits it.
     assert (2, 2, 2, 3) in vo._reshape_targets((4, 2, 3))
 
@@ -170,26 +170,19 @@ def test_attr_options(op, keys, shape, want):
 def test_attr_options_inner_vetoes():
     """Per-key inner conditions of the attr tables."""
     # slice over a non-int extent skips that axis (``continue``).
-    opts = vo._attr_options(
-        "slice", ("dim", "start", "end"), (4, "x")
-    )
+    opts = vo._attr_options("slice", ("dim", "start", "end"), (4, "x"))
     assert opts and all(o["dim"] != -1 for o in opts)
     # chunk needs extent >= chunks; a (1,)-shaped operand admits
     # chunks=1 only.
-    opts = vo._attr_options(
-        "chunk", ("chunks", "dim", "index"), (1,)
-    )
+    opts = vo._attr_options("chunk", ("chunks", "dim", "index"), (1,))
     assert opts and all(o["chunks"] == 1 for o in opts)
     # split needs extent >= 2.
     assert (
-        vo._attr_options("split", ("sizes", "dim", "index"), (1,))
-        == []
+        vo._attr_options("split", ("sizes", "dim", "index"), (1,)) == []
     )
     # narrow over a non-int extent emits no option.
     assert (
-        vo._attr_options(
-            "narrow", ("dim", "start", "length"), ("x",)
-        )
+        vo._attr_options("narrow", ("dim", "start", "length"), ("x",))
         == []
     )
     # permute at rank 0 has no non-empty permutation.
@@ -210,8 +203,7 @@ def test_operand_shape_kinds():
     # not know falls to the walk, which finds only Consts.
     assert vo._operand_shape(_p("add", Const(1), Const(2))) == ()
     assert (
-        vo._operand_shape(_p("frobnicate", _p("neg", Const(1))))
-        == ()
+        vo._operand_shape(_p("frobnicate", _p("neg", Const(1)))) == ()
     )
     # ``_shape_of`` may raise on unresolved attrs — that currently
     # propagates (see the nested-view boundary test below).
@@ -221,25 +213,124 @@ def test_operand_shape_kinds():
         vo._operand_shape(nested)
 
 
-def test_nested_view_candidate_crashes_honestly():
-    """A view-under-view candidate raises in ``_attr_domains``.
+def test_chain_domain_resolves_through_view_outputs():
+    """The unsqueeze→expand→reshape chain enumerates jointly.
 
-    The oracle's candidate family is single-level views; a nested
-    one reaches ``_operand_shape`` on the outer node's bound operand
-    — still carrying the inner node's unresolved attr metavariables —
-    and ``_shape_of`` raises ``TypeError`` rather than reporting a
-    non-int dim.  Pinned as the honest current boundary.
+    Each outer node's attr options are computed against the operand
+    shape the drawn inner attrs produce: ``unsqueeze(u, 2)`` on
+    ``u=(2,3,4)`` yields ``(2,3,1,4)``; ``expand`` grows that 1-axis
+    to ``(2,3,2,4)``; ``reshape``'s interior merge yields ``(2,6,4)``
+    — the ``repeat-chain`` shape triple the pre-chaining domains
+    could never mint.
     """
-    with pytest.raises(TypeError):
-        vo.synthesize(
-            _p(
-                "transpose",
-                _p("transpose", "U", dim0="A", dim1="B"),
-                dim0="A",
-                dim1="B",
-            ),
-            "U",
+    chain = _p(
+        "reshape",
+        _p("expand", _p("unsqueeze", "u", dim="UD"), shape="ES"),
+        shape="RS",
+    )
+    nodes = vo._view_nodes([chain])
+    groups = vo._attr_groups(nodes)
+    assert len(groups) == 1 and len(groups[0]) == 3
+    assigns = vo._chain_domain(groups[0], {"u": _v("u", 2, 3, 4)})
+    # The repeat-merge triple: unsqueeze the last-but-one axis
+    # (``dim=-2`` is the spellable form; ``dim=2`` is not in the axis
+    # domain), grow the inserted 1 to 2, merge dims 2*3 back.
+    assert {"UD": -2, "ES": (2, 3, 2, 4), "RS": (2, 6, 4)} in assigns
+    # Every assignment is chain-consistent: instantiating the inner
+    # views under it produces exactly the shapes the outer options
+    # were drawn for.
+    for a in assigns:
+        subst = {f"$attr:{k}": v for k, v in a.items()}
+        subst["u"] = _v("u", 2, 3, 4)
+        us = vo._operand_shape(
+            _term_instantiate(chain.args[0].args[0], subst)
         )
+        es = vo._operand_shape(_term_instantiate(chain.args[0], subst))
+        assert es == a["ES"]
+        assert us[a["UD"] % len(us)] == 1
+        rs = vo._operand_shape(_term_instantiate(chain, subst))
+        assert rs == a["RS"]
+
+
+def test_chain_domain_edge_paths():
+    """``_chain_domain``'s fallback and veto paths.
+
+    - a member whose operand cannot instantiate (an unbound leaf
+      metavariable) falls back to the rank-0 shape domain;
+    - a member with no options under the drawn operand shape kills
+      the partial assignment — the group returns ``None`` when every
+      draw dies;
+    - a metavariable shared *inside* a chain must agree, so a chain
+      whose levels can't share a value enumerates nothing.
+    """
+    usq = _p("unsqueeze", "u", dim="UD")
+    assigns = vo._chain_domain([usq], {})
+    assert assigns and all("UD" in a for a in assigns)
+
+    # A fabricated arg-less member falls back to the rank-0 domain.
+    bare = _p("unsqueeze", dim="UD")
+    assert vo._chain_domain([bare], {})
+
+    sel = _p("select", "u", dim="SD", index="SI")
+    assert vo._chain_domain([sel], {}) is None
+
+    # ``D`` is both the unsqueeze axis and the expand shape — no
+    # integer axis equals a shape tuple, so the chain is empty and
+    # the binding vetoes.
+    dead = _p("expand", _p("unsqueeze", "u", dim="D"), shape="D")
+    nodes = vo._view_nodes([dead])
+    groups = vo._attr_groups(nodes)
+    assert len(groups) == 1
+    assert vo._attr_domains(nodes, {"u": _v("u", 2, 3)}) is None
+
+
+def test_synth_bases_skips_fully_conflicted_binding():
+    """A binding whose attr product is all merge-conflicts yields no
+    bases — the lazy group is probed once and skipped, preserving the
+    eager ``if bases:`` group indexing."""
+    pat = _p(
+        "mul",
+        _p("expand", "v", shape="S"),
+        _p("transpose", "u", dim0="S", dim1="T"),
+    )
+    # S is drawn as a shape tuple by ``expand`` and as an int axis by
+    # ``transpose`` — disjoint option types, so every combination
+    # merge-conflicts.
+    assert list(vo._synth_bases(pat, "v")) == []
+
+
+def test_nested_view_candidate_chains_consistently():
+    """A view-under-view candidate enumerates as one chained group.
+
+    ``transpose(transpose(u, A, B), A, B)`` links the outer node's
+    operand to the inner node, so both transposes are enumerated
+    jointly — the outer domain is computed over the *transposed*
+    operand shape (the drawn inner dims), not the pre-view leaf.
+    """
+    lhs = _p(
+        "transpose",
+        _p("transpose", "U", dim0="A", dim1="B"),
+        dim0="A",
+        dim1="B",
+    )
+    nodes = vo._view_nodes([lhs, "U"])
+    groups = vo._attr_groups(nodes)
+    assert len(groups) == 1 and len(groups[0]) == 2
+    domains = vo._attr_domains(nodes, {"U": _v("U", 2, 3)})
+    assert len(domains) == 1
+    node, opts = domains[0]
+    assert isinstance(node, vo._ChainGroup)
+    # Every joint draw instantiates both transposes back to the leaf
+    # shape — the same (A, B) resolves at both levels.
+    for o in opts:
+        subst = {f"$attr:{k}": v for k, v in o.items()}
+        subst["U"] = _v("U", 2, 3)
+        assert vo._operand_shape(_term_instantiate(lhs, subst)) == (
+            2,
+            3,
+        )
+    inst = list(vo.synthesize(lhs, "U", limit=24))
+    assert inst and all(i.outcome == "equal" for i in inst)
 
 
 def test_tuple_sources_and_leaf_bindings():
@@ -421,7 +512,14 @@ def test_attr_kind_canonicalizes_and_overrides():
 def test_kind_domain_shapes():
     """Kind domains are small and shape-aware where it matters."""
     # axis: the shape-valid axes for a rank-3 operand.
-    assert set(vo._kind_domain("axis", (2, 3, 4))) <= {-3, -2, -1, 0, 1, 2}
+    assert set(vo._kind_domain("axis", (2, 3, 4))) <= {
+        -3,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+    }
     # unknown shape -> the generic axis fallback, still enumerable.
     assert vo._kind_domain("axis", ())
     # red-dims carry both the scalar and tuple spellings.
@@ -505,9 +603,7 @@ def test_synthesize_sdpa_scale_metavar():
         limit=120,
     )
     assert insts
-    assert any(
-        "$attr:SC" in dict(i.binds) for i in insts
-    )
+    assert any("$attr:SC" in dict(i.binds) for i in insts)
 
 
 def test_diag_product_orders_corners_first():
@@ -549,6 +645,54 @@ def test_binding_envs_covers_bases_early():
     # several viewed bindings are represented inside the first dozen —
     # the old nesting served one base's whole free product first.
     assert len(u_shapes) > 1
+
+
+def test_binding_envs_lazy_pull_matches_eager_order():
+    """The lazy (pull) enumeration yields the eager order exactly.
+
+    Rebuild the pre-laziness algorithm in the test — materialize the
+    whole ``_synth_bases`` space, then round-robin the per-base free
+    products — and require the yielded binding dicts coincide with
+    ``_binding_envs``'s, which now only materializes the prefix a cap
+    reaches.
+    """
+    lhs = _p("mul", _p("unsqueeze", "U", dim="A_d"), "V")
+    rhs = _p("mul", "U", "V")
+
+    parents = vo._metavar_parents(lhs, rhs)
+    free = sorted(
+        m for m in parents if not (parents.get(m, set()) & vo._VIEWISH)
+    )
+    entries = []
+    for base, u_shapes, out_shapes in vo._synth_bases(lhs, rhs):
+        derived = vo._derived_free_shapes(u_shapes, out_shapes)
+        lists = [
+            vo._leaf_bindings(m, parents[m], derived) for m in free
+        ]
+        entries.append([base, vo._diag_product(lists), True])
+    eager: list[dict] = []
+    total = 0
+    live = len(entries)
+    while live and len(eager) < 60:
+        for i in range(min(total, len(entries) - 1), -1, -1):
+            entry = entries[i]
+            if not entry[2]:
+                continue
+            try:
+                combo = next(entry[1])
+            except StopIteration:
+                entry[2] = False
+                live -= 1
+                continue
+            eager.append(
+                {**entry[0], **dict(zip(free, combo, strict=True))}
+            )
+        total += 1
+
+    lazy = list(itertools.islice(vo._binding_envs(lhs, rhs), 60))
+    # A round appends per entry, so the eager cap overshoots — the
+    # shared prefix is the equivalence check.
+    assert lazy == eager[:60]
 
 
 # ---------------------------------------------------------------------------
@@ -683,9 +827,7 @@ def test_escalate_limit_leaves_the_common_case_alone():
 def test_escalate_limit_never_lowers_and_never_raises_past_ceiling():
     """The returned cap is never below *limit*; a window already at or
     past the ceiling is unchanged."""
-    assert (
-        vo.escalate_limit(4000, guarded=True, accepted=0) == 4000
-    )
+    assert vo.escalate_limit(4000, guarded=True, accepted=0) == 4000
     assert (
         vo.escalate_limit(vo._GUARDED_CAP, guarded=True, accepted=0)
         == vo._GUARDED_CAP
@@ -780,9 +922,7 @@ def test_synthesize_reshape_exercises_targets():
         "env-err",
     }
     # the reshape no-op feature was computed on tensor u.
-    assert any(
-        dict(i.feats).get("rs:noop") is True for i in insts
-    )
+    assert any(dict(i.feats).get("rs:noop") is True for i in insts)
 
 
 def test_synthesize_conflicting_shared_attrs_are_skipped():
@@ -1101,9 +1241,7 @@ def test_features_g_out_eval_failure():
 
 def test_feats_id_broadcast_failure():
     g_u = torch.zeros(3, 1)
-    feats = vo._feats_id(
-        torch.randn(3), g_u, torch.randn(5)
-    )
+    feats = vo._feats_id(torch.randn(3), g_u, torch.randn(5))
     assert feats == {}
     # incompatible broadcast grids -> no pairing feature at all
     u_t, v_t = torch.randn(2, 3), torch.randn(5)
@@ -1191,10 +1329,7 @@ def test_sweep_real_derive_supplies_and_instantiate_fails():
     assert len(insts) == 1
     # an RHS metavar the binding never supplies fails instantiation.
     assert (
-        vo.sweep_real(
-            "t", lhs_pat, _p("mul", "U", "W"), [match]
-        )
-        == []
+        vo.sweep_real("t", lhs_pat, _p("mul", "U", "W"), [match]) == []
     )
 
 
@@ -1215,9 +1350,7 @@ def test_sweep_real_u_term_eval_failure():
     """A bound U that cannot evaluate records an empty kind."""
     u, v = _v("u", 4), _v("v", 4)
     match = _p("mul", _p("frobnicate", u), v)
-    insts = vo.sweep_real(
-        "t", _p("mul", "U", "V"), "V", [match]
-    )
+    insts = vo.sweep_real("t", _p("mul", "U", "V"), "V", [match])
     assert len(insts) == 1
     assert insts[0].outcome == "lhs-err"
     assert dict(insts[0].feats)["u_kind"] == ""
@@ -1239,9 +1372,7 @@ def test_sweep_real_u_kind_and_env_none():
     w = _v("w", 2, 4)
     v = _v("v", 4)
     # tuple-valued U under getitem -> u_kind "tuple".
-    match_t = _p(
-        "add", _p("getitem", _p("topk", w, k=2), index=0), v
-    )
+    match_t = _p("add", _p("getitem", _p("topk", w, k=2), index=0), v)
     insts = vo.sweep_real(
         "t",
         _p("add", _p("getitem", "U", index="I"), "V"),
@@ -1355,9 +1486,7 @@ def test_verdict_counts_real_matches():
     eq_match = _p("mul", _p("unsqueeze", u, dim=0), v)
     w = _v("w", 3, 1)
     neq_match = _p("mul", _p("unsqueeze", u, dim=1), w)
-    rerr_match = _p(
-        "mul", _p("unsqueeze", u, dim=1), _v("y", 3, 2)
-    )
+    rerr_match = _p("mul", _p("unsqueeze", u, dim=1), _v("y", 3, 2))
     verdict = vo.verify_view_candidate(
         "t",
         _p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
@@ -1549,10 +1678,12 @@ def test_gqa_absorb_repeat_guard_accepts_a_chained_binding():
     The guard's ``repeat-chain`` / ``repeat-heads`` clauses are
     satisfiable: a hand-built ``unsqueeze(2) -> expand(2 at 2) ->
     reshape(merge)`` chain with ``q[-2] == k[-2] * r`` clears.  The
-    enumeration never mints it — ``_attr_domains`` reads each view
-    node's operand shape from the *pre-view* term, so the
-    ``expand``/``reshape`` attr domains cannot chain onto the
-    ``unsqueeze`` output.
+    enumeration mints it now: the operand-chained
+    ``unsqueeze -> expand -> reshape`` nodes form one chained attr
+    group (:func:`catopt_discovery.oracle._chain_domain`), so the
+    ``expand``/``reshape`` options are drawn against the real
+    intermediate shapes — and the pinned rank-4 corner evaluates
+    ``equal``.
     """
     from catopt_core.laws import ALL_RULES
 
@@ -1571,6 +1702,56 @@ def test_gqa_absorb_repeat_guard_accepts_a_chained_binding():
         "$attr:C": False,
     }
     assert rule.check(bound)
+
+    # The chained domain contains the consistent triples — the
+    # enumerator mints what it previously could not.
+    nodes = vo._view_nodes([rule.lhs, rule.rhs])
+    viewed = {
+        "k": _v("k", 2, 3, 2, 4),
+        "q": _v("q", 2, 3, 4, 4),
+        "v": _v("v", 2, 3, 2, 4),
+    }
+    domains = vo._attr_domains(nodes, viewed)
+    assert len(domains) == 3  # the {C, D} pair and the two chains
+    k_chain = {
+        "UDk": -2,
+        "ESk": (2, 3, 2, 2, 4),
+        "RSk": (2, 3, 4, 4),
+    }
+    v_chain = {
+        "UDv": -2,
+        "ESv": (2, 3, 2, 2, 4),
+        "RSv": (2, 3, 4, 4),
+    }
+    assert any(
+        all(o.get(m) == val for m, val in k_chain.items())
+        for o in domains[1][1] + domains[2][1]
+    )
+    assert any(
+        all(o.get(m) == val for m, val in v_chain.items())
+        for o in domains[1][1] + domains[2][1]
+    )
+
+    # The corner binding passes the guard and evaluates equal.
+    for combo in vo._diag_product([d[1] for d in domains]):
+        base = vo._attr_merge(domains, combo, viewed)
+        if base is None:
+            continue
+        if not all(
+            base.get(f"$attr:{m}") == val
+            for m, val in {**k_chain, **v_chain}.items()
+        ):
+            continue
+        if base.get("$attr:D") != 1e-5 or base.get("$attr:C"):
+            continue
+        assert rule.check(base)
+        lhs_i = _term_instantiate(rule.lhs, base)
+        rhs_i = _term_instantiate(rule.rhs, base)
+        torch.manual_seed(0)
+        assert vo.eval_instance(lhs_i, rhs_i)[0] == "equal"
+        break
+    else:
+        raise AssertionError("chained corner not enumerated")
 
 
 def test_rms_norm_fold_guard_accepts_a_tail_block_binding():
