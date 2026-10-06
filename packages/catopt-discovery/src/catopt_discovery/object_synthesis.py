@@ -77,7 +77,6 @@ from catopt_core.laws.cond import (
 )
 from catopt_core.meta import (
     _positions,
-    _subterm,
     apply_rewrite_at,
     instantiate_pattern,
     match_pattern,
@@ -288,15 +287,21 @@ def _as_rule(obj: Any) -> Rewrite:
 #  have fired.  Two flavours, chosen by what the premise's guard is:
 #
 #  * **declarative** — a purely declarative ``cond`` is re-expressed
-#    (metavariable references renamed) and folded into the composite's
-#    own ``cond``.  The composite stays pure data (serializable), so the
-#    gauntlet's guarded-region sweep can rule on it.
+#    (metavariable references renamed — a reference bound to a compound
+#    piece becomes its view-output spec, a reference to a *derived*
+#    attr becomes the inlined derive expr) and folded into the
+#    composite's own ``cond``.  The composite stays pure data
+#    (serializable), so the gauntlet's guarded-region sweep can rule
+#    on it.
 #  * **procedural** — a ``check``/``derive`` with a code remainder is
-#    re-run at fire time on the premise's own binding (the intermediate
-#    re-instantiated from the composite's binding).  The composite is
-#    sound but non-serializable: the store flags ``missing_hooks``
-#    honestly and the gauntlet's full-data gate refuses it — construction
-#    is a claim, and a claim data cannot carry is refused as such.
+#    re-run at fire time on the premise's own binding (the premise
+#    match re-instantiated from the composite's binding plus the
+#    accumulated derive outputs — an earlier premise's minted attrs
+#    feed a later premise's check, the chaining the premises' own fire
+#    order performs).  The composite is sound but non-serializable:
+#    the store flags ``missing_hooks`` honestly and the gauntlet's
+#    full-data gate refuses it — construction is a claim, and a claim
+#    data cannot carry is refused as such.
 
 
 def _structural_fire(rule: Rewrite, term: Any) -> tuple | None:
@@ -305,9 +310,11 @@ def _structural_fire(rule: Rewrite, term: Any) -> tuple | None:
     The decidable path (:func:`catopt_core.meta.apply_rewrite_at`)
     evaluates the premise's guard on the symbolic binding; a guard that
     needs real shapes declines there.  This retries the *structural*
-    match — the LHS alone — and returns ``(path, rewritten, match)`` so
-    the caller can transport the premise's guard into the composite.
-    The premise's ``derive`` still runs (its RHS attributes must
+    match — the LHS alone — and returns ``(path, rewritten, match,
+    extra)`` so the caller can transport the premise's guard *and*
+    derive into the composite (``extra`` is the derive's output on the
+    symbolic binding, ``None`` when the premise has none).  The
+    premise's ``derive`` still runs (its RHS attributes must
     instantiate); a ``derive`` that cannot evaluate on the symbolic
     binding declines — a composite whose RHS needs instance-computed
     attributes is not constructible at pattern level, honestly.
@@ -317,6 +324,7 @@ def _structural_fire(rule: Rewrite, term: Any) -> tuple | None:
         if subst is None:
             continue
         inst = dict(subst)
+        extra = None
         if rule.derive is not None:
             try:
                 extra = rule.derive(subst)
@@ -331,68 +339,370 @@ def _structural_fire(rule: Rewrite, term: Any) -> tuple | None:
             continue
         nxt = _replace_subterm(term, path, rhs)
         if nxt != term:
-            return path, nxt, subst
+            return path, nxt, subst, extra
     return None
 
 
-def _rename_cond(node: Any, rename: dict[str, str]) -> Any:
-    """Rename metavariable references inside a declarative cond tree."""
+# ---------------------------------------------------------------------------
+#  Transport substitution — re-expressing premise data over composite names
+#
+#  A transported ``cond`` clause or ``dspec`` entry is the premise's own
+#  datum with every reference renamed through the premise's match —
+#  the map ``premise metavar -> pattern piece over the composite's
+#  metavars``.  Three cases per reference:
+#
+#  * bound to a metavariable — a plain rename;
+#  * bound to a *compound* piece — only re-expressible in a shape
+#    reading (``T``) position, where the piece becomes its view-output
+#    spec (``index_select(t,D,U)`` -> ``("isel-out","t","D","U")``);
+#  * bound to a literal — inlines as ``("lit", v)`` in attr positions.
+#
+#  Attr positions additionally consult *derived*: when the renamed
+#  target is an attr the composite derives (a transported ``dspec``
+#  entry), the derive expr is inlined in place of the name — a
+#  composite ``cond`` evaluates before ``derive`` runs, so only the
+#  inline spelling can see the value.  Anything un-expressible is
+#  ``None``, sending the premise down the procedural path honestly.
+# ---------------------------------------------------------------------------
+
+
+#: Failure sentinel for the transport substitution — distinct from
+#: ``None``, which is a legitimate literal argument (``slice-out``'s
+#: optional bounds, an ``attr-is`` ``None`` pin).
+_UNX: Any = object()
+
+
+def _spec_arg(v: Any, derived: dict) -> Any:
+    """Return the spec-arg spelling of a pattern attr value.
+
+    A metavariable name stays a name — or becomes its derive expr when
+    the composite *derives* that name; a literal tuple/list must ride
+    ``("lit", v)`` (a bare tuple is an expr); other literals pass.
+    """
+    if isinstance(v, str):
+        return derived.get(v, v)
+    if isinstance(v, (tuple, list)):
+        return ("lit", tuple(v))
+    return v
+
+
+def _term_to_spec(node: Any, derived: dict) -> Any:
+    """Return a shape spec denoting the compound pattern piece *node*.
+
+    A metavar leaf stays a metavar; a view ``Op`` becomes its
+    ``*_-out`` spec over the (recursively spec'd) operand, attr values
+    resolved through :func:`_spec_arg`.  ``_UNX`` when the op has no
+    spec form or the piece is a concrete leaf — the clause then rides
+    the procedural path instead.
+    """
     if isinstance(node, str):
-        return rename.get(node, node)
-    if isinstance(node, (tuple, list)):
-        return tuple(_rename_cond(x, rename) for x in node)
-    return node
+        return node
+    if not isinstance(node, Op) or not node.args:
+        return _UNX
+    operand = _term_to_spec(node.args[0], derived)
+    if operand is _UNX:
+        return _UNX
+    attrs = {k: _spec_arg(v, derived) for k, v in node.attrs.items()}
+    spec = _view_out_spec(node.op, operand, attrs)
+    return _UNX if spec is None else spec
 
 
-def _declarative_clause(rule: Rewrite, match: dict) -> Any:
+def _tsub(match: dict, derived: dict, x: Any) -> Any:
+    """Resolve a ``T``-position arg — metavar name or nested spec."""
+    if isinstance(x, str):
+        if x not in match:
+            return _UNX
+        piece = match[x]
+        return (
+            piece
+            if isinstance(piece, str)
+            else (_term_to_spec(piece, derived))
+        )
+    if isinstance(x, (tuple, list)) and x:
+        return _spec_subst(x, match, derived)
+    return x
+
+
+def _asub(match: dict, derived: dict, x: Any) -> Any:
+    """Resolve an ``A``-position arg — an attr metavar name."""
+    if not isinstance(x, str):
+        return (
+            _dexpr_subst(x, match, derived)
+            if isinstance(x, (tuple, list))
+            else x
+        )
+    key = "$attr:" + x
+    if key not in match:
+        return _UNX
+    return _spec_arg(match[key], derived)
+
+
+def _spec_subst(spec: Any, match: dict, derived: dict) -> Any:
+    """Re-express a shape spec's metavar references, or ``_UNX``."""
+    if isinstance(spec, str):
+        return _tsub(match, derived, spec)
+    if not isinstance(spec, (tuple, list)) or not spec:
+        return spec
+    sig = _SPEC_REFS.get(spec[0])
+    args = tuple(spec[1:])
+    if sig is None or len(args) != len(sig):
+        return _UNX
+    out = [
+        _subst_arg(k, a, match, derived)
+        for k, a in zip(sig, args, strict=True)
+    ]
+    return _UNX if any(a is _UNX for a in out) else (spec[0], *out)
+
+
+def _subst_sig(
+    node: Any, sigs: dict, match: dict, derived: dict
+) -> Any:
+    """Positional-substitution tail shared by the two walkers.
+
+    Looks up *node*'s op in *sigs*, substitutes each argument under
+    its position kind — the shape both :func:`_dexpr_subst` (derive
+    exprs) and :func:`_subst_cond` (predicates) reduce to after their
+    own recursion clauses.
+    """
+    sig = sigs.get(node[0])
+    args = tuple(node[1:])
+    if sig is None or len(args) != len(sig):
+        return _UNX
+    out = [
+        _subst_arg(k, a, match, derived)
+        for k, a in zip(sig, args, strict=True)
+    ]
+    return _UNX if any(a is _UNX for a in out) else (node[0], *out)
+
+
+def _dexpr_subst(node: Any, match: dict, derived: dict) -> Any:
+    """Re-express a derive expr's metavar references, or ``_UNX``."""
+    if node is None or isinstance(node, (bool, int, float)):
+        return node
+    if not isinstance(node, (tuple, list)) or not node:
+        return _UNX
+    if node[0] in ("tuple", "concat"):
+        out = [_dexpr_subst(a, match, derived) for a in node[1:]]
+        return _UNX if any(a is _UNX for a in out) else (node[0], *out)
+    return _subst_sig(node, _DEXPR_REFS, match, derived)
+
+
+def _subst_arg(kind: str, a: Any, match: dict, derived: dict) -> Any:
+    """Substitute one datum argument under its position kind."""
+    if kind == "T":
+        return _tsub(match, derived, a)
+    if kind == "A":
+        return _asub(match, derived, a)
+    if kind == "e":
+        return _dexpr_subst(a, match, derived)
+    return a
+
+
+def _subst_comb(node: Any, match: dict, derived: dict) -> Any:
+    """Substitute an ``and``/``or``/``not`` node of :func:`_subst_cond`."""
+    op = node[0]
+    if op == "not":
+        inner = (
+            _subst_cond(node[1], match, derived)
+            if len(node) == 2
+            else _UNX
+        )
+        return _UNX if inner is _UNX else ("not", inner)
+    parts = [_subst_cond(c, match, derived) for c in node[1:]]
+    if any(p is _UNX for p in parts):
+        return _UNX
+    return (op, *parts)
+
+
+def _subst_cond(node: Any, match: dict, derived: dict) -> Any:
+    """Re-express a declarative cond over the composite's metavars.
+
+    ``_UNX`` marks a node the match cannot carry — an unknown op or
+    arity mismatch, a term metavar bound to a concrete leaf — the
+    caller then falls back to the procedural step.
+    """
+    if isinstance(node, bool):
+        return node
+    if not isinstance(node, (tuple, list)) or not node:
+        return _UNX
+    op = node[0]
+    if op in ("and", "or", "not"):
+        return _subst_comb(node, match, derived)
+    return _subst_sig(node, _PRED_REFS, match, derived)
+
+
+def _transport_clause(rule: Rewrite, match: dict, derived: dict) -> Any:
     """Re-express *rule*'s declarative guard over the composite's metavars.
 
-    Returns the premise's ``cond`` with its metavariable references
-    renamed to the composite's, or ``None`` when the guard is not purely
-    declarative (a procedural ``check`` remainder) or binds a
-    metavariable to a compound subterm — a cond atom addresses
-    metavariables by name, so a compound binding is un-expressible as a
-    clause and must ride the procedural path.
+    Returns the premise's ``cond`` substituted through the premise's
+    match — metavar renames, compound pieces as their view-output
+    specs, derived-attr reads inlined as their exprs — or ``None``
+    when the guard is not purely declarative (a procedural ``check``
+    remainder) or a reference cannot be re-expressed; the premise
+    then rides the procedural path instead.
     """
     from catopt_core.laws.serialize import _proc_check
 
     if rule.cond is None or _proc_check(rule):
         return None
-    rename: dict[str, str] = {}
-    for k, v in match.items():
-        if not isinstance(v, str):
-            return None
-        rename[k[len("$attr:") :] if k.startswith("$attr:") else k] = v
-    return _rename_cond(rule.cond, rename)
+    clause = _subst_cond(rule.cond, match, derived)
+    return None if clause is _UNX else clause
 
 
-def _guard_transport(steps: list) -> Any:
-    """Build the composite's fire-time check from transported premises.
+# ---------------------------------------------------------------------------
+#  The procedural chain — re-running premise hooks on their own bindings
+# ---------------------------------------------------------------------------
+#
+#  When a premise's guard or derive cannot ride the composite's data
+#  fields (procedural hooks, or a reference the substitution cannot
+#  carry), the composite keeps them as fire-time callables.  Each
+#  premise's binding is reconstructed from the composite's bound env
+#  plus the *accumulated derive outputs* — an earlier premise's minted
+#  attrs feed a later premise's check, exactly the chaining the
+#  premises' own fire order performs.  The chain is total: a
+#  re-expression failure, a guard veto or a derive veto vetoes the
+#  firing, never raises.
 
-    *steps* is ``(rule, mid_pattern, path)`` per premise fired
-    structurally — *mid_pattern* the intermediate term (over the
-    composite's metavariables) the premise fired into, *path* the
-    position inside it.  On a composite firing the intermediate is
-    re-instantiated from the binding and the premise's own ``check``
-    re-run on ITS binding (the check sees only the LHS binding, never
-    the premise's ``derive`` output — the ``apply_rewrite_at`` order),
-    so the composite is admissible exactly where every transported
-    premise is.  Total — an un-evaluable re-check declines, never
-    raises (the ``apply_rewrite_at`` convention).
+
+def _pat_bind(pats: dict, env: dict) -> dict | None:
+    """Instantiate a recorded premise binding against *env*.
+
+    *pats* maps premise metavariables to pattern pieces over the
+    composite's metavars — the match dict captured at composition.
+    ``$attr:`` entries holding a name resolve through ``env`` (which
+    carries the accumulated derived attrs); term metavars instantiate
+    through it.  ``None`` when a reference is unbound.
+    """
+    out = {}
+    for k, v in pats.items():
+        if k.startswith("$attr:"):
+            if isinstance(v, str):
+                key = "$attr:" + v
+                if key not in env:
+                    return None
+                out[k] = env[key]
+            else:
+                out[k] = v
+        else:
+            try:
+                out[k] = instantiate_pattern(v, env)
+            except Exception:
+                return None
+    return out
+
+
+def _emit_map(rule: Rewrite, extra: dict | None) -> dict | str | None:
+    """How a premise's derive output maps onto composite attr names.
+
+    ``None`` for no emission — a premise with no ``derive``, a purely
+    declarative one (its minted names are covered by the composite's
+    ``dspec`` transport or ride upstream names), or a derive whose
+    symbolic output carried no metavar-strings to re-mint.  ``"all"``
+    emits every output verbatim (the head premise — its minted names
+    ARE the composite RHS metavar names).  Otherwise a
+    ``{premise-key: composite-key}`` map built from the symbolic
+    ``extra``: a str-valued output is the metavar name it left in the
+    composite RHS.
+    """
+    from catopt_core.laws.serialize import _proc_derive
+
+    if rule.derive is None:
+        return None
+    if _proc_derive(rule):
+        if extra is None:
+            return "all"
+        emit = {
+            k: ("$attr:" + v if k.startswith("$attr:") else v)
+            for k, v in extra.items()
+            if isinstance(v, str)
+        }
+        return emit or None
+    return None
+
+
+def _chain_step(
+    rule: Rewrite,
+    pat: dict,
+    emit: Any,
+    recheck: bool,
+    env: dict,
+    out: dict,
+) -> bool:
+    """Run one premise's hooks against its reconstructed binding.
+
+    Re-expresses the premise's binding under the accumulated *env*,
+    re-runs its ``check`` when *recheck*, then its ``derive`` — the
+    outputs grow *env* for later steps, and *emit* selects which of
+    them the composite's substitution reads into *out*.  A binding
+    that cannot be re-expressed, a guard veto or a derive veto is a
+    plain ``False`` — never a raise.
+    """
+    b = _pat_bind(pat, env)
+    if b is None:
+        return False
+    try:
+        if recheck and rule.check is not None and not rule.check(b):
+            return False
+        if rule.derive is None:
+            return True
+        e = rule.derive(b)
+    except Exception:
+        return False
+    if e is None:
+        return False
+    env.update(e)
+    _chain_emit(emit, e, out)
+    return True
+
+
+def _chain_emit(emit: Any, e: dict, out: dict) -> None:
+    """Select a premise's derive outputs into the composite env."""
+    if emit == "all":
+        out.update(e)
+        return
+    if emit:
+        for k, v in e.items():
+            tgt = emit.get(k)
+            if tgt is not None:
+                out[tgt] = v
+
+
+def _chain_hooks(steps: list) -> tuple:
+    """Build the composite's procedural ``(check, derive)`` pair.
+
+    *steps* is ``(rule, pat, emit, recheck)`` per premise in firing
+    order — see the section note.  The shared evaluation replays the
+    premises' fire order: each premise's binding is re-expressed under
+    the accumulated env, its ``check`` re-runs when *recheck* (a guard
+    the declarative transport could not carry), and its ``derive``
+    always runs — for the env the later steps read and for the outputs
+    *emit* selects into the composite's substitution.  Returns
+    ``(None, None)`` when no step carries real work.
     """
 
-    def check(bound: dict) -> bool:
-        for rule, mid, path in steps:
-            try:
-                term = instantiate_pattern(mid, bound)
-                m = match_pattern(rule.lhs, _subterm(term, path), {})
-                if rule.check is not None and not rule.check(m):
-                    return False
-            except Exception:
-                return False
-        return True
+    def _eval(bound: dict) -> dict | None:
+        env = dict(bound)
+        out: dict = {}
+        for rule, pat, emit, recheck in steps:
+            if not _chain_step(rule, pat, emit, recheck, env, out):
+                return None
+        return out
 
-    return check
+    if not any(
+        s[2] or (s[3] and s[0].check is not None) for s in steps
+    ):
+        return None, None
+
+    def check(bound: dict) -> bool:
+        return _eval(bound) is not None
+
+    def derive(bound: dict) -> dict | None:
+        return _eval(bound)
+
+    return (
+        check if any(s[3] for s in steps) else None,
+        derive if any(s[2] for s in steps) else None,
+    )
 
 
 def _fold_and(clauses: list) -> Any:
@@ -404,28 +714,44 @@ def _fold_and(clauses: list) -> Any:
     return ("and", *clauses)
 
 
+def _premise_extra(rule: Rewrite, match: dict) -> dict | None:
+    """Return the premise's derive output on *match*, or ``None``.
+
+    On the decidable path a derive that cannot evaluate on the
+    symbolic binding is tolerated — the premise's emit map simply
+    carries nothing; :func:`_structural_fire` holds the stricter
+    contract (an unevaluable derive declines the position).
+    """
+    if rule.derive is None:
+        return None
+    try:
+        return rule.derive(dict(match))
+    except Exception:
+        return None
+
+
 def _fire_premise(rule: Rewrite, cur: Any) -> tuple | None:
     """Fire *rule* on *cur*, decidable first then structurally.
 
-    Returns ``(rewritten, clause, step)`` — the rewritten term, the
-    declarative guard clause to fold into the composite's ``cond`` (or
-    ``None``), and the procedural ``(rule, mid, path)`` re-check step (or
-    ``None``) — or ``None`` when the premise's LHS matches nowhere.  A
-    decidable firing transports nothing (its guard held on the symbolic
-    binding); a structural firing transports the guard.
+    Returns ``(rewritten, match, decidable, extra)`` — the rewritten
+    term, the premise's binding as patterns over the composite's
+    metavars, whether the firing was decidable (its guard held on the
+    symbolic binding — no guard to transport), and the derive's
+    symbolic output — or ``None`` when the premise's LHS matches
+    nowhere.
     """
-    for path, _sub in _positions(cur):
+    for path, sub in _positions(cur):
         nxt = apply_rewrite_at(rule, cur, path)
-        if nxt is not None and nxt != cur:
-            return nxt, None, None
+        if nxt is None or nxt == cur:
+            continue
+        match = match_pattern(rule.lhs, sub, {})
+        if match is not None:
+            return nxt, match, True, _premise_extra(rule, match)
     fired = _structural_fire(rule, cur)
     if fired is None:
         return None
-    path, nxt, match = fired
-    clause = _declarative_clause(rule, match)
-    if clause is not None:
-        return nxt, clause, None
-    return nxt, None, (rule, cur, path)
+    _path, nxt, match, extra = fired
+    return nxt, match, False, extra
 
 
 def _spec_map(specialize: dict | None) -> dict:
@@ -439,22 +765,26 @@ def _premise_names(rules: list) -> tuple[str, ...]:
 
 
 def _head_transport(
-    head: Rewrite, lhs: Any, has_caller_cond: bool
+    head: Rewrite, lhs: Any, has_caller_cond: bool, derived: dict
 ) -> tuple:
     """Transport the first premise's guard (it guards the composite LHS).
 
-    Returns ``(clause, step)``.  A declaratively re-expressible guard
-    becomes a cond clause; otherwise the caller's ``cond`` is taken as
-    the declared composite guard (the pre-existing contract) unless none
-    was given, in which case the guard rides a procedural fire-time step.
+    Returns ``(clause, step, match)`` — *match* is the head's binding
+    over the composite's LHS, the renaming map the derive transport
+    also needs.  A declaratively re-expressible guard becomes a cond
+    clause; otherwise the caller's ``cond`` is taken as the declared
+    composite guard (the pre-existing contract) unless none was given,
+    in which case the guard rides a procedural fire-time step.  A
+    guarded head whose own LHS cannot bind the composite LHS (``None``
+    *match*) must decline — the caller checks for it.
     """
-    if head.cond is None and head.check is None:
-        return None, None
     m0 = match_pattern(head.lhs, lhs, {})
-    clause = _declarative_clause(head, m0) if m0 is not None else None
-    if clause is not None:
-        return clause, None
-    return None, (None if has_caller_cond else (head, lhs, ()))
+    if m0 is None or (head.cond is None and head.check is None):
+        return None, None, m0
+    clause = _transport_clause(head, m0, derived)
+    if clause is not None or has_caller_cond:
+        return clause, None, m0
+    return None, [head, m0, None, True], m0
 
 
 def _specialize(pat: Any, subst: dict) -> Any:
@@ -473,6 +803,89 @@ def _specialize(pat: Any, subst: dict) -> Any:
         }
         return Op.make(pat.op, *args, **attrs)
     return pat
+
+
+def _head_derive(
+    head: Rewrite, m0: dict, derived: dict, caller: dict, entries: list
+) -> tuple:
+    """Transport the head premise's derive mints into the composite.
+
+    Pure ``dspec`` entries become composite spec entries — each
+    expression substituted through the head's match and the *derived*
+    map (so a later premise may inline them).  Returns
+    ``(emit, derived)``: ``emit="all"`` when the derive rides the
+    procedural chain instead — a procedural ``derive``, or a spec
+    entry the substitution cannot express (the accumulated entries
+    and the derived map roll back to the caller's own claims).
+    """
+    from catopt_core.laws.serialize import _proc_derive
+
+    if _proc_derive(head):
+        return "all", derived
+    for dname, dx in head.dspec:
+        e2 = _dexpr_subst(dx, m0, derived)
+        if e2 is _UNX:
+            entries.clear()
+            return "all", dict(caller)
+        entries.append((dname, e2))
+        derived[dname] = e2
+    return None, derived
+
+
+def _premise_step(r: Rewrite, cur: Any, derived: dict) -> tuple | None:
+    """Fire one ``rest`` premise on the composite RHS-in-progress.
+
+    Returns ``(cur, clause, pending)`` — the rewritten RHS, the
+    premise's transported declarative guard clause (``None`` when it
+    rode the procedural path or was decidable), and the chain step to
+    append (``None`` when the premise needs no fire-time hook) — or
+    ``None`` when the premise matches nowhere.
+    """
+    fired = _fire_premise(r, cur)
+    if fired is None:
+        return None
+    cur, match, decidable, extra = fired
+    emit = _emit_map(r, extra)
+    if decidable:
+        pend = [r, match, emit, False] if emit else None
+        return cur, None, pend
+    clause = _transport_clause(r, match, derived)
+    recheck = clause is None and r.check is not None
+    pend = None
+    if recheck or emit or r.derive is not None:
+        pend = [r, match, emit, recheck]
+    return cur, clause, pend
+
+
+def _compose_head(
+    head: Rewrite, lhs: Any, caller_cond: Any, caller: dict
+) -> tuple | None:
+    """Transport the first premise's guard *and* derive mints.
+
+    The head's own guard applies to the composite's LHS
+    (:func:`_head_transport`); its ``derive`` mints the attrs its RHS
+    carries — pure ``dspec`` entries become composite spec entries
+    (:func:`_head_derive`), anything else rides the procedural chain.
+    Returns ``(clauses, pending, derived, entries)`` or ``None`` when
+    the head's LHS cannot bind the composite's LHS.
+    """
+    derived = dict(caller)
+    entries: list = []
+    clause, step, m0 = _head_transport(
+        head, lhs, caller_cond is not None, derived
+    )
+    if m0 is None:
+        return None
+    clauses = [clause] if clause is not None else []
+    pending = [step] if step is not None else []
+    if head.derive is not None:
+        emit, derived = _head_derive(head, m0, derived, caller, entries)
+        if emit is not None:
+            if step is not None:
+                step[2] = emit
+            else:
+                pending.append([head, m0, emit, False])
+    return clauses, pending, derived, entries
 
 
 def compose_objects(
@@ -515,44 +928,88 @@ def compose_objects(
     can carry a replayable certificate.
 
     *cond* / *dspec* declare the composite's own guard and derive spec
-    — the constructor's claim about where the composite is legal.  A
-    declaratively transported premise guard is ANDed onto *cond*; a
-    procedural one rides ``check`` (the composite then reports
-    ``missing_hooks == ["check"]`` at the store, honestly).
+    — the constructor's claim about where the composite is legal (on a
+    name collision the caller's ``dspec`` entry wins).  A declaratively
+    transported premise guard is ANDed onto *cond*; a procedural one
+    rides ``check`` (the composite then reports the hooks it still
+    carries — ``missing_hooks`` — at the store, honestly).
+
+    Premise *derives* transport the same way (see the module note on
+    derive transport): a head premise whose RHS mints attr metavariables
+    contributes its ``dspec`` entries to the composite's — renamed
+    through its own match — and a procedural premise ``derive`` rides
+    the composite's fire-time ``derive``, the chained evaluation that
+    reconstructs each premise's binding under the earlier premises'
+    minted attrs.
     """
+    from catopt_core.laws.cond import derive_from_data
+
     rules = [_as_rule(first), *(_as_rule(r) for r in rest)]
     subst = _spec_map(specialize)
     lhs = _specialize(rules[0].lhs, subst)
     cur = _specialize(rules[0].rhs, subst)
-    clauses: list = []
-    steps: list = []
-    # The first premise's own guard applies to the composite's LHS, so it
-    # is transported too (see :func:`_head_transport`).
-    head_clause, head_step = _head_transport(
-        rules[0], lhs, cond is not None
-    )
-    if head_clause is not None:
-        clauses.append(head_clause)
-    if head_step is not None:
-        steps.append(head_step)
+    caller = dict(derive_from_data(dspec)) if dspec is not None else {}
+    head_res = _compose_head(rules[0], lhs, cond, caller)
+    if head_res is None:
+        return None
+    clauses, pending, derived, entries = head_res
     for r in rules[1:]:
-        fired = _fire_premise(r, cur)
-        if fired is None:
+        step = _premise_step(r, cur, derived)
+        if step is None:
             return None
-        cur, clause, step = fired
+        cur, clause, pend = step
         if clause is not None:
             clauses.append(clause)
-        elif step is not None:
-            steps.append(step)
+        if pend is not None:
+            pending.append(pend)
+    return _compose_result(
+        name,
+        rules,
+        lhs,
+        cur,
+        pending,
+        clauses,
+        cond,
+        caller,
+        entries,
+        kind,
+        tags,
+    )
+
+
+def _compose_result(
+    name: str,
+    rules: list,
+    lhs: Any,
+    cur: Any,
+    pending: list,
+    clauses: list,
+    cond: Any,
+    caller: dict,
+    entries: list,
+    kind: str,
+    tags: Any,
+) -> ConstructedObject:
+    """Assemble the composite rule + object from transported parts.
+
+    The premises name the replayable derivation; the pending chain
+    becomes the procedural ``(check, derive)`` pair; the caller's
+    declared ``dspec`` entries win over transported ones (``caller``
+    merges last); the caller's ``cond`` conjoins ahead of the
+    transported premise clauses.
+    """
     premises = _premise_names(rules)
+    ck, dr = _chain_hooks(pending) if pending else (None, None)
+    merged = {**dict(entries), **caller}
     rule = Rewrite(
         name=name,
         lhs=lhs,
         rhs=cur,
         law="composite of " + " ∘ ".join(premises),
-        check=_guard_transport(steps) if steps else None,
+        check=ck,
+        derive=dr,
         cond=_fold_and(([cond] if cond is not None else []) + clauses),
-        dspec=dspec,
+        dspec=merged or None,
         tags=frozenset(tags),
         derivation=premises,
     )
@@ -774,6 +1231,7 @@ _PRED_REFS: dict[str, tuple] = {
     "flat-map-unsq": ("T", "A", "T", "T"),
     "repeat-chain": ("T", "A", "A", "A"),
     "repeat-heads": ("T", "T", "A", "A"),
+    "attr-range": ("A", "T", "A"),
 }
 
 #: ``("T" | "A")`` per argument of each shape spec — ``None`` literal
@@ -789,6 +1247,7 @@ _SPEC_REFS: dict[str, tuple] = {
     "chunk-out": ("T", "A", "A"),
     "transpose-out": ("T", "A", "A"),
     "tail-block": ("T", "A"),
+    "isel-out": ("T", "A", "A"),
 }
 
 #: ``("e" | "T" | "A" | "_")`` per argument of each derive expr —
@@ -802,6 +1261,9 @@ _DEXPR_REFS: dict[str, tuple] = {
     "dim": ("T", "_"),
     "leaf-dim": ("T", "_"),
     "len": ("e",),
+    "gather": ("e", "e"),
+    "unique": ("e",),
+    "posmap": ("e", "e"),
     "bcast": ("T", "T"),
     "add": ("e", "e"),
     "sub": ("e", "e"),
@@ -813,6 +1275,20 @@ _DEXPR_REFS: dict[str, tuple] = {
     "float": ("e",),
     "int": ("e",),
 }
+
+
+def _attr_refs(a: Any) -> set | None:
+    """Return the bound-env refs of an ``"A"`` position argument.
+
+    A metavariable name reads its own ``$attr:`` binding; a literal
+    tuple/list is an inlined derive expr whose refs walk
+    :func:`_dexpr_refs`; a bare literal reads nothing.
+    """
+    if isinstance(a, str):
+        return {"$attr:" + a}
+    if isinstance(a, (tuple, list)):
+        return _dexpr_refs(a)
+    return set()
 
 
 def _sig_refs(sig: tuple, args: tuple, e_fn: Any) -> set | None:
@@ -830,7 +1306,7 @@ def _sig_refs(sig: tuple, args: tuple, e_fn: Any) -> set | None:
         elif kind == "e":
             r = e_fn(a)
         elif kind == "A":
-            r = {"$attr:" + a} if isinstance(a, str) else set()
+            r = _attr_refs(a)
         else:
             r = set()
         if r is None:
@@ -1421,6 +1897,14 @@ def _spec_transpose(operand: Any, attrs: dict) -> tuple | None:
     return ("transpose-out", operand, d0, attrs.get("dim1"))
 
 
+def _spec_isel(operand: Any, attrs: dict) -> tuple | None:
+    """``index_select`` output spec (dim + index are attrs)."""
+    d, i = attrs.get("dim"), attrs.get("index")
+    if d is None or i is None:
+        return None
+    return ("isel-out", operand, d, i)
+
+
 #: The view-output spec table — one entry per specifiable view op.
 #: Mirrors the ``_infer_op_shape`` branches the ``laws.cond`` shape
 #: specs implement; the bank's specs and the DSL's must agree.
@@ -1434,6 +1918,7 @@ _VIEW_SPEC_FNS = {
     "chunk": _spec_chunk,
     "transpose": _spec_transpose,
     "t": _spec_transpose,
+    "index_select": _spec_isel,
 }
 
 

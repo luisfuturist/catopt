@@ -177,3 +177,37 @@ capability-admitted, site-absent on this holdout.
   `i not in chosen` skip: kill masks of already-chosen predicates
   are removed from `uncovered`, so they can never kill a
   still-uncovered site.
+
+## Machinery limits — closed (derive transport + index-of-index)
+
+Both measured limits are closed as *data*, not procedural escapes:
+
+- **Compose transports derives.**  `compose_objects` now threads
+  each premise's binding through the chain: a head premise's pure
+  `dspec` entries become composite spec entries (substituted
+  through the match and the accumulated *derived* map); procedural
+  `check`/`derive` hooks ride a fire-time `_chain_hooks` pair that
+  replays the premises' fire order — each premise's binding
+  re-expressed under the accumulated env, its derive outputs feeding
+  later premises.  A composite over procedural premises honestly
+  records both hooks in `missing_hooks` (`["check","derive"]` — the
+  pin changed *upward* in honesty); a composite over dspec premises
+  serializes fully.
+- **Index-of-index is a derive expr.**  The dspec language gained
+  `("gather", e_table, e_sel)` (`t[I][J] → t[I[J]]` = `K ↦
+  ("gather", ("attr","I"), ("attr","J"))`), `("posmap", …)`, the
+  `("isel-out", T, D, I)` shape spec, and the `attr-range`
+  predicate.  Attr positions in conds/specs/exprs now accept inline
+  derive exprs — a transported guard can read a *derived* attr.
+- **`attr-is`/`attr-eq`/`attr-in` keep the absent-is-None contract**:
+  the new `_aval` resolver distinguishes unbound (`_MISSING`) from
+  bound-None, but the value predicates map `_MISSING → None` — the
+  synthesized optional-attr guards (`slice.start is None` = torch
+  default) depend on it; the pin held.
+
+**Measured:** `isel_compose` (`t[I][J] → t[I[J]]`) as a pure-data
+object clears **all eight gauntlet stages including cert — `usable`**
+— a construction class that was refused at `full-data` on a
+technicality is now an admitted, serializable, deployable object.
+The procedural spelling still declines honestly (and the pin proves
+the data spelling replaces it, not hides it).

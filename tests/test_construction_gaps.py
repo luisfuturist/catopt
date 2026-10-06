@@ -448,10 +448,30 @@ def _isel_compose_lit() -> Rewrite:
     )
 
 
+def _isel_compose_data() -> synth.ConstructedObject:
+    """``K = I[J]`` spelled as data — the dspec ``gather`` expr."""
+    return synth.ConstructedObject(
+        rule=Rewrite(
+            name="isel_compose",
+            lhs=_p(
+                "index_select",
+                _p("index_select", "t", dim="D", index="I"),
+                dim="D",
+                index="J",
+            ),
+            rhs=_p("index_select", "t", dim="D", index="K"),
+            dspec={"K": ("gather", ("attr", "I"), ("attr", "J"))},
+            law="t[I][J] = t[I[J]] — gather composition.",
+        ),
+        kind="abstraction",
+        construction=("fold", "isel_compose"),
+    )
+
+
 def _isel_compose_proc() -> synth.ConstructedObject:
-    """The metavar version needs ``K = I[J]`` — index-of-index — which
-    the declarative dspec vocabulary cannot express; spelled with a
-    procedural ``derive`` it is honest but not full-data."""
+    """The metavar version needs ``K = I[J]`` — index-of-index —
+    expressible today as the dspec ``gather`` expr; spelled with a
+    procedural ``derive`` instead it is honest but not full-data."""
 
     def _derive_gg(bound):
         i, j = bound.get("$attr:I"), bound.get("$attr:J")
@@ -598,19 +618,30 @@ def test_cat_gather_dedup_folds_are_usable():
 
 
 def test_metavar_gather_compose_needs_a_missing_derive():
-    """``t[I][J] = t[I[J]]`` over metavar indices: the dspec tuple
-    language has no index-of-index form, so the object can only be
-    spelled procedurally — and the full-data stage refuses it."""
+    """``t[I][J] = t[I[J]]`` over metavar indices: index-of-index.
+
+    The procedural spelling declines at full-data (a ``derive`` hook
+    does not serialize); the *data* spelling — dspec
+    ``("gather", I, J)`` — reconstructs the same derive and clears
+    the stage the machinery limit used to fail on.
+    """
     rep, rec = _gauntlet(_isel_compose_proc(), _gg_case())
     assert not rep.usable
     assert rec["missing_hooks"] == ["derive"]
     assert not _stages(rep)["full-data"].passed
+    rep2, rec2 = _gauntlet(_isel_compose_data(), _gg_case())
+    assert rec2["missing_hooks"] == []
+    assert _stages(rep2)["full-data"].passed
+    assert rep2.usable
 
 
 def test_compose_over_procedural_gather_laws_stays_procedural():
     """``compose`` transports the shipped gather laws' Python ``check``
-    guards; the composite keeps the hook and full-data declines —
-    composition does not launder procedural evidence."""
+    guards *and* their ``derive`` hooks — the composite keeps every
+    procedural remainder honestly recorded (the transported derive
+    can't serialize, so it joins the missing-hooks list) and
+    full-data declines — composition does not launder procedural
+    evidence."""
     obj = synth.compose_objects(
         "dedup_then_id",
         _DECODE["index_select_dedup"],
@@ -619,7 +650,7 @@ def test_compose_over_procedural_gather_laws_stays_procedural():
     assert obj is not None
     rep, rec = _gauntlet(obj, _gg_case())
     assert not rep.usable
-    assert rec["missing_hooks"] == ["check"]
+    assert sorted(rec["missing_hooks"]) == ["check", "derive"]
     assert not _stages(rep)["full-data"].passed
 
 

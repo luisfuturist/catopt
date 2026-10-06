@@ -77,6 +77,10 @@ Grammar
                                      #   repeat_interleave on T's dim
           | ("repeat-heads", A,B,UD,ES)  # sa[-2] == sb[-2] * the repeat
                                      #   factor $attr:ES[UD mod rank+1]
+          | ("attr-range", V, T, K)    # bound attr V == range(s[K]),
+                                     #   s = shape(T) — the identity-
+                                     #   gather guard (K normalized
+                                     #   mod rank)
 
     T/A/B := metavar name (str) | ("mm-out", T, T)   — a *shape spec*:
              a bound term's inferred shape, or the matmul output shape
@@ -105,7 +109,13 @@ Grammar
                                      #   when they name exactly T's
                                      #   last k axes (the *_norm
                                      #   normalized_shape), else None
+          | ("isel-out", T, D, I)    # index_select output: s with
+                                     #   axis D replaced by len(I)
     D*/NAME := attribute metavar names — looked up under "$attr:NAME".
+             An attr position also accepts a derive *expr* (a tuple,
+             evaluated inline against ``bound`` — how a transported
+             guard reads a *derived* attr) or a non-tuple literal;
+             spell a literal tuple through ``("lit", v)``.
     CMP    := "==" | "!=" | "<" | "<=" | ">" | ">=".
 
 Strictness contract: any predicate that cannot be *proven* from the
@@ -143,6 +153,10 @@ value expressions evaluated against the same ``bound`` environment:
            | ("len", e)                        # len of a tuple/list
            | ("tuple", e1, ...)                # tuple literal
            | ("concat", e1, ...)               # tuple concatenation
+           | ("gather", e_table, e_sel)        # table[j] per j in sel
+                                              #   — index-of-index
+           | ("unique", e)                     # first-occurrence uniques
+           | ("posmap", e_dom, e_keys)         # dom.index(k) per key
            | ("add"|"sub"|"mul"|"fdiv"|"floordiv", e, e)
            | ("neg"|"recip"|"float"|"int", e)
            | ("bcast", T, T)                   # broadcast two shapes —
@@ -300,8 +314,9 @@ def _s_unsq_out(args: tuple, bound: dict) -> Any:
     """``("unsq-out", T, K)`` — the ``unsqueeze`` output shape."""
     if len(args) != 2:
         return None
+    dim = _aval(bound, args[1])
     return _unsq_shape(
-        _shape(bound, args[0]), bound.get(f"$attr:{args[1]}")
+        _shape(bound, args[0]), None if dim is _MISSING else dim
     )
 
 
@@ -309,8 +324,9 @@ def _s_reshape_out(args: tuple, bound: dict) -> Any:
     """``("reshape-out", T, NAME)`` — the resolved reshape target."""
     if len(args) != 2:
         return None
+    tgt = _aval(bound, args[1])
     return _reshape_shape(
-        _shape(bound, args[0]), bound.get(f"$attr:{args[1]}")
+        _shape(bound, args[0]), None if tgt is _MISSING else tgt
     )
 
 
@@ -329,7 +345,9 @@ def _attr_dims(bound: dict, name: str) -> tuple | None:
     bare int; every entry must be a non-``bool`` int — the
     normalization the procedural rms hook used.
     """
-    dims = bound.get(f"$attr:{name}")
+    dims = _aval(bound, name)
+    if dims is _MISSING:
+        return None
     if isinstance(dims, int) and not isinstance(dims, bool):
         dims = (dims,)
     if not (
@@ -353,8 +371,35 @@ def _bound_attr(bound: dict, name: Any, default: Any) -> Any:
     """
     if name is None:
         return default
-    v = bound.get(f"$attr:{name}")
+    v = _aval(bound, name)
+    if v is _MISSING:
+        # An unbound name defaults as before; a declining inline expr
+        # propagates the decline — the spec must not silently default
+        # a value the author wrote as computed.
+        return _MISSING if isinstance(name, (tuple, list)) else default
     return default if v is None else v
+
+
+def _aval(bound: dict, x: Any) -> Any:
+    """Resolve an attr-typed argument to its bound value.
+
+    Attr positions (cond predicates, shape specs, derive exprs) accept
+    three spellings: a ``str`` names an attribute metavariable —
+    ``bound["$attr:<name>"]``, ``_MISSING`` when unbound; a
+    ``tuple``/``list`` is a derive expr evaluated inline against
+    *bound* — the derived-attr read a transported guard needs (a
+    ``_Decline`` surfaces as ``_MISSING``, a ``ValueError`` propagates
+    as malformed); anything else is the literal value itself.  A
+    literal tuple spells ``("lit", v)`` — a bare tuple is an expr.
+    """
+    if isinstance(x, str):
+        return bound.get(f"$attr:{x}", _MISSING)
+    if isinstance(x, (tuple, list)):
+        try:
+            return _dexpr(tuple(x), bound)
+        except _Decline:
+            return _MISSING
+    return x
 
 
 def _s_select_out(args: tuple, bound: dict) -> Any:
@@ -368,7 +413,7 @@ def _s_select_out(args: tuple, bound: dict) -> Any:
     if len(args) != 2:
         return None
     s = _tshape(bound, args[0])
-    d = bound.get(f"$attr:{args[1]}")
+    d = _aval(bound, args[1])
     if s is None or not s or not isinstance(d, int):
         return None
     nd = d % len(s)
@@ -390,12 +435,14 @@ def _s_slice_out(args: tuple, bound: dict) -> Any:
     if len(args) != 5:
         return None
     s = _tshape(bound, args[0])
-    d = bound.get(f"$attr:{args[1]}")
+    d = _aval(bound, args[1])
     if s is None or not s or not isinstance(d, int):
         return None
     lo = _bound_attr(bound, args[2], 0)
     hi = _bound_attr(bound, args[3], None)
     step = _bound_attr(bound, args[4], 1)
+    if _MISSING in (lo, hi, step):
+        return None
     nd = d % len(s)
     bd = s[nd]
     out = list(s)
@@ -424,8 +471,8 @@ def _s_chunk_out(args: tuple, bound: dict) -> Any:
     if len(args) != 3:
         return None
     s = _tshape(bound, args[0])
-    c = bound.get(f"$attr:{args[1]}")
-    d = bound.get(f"$attr:{args[2]}")
+    c = _aval(bound, args[1])
+    d = _aval(bound, args[2])
     if (
         s is None
         or not s
@@ -454,6 +501,8 @@ def _s_transpose_out(args: tuple, bound: dict) -> Any:
     s = _tshape(bound, args[0])
     d0 = _bound_attr(bound, args[1], -2)
     d1 = _bound_attr(bound, args[2], -1)
+    if _MISSING in (d0, d1):
+        return None
     if (
         s is None
         or not s
@@ -512,6 +561,34 @@ def _trailing_block(su: tuple, dims: tuple) -> tuple | None:
     return tuple(su[rank - k :])
 
 
+def _s_isel_out(args: tuple, bound: dict) -> Any:
+    """``("isel-out", T, D, I)`` — the ``index_select`` output shape.
+
+    Mirrors the ``index_select`` branch of ``_infer_op_shape``: the
+    axis ``D`` names keeps every other extent and takes the index's
+    length.  ``D`` and ``I`` resolve through :func:`_aval` — attr
+    metavar names, literals, or inline exprs (a transported gather
+    spec may carry a derived index).  An unshaped operand, a rank-0
+    operand or a non-int axis declines; a non-tuple index declines.
+    """
+    if len(args) != 3:
+        return None
+    s = _tshape(bound, args[0])
+    d = _aval(bound, args[1])
+    idx = _aval(bound, args[2])
+    if (
+        s is None
+        or not s
+        or not isinstance(d, int)
+        or not isinstance(idx, (tuple, list))
+    ):
+        return None
+    nd = d % len(s)
+    out = list(s)
+    out[nd] = len(idx)
+    return tuple(out)
+
+
 #: Tag-dispatch for tuple shape specs — each handler takes
 #: ``(args, bound)`` and validates its own arity.
 _SPEC_OPS: dict = {
@@ -525,6 +602,7 @@ _SPEC_OPS: dict = {
     "chunk-out": _s_chunk_out,
     "transpose-out": _s_transpose_out,
     "tail-block": _s_tail_block,
+    "isel-out": _s_isel_out,
 }
 
 
@@ -536,9 +614,10 @@ def _shape(bound: dict, ref: Any) -> Any:
     ``("mm-out", a, b)``, ``("bcast", a, b)``, ``("unsq-out", a, K)``,
     ``("reshape-out", a, NAME)``, ``("getitem-out", a)``,
     ``("select-out", a, D)``, ``("slice-out", a, D, S, E, STEP)``,
-    ``("chunk-out", a, C, D)``, ``("transpose-out", a, D0, D1)`` and
-    ``("tail-block", a, NAME)``.  Specs compose — an operand may itself
-    be a spec (``("select-out", ("bcast", a, b), D)``).
+    ``("chunk-out", a, C, D)``, ``("transpose-out", a, D0, D1)``,
+    ``("tail-block", a, NAME)`` and ``("isel-out", a, D, I)``.  Specs
+    compose — an operand may itself be a spec (``("select-out",
+    ("bcast", a, b), D)``).
     Anything else resolves to ``None`` (unknown), which every
     predicate treats as a decline.
     """
@@ -575,10 +654,13 @@ def _axes_pair(bound: dict, k0: str, k1: str, rank: int) -> Any:
     """
     if rank < 2:
         return None
-    if f"$attr:{k0}" not in bound and f"$attr:{k1}" not in bound:
+    a0, a1 = _aval(bound, k0), _aval(bound, k1)
+    if a0 is _MISSING and a1 is _MISSING:
         return (rank - 2, rank - 1)
     return _axis_pair(
-        bound.get(f"$attr:{k0}"), bound.get(f"$attr:{k1}"), rank
+        None if a0 is _MISSING else a0,
+        None if a1 is _MISSING else a1,
+        rank,
     )
 
 
@@ -684,8 +766,8 @@ def _p_dim_eq_attr(args: tuple, bound: dict) -> bool:
     sa, sb = _tshape(bound, args[0]), _tshape(bound, args[2])
     if sa is None or sb is None:
         return False
-    ia = bound.get(f"$attr:{args[1]}")
-    ib = bound.get(f"$attr:{args[3]}")
+    ia = _aval(bound, args[1])
+    ib = _aval(bound, args[3])
     if not isinstance(ia, int) or not isinstance(ib, int):
         return False
     ok_a, da = _dim_at(sa, ia)
@@ -706,7 +788,7 @@ def _p_dim_mod(args: tuple, bound: dict) -> bool:
     non-int or zero modulus declines rather than raising.
     """
     s = _tshape(bound, args[0])
-    d = bound.get(f"$attr:{args[1]}")
+    d = _aval(bound, args[1])
     m = args[2]
     if (
         s is None
@@ -769,7 +851,7 @@ def _p_axes_eq(args: tuple, bound: dict) -> bool:
 
 def _p_axis(args: tuple, bound: dict) -> bool:
     s = _tshape(bound, args[0])
-    v = bound.get(f"$attr:{args[1]}")
+    v = _aval(bound, args[1])
     return (
         s is not None
         and len(s) > 0
@@ -805,25 +887,28 @@ def _p_const_cmp(args: tuple, bound: dict) -> bool:
 
 
 def _p_attr_is(args: tuple, bound: dict) -> bool:
-    return bound.get(f"$attr:{args[0]}") is args[1]
+    v = _aval(bound, args[0])
+    # absent reads as None — the optional-attr contract
+    return (None if v is _MISSING else v) is args[1]
 
 
 def _p_attr_eq(args: tuple, bound: dict) -> bool:
-    return bound.get(f"$attr:{args[0]}") == args[1]
+    v = _aval(bound, args[0])
+    return (None if v is _MISSING else v) == args[1]
 
 
 def _p_attr_in(args: tuple, bound: dict) -> bool:
-    return bound.get(f"$attr:{args[0]}") in args[1]
+    v = _aval(bound, args[0])
+    return (None if v is _MISSING else v) in args[1]
 
 
 def _p_attr_type(args: tuple, bound: dict) -> bool:
-    return isinstance(
-        bound.get(f"$attr:{args[0]}"), _ATTR_TYPES[args[1]]
-    )
+    v = _aval(bound, args[0])
+    return v is not _MISSING and isinstance(v, _ATTR_TYPES[args[1]])
 
 
 def _p_attr_len(args: tuple, bound: dict) -> bool:
-    v = bound.get(f"$attr:{args[0]}")
+    v = _aval(bound, args[0])
     return isinstance(v, tuple) and _CMPS[args[1]](len(v), args[2])
 
 
@@ -835,9 +920,9 @@ def _p_attr_cmp_dim(args: tuple, bound: dict) -> bool:
     must resolve to ints — a missing attr, an unshaped term, a
     non-int index or a ``None`` dim all decline.
     """
-    v = bound.get(f"$attr:{args[0]}")
+    v = _aval(bound, args[0])
     s = _tshape(bound, args[2])
-    k = bound.get(f"$attr:{args[3]}")
+    k = _aval(bound, args[3])
     if not isinstance(v, int) or s is None or not isinstance(k, int):
         return False
     ok, d = _dim_at(s, k)
@@ -851,8 +936,8 @@ def _p_attr_eq_attr(args: tuple, bound: dict) -> bool:
     pattern-bound attrs must coincide (``gqa_absorb_repeat``'s k/v
     expand shapes).  An unbound side declines — the strict posture.
     """
-    a = bound.get(f"$attr:{args[0]}", _MISSING)
-    b = bound.get(f"$attr:{args[1]}", _MISSING)
+    a = _aval(bound, args[0])
+    b = _aval(bound, args[1])
     return a is not _MISSING and a == b
 
 
@@ -882,7 +967,7 @@ def _p_ones_before(args: tuple, bound: dict) -> bool:
     insertion is a broadcast-1.
     """
     s = _tshape(bound, args[0])
-    k = bound.get(f"$attr:{args[1]}")
+    k = _aval(bound, args[1])
     if s is None or not isinstance(k, int):
         return False
     nd = k % (len(s) + 1)
@@ -903,8 +988,8 @@ def _p_axes_noop(args: tuple, bound: dict) -> bool:
     if s is None or not s:
         return False
     if len(s) == 1:
-        d0 = bound.get(f"$attr:{args[1]}")
-        d1 = bound.get(f"$attr:{args[2]}")
+        d0 = _aval(bound, args[1])
+        d1 = _aval(bound, args[2])
         return (
             isinstance(d0, int)
             and isinstance(d1, int)
@@ -954,7 +1039,7 @@ def _p_flat_pair_unsq(args: tuple, bound: dict) -> bool:
     is ``k`` or ``k+1`` past the inserted axis ``nd = K mod r+1``).
     Requires every spec to resolve to a concrete-int shape.
     """
-    k = bound.get(f"$attr:{args[1]}")
+    k = _aval(bound, args[1])
     specs = _concrete_specs(bound, (args[0], args[2], args[3]))
     if specs is None or not isinstance(k, int):
         return False
@@ -1032,7 +1117,7 @@ def _p_flat_map_unsq(args: tuple, bound: dict) -> bool:
     ``mul(u,v)`` shifted by the inserted axis.  All shapes must
     resolve to concrete ints.
     """
-    k = bound.get(f"$attr:{args[1]}")
+    k = _aval(bound, args[1])
     specs = _concrete_specs(bound, (args[0], args[2], args[3]))
     if specs is None or not isinstance(k, int):
         return False
@@ -1083,9 +1168,9 @@ def _p_repeat_chain(args: tuple, bound: dict) -> bool:
     dims — every unprovable piece declines (the strict posture; a
     law never admits a chain it cannot verify).
     """
-    d = bound.get(f"$attr:{args[1]}")
-    es = bound.get(f"$attr:{args[2]}")
-    rs = bound.get(f"$attr:{args[3]}")
+    d = _aval(bound, args[1])
+    es = _aval(bound, args[2])
+    rs = _aval(bound, args[3])
     bs = _shape(bound, args[0])
     if not (
         isinstance(d, int)
@@ -1130,8 +1215,8 @@ def _p_repeat_heads(args: tuple, bound: dict) -> bool:
     """
     sa = _concrete_rank2(bound, args[0])
     sb = _concrete_rank2(bound, args[1])
-    d = bound.get(f"$attr:{args[2]}")
-    es = bound.get(f"$attr:{args[3]}")
+    d = _aval(bound, args[2])
+    es = _aval(bound, args[3])
     if (
         sa is None
         or sb is None
@@ -1156,7 +1241,7 @@ def _p_axis_align_eq(args: tuple, bound: dict) -> bool:
     unbound/non-int ``K``, decline.
     """
     sa, sb = _tshape(bound, args[0]), _tshape(bound, args[1])
-    d = bound.get(f"$attr:{args[2]}")
+    d = _aval(bound, args[2])
     if (
         sa is None
         or sb is None
@@ -1182,13 +1267,44 @@ def _p_bcast_dim_inv(args: tuple, bound: dict) -> bool:
     position declines too (not provably ``1``).
     """
     sv, su = _tshape(bound, args[0]), _tshape(bound, args[1])
-    d = bound.get(f"$attr:{args[2]}")
+    d = _aval(bound, args[2])
     if sv is None or su is None or not su or not isinstance(d, int):
         return False
     pos = d % len(su) - len(su) + len(sv)
     if not (0 <= pos < len(sv)):
         return True
     return sv[pos] == 1
+
+
+def _p_attr_range(args: tuple, bound: dict) -> bool:
+    """``("attr-range", V, T, K)`` — bound attr V IS ``range(s[K])``.
+
+    The identity-gather guard as data:
+    ``index_select(t, d, I)`` is the identity exactly when ``I`` is
+    ``(0, 1, …, s[d]-1)`` — the bound attr is a tuple/list of
+    non-``bool`` ints equal to ``tuple(range(s[K % rank]))``.  ``V``
+    and ``K`` resolve through :func:`_aval` — a metavar name, a
+    literal, or an inline derive expr (a transported clause reads a
+    *derived* index this way).  An unshaped ``T``, a non-int ``K``,
+    an out-of-range axis, a ``None`` extent or a non-int-tuple ``V``
+    all decline.
+    """
+    v = _aval(bound, args[0])
+    s = _tshape(bound, args[1])
+    k = _aval(bound, args[2])
+    if (
+        v is _MISSING
+        or s is None
+        or not s
+        or not isinstance(k, int)
+        or not isinstance(v, (tuple, list))
+        or not all(
+            isinstance(i, int) and not isinstance(i, bool) for i in v
+        )
+    ):
+        return False
+    ok, d = _dim_at(s, k)
+    return ok and isinstance(d, int) and tuple(v) == tuple(range(d))
 
 
 _OPS: dict = {
@@ -1237,6 +1353,7 @@ _OPS: dict = {
     "flat-map-unsq": _p_flat_map_unsq,
     "repeat-chain": _p_repeat_chain,
     "repeat-heads": _p_repeat_heads,
+    "attr-range": _p_attr_range,
 }
 
 
@@ -1363,18 +1480,23 @@ def _d_lit(args: tuple, bound: dict) -> Any:
 
 
 def _d_attr(args: tuple, bound: dict) -> Any:
-    """``("attr", NAME)`` — the bound attribute metavar's value."""
-    v = bound.get(f"$attr:{args[0]}", _MISSING)
+    """``("attr", NAME)`` — the bound attribute metavar's value.
+
+    ``NAME`` resolves through :func:`_aval` — a metavar name, a
+    literal, or an inline expr (``("attr", expr)`` is the expr's own
+    value — how a transported spec reads a derived attr).
+    """
+    v = _aval(bound, args[0])
     if v is _MISSING:
-        raise _Decline(f"$attr:{args[0]} unbound")
+        raise _Decline(f"attr {args[0]!r} unresolvable")
     return v
 
 
 def _d_attr0(args: tuple, bound: dict) -> Any:
     """``("attr0", NAME)`` — ``v[0]`` for a tuple attr, else ``v``."""
-    v = bound.get(f"$attr:{args[0]}", _MISSING)
+    v = _aval(bound, args[0])
     if v is _MISSING:
-        raise _Decline(f"$attr:{args[0]} unbound")
+        raise _Decline(f"attr {args[0]!r} unresolvable")
     if isinstance(v, tuple):
         if not v:
             raise _Decline("empty attr tuple")
@@ -1455,6 +1577,71 @@ def _d_concat(args: tuple, bound: dict) -> tuple:
     return tuple(out)
 
 
+def _d_gather(args: tuple, bound: dict) -> tuple:
+    """``("gather", e_table, e_sel)`` — the index-of-index form.
+
+    ``tuple(table[j] for j in sel)`` — the tuple-level image of
+    ``index_select``; ``t[I][J] → t[K]`` derives ``K`` as
+    ``("gather", ("attr", "I"), ("attr", "J"))``.  Both operands must
+    be tuples/lists and every selector a non-``bool`` int in
+    ``[0, len(table))`` — an out-of-range or non-int selector declines
+    (an ``index_select`` index never denotes past the table).
+    """
+    table = _dexpr(args[0], bound)
+    sel = _dexpr(args[1], bound)
+    if not (
+        isinstance(table, (tuple, list))
+        and isinstance(sel, (tuple, list))
+    ):
+        raise _Decline("gather: a non-sequence operand")
+    if any(
+        not isinstance(j, int) or isinstance(j, bool) or j < 0
+        for j in sel
+    ):
+        raise _Decline("gather: a non-int or negative selector")
+    if any(j >= len(table) for j in sel):
+        raise _Decline("gather: selector out of range")
+    return tuple(table[j] for j in sel)
+
+
+def _d_unique(args: tuple, bound: dict) -> tuple:
+    """Return first-occurrence uniques — ``("unique", e)``.
+
+    ``tuple(dict.fromkeys(v))`` — order-stable; the ``U`` half of the
+    gather-dedup pair.  A non-sequence operand declines; an unhashable
+    element declines rather than guessing.
+    """
+    v = _dexpr(args[0], bound)
+    if not isinstance(v, (tuple, list)):
+        raise _Decline("unique: not a sequence")
+    try:
+        return tuple(dict.fromkeys(v))
+    except TypeError as e:
+        raise _Decline(f"unique: unhashable element: {e}") from None
+
+
+def _d_posmap(args: tuple, bound: dict) -> tuple:
+    """``("posmap", e_dom, e_keys)`` — ``dom.index(k)`` per key.
+
+    The ``inv`` half of gather-dedup: ``posmap(unique(I), I)`` is the
+    first-occurrence position map.  Both operands must be
+    tuples/lists; a key absent from the domain declines (no honest
+    position exists to mint).
+    """
+    dom = _dexpr(args[0], bound)
+    keys = _dexpr(args[1], bound)
+    if not (
+        isinstance(dom, (tuple, list))
+        and isinstance(keys, (tuple, list))
+    ):
+        raise _Decline("posmap: a non-sequence operand")
+    base = list(dom)
+    try:
+        return tuple(base.index(k) for k in keys)
+    except ValueError as e:
+        raise _Decline(f"posmap: key not in domain: {e}") from None
+
+
 def _d_bcast(args: tuple, bound: dict) -> tuple:
     """``("bcast", T, T)`` — broadcast two shape specs, concrete dims.
 
@@ -1529,6 +1716,9 @@ _DOPS: dict = {
     "len": _d_len,
     "tuple": _d_tuple,
     "concat": _d_concat,
+    "gather": _d_gather,
+    "unique": _d_unique,
+    "posmap": _d_posmap,
     "bcast": _d_bcast,
     **{k: _binop(k) for k in _DBINOPS},
     **{k: _unop(k) for k in _DUNOPS},
