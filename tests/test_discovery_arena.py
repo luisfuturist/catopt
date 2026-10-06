@@ -761,7 +761,7 @@ def test_greedy_player_legal_hook(tmp_path):
 
 
 def test_depth_probe_small_board(tmp_path):
-    """``depth_probe`` plays all three arms on an injected board."""
+    """``depth_probe`` plays all four arms on an injected board."""
 
     from catopt_core.laws import ALL_RULES
 
@@ -780,19 +780,25 @@ def test_depth_probe_small_board(tmp_path):
     table = ar.depth_probe(
         episodes=1, budget=5, seed=0, arena_factory=factory
     )
-    assert set(table) == {"fixed", "random", "greedy"}
+    assert set(table) == {"fixed", "random", "greedy", "heuristic"}
     for rows in table.values():
         (r,) = rows
         assert r["episode"] == 0 and r["steps"] <= 5
         assert {"usable", "holdout_fires", "holdout_paid"} <= set(r)
         # the live move set is free to grow (ingest adds spellings)
         assert r["legal_start"] >= 0 and r["legal_end"] >= 0
+        # the per-stage failure counts are part of the row
+        assert isinstance(r["failed"], dict)
     # the fixed playbook replays ingest + its three constructions,
     # then may spend steps guarding whatever refused at truth
     fixed = table["fixed"][0]
     assert fixed["steps"] >= 4
     rendered = ar._fmt_probe(table)
     assert "fixed" in rendered and "greedy" in rendered
+    # the bottleneck aggregate sums each arm's failed column
+    totals = ar.probe_failure_totals(table)
+    assert set(totals) == set(table)
+    assert sum(totals["fixed"].values()) == fixed["steps"]
 
 
 def test_main_runs_the_probe_and_writes_json(tmp_path, monkeypatch, capsys):
@@ -1106,3 +1112,209 @@ def test_legal_actions_enumerate_relax_and_specialize(tmp_path):
     ]
     # one leaf metavar X x the scalar bank
     assert len(spec) == len(ar.lawdata.SPECIALIZE_SCALARS)
+
+
+# ---------------------------------------------------------------------------
+#  The cheap board — make_arena's seeded corpus cap
+# ---------------------------------------------------------------------------
+
+
+def test_make_arena_max_cases_is_deterministic_and_isolated(tmp_path):
+    """The corpus cap thins working+pending; the holdout stays honest.
+
+    ``max_cases`` subsamples *after* the honest split, so a held-out
+    case can never leak back into working, the holdout keeps its
+    real-only/probe-eligible contract, and the whole draw replays
+    under the same seed.
+    """
+    a1 = ar.make_arena(
+        seed=0, max_cases=12, max_holdout=6, meta=_meta()
+    )
+    a2 = ar.make_arena(
+        seed=0, max_cases=12, max_holdout=6, meta=_meta()
+    )
+    def _wnames(a: ar.Arena) -> list:
+        return [c.name for c in a.working]
+
+    assert _wnames(a1) == _wnames(a2)  # seeded → replays
+    assert [c.name for c in a1.holdout] == [
+        c.name for c in a2.holdout
+    ]
+    # the caps bind
+    assert 0 < len(a1.working) <= 12
+    assert len(a1.pending) <= 12
+    assert 0 < len(a1.holdout) <= 6
+    # holdout isolation under subsampling: no held name is playable
+    held = {c.name for c in a1.holdout}
+    assert held.isdisjoint({c.name for c in a1.working})
+    assert held.isdisjoint(set(a1.pending))
+    # and the holdout keeps its honest contract: real-only, feeds
+    pb = ar.purpose_built_names()
+    assert held and not (held & pb)
+    assert all(c.feed for c in a1.holdout)
+    # the thinned sets are subsets of the full board's honest splits
+    full = ar.make_arena(seed=0, meta=_meta())
+    assert set(_wnames(a1)) <= {c.name for c in full.working}
+    assert held <= {c.name for c in full.holdout}
+    assert set(a1.pending) <= set(full.pending)
+    # the state view still hides every held case name
+    blob = json.dumps(a1.observe().to_dict())
+    assert all(f'"{n}"' not in blob for n in held)
+
+
+# ---------------------------------------------------------------------------
+#  The heuristic player — a ranked move preference over legal_actions
+# ---------------------------------------------------------------------------
+
+
+def test_heuristic_player_walks_the_ranked_order(tmp_path):
+    """Rank data drives the pick: compose > fold > ingest here.
+
+    No stored objects → no ``auto_cond``/``relax_guard``/``specialize``
+    moves exist, so the top-ranked live class is ``compose``
+    (premises present), ahead of ``fold`` (corpus composites) and
+    ``ingest`` (pending).
+    """
+    arena = _arena(
+        working=[_silu_swap_case("w", 4)],
+        pending=[_filler_case("pend")],
+        carrier_rules=(),
+    )
+    hp = ar.HeuristicPlayer()
+    move = hp(arena.observe())
+    assert move is not None and move.op == "compose"
+    assert move in ar.legal_actions(arena.observe())
+
+
+def test_heuristic_player_rescues_unguarded_objects_first(tmp_path):
+    """A stored unguarded object arms ``auto_cond`` — the top rank."""
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        carrier_rules=(),
+    )
+    _s, _rep = arena.step(
+        ar.Action.fold(("add", "X", "X"), "abs", name="bad")
+    )
+    hp = ar.HeuristicPlayer()
+    move = hp(arena.observe())
+    assert move is not None and move.op == "auto_cond"
+
+
+def test_heuristic_player_relaxes_before_folding(tmp_path):
+    """A guarded stored object ranks ``relax_guard`` over ``fold``.
+
+    The stored object is itself a premise (a self-compose is legal),
+    so the preference walk drains ``compose`` (rank 1) first, then
+    ``relax_guard`` (rank 2) — and every ``fold`` (rank 3) comes
+    after.  One state, repeated calls: the player's ``_played`` set
+    walks the frontier without stepping the board.
+    """
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    _s, rep = arena.step(
+        ar.Action.fold(
+            ("div", "X", ("add", ("abs", "X"), 1)),
+            "softsign",
+            cond=("rank", "X", ">=", 1),
+            name="guarded",
+        )
+    )
+    assert rep.applied
+    hp = ar.HeuristicPlayer()
+    state = arena.observe()
+    ops = []
+    while (move := hp(state)) is not None:
+        ops.append(move.op)
+    assert "relax_guard" in ops and "fold" in ops
+    # everything ahead of the first relax is a self-compose
+    assert set(ops[: ops.index("relax_guard")]) <= {"compose"}
+    assert ops.index("relax_guard") < ops.index("fold")
+
+
+def test_heuristic_player_skips_played_moves_and_terminates(tmp_path):
+    """Each move is spent once; a drained board returns ``None``.
+
+    The corpus is one-op cases (no composite spellings, no premises,
+    no carriers), so the whole legal set is the ingest pair plus the
+    whole-pool move — the player spends each once, then stops.
+    """
+    one_op = _case("one", _p("mul", _v("one_x", 4), Const(2)), _v("one_x", 4))
+    another = _case(
+        "two", _p("neg", _v("two_x", 4)), _v("two_x", 4)
+    )
+    arena = _arena(
+        working=[one_op],
+        pending=[another],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    hp = ar.HeuristicPlayer()
+    seen = []
+    while (move := hp(arena.observe())) is not None:
+        assert move in ar.legal_actions(arena.observe())
+        seen.append(move.op)
+        arena.step(move)
+    assert seen  # it played before draining
+    # the whole episode is replayable — the policy is deterministic
+    arena2 = _arena(
+        working=[one_op],
+        pending=[another],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    traj = ar.run_episode(arena2, ar.HeuristicPlayer(), 8)
+    assert [r.action.op for r in traj.reports] == seen
+
+
+def test_heuristic_player_legal_and_order_seams(tmp_path):
+    """The ``legal``/``order`` seams re-rank or restrict the policy."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    assert ar.HeuristicPlayer(legal=lambda _s: ())(arena.observe()) is None
+    # a re-ranked table inverts the preference honestly
+    arena2 = _arena(
+        working=[_aff_step_case("w", 4)],
+        pending=[_filler_case("pend")],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    hp = ar.HeuristicPlayer(order=("ingest", "fold"))
+    move = hp(arena2.observe())
+    assert move is not None and move.op == "ingest"
+
+
+# ---------------------------------------------------------------------------
+#  The stage-failure aggregate — the bottleneck column
+# ---------------------------------------------------------------------------
+
+
+def test_stage_failures_aggregates_the_failed_column(tmp_path):
+    """Every step lands in exactly one bucket of the aggregate."""
+    from collections import deque
+
+    moves = deque(
+        [
+            _aff_lift(),  # clears all eight stages
+            ar.Action.fold(("add", "X", "X"), "abs", name="bad"),
+            ar.Action.ingest(("pend",)),  # corpus move — no gauntlet
+            ar.Action.ingest(("ghost",)),  # honest refusal
+        ]
+    )
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        holdout=[_aff_step_case("holdout", 6)],
+        pending=[_filler_case("pend")],
+    )
+    traj = ar.run_episode(
+        arena, lambda _s: moves.popleft() if moves else None, 6
+    )
+    fail = ar.stage_failures(traj)
+    assert fail == {
+        "cleared": 1,
+        "truth": 1,
+        "corpus": 1,
+        "declined": 1,
+    }
+    assert sum(fail.values()) == len(traj.reports)

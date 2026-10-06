@@ -42,6 +42,7 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "ARENA_MOVE_ORDER",
     "ARENA_REWARD",
     "ATTR_KINDS",
     "ATTR_KIND_OVERRIDES",
@@ -560,6 +561,27 @@ ARENA_REWARD: dict[str, float] = {
     "fire": 0.5,
     "paid": 5.0,
 }
+
+#: The heuristic player's move ranking — a hand-ordered policy over
+#: the construction vocabulary, in preference order.  ``auto_cond``
+#: first (the enumerator only offers it where a conditional verdict
+#: or an unguarded object makes it live — the cheapest rescue of
+#: already-measured constructions); ``compose`` next (premise-level
+#: structure is the highest-information move); ``relax_guard``
+#: widens a guarded region the sweeps re-referee; ``fold`` is the
+#: generic mint; ``ingest`` grows the evidence scope mid-game;
+#: ``specialize`` narrows a stored object; ``lift`` last — the most
+#: speculative construction.  The table is data, not code: a learned
+#: player must *beat* this ordering, and tuning it is a data edit.
+ARENA_MOVE_ORDER: tuple[str, ...] = (
+    "auto_cond",
+    "compose",
+    "relax_guard",
+    "fold",
+    "ingest",
+    "specialize",
+    "lift",
+)
 
 # ---------------------------------------------------------------------------
 #  The proposal corpus — term specs (the spec language is documented

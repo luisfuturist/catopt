@@ -82,9 +82,11 @@ signal) but never the workloads they were measured on.
 :func:`run_episode` drives a callable until the action budget is
 spent; :class:`FixedRule` (an authored playbook plus the
 "guard the conditionals" rule the real run measured as the missing
-move), :class:`RandomPlayer` (uniform over the live legal set) and
-:class:`GreedyPlayer` (the largest immediate-stage estimate) are the
-immediately-playable baselines.
+move), :class:`RandomPlayer` (uniform over the live legal set),
+:class:`GreedyPlayer` (the largest immediate-stage estimate) and
+:class:`HeuristicPlayer` (a hand-ordered move preference, data in
+``lawdata.ARENA_MOVE_ORDER``) are the immediately-playable
+baselines.
 
 The move set
 ------------
@@ -137,6 +139,7 @@ __all__ = [
     "CaseView",
     "FixedRule",
     "GreedyPlayer",
+    "HeuristicPlayer",
     "ObjectView",
     "ProposalView",
     "RandomPlayer",
@@ -147,10 +150,12 @@ __all__ = [
     "legal_actions",
     "main",
     "make_arena",
+    "probe_failure_totals",
     "purpose_built_names",
     "register_action",
     "run_episode",
     "split_corpus",
+    "stage_failures",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1411,11 +1416,16 @@ class Arena:
         The handler constructs (or declines); a produced object is
         stored through ``object_synthesis.store_constructed`` and
         faces ``evidence.run_gauntlet`` on a corpus whose probe is
-        the holdout.  The reward is the documented composition — a
-        refusal scores 0, ingest scores 0 immediately (its payoff is
-        what it later enables — see ``Trajectory.hindsight``).
-        An unregistered ``op`` is a ``KeyError`` — the registry is
-        the action space's own contract.
+        the holdout.  A construction the referee machinery cannot
+        process — the store's cert materialization raising on a
+        metavar the specialize map left free is the measured case —
+        is an honest refusal, not an episode-ending crash: the note
+        names the exception.  The reward is the documented
+        composition — a refusal scores 0, ingest scores 0
+        immediately (its payoff is what it later enables — see
+        ``Trajectory.hindsight``).  An unregistered ``op`` is a
+        ``KeyError`` — the registry is the action space's own
+        contract.
         """
         fn = ACTIONS.get(action.op)
         if fn is None:
@@ -1424,7 +1434,17 @@ class Arena:
                 f"(registered: {sorted(ACTIONS)})"
             )
         out = fn(self, action)
-        key, rep = self._referee(out)
+        try:
+            key, rep = self._referee(out)
+        except Exception as exc:
+            # the store/gauntlet declining to process a constructed
+            # object is a refusal with a named cause, not a crash
+            out = _Outcome(
+                applied=False,
+                note=(f"referee declined: {type(exc).__name__}: {exc}"),
+                detail=out.detail,
+            )
+            key, rep = "", None
         report = self._step_report(action, out, key, rep)
         self.steps += 1
         return self.observe(), report
@@ -1965,10 +1985,36 @@ def _pick_holdout(
     return set(ranked[:n_hold])
 
 
+def _subsample(
+    cases: Iterable[TermCase], n: int, *, seed: int, salt: str
+) -> list:
+    """Deterministic seeded subsample of at most *n* cases.
+
+    The same sha256-ranked draw :func:`_pick_holdout` uses, salted so
+    the working/pending/holdout subsamples are independent draws of
+    the same seed.  Survivors keep their corpus order — the split
+    and the enumeration order are untouched, only thinned.  A cap at
+    or above the input size is a no-op.
+    """
+    cases = list(cases)
+    if len(cases) <= n:
+        return cases
+    ranked = sorted(
+        cases,
+        key=lambda c: hashlib.sha256(
+            f"{seed}:{salt}:{c.name}".encode()
+        ).digest(),
+    )
+    keep = {c.name for c in ranked[:n]}
+    return [c for c in cases if c.name in keep]
+
+
 def make_arena(
     *,
     seed: int = 0,
     holdout_frac: float = 0.25,
+    max_cases: int | None = None,
+    max_holdout: int | None = None,
     conn: Any = None,
     meta: dict | None = None,
 ) -> Arena:
@@ -1982,6 +2028,17 @@ def make_arena(
     remaining intake terms (terms only — they feed real_terms but
     carry no probe feed) seed the pending pool, so the first
     ``ingest`` action is the corpus-direction move the board is for.
+
+    *max_cases* is the cheap-board knob: a seeded subsample of the
+    working split *and* the pending pool, each thinned to at most
+    *max_cases* cases after the honest split — the holdout can never
+    leak back into working (it is drawn first and the subsample only
+    removes).  *max_holdout* thins the probe the reward reads to at
+    most *max_holdout* cases (still a subset of the real,
+    probe-eligible holdout — shrinking it narrows what ``usable``
+    can ever fire on, so keep it honest-sized).  ``None`` (the
+    default) leaves the full board — a step there costs a gauntlet
+    over ~260 working terms plus ~50 probe cases.
     """
     from catopt_discovery import intake as li
     from catopt_discovery.impact import _bench_cases, model_cases
@@ -1999,6 +2056,11 @@ def make_arena(
     )
     seen = {c.name for c in pool} | {c.name for c in bench}
     pending = [c for c in li.load_cases() if c.name not in seen]
+    if max_cases is not None:
+        working = _subsample(working, max_cases, seed=seed, salt="w")
+        pending = _subsample(pending, max_cases, seed=seed, salt="p")
+    if max_holdout is not None:
+        holdout = _subsample(holdout, max_holdout, seed=seed, salt="h")
     return Arena(
         working=working,
         holdout=holdout,
@@ -2144,6 +2206,59 @@ class GreedyPlayer:
         return max(acts, key=lambda a: self._score(state, a))
 
 
+class HeuristicPlayer:
+    """Hand-ordered preference over the live legal set — as data.
+
+    The baseline a learned player must beat: not a playbook (it reads
+    :func:`legal_actions` like every real player) but a *ranked move
+    preference* — :data:`lawdata.ARENA_MOVE_ORDER` tries ``auto_cond``
+    first (the enumerator only offers it on conditional verdicts and
+    unguarded objects — the cheapest rescue of measured
+    constructions), then ``compose``, ``relax_guard``, ``fold``,
+    ``ingest``, ``specialize``, ``lift``.  Within an op class the
+    deterministic enumeration order is kept.
+
+    Like :class:`FixedRule` the player remembers what it spent — an
+    action already played is skipped even while it stays legal
+    (re-declaring re-gauntlets the same alpha key), so the policy
+    walks its preference frontier instead of replaying the top move.
+    ``None`` when nothing unplayed remains.  *order* and *legal* are
+    the seams: a different ranking or a filtered move generator
+    plugs in without new code.
+    """
+
+    def __init__(
+        self,
+        order: Iterable[str] | None = None,
+        legal: Any = None,
+    ) -> None:
+        """Bind the ranked preference and the legal-move enumerator."""
+        self._order = tuple(
+            lawdata.ARENA_MOVE_ORDER if order is None else order
+        )
+        self._legal = legal_actions if legal is None else legal
+        self._played: set = set()
+
+    def __call__(self, state: ArenaState) -> Action | None:
+        """Return the best-ranked unplayed move, or ``None``."""
+        fresh = [
+            a
+            for a in self._legal(state)
+            if _action_key(a) not in self._played
+        ]
+        for op in self._order:
+            pick = next((a for a in fresh if a.op == op), None)
+            if pick is not None:
+                self._played.add(_action_key(pick))
+                return pick
+        # ops the authored order does not rank (a newly registered
+        # action) play last, in enumeration order
+        pick = next(iter(fresh), None)
+        if pick is not None:
+            self._played.add(_action_key(pick))
+        return pick
+
+
 @dataclass
 class Trajectory:
     """One episode's step reports, in play order.
@@ -2271,6 +2386,31 @@ def run_episode(
     return Trajectory(reports)
 
 
+def stage_failures(traj: Trajectory) -> dict[str, int]:
+    """Aggregate which gauntlet stage killed each construction.
+
+    The bottleneck report the depth question needs when no arm
+    reaches ``usable``: per step, the *first* refusing gate — the
+    same ``failed`` column ``ObjectView`` carries — counted over the
+    episode.  Buckets: ``"declined"`` for honest refusals (no object
+    reached the gauntlet), ``"corpus"`` for ingest moves (no
+    gauntlet ran), ``"cleared"`` for constructions that passed every
+    stage, and the stage name for each measured failure.
+    """
+    out: dict[str, int] = {}
+    for r in traj.reports:
+        if not r.applied:
+            out["declined"] = out.get("declined", 0) + 1
+            continue
+        if not r.stages:
+            out["corpus"] = out.get("corpus", 0) + 1
+            continue
+        failed = next((s.name for s in r.stages if not s.passed), None)
+        key = "cleared" if failed is None else failed
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 #  The depth probe — does move choice matter on the construction board?
 # ---------------------------------------------------------------------------
@@ -2307,13 +2447,14 @@ def _probe_playbook() -> list[Action]:
 
 
 def _probe_players(seed: int) -> dict:
-    """Return the probe's three arms — fixed playbook, uniform, greedy."""
+    """Return the probe's arms — playbook, uniform, greedy, heuristic."""
     return {
         "fixed": lambda _e: FixedRule(_probe_playbook()),
         "random": lambda e: RandomPlayer(
             random.Random(1000 * seed + e)
         ),
         "greedy": lambda _e: GreedyPlayer(),
+        "heuristic": lambda _e: HeuristicPlayer(),
     }
 
 
@@ -2330,7 +2471,26 @@ def _probe_row(
         "reward": round(traj.total, 3),
         "legal_start": legal0,
         "legal_end": legal_end,
+        "failed": stage_failures(traj),
     }
+
+
+def probe_failure_totals(table: dict) -> dict:
+    """Aggregate ``stage_failures`` per player across episodes.
+
+    The bottleneck answer to "nothing reached ``usable``": which
+    gauntlet stage refused the most constructions under each arm —
+    ``{player: {stage: count}}`` over the probe rows' ``failed``
+    maps.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for name, rows in table.items():
+        totals: dict[str, int] = {}
+        for r in rows:
+            for stage, n in r["failed"].items():
+                totals[stage] = totals.get(stage, 0) + n
+        out[name] = totals
+    return out
 
 
 def depth_probe(
@@ -2340,15 +2500,18 @@ def depth_probe(
     seed: int = 0,
     arena_factory: Any = None,
 ) -> dict:
-    """Play the three baselines on fresh arenas; return the probe table.
+    """Play the four baselines on fresh arenas; return the probe table.
 
     Plan 0020 phase 2: ``fixed`` replays the authored playbook,
     ``random`` samples :func:`legal_actions` uniformly, ``greedy``
-    takes the largest immediate-stage estimate.  Each episode gets a
-    fresh board from *arena_factory* (``make_arena(seed)`` by
-    default); every row carries the legal-set size at the episode's
-    start and end plus the honest bars — usable objects, holdout
-    fires and holdout pay.
+    takes the largest immediate-stage estimate, ``heuristic`` walks
+    the :data:`lawdata.ARENA_MOVE_ORDER` preference.  Each episode
+    gets a fresh board from *arena_factory* (``make_arena(seed)``
+    by default — pass ``max_cases``/``max_holdout`` through a
+    factory for the cheap board); every row carries the legal-set
+    size at the episode's start and end, the honest bars — usable
+    objects, holdout fires and holdout pay — and the per-stage
+    failure counts :func:`probe_failure_totals` aggregates.
     """
     factory = arena_factory or (
         lambda s: make_arena(seed=s, meta={"code_rev": "probe"})
@@ -2391,16 +2554,47 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--episodes", type=int, default=2)
     parser.add_argument("--budget", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=None,
+        help="cheap board: cap working+pending corpus at N cases",
+    )
+    parser.add_argument(
+        "--max-holdout",
+        type=int,
+        default=None,
+        help="cheap board: cap the holdout probe at N cases",
+    )
     parser.add_argument("--json", help="write machine-readable results")
     args = parser.parse_args(argv)
 
+    factory = None
+    if args.max_cases is not None or args.max_holdout is not None:
+
+        def factory(s: int) -> Arena:
+            return make_arena(
+                seed=s,
+                max_cases=args.max_cases,
+                max_holdout=args.max_holdout,
+                meta={"code_rev": "probe"},
+            )
+
     table = depth_probe(
-        episodes=args.episodes, budget=args.budget, seed=args.seed
+        episodes=args.episodes,
+        budget=args.budget,
+        seed=args.seed,
+        arena_factory=factory,
     )
     print(  # stdout-compat
         "== arena depth probe — construction board =="
     )
     print(_fmt_probe(table))  # stdout-compat
+    totals = probe_failure_totals(table)
+    print("\nstage failures per player:")  # stdout-compat
+    for name, stages in totals.items():
+        if stages:
+            print(f"  {name}: {stages}")  # stdout-compat
     if args.json:
         from pathlib import Path
 

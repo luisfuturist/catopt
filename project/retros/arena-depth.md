@@ -74,3 +74,76 @@ space, payoff differences between players, honest holdout.  The
 board's depth for a *learned* player is the open question — the
 reward no longer rewards churn, so a longer-horizon probe (or a
 learned policy over the ~150k-move set) is the next measurement.
+
+## The cheap board / long horizon probe
+
+The real board's ~5-8 s/step (a full gauntlet over 261 working terms
+plus a 50-case probe) made the depth question unmeasurable: 24 steps
+cost ~1 h.  `make_arena` now takes `max_cases` / `max_holdout` —
+seeded sha256-ranked subsamples drawn *after* the honest split, so
+the holdout stays real-only and probe-eligible and can never leak
+back into working.  At `max_cases=24, max_holdout=12` the board has
+~35k-51k legal moves, a deep step costs ~1 s, and the probe below
+(5 episodes x budget 60, four arms) ran in **~15 min**.
+
+The probe (`max_cases=24`, `max_holdout=12`, seed 0, budget 60):
+
+| player | steps | usable | holdout fires | holdout paid | reward |
+|---|---|---|---|---|---|
+| fixed     | 6-7/episode (drains) | **1/0/0/0/1** | 4/0/0/0/4 | 1/0/0/0/1 | 19.3/2.3/2.0/2.3/19.3 |
+| random    | 60 | 0 | 0/1/1/5/0 | 0/0/0/2/0 | 14-24 |
+| greedy    | 60 | 0 | 0 | 0 | 18.0 all |
+| heuristic | 60 | 0 | 0 | 0 | ~17.8 all |
+
+Three findings:
+
+- **`usable` is reachable but only through authored knowledge.**  The
+  fixed playbook admits the aff-step lift in 2 of 5 episodes (the
+  subsample decides whether the working set keeps a measuring site
+  and the 12-case probe keeps a paying one).  No enumerated-frontier
+  arm — random, greedy, or the new heuristic — mints a usable object
+  in 300 moves.
+- **Move ordering separates on *depth*, not yet on yield.**  The
+  heuristic (`lawdata.ARENA_MOVE_ORDER`: auto_cond -> compose ->
+  relax -> fold -> ingest -> specialize -> lift, each move spent
+  once) gets ~29% of its plays past truth+novelty vs ~2% random and
+  0% greedy — but converts none to holdout fires.  Its episode is
+  34 composes + 26 auto_conds: the preference walk *never drains the
+  top classes*, so at this budget it never reaches the fold/lift
+  mass where firing objects live.  A ranked order is a frontier
+  policy; the tail ranks are unreachable when the head class has
+  ~14k members.
+- **The bottleneck is `truth`, then `typed-pay`.**  Stage-failure
+  aggregates over the run: random `truth` 199 / `full-data` 72 /
+  `declined` 24 / `typed-pay` 5; greedy `truth` 300 (every largest-
+  spec fold is a false equality); heuristic `truth` 154 /
+  `typed-pay` 86 / `declined` 60.  `truth` kills most minted
+  constructions — the board's constructions are mostly *false*
+  equalities, not unmeasured ones.  For deeper arms the wall moves
+  to `typed-pay`: true, novel objects that never fire or pay on the
+  probe (12 holdout cases is a small target — a `usable` needs
+  fires>0 *and* paid>0 *there*).  `full-data` (72, all random) is
+  the compose-products-drop-check-hooks class.
+
+Two infrastructure findings the run surfaced:
+
+- **Cert materialization gap.**  An enumerated `compose` whose
+  specialize map leaves an attr metavariable free (the `sdpa_fold_*`
+  family's `SC` — `INSTANCE_ATTR_DEFAULTS` covers TD/SD/DP/DT but
+  not `SC`) produced a rule `lemma_cert.materialize` raised
+  `KeyError` on — an episode-killing crash.  `Arena.step` now
+  converts referee-side failures into an honest `applied=False`
+  refusal (`referee declined: ...` in the note); ~1 in 60 random
+  moves hits it.
+- **Cheap-board auto-cond starvation.**  All 12 heuristic declines
+  per episode are `auto_cond` refusals — "no equal site in the
+  measured domain": a 24-case working corpus measures too few equal
+  sites for the guard synth to cover.  The rescue class is weaker on
+  the small board by construction.
+
+Verdict, sharpened: the board is deep-but-winnable — `usable` is
+*reachable*, not far-away-invisible; the blocker is that enumerated
+constructions are mostly false (`truth`) and the true ones mostly
+don't pay on the probe (`typed-pay`).  A learned player's edge, if
+any, is in *targeting* — picking constructions that fire on real
+workloads — which is exactly what the frontier arms cannot do.
