@@ -187,6 +187,41 @@ gate no longer has to refuse it.
   crash's honest residue, not a new defect: the rule is human-admitted
   and its real firing is unaffected.
 
+## Follow-up — `gqa_absorb_repeat` rank-4 (the chained-bindings hole)
+
+Same class, one more law — the eighth.  `chained-bindings.md`'s
+operand-chained attr domains made the rank-3 binding *mintable*,
+surfacing the latent hole its §6 recorded: `q=(2,6,4)`,
+`k=v=(2,3,4)` with the consistent `unsq(-2) → expand (2,3,2,4) →
+reshape (2,6,4)` chains satisfies `repeat-chain`/`attr-eq-attr`/
+`repeat-heads` (`q[-2]=6 == k[-2]·r`), but the minted `sdpa(...,
+enable_gqa=True)` RHS cannot contract — `enable_gqa` repeats along
+the head axis at `-3`, and the pattern's `transpose(1, 2)` only
+lands the heads there when the leaves are rank-4 `(b, t, h, d)`.
+Measured: `rhs-err` (`RuntimeError: Expected size for first two
+dimensions of batch2 tensor to be: [2, 6] but got: [2, 3]`); the
+enumerator mints 6 such bases per rank-3 leaf binding (the `{D, C}`
+product).
+
+Fix: `("rank", "q", "==", 4)`, `("rank", "k", "==", 4)`,
+`("rank", "v", "==", 4)` prepended to `_COND_GQA_ABSORB` — the
+existing `rank` atom, no new vocabulary.  Every `equal` site is
+preserved: all real fires are rank-4 (`test_gqa_absorb_repeat_kv`,
+`test_gqa_absorb_real_firing_and_veto`), and every non-rank-4
+accepted site was a `rhs-err`/`unequal` anyway (the repeated axis
+lands at `-2`, not `-3`, off rank 4).  The synth window stays
+`0/3000` all-declined — clean — and the accepted region is
+non-empty: the rank-4 corner binding clears and evaluates `equal`
+(the equal corner's ~5M-env depth remains the cap-depth limitation
+`chained-bindings.md` §6 names, not a guard failure).
+
+Tests: `test_cond_laws.test_gqa_absorb_repeat_requires_rank4_operands`
+(the decline, the measured `rhs-err`, the corner `equal`),
+`test_laws_rewrite_edges.test_gqa_absorb_declines_a_rank3_term`
+(`apply_rule` mints no enodes) + a rank-3 decline case in
+`test_check_gqa_absorb_both_directions`; the `test_discovery_oracle`
+pin's hand-built binding moved to the rank-4 corner spelling.
+
 ## Gates
 
 `pytest tests/test_cond_laws.py tests/test_law_serialize.py

@@ -53,6 +53,7 @@ from catopt_core.laws.tensor import (
     CHUNK_SINGLE,
     DISTRIBUTE_MUL,
     FACTOR_MUL,
+    GQA_ABSORB,
     LINEAR_CHANNEL_SCALE,
     LINEAR_CHANNEL_TO_ROW_SCALE,
     LINEAR_ROW_SCALE,
@@ -1040,6 +1041,62 @@ def test_linear_row_scale_requires_r_broadcasts_into_output():
     bad = {"x": _v("x", 1), "r": _v("r", 1), "W": _p("W", 1)}
     assert not LINEAR_ROW_SCALE.check(bad)
     assert not LINEAR_ROW_SCALE_REV.check(bad)
+
+
+def test_gqa_absorb_repeat_requires_rank4_operands():
+    """``sdpa`` + ``enable_gqa`` repeats along the head axis at ``-3``;
+    the pattern's ``transpose(1, 2)`` only lands the heads there when
+    the leaves are rank-4 ``(b, t, h, d)``.  A rank-3 spelling —
+    ``q=(2,6,4)``, ``k=v=(2,3,4)`` with the consistent
+    ``unsq(-2) → expand (2,3,2,4) → reshape (2,6,4)`` chain —
+    satisfies every repeat clause but its minted ``enable_gqa`` RHS
+    cannot contract: a measured ``rhs-err``
+    (``Expected size for first two dimensions of batch2 tensor to be:
+    [2, 6] but got: [2, 3]``).  The ``rank == 4`` clauses decline it.
+    """
+    from catopt_core.egraph.terms import _term_instantiate
+    from catopt_discovery import oracle as vo
+
+    # the measured counterexample: all repeat clauses pass, rank-3
+    # leaves make the enable_gqa RHS ill-typed.
+    bad = {
+        "q": _v("q", 2, 6, 4),
+        "k": _v("k", 2, 3, 4),
+        "v": _v("v", 2, 3, 4),
+        "$attr:UDk": -2,
+        "$attr:ESk": (2, 3, 2, 4),
+        "$attr:RSk": (2, 6, 4),
+        "$attr:UDv": -2,
+        "$attr:ESv": (2, 3, 2, 4),
+        "$attr:RSv": (2, 6, 4),
+        "$attr:D": 1e-5,
+        "$attr:C": False,
+    }
+    assert not GQA_ABSORB.check(bad)
+    # …and it was a real rhs-err, not a vacuous decline: the
+    # instantiated RHS genuinely cannot denote.
+    lhs = _term_instantiate(GQA_ABSORB.lhs, bad)
+    rhs = _term_instantiate(GQA_ABSORB.rhs, bad)
+    assert vo.eval_instance(lhs, rhs)[0] == "rhs-err"
+    # the rank-4 (b, t, h, d) corner — the binding the chained
+    # enumerator mints — still clears and evaluates equal.
+    good = {
+        "q": _v("q", 2, 3, 4, 4),
+        "k": _v("k", 2, 3, 2, 4),
+        "v": _v("v", 2, 3, 2, 4),
+        "$attr:UDk": -2,
+        "$attr:ESk": (2, 3, 2, 2, 4),
+        "$attr:RSk": (2, 3, 4, 4),
+        "$attr:UDv": -2,
+        "$attr:ESv": (2, 3, 2, 2, 4),
+        "$attr:RSv": (2, 3, 4, 4),
+        "$attr:D": 1e-5,
+        "$attr:C": False,
+    }
+    assert GQA_ABSORB.check(good)
+    lhs = _term_instantiate(GQA_ABSORB.lhs, good)
+    rhs = _term_instantiate(GQA_ABSORB.rhs, good)
+    assert vo.eval_instance(lhs, rhs)[0] == "equal"
 
 
 def test_linear_scale_guards_cap_the_weight_arity():

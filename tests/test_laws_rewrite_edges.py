@@ -281,6 +281,62 @@ def test_check_gqa_absorb_both_directions():
     )
     # q head count must equal kv_heads * r
     assert not _check_gqa_absorb({**bound, "q": _p("q3", 1, 4, 7, 3)})
+    # rank-3 leaves satisfy the chain/head clauses but the minted
+    # enable_gqa RHS cannot contract (measured rhs-err — the
+    # chained-bindings hole); the rank clauses decline them.
+    rank3 = {
+        "q": _v("q", 2, 6, 4),
+        "k": _v("k", 2, 3, 4),
+        "v": _v("v", 2, 3, 4),
+        "$attr:UDk": -2,
+        "$attr:ESk": (2, 3, 2, 4),
+        "$attr:RSk": (2, 6, 4),
+        "$attr:UDv": -2,
+        "$attr:ESv": (2, 3, 2, 4),
+        "$attr:RSv": (2, 6, 4),
+    }
+    assert not _check_gqa_absorb(rank3)
+
+
+def test_gqa_absorb_declines_a_rank3_term():
+    """End-to-end through ``apply_rule``: a rank-3 sdpa term whose
+    k/v carry consistent repeat chains mints NO new enodes — the
+    ``enable_gqa`` RHS cannot contract on rank-3 operands, so the
+    guard declines the match (the measured ``rhs-err`` site)."""
+    q = _v("q", 2, 6, 4)
+    k, v = _v("k", 2, 3, 4), _v("v", 2, 3, 4)
+
+    def rep3(t):
+        return Op.make(
+            "transpose",
+            Op.make(
+                "reshape",
+                Op.make(
+                    "expand",
+                    Op.make("unsqueeze", t, dim=-2),
+                    shape=(2, 3, 2, 4),
+                ),
+                shape=(2, 6, 4),
+            ),
+            dim0=1,
+            dim1=2,
+        )
+
+    term = Op.make(
+        "sdpa",
+        Op.make("transpose", q, dim0=1, dim1=2),
+        rep3(k),
+        rep3(v),
+        arg4=0.0,
+        arg5=False,
+    )
+    eg = EGraph()
+    root = eg.add_term(term)
+    assert not eg.apply_rule(GQA_ABSORB, root)
+    assert all(
+        dict(n.attrs).get("arg7") is not True
+        for n in eg.get_class(root).nodes
+    )
 
 
 def test_gqa_absorb_real_firing_and_veto():

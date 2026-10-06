@@ -109,13 +109,21 @@ The region is **not** genuinely empty — the guard accepts a hand-built
 binding (pinned in `test_discovery_oracle`):
 
 ```
-q=(2,6,4), k=v=(2,3,4)
-UDk=UDv=2, ESk=ESv=(2,3,2,4), RSk=RSv=(2,6,4)  ->  guard True
+q=(2,3,4,4), k=v=(2,3,2,4)
+UDk=UDv=-2, ESk=ESv=(2,3,2,2,4), RSk=RSv=(2,3,4,4)  ->  guard True
 ```
 
-`unsqueeze(2)` gives `(2,3,1,4)`, `expand` grows dim 2 to `(2,3,2,4)`,
-`reshape` merges dims 1–2 to `(2,6,4)` — a `repeat_interleave` with
-`r=2`, and `q[-2] = 6 = k[-2]·r`.
+`unsqueeze(-2)` gives `(2,3,2,1,4)`, `expand` grows dim -2 to
+`(2,3,2,2,4)`, `reshape` merges dims 2–3 to `(2,3,4,4)` — a
+`repeat_interleave` with `r=2`, and `q[-2] = 4 = k[-2]·r`.
+
+(The earlier draft of this pin used the rank-3 spelling `q=(2,6,4)`,
+`k=v=(2,3,4)` — every repeat clause held, but its minted
+`enable_gqa` RHS could not contract: a measured `rhs-err`, the
+latent hole `chained-bindings.md` §6 named.  The guard now carries
+`("rank", q|k|v, "==", 4)` — `sdpa`'s head axis must sit at `-3`
+after the pattern's `transpose(1, 2)` — see
+`shipped-guard-tightening.md`'s follow-up section.)
 
 The enumeration never mints it.  `oracle._attr_domains` resolves each
 view node's operand shape through `_operand_shape`, which for

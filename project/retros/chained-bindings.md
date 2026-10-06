@@ -91,9 +91,11 @@ same root cause.
 
 Leaf binding `k=v=(2,3,2,4)`, `q=(2,3,4,4)` (the `(b,t,h_kv,d)` /
 `(b,t,h,d)` pair — `repeat-heads` needs `q[-2]==k[-2]*r`, and
-`sdpa`/`enable_gqa` needs rank 4; rank-3 spellings are guard-accepted
-but `rhs-err` — the guard does not check rank, a real latent hole
-the enumeration now *can* see):
+`sdpa`/`enable_gqa` needs rank 4; rank-3 spellings *were*
+guard-accepted but `rhs-err` — the guard did not check rank, a
+latent hole the enumeration could now see.  **Fixed** in a
+follow-up: the cond gained `("rank", q|k|v, "==", 4)` — see
+`shipped-guard-tightening.md`):
 
 - the k/v chain groups mint `{UD=-2, ES=(2,3,2,2,4), RS=(2,3,4,4)}`
   at option index 29 of 151 consistent triples;
@@ -190,7 +192,13 @@ correctly proposes.
 - The chain enumeration covers only direct `args[0]` links; a view
   buried inside a wider compound operand still resolves through
   `_operand_shape`'s leaf fallback (unchanged, honest posture).
-- `gqa_absorb_repeat`'s guard accepts rank-3 bindings whose RHS sdpa
-  cannot contract — a real latent hole in the *law* (not the
-  enumeration); fixing it would need a rank predicate on the guard
-  side, which lives in `laws/`, not the owned seam.
+- ~~`gqa_absorb_repeat`'s guard accepts rank-3 bindings whose RHS
+  sdpa cannot contract~~ — **RESOLVED** (follow-up, same change
+  class as `shipped-guard-tightening.md`): `_COND_GQA_ABSORB` gained
+  `("rank", "q", "==", 4)`/`("rank", "k", "==", 4)`/`("rank", "v",
+  "==", 4)` — the pattern's `transpose(1, 2)` lands the head axis at
+  sdpa's `-3` slot only at rank 4.  Measured on the minted rank-3
+  chain (`UD=-2, ES=(2,3,2,4), RS=(2,6,4)` over `q=(2,6,4)`,
+  `k=v=(2,3,4)` — 6 bases): old guard accepts all → `rhs-err`;
+  tightened guard declines all.  The rank-4 corner still accepts and
+  evaluates `equal`.

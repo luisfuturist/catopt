@@ -1675,33 +1675,53 @@ def test_gqa_absorb_repeat_guard_accepts_a_chained_binding():
     """The empty ``gqa_absorb_repeat`` synth window is an ENUMERATION
     gap, not an empty region.
 
-    The guard's ``repeat-chain`` / ``repeat-heads`` clauses are
-    satisfiable: a hand-built ``unsqueeze(2) -> expand(2 at 2) ->
-    reshape(merge)`` chain with ``q[-2] == k[-2] * r`` clears.  The
+    The guard's clauses are satisfiable: a hand-built rank-4
+    ``(b, t, h, d)`` binding with ``unsqueeze(-2) -> expand(r at -2)
+    -> reshape(merge)`` chains and ``q[-2] == k[-2] * r`` clears.  The
     enumeration mints it now: the operand-chained
     ``unsqueeze -> expand -> reshape`` nodes form one chained attr
     group (:func:`catopt_discovery.oracle._chain_domain`), so the
     ``expand``/``reshape`` options are drawn against the real
     intermediate shapes — and the pinned rank-4 corner evaluates
-    ``equal``.
+    ``equal``.  (The earlier rank-3 spelling — ``q=(2,6,4)``,
+    ``k=v=(2,3,4)`` — satisfied the repeat clauses but its
+    ``enable_gqa`` RHS cannot contract; the guard's ``rank == 4``
+    clauses now decline it — see ``test_cond_laws``.)
     """
     from catopt_core.laws import ALL_RULES
 
     rule = next(r for r in ALL_RULES if r.name == "gqa_absorb_repeat")
     bound = {
-        "q": _v("q", 2, 6, 4),
-        "k": _v("k", 2, 3, 4),
-        "v": _v("v", 2, 3, 4),
-        "$attr:UDk": 2,
-        "$attr:ESk": (2, 3, 2, 4),
-        "$attr:RSk": (2, 6, 4),
-        "$attr:UDv": 2,
-        "$attr:ESv": (2, 3, 2, 4),
-        "$attr:RSv": (2, 6, 4),
+        "q": _v("q", 2, 3, 4, 4),
+        "k": _v("k", 2, 3, 2, 4),
+        "v": _v("v", 2, 3, 2, 4),
+        "$attr:UDk": -2,
+        "$attr:ESk": (2, 3, 2, 2, 4),
+        "$attr:RSk": (2, 3, 4, 4),
+        "$attr:UDv": -2,
+        "$attr:ESv": (2, 3, 2, 2, 4),
+        "$attr:RSv": (2, 3, 4, 4),
         "$attr:D": -1,
         "$attr:C": False,
     }
     assert rule.check(bound)
+    # the rank-3 spelling the chained enumeration can also mint is
+    # declined — its enable_gqa RHS cannot contract (rhs-err).
+    assert not rule.check(
+        {
+            "q": _v("q", 2, 6, 4),
+            "k": _v("k", 2, 3, 4),
+            "v": _v("v", 2, 3, 4),
+            "$attr:UDk": -2,
+            "$attr:ESk": (2, 3, 2, 4),
+            "$attr:RSk": (2, 6, 4),
+            "$attr:UDv": -2,
+            "$attr:ESv": (2, 3, 2, 4),
+            "$attr:RSv": (2, 6, 4),
+            "$attr:D": -1,
+            "$attr:C": False,
+        }
+    )
 
     # The chained domain contains the consistent triples — the
     # enumerator mints what it previously could not.

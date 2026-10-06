@@ -1609,14 +1609,21 @@ QKV_FUSE_ASYM = R(
 # ---------------------------------------------------------------------------
 
 
-#: The whole guard is now data: both kv operands must be
-#: ``unsqueeze→expand→reshape`` repeat-chains (the ``repeat-chain``
-#: predicate — the same copy-map verification ``decode_laws`` uses
-#: through ``_check_repeat_chain``), their expand shapes must agree
-#: (same repeat factor), and q's head count must equal kv heads × r
-#: (``repeat-heads``: ``qs[-2] == ks[-2] * es[d]``).
+#: The whole guard is now data: the leaves must be rank-4
+#: ``(b, t, h, d)`` — the pattern's ``transpose(1, 2)`` only lands the
+#: head axis at sdpa's ``-3`` slot (where ``enable_gqa`` repeats) at
+#: exactly rank 4; a rank-3 binding satisfies the chain/head clauses
+#: but its minted RHS cannot contract (measured ``rhs-err``).
+#: Both kv operands must be ``unsqueeze→expand→reshape`` repeat-chains
+#: (the ``repeat-chain`` predicate — the same copy-map verification
+#: ``decode_laws`` uses through ``_check_repeat_chain``), their expand
+#: shapes must agree (same repeat factor), and q's head count must
+#: equal kv heads × r (``repeat-heads``: ``qs[-2] == ks[-2] * es[d]``).
 _COND_GQA_ABSORB = (
     "and",
+    ("rank", "q", "==", 4),
+    ("rank", "k", "==", 4),
+    ("rank", "v", "==", 4),
     ("repeat-chain", "k", "UDk", "ESk", "RSk"),
     ("repeat-chain", "v", "UDv", "ESv", "RSv"),
     ("attr-eq-attr", "ESk", "ESv"),
