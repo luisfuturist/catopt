@@ -239,6 +239,21 @@ SILU_FOLD = R(
     derivation=("silu_expand",),
 )
 
+# softsign is the bounded rational activation — x/(|x| + 1), spelled
+# in decomposed form as div/abs/add.  The fold mints the one fused
+# kernel (three ops -> one); discovered by ``fold_object`` and
+# promoted after clearing the guarded sweep unguarded-clean
+# (``project/retros/promoted-laws.md``).
+SOFTSIGN_FOLD = R(
+    "softsign_fold",
+    Op.make("div", "x", Op.make("add", Op.make("abs", "x"), Const(1))),
+    Op.make("softsign", "x"),
+    law="x / (|x| + 1) = softsign(x) — the bounded rational map, "
+    "written as a three-op decomposed spelling, folds into the one "
+    "kernel.",
+    tags=_SIM,
+)
+
 
 # ---------------------------------------------------------------------------
 #  View-op naturality — elementwise mul through `select`
@@ -288,6 +303,120 @@ SELECT_MUL = R(
         ("dim-eq-attr", "u", "D", "v", "D"),
         ("shaped", ("bcast", "u", "v")),
     ),
+    tags=_SIM,
+)
+
+
+# ---------------------------------------------------------------------------
+#  View-identity and broadcast-pad strips — discovered by auto-cond,
+#  promoted after the guarded sweep measured the regions clean
+#  (``project/retros/promoted-laws.md``).
+#
+#  A view op wrapped inside an elementwise consumer is removable when
+#  the view provably preserves the broadcast *grid*: both sides then
+#  read the same operands at the same output positions, so the op is a
+#  pure no-op the extraction can drop.  Each guard is the conjunction
+#  auto-cond minted — measured-exact on the oracle's domain — spelled
+#  in the declarative DSL, so the whole law is data-serializable.
+#
+#  The two view-identity laws are strictly more general than the
+#  discovered mul/add-wrapped strips they subsume: once the view is
+#  merged into its operand's e-class, congruence does the rest in
+#  every context.
+# ---------------------------------------------------------------------------
+
+#: ``transpose(u, d0, d1) == u`` — the axes coincide after normalising,
+#: or both swapped extents are 1, so the swap reads positionally as the
+#: identity.
+TRANSPOSE_NOOP = R(
+    "transpose_noop",
+    Op.make("transpose", "u", dim0="D0", dim1="D1"),
+    "u",
+    law="A transpose whose swap axes coincide (d0 == d1 mod rank) or "
+    "whose swapped extents are both 1 is a semantic no-op — the stride "
+    "permutation maps each position to itself; strip the view.",
+    cond=("axes-noop", "u", "D0", "D1"),
+    tags=_SIM,
+)
+
+#: ``chunk(u, chunks=1, …) == u`` — a single-chunk partition IS the
+#: whole tensor (index must be 0 for the term to denote at all).
+CHUNK_SINGLE = R(
+    "chunk_single",
+    Op.make("chunk", "u", chunks="CK", dim="CD", index="CI"),
+    "u",
+    law="chunk(u, chunks=1, dim, index) is u — a one-section "
+    "partition returns the whole tensor unchanged.",
+    cond=("attr-eq", "CK", 1),
+    tags=_SIM,
+)
+
+#: The broadcast-pad strip region for ``op(unsqueeze(u, K), v)``:
+#: the lifted operand's broadcast grid equals the unlifted one
+#: (``bcast-eq`` — the unsqueeze's inserted axis adds nothing the
+#: broadcast would not already pad), and ``u`` broadcast-fits its own
+#: unsqueezed shape (``bcast-into`` — semantically the
+#: ``ones-before`` clause: every dim shifted by the insertion is a
+#: broadcast-1, so the operand pairing is preserved elementwise).
+#: Auto-cond minted exactly this pair; both clauses are needed
+#: (grid-coincidence alone accepts a reshuffled read when the pad is
+#: not a leading/trailing extent-1 axis).
+_COND_UNSQ_PAD_L = (
+    "and",
+    ("bcast-eq", ("unsq-out", "u", "UD"), "v", "u", "v"),
+    ("bcast-into", "u", ("unsq-out", "u", "UD")),
+)
+
+#: The right-operand twin — same pair on ``v``'s unsqueeze.
+_COND_UNSQ_PAD_R = (
+    "and",
+    ("bcast-eq", ("unsq-out", "v", "UD"), "u", "v", "u"),
+    ("bcast-into", "v", ("unsq-out", "v", "UD")),
+)
+
+MUL_UNSQ_PAD_L = R(
+    "mul_unsq_pad_l",
+    Op.make("mul", Op.make("unsqueeze", "u", dim="UD"), "v"),
+    Op.make("mul", "u", "v"),
+    law="unsqueeze(u, d) · v = u · v when the inserted axis is a "
+    "broadcast pad and the broadcast grids coincide — the lifted "
+    "operand reads the same positions, so the pad view is dead.  "
+    "Drops one dispatched op per site (the exported ALiBi spelling "
+    "carries it).",
+    cond=_COND_UNSQ_PAD_L,
+    tags=_SIM,
+)
+
+MUL_UNSQ_PAD_R = R(
+    "mul_unsq_pad_r",
+    Op.make("mul", "u", Op.make("unsqueeze", "v", dim="UD")),
+    Op.make("mul", "u", "v"),
+    law="Right-operand twin of mul_unsq_pad_l: u · unsqueeze(v, d) = "
+    "u · v under the same broadcast-pad grid guard.",
+    cond=_COND_UNSQ_PAD_R,
+    tags=_SIM,
+)
+
+SUB_UNSQ_PAD_L = R(
+    "sub_unsq_pad_l",
+    Op.make("sub", Op.make("unsqueeze", "u", dim="UD"), "v"),
+    Op.make("sub", "u", "v"),
+    law="unsqueeze(u, d) - v = u - v under the broadcast-pad guard — "
+    "same strip for the asymmetric operand pair (the guard, not the "
+    "op's commutativity, is what carries it).",
+    cond=_COND_UNSQ_PAD_L,
+    tags=_SIM,
+)
+
+MUL_RESHAPE_INERT_L = R(
+    "mul_reshape_inert_l",
+    Op.make("mul", Op.make("reshape", "u", shape="RS"), "v"),
+    Op.make("mul", "u", "v"),
+    law="reshape(u, S) · v = u · v when the reshape is broadcast-inert "
+    "— equal broadcast grids force the reshape to a 1-axis insert/"
+    "remove (a permuting reshape changes an extent and the grids "
+    "disagree).  Grid equality is the minted single-clause guard.",
+    cond=("bcast-eq", ("reshape-out", "u", "RS"), "v", "u", "v"),
     tags=_SIM,
 )
 
@@ -1244,6 +1373,42 @@ LINEAR_ROW_SCALE_REV = R(
 )
 
 
+#: The row-scale guard over a metavar named ``c`` — the composite's
+#: binding names the shared scale ``c``, where the premises spell it
+#: ``r``.  Same clauses as :data:`_COND_ROW_SCALE` modulo the rename.
+_COND_ROW_SCALE_C = (
+    "and",
+    ("or", ("scalar", "c"), ("dim-eq-const", "c", -1, 1)),
+    ("bcast-into", "c", _SPEC_LINEAR_OUT),
+    _COND_LINEAR_WT,
+)
+
+#: The guarded composite's transported precondition — the conjunction
+#: of both premises' guards over the shared bindings, exactly what
+#: ``compose_objects`` minted (guarded-compose).  The scalar ``c``
+#: corner satisfies both sides; a vector ``c`` must be a channel
+#: (in-feature) scale that is ALSO a row scale, i.e. extent-1 on its
+#: last dim — the intersection is the honest region.
+_COND_CHANNEL_TO_ROW = ("and", _COND_CHANNEL_SCALE, _COND_ROW_SCALE_C)
+
+# A guarded composition, promoted: both premises are the SYMMETRY-gated
+# scale hoists, so under the DEFAULT set this direct edge is genuinely
+# new reach — and it is term-local, adding one member per site (not
+# closure-generating, hence not EXPANSIVE).
+LINEAR_CHANNEL_TO_ROW_SCALE = R(
+    "linear_channel_to_row_scale",
+    Op.make("linear", "x", Op.make("mul", "W", "c")),
+    Op.make("mul", Op.make("linear", "x", "W"), "c"),
+    law="linear(x, W∘c) = c·linear(x, W) — a channel scale folded "
+    "into the weight migrates through the linear map and re-emerges "
+    "as a row scale on the output (channel_scale_rev then "
+    "row_scale, fused into one premise-guarded step).",
+    cond=_COND_CHANNEL_TO_ROW,
+    tags=(tags.CATEGORICAL,),
+    derivation=("linear_channel_scale_rev", "linear_row_scale"),
+)
+
+
 # ---------------------------------------------------------------------------
 #  Fused QKV — the product rule applied to attention's three projections.
 #
@@ -1691,6 +1856,60 @@ def _make_sdpa_fold_rules() -> list:
 
 SDPA_FOLD_RULES: list = _make_sdpa_fold_rules()
 
+
+#: ``sdpa`` needs rank >= 2 operands — the mask-free fold's LHS
+#: ``matmul(softmax(…), v)`` still denotes on a rank-1 ``Q``/``V``
+#: (vec @ mat is legal), while the minted ``sdpa`` RHS raises
+#: ``rhs-err`` ("at least 2 dimensional").  ``axes-last2`` already
+#: forces ``K``'s rank; ``Q`` and ``V`` need the explicit floor.
+#: (The masked family gets away without it: the mask read makes a
+#: rank-1 ``Q`` lhs fail to denote too.)
+_COND_SDPA_QV_RANK = (
+    "and",
+    ("rank", "Q", ">=", 2),
+    ("rank", "V", ">=", 2),
+)
+
+#: Mask-free spelled attention — ``(Q @ Kᵀ) * softmax → @V`` with no
+#: mask operand.  The folded ``sdpa`` takes no ``attn_mask``.
+_COND_SDPA_NOMASK = ("and", _COND_SDPA_BASE, _COND_SDPA_QV_RANK)
+_COND_SDPA_DIV_NOMASK = ("and", _COND_SDPA_SCALED, _COND_SDPA_QV_RANK)
+
+# The mask-free forms of the fold — ``nn.MultiheadAttention``'s
+# default path exports exactly this spelling (no mask operand), so the
+# add/masked_fill family above never fires there.  Discovered by
+# ``fold_object`` + the guarded-compose machinery and promoted after
+# the guarded sweep measured both regions clean
+# (``project/retros/promoted-laws.md``).
+SDPA_FOLD_NOMASK = R(
+    "sdpa_fold_nomask",
+    Op.make("matmul", Op.make("softmax", _QK_SCORES, dim="SD"), "V"),
+    Op.make("sdpa", "Q", "K", "V", scale="SC"),
+    law="softmax(q kᵀ) v is sdpa(q, k, v, scale=1) — the mask-free "
+    "spelled attention is one fused kernel (the add/masked_fill "
+    "family's empty-mask row).",
+    cond=_COND_SDPA_NOMASK,
+    dspec=_DSPEC_SCALE_ONE,
+    tags=_FUS,
+)
+
+SDPA_FOLD_DIV_NOMASK = R(
+    "sdpa_fold_div_nomask",
+    Op.make(
+        "matmul",
+        Op.make("softmax", Op.make("div", _QK_SCORES, "S"), dim="SD"),
+        "V",
+    ),
+    Op.make("sdpa", "Q", "K", "V", scale="SC"),
+    law="softmax(q kᵀ / s) v is sdpa(q, k, v, scale=1/s) — the "
+    "mask-free spelled form with the decomposed pre-softmax scale.",
+    cond=_COND_SDPA_DIV_NOMASK,
+    dspec=_DSPEC_SCALE_DIV,
+    tags=_FUS,
+)
+
+SDPA_FOLD_RULES += [SDPA_FOLD_NOMASK, SDPA_FOLD_DIV_NOMASK]
+
 #: Scalar factor as data — the bound term's shape is ``()``.  (Same
 #: verdict as ``base._is_scalar``.)
 _COND_SCALAR = ("scalar", "c")
@@ -1752,11 +1971,19 @@ SIMPLIFICATION_RULES: list[Rewrite] = [
     SILU_EXPAND,
     SILU_FOLD,
     SILU_MUL_FORM,
+    SOFTSIGN_FOLD,
     SQUARE_EXPAND,
     POW_TO_SQUARE,
     SQUARE_TO_POW,
     MUL_SQUARE,
     SELECT_MUL,
+    # View-identity and broadcast-pad strips (auto-cond promotions)
+    TRANSPOSE_NOOP,
+    CHUNK_SINGLE,
+    MUL_UNSQ_PAD_L,
+    MUL_UNSQ_PAD_R,
+    SUB_UNSQ_PAD_L,
+    MUL_RESHAPE_INERT_L,
     SOFTMAX_FOLD,
     GLU_FOLD,
     RMS_NORM_FOLD,
@@ -1796,6 +2023,7 @@ CATEGORICAL_RULES: list[Rewrite] = [
     LINEAR_CHANNEL_SCALE_REV,
     LINEAR_ROW_SCALE,
     LINEAR_ROW_SCALE_REV,
+    LINEAR_CHANNEL_TO_ROW_SCALE,
     # Diagonal-map absorption (copy pushed inside the kernel)
     GQA_ABSORB,
     # Softmax-attention fold (flash-attention transform)
@@ -1803,16 +2031,17 @@ CATEGORICAL_RULES: list[Rewrite] = [
 ]
 #: All rules combined — the default saturation set.
 #:
-#: The axiom/lemma split (measured by ``tools/law_coherence.py
-#: --emit-basis``, documented in
-#: ``project/retros/axiom-lemma-split.md``): 46 of these 61 rules are
-#: kernel members — ``kind == "axiom"`` — and 15 carry a recorded
-#: ``derivation`` from the kernel (13 ``"lemma"`` — inverse twins
-#: whose direction buys reach, plus the emergent ``silu_mul_form`` —
-#: and 2 ``"redundant"`` alpha-duplicate spellings tagged
-#: ``tags.REDUNDANT``).  The kernel itself is the 32 primitives plus
-#: one designated representative (alphabetically first) per
-#: derivability cycle.
+#: The axiom/lemma split is declared on the rules: 55 of these 71
+#: carry no derivation — ``kind == "axiom"`` — and 16 carry a recorded
+#: ``derivation`` from the kernel (14 ``"lemma"`` — inverse twins
+#: whose direction buys reach, the emergent ``silu_mul_form``, and the
+#: promoted guarded composite ``linear_channel_to_row_scale`` — plus
+#: 2 ``"redundant"`` alpha-duplicate spellings tagged
+#: ``tags.REDUNDANT``).  The measured catalogue (``catopt_discovery
+#: .coherence --emit-basis``; ``project/retros/axiom-lemma-split.md``)
+#: reads 47 axioms / 13 lemmas / 2 redundant plus 9 ``no-instance``
+#: verdicts — the promoted conditional laws its instancer cannot
+#: build a site for (``project/retros/promoted-laws.md``).
 #:
 #: LAYOUT_RULES are deliberately NOT in the default: measured on the
 #: laws_effect bench they deliver runtime parity (the NT-GEMM form is

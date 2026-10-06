@@ -233,7 +233,7 @@ def test_preset_contents():
     assert (
         len(laws.FUSION)
         == sum(1 for r in all_rules() if tags.FUSION in r.tags)
-        == 17
+        == 19
     )
     assert {r.name for r in laws.SYMMETRY} == SYMMETRY_NAMES
     # CARRIERS names the carrier-package families — empty core-side;

@@ -64,7 +64,11 @@ def _case(name: str, term: Op, *inputs: Var) -> TermCase:
 
 
 def _mul_unsqueeze_l_id() -> Rewrite:
-    """The first synthesized inhabitant: the guarded unsqueeze strip."""
+    """The first synthesized inhabitant: the guarded unsqueeze strip.
+
+    Post-promotion this pattern IS the shipped ``mul_unsq_pad_l`` —
+    the store now reports it as a library duplicate
+    (``project/retros/promoted-laws.md``)."""
     return Rewrite(
         name="mul_unsqueeze_l_id",
         lhs=_p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
@@ -75,6 +79,44 @@ def _mul_unsqueeze_l_id() -> Rewrite:
     )
 
 
+def _add_unsqueeze_l_id() -> Rewrite:
+    """The still-unshipped sibling: the same pad strip under ``add``.
+
+    ``mul``/``sub`` spellings promoted to ``mul_unsq_pad_*`` /
+    ``sub_unsq_pad_l``; the ``add`` variant was not measured paying, so
+    it stays a store object — exactly the admitted-but-unshipped
+    posture these tests exercise.
+    """
+    return Rewrite(
+        name="add_unsqueeze_l_id",
+        lhs=_p("add", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        rhs=_p("add", "U", "V"),
+        law="add(unsqueeze(u,d),v) = add(u,v) when the inserted axis "
+        "is a broadcast pad",
+        cond=(
+            "and",
+            ("bcast-eq", ("unsq-out", "U", "A_dim"), "V", "U", "V"),
+            ("bcast-into", "U", ("unsq-out", "U", "A_dim")),
+        ),
+    )
+
+
+def _mul_transpose_l_id() -> Rewrite:
+    """The auto-cond transpose strip — admitted, but not promoted: the
+    generic ``transpose_noop`` law subsumes it (see
+    ``project/retros/promoted-laws.md``)."""
+    return Rewrite(
+        name="mul_transpose_l_id",
+        lhs=_p(
+            "mul", _p("transpose", "U", dim0="A_d0", dim1="A_d1"), "V"
+        ),
+        rhs=_p("mul", "U", "V"),
+        law="mul(transpose(u,d0,d1),v) = mul(u,v) when the swap is a "
+        "semantic no-op",
+        cond=("axes-noop", "U", "A_d0", "A_d1"),
+    )
+
+
 def _guarded_case() -> TermCase:
     """A real firing site in the guard's region: ``u=(8,8)``,
     ``v=(1,1,1)``, ``dim=0`` — the retro's verified real acceptance."""
@@ -82,6 +124,29 @@ def _guarded_case() -> TermCase:
     return _case(
         "unsq_pad",
         _p("mul", _p("unsqueeze", u, dim=0), v),
+        u,
+        v,
+    )
+
+
+def _guarded_add_case() -> TermCase:
+    """The pad site under ``add`` — the unshipped sibling's region."""
+    u, v = _v("u", 8, 8), _v("v", 1, 1, 1)
+    return _case(
+        "add_unsq_pad",
+        _p("add", _p("unsqueeze", u, dim=0), v),
+        u,
+        v,
+    )
+
+
+def _transpose_noop_case() -> TermCase:
+    """A real firing site for the no-op transpose strip: ``u=(2,1,1)``
+    transposed on ``(-2,-1)`` — both swapped extents are 1."""
+    u, v = _v("u", 2, 1, 1), _v("v", 2, 1, 1)
+    return _case(
+        "transpose_noop",
+        _p("mul", _p("transpose", u, dim0=-2, dim1=-1), v),
         u,
         v,
     )
@@ -126,15 +191,19 @@ def _stages(rep: ev.Gauntlet) -> dict[str, ev.GauntletStage]:
 
 
 def test_synthesized_object_clears_the_gauntlet(tmp_path):
+    """The happy path end-to-end — now run on ``mul_transpose_l_id``,
+    the admitted sibling that stayed unshipped (its noop transpose is
+    subsumed by the promoted ``transpose_noop`` law; the wrapped
+    spelling itself is not in the library)."""
     conn = ev.connect(str(tmp_path / "s.db"))
     key = ev.store_object(
-        conn, _mul_unsqueeze_l_id(), kind="abstraction"
+        conn, _mul_transpose_l_id(), kind="abstraction"
     )
-    rep = ev.run_gauntlet(conn, key, corpus=_corpus(_guarded_case()))
+    rep = ev.run_gauntlet(conn, key, corpus=_corpus(_transpose_noop_case()))
     conn.close()
     assert rep.usable, rep.reason
     assert (
-        rep.name == "mul_unsqueeze_l_id" and rep.kind == "abstraction"
+        rep.name == "mul_transpose_l_id" and rep.kind == "abstraction"
     )
     stages = _stages(rep)
     assert all(s.passed for s in rep.stages)
@@ -152,6 +221,26 @@ def test_synthesized_object_clears_the_gauntlet(tmp_path):
     assert rep.evidence.paid == 1
     assert rep.evidence.cert_fail == 0
     assert stages["cert"].detail == "no derivation recorded"
+
+
+def test_promoted_object_now_reports_library_duplicate(tmp_path):
+    """The first inhabitant's post-promotion verdict: ``mul_unsqueeze_*
+    l_id`` shipped as ``mul_unsq_pad_l`` (``promoted-laws.md``), so the
+    store's novelty gate reports the declared object as a library
+    duplicate — the intended terminal state of a promoted object."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = ev.store_object(
+        conn, _mul_unsqueeze_l_id(), kind="abstraction"
+    )
+    rep = ev.run_gauntlet(conn, key, corpus=_corpus(_guarded_case()))
+    conn.close()
+    assert not rep.usable
+    assert rep.evidence.relation == "duplicate"
+    assert rep.reason.startswith("novelty:")
+    # the guarded-region measurement still ran clean — the refusal is
+    # novelty alone, not a soundness regression.
+    assert rep.synth_region.unequal == 0
+    assert rep.synth_region.rhs_err == 0
 
 
 def test_admitted_object_fires_only_in_guarded_region(tmp_path):
@@ -209,16 +298,20 @@ def test_guarded_truth_sweep_counts(tmp_path):
 
 
 def test_unguarded_conditional_object_fails_truth(tmp_path):
-    """The same pattern with NO cond is only conditionally true —
-    the plain verdict is 'conditional' and the object is unusable."""
+    """The same strip with NO cond is only conditionally true —
+    the plain verdict is 'conditional' and the object is unusable.
+    (The ``mul`` spelling shipped as ``mul_unsq_pad_l`` — its bare
+    twin would now read *derivable* on the pad instance and refuse at
+    novelty instead — so this pin runs the still-unshipped ``add``
+    variant.)"""
     conn = ev.connect(str(tmp_path / "s.db"))
     bare = Rewrite(
-        name="mul_unsqueeze_l_id_bare",
-        lhs=_p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
-        rhs=_p("mul", "U", "V"),
+        name="add_unsqueeze_l_id_bare",
+        lhs=_p("add", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        rhs=_p("add", "U", "V"),
     )
     key = ev.store_object(conn, bare, kind="abstraction")
-    rep = ev.run_gauntlet(conn, key, corpus=_corpus(_guarded_case()))
+    rep = ev.run_gauntlet(conn, key, corpus=_corpus(_guarded_add_case()))
     conn.close()
     assert not rep.usable
     assert rep.reason.startswith("truth:")
@@ -243,10 +336,12 @@ def test_known_false_candidate_fails_truth(tmp_path):
 
 def test_no_firing_site_fails_typed_pay(tmp_path):
     """A true-under-guard object on a corpus with no firing site
-    clears truth but has nothing to pay for — typed-pay refuses."""
+    clears truth but has nothing to pay for — typed-pay refuses.
+    (Runs the unshipped ``add`` strip — the ``mul`` twin is a library
+    duplicate now.)"""
     conn = ev.connect(str(tmp_path / "s.db"))
     key = ev.store_object(
-        conn, _mul_unsqueeze_l_id(), kind="abstraction"
+        conn, _add_unsqueeze_l_id(), kind="abstraction"
     )
     x, y = _v("x", 4, 4), _v("y", 4, 4)
     other = _case("plain", _p("add", x, y), x, y)
@@ -436,20 +531,20 @@ def test_cli_gauntlet_usable_and_refusal(tmp_path, capsys, monkeypatch):
     db = str(tmp_path / "s.db")
     conn = ev.connect(db)
     key = ev.store_object(
-        conn, _mul_unsqueeze_l_id(), kind="abstraction"
+        conn, _mul_transpose_l_id(), kind="abstraction"
     )
     conn.close()
     monkeypatch.setattr(
         ev,
         "default_gauntlet_corpus",
-        lambda: _corpus(_guarded_case()),
+        lambda: _corpus(_transpose_noop_case()),
     )
     assert (
         ev.main(["--report", db, "--admit-object", key, "--gauntlet"])
         == 0
     )
     out = capsys.readouterr().out
-    assert "admitted mul_unsqueeze_l_id" in out
+    assert "admitted mul_transpose_l_id" in out
     assert "kind: abstraction" in out
     assert "[pass] truth" in out
     assert "usable: yes" in out
@@ -467,6 +562,19 @@ def test_cli_gauntlet_usable_and_refusal(tmp_path, capsys, monkeypatch):
     )
     out = capsys.readouterr().out
     assert "usable: no" in out
+    # And a promoted object refuses at novelty — it is a library member.
+    conn = ev.connect(db)
+    key3 = ev.store_object(
+        conn, _mul_unsqueeze_l_id(), kind="abstraction"
+    )
+    conn.close()
+    assert (
+        ev.main(["--report", db, "--admit-object", key3, "--gauntlet"])
+        == 1
+    )
+    out = capsys.readouterr().out
+    assert "usable: no" in out
+    assert "novelty" in out
 
 
 def test_cli_gauntlet_requires_an_admit(tmp_path, capsys):

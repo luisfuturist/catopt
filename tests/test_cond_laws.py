@@ -44,13 +44,28 @@ from catopt_core.laws.cond import (
     cond_to_data,
     eval_cond,
 )
+from catopt_core.laws.serialize import (
+    law_from_data,
+    law_to_data,
+    missing_hooks,
+)
 from catopt_core.laws.tensor import (
+    CHUNK_SINGLE,
     DISTRIBUTE_MUL,
     FACTOR_MUL,
     LINEAR_CHANNEL_SCALE,
+    LINEAR_CHANNEL_TO_ROW_SCALE,
     LINEAR_ROW_SCALE,
     LINEAR_ROW_SCALE_REV,
+    MUL_RESHAPE_INERT_L,
+    MUL_UNSQ_PAD_L,
+    MUL_UNSQ_PAD_R,
+    SDPA_FOLD_DIV_NOMASK,
+    SDPA_FOLD_NOMASK,
     SOFTMAX_FOLD,
+    SOFTSIGN_FOLD,
+    SUB_UNSQ_PAD_L,
+    TRANSPOSE_NOOP,
     WEIGHT_DISTRIBUTE,
     WEIGHT_DISTRIBUTE_LINEAR,
     WEIGHT_FACTOR,
@@ -767,7 +782,7 @@ def test_cond_data_roundtrip_is_canonical():
 
 
 def test_every_shipped_cond_roundtrips_through_json():
-    """All 36 cond-carrying rules' conds survive the store wire format."""
+    """All 45 cond-carrying rules' conds survive the store wire format."""
     seen = 0
     for rule in all_rules():
         if rule.cond is None:
@@ -784,7 +799,7 @@ def test_every_shipped_cond_roundtrips_through_json():
             cond=json.loads(blob),  # list tree: canonicalized
         )
         assert rebuilt.cond == rule.cond
-    assert seen == 36
+    assert seen == 45
 
 
 def test_rebuilt_rule_fires_identically_in_egraph():
@@ -851,7 +866,7 @@ def test_migrated_rules_carry_cond_and_folded_check():
     migrated = [
         r for r in all_rules() if r.cond is not None
     ]
-    assert len(migrated) == 36
+    assert len(migrated) == 45
     for r in migrated:
         assert callable(r.check), r.name
     # every shipped guard is data now — the once-procedural laws all
@@ -1534,3 +1549,196 @@ def test_reshape_unsq_family_guards_roundtrip():
     yes = {"U": _v("u", 4), "V": _v("v", 4),
            "$attr:A_dim": 0, "$attr:B_shape": (4,)}
     assert eval_cond(guards["wl"], yes)
+
+
+# ---------------------------------------------------------------------------
+#  The promoted discovery objects — auto-cond / fold_object / guarded
+#  composition outputs that became shipped laws
+#  (``project/retros/promoted-laws.md``).  Each pin: the guard accepts
+#  its measured region and declines the off-region binding, the rule
+#  fires through the real ``EGraph`` path, and the whole record is
+#  serializable data.
+# ---------------------------------------------------------------------------
+
+
+def _merged(rule, src, dst):
+    """Run *rule* alone; return whether src and dst ended up merged."""
+    eg = EGraph()
+    root = eg.add_term(src)
+    eg.run([rule], root, max_iterations=4, max_nodes=10_000)
+    return eg.find(root) == eg.find(eg.add_term(dst))
+
+
+def _rt(rule):
+    """JSON round-trip the law record; the rebuilt rule fires the same."""
+    import json as _json
+
+    return law_from_data(
+        _json.loads(_json.dumps(law_to_data(rule)))
+    )
+
+
+PROMOTED_LAWS = (
+    SOFTSIGN_FOLD,
+    TRANSPOSE_NOOP,
+    CHUNK_SINGLE,
+    MUL_UNSQ_PAD_L,
+    MUL_UNSQ_PAD_R,
+    SUB_UNSQ_PAD_L,
+    MUL_RESHAPE_INERT_L,
+    SDPA_FOLD_NOMASK,
+    SDPA_FOLD_DIV_NOMASK,
+    LINEAR_CHANNEL_TO_ROW_SCALE,
+)
+
+
+def test_promoted_laws_are_full_data():
+    """Every promoted law serializes whole — no procedural hooks."""
+    for rule in PROMOTED_LAWS:
+        assert missing_hooks(rule) == (), rule.name
+        rebuilt = _rt(rule)
+        assert law_to_data(rebuilt) == law_to_data(rule), rule.name
+
+
+def test_promoted_softsign_fold():
+    x = _v("x", 4, 8)
+    src = Op.make(
+        "div", x, Op.make("add", Op.make("abs", x), Const(1))
+    )
+    assert _merged(SOFTSIGN_FOLD, src, Op.make("softsign", x))
+    assert _merged(_rt(SOFTSIGN_FOLD), src, Op.make("softsign", x))
+    # the decomposed spelling without the +1 is not the fold's pattern
+    bad = Op.make("div", x, Op.make("abs", x))
+    assert not _merged(SOFTSIGN_FOLD, bad, Op.make("softsign", x))
+    assert SOFTSIGN_FOLD in all_rules()
+
+
+def test_promoted_transpose_noop():
+    # equal axes: an explicit no-op swap strips to the operand
+    u = _v("u", 2, 3)
+    src = Op.make("transpose", u, dim0=0, dim1=0)
+    assert _merged(TRANSPOSE_NOOP, src, u)
+    # both swapped extents are 1: the "transpose" permutes nothing
+    w = _v("w", 4, 1, 1)
+    src = Op.make("transpose", w, dim0=-2, dim1=-1)
+    assert _merged(TRANSPOSE_NOOP, src, w)
+    # a real swap declines — (8,8) transposed on (-2,-1) is not u
+    t = _v("t", 8, 8)
+    assert not _merged(
+        TRANSPOSE_NOOP, Op.make("transpose", t, dim0=-2, dim1=-1), t
+    )
+    assert _merged(_rt(TRANSPOSE_NOOP), src, w)
+
+
+def test_promoted_chunk_single():
+    u = _v("u", 4, 8)
+    src = Op.make("chunk", u, chunks=1, dim=-1, index=0)
+    assert _merged(CHUNK_SINGLE, src, u)
+    assert _merged(_rt(CHUNK_SINGLE), src, u)
+    # a two-chunk index read is not the whole tensor
+    src2 = Op.make("chunk", u, chunks=2, dim=-1, index=0)
+    assert not _merged(CHUNK_SINGLE, src2, u)
+
+
+def test_promoted_unsq_pad_strips():
+    # u broadcast-padded at dim 0: grids coincide, pad view is dead.
+    u, v = _v("u", 8, 8), _v("v", 1, 1, 1)
+    src = Op.make("mul", Op.make("unsqueeze", u, dim=0), v)
+    assert _merged(MUL_UNSQ_PAD_L, src, Op.make("mul", u, v))
+    assert _merged(
+        _rt(MUL_UNSQ_PAD_L), src, Op.make("mul", u, v)
+    )
+    assert _merged(
+        SUB_UNSQ_PAD_L,
+        Op.make("sub", Op.make("unsqueeze", u, dim=0), v),
+        Op.make("sub", u, v),
+    )
+    # the off-region binding: a non-pad insertion axis declines
+    u2, v2 = _v("u2", 8, 8), _v("v2", 8, 8)
+    bad = Op.make("mul", Op.make("unsqueeze", u2, dim=1), v2)
+    assert not _merged(MUL_UNSQ_PAD_L, bad, Op.make("mul", u2, v2))
+    assert not _merged(SUB_UNSQ_PAD_L, bad, Op.make("sub", u2, v2))
+
+
+def test_promoted_unsq_pad_right():
+    # the right-operand twin: v's leading pad strips inside mul
+    u, v = _v("u", 1, 8, 8), _v("v", 8, 8)
+    src = Op.make("mul", u, Op.make("unsqueeze", v, dim=0))
+    assert _merged(MUL_UNSQ_PAD_R, src, Op.make("mul", u, v))
+    assert _merged(_rt(MUL_UNSQ_PAD_R), src, Op.make("mul", u, v))
+    # v=(1,1,1) unsqueezed at 0 adds a real leading axis — declines
+    u2, v2 = _v("u2", 8, 8), _v("v2", 1, 1, 1)
+    bad = Op.make("mul", u2, Op.make("unsqueeze", v2, dim=0))
+    assert not _merged(MUL_UNSQ_PAD_R, bad, Op.make("mul", u2, v2))
+
+
+def test_promoted_reshape_inert_strip():
+    # (h,w) -> (1,h,w) is broadcast-inert inside the elementwise op
+    u, v = _v("u", 2, 6), _v("v", 1, 2, 6)
+    src = Op.make("mul", Op.make("reshape", u, shape=(1, 2, 6)), v)
+    assert _merged(MUL_RESHAPE_INERT_L, src, Op.make("mul", u, v))
+    assert _merged(_rt(MUL_RESHAPE_INERT_L), src, Op.make("mul", u, v))
+    # a permuting reshape changes the pairing — declines
+    u2, v2 = _v("u2", 2, 3), _v("v2", 3, 2)
+    bad = Op.make("mul", Op.make("reshape", u2, shape=(3, 2)), v2)
+    assert not _merged(MUL_RESHAPE_INERT_L, bad, Op.make("mul", u2, v2))
+
+
+def test_promoted_sdpa_nomask_folds():
+    q, k, v = _v("q", 2, 4), _v("k", 3, 4), _v("v", 3, 4)
+    scores = Op.make(
+        "matmul", q, Op.make("transpose", k, dim0=-1, dim1=-2)
+    )
+    src = Op.make("matmul", Op.make("softmax", scores, dim=-1), v)
+    want = Op.make("sdpa", q, k, v, scale=1.0)
+    assert _merged(SDPA_FOLD_NOMASK, src, want)
+    assert _merged(_rt(SDPA_FOLD_NOMASK), src, want)
+    # scaled twin: a numeric S mints the reciprocal scale attr
+    src2 = Op.make(
+        "matmul",
+        Op.make(
+            "softmax", Op.make("div", scores, Const(4.0)), dim=-1
+        ),
+        v,
+    )
+    want2 = Op.make("sdpa", q, k, v, scale=0.25)
+    assert _merged(SDPA_FOLD_DIV_NOMASK, src2, want2)
+    assert _merged(_rt(SDPA_FOLD_DIV_NOMASK), src2, want2)
+    # a rank-1 Q declines — the minted sdpa cannot denote
+    q1 = _v("q1", 4)
+    bad = Op.make(
+        "matmul",
+        Op.make(
+            "softmax",
+            Op.make(
+                "matmul",
+                q1,
+                Op.make("transpose", k, dim0=-1, dim1=-2),
+            ),
+            dim=-1,
+        ),
+        v,
+    )
+    assert not _merged(SDPA_FOLD_NOMASK, bad, want)
+
+
+def test_promoted_channel_to_row_scale():
+    # linear(x, W∘c) -> c·linear(x,W) — the guarded composite fires on
+    # the scalar-weight-scale site the corpus measured.
+    x, w = _v("x", 2, 4), _p("W", 3, 4)
+    src = Op.make("linear", x, Op.make("mul", w, Const(2.0)))
+    want = Op.make("mul", Op.make("linear", x, w), Const(2.0))
+    assert _merged(LINEAR_CHANNEL_TO_ROW_SCALE, src, want)
+    assert _merged(_rt(LINEAR_CHANNEL_TO_ROW_SCALE), src, want)
+    # recorded derivation: the lemma is a two-premise consequence
+    assert LINEAR_CHANNEL_TO_ROW_SCALE.derivation == (
+        "linear_channel_scale_rev",
+        "linear_row_scale",
+    )
+    assert LINEAR_CHANNEL_TO_ROW_SCALE.kind == "lemma"
+    # a channel scale that is NOT a row scale declines: c=(4,) on a
+    # 3x4 weight — bcast-into(c, out) fails (out's last dim is 3)
+    c2 = _v("c", 4)
+    bad = Op.make("linear", x, Op.make("mul", w, c2))
+    want2 = Op.make("mul", Op.make("linear", x, w), c2)
+    assert not _merged(LINEAR_CHANNEL_TO_ROW_SCALE, bad, want2)

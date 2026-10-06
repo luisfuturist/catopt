@@ -143,18 +143,18 @@ The core design claim is that **laws, guards, objects and the op
 vocabulary are data**, not code — so the machine can grow the object
 language without growing a pile of Python.
 
-- **Laws.**  `catopt_core.laws.ALL_RULES` holds **61** rules, each an
+- **Laws.**  `catopt_core.laws.ALL_RULES` holds **71** rules, each an
   `R(name, lhs, rhs, law=, cond=, dspec=, tags=, derivation=)`.  The
   kernel taxonomy is *measured*, not asserted:
-  `catopt_discovery.coherence --emit-basis` reports **46 axioms / 13
-  lemmas / 2 redundant**.  **All 61 serialize completely** — pattern +
+  `catopt_discovery.coherence --emit-basis` reports **47 axioms / 13 lemmas /
+  2 redundant** (9 promoted conditionals sit uninstanced in the catalogue).  **All 71 serialize completely** — pattern +
   declarative `cond`/`dspec` guards + tags + derivation, no Python — and
   `derivation=` replays into real `Certificate`s.
 - **Guards.**  Side conditions prefer the declarative `cond` DSL
   (`catopt_core.laws.cond`, pure data such as
   `("and", ("rank-eq", "a", "b"), ("rank-ge", "a", 2))`, JSON-serializable;
-  **36 of 61** rules use it) over procedural `check`/`derive` hooks — the
-  escape hatch for conditions the DSL cannot express (**16 of 61** use
+  **45 of 71** rules use it) over procedural `check`/`derive` hooks — the
+  escape hatch for conditions the DSL cannot express (**18 of 71** use
   `dspec`).  A record that cannot carry a hook flags it in
   `missing_hooks` rather than weakening silently.
 - **Objects.**  The unit of invention is a *declared object* — data the
@@ -235,9 +235,9 @@ sizes — see [Limits](#limits)); provenance is in
 | contraction player n=40 vs `opt_einsum` | **0.87–0.99× randomised greedy at equal wall-clock** (0.44–0.60× deterministic) | `tools/contraction_guided_restart.py` |
 | pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `catopt_discovery.pipeline --holdout` |
 | pipeline on the 364-term corpus | **shippable = 11** (was 0 before round 4; corpus-circular — see negatives) | `catopt_discovery.pipeline` |
-| coherence catalogue over `ALL_RULES` | **46 axioms / 13 lemmas / 2 redundant; divergence 0** | `catopt_discovery.coherence` |
+| coherence catalogue over `ALL_RULES` | **47 axioms / 13 lemmas / 2 redundant; 9 no-instance; divergence 0** | `catopt_discovery.coherence` |
 | workload intake | **254 real `nn.*` workloads, 201 fp64-verified** (corpus 211→725 op-tuples) | `catopt_discovery.intake` |
-| laws as data | **61/61 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_core.laws.serialize` |
+| laws as data | **71/71 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_core.laws.serialize` |
 | evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
 
 ### What it finds — and what it doesn't

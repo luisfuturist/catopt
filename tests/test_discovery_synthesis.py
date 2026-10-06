@@ -415,13 +415,19 @@ def test_constructed_objects_are_full_data(tmp_path):
 
 
 def test_fold_object_clears_the_gauntlet(tmp_path):
+    """Post-promotion, ``softsign_fold`` IS the shipped law — the
+    store's novelty gate reports the declared object as a library
+    duplicate (``project/retros/promoted-laws.md``).  The measurement
+    underneath is unchanged: the numeric oracle still finds it true
+    and paying."""
     conn = ev.connect(str(tmp_path / "s.db"))
     key = synth.store_constructed(conn, _softsign_fold())
     rep = ev.run_gauntlet(conn, key, corpus=_corpus(_softsign_case()))
     conn.close()
-    assert rep.usable, rep.reason
+    assert not rep.usable
     assert rep.name == "softsign_fold" and rep.kind == "abstraction"
-    assert all(s.passed for s in rep.stages)
+    assert rep.reason.startswith("novelty:")
+    assert rep.evidence.relation == "duplicate"
     # Unguarded object: truth is the numeric oracle on the real match.
     assert rep.evidence.num_true is True
     assert rep.evidence.fires >= 1 and rep.evidence.paid == 1

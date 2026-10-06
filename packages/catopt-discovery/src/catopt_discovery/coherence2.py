@@ -42,7 +42,7 @@ oracle call is one bounded saturation plus a replayable certificate):
 
 And the honest cost accounting the question demands: every phase's
 oracle calls and wall-time are counted, then projected onto the naive
-all-triples enumeration (``C(61,3) ≈ 35.9 k`` triples) to show where
+all-triples enumeration (``C(71,3) ≈ 57.2 k`` triples) to show where
 enumeration actually strains — and how much of the triple space the
 pair results already prune away.
 

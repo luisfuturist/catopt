@@ -63,12 +63,17 @@ def _corpus(*cases: TermCase) -> ev.GauntletCorpus:
     )
 
 
-def _unsq_bare(name: str = "mul_unsqueeze_l_id") -> Rewrite:
-    """The known conditional: strip ``unsqueeze`` off a mul operand."""
+def _unsq_bare(name: str = "mul_unsqueeze_l_id", op: str = "mul") -> Rewrite:
+    """The known conditional: strip ``unsqueeze`` off an operand.
+
+    ``op="add"`` spells the still-unshipped sibling — the ``mul``
+    variant promoted to ``mul_unsq_pad_l`` (its alpha key now reads
+    ``duplicate`` against ``ALL_RULES``).
+    """
     return Rewrite(
         name=name,
-        lhs=_p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
-        rhs=_p("mul", "U", "V"),
+        lhs=_p(op, _p("unsqueeze", "U", dim="A_dim"), "V"),
+        rhs=_p(op, "U", "V"),
     )
 
 
@@ -76,6 +81,14 @@ def _guarded_case() -> TermCase:
     """``pad_after_flat``: ``u=(8,8)`` * ``v=(1,1,1)`` pad broadcast."""
     u, v = _v("u", 8, 8), _v("v", 1, 1, 1)
     return _case("unsq_pad", _p("mul", _p("unsqueeze", u, dim=0), v), u, v)
+
+
+def _guarded_add_case() -> TermCase:
+    """The same pad site under ``add`` — the unshipped variant."""
+    u, v = _v("u", 8, 8), _v("v", 1, 1, 1)
+    return _case(
+        "unsq_pad_add", _p("add", _p("unsqueeze", u, dim=0), v), u, v
+    )
 
 
 def _accepted_region(rule: Rewrite, limit: int = 360) -> ev.GuardedRegion:
@@ -222,11 +235,19 @@ def test_auto_cond_refuses_an_unenumerable_domain() -> None:
 
 
 def test_gauntlet_auto_cond_rewrites_and_admits() -> None:
-    """The additive hook: refusal -> mint -> rewritten record -> admit."""
+    """The additive hook: refusal -> mint -> rewritten record -> admit.
+
+    Runs the unshipped ``add`` spelling — the ``mul`` variant is a
+    shipped law now, so the store's novelty gate would read it
+    ``duplicate`` after the mint."""
     torch.manual_seed(0)
     conn = ev.connect(":memory:")
-    key = ev.store_object(conn, _unsq_bare(), kind="abstraction")
-    corpus = _corpus(_guarded_case())
+    key = ev.store_object(
+        conn,
+        _unsq_bare(name="add_unsqueeze_l_id", op="add"),
+        kind="abstraction",
+    )
+    corpus = _corpus(_guarded_add_case())
     rep = ev.run_gauntlet(conn, key, corpus=corpus)
     assert not rep.usable
     assert rep.stages[-1].name == "truth"
@@ -289,15 +310,15 @@ def test_gauntlet_auto_cond_via_missing_check() -> None:
     torch.manual_seed(0)
     proc = Rewrite(
         name="unsq_proc",
-        lhs=_p("mul", _p("unsqueeze", "U", dim="A_dim"), "V"),
-        rhs=_p("mul", "U", "V"),
+        lhs=_p("add", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        rhs=_p("add", "U", "V"),
         check=lambda bound: True,
     )
     conn = ev.connect(":memory:")
     key = ev.store_object(conn, proc, kind="abstraction")
     assert ev.stored_object(conn, key)["missing_hooks"] == ["check"]
     rep = ev.run_gauntlet(
-        conn, key, corpus=_corpus(_guarded_case()), auto_cond=True
+        conn, key, corpus=_corpus(_guarded_add_case()), auto_cond=True
     )
     assert rep.usable
     assert rep.auto_cond is not None and rep.auto_cond["found"]

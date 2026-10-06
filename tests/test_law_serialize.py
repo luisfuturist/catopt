@@ -9,8 +9,8 @@ This file pins:
   scheme ``rulecache`` persists, round-tripped over every shipped
   pattern);
 * the ``Rewrite`` record round-trip — ``law_to_data`` /
-  ``law_from_data`` — including the exact census of which of the 61
-  shipped laws are *full-data* (all 61 now — the last four
+  ``law_from_data`` — including the exact census of which of the 71
+  shipped laws are *full-data* (all 71 now — the last four
   procedural hooks went declarative in stage 0 of plan 0017);
 * the honesty contract — a ``serializable: false`` record rebuilds
   its pattern + cond but *not* the dropped hooks: a synthetic
@@ -159,7 +159,7 @@ def test_alpha_key_canonicalizer_branches():
 
 
 def test_serializability_census_of_shipped_library():
-    """Pin the honest partition of the 61 shipped laws."""
+    """Pin the honest partition of the 71 shipped laws."""
     full, need_derive, need_check = [], [], []
     for rule in ALL_RULES:
         missing = missing_hooks(rule)
@@ -169,13 +169,15 @@ def test_serializability_census_of_shipped_library():
             need_derive.append(rule.name)
         else:
             need_check.append((rule.name, missing))
-    assert len(ALL_RULES) == 61
+    assert len(ALL_RULES) == 71
     # the whole shipped library is full-data now: the four stragglers
     # went declarative in stage 0 of plan 0017 — glu_fold's parity on
     # a dim-mod predicate, the rms pair's trailing block on the
     # tail-block spec, and gqa_absorb_repeat's repeat-chain /
-    # attr-eq-attr / repeat-heads triple
-    assert len(full) == 61
+    # attr-eq-attr / repeat-heads triple — and the ten promoted
+    # discovery laws carry pure-data cond/dspec/derivation
+    # (project/retros/promoted-laws.md)
+    assert len(full) == 71
     assert need_derive == []
     assert need_check == []
 
@@ -254,7 +256,7 @@ def test_law_record_roundtrip_rewrite_equality_unguarded():
             rebuilt = law_from_data(_json_roundtrip(law_to_data(rule)))
             assert rebuilt == rule, rule.name
             n += 1
-    assert n == 24
+    assert n == 25
 
 
 def _flagged_rule():
