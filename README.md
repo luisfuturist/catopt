@@ -161,15 +161,20 @@ language without growing a pile of Python.
   referee replays, not an arbitrary rewrite
   ([ADR 0004](project/adrs/0004-abstraction-as-move.md)).  `evidence.py`
   stores objects (`--add-object`) and admits them (`--admit-object KEY
-  --gauntlet`); the first inhabitants are `mul_unsqueeze_l_id` and
-  `sub_unsqueeze_l_id`.
+  --gauntlet`); **ten admitted objects have since been promoted into
+  `laws/` as real rules** — the loop from machine-found to shipped
+  ([promoted-laws.md](project/retros/promoted-laws.md)).
 - **Op vocabulary.**  `catopt_core.opmeta` is a single registry of
   **166 ops**; the thirteen op sets that used to be hand-duplicated
   across modules are now named projections of it, with the subset
   relations machine-checked.  The discovery generator's alphabet is
   itself *derived by property test* (`catopt_discovery.vocab`) — an op
   is classified by what it *does* (commutes-with-views, value-preserving),
-  not by a lookup table.
+  not by a lookup table.  And the op *set* is now declarable too:
+  `catopt_core.opdata` registers a view/relayout-class op from a data
+  `OpDef` (name, arity, tags, attr schema, shape spec in the `cond`
+  DSL) — kernels and aten spellings stay code, the structural slice is
+  a declaration ([plan 0019](project/plans/0019-ops-as-data.md)).
 
 ## The referee
 
@@ -194,6 +199,7 @@ library** (all regression-tested):
 | `select_mul` latently unsound — `mul` broadcasts along the *selected* axis (`u=(4,), v=(2,4), D=0` falsifies it) | the view/index oracle; now guarded by `dim-eq-attr` |
 | `reshape_transpose` fires 23× and cost-lowers yet is numerically false | the oracle rejects it |
 | seven shipped guarded laws with measured-unclean regions | the derivable-gate audit; a measured counterexample now outranks a derivation; all tightened |
+| a derivation outranking a measured counterexample in the *pipeline's* `truth` and the persisted `verdict` | the truth-parity audit — all three bars (in-memory, store, gauntlet) now refuse a refuted derivation |
 | `gqa_absorb_repeat` sweep crash (a `str` attr metavar reaching `_infer_op_shape`) | the guarded-region sweep; fixed |
 | a shape misinference that fabricated a 1.98× "win"; a well-typed but wrong program; a launch-time-vs-execution timing bug | the certificate and the equivalence gate |
 | three real `nn.*` lowering defects | the workload intake corpus |
@@ -234,8 +240,8 @@ sizes — see [Limits](#limits)); provenance is in
 | bounded rewrites on a real checkpoint | **up to 1.32× vs eager / 1.25× vs Inductor** (stories15M) | `bench.suites.bounded.bounded_e2e` |
 | contraction player n=40 vs `opt_einsum` | **0.87–0.99× randomised greedy at equal wall-clock** (0.44–0.60× deterministic) | `tools/contraction_guided_restart.py` |
 | pipeline held-out rediscovery | **winner re-ranks #1, SHIP, every run** | `catopt_discovery.pipeline --holdout` |
-| pipeline on the 364-term corpus | **shippable = 11** (was 0 before round 4; corpus-circular — see negatives) | `catopt_discovery.pipeline` |
-| coherence catalogue over `ALL_RULES` | **47 axioms / 13 lemmas / 2 redundant; 9 no-instance; divergence 0** | `catopt_discovery.coherence` |
+| pipeline on the 364-term corpus | **shippable = 11** — and **0** with `--real-only` (all 11 are corpus-circular; see negatives) | `catopt_discovery.pipeline` |
+| coherence catalogue over `ALL_RULES` | **47 axioms / 13 lemmas / 2 redundant; 9 no-instance; divergence 1** (`rms_norm_fold` × `_nogain` — measured, unresolved) | `catopt_discovery.coherence` |
 | workload intake | **254 real `nn.*` workloads, 201 fp64-verified** (corpus 211→725 op-tuples) | `catopt_discovery.intake` |
 | laws as data | **71/71 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_core.laws.serialize` |
 | evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
@@ -322,6 +328,14 @@ canonicalization bridges that make them reachable:
 - **Canonicalization bridges** — `mul(u,u) → square(u)` plus three
   `rsqrt` spellings, machinery-motivated bridges that make noncanonical
   RMSNorm spellings reach the fold.
+- **Ten machine-admitted objects, promoted to laws** — the found →
+  guarded → admitted → *shipped* loop closed end to end:
+  `sdpa_fold_nomask`/`_div_nomask` (the mask-free attention fold, in no
+  earlier ruleset, each carrying a `rank≥2` guard the sweep demanded),
+  `softsign_fold`, generalized `transpose_noop`/`chunk_single`, the
+  unsqueeze/reshape pad identities, and
+  `linear_channel_to_row_scale` shipped as a *lemma* over its premise
+  chain ([promoted-laws.md](project/retros/promoted-laws.md)).
 
 **The loop is closed.**  `catopt_discovery.pipeline` runs
 census → propose → verify → measure → rank → **emit** end to end:
@@ -344,16 +358,21 @@ The negatives are load-bearing, not footnotes:
   rules through the whole gate stack
   ([typed-pay-gate.md](project/retros/typed-pay-gate.md),
   [corpus-round-4.md](project/retros/corpus-round-4.md)).
-- **`shippable = 11` is corpus-circular — read it carefully.**  All 11
-  clear the full gauntlet (zero refusals) but they are *unguarded*, so
-  the one stricter stage never runs; and against the **baseline** corpus
-  (no intake) every one of them measures `fires = 0`.  Each firing site
-  is a round-4 workload written to spell that pattern.  The 11 are real
-  *library* additions (elementwise factoring — `x−x=0`, `x**1=x`,
-  `(−x)²=x²`, `eˣeʸ=eˣ⁺ʸ`, `x·y±x·z=x·(y±z)` — the library had only the
-  matmul/linear controls), but the number measures the corpus's new
+- **`shippable = 11` is corpus-circular — now measured, not just
+  argued.**  All 11 clear the full gauntlet (zero refusals) but they
+  are *unguarded*, so the one stricter stage never runs; and running
+  the same pipeline on **real modules alone** (`intake --real-only`,
+  dropping the 46 purpose-built spellings) measures **shippable = 0**.
+  Each firing site is a round-4 workload written to spell that
+  pattern.  Sharper still: seven wrap/mirror guards *do* occur on real
+  modules (SwiGLU, Conformer, ALiBi, selective SSMs) but measure
+  `equal == 0` at every real site — real code hits the non-trivial
+  corner the guard must decline.  The 11 are real *library* additions
+  (elementwise factoring — `x−x=0`, `x**1=x`, `(−x)²=x²`, `eˣeʸ=eˣ⁺ʸ`,
+  `x·y±x·z=x·(y±z)`), but the number measures the corpus's new
   *spellings*, not real-network relevance
-  ([shippable-audit.md](project/retros/shippable-audit.md)).
+  ([shippable-audit.md](project/retros/shippable-audit.md),
+  [real-corpus-yield.md](project/retros/real-corpus-yield.md)).
 - **Guards that can never fire on exported graphs.**  Seven minted
   guards are *boundary facts*, not corpus gaps: `torch.export` folds
   every full-extent slice to `alias`, `x[0]` exports as `select` (never
