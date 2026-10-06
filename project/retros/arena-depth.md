@@ -44,10 +44,33 @@ per-clause relax moves and per-metavar pin moves over the
 `lawdata.SPECIALIZE_{SCALARS,AXES}` banks.  The pin banks are data —
 a richer pin is a data change, not code.
 
+## The 24-step probe (3 episodes × budget 24, seed 0)
+
+| player | usable | holdout fires | holdout paid | reward |
+|---|---|---|---|---|
+| fixed  | 0 | 8/0/0 | **2/0/0** | 23.6/17/17 |
+| random | 0 | 2/2/1 | 0/1/0 | 66/72/66 |
+| greedy | 0 | 0/0/0 | 0/0/0 | 72/72/72 |
+
+Two findings:
+
+- **Nobody reaches `usable` in 24 moves.**  The admitted-object bar
+  needs longer horizons or guided play — random and greedy churn
+  through applied-but-unproductive constructions.
+- **The reward is stage-clear-dominated.**  Greedy maxes reward
+  (72.0) with *zero* holdout yield — `stages_cleared + 0.2·fires +
+  2·paid` lets three cleared stages outscore a paying object until
+  it admits.  **Fixed as data**: `lawdata.ARENA_REWARD` is now
+  `stage=0.1, usable=10, fire=0.5, paid=5` — the objective
+  (admitted, paying objects) outweighs a full budget of churn
+  (24 × ~0.3 ≈ 7 < one usable's 10).  Under the old weights the
+  same fixed episode scores 23.6; under the new, ~15–16 — still the
+  only paying line, now correctly top of the board.
+
 ## Verdict for plan 0021
 
 The construction board is **deep enough to measure**: large action
-space, payoff differences between players, honest holdout.  The next
-probe needs a longer horizon (or a smaller/cheaper corpus) before
-"does a learned player beat the rule" is answerable — 8 moves does
-not reach `usable`.
+space, payoff differences between players, honest holdout.  The
+board's depth for a *learned* player is the open question — the
+reward no longer rewards churn, so a longer-horizon probe (or a
+learned policy over the ~150k-move set) is the next measurement.

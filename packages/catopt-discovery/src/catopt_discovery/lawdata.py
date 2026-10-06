@@ -547,13 +547,18 @@ REFEREE_SCORE: dict[str, int | float] = {
 
 #: The arena reward composition — partial credit per cleared gauntlet
 #: stage, a bonus on the honest ``usable`` verdict, and the holdout
-#: firing/pay columns (the same ``0.2·fires + 2·paid`` shape the
-#: meta-game's referee scored).
+#: firing/pay columns.  Weights are shaped so *the objective
+#: dominates the shaping signal*: the 24-step probe measured a
+#: stage-clear-dominated reward letting a churn policy outscore a
+#: paying playbook (greedy 72 reward / 0 pay vs fixed 23.6 / 2
+#: paid).  Stage clears stay as a dense orienting signal but a
+#: paying or admitted object outweighs a full budget of churn.
+#: ``project/retros/arena-depth.md``.
 ARENA_REWARD: dict[str, float] = {
-    "stage": 1.0,
-    "usable": 2.0,
-    "fire": 0.2,
-    "paid": 2.0,
+    "stage": 0.1,
+    "usable": 10.0,
+    "fire": 0.5,
+    "paid": 5.0,
 }
 
 # ---------------------------------------------------------------------------

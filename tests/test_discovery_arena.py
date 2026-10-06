@@ -120,7 +120,7 @@ def test_episode_runs_end_to_end(tmp_path):
     assert lift.usable and lift.holdout_fires >= 1
     assert lift.holdout_paid >= 1
     assert lift.reward == pytest.approx(
-        8 + 2 + 0.2 * lift.holdout_fires + 2 * lift.holdout_paid
+        0.8 + 10 + 0.5 * lift.holdout_fires + 5 * lift.holdout_paid
     )
     # trajectory accounting
     assert traj.usable == 1
@@ -277,7 +277,7 @@ def test_stage_clear_partial_credit(tmp_path):
 
     ``add(X,X) → abs(X)`` rebuilds fine, serializes fully and
     measures — then the truth gate refuses it: three stages of
-    honest progress, reward 3, not usable, zero holdout payoff.
+    honest progress, reward 0.3, not usable, zero holdout payoff.
     """
     arena = _arena(
         working=[_aff_step_case("w", 4)],
@@ -295,7 +295,7 @@ def test_stage_clear_partial_credit(tmp_path):
         "truth",
     ]
     assert rep.stages[-1].passed is False
-    assert not rep.usable and rep.reward == 3.0
+    assert not rep.usable and rep.reward == pytest.approx(0.3)
     assert rep.holdout_fires == 0 and rep.holdout_paid == 0
     # the refusal lands in the state view
     (o,) = state.objects
