@@ -101,9 +101,16 @@ Two games are played on that tower:
   `CONSTRUCTORS`/`ACTIONS` registries.  `catopt_discovery.arena`
   runs episodes on the real board: `legal_actions(state)` enumerates
   the live move set (~150k on the real corpus), `FixedRule`/
-  `RandomPlayer`/`GreedyPlayer` are the baselines, and the score is
-  holdout-only pay the player cannot write into.  Ten machine-
-  written cells are shipped laws today.
+  `RandomPlayer`/`GreedyPlayer`/`HeuristicPlayer` are the baselines,
+  and the score is holdout-only pay the player cannot write into.
+  Ten machine-written cells are shipped laws today.
+- **The meta-arena** (`catopt_discovery.meta_arena`) — plan 0021's
+  unified board: a program being optimized, where the moves mix
+  `fire(law)` (apply a 2-cell in position), `saturate(budget)`,
+  `declare(…)` (construct an object mid-search — *inserts it into
+  the live ruleset*), and a terminal `extract()` refereed by
+  certificate replay.  Measured: mid-search `declare` reaches
+  certified extractions no law sequence can reach.
 
 Then the shared equipment:
 
@@ -275,7 +282,9 @@ sizes — see [Limits](#limits)); provenance is in
 | human-vs-machine law arms on the zoo | human-only **4/22** · machine-only **3/22** → **6/22 after a construction round closed the measured gaps** (`linear_chain_t` owns LoRAAdapter's −20%; `affd_step_lift` −4.07% on AdaLNBlock where the whole human library scores 0) | `catopt_core.laws.provenance` + `machine_pack` |
 | machine law pack | **16/16 store objects deployable** as an opt-in `RuleSet` (`machine_default(store)`) | `catopt_discovery.machine_pack` |
 | law-order board (plan 0021 probe) | extracted term **identical under ~350 ordering arms**; wall-clock swings up to **40×** — order is a schedule dimension, not a quality one | `catopt_discovery.law_order` |
-| construction arena depth probe | board size **~150k legal moves**; fixed playbook pays 2 on holdout, greedy pays 0 — move choice matters; nobody reaches `usable` in 24 moves yet | `catopt_discovery.arena` |
+| construction arena depth probe | board size **~150k legal moves**; on the cheap board `usable` **is reachable** (fixed playbook admits in 2/5 episodes); reward rebalanced after the probe caught stage-clear-dominated churn outscoring pay | `catopt_discovery.arena` |
+| meta-arena Q2 (mid-search declare) | **yes** — `declare` reaches certified extractions no law sequence reaches (`sub_gap` unreachable under full `DEFAULT` → half-cost via one fold) | `catopt_discovery.meta_arena` |
+| referee totality | a legal move can never crash the referee — `apply_rule` declines unrealizable RHS bindings; arena step reports referee declines as honest refusals | `catopt_core.egraph` |
 | discovery content tables → data | oracle banks, verifier defaults, grammar alphabet, reward weights, term corpora all live in `lawdata` — pure data a model could write | `catopt_core.lawdata` + `catopt_discovery.lawdata` |
 | evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
 
