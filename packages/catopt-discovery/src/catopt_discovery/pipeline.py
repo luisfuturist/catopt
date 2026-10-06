@@ -644,7 +644,15 @@ class Evidence:
 
     @property
     def truth(self) -> bool:
-        """True iff derivable, or numerically true on a real instance."""
+        """True iff derivable, or numerically true on a real instance.
+
+        A measured ``num_true is False`` is a counterexample — it
+        outranks a derivation, matching the gauntlet's truth gate and
+        the store-boundary verdict.  ``derivable`` may only waive an
+        *absent* measurement (``num_true is None``).
+        """
+        if self.num_true is False:
+            return False
         return self.derivable or self.num_true is True
 
     @property

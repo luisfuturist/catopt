@@ -240,14 +240,14 @@ def test_gauntlet_truth_takes_the_unguarded_branch():
 # ---------------------------------------------------------------------------
 
 
-def test_gauntlet_truth_is_stricter_on_a_derivable_counterexample():
-    """The round-4 tightening: a measured counterexample outranks a
-    derivation.  The pipeline's ``truth`` still lets ``derivable``
-    win, so the bars diverge here — though not for the 11 (all
-    measure ``num_true is True``, not ``False``)."""
+def test_bars_agree_on_a_derivable_counterexample():
+    """A measured counterexample outranks a derivation on both sides
+    of the boundary now: the pipeline's ``truth`` and the gauntlet's
+    truth gate both refuse.  (Formerly the pipeline let ``derivable``
+    win — the audit-pinned divergence, now closed.)"""
     prop = _props()["sub_self"]
     evd = pl.Evidence(proposal=prop, num_true=False, derivable=True)
-    assert evd.truth is True  # pipeline: derivation wins
+    assert evd.truth is False  # pipeline: the counterexample wins
     rep = ev.Gauntlet(alpha_key="k")
     rep.evidence = evd
     assert ev._truth_gate(rep, prop.as_rule(), None, None) is False

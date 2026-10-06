@@ -669,7 +669,14 @@ class GapResult:
 
     @property
     def truth(self) -> bool:
-        """Truth on the best evidence (baseline or generated instance)."""
+        """Truth on the best evidence (baseline or generated instance).
+
+        A measured ``num_true is False`` is a counterexample — it
+        outranks both the baseline verdict and a derivation, matching
+        ``pipeline.Evidence.truth`` and the gauntlet's truth gate.
+        """
+        if self.num_true is False:
+            return False
         return (
             self.base_truth or self.num_true is True or self.derivable
         )

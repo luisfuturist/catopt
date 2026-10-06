@@ -199,6 +199,106 @@ def test_numeric_true_none_stays_null(tmp_path):
     assert row["numeric_true"] is None
 
 
+# ---------------------------------------------------------------------------
+#  Truth parity — a measured counterexample outranks a derivation at
+#  the store boundary too (the gauntlet's rule, commit c2acfbf)
+# ---------------------------------------------------------------------------
+#
+#  ``pipeline.Evidence.truth`` now refuses too — a derivable record
+#  the numeric oracle measured *false* reads ``truth is False`` in
+#  memory, in the store row (``_stored_verdict``) and in the
+#  gauntlet: all three classify exactly like the gauntlet's unguarded
+#  truth branch (``num_true is not False and (derivable or num_true
+#  is True)``).  ``derivable`` waives an *absent* measurement, never
+#  a measured one.
+
+
+def _ship_ready(prop, **kw):
+    """An ``Evidence`` green on every non-truth gate."""
+    return Evidence(
+        proposal=prop,
+        relation="new",
+        matches=1,
+        fires=1,
+        fires_typed=1,
+        paid=1,
+        **kw,
+    )
+
+
+def test_verdict_row_measured_false_outranks_derivation(tmp_path):
+    """derivable=True + a measured unequal site classifies refuted.
+
+    ``Evidence.truth``/``shippable`` refuse too (the pipeline
+    property is aligned — pipeline.py); the store row carries the
+    derivation-override marker.
+    """
+    prop = Proposal(name="p", lhs=None, rhs=None, family="f")
+    evid = _ship_ready(prop, num_true=False, derivable=True)
+    assert evid.truth is False and evid.shippable is False
+    row = ev.verdict_row("K", evid, "l", "r")
+    assert row["verdict"] == (
+        "no:false (numeric oracle rejects; derivation overridden)"
+    )
+    assert row["numeric_true"] == 0 and row["derivable"] == 1
+
+
+def test_verdict_row_measured_false_reason_unchanged(tmp_path):
+    """Without a derivation the reason is the pipeline's own — the
+    same spelling existing rows and ``no_ship_reason`` already use."""
+    prop = Proposal(name="p", lhs=None, rhs=None, family="f")
+    evid = Evidence(proposal=prop, num_true=False, matches=1)
+    assert not evid.shippable
+    assert evid.no_ship_reason == "false (numeric oracle rejects)"
+    row = ev.verdict_row("K", evid, "l", "r")
+    assert row["verdict"] == "no:false (numeric oracle rejects)"
+
+
+def test_verdict_row_derivable_waives_only_absent_measurement(
+    tmp_path,
+):
+    """A derivable record with NO measured site stays admissible —
+    ``num_true is None`` is starvation, not a counterexample."""
+    prop = Proposal(name="p", lhs=None, rhs=None, family="f")
+    evid = _ship_ready(prop, num_true=None, derivable=True)
+    assert evid.shippable is True
+    row = ev.verdict_row("K", evid, "l", "r")
+    assert row["verdict"] == "SHIP"
+    assert row["numeric_true"] is None
+
+
+def test_stored_verdict_agrees_with_the_gauntlet(tmp_path):
+    """The store and the gauntlet's unguarded truth branch now
+    classify the refuted derivation identically — refuse."""
+    prop = Proposal(name="p", lhs=None, rhs=None, family="f")
+    evid = _ship_ready(prop, num_true=False, derivable=True)
+    rep = ev.Gauntlet(alpha_key="k")
+    rep.evidence = evid
+    # an unguarded stand-in: cond/check are what _truth_gate reads
+    rule = _BY_NAME["id_add"]
+    assert rule.cond is None and rule.check is None
+    assert ev._truth_gate(rep, rule, None, None) is False
+    assert ev._stored_verdict(evid).startswith("no:false")
+
+
+def test_stored_verdict_round_trip_refused(tmp_path):
+    """The refused row persists and serves back as ``no:`` — the
+    history report and cache hits see the refutation, not a SHIP."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    prop = Proposal(name="p", lhs=None, rhs=None, family="f")
+    evid = _ship_ready(prop, num_true=False, derivable=True)
+    meta = _meta(run_id="r1")
+    ev.record_run(conn, meta, [ev.verdict_row("K", evid, "l", "r")])
+    hits = ev.latest_verdicts(
+        conn, meta["corpus_hash"], meta["rules_hash"], "abc123"
+    )
+    assert hits["K"]["verdict"].startswith("no:")
+    assert (
+        hits["K"]["numeric_true"] == 0 and hits["K"]["derivable"] == 1
+    )
+    conn.close()
+
+
 def test_record_run_and_latest_verdicts(tmp_path):
     conn = ev.connect(str(tmp_path / "s.db"))
     meta = _meta(run_id="r1")

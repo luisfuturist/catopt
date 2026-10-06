@@ -265,6 +265,31 @@ def code_rev(root: Path | None = None) -> str:
     return f"{rev}+{h.hexdigest()[:8]}"
 
 
+def _stored_verdict(ev: Any) -> str:
+    """Classify the persisted verdict for one measured ``Evidence``.
+
+    The same precedence :func:`_truth_gate` applies in the gauntlet,
+    applied here at the store boundary: a measured ``num_true is
+    False`` is a counterexample, and ``derivable`` may waive an
+    *absent* measurement — never a measured one.
+    ``Evidence.truth``/``shippable`` (``pipeline``) still let a
+    derivation override the oracle, so the row re-checks the measured
+    site itself rather than trusting ``ev.shippable`` to have
+    refused: a ``derivable`` + ``num_true is False`` record persists
+    ``no:false (numeric oracle rejects; derivation overridden)``,
+    not ``SHIP``.  The reason stem is the pipeline's own
+    (``Evidence.no_ship_reason``'s ``"false (numeric oracle
+    rejects)"``), so a non-derivable measured-false row is spelled
+    exactly as before — only the derivation-override case gains a
+    marker, visible in the history report like the gauntlet's
+    ``"derivation overridden by a measured counterexample"``.
+    """
+    if ev.num_true is False:
+        over = "; derivation overridden" if ev.derivable else ""
+        return f"no:false (numeric oracle rejects{over})"
+    return "SHIP" if ev.shippable else f"no:{ev.no_ship_reason}"
+
+
 def verdict_row(alpha_key: str, ev: Any, lhs: str, rhs: str) -> dict:
     """Serialise one ``Evidence``-shaped record as a store row.
 
@@ -272,7 +297,9 @@ def verdict_row(alpha_key: str, ev: Any, lhs: str, rhs: str) -> dict:
     stays torch/catopt-free.  *lhs* / *rhs* are the rendered pattern
     sides kept in ``proposal_json`` for inspection.  ``drop_pct`` is
     stored in percent (``cost_drop * 100``); ``verdict`` is ``"SHIP"``
-    or ``"no:<reason>"``.
+    or ``"no:<reason>"``, classified by :func:`_stored_verdict` — a
+    measured ``num_true is False`` never persists as ``SHIP``, no
+    matter what the derivation says.
     """
     p = ev.proposal
     return {
@@ -307,9 +334,7 @@ def verdict_row(alpha_key: str, ev: Any, lhs: str, rhs: str) -> dict:
         "drop_pct": ev.cost_drop * 100.0,
         "cert": ev.cert_fail,
         "enode_ratio": ev.closure_ratio,
-        "verdict": (
-            "SHIP" if ev.shippable else f"no:{ev.no_ship_reason}"
-        ),
+        "verdict": _stored_verdict(ev),
     }
 
 
