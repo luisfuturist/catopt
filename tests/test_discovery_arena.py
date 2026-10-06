@@ -17,10 +17,13 @@ import pytest
 import torch
 from catopt_core.egraph import Rewrite
 from catopt_core.ir import Const, Op, TensorType, Var, op_repr_dag
+from catopt_core.laws import ALL_RULES
 from catopt_discovery import arena as ar
 from catopt_discovery import evidence as ev
 from catopt_discovery import object_synthesis as obs
 from catopt_discovery.impact import TermCase
+
+_BY_NAME = {r.name: r for r in ALL_RULES}
 
 
 def _p(op: str, *args, **attrs) -> Op:
@@ -512,7 +515,8 @@ def test_legal_actions_are_grounded_and_constructible(tmp_path):
     # deterministic order: family order, sorted inside each family
     order = [a.op for a in acts]
     assert order == sorted(
-        order, key=("ingest", "auto_cond", "fold", "lift", "compose").index
+        order,
+        key=("ingest", "auto_cond", "fold", "lift", "compose").index,
     )
     specs = {c.spec for c in state.corpus}
     for a in acts:
@@ -531,9 +535,7 @@ def test_legal_actions_are_grounded_and_constructible(tmp_path):
             assert ar._spec_size(p["step"]) >= 2
             assert any(_spec_occurs(s, p["step"]) for s in specs)
             apply = p["apply_op"]
-            assert any(
-                a_ == apply for _c, a_, _h in state.carriers
-            )
+            assert any(a_ == apply for _c, a_, _h in state.carriers)
         elif a.op == "compose":
             assert p["first"] in state.premises
             assert all(r in state.premises for r in p["rest"])
@@ -563,7 +565,8 @@ def test_legal_actions_compose_pairs_and_specialize(tmp_path):
     state = arena.observe()
     acts = ar.legal_actions(state)
     pairs = [
-        a for a in acts
+        a
+        for a in acts
         if a.op == "compose"
         and a.params["first"] == "comm_mul"
         and a.params["rest"] == ("silu_fold",)
@@ -606,9 +609,7 @@ def test_legal_actions_auto_cond_targets_unguarded(tmp_path):
     )
     state2 = arena.observe()
     acts2 = ar.legal_actions(state2)
-    keys = {
-        a.params["ref"] for a in acts2 if a.op == "auto_cond"
-    }
+    keys = {a.params["ref"] for a in acts2 if a.op == "auto_cond"}
     assert rep2.alpha_key not in keys
     assert rep.alpha_key in keys
 
@@ -622,8 +623,7 @@ def test_legal_actions_replay_is_idempotent(tmp_path):
         a
         for a in acts
         if a.op == "fold"
-        and a.params["spelled"]
-        == ("add", ("matmul", "X1", "X2"), "X3")
+        and a.params["spelled"] == ("add", ("matmul", "X1", "X2"), "X3")
         and a.params["kernel"] == "abs"
         and a.params["arg"] == "X1"
     )
@@ -659,15 +659,17 @@ def test_carrier_basis_parametrized(tmp_path):
     acts = ar.legal_actions(state)
     lifts = [a for a in acts if a.op == "lift"]
     assert lifts and all(
-        a.params["apply_op"] == "om_apply"
-        and a.params["state"] is None
+        a.params["apply_op"] == "om_apply" and a.params["state"] is None
         for a in lifts
     )
-    assert ar.Action.lift(
-        ("add", ("matmul", "X1", "X2"), "X3"),
-        ("om_elem", "X1", "X2", "X3"),
-        "om_apply",
-    ) in acts
+    assert (
+        ar.Action.lift(
+            ("add", ("matmul", "X1", "X2"), "X3"),
+            ("om_elem", "X1", "X2", "X3"),
+            "om_apply",
+        )
+        in acts
+    )
     # a lift-shaped rule mines its (carrier, apply, state) template
     from catopt_core.laws.scan import AFF_LIFT
 
@@ -801,17 +803,23 @@ def test_depth_probe_small_board(tmp_path):
     assert sum(totals["fixed"].values()) == fixed["steps"]
 
 
-def test_main_runs_the_probe_and_writes_json(tmp_path, monkeypatch, capsys):
+def test_main_runs_the_probe_and_writes_json(
+    tmp_path, monkeypatch, capsys
+):
     """``main`` renders the probe table; ``--json`` dumps it."""
     monkeypatch.setattr(
-        ar, "depth_probe", lambda **_kw: {"p": [ar._probe_row(
-            ar.Trajectory([]), 0, 5, 3
-        )]}
+        ar,
+        "depth_probe",
+        lambda **_kw: {
+            "p": [ar._probe_row(ar.Trajectory([]), 0, 5, 3)]
+        },
     )
     out = tmp_path / "probe.json"
     assert ar.main(["--json", str(out)]) == 0
     blob = json.loads(out.read_text())
-    assert blob["p"][0]["usable"] == 0 and blob["p"][0]["legal_start"] == 5
+    assert (
+        blob["p"][0]["usable"] == 0 and blob["p"][0]["legal_start"] == 5
+    )
     assert "player" in capsys.readouterr().out
 
 
@@ -1031,7 +1039,11 @@ def test_relax_guard_action_drops_a_clause(tmp_path):
         ar.Action.fold(
             ("div", "X", ("add", ("abs", "X"), 1)),
             "softsign",
-            cond=("and", ("rank", "X", ">=", 1), ("rank", "X", ">=", 0)),
+            cond=(
+                "and",
+                ("rank", "X", ">=", 1),
+                ("rank", "X", ">=", 0),
+            ),
             name="guarded",
         )
     )
@@ -1039,9 +1051,7 @@ def test_relax_guard_action_drops_a_clause(tmp_path):
     (o,) = arena.observe().objects
     assert len(o.cond_clauses) == 2
     # drop the second clause — the object re-gauntlets under the key
-    _s2, rep2 = arena.step(
-        ar.Action.relax_guard(rep.alpha_key, 1)
-    )
+    _s2, rep2 = arena.step(ar.Action.relax_guard(rep.alpha_key, 1))
     assert rep2.applied and rep2.alpha_key == rep.alpha_key
     (o2,) = arena.observe().objects
     assert len(o2.cond_clauses) == 1
@@ -1052,9 +1062,7 @@ def test_relax_guard_declines_without_a_declarative_guard(tmp_path):
     arena = _arena(working=[_aff_step_case("w", 4)])
     _s, rep = arena.step(_aff_lift())
     assert rep.applied
-    _s2, rep2 = arena.step(
-        ar.Action.relax_guard(rep.alpha_key, 0)
-    )
+    _s2, rep2 = arena.step(ar.Action.relax_guard(rep.alpha_key, 0))
     assert not rep2.applied
     assert "declined" in rep2.note
 
@@ -1094,7 +1102,11 @@ def test_legal_actions_enumerate_relax_and_specialize(tmp_path):
         ar.Action.fold(
             ("div", "X", ("add", ("abs", "X"), 1)),
             "softsign",
-            cond=("and", ("rank", "X", ">=", 1), ("rank", "X", ">=", 0)),
+            cond=(
+                "and",
+                ("rank", "X", ">=", 1),
+                ("rank", "X", ">=", 0),
+            ),
             name="guarded",
         )
     )
@@ -1133,13 +1145,12 @@ def test_make_arena_max_cases_is_deterministic_and_isolated(tmp_path):
     a2 = ar.make_arena(
         seed=0, max_cases=12, max_holdout=6, meta=_meta()
     )
+
     def _wnames(a: ar.Arena) -> list:
         return [c.name for c in a.working]
 
     assert _wnames(a1) == _wnames(a2)  # seeded → replays
-    assert [c.name for c in a1.holdout] == [
-        c.name for c in a2.holdout
-    ]
+    assert [c.name for c in a1.holdout] == [c.name for c in a2.holdout]
     # the caps bind
     assert 0 < len(a1.working) <= 12
     assert len(a1.pending) <= 12
@@ -1241,10 +1252,10 @@ def test_heuristic_player_skips_played_moves_and_terminates(tmp_path):
     no carriers), so the whole legal set is the ingest pair plus the
     whole-pool move — the player spends each once, then stops.
     """
-    one_op = _case("one", _p("mul", _v("one_x", 4), Const(2)), _v("one_x", 4))
-    another = _case(
-        "two", _p("neg", _v("two_x", 4)), _v("two_x", 4)
+    one_op = _case(
+        "one", _p("mul", _v("one_x", 4), Const(2)), _v("one_x", 4)
     )
+    another = _case("two", _p("neg", _v("two_x", 4)), _v("two_x", 4))
     arena = _arena(
         working=[one_op],
         pending=[another],
@@ -1272,7 +1283,9 @@ def test_heuristic_player_skips_played_moves_and_terminates(tmp_path):
 def test_heuristic_player_legal_and_order_seams(tmp_path):
     """The ``legal``/``order`` seams re-rank or restrict the policy."""
     arena = _arena(working=[_aff_step_case("w", 4)])
-    assert ar.HeuristicPlayer(legal=lambda _s: ())(arena.observe()) is None
+    assert (
+        ar.HeuristicPlayer(legal=lambda _s: ())(arena.observe()) is None
+    )
     # a re-ranked table inverts the preference honestly
     arena2 = _arena(
         working=[_aff_step_case("w", 4)],
@@ -1318,3 +1331,332 @@ def test_stage_failures_aggregates_the_failed_column(tmp_path):
         "declined": 1,
     }
     assert sum(fail.values()) == len(traj.reports)
+
+
+# ---------------------------------------------------------------------------
+#  Handler declines, record traversal, and the referee's failure path
+# ---------------------------------------------------------------------------
+
+
+def test_relax_and_specialize_unknown_refs_decline(tmp_path):
+    """Both object-reference handlers decline an unresolvable ref —
+    nothing is stored, the note names the reference."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    _s, rel = arena.step(ar.Action.relax_guard("ghost", 0))
+    assert not rel.applied
+    assert "unknown object" in rel.note and "ghost" in rel.note
+    _s, spec = arena.step(ar.Action.specialize("ghost", {"X": 0}))
+    assert not spec.applied
+    assert "unknown object" in spec.note and "ghost" in spec.note
+    assert rel.reward == 0.0 == spec.reward
+
+
+def test_premise_forms_skip_a_row_the_admit_path_cannot_resolve(
+    tmp_path, monkeypatch
+):
+    """A stored row that cannot be rebuilt contributes no premise
+    form — the ``got is None`` skip is honest bookkeeping."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    _s, rep = arena.step(_aff_lift())
+    orig = ev.admit_object
+    monkeypatch.setattr(
+        ar.ev,
+        "admit_object",
+        lambda conn, key: (
+            None if key == rep.alpha_key else orig(conn, key)
+        ),
+    )
+    state = arena.observe()
+    # the row is real — the object still renders in the state
+    assert rep.alpha_key in {o.alpha_key for o in state.objects}
+    names = {n for n, _l, _r in state.premise_forms}
+    assert "aff_step_lift" not in names
+    assert "comm_mul" in names  # the shipped premises are unaffected
+
+
+def test_data_metavar_helpers_walk_the_record_tree():
+    """``_data_metavars``/``_data_attr_metavars`` traverse the stored
+    ``term_to_data`` tree — metavar leaves, non-dict data and the
+    ``__list__``/``__tuple__`` attr encodings."""
+    tree = {
+        "op": "mul",
+        "args": [
+            {"mvar": "A"},
+            "raw-leaf",
+            {
+                "op": "select",
+                "args": [{"mvar": "B"}, 7],
+                "attrs": {
+                    "dims": ["D", 3],
+                    "shape": {"__tuple__": ["S1", "S2"]},
+                    "mode": "D",  # a repeat — deduped
+                },
+            },
+        ],
+        "attrs": {},
+    }
+    assert ar._data_metavars(tree) == ("A", "B")
+    assert (
+        ar._data_metavars({"var": "x"}) == ()
+    )  # a typed leaf is no metavar
+    assert ar._data_metavars("not-a-node") == ()
+    assert ar._data_attr_metavars(tree) == ("D", "S1", "S2")
+    assert ar._data_attr_metavars({"mvar": "A"}) == ()
+
+
+def test_stored_attr_metavars_feed_views_and_specialize_moves(tmp_path):
+    """A stored object whose lhs carries ``$attr:`` metavars lands in
+    the view's ``attr_metavars`` and the specialize enumeration."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    sel = obs.ConstructedObject(
+        rule=_BY_NAME["select_mul"],
+        kind="abstraction",
+        construction=("test",),
+    )
+    key = obs.store_constructed(arena.conn, sel, "h")
+    state = arena.observe()
+    view = next(o for o in state.objects if o.alpha_key == key)
+    assert view.leaf_metavars == ("u", "v")
+    assert view.attr_metavars == ("D", "I")
+    specs = [
+        a
+        for a in ar.legal_actions(state)
+        if a.op == "specialize" and a.params["ref"] == key
+    ]
+    n = len(view.leaf_metavars) * len(ar.lawdata.SPECIALIZE_SCALARS)
+    n += len(view.attr_metavars) * len(ar.lawdata.SPECIALIZE_AXES)
+    assert len(specs) == n
+    assert ar.Action.specialize(key, {"D": 0}) in specs
+
+
+def test_referee_declines_a_certification_that_raises(tmp_path):
+    """A construction whose store-side certification raises is a
+    refusal — the note names the failure class, nothing is stored."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    _s, rep = arena.step(
+        ar.Action.compose(
+            "comm_mul",
+            "silu_fold",
+            specialize={"a": ("sigmoid", "X"), "b": "X"},
+            env={"ZZ": _v("zz", 4)},
+        )
+    )
+    assert not rep.applied
+    assert "referee declined" in rep.note
+    assert rep.reward == 0.0
+    assert ev.lemma_rows(arena.conn) == []
+
+
+# ---------------------------------------------------------------------------
+#  Move enumeration edges — attr specialization inside compose
+# ---------------------------------------------------------------------------
+
+
+def test_spec_attr_match_binds_and_declines():
+    """``_spec_attrs_match`` binds a sub-attr metavar to the firing
+    premise's concrete value and refuses a concrete clash."""
+    out: dict = {}
+    assert (
+        ar._spec_attrs_match(
+            _p("reshape", "A", shape=(2, 2)),
+            _p("reshape", "B", shape="S"),
+            out,
+        )
+        is True
+    )
+    assert out == {"S": (2, 2)}
+    # a metavar attr on the pattern side always binds — nothing pinned
+    assert (
+        ar._spec_attrs_match(
+            _p("reshape", "A", shape="D"),
+            _p("reshape", "B", shape=(9,)),
+            {},
+        )
+        is True
+    )
+    # two concrete values that disagree decline the pair
+    assert (
+        ar._spec_attrs_match(
+            _p("reshape", "A", shape=(2, 2)),
+            _p("reshape", "B", shape=(9,)),
+            {},
+        )
+        is False
+    )
+
+
+def test_compose_moves_specialize_over_attr_metavars(tmp_path):
+    """A premise RHS whose subterm carries an attr metavar gets a
+    specialization binding it to the firing premise's concrete attr."""
+    p1 = Rewrite(
+        "p_src",
+        "X",
+        _p(
+            "add",
+            _p("reshape", "Y", shape="S"),
+            _p("reshape", "Q", shape=(9,)),
+        ),
+    )
+    p2 = Rewrite("p_two", _p("reshape", "Z", shape=(2, 2)), "Z")
+    p3 = Rewrite("p_three", _p("reshape", "W", shape=(4,)), "W")
+    arena = _arena(base_rules=(p1, p2, p3))
+    acts = ar.legal_actions(arena.observe())
+    specs_by_rest: dict[str, list] = {}
+    for a in acts:
+        if a.op == "compose" and a.params["first"] == "p_src":
+            for r in a.params["rest"]:
+                specs_by_rest.setdefault(r, []).append(
+                    a.params["specialize"]
+                )
+    # the "S" attr metavar binds the firing premise's concrete shape
+    assert {"S": (2, 2)} in specs_by_rest["p_two"]
+    assert {"S": (4,)} in specs_by_rest["p_three"]
+    # the concrete-(9,) subterm clashes with both firing shapes — the
+    # pair declines there, so no map pins a metavar to (9,)
+    assert not any((9,) in s.values() for s in specs_by_rest["p_two"])
+    assert not any((9,) in s.values() for s in specs_by_rest["p_three"])
+
+
+def test_composite_spec_walkers_skip_consts_and_attr_dicts(tmp_path):
+    """Const leaves and attr dicts inside composite specs are data,
+    not metavariables — the walkers' scalar/dict edges."""
+    x, y = _v("cx", 4, 8), _v("cy", 4, 8)
+    term = _p(
+        "mul",
+        _p("add", _p("abs", x), Const(1)),
+        _p("select", y, dim=0, index=1),
+    )
+    arena = _arena(
+        working=[_case("mix", term, x, y)],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    specs = ar._composite_specs(arena.observe(), 64)
+    assert ("add", ("abs", "X1"), 1) in specs
+    full = (
+        "mul",
+        ("add", ("abs", "X1"), 1),
+        ("select", "X2", {"dim": 0, "index": 1}),
+    )
+    assert full in specs
+    assert ar._spec_metavars(full) == ("X1", "X2")
+    # the sub-spec walk visits op nodes only — attr dicts are data
+    subs = list(ar._sub_specs(full))
+    assert subs[0] == full
+    assert ("select", "X2", {"dim": 0, "index": 1}) in subs
+    assert ("add", ("abs", "X1"), 1) in subs
+    assert all(
+        isinstance(s, tuple) and isinstance(s[0], str) for s in subs
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Construction-board plumbing — carrier basis, subsampling, players, main
+# ---------------------------------------------------------------------------
+
+
+def test_default_carrier_basis_survives_missing_carriers(monkeypatch):
+    """Without ``catopt_carriers`` the basis degrades to the scan
+    lifts — the import failure is the honest edge."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "catopt_carriers", None)
+    rules = ar._default_carrier_rules()
+    from catopt_core.laws.scan import SCAN_DIAG_LAWS, SCAN_LAWS
+
+    assert rules == [*SCAN_LAWS, *SCAN_DIAG_LAWS]
+
+
+def test_subsample_at_or_over_size_is_identity():
+    """A cap at or above the corpus size is a no-op — no draw."""
+    cases = [_filler_case(f"c{i}") for i in range(4)]
+    assert ar._subsample(cases, 4, seed=0, salt="w") == cases
+    assert ar._subsample(cases, 8, seed=0, salt="w") == cases
+    # a real cap keeps corpus order and is seed-deterministic
+    sub = ar._subsample(cases, 2, seed=0, salt="w")
+    assert len(sub) == 2
+    assert [c.name for c in cases if c in sub] == [c.name for c in sub]
+    assert sub == ar._subsample(cases, 2, seed=0, salt="w")
+
+
+def test_heuristic_player_falls_back_for_unranked_ops(tmp_path):
+    """An op the preference order omits plays in enumeration order —
+    the ``next(iter(...))`` fallback."""
+    x, y = _v("hx", 4), _v("hy", 4)
+    case = _case(
+        "mix", _p("mul", _p("add", _p("abs", x), y), Const(2)), x, y
+    )
+    arena = _arena(
+        working=[case],
+        pending=[_filler_case("pend")],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    hp = ar.HeuristicPlayer(order=("fold",))
+    state = arena.observe()
+    acts = ar.legal_actions(state)
+    # the ranked op plays first — every fold position it affords
+    folds = 0
+    while (mv := hp(state)) is not None and mv.op == "fold":
+        folds += 1
+    assert folds > 0
+    # unranked ops follow in enumeration order — the fallback pick
+    nxt = mv
+    assert nxt is not None and nxt.op != "fold"
+    assert nxt == next(a for a in acts if a.op != "fold")
+
+
+def test_main_routes_board_flags_and_prints_stage_failures(
+    monkeypatch, capsys
+):
+    """``--max-cases``/``--max-holdout`` feed ``make_arena`` through
+    the probe's arena factory; without ``--json`` the table and the
+    stage-failure totals print."""
+    made: dict = {}
+
+    def fake_make(**kw):
+        made.update(kw)
+        return "SENTINEL"
+
+    rows = [
+        {
+            "episode": 0,
+            "steps": 1,
+            "usable": 0,
+            "holdout_fires": 0,
+            "holdout_paid": 0,
+            "reward": 0.0,
+            "legal_start": 0,
+            "legal_end": 0,
+            "failed": {"declined": 1},
+        }
+    ]
+
+    def fake_probe(*, episodes, budget, seed, arena_factory):
+        assert arena_factory(seed) == "SENTINEL"
+        return {"p": rows}
+
+    monkeypatch.setattr(ar, "make_arena", fake_make)
+    monkeypatch.setattr(ar, "depth_probe", fake_probe)
+    rc = ar.main(
+        [
+            "--episodes",
+            "1",
+            "--budget",
+            "1",
+            "--max-cases",
+            "2",
+            "--max-holdout",
+            "1",
+        ]
+    )
+    assert rc == 0
+    assert made == {
+        "seed": 0,
+        "max_cases": 2,
+        "max_holdout": 1,
+        "meta": {"code_rev": "probe"},
+    }
+    out = capsys.readouterr().out
+    assert "declined" in out  # the stage-failure totals printed
+    assert '"episode"' not in out  # the JSON path was not taken

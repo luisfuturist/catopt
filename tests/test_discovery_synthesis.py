@@ -11,6 +11,7 @@ claim; the gauntlet is the referee — the honest-negatives below are
 constructed objects the gates refuse.
 """
 
+import pytest
 import torch
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.ir import Const, Op, TensorType, Var
@@ -20,6 +21,7 @@ from catopt_core.typing import _shape_of
 from catopt_discovery import evidence as ev
 from catopt_discovery import object_synthesis as synth
 from catopt_discovery import oracle as lvo
+from catopt_discovery import shape_proposal
 from catopt_discovery.impact import TermCase, _cost_fn
 from catopt_discovery.shape_proposal import _sink
 
@@ -1564,3 +1566,654 @@ def test_construct_dispatches_the_ops_by_name(tmp_path):
     else:
         raise AssertionError("unknown op must raise")
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+#  Spec-grammar and specialization internals — the honest declines
+# ---------------------------------------------------------------------------
+
+
+def test_term_from_spec_rejects_a_non_string_head():
+    """A spec whose head is not an op name is malformed data."""
+    with pytest.raises(TypeError, match="spec head"):
+        synth.term_from_spec((42, "X"))
+
+
+def test_term_from_spec_passes_a_plain_leaf_through():
+    """A leaf that is already a term is the identity case — it is
+    re-validated nowhere."""
+    v = _v("w", 4)
+    assert synth.term_from_spec(v) is v
+
+
+def test_specialize_ref_tables_mark_what_a_clause_reads():
+    """The ref tables are the dangling-boundary oracle: ``None`` is
+    the refusal, a set is what the node actually reads."""
+    # _shape_refs — literal / metavar / unknown spec / bad arity
+    assert synth._shape_refs(3) == set()
+    assert synth._shape_refs("A") == {"A"}
+    assert synth._shape_refs(("nosuch-spec", "A")) is None
+    assert synth._shape_refs(("mm-out", "A")) is None
+    # _cond_refs — bool/data leaves, unknown predicates, arity
+    assert synth._cond_refs(True) == set()
+    assert synth._cond_refs("dangling") is None
+    assert synth._cond_refs(()) is None
+    assert synth._cond_refs(
+        ("and", ("leaf", "A"), ("shaped", "B"))
+    ) == {
+        "A",
+        "B",
+    }
+    # a refusal deep inside a junction propagates upward
+    assert (
+        synth._cond_refs(
+            ("or", ("leaf", "A"), ("nosuch",), ("shaped", "C"))
+        )
+        is None
+    )
+    assert synth._cond_refs(("not", ("leaf", "A"))) == {"A"}
+    assert synth._cond_refs(("not",)) is None
+    assert synth._cond_refs(("nosuch-pred", "A")) is None
+    assert synth._cond_refs(("leaf", "A", "B")) is None
+    # attr-eq over non-metavar names reads nothing
+    assert synth._cond_refs(("attr-eq", 5, 0)) == set()
+    # a malformed shape spec inside a T slot refuses
+    assert synth._cond_refs(("rank-eq", ("nosuch-spec",), "B")) is None
+    # _dexpr_refs — the derive-expression mirror of _cond_refs
+    assert synth._dexpr_refs(None) == set()
+    assert synth._dexpr_refs(4) == set()
+    assert synth._dexpr_refs("X") is None
+    assert synth._dexpr_refs(
+        ("tuple", ("shape", "A"), ("attr", "D"))
+    ) == {"A", "$attr:D"}
+    assert synth._dexpr_refs(("concat", ("attr", "D"), "bad")) is None
+    assert synth._dexpr_refs(("nosuch", 1)) is None
+    assert synth._dexpr_refs(("dim", "A")) is None
+
+
+def test_fold_bound_combinator_edges():
+    """``_fold_bound``/``_fold_comb``: refuse to guess (``None``),
+    fold what the binding decides, keep what stays live."""
+    env = {"S": Const(4.0), "$attr:D": 0}
+    bound, dead = {"S", "$attr:D"}, {"S"}
+    fb = synth._fold_bound
+    # passthroughs and malformed data
+    assert fb(True, bound, dead, env) is True
+    assert fb("X", bound, dead, env) is None
+    assert fb(("nosuch-pred", "S"), bound, dead, env) is None
+    # combinators — an undecidable child vetoes the fold
+    assert (
+        fb(("not", ("dim-eq", "S", 0, "T", 0)), bound, dead, env)
+        is None
+    )
+    assert (
+        fb(
+            ("and", ("leaf", "Q"), ("dim-eq", "S", 0, "T", 0)),
+            bound,
+            dead,
+            env,
+        )
+        is None
+    )
+    # every child absorbed: the junction folds to its identity's dual
+    assert (
+        fb(
+            ("and", ("const-num", "S"), ("attr-eq", "D", 0)),
+            bound,
+            dead,
+            env,
+        )
+        is True
+    )
+    assert (
+        fb(
+            ("or", ("const-cmp", "S", ">", 9), ("attr-eq", "D", 7)),
+            bound,
+            dead,
+            env,
+        )
+        is False
+    )
+
+
+def test_a_raising_eval_declines_the_fold_and_drops_the_pred(
+    monkeypatch,
+):
+    """The ``except`` around ``eval_cond`` is the honest
+    refuse-to-guess: a raising eval declines the fold outright and a
+    raising predicate is dropped from the mask bank."""
+
+    def boom(node, _env):
+        if node == ("leaf", "A"):
+            raise TypeError("edge")
+        return True
+
+    monkeypatch.setattr(synth, "eval_cond", boom)
+    assert (
+        synth._fold_bound(("leaf", "A"), {"A"}, {"A"}, {"A": Const(1)})
+        is None
+    )
+    masks = synth._pred_masks(
+        [("leaf", "A"), ("leaf", "B")], [{"X": 1}]
+    )
+    assert masks == [(("leaf", "B"), 0b1)]
+
+
+def test_specialize_pin_clause_spellings_and_declines():
+    """``None``/bool pins ride ``attr-is``, other values ``attr-eq``;
+    lists normalize to tuples; a non-str key or a leaf reintroduced
+    as an attr metavar declines."""
+    r = Rewrite(
+        "t_sel",
+        lhs=_p("select", "u", dim="D", index="I"),
+        rhs="u",
+        cond=("dim-eq-const", "u", 0, 1),
+    )
+    obj = synth.specialize(r, {"D": None})
+    assert obj.rule.cond == (
+        "and",
+        ("dim-eq-const", "u", 0, 1),
+        ("attr-is", "D", None),
+    )
+    obj = synth.specialize(r, {"$attr:I": True})
+    assert obj.rule.cond == (
+        "and",
+        ("dim-eq-const", "u", 0, 1),
+        ("attr-is", "I", True),
+    )
+    obj = synth.specialize(r, {"D": [0, 1]})
+    assert obj.rule.cond == (
+        "and",
+        ("dim-eq-const", "u", 0, 1),
+        ("attr-eq", "D", (0, 1)),
+    )
+    assert synth.specialize(r, {4: 0}) is None
+    # leaf name "D" is a leaf metavar — a spec that reintroduces "D"
+    # as an attr metavar is a collision, not a binding
+    amb = Rewrite("t_amb", lhs=_p("add", "D", "X"), rhs="X")
+    assert (
+        synth.specialize(amb, {"D": ("reshape", "Q", {"shape": "D"})})
+        is None
+    )
+
+
+def test_specialize_dspec_folds_vetoes_and_declines():
+    """The derive spec folds the same honest way — literals where the
+    binding decides, verbatim where live, decline on the dangling."""
+    base = _p("add", "A", "B")
+    r = Rewrite(
+        "t_d", base, _p("add", "B", "A"), dspec={"Z": ("dim", "B", 0)}
+    )
+    obj = synth.specialize(r, {"A": 4})
+    assert obj.rule.dspec == (("Z", ("dim", "B", 0)),)
+    r = Rewrite(
+        "t_d2", base, _p("add", "B", "A"), dspec={"Z": ("const", "A")}
+    )
+    obj = synth.specialize(r, {"A": 4})
+    assert obj.rule.dspec == (("Z", ("lit", 4)),)
+    # the binding decides the expr but it cannot evaluate → veto
+    r = Rewrite("t_d3", base, "A", dspec={"Z": ("dim", "A", 0)})
+    assert synth.specialize(r, {"A": 4}) is None
+    # a dead leaf mixed with a live one is unexpressible → decline
+    r = Rewrite(
+        "t_d4",
+        base,
+        "A",
+        dspec={"Z": ("add", ("dim", "A", 0), ("dim", "B", 0))},
+    )
+    assert synth.specialize(r, {"A": 4}) is None
+    # malformed expr data → decline, not a guess
+    r = Rewrite("t_d5", base, "A", dspec={"Z": "A"})
+    assert synth.specialize(r, {"A": 4}) is None
+
+
+# ---------------------------------------------------------------------------
+#  The auto-cond predicate bank — the cond-DSL vocabulary over a pattern
+# ---------------------------------------------------------------------------
+
+
+def test_view_out_spec_table():
+    """Every spec fn names its output shape through the attr metavars
+    it needs — a missing metavar or a foreign op declines (``None``)."""
+    cases = [
+        ("unsqueeze", {"dim": "D"}, ("unsq-out", "U", "D")),
+        ("unsqueeze", {"dim": 0}, None),
+        ("reshape", {"shape": "S"}, ("reshape-out", "U", "S")),
+        ("view", {"shape": "S"}, ("reshape-out", "U", "S")),
+        ("reshape", {"shape": (1, 2)}, None),
+        ("getitem", {"index": "I"}, ("getitem-out", "U")),
+        ("getitem", {}, ("getitem-out", "U")),
+        ("select", {"dim": "D"}, ("select-out", "U", "D")),
+        ("select", {"dim": 0}, None),
+        (
+            "slice",
+            {"dim": "D", "start": "S", "end": "E"},
+            ("slice-out", "U", "D", "S", "E", None),
+        ),
+        ("slice", {"dim": 0}, None),
+        (
+            "chunk",
+            {"chunks": "C", "dim": "D"},
+            ("chunk-out", "U", "C", "D"),
+        ),
+        ("chunk", {"chunks": 2}, None),
+        (
+            "transpose",
+            {"dim0": "A", "dim1": "B"},
+            ("transpose-out", "U", "A", "B"),
+        ),
+        ("transpose", {"dim0": -1}, None),
+        ("t", {"dim0": "A"}, ("transpose-out", "U", "A", None)),
+        ("softmax", {"dim": "D"}, None),
+    ]
+    for op, attrs, want in cases:
+        assert synth._view_out_spec(op, "U", attrs) == want, (op, attrs)
+
+
+def _bank_probe_lhs() -> Op:
+    """A probe pattern exercising every view-spec slot of the bank."""
+    return _p(
+        "add",
+        _p("mul", _p("getitem", "T", index="I"), "U"),
+        _p(
+            "add",
+            _p(
+                "mul",
+                _p("unsqueeze", "W", dim="UD"),
+                _p("transpose", "V", dim0="T2", dim1="T3"),
+            ),
+            _p(
+                "mul",
+                _p(
+                    "mul",
+                    _p("select", "A", dim="PD", index="PI"),
+                    _p("select", "B", dim="PD", index="PI"),
+                ),
+                _p(
+                    "add",
+                    _p(
+                        "transpose",
+                        _p("reshape", "R", shape="RS"),
+                        dim0="T0",
+                        dim1="T1",
+                    ),
+                    _p(
+                        "mul",
+                        _p(
+                            "slice",
+                            "E",
+                            dim="LD",
+                            start="LS",
+                            end="LE",
+                        ),
+                        _p("chunk", "C", chunks="CN", dim="CD"),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _bank_probe_rhs() -> Op:
+    """Pattern-side nodes that drive the bank's skip branches."""
+    return _p(
+        "add",
+        # dim0 concrete: the node has *some* attr metavar but the spec
+        # and the transpose pred's required names are missing
+        _p("transpose", "K", dim0=-1, dim1="D1"),
+        _p(
+            "mul",
+            _p(
+                "mul",
+                # a str attr on a non-view op — no output spec exists
+                _p("softmax", _p("mul", "G", "H"), dim="MD"),
+                # a concrete ``chunks``: a view node whose spec declines
+                Op.make("chunk", "C2", chunks=2, dim="CD2"),
+            ),
+            _p(
+                "mul",
+                # a second getitem with identical attrs: a view pair
+                # whose op carries no index-attr alignment
+                _p("getitem", "T2", index="I"),
+                _p(
+                    "mul",
+                    # slice with a concrete start / a concrete end —
+                    # the per-attr emission edges
+                    _p("slice", "E2", dim="LD2", start=0, end="LE2"),
+                    _p(
+                        "slice",
+                        "E3",
+                        dim="LD3",
+                        start="LS3",
+                        end=0,
+                    ),
+                ),
+            ),
+        ),
+        # a view chain whose inner operand's operand is not a metavar
+        _p(
+            "add",
+            _p("unsqueeze", _p("mul", Const(2), "M"), dim="WD"),
+            "N",
+        ),
+    )
+
+
+def test_pred_bank_enumerates_the_view_vocabulary():
+    """The bank is data over the pattern's vocabulary — per-metavar
+    atoms, pair atoms, view-output spec atoms, observed attr values,
+    op bindings, and the commute/wrap/view-view forms."""
+    lhs, rhs = _bank_probe_lhs(), _bank_probe_rhs()
+    envs = [
+        # T observed bound to an op (op-in); PD observed as a list
+        # (normalized to a tuple)
+        (
+            {
+                "T": _p("topk", _v("w", 2, 4), k=2),
+                "$attr:I": 0,
+                "$attr:PD": [-1, -2],
+            },
+            "equal",
+        ),
+        # None/bool observations do not mint ``attr-eq`` pins
+        (
+            {
+                "T": _v("t", 4),
+                "$attr:I": 1,
+                "$attr:UD": None,
+                "$attr:T2": True,
+            },
+            "unequal",
+        ),
+    ]
+    bank = synth._pred_bank(lhs, rhs, envs)
+    # per-metavar atoms
+    assert ("leaf", "T") in bank
+    assert ("not", ("leaf", "T")) in bank
+    assert ("rank", "U", ">=", 2) in bank
+    assert ("const-cmp", "U", "!=", 0) in bank
+    # metavar-pair atoms
+    assert ("shape-eq", "T", "U") in bank
+    assert ("shape-compat", "T", "U") in bank
+    assert ("bcast-into", "T", "U") in bank
+    assert ("dim-eq", "T", 0, "U", -1) in bank
+    assert ("dim-compat", "T", 1, "U", -1) in bank
+    # view-output spec preds — ``unsq-out`` names unsqueeze's shape
+    assert ("shape-eq", ("unsq-out", "W", "UD"), "T") in bank
+    assert ("bcast-into", "T", ("unsq-out", "W", "UD")) in bank
+    assert ("bcast-eq", ("unsq-out", "W", "UD"), "T", "W", "T") in bank
+    # attr-metavar atoms: the type bank, pair pins, dim/attr crosses
+    assert ("attr-type", "UD", "int") in bank
+    assert ("attr-eq-attr", "I", "UD") in bank
+    assert ("dim-eq-attr", "A", "PD", "B", "PD") in bank
+    assert ("attr-cmp-dim", "I", "!=", "T", "UD") in bank
+    assert ("attr-cmp-dim", "UD", ">=", "W", "T2") in bank
+    # observed values — the list normalizes to a tuple; bool/None
+    # observations mint no ``attr-eq`` pin
+    assert ("attr-eq", "I", 0) in bank
+    assert ("attr-eq", "PD", (-1, -2)) in bank
+    assert ("attr-eq", "UD", None) not in bank
+    assert ("attr-eq", "T2", True) not in bank
+    # op bindings observed under a metavariable
+    assert ("op-in", "T", ("topk",)) in bank
+    assert ("not", ("op-in", "T", ("topk",))) in bank
+    assert ("op-in", "U", ("topk",)) not in bank
+    # per-view node preds
+    assert ("attr-in", "I", (0, -1)) in bank  # getitem
+    assert ("dim-eq-const", "T", 0, 1) in bank
+    assert ("ones-before", "W", "UD") in bank  # unsqueeze
+    assert (
+        "flat-pair-unsq",
+        "W",
+        "UD",
+        "A",
+        ("reshape-out", "R", "RS"),
+    ) in bank
+    assert (
+        "flat-map-unsq",
+        "W",
+        "UD",
+        "A",
+        ("reshape-out", "R", "RS"),
+    ) in bank
+    assert ("axes-last2", "V", "T2", "T3") in bank  # transpose
+    assert ("attr-is", "LS", None) in bank  # slice
+    assert ("attr-eq", "LS", 0) in bank
+    assert ("attr-is", "LE", None) in bank
+    assert ("attr-cmp-dim", "LE", ">=", "E", "LD") in bank
+    # the commute/wrap vocabulary
+    assert ("bcast-dim-inv", "U", "A", "PD") in bank
+    assert ("axis-align-eq", "A", "B", "PD") in bank
+    assert (
+        "or",
+        ("axes-noop", "U", "T2", "T3"),
+        ("rank", "U", "<=", 1),
+    ) in bank
+    assert (
+        "bcast-eq",
+        ("getitem-out", "T"),
+        "U",
+        ("getitem-out", ("bcast", "T", "U")),
+        ("getitem-out", ("bcast", "T", "U")),
+    ) in bank
+    # same-op same-attrs view pair — the aligned-index case
+    assert (
+        "bcast-eq",
+        ("select-out", "A", "PD"),
+        ("select-out", "B", "PD"),
+        ("select-out", ("bcast", "A", "B"), "PD"),
+        ("select-out", ("bcast", "A", "B"), "PD"),
+    ) in bank
+    # view-view commutation: the g1(g2(x)) spec vs g2(g1(x))
+    assert (
+        "shape-eq",
+        ("transpose-out", ("reshape-out", "R", "RS"), "T0", "T1"),
+        ("reshape-out", ("transpose-out", "R", "T0", "T1"), "RS"),
+    ) in bank
+    # predicate spellings dedupe
+    assert len(bank) == len(set(bank))
+
+
+# ---------------------------------------------------------------------------
+#  The auto-cond domain machinery — measurement, enumeration, cover
+# ---------------------------------------------------------------------------
+
+
+def test_oracle_sites_derive_and_instantiate_edges(monkeypatch):
+    """``_oracle_sites``: derive extras merge; vetoes, raises and
+    uninstantiable envs skip; signatures dedupe; ``limit`` caps."""
+    lhs = _p("add", "A", "B")
+    rhs = _p("add", "B", "A")
+    va, vb, vb2 = _v("a", 2), _v("b", 2), _v("b2", 2)
+    envs = [
+        {"A": va, "B": vb},  # instantiates
+        {"A": va},  # missing B — the instantiation raises
+        {"A": va, "B": vb2},  # instantiates to a distinct site
+        {"A": va, "B": vb},  # a replay — deduped by signature
+    ]
+    monkeypatch.setattr(lvo, "_binding_envs", lambda _l, _r: iter(envs))
+    got = list(synth._oracle_sites(lhs, rhs, None, 10))
+    assert len(got) == 2
+    assert got[0][0]["B"] is vb and got[1][0]["B"] is vb2
+    # the limit caps the enumeration window
+    assert len(list(synth._oracle_sites(lhs, rhs, None, 1))) == 1
+
+    def derive(bound):
+        if bound.get("B") is vb2:
+            return None  # a veto — the site declines
+        if bound.get("B") is None:
+            raise ValueError("boom")  # a raising derive — skipped
+        return {"$attr:Z": 0}
+
+    got = list(synth._oracle_sites(lhs, rhs, derive, 10))
+    assert len(got) == 1 and got[0][0]["B"] is vb
+
+
+def test_measure_domain_records_real_matches_over_an_enum_failure(
+    monkeypatch,
+):
+    """``_measure_domain``'s honest boundary: a raising enumerator
+    still reports whatever was collected plus the real matches."""
+    torch.manual_seed(0)
+    rule = Rewrite(
+        "gi",
+        lhs=_p("getitem", "T", index="I"),
+        rhs=_p("getitem", "T", index=0),
+    )
+    t = _v("t", 4)
+    site = _p("getitem", t, index=0)
+
+    def _boom(*_a, **_k):
+        raise TypeError("enumerator edge")
+
+    monkeypatch.setattr(ev, "_synth_sites", _boom)
+    out = synth._measure_domain(rule, [site], 60)
+    assert out == [({"T": t, "$attr:I": 0}, "equal")]
+
+
+def test_measure_domain_skips_a_real_match_that_does_not_rebind(
+    monkeypatch,
+):
+    """A schema match that fails the re-binding contributes nothing —
+    the second ``_term_match`` is the honest gate."""
+    torch.manual_seed(0)
+    rule = Rewrite(
+        "r", lhs=_p("add", "X", "Y"), rhs=_p("add", "Y", "X")
+    )
+    x, y = _v("x", 2), _v("y", 2)
+    term = _p("add", x, y)
+    phantom = _v("phantom", 2)
+    monkeypatch.setattr(
+        shape_proposal,
+        "real_matches",
+        lambda _terms, _schema: [phantom],
+    )
+    out = synth._measure_domain(rule, [term], 8)
+    assert out and all(o == "equal" for _e, o in out)
+    assert all(e.get("X") is not phantom for e, _o in out)
+
+
+def test_outcome_bitsets_partitions_every_outcome_class():
+    """``(equal, bad, other, declined)`` — declined sites sit outside
+    the firing region and play no role in the cover."""
+    eq, bad, other, declined = synth._outcome_bitsets(
+        [
+            ({}, "equal"),
+            ({}, "unequal"),
+            ({}, "rhs-err"),
+            ({}, "unstable"),
+            ({}, "lhs-err"),
+            ({}, "declined"),
+            ({}, "guard-err"),
+            ({}, "env-err"),
+        ]
+    )
+    assert eq == 0b00000001
+    assert bad == 0b00001110
+    assert other == 0b10010000
+    assert declined == 0b01100000
+
+
+def test_min_cover_search_order_and_spent_budget(monkeypatch):
+    """Iterative deepening by clause count; a bad site with no killer
+    refuses before the search; a spent visit budget returns nothing
+    deeper."""
+    eq, bad = 0b000111, 0b111000
+    useful = [
+        (("a",), eq | 0b110000, 0b001000),
+        (("b",), eq | 0b001000, 0b110000),
+        (("c",), eq, bad),
+    ]
+    assert synth._min_cover(useful, eq, bad, 6, 3) == (("c",),)
+    # bad sites 4/5 have no killer → honest refusal before searching
+    assert synth._min_cover(useful[:1], eq, bad, 6, 3) is None
+    # competing covers at a level are compared — a worse completion
+    # does not replace the recorded best
+    useful2 = [
+        (("a",), eq, 0b001000),  # kills 3
+        (("b",), eq, 0b010000),  # kills 4
+        (("c",), eq, 0b100000),  # kills 5
+        (("d",), eq, 0b001000),  # kills 3 too
+    ]
+    got = synth._min_cover(useful2, eq, bad, 6, 3)
+    assert got is not None and sorted(p[0] for p in got) == [
+        "a",
+        "b",
+        "c",
+    ]
+    # a spent visit budget: the deeper levels short-circuit
+    monkeypatch.setattr(synth, "_AUTO_VISIT_CAP", 4)
+    assert synth._min_cover(useful[:2], eq, bad, 6, 3) is None
+
+
+def test_stable_outcome_short_circuits_on_declined_sites():
+    """A site whose probe declines (a derive veto) reports the veto
+    outcome directly — no second draw."""
+    rule = Rewrite(
+        "veto",
+        lhs=_p("add", "X", "Y"),
+        rhs=_p("mul", "X", "Y"),
+        derive=lambda _b: None,
+    )
+    env = {"X": _v("x", 2), "Y": _v("y", 2)}
+    assert synth._stable_outcome(rule, env, None) == "declined"
+
+
+def test_auto_cond_mints_a_one_clause_guard():
+    """``add(getitem(T,I),U) → add(getitem(T,0),U)`` holds iff I is 0 —
+    the smallest cover is the one-atom pin."""
+    torch.manual_seed(0)
+    rule = Rewrite(
+        "gi_first",
+        lhs=_p("add", _p("getitem", "T", index="I"), "U"),
+        rhs=_p("add", _p("getitem", "T", index=0), "U"),
+    )
+    res = synth.auto_cond_object(rule, synth_limit=360)
+    assert res.object is not None
+    assert res.cond == ("attr-eq", "I", 0)
+    assert res.clauses == (("attr-eq", "I", 0),)
+    assert res.equal > 0 and res.bad > 0 and res.other > 0
+    assert (
+        res.accepted_other > 0
+    )  # don't-care sites counted, not folded
+    # pure data — the minted cond is the whole claim
+    assert serialize.missing_hooks(res.object.rule) == ()
+    # the guard is the real gate: it accepts exactly the I=0 slice
+    assert eval_cond(res.cond, {"$attr:I": 0}) is True
+    assert eval_cond(res.cond, {"$attr:I": 1}) is False
+
+
+def test_auto_cond_mints_a_two_clause_guard_and_refuses_below():
+    """The unsqueeze strip needs a conjunction — the deepened search
+    finds it; capped below the cover it refuses honestly."""
+    torch.manual_seed(0)
+    rule = Rewrite(
+        "add_unsq",
+        lhs=_p("add", _p("unsqueeze", "U", dim="A_dim"), "V"),
+        rhs=_p("add", "U", "V"),
+    )
+    res = synth.auto_cond_object(rule, synth_limit=360)
+    assert res.object is not None
+    assert len(res.clauses) == 2
+    assert res.cond == ("and", *res.clauses)
+    # capped under the minimal cover → no declarable conjunction
+    res2 = synth.auto_cond_object(rule, synth_limit=360, max_clauses=1)
+    assert res2.object is None
+    assert "no declarable conjunction" in res2.detail
+
+
+def test_auto_cond_refuses_a_domain_that_never_evaluates():
+    """A derive that vetoes every site: measured but never evaluable —
+    the refusal names it."""
+    torch.manual_seed(0)
+    rule = Rewrite(
+        "always_veto",
+        lhs=_p("add", "X", "Y"),
+        rhs=_p("mul", "X", "Y"),
+        derive=lambda _b: None,
+    )
+    res = synth.auto_cond_object(rule, synth_limit=60)
+    assert res.object is None
+    assert res.measured > 0
+    assert res.declined == res.measured
+    assert "no evaluable site" in res.detail
