@@ -166,3 +166,14 @@ capability-admitted, site-absent on this holdout.
 - Gates: `pytest tests/test_construction_gaps.py` 14 passed (~0.6 s);
   `ruff check`/`ruff format --check` clean on the new files; radon
   ratchet unaffected (test file, no source edits).  Not committed.
+
+## Coverage notes (unreachable-defensive arcs, verified)
+
+- `object_synthesis.py:1481` / `:1507` — the `suv/suw is None`
+  skips in `_wrap_preds`/`_pair_preds`: `views` entries are
+  pre-filtered to spec-non-None nodes, so the recomputed spec can
+  never be None there.
+- `object_synthesis.py:2080->2079` — `_min_cover`'s
+  `i not in chosen` skip: kill masks of already-chosen predicates
+  are removed from `uncovered`, so they can never kill a
+  still-uncovered site.
