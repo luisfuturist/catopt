@@ -64,7 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -101,6 +101,7 @@ __all__ = [
     "load_records",
     "main",
     "probe_cases",
+    "real_workloads",
     "write_intake",
 ]
 
@@ -2304,11 +2305,90 @@ class _ScalarInverseSum(nn.Module):
 
 @dataclass(frozen=True)
 class Workload:
-    """One intake candidate: a name and a ``(model, input)`` thunk."""
+    """One intake candidate: a name and a ``(model, input)`` thunk.
+
+    ``kind`` is the registry class (``"torch-native"`` / ``"compound"``);
+    ``purpose_built`` is the provenance flag — true for a micro-module
+    written to spell one specific pattern (a guard region) rather than
+    to represent a real network.  :data:`_PURPOSE_BUILT` is the ledger;
+    :func:`real_workloads` is the honest filter over it.
+    """
 
     name: str
     build: Callable[[], tuple[nn.Module, Any]]
     kind: str = "torch-native"
+    purpose_built: bool = False
+
+
+#: The corpus-circularity ledger — the workload names written to spell
+#: one specific *pattern* (an auto-cond guard's region), not to stand
+#: for a real program.  Round 3's view-identity elementwise spellings
+#: exist to fill the guards' empty regions ("Round 3 supplies the
+#: no-op spellings directly"); every round-4 workload spells one
+#: wrap / mirror / shared-factor / grammar / scalar-corner pattern.
+#: Everything else — the torch-native ``nn.*`` modules and the
+#: realistic compound assemblies — is what an honest "real-only"
+#: measurement keeps.  This table is data, not code: :func:`candidates`
+#: reads it to set ``Workload.purpose_built``, and :func:`real_workloads`
+#: filters on the flag.
+_PURPOSE_BUILT: frozenset[str] = frozenset(
+    {
+        # --- round 3 — view-identity elementwise spellings ----------
+        "BroadcastPadLeft",
+        "BroadcastPadRight",
+        "BroadcastPadSub",
+        "FullSliceScale",
+        "NoopTransposeScale",
+        "NoopTransposeAdd",
+        "InertReshapeScale",
+        "SingleChunkScale",
+        "SquaredDistance",
+        # --- round 4 — unsqueeze-wrap (gated broadcast) -------------
+        "ChannelGateBroadcast",
+        "LiftedScalarScale",
+        "HeadGateBroadcast",
+        "LiftedScalarScaleRight",
+        "LiftedScalarCenter",
+        "ContrastiveCenter",
+        "PairwiseSubLift",
+        # --- round 4 — chunked-projection mirrors -------------------
+        "ScaledChunkProjection",
+        "SingleChunkGate",
+        "ChunkHalfScale",
+        # --- round 4 — transposed-add mirrors -----------------------
+        "NoopTransposeResidual",
+        "ScalarTransposeBias",
+        "Rank3TransposeAdd",
+        # --- round 4 — select naturality ----------------------------
+        "SelectGateSum",
+        "SelectGateDiff",
+        # --- round 4 — shared-factor algebra ------------------------
+        "SharedFactorMixture",
+        "SharedFactorContrast",
+        "SharedFactorMixtureRight",
+        "SharedFactorContrastRight",
+        "QuadraticFeature",
+        # --- round 4 — reshape / neg / exp / square grammar ---------
+        "DoubleReshapeHead",
+        "NegatedSum",
+        "NegDistributeHead",
+        "SubNegBias",
+        "NegatedScale",
+        "ExpProductHead",
+        "ExpSumHead",
+        "SquareNegHead",
+        "SquareMulHead",
+        "SigmoidNegGate",
+        "PowOneHead",
+        "SubAddFactorHead",
+        "DivAddHead",
+        # --- round 4 — scalar-corner annihilators -------------------
+        "ScalarAnnihilator",
+        "ScalarSelfCancel",
+        "ScalarSelfRatio",
+        "ScalarInverseSum",
+    }
+)
 
 
 def _r(*shape: int) -> torch.Tensor:
@@ -2335,7 +2415,7 @@ def candidates() -> list[Workload]:
     seeded weights the report records.
     """
     d = 16
-    return [
+    reg = [
         # --- torch-native: attention / transformer family -----------
         Workload(
             "nn.MultiheadAttention",
@@ -3687,6 +3767,30 @@ def candidates() -> list[Workload]:
             kind="compound",
         ),
     ]
+    # Provenance is data: the ledger above marks the micro-modules
+    # written to spell a pattern, so the honest "real-only" filter is
+    # one predicate over the registry.
+    return [
+        replace(w, purpose_built=True)
+        if w.name in _PURPOSE_BUILT
+        else w
+        for w in reg
+    ]
+
+
+def real_workloads(
+    cands: list[Workload] | None = None,
+) -> list[Workload]:
+    """Return the registry minus the purpose-built spelling workloads.
+
+    The honest subset for a full-vs-real corpus comparison: workloads
+    that represent a real network — a torch-native ``nn.*`` module or
+    a realistic compound assembly — not a micro-module written to
+    spell one pattern.  ``purpose_built`` is the ledger
+    (:data:`_PURPOSE_BUILT`); the filter excludes exactly those names.
+    """
+    src = candidates() if cands is None else cands
+    return [w for w in src if not w.purpose_built]
 
 
 # ---------------------------------------------------------------------------
@@ -4180,6 +4284,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--holdout", help="pipeline holdout rules")
     parser.add_argument("--skip-pipeline", action="store_true")
+    parser.add_argument(
+        "--real-only",
+        action="store_true",
+        help="ingest only real workloads (drop the purpose-built spellings)",
+    )
     parser.add_argument("--json", help="write machine-readable results")
     args = parser.parse_args(argv)
 
@@ -4188,7 +4297,14 @@ def main(argv: list[str] | None = None) -> int:
         "== law_intake — real workloads into the census =="
     )
     sink = TorchSink()
-    cases, records, rejections = ingest(sink=sink)
+    cands = real_workloads() if args.real_only else None
+    if cands is not None:
+        print(  # stdout-compat
+            f"   --real-only: {len(cands)} real workloads "
+            f"(of {len(candidates())}; "
+            f"{len(_PURPOSE_BUILT)} purpose-built dropped)"
+        )
+    cases, records, rejections = ingest(cands=cands, sink=sink)
     n_in = sum(1 for r in records if r["status"] == "ingested")
     n_co = sum(1 for r in records if r["status"] == "census-only")
     n_vf = sum(1 for r in records if r["status"] == "verify-failed")

@@ -119,6 +119,158 @@ def test_candidates_build_and_run_eager():
 
 
 # ---------------------------------------------------------------------------
+#  Provenance — the purpose-built / real split
+# ---------------------------------------------------------------------------
+
+
+#: Round 3's view-identity elementwise spellings — micro-modules
+#: written to fill the auto-cond guards' empty regions.
+_R3_PURPOSE_BUILT = {
+    "BroadcastPadLeft",
+    "BroadcastPadRight",
+    "BroadcastPadSub",
+    "FullSliceScale",
+    "NoopTransposeScale",
+    "NoopTransposeAdd",
+    "InertReshapeScale",
+    "SingleChunkScale",
+    "SquaredDistance",
+}
+
+#: Round 4's 37 wrap / mirror / algebra / grammar / scalar spellings.
+_R4_PURPOSE_BUILT = {
+    "ChannelGateBroadcast",
+    "LiftedScalarScale",
+    "HeadGateBroadcast",
+    "LiftedScalarScaleRight",
+    "LiftedScalarCenter",
+    "ContrastiveCenter",
+    "PairwiseSubLift",
+    "ScaledChunkProjection",
+    "SingleChunkGate",
+    "ChunkHalfScale",
+    "NoopTransposeResidual",
+    "ScalarTransposeBias",
+    "Rank3TransposeAdd",
+    "SelectGateSum",
+    "SelectGateDiff",
+    "SharedFactorMixture",
+    "SharedFactorContrast",
+    "SharedFactorMixtureRight",
+    "SharedFactorContrastRight",
+    "QuadraticFeature",
+    "DoubleReshapeHead",
+    "NegatedSum",
+    "NegDistributeHead",
+    "SubNegBias",
+    "NegatedScale",
+    "ExpProductHead",
+    "ExpSumHead",
+    "SquareNegHead",
+    "SquareMulHead",
+    "SigmoidNegGate",
+    "PowOneHead",
+    "SubAddFactorHead",
+    "DivAddHead",
+    "ScalarAnnihilator",
+    "ScalarSelfCancel",
+    "ScalarSelfRatio",
+    "ScalarInverseSum",
+}
+
+
+def test_purpose_built_ledger_is_complete_and_disjoint():
+    """Every ledger name exists in the registry and is tagged.
+
+    The ledger (``_PURPOSE_BUILT``) is the corpus-circularity record:
+    the micro-modules written to spell one pattern.  Every name in it
+    must be a real registry workload carrying ``purpose_built=True``,
+    and no other workload may be tagged — the flag is derived from the
+    table, not written by hand, so the two cannot drift.
+    """
+    cands = li.candidates()
+    by_name = {w.name: w for w in cands}
+    assert set(by_name) >= li._PURPOSE_BUILT, li._PURPOSE_BUILT - set(
+        by_name
+    )
+    tagged = {w.name for w in cands if w.purpose_built}
+    assert tagged == set(li._PURPOSE_BUILT)
+    # Every purpose-built workload is a compound micro-module.
+    assert {by_name[n].kind for n in li._PURPOSE_BUILT} == {"compound"}
+
+
+def test_real_workloads_excludes_exactly_the_purpose_built():
+    """The real-only filter is the ledger's complement, and only that."""
+    cands = li.candidates()
+    real = li.real_workloads(cands)
+    assert {w.name for w in real} == {
+        w.name for w in cands if w.name not in li._PURPOSE_BUILT
+    }
+    assert not any(w.purpose_built for w in real)
+    assert len(real) == len(cands) - len(li._PURPOSE_BUILT)
+    # It reads the registry when given no list, and the split is
+    # orthogonal to ``kind`` — real keeps both classes.
+    assert {w.name for w in li.real_workloads()} == {
+        w.name for w in real
+    }
+    assert {w.kind for w in real} == {"torch-native", "compound"}
+
+
+def test_purpose_built_covers_rounds_three_and_four():
+    """The ledger is exactly round-3 view-identity + round-4 spellings."""
+    assert len(_R4_PURPOSE_BUILT) == 37
+    assert (
+        frozenset(_R3_PURPOSE_BUILT | _R4_PURPOSE_BUILT)
+        == li._PURPOSE_BUILT
+    )
+    # A real workload is never in the ledger.
+    for name in (
+        "nn.LayerNorm",
+        "nn.TransformerEncoderLayer",
+        "SwiGLU",
+    ):
+        assert name not in li._PURPOSE_BUILT
+
+
+def test_main_real_only_flag_filters_the_registry(monkeypatch, capsys):
+    """``--real-only`` passes the real subset to ``ingest``."""
+    captured = {}
+
+    def fake_ingest(cands=None, sink=None):
+        captured["cands"] = cands
+        return [], [], []
+
+    monkeypatch.setattr(li, "ingest", fake_ingest)
+    monkeypatch.setattr(li, "_bench_cases", lambda: ([], []))
+    monkeypatch.setattr(li, "model_cases", lambda: ([], []))
+    rc = li.main(["--no-write", "--skip-pipeline", "--real-only"])
+    assert rc == 0
+    got = captured["cands"]
+    assert got is not None
+    assert {w.name for w in got} == {
+        w.name for w in li.real_workloads()
+    }
+    out = capsys.readouterr().out
+    assert "--real-only" in out and "purpose-built dropped" in out
+
+
+def test_main_default_ingests_the_full_registry(monkeypatch):
+    """Without ``--real-only`` the full registry is ingested."""
+    captured = {}
+
+    def fake_ingest(cands=None, sink=None):
+        captured["cands"] = cands
+        return [], [], []
+
+    monkeypatch.setattr(li, "ingest", fake_ingest)
+    monkeypatch.setattr(li, "_bench_cases", lambda: ([], []))
+    monkeypatch.setattr(li, "model_cases", lambda: ([], []))
+    rc = li.main(["--no-write", "--skip-pipeline"])
+    assert rc == 0
+    assert captured["cands"] is None
+
+
+# ---------------------------------------------------------------------------
 #  _ingest_one / ingest — export, classify, verify
 # ---------------------------------------------------------------------------
 
