@@ -435,6 +435,19 @@ def test_slice_out_spec():
     assert eval_cond(
         ("shape-eq", ("slice-out", "u", "D", "S", "E", "ST"), "s"), stepped
     )
+    # a non-positive step cannot rewrite the extent — the axis keeps
+    # its bound dim (the mirror-decline arm, not an error)
+    nostep = {
+        "u": _v("u", 4, 6),
+        "$attr:D": -1,
+        "$attr:S": 0,
+        "$attr:E": 2,
+        "$attr:ST": 0,
+        "s": _v("s", 4, 6),
+    }
+    assert eval_cond(
+        ("shape-eq", ("slice-out", "u", "D", "S", "E", "ST"), "s"), nostep
+    )
     # unbound axis / rank-0 / bad arity decline
     assert not eval_cond(
         ("shaped", ("slice-out", "u", "D", None, None, None)),
@@ -468,6 +481,17 @@ def test_chunk_out_spec():
     assert not eval_cond(
         ("shaped", ("chunk-out", "u", "C")),
         {"u": _v("u", 4, 6), "$attr:C": 2, "$attr:D": -1},
+    )
+    # a symbolic (non-int) dim leaves it unchanged — the spec only
+    # rewrites a concrete int extent
+    sym = {
+        "u": Var("u", TensorType((4, None))),
+        "$attr:C": 2,
+        "$attr:D": -1,
+        "s": Var("s", TensorType((4, None))),
+    }
+    assert eval_cond(
+        ("shape-eq", ("chunk-out", "u", "C", "D"), "s"), sym
     )
 
 
