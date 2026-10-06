@@ -1168,3 +1168,15 @@ SYNTHETIC_CASES: tuple = (
         ("x",),
     ),
 )
+
+
+#: The ``specialize`` move's value bank — the scalar constants a leaf
+#: metavariable may be pinned to (identity and sign/direction probes;
+#: deliberately small — a player that wants a richer pin writes a
+#: richer bank, the bank is data not code).
+SPECIALIZE_SCALARS: tuple[float, ...] = (0, 1, -1, 0.5, 2)
+
+#: The ``specialize`` move's axis bank — the attr-metavariable pins
+#: worth trying (the last/two-last axes are where view patterns
+#: live; 0 keeps the first axis reachable).
+SPECIALIZE_AXES: tuple[int, ...] = (-2, -1, 0, 1)

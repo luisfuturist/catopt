@@ -153,6 +153,8 @@ def test_state_is_read_only_data(tmp_path):
         "fold",
         "ingest",
         "lift",
+        "relax_guard",
+        "specialize",
     }
     # the store's object set and the library premises are visible
     state2, _rep = arena.step(_aff_lift())
@@ -304,7 +306,7 @@ def test_unknown_action_kind_is_an_error(tmp_path):
     """The registry is the action space — an unregistered op fails."""
     arena = _arena()
     with pytest.raises(KeyError, match="unregistered"):
-        arena.step(ar.Action("relax_guard", {}))
+        arena.step(ar.Action("nonsense_op", {}))
 
 
 def test_the_registry_is_the_plug_in_seam(tmp_path):
@@ -478,21 +480,218 @@ def test_fixed_rule_guards_conditionals(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-#  The random baseline
+#  The legal-move enumeration
+# ---------------------------------------------------------------------------
+
+
+def _spec_occurs(hay: tuple, needle: tuple) -> bool:
+    """Whether *needle* spec matches a subterm of *hay* spec."""
+    from catopt_core.meta import match_pattern
+
+    pat = obs.term_from_spec(needle)
+    return any(
+        match_pattern(pat, obs.term_from_spec(s), {}) is not None
+        for s in ar._sub_specs(hay)
+    )
+
+
+def test_legal_actions_are_grounded_and_constructible(tmp_path):
+    """Every enumerated move cites material the state attests."""
+    arena = _arena(
+        working=[_aff_step_case("w", 4), _silu_swap_case("s", 4)],
+        holdout=[_aff_step_case("holdout", 6)],
+        pending=[_filler_case("pend"), _filler_case("pend2")],
+        base_rules=tuple(),  # isolate: no library premises
+    )
+    state = arena.observe()
+    acts = ar.legal_actions(state)
+    assert acts
+    keys = [ar._action_key(a) for a in acts]
+    assert len(keys) == len(set(keys))  # deduped
+    assert acts == ar.legal_actions(state)  # pure function of state
+    # deterministic order: family order, sorted inside each family
+    order = [a.op for a in acts]
+    assert order == sorted(
+        order, key=("ingest", "auto_cond", "fold", "lift", "compose").index
+    )
+    specs = {c.spec for c in state.corpus}
+    for a in acts:
+        assert a.op in ar.ACTIONS
+        p = a.params
+        if a.op == "ingest":
+            assert set(p["names"]) <= set(state.pending)
+        elif a.op == "fold":
+            assert ar._spec_size(p["spelled"]) >= 2
+            assert any(_spec_occurs(s, p["spelled"]) for s in specs)
+            # spelled's own ops are never re-cited as the kernel
+            inner = ar._spec_ops(p["spelled"])
+            k = p["kernel"]
+            assert (k if isinstance(k, str) else k[0]) not in inner
+        elif a.op == "lift":
+            assert ar._spec_size(p["step"]) >= 2
+            assert any(_spec_occurs(s, p["step"]) for s in specs)
+            apply = p["apply_op"]
+            assert any(
+                a_ == apply for _c, a_, _h in state.carriers
+            )
+        elif a.op == "compose":
+            assert p["first"] in state.premises
+            assert all(r in state.premises for r in p["rest"])
+        else:
+            pytest.fail(f"unexpected op {a.op}")
+    # the aff-step lift the tests prove is enumerated verbatim
+    aff = ar.Action.lift(
+        ("add", ("matmul", "X1", "X2"), "X3"),
+        ("aff", "X1", "X3"),
+        "apply",
+        state="X2",
+    )
+    assert aff in acts
+    # ingest: singletons plus the whole pool
+    assert ar.Action.ingest(("pend",)) in acts
+    assert ar.Action.ingest(("pend", "pend2")) in acts
+
+
+def test_legal_actions_compose_pairs_and_specialize(tmp_path):
+    """Compose enumeration: bare matches plus metavar specializations.
+
+    ``compose(comm_mul, silu_fold)`` is the canonical specialized
+    composite — the enumeration must reach a specialize map under
+    which the pair actually constructs.
+    """
+    arena = _arena(working=[_silu_swap_case("w", 4)])
+    state = arena.observe()
+    acts = ar.legal_actions(state)
+    pairs = [
+        a for a in acts
+        if a.op == "compose"
+        and a.params["first"] == "comm_mul"
+        and a.params["rest"] == ("silu_fold",)
+    ]
+    assert pairs
+    # at least one emitted specialize map actually constructs
+    ok = False
+    for a in pairs:
+        obj = obs.compose_objects(
+            "t",
+            arena.resolve_ref("comm_mul"),
+            arena.resolve_ref("silu_fold"),
+            specialize=dict(a.params["specialize"]),
+        )
+        ok = ok or obj is not None
+    assert ok
+
+
+def test_legal_actions_auto_cond_targets_unguarded(tmp_path):
+    """Unguarded stored objects + conditional verdicts are targets."""
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        holdout=[_aff_step_case("holdout", 6)],
+    )
+    _s1, rep = arena.step(
+        ar.Action.fold(("add", "X", "X"), "abs", name="bad")
+    )
+    assert not rep.usable
+    state = arena.observe()
+    acts = ar.legal_actions(state)
+    assert ar.Action.auto_cond(rep.alpha_key) in acts
+    # a stored object carrying a guard is not a target
+    _s2, rep2 = arena.step(
+        ar.Action.fold(
+            ("div", "X", ("add", ("abs", "X"), 1)),
+            "softsign",
+            cond=("rank", "X", ">=", 1),
+            name="guarded",
+        )
+    )
+    state2 = arena.observe()
+    acts2 = ar.legal_actions(state2)
+    keys = {
+        a.params["ref"] for a in acts2 if a.op == "auto_cond"
+    }
+    assert rep2.alpha_key not in keys
+    assert rep.alpha_key in keys
+
+
+def test_legal_actions_replay_is_idempotent(tmp_path):
+    """Re-declaring a stored object stays legal — same alpha key."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    state = arena.observe()
+    acts = ar.legal_actions(state)
+    fold = next(
+        a
+        for a in acts
+        if a.op == "fold"
+        and a.params["spelled"]
+        == ("add", ("matmul", "X1", "X2"), "X3")
+        and a.params["kernel"] == "abs"
+        and a.params["arg"] == "X1"
+    )
+    _s1, r1 = arena.step(fold)
+    acts2 = ar.legal_actions(arena.observe())
+    # still legal (re-declaring re-gauntlets the same object)…
+    assert fold in acts2
+    _s2, r2 = arena.step(fold)
+    # …and idempotent: the store key is unchanged
+    assert r2.alpha_key == r1.alpha_key
+
+
+def test_legal_actions_empty_board(tmp_path):
+    """No corpus, no pending, no premises → the empty move set."""
+    arena = _arena(base_rules=tuple(), carrier_rules=())
+    state = arena.observe()
+    assert state.carriers == ()
+    acts = ar.legal_actions(state)
+    assert acts == ()
+    assert ar.RandomPlayer(random.Random(0))(state) is None
+    traj = ar.run_episode(arena, ar.RandomPlayer(random.Random(0)), 3)
+    assert traj.reports == []
+
+
+def test_carrier_basis_parametrized(tmp_path):
+    """``carrier_rules`` binds the lift basis; triples pass through."""
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        carrier_rules=[("om_elem", "om_apply", False)],
+    )
+    state = arena.observe()
+    assert state.carriers == (("om_elem", "om_apply", False),)
+    acts = ar.legal_actions(state)
+    lifts = [a for a in acts if a.op == "lift"]
+    assert lifts and all(
+        a.params["apply_op"] == "om_apply"
+        and a.params["state"] is None
+        for a in lifts
+    )
+    assert ar.Action.lift(
+        ("add", ("matmul", "X1", "X2"), "X3"),
+        ("om_elem", "X1", "X2", "X3"),
+        "om_apply",
+    ) in acts
+    # a lift-shaped rule mines its (carrier, apply, state) template
+    from catopt_core.laws.scan import AFF_LIFT
+
+    arena2 = _arena(carrier_rules=[AFF_LIFT])
+    assert arena2.observe().carriers == (("aff", "apply", True),)
+
+
+# ---------------------------------------------------------------------------
+#  The baselines — random over the legal set, greedy on stages
 # ---------------------------------------------------------------------------
 
 
 def test_random_player_episode_is_deterministic(tmp_path):
-    """Same seed → same episode; the random baseline is playable."""
+    """Same seed → same episode over the live legal set."""
 
     def _mk():
         arena = _arena(
             working=[_aff_step_case("w", 4)],
             holdout=[_aff_step_case("holdout", 6)],
             pending=[_filler_case("pend")],
+            base_rules=tuple(),
         )
         return ar.run_episode(
-            arena, ar.RandomPlayer(random.Random(7), [_aff_lift()]), 4
+            arena, ar.RandomPlayer(random.Random(7)), 4
         )
 
     t1, t2 = _mk(), _mk()
@@ -503,23 +702,111 @@ def test_random_player_episode_is_deterministic(tmp_path):
     assert t1.reports  # the episode ran
 
 
-def test_random_player_covers_ingest_and_auto_cond(tmp_path):
-    """An empty library leaves ingest + auto_cond — both get drawn."""
+def test_random_player_plays_only_legal_moves(tmp_path):
+    """Every move the random player takes was legal in that state."""
     arena = _arena(
         working=[_aff_step_case("w", 4)],
-        holdout=[_aff_step_case("holdout", 6)],
         pending=[_filler_case("pend")],
+        base_rules=tuple(),
     )
-    arena.step(ar.Action.fold(("add", "X", "X"), "abs", name="bad"))
-    traj = ar.run_episode(
-        arena,
-        ar.RandomPlayer(random.Random(0), [], ingest=True, guard=True),
-        5,
+    rng = random.Random(0)
+    seen: list[str] = []
+
+    class _Checked(ar.RandomPlayer):
+        def __call__(self, state):
+            action = super().__call__(state)
+            if action is not None:
+                assert action in ar.legal_actions(state)
+                seen.append(action.op)
+            return action
+
+    traj = ar.run_episode(arena, _Checked(rng), 5)
+    assert seen and len(traj.reports) == len(seen)
+
+
+def test_greedy_player_picks_the_largest_spec(tmp_path):
+    """Greed prefers a construction over ingest, the biggest first."""
+    two = _case(
+        "two",
+        _p("square", _p("add", _v("t_a", 4, 4), _v("t_b", 4, 4))),
+        _v("t_a", 4, 4),
+        _v("t_b", 4, 4),
     )
-    ops = {r.action.op for r in traj.reports}
-    assert {"ingest", "auto_cond"} <= ops
-    # and then the board drains — the player returns None
-    assert len(traj.reports) <= 5
+    arena = _arena(
+        working=[_aff_step_case("w", 4), two],
+        pending=[_filler_case("pend")],
+        base_rules=tuple(),
+        carrier_rules=(),
+    )
+    move = ar.GreedyPlayer()(arena.observe())
+    assert move is not None and move.op in ("fold", "lift", "compose")
+    # bigger spelled pattern (2-op square(add(..)) = size 2…3) —
+    # the point is greed never takes the zero-scoring ingest
+    assert move.op != "ingest"
+    # deterministic: same observation, same pick
+    move2 = ar.GreedyPlayer()(arena.observe())
+    assert ar._action_key(move) == ar._action_key(move2)
+
+
+def test_greedy_player_legal_hook(tmp_path):
+    """The ``legal`` seam restricts what greed sees."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    move = ar.GreedyPlayer(legal=lambda _s: ())(arena.observe())
+    assert move is None
+
+
+# ---------------------------------------------------------------------------
+#  The depth probe — players on a small board
+# ---------------------------------------------------------------------------
+
+
+def test_depth_probe_small_board(tmp_path):
+    """``depth_probe`` plays all three arms on an injected board."""
+
+    from catopt_core.laws import ALL_RULES
+
+    def factory(_s: int) -> ar.Arena:
+        return _arena(
+            working=[_aff_step_case("w", 4)],
+            holdout=[_aff_step_case("holdout", 6)],
+            pending=[_filler_case("pend")],
+            base_rules=[
+                r
+                for r in ALL_RULES
+                if r.name in ("comm_mul", "silu_fold")
+            ],
+        )
+
+    table = ar.depth_probe(
+        episodes=1, budget=5, seed=0, arena_factory=factory
+    )
+    assert set(table) == {"fixed", "random", "greedy"}
+    for rows in table.values():
+        (r,) = rows
+        assert r["episode"] == 0 and r["steps"] <= 5
+        assert {"usable", "holdout_fires", "holdout_paid"} <= set(r)
+        # the live move set is free to grow (ingest adds spellings)
+        assert r["legal_start"] >= 0 and r["legal_end"] >= 0
+    # the fixed playbook replays ingest + its three constructions,
+    # then may spend steps guarding whatever refused at truth
+    fixed = table["fixed"][0]
+    assert fixed["steps"] >= 4
+    rendered = ar._fmt_probe(table)
+    assert "fixed" in rendered and "greedy" in rendered
+
+
+def test_main_runs_the_probe_and_writes_json(tmp_path, monkeypatch, capsys):
+    """``main`` renders the probe table; ``--json`` dumps it."""
+    monkeypatch.setattr(
+        ar, "depth_probe", lambda **_kw: {"p": [ar._probe_row(
+            ar.Trajectory([]), 0, 5, 3
+        )]}
+    )
+    out = tmp_path / "probe.json"
+    assert ar.main(["--json", str(out)]) == 0
+    blob = json.loads(out.read_text())
+    assert blob["p"][0]["usable"] == 0 and blob["p"][0]["legal_start"] == 5
+    assert "player" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -726,3 +1013,96 @@ def test_make_arena_builds_the_real_board(tmp_path):
     assert state.pending or any(
         c.source == "bench" for c in state.corpus
     )
+
+
+def test_relax_guard_action_drops_a_clause(tmp_path):
+    """``relax_guard`` weakens the stored guard and re-gauntlets."""
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        holdout=[_aff_step_case("holdout", 6)],
+    )
+    _s, rep = arena.step(
+        ar.Action.fold(
+            ("div", "X", ("add", ("abs", "X"), 1)),
+            "softsign",
+            cond=("and", ("rank", "X", ">=", 1), ("rank", "X", ">=", 0)),
+            name="guarded",
+        )
+    )
+    assert rep.applied
+    (o,) = arena.observe().objects
+    assert len(o.cond_clauses) == 2
+    # drop the second clause — the object re-gauntlets under the key
+    _s2, rep2 = arena.step(
+        ar.Action.relax_guard(rep.alpha_key, 1)
+    )
+    assert rep2.applied and rep2.alpha_key == rep.alpha_key
+    (o2,) = arena.observe().objects
+    assert len(o2.cond_clauses) == 1
+
+
+def test_relax_guard_declines_without_a_declarative_guard(tmp_path):
+    """An unguarded object has no clause to drop — honest refusal."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    _s, rep = arena.step(_aff_lift())
+    assert rep.applied
+    _s2, rep2 = arena.step(
+        ar.Action.relax_guard(rep.alpha_key, 0)
+    )
+    assert not rep2.applied
+    assert "declined" in rep2.note
+
+
+def test_specialize_action_pins_a_leaf_metavar(tmp_path):
+    """``specialize`` narrows the object; a free name is an honest pin."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    _s, rep = arena.step(
+        ar.Action.fold(("sub", "X", "Y"), "abs", name="abssub")
+    )
+    assert rep.applied
+    (o,) = arena.observe().objects
+    assert set(o.leaf_metavars) == {"X", "Y"}
+    _s2, rep2 = arena.step(
+        ar.Action.specialize(rep.alpha_key, {"Y": 0})
+    )
+    assert rep2.applied
+
+
+def test_specialize_declines_a_name_the_lhs_binds_nowhere(tmp_path):
+    """A binding that names nothing is the honest refusal."""
+    arena = _arena(working=[_aff_step_case("w", 4)])
+    _s, rep = arena.step(_aff_lift())
+    _s2, rep2 = arena.step(
+        ar.Action.specialize(rep.alpha_key, {"ZZZ": 1})
+    )
+    assert not rep2.applied
+
+
+def test_legal_actions_enumerate_relax_and_specialize(tmp_path):
+    """A guarded, free-metavar object contributes both move kinds."""
+    arena = _arena(
+        working=[_aff_step_case("w", 4)],
+        holdout=[_aff_step_case("holdout", 6)],
+    )
+    _s, rep = arena.step(
+        ar.Action.fold(
+            ("div", "X", ("add", ("abs", "X"), 1)),
+            "softsign",
+            cond=("and", ("rank", "X", ">=", 1), ("rank", "X", ">=", 0)),
+            name="guarded",
+        )
+    )
+    acts = ar.legal_actions(arena.observe())
+    relax = [
+        a
+        for a in acts
+        if a.op == "relax_guard" and a.params["ref"] == rep.alpha_key
+    ]
+    assert len(relax) == 2  # one per cond clause
+    spec = [
+        a
+        for a in acts
+        if a.op == "specialize" and a.params["ref"] == rep.alpha_key
+    ]
+    # one leaf metavar X x the scalar bank
+    assert len(spec) == len(ar.lawdata.SPECIALIZE_SCALARS)
