@@ -8,6 +8,21 @@ This is the conceptual pipeline behind ADR 0002.  It is deliberately
 separate from the code walkthrough — it answers *why* the machinery
 is shaped the way it is.
 
+## The tower
+
+The same picture in categorical vocabulary: a program is a
+**1-morphism** between objects (tensor types); a rewrite law is a
+**2-morphism** between programs; a `derivation=` — one law proven
+from premises — is a **3-morphism** (a coherence; the catalogue
+measures confluence and divergence between laws).  Declared objects
+— folds, lifts, compositions — are machine-constructed cells written
+as *data*, and `opdata` makes a new primitive declarable the same
+way.  Two games are played on this tower: **search** applies 2-cells
+inside one equivalence class (steps 5–6 below); **construction**
+writes new cells (`catopt_discovery.object_synthesis` +
+`evidence`; plan 0020 builds the episode arena).  The certificate
+is the replayable 2-cell; its replay is the referee.
+
 ## The loop, step by step
 
 Running example throughout: the recurrence `h_t = A·h_{t-1} + x_t`.

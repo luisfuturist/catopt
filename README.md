@@ -74,27 +74,51 @@ hexagonal boundary is pinned by import-linter:
 `numpy`, or GPU library — it is a *sink* for adapter-pushed state, never
 a puller.  A new backend implements `Sink`; nothing in core changes.
 
-## Game
+## The game
 
-catopt is, structurally, **a game**.
+catopt is, structurally, a game played on a **tower of morphisms** —
+the n-cell picture where programs, rewrites, proofs and metarules are
+the same kind of thing at different dimensions:
+
+| level | cell | in catopt |
+|---|---|---|
+| 0 | objects | tensor types / shapes |
+| 1 | morphisms | **programs** — a term `a ~> b` |
+| 2 | rewrites | **laws** — equalities between programs (`lhs ~ rhs` + guards) |
+| 3 | coherences | **derivations between laws** — a `lemma` is a 2-cell proven from premises; the coherence catalogue measures confluence and divergence |
+| ↑ | polymorphic forms | **declared objects** — folds, lifts, compositions written *as data* (`opdata`/`evidence` records) |
+
+Two games are played on that tower:
+
+- **The search game** — moves *apply* 2-cells.  The **e-graph is the
+  board**: every program *known equal* to yours, in one place; a move
+  walks it, extraction picks the cheapest member.  The contraction
+  player is a proven winner on this board (0.87–0.99× `opt_einsum`
+  randomized greedy at n=40).
+- **The construction game** — moves *write new cells into the tower*:
+  `fold`/`lift`/`compose` mint objects (`catopt_discovery.object_synthesis`),
+  `relax_guard`/`specialize` reshape their regions, `auto_cond`
+  writes their guards as declarative data; the evidence store and
+  gauntlet referee each write (plan 0020 builds the episode arena).
+  Ten machine-written cells are shipped laws today.
+
+Then the shared equipment:
 
 - **Rules.**  The rewrite laws are *derived from category theory*, not
   enumerated as op patterns: associativity of composition, the unit and
   interchange laws, the traced-monoidal axioms, products, and monoid
-  carriers.  A rewrite is a **2-cell**; a law *about* rewrites is a
-  **3-cell** (coherence); the e-graph is the **higher-categorical board**
-  those cells live on ([ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md)).
-- **Moves.**  Applying a law — a rewrite.
-- **Board.**  The e-graph: every program *known equal* to yours, in one
-  place.  The board is the whole equivalence class, not one term.
-- **Referee.**  The **certificate**.  `verify_certificate` replays the
-  derivation on real terms, so whatever the player does, the output is
-  provably the same function.  egglog has proof-carrying rewriting and
-  Catlab/AlgebraicJulia does categorical rewriting, but the *combination*
-  — derived laws + machine-checked replay + a learned player + a
-  compiler IR — is the claim.
-- **Score.**  A pluggable, per-target cost model.  Evaluation is an
-  independent dimension, so the score never decides semantics.
+  carriers ([ADR 0002](project/adrs/0002-categorical-re-expression-thesis.md)).
+  The legality relation is semantic equivalence — the tower is the
+  grammar, equivalence is the law.
+- **Referee.**  The **certificate** — `verify_certificate` replays the
+  derivation on real terms — plus the eight-stage admission gauntlet
+  for constructed cells.  A player only ever chooses among legal
+  moves: it can be slow, never wrong.
+- **Score.**  A pluggable, per-target cost model — Pareto utilities
+  over FLOPs, measured time and closure blowup; in the construction
+  game, concretely: *admitted objects that pay on held-out code*.
+  Evaluation is an independent dimension, so the score never decides
+  semantics.
 
 One call runs the whole game:
 
@@ -517,6 +541,7 @@ selection*, delivered end to end.
 | **TVM / Ansor / Halide** | schedule search, cost models, target tuning | they search *schedules over a fixed algorithm*; catopt searches *across algorithms* via algebraic laws. |
 | **Herbie** | e-graph rewrite search | different objective (numerical accuracy, not cost); same saturation lineage. |
 | **Alive2 / CompCert** | machine-checked equivalence | catopt's certificate is per-program *derivational replay* on real terms, not a whole-compiler proof. |
+| **HANDL** (arrow-calculus kernel) | the n-cell tower — programs, rewrites, proofs and metarules as one morphism mechanism at `~[n]~>`; everything serializable data | HANDL is the *language* side of the same picture (a composable kernel where a law is a 2-morphism and a metarule a 3-morphism); catopt is the *optimizer* side — an e-graph board, a measured referee, and a player over the tower's construction moves. |
 | **torch.compile / Inductor** | the baseline measured against | op-level fusion cannot express transforms across runtime parameters (weight folding, reassociation) — which is where catopt's wins live. |
 
 ## Limits
