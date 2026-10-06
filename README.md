@@ -96,11 +96,14 @@ Two games are played on that tower:
   player is a proven winner on this board (0.87–0.99× `opt_einsum`
   randomized greedy at n=40).
 - **The construction game** — moves *write new cells into the tower*:
-  `fold`/`lift`/`compose` mint objects (`catopt_discovery.object_synthesis`),
-  `relax_guard`/`specialize` reshape their regions, `auto_cond`
-  writes their guards as declarative data; the evidence store and
-  gauntlet referee each write (plan 0020 builds the episode arena).
-  Ten machine-written cells are shipped laws today.
+  `fold`/`lift`/`compose`/`auto_cond`/`relax_guard`/`specialize`/
+  `ingest` are the seven registered ops, all pure data over the
+  `CONSTRUCTORS`/`ACTIONS` registries.  `catopt_discovery.arena`
+  runs episodes on the real board: `legal_actions(state)` enumerates
+  the live move set (~150k on the real corpus), `FixedRule`/
+  `RandomPlayer`/`GreedyPlayer` are the baselines, and the score is
+  holdout-only pay the player cannot write into.  Ten machine-
+  written cells are shipped laws today.
 
 Then the shared equipment:
 
@@ -268,6 +271,12 @@ sizes — see [Limits](#limits)); provenance is in
 | coherence catalogue over `ALL_RULES` | **47 axioms / 13 lemmas / 2 redundant; 9 no-instance; divergence 1** (`rms_norm_fold` × `_nogain` — measured, unresolved) | `catopt_discovery.coherence` |
 | workload intake | **254 real `nn.*` workloads, 201 fp64-verified** (corpus 211→725 op-tuples) | `catopt_discovery.intake` |
 | laws as data | **71/71 fully serializable** (pattern + `cond`/`dspec` + derivation) | `catopt_core.laws.serialize` |
+| held-out model zoo (22 architectures) | **5/22 verified wins** — `assoc_linear` −20% on LoRAAdapter; machine-admitted `mul_unsq_pad` −5% on TimeCondConv; 0 verify-failures | `catopt_discovery.zoo` |
+| human-vs-machine law arms on the zoo | human-only **4/22** · machine-only **3/22** · **union 6/22** — `affd_step_lift` (unshipped store object) wins −4.07% on AdaLNBlock where the whole human library scores 0 | `catopt_core.laws.provenance` + `machine_pack` |
+| machine law pack | **16/16 store objects deployable** as an opt-in `RuleSet` (`machine_default(store)`) | `catopt_discovery.machine_pack` |
+| law-order board (plan 0021 probe) | extracted term **identical under ~350 ordering arms**; wall-clock swings up to **40×** — order is a schedule dimension, not a quality one | `catopt_discovery.law_order` |
+| construction arena depth probe | board size **~150k legal moves**; fixed playbook pays 2 on holdout, greedy pays 0 — move choice matters; nobody reaches `usable` in 8 moves | `catopt_discovery.arena` |
+| discovery content tables → data | oracle banks, verifier defaults, grammar alphabet, reward weights, term corpora all live in `lawdata` — pure data a model could write | `catopt_core.lawdata` + `catopt_discovery.lawdata` |
 | evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
 
 ### What it finds — and what it doesn't
@@ -360,6 +369,15 @@ canonicalization bridges that make them reachable:
   unsqueeze/reshape pad identities, and
   `linear_channel_to_row_scale` shipped as a *lemma* over its premise
   chain ([promoted-laws.md](project/retros/promoted-laws.md)).
+- **`affd_step_lift` — the machine-exclusive held-out win.**  On the
+  22-model zoo the ablation reads human-only 4/22, machine-only 3/22,
+  union 6/22 — and `affd_step_lift`, a store object never promoted,
+  wins **−4.07% on AdaLNBlock** where the entire human-authored
+  library scores zero.  Machine-admitted work is *additive*, not
+  redundant with the authored laws ([human-bar.md](project/retros/human-bar.md)).
+  The whole admitted store deploys as an opt-in `RuleSet` via
+  `catopt_discovery.machine_pack.machine_default(store)` — 16/16
+  objects load, union is the 6/22 arm.
 
 **The loop is closed.**  `catopt_discovery.pipeline` runs
 census → propose → verify → measure → rank → **emit** end to end:
