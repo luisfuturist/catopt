@@ -147,3 +147,19 @@ constructions are mostly false (`truth`) and the true ones mostly
 don't pay on the probe (`typed-pay`).  A learned player's edge, if
 any, is in *targeting* — picking constructions that fire on real
 workloads — which is exactly what the frontier arms cannot do.
+
+## Post-rebalance probe (cheap board, 3 eps × budget 40)
+
+Under `ARENA_REWARD` = `stage=0.1, usable=10, fire=0.5, paid=5`:
+
+| player | usable | fires | paid | reward |
+|---|---|---|---|---|
+| fixed  | **1/0/0** | 4/0/0 | 1/0/0 | **19.3**/2.3/2.0 |
+| random | 0 | 0/1/1 | 0 | 9.7–10.7 |
+| greedy | 0 | 0 | 0 | 12.0 |
+| heuristic | 0 | 0 | 0 | 9.7 |
+
+The inversion is fixed: the episode that mints a usable, paying
+object tops the board (19.3), churn policies score below it.
+Stage-failure aggregate: `truth` kills most constructions
+(72–120/player), then `typed-pay`/`novelty`/`full-data`.
