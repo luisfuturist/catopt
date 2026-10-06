@@ -31,6 +31,10 @@
 * :mod:`catopt_core.laws.pairing` — the non-local passes over the whole
   e-graph (pairing, weight sharing).  These are diagram-level passes,
   not equational laws.
+* :mod:`catopt_core.laws.provenance` — the authorship registry:
+  :func:`law_provenance` classifies every law as human-authored or
+  machine-admitted (the promoted objects and the unshipped store
+  population), registry-level rather than a per-law field.
 * :mod:`catopt_core.laws.factored` — the factored-parameter path:
   ``offer_low_rank_factors`` detects numerically low-rank weight
   values and offers the ``(x@A)@B`` / ``linear(linear(x,A),B)``
@@ -138,6 +142,12 @@ from catopt_core.laws.pairing import (  # noqa: F401
     pair_shared_input_linears,
     share_duplicate_param_slices,
     share_duplicate_params,
+)
+from catopt_core.laws.provenance import (
+    MACHINE_LAWS,
+    MACHINE_SHIPPED,
+    MACHINE_STORED,
+    law_provenance,
 )
 from catopt_core.laws.ruleset import (
     CARRIER_SEARCH,
@@ -354,6 +364,9 @@ __all__ = [
     "LINEAR_ROW_SCALE",
     "LINEAR_ROW_SCALE_REV",
     "LINEAR_TO_MM_T",
+    "MACHINE_LAWS",
+    "MACHINE_SHIPPED",
+    "MACHINE_STORED",
     "MUL_RESHAPE_INERT_L",
     "MUL_SQUARE",
     "MUL_UNSQ_PAD_L",
@@ -409,6 +422,7 @@ __all__ = [
     "RuleSet",
     "all_rules",
     "headshare_keys_hold",
+    "law_provenance",
     "offer_low_rank_factors",
     "offer_weight_specials",
     "pair_shared_input_convs",
