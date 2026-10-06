@@ -74,6 +74,7 @@ from catopt_core.laws import tags as _tags
 from catopt_core.meta import apply_rewrite_at
 
 from catopt_discovery import coherence as lc
+from catopt_discovery import lawdata
 from catopt_discovery import verifier as lv
 
 __all__ = ["MediatorRow", "main"]
@@ -95,16 +96,10 @@ _EXPANSIVE_BUDGET = 600
 
 #: The reach corpus — small real exports chosen to cover the
 #: interesting law neighbourhoods: silu/swiglu, matmul chains,
-#: linear folds, softmax/select, residual adds.
-_CORPUS_MODELS = (
-    "SwiGLU",
-    "ResidualMLP",
-    "GatedResidualBlock",
-    "ManualSoftmaxAttention",
-    "MatrixChain",
-    "ParallelLinear",
-    "NormLinear",
-)
+#: linear folds, softmax/select, residual adds.  The name list is
+#: data in :mod:`catopt_discovery.lawdata`
+#: (:data:`COHERENCE_CORPUS_MODELS`).
+_CORPUS_MODELS = lawdata.COHERENCE_CORPUS_MODELS
 
 
 # ---------------------------------------------------------------------------

@@ -59,11 +59,12 @@ from typing import Any
 from catopt_core.cost import dag_cost
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.egraph.terms import _term_instantiate, _term_match
-from catopt_core.ir import Const, Op
+from catopt_core.ir import Op
 from catopt_core.laws import ALL_RULES
 
 # Sibling tools: the census/corpus, the verifier, and the numeric
 # oracle + saturation helpers the proposal retro already built.
+from catopt_discovery import lawdata
 from catopt_discovery.impact import (
     _bench_cases,
     _cost_fn,
@@ -77,6 +78,7 @@ from catopt_discovery.proposal import (
     _numeric_true,
     _relation,
     _sat_cost,
+    _spec_term,
 )
 from catopt_discovery.verifier import verify_law
 
@@ -119,14 +121,11 @@ class Schema:
         return Rewrite(self.name, self.lhs, self.rhs)
 
 
-def _op(name: str, *args: Any, **attrs: Any) -> Op:
-    """Build an ``Op`` pattern node (metavariable leaves are ``str``)."""
-    return Op.make(name, *args, **attrs)
-
-
 def schemas() -> list[Schema]:
     """Return the schema library, grouped by the shape it targets.
 
+    The library is data — :data:`catopt_discovery.lawdata.SHAPE_SCHEMAS`,
+    one ``(name, lhs, rhs, note, family)`` spec row per schema.
     Every schema is a *true* algebraic identity over the real op
     vocabulary (elementwise arithmetic, the ``select``/``slice``
     naturality, layout).  Some are deliberately library duplicates
@@ -134,236 +133,19 @@ def schemas() -> list[Schema]:
     exercised, and some target shapes the census found frequent
     (``mul(select, select)``, ``add(mul, mul)``).
     """
-    a, b, c, x = "A", "B", "C", "X"
-    d, i = "D", "I"
-    out: list[Schema] = []
+    return list(map(_schema, lawdata.SHAPE_SCHEMAS))
 
-    # -- elementwise factorization (targets add(mul,mul), sub(mul,mul)) --
-    out.append(
-        Schema(
-            "factor_left",
-            _op("add", _op("mul", a, b), _op("mul", a, c)),
-            _op("mul", a, _op("add", b, c)),
-            note="x*y + x*z = x*(y+z) (shared left factor).",
-            family="elementwise-factor",
-        )
-    )
-    out.append(
-        Schema(
-            "factor_right",
-            _op("add", _op("mul", b, a), _op("mul", c, a)),
-            _op("mul", _op("add", b, c), a),
-            note="y*x + z*x = (y+z)*x (shared right factor).",
-            family="elementwise-factor",
-        )
-    )
-    out.append(
-        Schema(
-            "factor_mid",
-            _op("add", _op("mul", a, b), _op("mul", c, b)),
-            _op("mul", _op("add", a, c), b),
-            note="x*y + z*y = (x+z)*y (shared right factor, y).",
-            family="elementwise-factor",
-        )
-    )
-    out.append(
-        Schema(
-            "factor_sub_left",
-            _op("sub", _op("mul", a, b), _op("mul", a, c)),
-            _op("mul", a, _op("sub", b, c)),
-            note="x*y - x*z = x*(y-z).",
-            family="elementwise-factor",
-        )
-    )
-    out.append(
-        Schema(
-            "factor_sub_right",
-            _op("sub", _op("mul", a, b), _op("mul", c, b)),
-            _op("mul", _op("sub", a, c), b),
-            note="x*y - z*y = (x-z)*y.",
-            family="elementwise-factor",
-        )
-    )
 
-    # -- select / slice naturality (targets mul(select,select)) --
-    sel_a = _op("select", a, dim=d, index=i)
-    sel_b = _op("select", b, dim=d, index=i)
-    out.append(
-        Schema(
-            "select_mul",
-            _op("mul", sel_a, sel_b),
-            _op("select", _op("mul", a, b), dim=d, index=i),
-            note="mul commutes with select: sel(x)*sel(y)=sel(x*y).",
-            family="select-naturality",
-        )
+def _schema(row: tuple) -> Schema:
+    """Resolve one ``SHAPE_SCHEMAS`` row to a :class:`Schema`."""
+    name, lhs, rhs, note, family = row
+    return Schema(
+        name,
+        _spec_term(lhs),
+        _spec_term(rhs),
+        note=note,
+        family=family,
     )
-    out.append(
-        Schema(
-            "select_add",
-            _op(
-                "add",
-                _op("select", a, dim=d, index=i),
-                _op("select", b, dim=d, index=i),
-            ),
-            _op("select", _op("add", a, b), dim=d, index=i),
-            note="add commutes with select: sel(x)+sel(y)=sel(x+y).",
-            family="select-naturality",
-        )
-    )
-    out.append(
-        Schema(
-            "select_sub",
-            _op(
-                "sub",
-                _op("select", a, dim=d, index=i),
-                _op("select", b, dim=d, index=i),
-            ),
-            _op("select", _op("sub", a, b), dim=d, index=i),
-            note="sub commutes with select: sel(x)-sel(y)=sel(x-y).",
-            family="select-naturality",
-        )
-    )
-    sl_a = _op("slice", a, dim=d, start="S0", end="E0")
-    sl_b = _op("slice", b, dim=d, start="S0", end="E0")
-    out.append(
-        Schema(
-            "slice_mul",
-            _op("mul", sl_a, sl_b),
-            _op("slice", _op("mul", a, b), dim=d, start="S0", end="E0"),
-            note="mul commutes with slice (equal range).",
-            family="slice-naturality",
-        )
-    )
-
-    # -- layout (targets transpose(reshape), reshape(reshape)) --
-    out.append(
-        Schema(
-            "reshape_reshape",
-            _op(
-                "reshape",
-                _op("reshape", a, shape="S1"),
-                shape="S2",
-            ),
-            _op("reshape", a, shape="S2"),
-            note="consecutive reshapes fuse.",
-            family="layout",
-        )
-    )
-    out.append(
-        Schema(
-            "reshape_transpose",
-            _op(
-                "transpose",
-                _op("reshape", a, shape="S"),
-                dim0=d,
-                dim1=i,
-            ),
-            _op(
-                "reshape",
-                _op("transpose", a, dim0=d, dim1=i),
-                shape="S",
-            ),
-            note="conjecture — false in general (oracle must reject).",
-            family="layout",
-        )
-    )
-
-    # -- elementwise algebra (targets mul(silu,linear), neg/dist) --
-    out.append(
-        Schema(
-            "neg_add",
-            _op("add", _op("neg", a), _op("neg", b)),
-            _op("neg", _op("add", a, b)),
-            note="-x + -y = -(x+y).",
-            family="elementwise-algebra",
-        )
-    )
-    out.append(
-        Schema(
-            "sub_neg",
-            _op("sub", a, _op("neg", b)),
-            _op("add", a, b),
-            note="x - (-y) = x + y.",
-            family="elementwise-algebra",
-        )
-    )
-    out.append(
-        Schema(
-            "mul_neg_left",
-            _op("mul", _op("neg", a), b),
-            _op("neg", _op("mul", a, b)),
-            note="(-x)*y = -(x*y).",
-            family="elementwise-algebra",
-        )
-    )
-    out.append(
-        Schema(
-            "exp_add",
-            _op("mul", _op("exp", a), _op("exp", b)),
-            _op("exp", _op("add", a, b)),
-            note="e^x * e^y = e^(x+y).",
-            family="elementwise-algebra",
-        )
-    )
-    out.append(
-        Schema(
-            "square_neg",
-            _op("square", _op("neg", a)),
-            _op("square", a),
-            note="(-x)^2 = x^2.",
-            family="elementwise-algebra",
-        )
-    )
-
-    # -- linear/matmul factor (library controls; already shipped) --
-    out.append(
-        Schema(
-            "linear_factor",
-            _op("add", _op("linear", x, a), _op("linear", x, b)),
-            _op("linear", x, _op("add", a, b)),
-            note="dup of weight_factor_linear (control).",
-            family="linear-control",
-        )
-    )
-    out.append(
-        Schema(
-            "matmul_factor",
-            _op("add", _op("matmul", x, a), _op("matmul", x, b)),
-            _op("matmul", x, _op("add", a, b)),
-            note="dup of weight_factor_matmul (control).",
-            family="linear-control",
-        )
-    )
-
-    # -- constants (annihilator / identity; targets are rare) --
-    out.append(
-        Schema(
-            "mul_zero",
-            _op("mul", a, Const(0)),
-            Const(0),
-            note="x*0 = 0.",
-            family="annihilator",
-        )
-    )
-    out.append(
-        Schema(
-            "id_mul_lit",
-            _op("mul", a, Const(1)),
-            a,
-            note="x*1 = x (dup of id_mul).",
-            family="annihilator",
-        )
-    )
-    out.append(
-        Schema(
-            "sub_self",
-            _op("sub", a, a),
-            Const(0),
-            note="x - x = 0.",
-            family="annihilator",
-        )
-    )
-    return out
 
 
 # ---------------------------------------------------------------------------

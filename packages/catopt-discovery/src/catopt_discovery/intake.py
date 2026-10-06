@@ -82,7 +82,7 @@ from catopt_core.ir import (
 from catopt_torch.adapters import TorchSink
 from catopt_torch.torch_bridge import export_to_ir
 
-from catopt_discovery import TOOLS
+from catopt_discovery import TOOLS, lawdata
 from catopt_discovery.impact import (
     TermCase,
     _bench_cases,
@@ -2322,73 +2322,14 @@ class Workload:
 
 #: The corpus-circularity ledger — the workload names written to spell
 #: one specific *pattern* (an auto-cond guard's region), not to stand
-#: for a real program.  Round 3's view-identity elementwise spellings
-#: exist to fill the guards' empty regions ("Round 3 supplies the
-#: no-op spellings directly"); every round-4 workload spells one
-#: wrap / mirror / shared-factor / grammar / scalar-corner pattern.
-#: Everything else — the torch-native ``nn.*`` modules and the
-#: realistic compound assemblies — is what an honest "real-only"
-#: measurement keeps.  This table is data, not code: :func:`candidates`
-#: reads it to set ``Workload.purpose_built``, and :func:`real_workloads`
-#: filters on the flag.
-_PURPOSE_BUILT: frozenset[str] = frozenset(
-    {
-        # --- round 3 — view-identity elementwise spellings ----------
-        "BroadcastPadLeft",
-        "BroadcastPadRight",
-        "BroadcastPadSub",
-        "FullSliceScale",
-        "NoopTransposeScale",
-        "NoopTransposeAdd",
-        "InertReshapeScale",
-        "SingleChunkScale",
-        "SquaredDistance",
-        # --- round 4 — unsqueeze-wrap (gated broadcast) -------------
-        "ChannelGateBroadcast",
-        "LiftedScalarScale",
-        "HeadGateBroadcast",
-        "LiftedScalarScaleRight",
-        "LiftedScalarCenter",
-        "ContrastiveCenter",
-        "PairwiseSubLift",
-        # --- round 4 — chunked-projection mirrors -------------------
-        "ScaledChunkProjection",
-        "SingleChunkGate",
-        "ChunkHalfScale",
-        # --- round 4 — transposed-add mirrors -----------------------
-        "NoopTransposeResidual",
-        "ScalarTransposeBias",
-        "Rank3TransposeAdd",
-        # --- round 4 — select naturality ----------------------------
-        "SelectGateSum",
-        "SelectGateDiff",
-        # --- round 4 — shared-factor algebra ------------------------
-        "SharedFactorMixture",
-        "SharedFactorContrast",
-        "SharedFactorMixtureRight",
-        "SharedFactorContrastRight",
-        "QuadraticFeature",
-        # --- round 4 — reshape / neg / exp / square grammar ---------
-        "DoubleReshapeHead",
-        "NegatedSum",
-        "NegDistributeHead",
-        "SubNegBias",
-        "NegatedScale",
-        "ExpProductHead",
-        "ExpSumHead",
-        "SquareNegHead",
-        "SquareMulHead",
-        "SigmoidNegGate",
-        "PowOneHead",
-        "SubAddFactorHead",
-        "DivAddHead",
-        # --- round 4 — scalar-corner annihilators -------------------
-        "ScalarAnnihilator",
-        "ScalarSelfCancel",
-        "ScalarSelfRatio",
-        "ScalarInverseSum",
-    }
-)
+#: for a real program.  Everything else — the torch-native ``nn.*``
+#: modules and the realistic compound assemblies — is what an honest
+#: "real-only" measurement keeps.  The table lives in
+#: :mod:`catopt_discovery.lawdata` (:data:`PURPOSE_BUILT`); this is
+#: the same object bound to the ledger's own name — :func:`candidates`
+#: reads it to set ``Workload.purpose_built``, and
+#: :func:`real_workloads` filters on the flag.
+_PURPOSE_BUILT: frozenset[str] = lawdata.PURPOSE_BUILT
 
 
 def _r(*shape: int) -> torch.Tensor:

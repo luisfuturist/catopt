@@ -167,6 +167,7 @@ from torch.distributions import Categorical
 # Sibling tools own the corpus, the oracles and the measurements.
 from catopt_discovery import evidence as ev_store
 from catopt_discovery import gap_gen as lgg
+from catopt_discovery import lawdata
 from catopt_discovery import pipeline as lpl
 from catopt_discovery import proposal as lp
 from catopt_discovery import workload_gen as lwg
@@ -216,32 +217,32 @@ __all__ = [
 #: Maximum op nodes on one side of a candidate (the task bound).
 _MAX_OPS_SIDE = 6
 
-#: Metavariable pool — distinct names bind distinct subterms.
-_MV_NAMES = ("U", "V", "W", "X")
+#: Metavariable pool — distinct names bind distinct subterms
+#: (:data:`catopt_discovery.lawdata.MV_NAMES`).
+_MV_NAMES = lawdata.MV_NAMES
 
-#: Literal leaves offered as actions.
-_CONSTS = (0, 1)
+#: Literal leaves offered as actions
+#: (:data:`catopt_discovery.lawdata.CONST_LEAVES`).
+_CONSTS = lawdata.CONST_LEAVES
 
-#: Fixed prior weights added to the learned logits:
-#: census child frequency (op, metavariable *and* const children are
-#: counted — the census's ``·``/``const`` entries), "op occurs on the
-#: other side", "metavariable already bound" (RHS) and "fresh
-#: metavariable" (LHS — distinct bindings are what naturality and
-#: factoring preconditions need).
-_PRIOR_CHILD = 2.0
-_PRIOR_REUSE = 2.0
-_PRIOR_BOUND_MV = 1.2
-_PRIOR_FRESH_MV = 0.4
-_PRIOR_COMMUTE = 1.0
+#: Fixed prior weights added to the learned logits — the corpus-
+#: informed biases the policy may learn to override.  The table is
+#: data (:data:`catopt_discovery.lawdata.PRIOR_WEIGHTS`); the private
+#: names bind its entries so the prior reads as before.
+_PRIOR_CHILD = lawdata.PRIOR_WEIGHTS["child"]
+_PRIOR_REUSE = lawdata.PRIOR_WEIGHTS["reuse"]
+_PRIOR_BOUND_MV = lawdata.PRIOR_WEIGHTS["bound_mv"]
+_PRIOR_FRESH_MV = lawdata.PRIOR_WEIGHTS["fresh_mv"]
+_PRIOR_COMMUTE = lawdata.PRIOR_WEIGHTS["commute"]
 
 #: Swap-the-nesting prior: at the RHS root, an op that sits one level
 #: down on the LHS is the naturality move (``f(g u, g v) -> g(f u v)``).
-_PRIOR_SWAP_NEST = 1.2
+_PRIOR_SWAP_NEST = lawdata.PRIOR_WEIGHTS["swap_nest"]
 
 #: Op-placement prior decays with hole depth: the corpus's frequent
 #: shapes are shallow (≤ ~3 ops), so below the seeded skeleton level
 #: leaves dominate and constructed LHSs stay applicable.
-_PRIOR_DEPTH_DECAY = 0.55
+_PRIOR_DEPTH_DECAY = lawdata.PRIOR_WEIGHTS["depth_decay"]
 
 #: Op budget per side.  The LHS gets the task bound; the RHS is
 #: capped tighter because the laws the corpus rewards are shallow.
@@ -1090,11 +1091,12 @@ class Referee:
         v.truth = True
         v.relation = lp._relation(lhs, rhs, self.lib)
         self._fire(v, lhs, rhs, check, derive)
+        s = lawdata.REFEREE_SCORE
         v.score = (
-            1.0
-            + 0.2 * min(v.fires, 40)
-            + 2.0 * v.paid
-            + 10.0 * v.rel_drop
+            s["base"]
+            + s["fire"] * min(v.fires, s["fire_cap"])
+            + s["paid"] * v.paid
+            + s["rel_drop"] * v.rel_drop
         )
         return v
 
@@ -1403,25 +1405,15 @@ def eval_baseline(
 
 #: The generator inventory in its fixed enumeration order — the
 #: five ``pipeline.propose`` sources plus ``"build"`` (the
-#: construction player; one draw is one play).
-ENUMERATION_ORDER = (
-    "census-naturality",
-    "census-mixed-view",
-    "pattern-recognition",
-    "shape-aware",
-    "algebraic-grammar",
-    "build",
-)
+#: construction player; one draw is one play).  The arm inventory is
+#: data in :mod:`catopt_discovery.lawdata` (:data:`GENERATOR_ORDER`)
+#: — a policy reads the same table the control schedules.
+ENUMERATION_ORDER = lawdata.GENERATOR_ORDER
 
 #: The corpus-mutating arms — a draw is one verified generated
-#: workload ingested into the arena corpus (``workload_gen``:
-#: undirected resample/mutate; ``gap_gen``: a witness workload
-#: synthesized for a ``no-instance`` candidate, which is then
-#: re-adjudicated under the grown corpus).  They mutate the
-#: evidence scope, so they sit outside the pipeline's enumeration;
-#: the enumeration control schedules them last (fixed inventory
-#: first, then corpus growth).
-CORPUS_ARMS = ("workload_gen", "gap_gen")
+#: workload ingested into the arena corpus, re-adjudicating under
+#: the grown corpus (:data:`catopt_discovery.lawdata.CORPUS_ARMS`).
+CORPUS_ARMS = lawdata.CORPUS_ARMS
 
 #: Canonical arm order for the learned guide's identity one-hot —
 #: the fixed pipeline inventory (incl. ``build``), then the corpus

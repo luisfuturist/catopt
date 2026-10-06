@@ -47,6 +47,7 @@ from catopt_core.ir import Const, Op, op_repr
 from catopt_core.laws import ALL_RULES
 from catopt_core.meta import canonicalize
 
+from catopt_discovery import lawdata
 from catopt_discovery import proposal as lp
 
 __all__ = [
@@ -57,26 +58,20 @@ __all__ = [
     "shape_of_term",
 ]
 
-#: Binary ops the search may place at a two-child node.
-_BINARY_OPS = ("add", "mul", "sub", "div", "pow", "matmul")
+#: Binary ops the search may place at a two-child node — the search
+#: alphabet is data in :mod:`catopt_discovery.lawdata`
+#: (:data:`GRAMMAR_BINARY_OPS`).
+_BINARY_OPS = lawdata.GRAMMAR_BINARY_OPS
 
-#: Unary ops the search may wrap a leaf in (and swap a unary node to).
-_UNARY_OPS = (
-    "neg",
-    "exp",
-    "square",
-    "sqrt",
-    "rsqrt",
-    "sigmoid",
-    "silu",
-    "tanh",
-)
+#: Unary ops the search may wrap a leaf in (and swap a unary node to)
+#: (:data:`catopt_discovery.lawdata.GRAMMAR_UNARY_OPS`).
+_UNARY_OPS = lawdata.GRAMMAR_UNARY_OPS
 
-#: Literal constants the search may substitute for a leaf.  Integer
-#: spelling, matching the hand-written grammar (``Const(0)``, not
-#: ``Const(0.0)``) -- the e-graph keys leaves by ``repr``, so a float
-#: spelling would make a law miss its own grammar rule and look novel.
-_LITERALS = (0, 1, 2)
+#: Literal constants the search may substitute for a leaf
+#: (:data:`catopt_discovery.lawdata.GRAMMAR_LITERALS`).  Integer
+#: spelling matches the hand-written grammar — the e-graph keys
+#: leaves by ``repr``, so a float spelling would look novel.
+_LITERALS = lawdata.GRAMMAR_LITERALS
 
 #: Recombine (cross) LHS/RHS only for a frontier this small.
 _CROSS_FRONTIER = 64

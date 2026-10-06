@@ -68,7 +68,7 @@ from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.egraph.types import _LeafRegistry
 from catopt_core.features import compute_features
 from catopt_core.game import Action
-from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
+from catopt_core.ir import Op, Param, TensorType, Var, op_repr
 from catopt_core.laws import ALL_RULES
 from catopt_core.laws import tags as _tags
 from catopt_core.laws.serialize import (
@@ -78,6 +78,8 @@ from catopt_core.laws.serialize import (
 from catopt_core.trajectories import rule_samples
 from catopt_torch.learned_policy import LearnedPolicy, train_rule_value
 
+from catopt_discovery import lawdata
+from catopt_discovery.object_synthesis import term_from_spec
 from catopt_discovery.verifier import (
     instance_of,
     verify_law,
@@ -115,9 +117,6 @@ _SCAN_NODES = 2_500
 
 #: Numeric-comparison tolerance (fp64).
 _TOL = 1e-6
-
-#: Feature dim used to build the synthetic seed terms.
-_D = 4
 
 
 # ---------------------------------------------------------------------------
@@ -367,76 +366,46 @@ def _cost_delta(cand: Candidate, programs: list, cost_fn: Any) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+#: Feature dim shared by the synthetic-term builders (the grammar's
+#: instantiation env mints its leaves at the same size).
+_D = 4
+
+
 def _v(name: str, *shape: int) -> Var:
     """Return a named tensor variable."""
     return Var(name, TensorType(tuple(shape)))
 
 
-def _p(name: str, *shape: int) -> Param:
-    """Return a named parameter."""
-    return Param(name, TensorType(tuple(shape)))
+def _spec_term(spec: Any) -> Any:
+    """Resolve a :mod:`catopt_discovery.lawdata` term spec.
+
+    The leaf forms ``("var", name, dims)`` / ``("param", name, dims)``
+    mint typed :class:`Var` / :class:`Param` leaves (resolved
+    recursively — concrete terms pass through the DSL untouched);
+    everything else delegates to
+    :func:`object_synthesis.term_from_spec` — the discovery engine's
+    declarative term DSL (``str`` metavariables, ``int``/``float``
+    constants, ``(op, *specs[, attrs])`` nodes).  A trailing attr
+    ``dict`` is passed through un-resolved — its values are attr
+    metavariables, not term specs.
+    """
+    if not isinstance(spec, (tuple, list)):
+        return term_from_spec(spec)
+    if spec and spec[0] in ("var", "param"):
+        cls = Var if spec[0] == "var" else Param
+        return cls(spec[1], TensorType(tuple(spec[2])))
+    return term_from_spec(
+        tuple(s if isinstance(s, dict) else _spec_term(s) for s in spec)
+    )
 
 
 def seed_terms() -> list[Op]:
-    """Return the curated real terms the strategies mine."""
-    d = _D
-    x, y, z = _v("x", d, d), _v("y", d, d), _v("z", d, d)
-    a, b, c = _v("a", 3, 5), _v("b", 5, 2), _v("c", 2, 3)
-    w, w1, w2 = _p("W", d, d), _p("W1", d, d), _p("W2", d, d)
-    q = _v("q", 2, 8, 4)
-    k = _v("k", 2, 8, 4)
-    v = _v("v", 2, 8, 4)
-    return [
-        # matmul bracketing (associativity)
-        Op.make("matmul", a, Op.make("matmul", b, c)),
-        # elementwise duplication (CSE)
-        Op.make(
-            "add",
-            Op.make("square", Op.make("mul", x, y)),
-            Op.make("mul", Op.make("mul", x, y), Op.make("mul", x, y)),
-        ),
-        # weight-merge / distribute
-        Op.make(
-            "add", Op.make("matmul", x, w1), Op.make("matmul", x, w2)
-        ),
-        Op.make("matmul", w, Op.make("add", x, y)),
-        # stacked linear
-        Op.make("linear", Op.make("linear", x, w1), w2),
-        # swiglu
-        Op.make(
-            "mul",
-            Op.make("silu", Op.make("matmul", x, w1)),
-            Op.make("matmul", x, w2),
-        ),
-        # attention path
-        Op.make(
-            "matmul",
-            Op.make(
-                "softmax",
-                Op.make(
-                    "matmul",
-                    q,
-                    Op.make("transpose", k, dim0=-2, dim1=-1),
-                ),
-                dim=-1,
-            ),
-            v,
-        ),
-        # elementwise algebra
-        Op.make(
-            "add",
-            Op.make("mul", x, y),
-            Op.make("mul", x, z),
-        ),
-        Op.make("add", Op.make("neg", x), Op.make("neg", y)),
-        Op.make("mul", Op.make("exp", x), Op.make("exp", y)),
-        Op.make("sub", x, Op.make("neg", y)),
-        Op.make("square", Op.make("neg", x)),
-        Op.make("add", x, x),
-        Op.make("mul", x, Const(0)),
-        Op.make("pow", x, Const(1)),
-        Op.make("sub", x, x),
-    ]
+    """Return the curated real terms the strategies mine.
+
+    The corpus is data — :data:`catopt_discovery.lawdata.SEED_TERMS`,
+    one declarative term spec per program.
+    """
+    return list(map(_spec_term, lawdata.SEED_TERMS))
 
 
 # ---------------------------------------------------------------------------
@@ -677,162 +646,27 @@ def schema_candidates() -> list[Candidate]:
 
     Each schema is a mathematically-motivated equality (distributivity,
     factoring, absorption, annihilators, involutions, inverse
-    elements) instantiated on concrete shapes.  The set deliberately
-    mixes *true* identities with *false* ones (so the numeric oracle
-    is exercised) and includes a library duplicate (so the
-    structural classifier is exercised).  This is the strategy the
-    retro did not try — and the only one that yields a useful new law.
+    elements) instantiated on concrete shapes.  The library is data —
+    :data:`catopt_discovery.lawdata.GRAMMAR_SCHEMAS`, one ``(label,
+    lhs, rhs, note)`` spec row per candidate; it deliberately mixes
+    *true* identities with *false* ones (so the numeric oracle is
+    exercised) and includes a library duplicate (so the structural
+    classifier is exercised).  This is the strategy the retro did not
+    try — and the only one that yields a useful new law.
     """
-    d = _D
-    x, y, z = _v("x", d, d), _v("y", d, d), _v("z", d, d)
-    out: list[Candidate] = []
+    return list(map(_grammar_candidate, lawdata.GRAMMAR_SCHEMAS))
 
-    def add(label: str, lhs: Any, rhs: Any, note: str = "") -> None:
-        out.append(Candidate("schema", label, lhs, rhs, note))
 
-    # -- true: elementwise distributivity / factoring -----------------
-    add(
-        "mul_factor",
-        Op.make("add", Op.make("mul", x, y), Op.make("mul", x, z)),
-        Op.make("mul", x, Op.make("add", y, z)),
-        "x*y + x*z = x*(y+z)  (fewer nodes)",
+def _grammar_candidate(row: tuple) -> Candidate:
+    """Resolve one ``GRAMMAR_SCHEMAS`` row to a :class:`Candidate`."""
+    label, lhs, rhs, note = row
+    return Candidate(
+        "schema",
+        label,
+        _spec_term(lhs),
+        _spec_term(rhs),
+        note,
     )
-    add(
-        "mul_distribute",
-        Op.make("mul", x, Op.make("add", y, z)),
-        Op.make("add", Op.make("mul", x, y), Op.make("mul", x, z)),
-        "reverse (expands)",
-    )
-    add(
-        "mul_factor_right",
-        Op.make("add", Op.make("mul", y, x), Op.make("mul", z, x)),
-        Op.make("mul", Op.make("add", y, z), x),
-        "right-slot variant",
-    )
-    add(
-        "neg_factor",
-        Op.make("add", Op.make("neg", x), Op.make("neg", y)),
-        Op.make("neg", Op.make("add", x, y)),
-        "-x + -y = -(x+y)",
-    )
-    add(
-        "neg_distribute",
-        Op.make("neg", Op.make("add", x, y)),
-        Op.make("add", Op.make("neg", x), Op.make("neg", y)),
-        "reverse (expands)",
-    )
-    add(
-        "sub_add_factor",
-        Op.make("sub", Op.make("sub", x, y), z),
-        Op.make("sub", x, Op.make("add", y, z)),
-        "(x-y)-z = x-(y+z)",
-    )
-    add(
-        "div_add",
-        Op.make("div", Op.make("add", x, y), z),
-        Op.make("add", Op.make("div", x, z), Op.make("div", y, z)),
-        "(x+y)/z = x/z + y/z",
-    )
-    add(
-        "square_neg",
-        Op.make("square", Op.make("neg", x)),
-        Op.make("square", x),
-        "(-x)^2 = x^2",
-    )
-    add(
-        "exp_factor",
-        Op.make("mul", Op.make("exp", x), Op.make("exp", y)),
-        Op.make("exp", Op.make("add", x, y)),
-        "e^x e^y = e^(x+y)",
-    )
-    add(
-        "exp_distribute",
-        Op.make("exp", Op.make("add", x, y)),
-        Op.make("mul", Op.make("exp", x), Op.make("exp", y)),
-        "reverse (expands)",
-    )
-    add(
-        "mul_neg",
-        Op.make("mul", Op.make("neg", x), y),
-        Op.make("neg", Op.make("mul", x, y)),
-        "(-x)y = -(xy)",
-    )
-    add(
-        "square_mul",
-        Op.make("square", Op.make("mul", x, y)),
-        Op.make("mul", Op.make("square", x), Op.make("square", y)),
-        "(xy)^2 = x^2 y^2",
-    )
-    add(
-        "sigmoid_neg",
-        Op.make("sigmoid", Op.make("neg", x)),
-        Op.make("sub", Const(1), Op.make("sigmoid", x)),
-        "sigma(-x) = 1 - sigma(x)",
-    )
-    # -- true: annihilators / identity elements -----------------------
-    add(
-        "mul_zero",
-        Op.make("mul", x, Const(0)),
-        Const(0),
-        "x*0 = 0",
-    )
-    add(
-        "mul_zero_left",
-        Op.make("mul", Const(0), x),
-        Const(0),
-        "0*x = 0",
-    )
-    add(
-        "pow_one",
-        Op.make("pow", x, Const(1)),
-        x,
-        "x^1 = x",
-    )
-    add(
-        "sub_self",
-        Op.make("sub", x, x),
-        Const(0),
-        "x - x = 0",
-    )
-    add(
-        "add_inv",
-        Op.make("add", x, Op.make("neg", x)),
-        Const(0),
-        "x + (-x) = 0",
-    )
-    add(
-        "div_self",
-        Op.make("div", x, x),
-        Const(1),
-        "x / x = 1",
-    )
-    # -- duplicate of a library law (classifier control) --------------
-    add(
-        "sub_to_add_dup",
-        Op.make("sub", x, y),
-        Op.make("add", x, Op.make("neg", y)),
-        "already in the library",
-    )
-    # -- false identities (numeric-oracle controls) -------------------
-    add(
-        "FALSE_mul_factor",
-        Op.make("add", Op.make("mul", x, y), Op.make("mul", x, z)),
-        Op.make("mul", x, Op.make("add", x, z)),
-        "false: x*y + x*z != x*(x+z)",
-    )
-    add(
-        "FALSE_exp_add",
-        Op.make("exp", Op.make("add", x, y)),
-        Op.make("add", Op.make("exp", x), Op.make("exp", y)),
-        "false: e^(x+y) != e^x + e^y",
-    )
-    add(
-        "FALSE_square_add",
-        Op.make("square", Op.make("add", x, y)),
-        Op.make("add", Op.make("square", x), Op.make("square", y)),
-        "false: (x+y)^2 != x^2 + y^2",
-    )
-    return out
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,7 @@ from catopt_torch.adapters import TorchSink
 # Sibling tools own the corpus, the census, the oracle, the pipeline
 # and the five-gate validity checker; reuse them so a generated term
 # is judged by exactly the machinery real models are judged by.
+from catopt_discovery import lawdata
 from catopt_discovery import pipeline as lpipe
 from catopt_discovery import proposal as lp
 from catopt_discovery import workload_gen as lwg
@@ -114,26 +115,14 @@ _ATTEMPTS = 400
 #: Distinct instances kept per candidate.
 _INSTANCES = 2
 
-#: Leaf-shape pool for metavariable instantiation.  Uniform draws
-#: cover the pointwise laws (all metavars one shape); the broadcastable
-#: entries (``(1,)``, ``(4,1)``, ``()``) give mixed-view candidates a
-#: non-view operand that composes on BOTH sides of the rewrite.
-_SHAPE_POOL = [
-    (4, 16),
-    (16, 16),
-    (2, 8, 16),
-    (8, 8),
-    (16,),
-    (4, 8),
-    (4, 1),
-    (1, 16),
-    (1,),
-    (),
-    (2, 4, 4),
-]
+#: Leaf-shape pool for metavariable instantiation — the table lives
+#: in :mod:`catopt_discovery.lawdata` (:data:`SHAPE_POOL`); bound to
+#: the private name so a monkeypatched pool still applies.
+_SHAPE_POOL = lawdata.SHAPE_POOL
 
-#: Uniform base shapes tried first, in order, before random draws.
-_BASE_SHAPES = [(4, 16), (16, 16), (2, 8, 16)]
+#: Uniform base shapes tried first, in order, before random draws
+#: (:data:`catopt_discovery.lawdata.BASE_SHAPES`).
+_BASE_SHAPES = lawdata.BASE_SHAPES
 
 
 # ---------------------------------------------------------------------------

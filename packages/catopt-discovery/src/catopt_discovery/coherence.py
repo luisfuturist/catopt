@@ -73,6 +73,7 @@ from catopt_core.meta import (
     pattern_metavars,
 )
 
+from catopt_discovery import lawdata
 from catopt_discovery import verifier as lv
 
 __all__ = [
@@ -419,21 +420,9 @@ def catalogue(
 
 #: The select_mul / softmax_fold / transpose_push_mul neighbourhood:
 #: the folds and the layout/pointwise naturality laws they touch.
-_CLUSTER = (
-    "select_mul",
-    "softmax_fold",
-    "sdpa_fold_add",
-    "sdpa_fold_addmul",
-    "comm_mul",
-    "comm_add",
-    "transpose_push_mul",
-    "transpose_pull_mul",
-    "transpose_push_add",
-    "transpose_pull_add",
-    "transpose_push_exp",
-    "transpose_transpose_dd",
-    "transpose_matmul",
-)
+#: The hand-picked member list is data in
+#: :mod:`catopt_discovery.lawdata` (:data:`COHERENCE_CLUSTER`).
+_CLUSTER = lawdata.COHERENCE_CLUSTER
 
 
 def _cluster_section() -> str:

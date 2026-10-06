@@ -60,7 +60,7 @@ from catopt_core.meta import (
     pattern_metavars,
 )
 
-from catopt_discovery import REPO_ROOT
+from catopt_discovery import REPO_ROOT, lawdata
 
 __all__ = [
     "LawResult",
@@ -314,24 +314,17 @@ def instance_of(rule: Any, size: int = _SIZE) -> tuple[Any, Any] | None:
 
 
 #: Leaf shapes for the SDPA-fold family's metavariables — the only
-#: rules the bench registry does not cover.  ``(B,H,T,D)`` scores feed
-#: ``(B,H,T,T)`` masks and a ``(B,H,T,D)`` value.
-_LEAF_SHAPES: dict[str, tuple[int, ...]] = {
-    "Q": (2, 4, 8, 4),
-    "K": (2, 4, 8, 4),
-    "V": (2, 4, 8, 4),
-    "M": (2, 4, 8, 8),
-    "MK": (2, 4, 8, 8),
-}
+#: rules the bench registry does not cover.  The table lives in
+#: :mod:`catopt_discovery.lawdata` (:data:`INSTANCE_LEAF_SHAPES`).
+_LEAF_SHAPES: dict[str, tuple[int, ...]] = lawdata.INSTANCE_LEAF_SHAPES
 
-#: Attr-metavariable defaults for the SDPA-fold family.
-_ATTR_DEFAULTS: dict[str, Any] = {
-    "TD1": -2,
-    "TD2": -1,
-    "SD": -1,
-    "DP": 0.5,
-    "DT": True,
-}
+#: Attr-metavariable defaults for the SDPA-fold family
+#: (:data:`catopt_discovery.lawdata.INSTANCE_ATTR_DEFAULTS`).
+_ATTR_DEFAULTS: dict[str, Any] = lawdata.INSTANCE_ATTR_DEFAULTS
+
+#: Scalar metavariable defaults — the ``Const`` a name mints
+#: (:data:`catopt_discovery.lawdata.INSTANCE_SCALAR_MVARS`).
+_SCALAR_MVARS: dict[str, int | float] = lawdata.INSTANCE_SCALAR_MVARS
 
 
 def generic_instance(rule: Any) -> tuple[Any, Any] | None:
@@ -354,10 +347,8 @@ def generic_instance(rule: Any) -> tuple[Any, Any] | None:
             subst[mv] = _ATTR_DEFAULTS[name]
         elif mv in _LEAF_SHAPES:
             subst[mv] = Var(mv, TensorType(_LEAF_SHAPES[mv]))
-        elif mv == "S":
-            subst[mv] = Const(0.5)
-        elif mv == "F":
-            subst[mv] = Const(float("-inf"))
+        elif mv in _SCALAR_MVARS:
+            subst[mv] = Const(_SCALAR_MVARS[mv])
         else:
             return None
     if rule.check is not None:

@@ -54,10 +54,8 @@ from catopt_core.egraph import (
 )
 from catopt_core.ir import (
     IR,
-    Const,
     Op,
     Param,
-    TensorType,
     Var,
 )
 from catopt_core.laws import ALL_RULES
@@ -66,7 +64,8 @@ from catopt_core.laws.base import R
 from catopt_orchestrator.optimize import _lower_extracted
 from catopt_torch.adapters import TorchSink, TorchSource
 
-from catopt_discovery import REPO_ROOT
+from catopt_discovery import REPO_ROOT, lawdata
+from catopt_discovery.proposal import _leaves, _spec_term
 
 # ``bench`` is a repo-root package, not an installed distribution —
 # the lazy ``from bench.suites...`` imports below need the root on
@@ -104,9 +103,6 @@ _RTOL = 1e-4
 #: Scale knob for the bench-case builders.
 _BENCH_SIZE = 32
 
-#: Shapes for the synthetic control's Vars.
-_D = 4
-
 
 # ---------------------------------------------------------------------------
 #  The 11 proposed laws — encoded here, never in ``packages/``
@@ -116,95 +112,29 @@ _D = 4
 def new_laws() -> list[Rewrite]:
     """Return the 11 candidate laws as fireable ``Rewrite`` values.
 
-    Names are prefixed ``cand_`` so a run can never shadow a shipped
-    rule.  All are unconditional (the pattern already restricts the
-    shape); the conditional caveats the proposal retro records
-    (``x/x`` needs ``x != 0``, the annihilators carry the usual
-    ``inf``/``nan`` fp caveat) are noted in the companion retro, not
-    encoded as ``check`` hooks — the point is to measure whether the
-    pattern matches at all.
+    The candidates are data — :data:`catopt_discovery.lawdata.CANDIDATE_LAWS`,
+    one ``(name, lhs, rhs, law-note)`` spec row per law.  Names are
+    prefixed ``cand_`` so a run can never shadow a shipped rule.  All
+    are unconditional (the pattern already restricts the shape); the
+    conditional caveats the proposal retro records (``x/x`` needs
+    ``x != 0``, the annihilators carry the usual ``inf``/``nan`` fp
+    caveat) are noted in the companion retro, not encoded as
+    ``check`` hooks — the point is to measure whether the pattern
+    matches at all.
     """
-    x, y, z = "x", "y", "z"
-    sim = (_tags.SIMPLIFICATION,)
-    return [
-        R(
-            "cand_mul_factor",
-            Op.make("add", Op.make("mul", x, y), Op.make("mul", x, z)),
-            Op.make("mul", x, Op.make("add", y, z)),
-            law="x*y + x*z = x*(y+z)  (factoring).",
-            tags=sim,
-        ),
-        R(
-            "cand_mul_factor_right",
-            Op.make("add", Op.make("mul", y, x), Op.make("mul", z, x)),
-            Op.make("mul", Op.make("add", y, z), x),
-            law="y*x + z*x = (y+z)*x  (right-slot factoring).",
-            tags=sim,
-        ),
-        R(
-            "cand_neg_factor",
-            Op.make("add", Op.make("neg", x), Op.make("neg", y)),
-            Op.make("neg", Op.make("add", x, y)),
-            law="-x + -y = -(x+y).",
-            tags=sim,
-        ),
-        R(
-            "cand_square_neg",
-            Op.make("square", Op.make("neg", x)),
-            Op.make("square", x),
-            law="(-x)^2 = x^2.",
-            tags=sim,
-        ),
-        R(
-            "cand_exp_factor",
-            Op.make("mul", Op.make("exp", x), Op.make("exp", y)),
-            Op.make("exp", Op.make("add", x, y)),
-            law="e^x * e^y = e^(x+y).",
-            tags=sim,
-        ),
-        R(
-            "cand_mul_zero",
-            Op.make("mul", x, Const(0)),
-            Const(0),
-            law="x * 0 = 0.",
-            tags=sim,
-        ),
-        R(
-            "cand_mul_zero_left",
-            Op.make("mul", Const(0), x),
-            Const(0),
-            law="0 * x = 0.",
-            tags=sim,
-        ),
-        R(
-            "cand_pow_one",
-            Op.make("pow", x, Const(1)),
-            x,
-            law="x^1 = x.",
-            tags=sim,
-        ),
-        R(
-            "cand_sub_self",
-            Op.make("sub", x, x),
-            Const(0),
-            law="x - x = 0.",
-            tags=sim,
-        ),
-        R(
-            "cand_add_inv",
-            Op.make("add", x, Op.make("neg", x)),
-            Const(0),
-            law="x + (-x) = 0.",
-            tags=sim,
-        ),
-        R(
-            "cand_div_self",
-            Op.make("div", x, x),
-            Const(1),
-            law="x / x = 1.",
-            tags=sim,
-        ),
-    ]
+    return list(map(_candidate_law, lawdata.CANDIDATE_LAWS))
+
+
+def _candidate_law(row: tuple) -> Rewrite:
+    """Resolve one ``CANDIDATE_LAWS`` row to a ``Rewrite``."""
+    name, lhs, rhs, note = row
+    return R(
+        name,
+        _spec_term(lhs),
+        _spec_term(rhs),
+        law=note,
+        tags=(_tags.SIMPLIFICATION,),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -513,100 +443,41 @@ def model_cases() -> tuple[list[TermCase], list[str]]:
     return cases, errors
 
 
-def _v(name: str, *shape: int) -> Var:
-    """Return a named tensor variable."""
-    return Var(name, TensorType(tuple(shape)))
-
-
 def synthetic_cases() -> list[TermCase]:
     """Return one designed witness term per law (the control).
 
     Each is the law's own LHS instantiated on small, nonzero fp64
-    tensors — the term the law *should* fire on.  A zero here would
-    mean the harness is broken, not that the law is useless.
+    tensors — the term the law *should* fire on.  The cases are data
+    (:data:`catopt_discovery.lawdata.SYNTHETIC_CASES`: ``(name, term
+    spec, var names)`` — the names order ``inputs``/``feed``).  A
+    zero here would mean the harness is broken, not that the law is
+    useless.
     """
-    d = _D
-    x, y, z = _v("x", d, d), _v("y", d, d), _v("z", d, d)
-    xyz = (x, y, z)
+    return list(map(_synthetic_case, lawdata.SYNTHETIC_CASES))
 
-    def feed(*vars_: Var) -> tuple:
-        return tuple(
-            torch.randn(
-                tuple(cast("int", d) for d in v.typ.shape),
-                dtype=torch.float64,
-            )
-            + 1.0
-            for v in vars_
-        )
 
-    specs: list[tuple[str, Any, tuple]] = [
-        (
-            "cand_mul_factor",
-            Op.make("add", Op.make("mul", x, y), Op.make("mul", x, z)),
-            xyz,
-        ),
-        (
-            "cand_mul_factor_right",
-            Op.make("add", Op.make("mul", y, x), Op.make("mul", z, x)),
-            xyz,
-        ),
-        (
-            "cand_neg_factor",
-            Op.make("add", Op.make("neg", x), Op.make("neg", y)),
-            (x, y),
-        ),
-        (
-            "cand_square_neg",
-            Op.make("square", Op.make("neg", x)),
-            (x,),
-        ),
-        (
-            "cand_exp_factor",
-            Op.make("mul", Op.make("exp", x), Op.make("exp", y)),
-            (x, y),
-        ),
-        (
-            "cand_mul_zero",
-            Op.make("mul", x, Const(0)),
-            (x,),
-        ),
-        (
-            "cand_mul_zero_left",
-            Op.make("mul", Const(0), x),
-            (x,),
-        ),
-        (
-            "cand_pow_one",
-            Op.make("pow", x, Const(1)),
-            (x,),
-        ),
-        (
-            "cand_sub_self",
-            Op.make("sub", x, x),
-            (x,),
-        ),
-        (
-            "cand_add_inv",
-            Op.make("add", x, Op.make("neg", x)),
-            (x,),
-        ),
-        (
-            "cand_div_self",
-            Op.make("div", x, x),
-            (x,),
-        ),
-    ]
-    return [
-        TermCase(
-            source="synthetic",
-            name=name,
-            term=term,
-            inputs=tuple(vars_),
-            feed=feed(*vars_),
-            param_vals={},
+def _synthetic_case(row: tuple) -> TermCase:
+    """Resolve one ``SYNTHETIC_CASES`` row to a :class:`TermCase`."""
+    name, spec, var_names = row
+    term = _spec_term(spec)
+    by_name = {leaf.name: leaf for leaf in _leaves(term)}
+    vars_ = tuple(by_name[n] for n in var_names)
+    feed = tuple(
+        torch.randn(
+            tuple(cast("int", d) for d in v.typ.shape),
+            dtype=torch.float64,
         )
-        for name, term, vars_ in specs
-    ]
+        + 1.0
+        for v in vars_
+    )
+    return TermCase(
+        source="synthetic",
+        name=name,
+        term=term,
+        inputs=vars_,
+        feed=feed,
+        param_vals={},
+    )
 
 
 # ---------------------------------------------------------------------------

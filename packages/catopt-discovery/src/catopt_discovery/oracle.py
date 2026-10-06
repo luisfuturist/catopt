@@ -73,7 +73,10 @@ from catopt_core.ir import Const, Op, Param, TensorType, Var, op_repr
 from catopt_core.opmeta import REDUCE_DIM_OPS, VIEWISH_OPS
 
 # Sibling tools own the corpus, the eval backend and the comparator;
-# reuse them, never duplicate.
+# reuse them, never duplicate.  The enumeration *banks* (shape banks,
+# attr kinds, per-op constants, tuple sources) are pure data in
+# ``catopt_discovery.lawdata`` — the table lives there, bound here.
+from catopt_discovery import lawdata
 from catopt_discovery import proposal as lp
 
 __all__ = [
@@ -511,102 +514,16 @@ def _attr_options(
 
 #: Canonical attr names -> the value kind the sweep can enumerate.
 #: ``ATTR_SCHEMA`` *names* every positional attr; this table *types*
-#: the names.  ``dim`` defaults to a plain axis — the reduction ops
-#: and the normalized-shape spellings override below.
-_ATTR_KINDS: dict[str, str] = {
-    # axes — valid values are ``-rank..rank-1`` of the operand
-    "dim": "axis",
-    "dim0": "axis",
-    "dim1": "axis",
-    "start_dim": "axis",
-    "end_dim": "axis",
-    "source": "axis",
-    "destination": "axis",
-    # small ints — indices, counts, bounds, kernel sizes
-    "index": "int",
-    "start": "int",
-    "end": "int",
-    "step": "int",
-    "length": "int",
-    "chunks": "int",
-    "k": "int",
-    "sections": "int",
-    "num_groups": "int",
-    "num_classes": "int",
-    "num_layers": "int",
-    "groups": "int",
-    "shifts": "int",
-    "diagonal": "int",
-    "correction": "int",
-    "upscale_factor": "int",
-    "downscale_factor": "int",
-    "stride": "int",
-    "padding": "int",
-    "dilation": "int",
-    "m": "int",
-    # float scalars — scales, epsilons, rates
-    "scale": "float",
-    "eps": "float",
-    "momentum": "float",
-    "p": "float",
-    "dropout_p": "float",
-    "dropout": "float",
-    "rtol": "float",
-    "atol": "float",
-    "alpha": "float",
-    "beta": "float",
-    "threshold": "float",
-    "min": "float",
-    "max": "float",
-    "input_scale": "float",
-    "value": "float",
-    "ord": "float",
-    # boolean flags
-    "keepdim": "bool",
-    "is_causal": "bool",
-    "enable_gqa": "bool",
-    "train": "bool",
-    "training": "bool",
-    "largest": "bool",
-    "sorted": "bool",
-    "descending": "bool",
-    "accumulate": "bool",
-    "equal_nan": "bool",
-    "cudnn_enabled": "bool",
-    "has_biases": "bool",
-    "bidirectional": "bool",
-    "batch_first": "bool",
-    "use_input_stats": "bool",
-    "right": "bool",
-    "out_int32": "bool",
-    # shape-typed tuples — normalized_shape and friends
-    "shape": "shape",
-    "sizes": "shape",
-    "size": "shape",
-    "pad": "shape",
-    # int-or-tuple axis lists (roll's ``dims``)
-    "dims": "red-dims",
-    # honestly unenumerable — string payloads, not scalars
-    "equation": "str",
-    "mode": "str",
-    "reduce": "str",
-    "layout": "str",
-}
+#: the names.  The table lives in :mod:`catopt_discovery.lawdata`
+#: (:data:`ATTR_KINDS`) — this is the same object bound to the
+#: consumer-side name.
+_ATTR_KINDS: dict[str, str] = lawdata.ATTR_KINDS
 
 #: ``(op, canonical-attr)`` pairs whose value kind differs from the
-#: name default — the attr names are honest but not typed, and these
-#: are the measured exceptions.
-_ATTR_KIND_OVERRIDES: dict[tuple[str, str], str] = {
-    # the norms' ``dim`` attr is aten's normalized_shape list, not an
-    # axis (``rms_norm(x, ns, w, eps)`` / ``layer_norm``'s arg1).
-    ("layer_norm", "dim"): "shape",
-    ("rms_norm", "dim"): "shape",
-    # ``eye(n)`` / ``eye.m(n, m)`` — sizes, not axes.
-    ("eye", "dim"): "int",
-    # unfold's ``size`` is a kernel extent; upsample's ``size`` stays
-    # a shape tuple.
-    ("unfold", "size"): "int",
-}
+#: name default (:data:`catopt_discovery.lawdata.ATTR_KIND_OVERRIDES`).
+_ATTR_KIND_OVERRIDES: dict[tuple[str, str], str] = (
+    lawdata.ATTR_KIND_OVERRIDES
+)
 
 #: Ops whose ``dim`` attr accepts an axis OR a tuple of axes (the
 #: aten reduction signature) — the domain enumerates both spellings.
@@ -617,19 +534,19 @@ _REDUCTION_DIM_OPS = REDUCE_DIM_OPS
 #: metavar'd keys) — matches the view tables' per-node caps.
 _MAX_GENERIC_OPTIONS = 16
 
-#: Axes offered when the operand's shape is not visible (a free
-#: metavariable bound later, or a rank-0 operand): the common last-
-#: and first-axis spellings.  Out-of-range draws surface as counted
-#: eval errors — honest enumeration, honest accounting.
-_FALLBACK_AXES: list[int] = [-2, -1, 0, 1]
+#: Axes offered when the operand's shape is not visible
+#: (:data:`catopt_discovery.lawdata.FALLBACK_AXES`).  Out-of-range
+#: draws surface as counted eval errors — honest enumeration, honest
+#: accounting.
+_FALLBACK_AXES: tuple = lawdata.FALLBACK_AXES
 
 #: Trailing tuples offered for a shape-typed attr whose operand
-#: shape is unknown — plausible normalized-shape spellings.
-_FALLBACK_SHAPES: list[tuple] = [(1,), (2,), (4,), (2, 4)]
+#: shape is unknown (:data:`catopt_discovery.lawdata.FALLBACK_SHAPES`).
+_FALLBACK_SHAPES: tuple = lawdata.FALLBACK_SHAPES
 
-#: Sentinel shapes the free operand's derived bank always carries —
-#: the scalar corner and two generic mismatches.
-_FREE_SENTINELS: tuple = ((), (4,), (7, 7))
+#: Sentinel shapes the free operand's derived bank always carries
+#: (:data:`catopt_discovery.lawdata.FREE_SENTINELS`).
+_FREE_SENTINELS: tuple = lawdata.FREE_SENTINELS
 
 
 def _attr_kind(op: str, key: str) -> str | None:
@@ -727,61 +644,31 @@ def _generic_attr_options(
 # ---------------------------------------------------------------------------
 
 
-#: Shapes offered to a metavariable that sits under a view op.
-_VIEWED_SHAPES: tuple = (
-    (4,),
-    (2, 3),
-    (3, 4),
-    (2, 2),
-    (2, 3, 4),
-    (2, 3, 1),
-)
+#: Shapes offered to a metavariable that sits under a view op
+#: (:data:`catopt_discovery.lawdata.VIEWED_SHAPES`).
+_VIEWED_SHAPES: tuple = lawdata.VIEWED_SHAPES
 
 #: Extra viewed-bank shapes for patterns that contain an
-#: operand-*chained* view (``reshape(expand(unsqueeze(...)))``) — the
-#: rank-4 ``(b, t, h_kv, d)`` / ``(b, t, h, d)`` pair.  The chain's
-#: intermediate tensors are rank-4+, and ``gqa_absorb_repeat``'s
-#: corner (``repeat-heads``: ``q[-2] == k[-2] * r``) needs the head-dim
-#: product only a rank-4 pair supplies.  Scoped to chained patterns so
-#: chain-free enumerations are byte-identical: appending to the
-#: universal bank would add free-operand cells at existing index sums
-#: and displace already-measured window-tail sites.
-_CHAIN_VIEWED_SHAPES: tuple = (
-    (2, 3, 2, 4),
-    (2, 3, 4, 4),
-)
+#: operand-*chained* view
+#: (:data:`catopt_discovery.lawdata.CHAIN_VIEWED_SHAPES`).  Scoped to
+#: chained patterns so chain-free enumerations are byte-identical:
+#: appending to the universal bank would add free-operand cells at
+#: existing index sums and displace already-measured window-tail
+#: sites.
+_CHAIN_VIEWED_SHAPES: tuple = lawdata.CHAIN_VIEWED_SHAPES
 
 
 #: Per-op literal-constant domain — the values a metavariable's
 #: *parent op* admits, keyed by the op name.  The leaf bank's generic
 #: scalar corner mints a single ``Const(0.5)``; a shipped guard can
-#: demand a specific literal that corner never reaches, so the
-#: guarded-region sweep can never construct the site — the
-#: *domain-gapped* class of ``project/retros/cap-policy.md``.  Each
-#: entry is a measured widening:
-#:
-#: * ``pow`` — the exponent (``2`` for the square/RMSNorm spelling,
-#:   ``-0.5`` for the reciprocal-root; ``0.5`` / ``1`` round it out).
-#: * ``masked_fill`` — the softmax mask sentinel; ``-inf`` is the one
-#:   that clears the strict ``const-cmp F < -1e30`` (``-1e30`` itself
-#:   does not: the comparison is strict), the other two are the
-#:   finite analogues.
-#: * ``div`` — the scalar identities (``1`` for the numerator of the
-#:   ``1 / sqrt(x)`` spelling, ``0`` for the additive-identity probe).
-#:
-#: Only the ops a shipped guard actually constrains carry an entry.
-#: ``mul`` / ``add`` identities were measured too: no domain-gapped
-#: guard needs them, and minting them into every free operand under
-#: those ops perturbs the enumeration enough to push an *already*
-#: rescued corner out of the window (``mul_unsqueeze_l_id``'s equal
-#: count moves 23 → 21) — the bank feeds the enumeration, so a
-#: widening with no rescue to show for it is left out.  See
+#: demand a specific literal that corner never reaches (the
+#: *domain-gapped* class of ``project/retros/cap-policy.md``).  Only
+#: the ops a shipped guard actually constrains carry an entry —
+#: ``mul`` / ``add`` identities were measured and left out (a
+#: widening with no rescue perturbs the capped order).  The table
+#: lives in :mod:`catopt_discovery.lawdata`; see
 #: ``project/retros/value-bank.md`` for the measured cost.
-_CONST_DOMAIN: dict[str, tuple[int | float, ...]] = {
-    "pow": (2, -0.5, 0.5, 1),
-    "masked_fill": (-float("inf"), -1e30, 1e9),
-    "div": (1, 0),
-}
+_CONST_DOMAIN: dict[str, tuple[int | float, ...]] = lawdata.CONST_DOMAIN
 
 
 def _const_domain(parents: set[str]) -> list[Const]:
@@ -828,12 +715,13 @@ def _tuple_sources(mv: str) -> list[Any]:
     the dim-0 tensor index.  Both meanings are instantiated; the
     eval decides.
     """
-    w = Var(f"{mv}@t", TensorType((2, 4)))
-    return [
-        Op.make("topk", w, k=2),
-        Op.make("var_mean", w, dim=(-1,), correction=0, keepdim=True),
-        Op.make("cummax", w, dim=0),
-    ]
+    w = Var(f"{mv}@t", TensorType(lawdata.TUPLE_SOURCE_SHAPE))
+    return list(
+        map(
+            lambda oa: Op.make(oa[0], w, **oa[1]),
+            lawdata.TUPLE_SOURCES,
+        )
+    )
 
 
 def _leaf_bindings(

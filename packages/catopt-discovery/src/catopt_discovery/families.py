@@ -29,6 +29,8 @@ from typing import Any
 from catopt_core.ir import Op, TensorType, Var
 from catopt_core.trajectories import rule_samples
 
+from catopt_discovery import lawdata
+
 __all__ = [
     "FAMILIES",
     "chain",
@@ -43,14 +45,17 @@ __all__ = [
     "summarize",
 ]
 
-#: The family names, in report order.
-FAMILIES: tuple[str, ...] = ("chain", "dup", "linear")
+#: The family names, in report order — data in
+#: :mod:`catopt_discovery.lawdata` (:data:`FAMILIES`), bound here.
+FAMILIES: tuple[str, ...] = lawdata.FAMILIES
 
-#: ``(d_in, d_hidden, d_out)`` shapes for the linear family — training.
-_LINEAR_TRAIN = ((8, 16, 8), (8, 24, 8), (6, 12, 6), (10, 20, 10))
+#: ``(d_in, d_hidden, d_out)`` shapes for the linear family — training
+#: (:data:`catopt_discovery.lawdata.LINEAR_TRAIN_SHAPES`).
+_LINEAR_TRAIN = lawdata.LINEAR_TRAIN_SHAPES
 
-#: Held-out linear shapes (widths unseen in training).
-_LINEAR_HELD = ((7, 18, 7), (9, 21, 9), (12, 26, 12), (11, 22, 11))
+#: Held-out linear shapes (widths unseen in training)
+#: (:data:`catopt_discovery.lawdata.LINEAR_HELD_SHAPES`).
+_LINEAR_HELD = lawdata.LINEAR_HELD_SHAPES
 
 
 def _v(name: str, *shape: int) -> Var:

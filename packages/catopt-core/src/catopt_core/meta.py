@@ -88,6 +88,7 @@ from collections.abc import Iterable
 from typing import Any, Protocol
 
 import catopt_core.laws as R
+from catopt_core import lawdata
 from catopt_core.egraph import EGraph, Rewrite
 from catopt_core.egraph.terms import (
     _replace_subterm,
@@ -102,30 +103,11 @@ from catopt_core.ir import Const, Op, Param, Var, op_repr
 #  Part A.1 — coherence classification
 # ---------------------------------------------------------------------------
 
-#: Rules that express pure coherence: symmetry/associativity/identity/
-#: involution.  They generate every *equivalent bracketing* of the same
-#: computation — the search-space the e-graph should never store.
-#: ``om_assoc``/``om_assoc_rev`` live in catopt_carriers.om (same law family:
-#: associativity of a monoid's compose).
-COHERENT_RULE_NAMES: frozenset[str] = frozenset(
-    {
-        "comm_add",
-        "comm_mul",  # SMC symmetry
-        "assoc_add",
-        "assoc_mul",  # additive/multiplicative associativity
-        "id_add",
-        "id_mul",  # monoid units
-        "double_neg",  # involution
-        "assoc_matmul",
-        "assoc_matmul_rev",  # associativity of composition
-        "aff_assoc",
-        "aff_assoc_rev",  # affine-map monoid associativity
-        "affd_assoc",
-        "affd_assoc_rev",  # diagonal-affine monoid assoc.
-        "om_assoc",
-        "om_assoc_rev",  # online-softmax monoid assoc.
-    }
-)
+#: Rules that express pure coherence — the search-space the e-graph
+#: should never store.  The table lives in :mod:`catopt_core.lawdata`
+#: (the law-vocabulary data home); this is the same object bound here
+#: so callers — and the tests that pin it — read it unchanged.
+COHERENT_RULE_NAMES: frozenset[str] = lawdata.COHERENT_RULE_NAMES
 
 
 def module_rules(mod=R) -> list[Rewrite]:
@@ -163,15 +145,12 @@ def classify_rules(
 #  Part A.2 — canonicalize: eager coherence normalization
 # ---------------------------------------------------------------------------
 
-#: Commutative + associative ops with a dropped identity element.
-_AC_IDENTITY: dict[str, float] = {"add": 0.0, "mul": 1.0}
+#: The canonicalizer's monoid vocabulary — lawdata content bound to
+#: the private names the canonicalize pass reads.
+_AC_IDENTITY: dict[str, float] = lawdata.AC_IDENTITY
 
-#: Associative but NOT commutative ops: chains flatten in order and
-#: rebuild balanced.  For ``aff_compose`` the balanced form is the
-#: parallel-scan (Blelloch) bracketing — computed here, not searched.
-_ASSOC_ONLY: frozenset[str] = frozenset(
-    {"matmul", "aff_compose", "affd_compose"}
-)
+#: Associative but NOT commutative ops (:data:`catopt_core.lawdata.ASSOC_ONLY`).
+_ASSOC_ONLY: frozenset[str] = lawdata.ASSOC_ONLY
 
 
 def _sort_key(t: Any) -> str:
@@ -1049,28 +1028,16 @@ def _fresh_leaves(n: int, shape: tuple = (4, 4)) -> list[Var]:
     return [Var(f"_synth_{i}", TensorType(shape)) for i in range(n)]
 
 
-#: Leaf shapes tried when instantiating a candidate LHS for validation.
-#: ``(4,4)`` satisfies shape-checked guards on rank-2 terms; ``()``
-#: catches guards requiring scalar bindings.  A candidate whose guards
-#: need a mixed/other profile is rejected — conservative, never unsound.
-_LEAF_SHAPES: tuple = ((4, 4), ())
+#: Leaf shapes tried when instantiating a candidate LHS for
+#: validation — the instantiation bank lives in
+#: :mod:`catopt_core.lawdata` (:data:`INSTANTIATE_LEAF_SHAPES`); a
+#: candidate whose guards need a profile outside the bank is rejected
+#: — conservative, never unsound.
+_LEAF_SHAPES: tuple = lawdata.INSTANTIATE_LEAF_SHAPES
 
 #: Values enumerated for attribute metavariables in a candidate LHS
-#: (dims first — they dominate; a few shapes for view-style attrs).
-_ATTR_POOL: tuple = (
-    -1,
-    -2,
-    1,
-    2,
-    0,
-    -3,
-    3,
-    4,
-    -4,
-    (4, 4),
-    (4,),
-    (2, 4, 4),
-)
+#: (:data:`catopt_core.lawdata.INSTANTIATE_ATTR_POOL`).
+_ATTR_POOL: tuple = lawdata.INSTANTIATE_ATTR_POOL
 
 #: Cap on LHS instantiations tried per leaf-shape profile.
 _MAX_INSTANTIATIONS: int = 400
