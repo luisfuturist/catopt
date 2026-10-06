@@ -21,6 +21,18 @@ material:
   premise's RHS by a second premise at pattern level, producing the
   composite object (``compose(aff_lift, aff_lift)`` — the two-step
   scan lift — exists in no shipped ruleset).
+* :func:`relax_guard` — **weaken a guard**: drop one conjunct of an
+  object's declarative ``cond``, growing the accepted region — a
+  candidate the guarded-region sweep re-measures.
+* :func:`specialize` — **narrow an object**: bind a leaf metavariable
+  to a concrete term, or pin an attr metavariable to a concrete value
+  (``select_mul`` under ``D=0``) — the instance family shrinks.
+* :func:`auto_cond_object` — **mint a guard**: the smallest
+  declarative ``cond`` separating the measured domain.
+
+:data:`CONSTRUCTORS` is the op-name registry the arena drives;
+:func:`construct` is its dispatch entry point (``construct(op_name,
+*args, store) -> record | None``).
 
 Each operation returns a :class:`ConstructedObject`: the ``Rewrite``
 plus its provenance — the construction trace and the premise names.
@@ -58,7 +70,11 @@ from catopt_core.egraph.terms import (
 )
 from catopt_core.ir import Const, Op
 from catopt_core.laws import tags as _tags
-from catopt_core.laws.cond import eval_cond
+from catopt_core.laws.cond import (
+    cond_from_data,
+    eval_cond,
+    eval_derive,
+)
 from catopt_core.meta import (
     _positions,
     _subterm,
@@ -68,13 +84,17 @@ from catopt_core.meta import (
 )
 
 __all__ = [
+    "CONSTRUCTORS",
     "AutoCond",
     "ConstructedObject",
     "auto_cond_object",
     "compose_objects",
+    "construct",
     "fold_object",
     "lift_object",
     "object_record",
+    "relax_guard",
+    "specialize",
     "store_constructed",
     "term_from_spec",
 ]
@@ -540,6 +560,634 @@ def compose_objects(
         rule=rule,
         kind=kind,
         construction=("compose", *premises),
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Guard manipulation — relax / specialize
+# ---------------------------------------------------------------------------
+#
+#  The arena's last two construction moves operate on the *guard* —
+#  the lever the real-corpus measurement showed mattering
+#  (``project/retros/auto-cond.md``: guards minted correctly but too
+#  tight for real sites, or too coarse to fire).  Both mint a plain
+#  :class:`ConstructedObject` on the same record path as
+#  fold/lift/compose — store-able, reconstructable, gauntlet-able —
+#  and both stay honest: the output is a *candidate*, never a proof.
+#
+#  * :func:`relax_guard` drops one conjunct of a declarative ``cond``.
+#    An ``and`` minus a conjunct accepts a superset of the old region
+#    — monotonic by construction — so the honest statement is only
+#    "the region grew"; whether the grown region is still clean is
+#    the guarded sweep's measurement, not the constructor's promise.
+#  * :func:`specialize` narrows the object to an instance family: a
+#    leaf metavariable binds a concrete term spec (``S ↦ 4.0`` — the
+#    ``div`` divisor becomes a literal ``Const``), an attr metavariable
+#    takes a value pinned by a fresh ``("attr-eq", NAME, v)`` conjunct
+#    (``D=0`` on ``select_mul``).  The pin form keeps the attr
+#    metavariable bound at match time, so sibling clauses still read
+#    ``$attr:D`` — the narrower family without re-spelling the
+#    pattern.
+
+
+def _obj_kind(obj: Any) -> str:
+    """Return the declaration kind a premise carries.
+
+    A :class:`ConstructedObject` keeps its own ``kind``; a bare
+    ``Rewrite`` has no declaration kind (its ``.kind`` property is the
+    kernel taxonomy — axiom/lemma — not the object record's), so the
+    introduced-object default applies.
+    """
+    return (
+        obj.kind
+        if isinstance(obj, ConstructedObject)
+        else "abstraction"
+    )
+
+
+def _conjuncts(cond: Any) -> list | None:
+    """Return *cond*'s top-level conjuncts, or ``None`` if unguarded.
+
+    ``and`` flattens — ``("and", ("and", a, b), c)`` is three
+    conjuncts ``[a, b, c]`` (conjunction is associative; a nested
+    ``and`` carries no extra meaning).  Any other node — a bare
+    predicate, an ``("or", …)``, ``("not", …)``, a ``False`` literal —
+    is a single clause.  ``None`` / ``True`` carry no clause to drop.
+    """
+    if cond is None or cond is True:
+        return None
+    out: list = []
+
+    def _flatten(n: Any) -> None:
+        if isinstance(n, (tuple, list)) and n and n[0] == "and":
+            for c in n[1:]:
+                _flatten(c)
+        else:
+            out.append(n)
+
+    _flatten(cond)
+    return out
+
+
+def _clause_index(clauses: list, clause: Any) -> int | None:
+    """Resolve *clause* — an index or a clause datum — to a position.
+
+    An ``int`` is a position into the top-level conjunction (Pythonic
+    negatives allowed); anything else is matched as a clause datum,
+    canonicalised through ``cond_from_data`` so a JSON-shaped list
+    finds its tuple-tree twin.  ``None`` when the conjunct is absent.
+    """
+    if isinstance(clause, int) and not isinstance(clause, bool):
+        return (
+            clause if -len(clauses) <= clause < len(clauses) else None
+        )
+    want = cond_from_data(clause)
+    for i, c in enumerate(clauses):
+        if c == want:
+            return i
+    return None
+
+
+def relax_guard(
+    obj: Any,
+    clause: Any,
+    *,
+    name: str | None = None,
+    kind: str | None = None,
+) -> ConstructedObject | None:
+    """Drop one clause of *obj*'s declarative ``cond`` — the relaxed claim.
+
+    *obj* is a ``Rewrite`` or :class:`ConstructedObject`; *clause*
+    selects the conjunct to remove — an ``int`` index into the
+    top-level ``("and", …)`` (or ``0`` for a single-clause guard), or
+    the clause datum itself (lists canonicalise, so the JSON spelling
+    works).  The result keeps ``lhs``/``rhs``, tags, ``dspec`` and any
+    *procedural* ``check``/``derive`` remainder untouched — only the
+    declarative conjunction weakens.  Dropping the last conjunct
+    unguards the object (``cond=None``).
+
+    The accepted region can only grow — an ``and`` minus a conjunct
+    is a superset of itself — so a relaxed object is strictly a
+    *candidate*: the guarded-region sweep re-measures whether the
+    grown region stays clean, and the gauntlet decides.  The store
+    keys records on ``(lhs, rhs)`` — the relaxed object shares the
+    premise's alpha key, so storing it rewrites the guard under the
+    same row, the in-place update ``auto-cond`` already performs.
+
+    ``None`` is the honest decline: no declarative guard to relax
+    (an unguarded object, or one whose guard is pure procedural
+    ``check`` — code is not a clause and cannot be dropped), or
+    *clause* names nothing in the conjunction.
+    """
+    from catopt_core.laws.serialize import _proc_check, _proc_derive
+
+    rule = _as_rule(obj)
+    clauses = _conjuncts(rule.cond)
+    if clauses is None:
+        return None
+    i = _clause_index(clauses, clause)
+    if i is None:
+        return None
+    dropped = clauses[i]
+    new_rule = Rewrite(
+        name=name or rule.name,
+        lhs=rule.lhs,
+        rhs=rule.rhs,
+        law=rule.law,
+        check=rule.check if _proc_check(rule) else None,
+        derive=rule.derive if _proc_derive(rule) else None,
+        tags=rule.tags,
+        error_bound=rule.error_bound,
+        bound_norm=rule.bound_norm,
+        cond=_fold_and(clauses[:i] + clauses[i + 1 :]),
+        dspec=rule.dspec,
+    )
+    return ConstructedObject(
+        rule=new_rule,
+        kind=kind or _obj_kind(obj),
+        construction=("relax_guard", rule.name, repr(dropped)),
+        note=(
+            "dropped conjunct "
+            f"{dropped!r} — the accepted region can only grow; "
+            "the sweep re-measures it"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Specialize — bound-env reference analysis for the cond fold
+# ---------------------------------------------------------------------------
+#
+#  Specializing inlines a leaf metavariable into the pattern, which
+#  removes the name from the matcher's ``bound`` env — a declarative
+#  clause or derive expr that still reads it would dangle (the DSL's
+#  strictness declines on a missing key, silently vacuating the rule).
+#  The tables below name, per cond predicate / shape spec / derive
+#  expr, which argument positions read the bound env: ``"T"`` a term
+#  ref or shape spec (a metavar name or a nested spec), ``"A"`` an
+#  attr-metavar name (resolved under ``"$attr:"``), ``"e"`` a nested
+#  derive expr, ``"_"`` a literal.  The fold then decides a clause
+#  exactly when every name it reads is bound, and refuses the
+#  construction on a dangling read — never guesses.
+
+#: ``("T" | "A" | "_")`` per argument of each cond predicate.
+_PRED_REFS: dict[str, tuple] = {
+    "shaped": ("T",),
+    "concrete": ("T",),
+    "scalar": ("T",),
+    "uniform": ("T",),
+    "ones-but-last": ("T",),
+    "rank": ("T", "_", "_"),
+    "rank-eq": ("T", "T"),
+    "shape-eq": ("T", "T"),
+    "shape-compat": ("T", "T"),
+    "dim-eq": ("T", "_", "T", "_"),
+    "dim-compat": ("T", "_", "T", "_"),
+    "dim-eq-const": ("T", "_", "_"),
+    "dim-eq-attr": ("T", "A", "T", "A"),
+    "dim-mod": ("T", "A", "_", "_"),
+    "bcast-into": ("T", "T"),
+    "mm-shape-ok": ("T", "T"),
+    "axes-last2": ("T", "A", "A"),
+    "axes-distinct": ("T", "A", "A"),
+    "axes-eq": ("T", "A", "A", "A", "A"),
+    "axis": ("T", "A", "_"),
+    "op-in": ("T", "_"),
+    "leaf": ("T",),
+    "const": ("T",),
+    "term-eq": ("T", "T"),
+    "const-num": ("T",),
+    "const-cmp": ("T", "_", "_"),
+    "attr-is": ("A", "_"),
+    "attr-eq": ("A", "_"),
+    "attr-in": ("A", "_"),
+    "attr-type": ("A", "_"),
+    "attr-len": ("A", "_", "_"),
+    "attr-cmp-dim": ("A", "_", "T", "A"),
+    "attr-eq-attr": ("A", "A"),
+    "bcast-eq": ("T", "T", "T", "T"),
+    "ones-before": ("T", "A"),
+    "axes-noop": ("T", "A", "A"),
+    "axis-align-eq": ("T", "T", "A"),
+    "bcast-dim-inv": ("T", "T", "A"),
+    "flat-pair-unsq": ("T", "A", "T", "T"),
+    "flat-map-unsq": ("T", "A", "T", "T"),
+    "repeat-chain": ("T", "A", "A", "A"),
+    "repeat-heads": ("T", "T", "A", "A"),
+}
+
+#: ``("T" | "A")`` per argument of each shape spec — ``None`` literal
+#: slots (``slice-out``'s optional bounds) read nothing.
+_SPEC_REFS: dict[str, tuple] = {
+    "mm-out": ("T", "T"),
+    "bcast": ("T", "T"),
+    "unsq-out": ("T", "A"),
+    "reshape-out": ("T", "A"),
+    "getitem-out": ("T",),
+    "select-out": ("T", "A"),
+    "slice-out": ("T", "A", "A", "A", "A"),
+    "chunk-out": ("T", "A", "A"),
+    "transpose-out": ("T", "A", "A"),
+    "tail-block": ("T", "A"),
+}
+
+#: ``("e" | "T" | "A" | "_")`` per argument of each derive expr —
+#: ``tuple``/``concat`` are variadic over ``"e"`` children.
+_DEXPR_REFS: dict[str, tuple] = {
+    "lit": ("_",),
+    "attr": ("A",),
+    "attr0": ("A",),
+    "const": ("T",),
+    "shape": ("T",),
+    "dim": ("T", "_"),
+    "leaf-dim": ("T", "_"),
+    "len": ("e",),
+    "bcast": ("T", "T"),
+    "add": ("e", "e"),
+    "sub": ("e", "e"),
+    "mul": ("e", "e"),
+    "fdiv": ("e", "e"),
+    "floordiv": ("e", "e"),
+    "neg": ("e",),
+    "recip": ("e",),
+    "float": ("e",),
+    "int": ("e",),
+}
+
+
+def _sig_refs(sig: tuple, args: tuple, e_fn: Any) -> set | None:
+    """Union the bound-env refs of *args* under position table *sig*.
+
+    ``"T"`` args recurse into :func:`_shape_refs`, ``"e"`` args into
+    *e_fn*, ``"A"`` args read ``"$attr:<name>"``, ``"_"`` is a
+    literal.  ``None`` propagates a malformed node — the caller
+    refuses rather than guess.
+    """
+    refs: set = set()
+    for kind, a in zip(sig, args, strict=True):
+        if kind == "T":
+            r = _shape_refs(a)
+        elif kind == "e":
+            r = e_fn(a)
+        elif kind == "A":
+            r = {"$attr:" + a} if isinstance(a, str) else set()
+        else:
+            r = set()
+        if r is None:
+            return None
+        refs |= r
+    return refs
+
+
+def _shape_refs(spec: Any) -> set | None:
+    """Return the bound-env keys a shape spec may read, or ``None``.
+
+    A ``str`` is a metavariable ref; a tuple dispatches through
+    :data:`_SPEC_REFS` (``None`` marks a malformed spec — unknown op
+    or arity mismatch); any other literal reads nothing.
+    """
+    if isinstance(spec, str):
+        return {spec}
+    if not isinstance(spec, (tuple, list)) or not spec:
+        return set()
+    sig = _SPEC_REFS.get(spec[0])
+    args = tuple(spec[1:])
+    if sig is None or len(args) != len(sig):
+        return None
+    return _sig_refs(sig, args, _shape_refs)
+
+
+def _cond_refs(node: Any) -> set | None:
+    """Return the bound-env keys a cond node may read, or ``None``.
+
+    Term refs come back bare (``bound[name]``), attr refs prefixed
+    (``bound["$attr:name"]``).  ``None`` marks a node outside the
+    predicate table — the specialize fold refuses rather than guess.
+    """
+    if isinstance(node, bool):
+        return set()
+    if not isinstance(node, (tuple, list)) or not node:
+        return None
+    op = node[0]
+    if op in ("and", "or"):
+        refs: set = set()
+        for c in node[1:]:
+            r = _cond_refs(c)
+            if r is None:
+                return None
+            refs |= r
+        return refs
+    if op == "not":
+        return _cond_refs(node[1]) if len(node) == 2 else None
+    sig = _PRED_REFS.get(op)
+    args = tuple(node[1:])
+    if sig is None or len(args) != len(sig):
+        return None
+    return _sig_refs(sig, args, _cond_refs)
+
+
+def _dexpr_refs(node: Any) -> set | None:
+    """Return the bound-env keys a derive expr may read, or ``None``.
+
+    Bare scalars are literals; a bare ``str`` is *malformed* in expr
+    position (``_dexpr`` raises on it) — ``None``, like any unknown
+    op or arity mismatch.
+    """
+    if node is None or isinstance(node, (bool, int, float)):
+        return set()
+    if not isinstance(node, (tuple, list)) or not node:
+        return None
+    if node[0] in ("tuple", "concat"):
+        refs: set = set()
+        for a in node[1:]:
+            r = _dexpr_refs(a)
+            if r is None:
+                return None
+            refs |= r
+        return refs
+    sig = _DEXPR_REFS.get(node[0])
+    args = tuple(node[1:])
+    if sig is None or len(args) != len(sig):
+        return None
+    return _sig_refs(sig, args, _dexpr_refs)
+
+
+def _fold_comb(node: Any, bound: set, dead: set, env: dict) -> Any:
+    """Fold the children of an ``and``/``or``/``not`` node.
+
+    See :func:`_fold_bound` for the contract.  ``False`` absorbs an
+    ``and`` (the node decides False), ``True`` absorbs an ``or``; the
+    opposite constants are identity children and drop away.  A
+    ``None`` (unexpressible) child vetoes the whole fold — the caller
+    refuses the construction.
+    """
+    op = node[0]
+    if op == "not":
+        k = (
+            _fold_bound(node[1], bound, dead, env)
+            if len(node) == 2
+            else None
+        )
+        if k is None:
+            return None
+        return not k if isinstance(k, bool) else ("not", k)
+    absorbing = op == "and"  # and: False absorbs; or: True absorbs
+    kids: list = []
+    for c in node[1:]:
+        f = _fold_bound(c, bound, dead, env)
+        if f is None:
+            return None
+        if isinstance(f, bool):
+            if f != absorbing:
+                return f
+            continue
+        kids.append(f)
+    if not kids:
+        return absorbing
+    return kids[0] if len(kids) == 1 else (op, *kids)
+
+
+def _fold_bound(node: Any, bound: set, dead: set, env: dict) -> Any:
+    """Evaluate *node* against the specialize binding (partial fold).
+
+    *bound* is the bound-env key set the binding determines — the
+    inlined leaf metavariables plus the pinned ``$attr:`` names;
+    *dead* is the inlined-leaf subset; *env* maps inlined names to
+    their terms and pinned attrs to their values.
+
+    Returns ``True``/``False`` for a node the binding decides, the
+    node verbatim when every name it reads stays live (a pinned attr
+    metavariable still binds at match time, so a mixed clause
+    survives), or ``None`` when the node reads an inlined leaf
+    alongside live names — a dangling ref the DSL cannot re-express —
+    or when a decided node's evaluation itself fails.  The caller
+    refuses the construction on ``None`` and on a ``False`` root (a
+    guard the binding falsifies is a vacuous family, not an object).
+    """
+    if isinstance(node, bool):
+        return node
+    if not isinstance(node, (tuple, list)) or not node:
+        return None
+    if node[0] in ("and", "or", "not"):
+        return _fold_comb(node, bound, dead, env)
+    refs = _cond_refs(node)
+    if refs is None:
+        return None
+    if refs <= bound:
+        try:
+            return bool(eval_cond(node, env))
+        except (ValueError, TypeError, KeyError, IndexError):
+            return None
+    if refs & dead:
+        return None
+    return node
+
+
+def _norm_pin(value: Any) -> Any:
+    """Return the canonical pin value — list attrs spell as tuples."""
+    return tuple(value) if isinstance(value, list) else value
+
+
+def _pin_clause(name: str, value: Any) -> tuple:
+    """Return the clause pinning attr metavar *name* to *value*.
+
+    ``None``/``bool`` compare by identity (``attr-is``), everything
+    else by equality (``attr-eq``).
+    """
+    if value is None or isinstance(value, bool):
+        return ("attr-is", name, value)
+    return ("attr-eq", name, _norm_pin(value))
+
+
+def _split_binding(rule: Rewrite, binding: dict) -> tuple | None:
+    """Split *binding* into ``(leaf_subst, attr_pins)``, or decline.
+
+    A ``$attr:``-prefixed key always names an attr metavar pin; a
+    bare name binds a leaf metavar of the LHS when one exists — the
+    value goes through :func:`term_from_spec`, and a bare ``str`` is
+    a metavar rename, not a narrowing: declined.  Anything else is a
+    *tentative* pin — the caller validates it against the
+    *specialized* pattern's attr metavars (a bound spec can carry
+    attr metavars of its own).  ``None`` on a non-str key.
+    """
+    leaf = set(_mv_names(rule.lhs))
+    subst: dict = {}
+    pins: list[tuple[str, Any]] = []
+    for k, v in binding.items():
+        if not isinstance(k, str):
+            return None
+        if k.startswith("$attr:"):
+            pins.append((k[len("$attr:") :], _norm_pin(v)))
+            continue
+        if k in leaf:
+            if isinstance(v, str):
+                return None
+            subst[k] = term_from_spec(v)
+        else:
+            pins.append((k, _norm_pin(v)))
+    return subst, pins
+
+
+def _specialize_dspec(
+    dspec: Any, bound: set, dead: set, env: dict
+) -> Any:
+    """Rewrite a declarative ``dspec`` under the binding, or refuse.
+
+    Per ``(NAME, expr)`` pair: an expr the binding fully determines
+    evaluates once and folds to ``("lit", v)``; an expr reading only
+    live names rides verbatim; an expr touching an inlined leaf it
+    cannot fully evaluate is unexpressible — ``None``.  ``()`` for a
+    ``None`` spec keeps "no derive" distinct from the refusal.
+    """
+    if dspec is None:
+        return ()
+    out: list = []
+    for name, expr in dspec:
+        refs = _dexpr_refs(expr)
+        if refs is None:
+            return None
+        if refs <= bound:
+            vals = eval_derive(((name, expr),), env)
+            if vals is None:
+                return None
+            out.append((name, ("lit", vals[f"$attr:{name}"])))
+            continue
+        if refs & dead:
+            return None
+        out.append((name, expr))
+    return tuple(out)
+
+
+def _spec_split(rule: Rewrite, binding: dict) -> tuple | None:
+    """Resolve *binding* against *rule* — the specialize fold's inputs.
+
+    Returns ``(lhs2, rhs2, pins, bound, dead, env)``: the specialized
+    patterns, the attr pins as ``(name, value)`` pairs, the bound-env
+    key set the binding determines, the inlined-leaf subset, and the
+    evaluation fragment (inlined names to terms, pinned attrs to
+    values).  ``None`` is the honest decline — an unbound pin name,
+    or a leaf name that is also an attr metavar in the result.
+    """
+    split = _split_binding(rule, binding)
+    if split is None:
+        return None
+    subst, pins = split
+    lhs2 = _specialize(rule.lhs, subst)
+    rhs2 = _specialize(rule.rhs, subst)
+    # Pin names resolve against the *specialized* LHS: a bound spec
+    # can carry attr metavars of its own, and a leaf name that is
+    # also an attr metavar would bind ambiguously — decline both.
+    live_attrs = set(_attr_mvs(lhs2))
+    if any(n not in live_attrs for n, _v in pins):
+        return None
+    if live_attrs & set(subst):
+        return None
+    # An inlined name is dead only if no bound spec reintroduced it —
+    # ``{"h": ("add", ("mul", "a1", "h"), "x1")}`` leaves a live "h".
+    live = set(_mv_names(lhs2)) | set(_mv_names(rhs2))
+    dead = {m for m in subst if m not in live}
+    bound = dead | {f"$attr:{n}" for n, _v in pins}
+    env = {
+        **{m: subst[m] for m in dead},
+        **{f"$attr:{n}": v for n, v in pins},
+    }
+    return lhs2, rhs2, pins, bound, dead, env
+
+
+def _spec_cond(
+    cond: Any, bound: set, dead: set, env: dict, pins: list
+) -> Any:
+    """Fold the guard under the binding and conjunct the pins.
+
+    Returns the new ``cond`` — the folded clauses plus the pin
+    conjuncts (``None`` when everything discharged).  ``False`` is
+    the refuse sentinel: a clause the binding falsifies or leaves
+    dangling means the specialized family is vacuous or
+    unexpressible, and the caller declines rather than mint it.
+    """
+    core = None
+    if cond is not None:
+        folded = _fold_bound(cond, bound, dead, env)
+        if folded is None or folded is False:
+            return False
+        core = None if folded is True else folded
+    return _fold_and(
+        ([core] if core is not None else [])
+        + [_pin_clause(n, v) for n, v in pins]
+    )
+
+
+def specialize(
+    obj: Any,
+    binding: dict,
+    *,
+    name: str | None = None,
+    kind: str | None = None,
+) -> ConstructedObject | None:
+    """Bind metavariables of *obj* to concrete values — the narrower family.
+
+    *obj* is a ``Rewrite`` or :class:`ConstructedObject`.  *binding*
+    maps a name to its specialization:
+
+    * a **leaf metavariable** takes a term spec — ``{"S": 4.0}`` turns
+      the ``div`` divisor into ``Const(4.0)``; a compound spec narrows
+      the metavar to that shape (``{"h": ("add", ("mul", "a1", "h"),
+      "x1")}``, the ``compose_objects`` ``specialize=`` idiom).  The
+      name leaves the matcher's binding env, so every ``cond`` clause
+      and ``dspec`` expr that reads it must *fold* under the bound
+      value: a clause decided ``True`` is discharged, ``False`` (or an
+      unexpressible dangling read) declines the construction — the
+      specialized family would be vacuous or unstatable.
+    * an **attr metavariable** — ``{"D": 0}`` or the explicit
+      ``{"$attr:D": 0}`` — takes a concrete value pinned by a fresh
+      ``("attr-eq", NAME, v)`` conjunct (``attr-is`` for
+      ``None``/``bool``).  The metavar stays bound at match time, so
+      sibling clauses still see ``$attr:D`` — ``select_mul`` under
+      ``D=0`` keeps its ``dim-eq-attr`` guard live while the pin
+      narrows the accepted region to the ``D=0`` slice.
+
+    The result is a strict narrowing — every binding the child accepts
+      satisfies the parent's guard — and stays pure data: serializable,
+      store-able, gauntlet-able.  ``None`` is the honest decline: an
+      empty binding, a name the LHS binds nowhere, a bare-string value
+      (a metavar rename is not a narrowing), an ambiguous
+      leaf-and-attr name, or a cond/dspec fold that cannot carry the
+      bound clause.
+    """
+    from catopt_core.laws.serialize import _proc_check, _proc_derive
+
+    rule = _as_rule(obj)
+    if not binding:
+        return None
+    spec = _spec_split(rule, binding)
+    if spec is None:
+        return None
+    lhs2, rhs2, pins, bound, dead, env = spec
+    cond_final = _spec_cond(rule.cond, bound, dead, env, pins)
+    if cond_final is False:
+        return None
+    dspec2 = _specialize_dspec(rule.dspec, bound, dead, env)
+    if dspec2 is None:
+        return None
+    new_rule = Rewrite(
+        name=name or rule.name,
+        lhs=lhs2,
+        rhs=rhs2,
+        law=rule.law,
+        check=rule.check if _proc_check(rule) else None,
+        derive=rule.derive if _proc_derive(rule) else None,
+        tags=rule.tags,
+        error_bound=rule.error_bound,
+        bound_norm=rule.bound_norm,
+        cond=cond_final,
+        dspec=dspec2 or None,
+    )
+    desc = ", ".join(f"{k}={v!r}" for k, v in sorted(binding.items()))
+    return ConstructedObject(
+        rule=new_rule,
+        kind=kind or _obj_kind(obj),
+        construction=("specialize", rule.name, desc),
+        note=f"bound {desc}; the instance family only narrows",
     )
 
 
@@ -1686,3 +2334,71 @@ def auto_cond_object(
         accepted_other=(acc & u_other).bit_count(),
         detail=detail,
     )
+
+
+# ---------------------------------------------------------------------------
+#  The constructor registry — the arena's action space as data
+# ---------------------------------------------------------------------------
+#
+#  Plan 0020's moves are op names over this module's constructors.
+#  The registry is the seam the arena drives — one name, one
+#  constructor — and :func:`construct` is its dispatch entry point:
+#  same store-able record path whatever the op.
+
+#: Op name → constructor.  ``auto_cond``'s entry returns an
+#: :class:`AutoCond` (its ``.object`` is the minted object); every
+#: other entry returns a :class:`ConstructedObject` — or ``None``,
+#: the honest decline.
+CONSTRUCTORS: dict[str, Any] = {
+    "fold": fold_object,
+    "lift": lift_object,
+    "compose": compose_objects,
+    "auto_cond": auto_cond_object,
+    "relax_guard": relax_guard,
+    "specialize": specialize,
+}
+
+
+def construct(
+    op: str,
+    *args: Any,
+    store: Any = None,
+    corpus_hash: str = "",
+    env: dict | None = None,
+    universe: Any = None,
+    **kwargs: Any,
+) -> dict | None:
+    """Run a construction op by name; return the object record or ``None``.
+
+    The arena's action entry point: *op* names a registered
+    constructor (:data:`CONSTRUCTORS`), *args* / *kwargs* forward to
+    it verbatim, and the minted :class:`ConstructedObject` persists
+    through :func:`store_constructed` when *store* (a sqlite3
+    connection) is given — the same object-record path
+    fold/lift/compose share, so the result is store-able,
+    reconstructable and gauntlet-able regardless of which op minted
+    it.  *env* / *universe* reach ``store_constructed``'s certificate
+    materialization for derivation-carrying composites.
+
+    Returns the object record — the ``evidence.stored_object`` row
+    when stored, else the unstored :func:`object_record` — or
+    ``None`` when the construction declines (a compose whose premise
+    fires nowhere, an auto-cond refusal, a relax of an absent clause,
+    a specialize over an unbound name).  An unknown *op* is a bug,
+    not a decline — ``ValueError``.
+    """
+    fn = CONSTRUCTORS.get(op)
+    if fn is None:
+        raise ValueError(f"unknown construction op: {op!r}")
+    res = fn(*args, **kwargs)
+    obj = res.object if isinstance(res, AutoCond) else res
+    if obj is None:
+        return None
+    if store is None:
+        return object_record(obj)
+    from catopt_discovery import evidence as ev
+
+    key = store_constructed(
+        store, obj, corpus_hash, env=env, universe=universe
+    )
+    return ev.stored_object(store, key)

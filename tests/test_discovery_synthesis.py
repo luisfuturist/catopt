@@ -1186,3 +1186,381 @@ def test_guarded_attr_metavar_object_clears_the_gauntlet(tmp_path):
     assert rep.synth_region.equal >= 1
     assert rep.synth_region.unequal == 0
     assert rep.real_region.equal >= 1
+
+
+# ---------------------------------------------------------------------------
+#  Guard manipulation — relax_guard / specialize (the plan-0020 moves)
+# ---------------------------------------------------------------------------
+
+
+def _guarded_softsign() -> synth.ConstructedObject:
+    """A two-clause guarded fold — the relax/specialize fixture.
+
+    ``div(x, |x|+1) -> softsign(x)`` under ``shaped(X) ∧ rank(X)<=2``.
+    Both clauses are honest (the equality holds on every binding), so
+    the rank conjunct is the tight clause a relax drops.
+    """
+    return synth.fold_object(
+        "softsign_guarded",
+        ("div", "X", ("add", ("abs", "X"), 1)),
+        "softsign",
+        cond=("and", ("shaped", "X"), ("rank", "X", "<=", 2)),
+    )
+
+
+def test_relax_guard_drops_the_named_clause():
+    """The clause is addressable by datum (tuple or JSON-shaped list)
+    or by index — and what is not there declines honestly."""
+    obj = _guarded_softsign()
+    by_data = synth.relax_guard(obj, ("rank", "X", "<=", 2))
+    by_list = synth.relax_guard(obj, ["rank", "X", "<=", 2])
+    by_index = synth.relax_guard(obj, 1)
+    for relaxed in (by_data, by_list, by_index):
+        assert relaxed is not None
+        assert relaxed.rule.cond == ("shaped", "X")
+        assert relaxed.kind == "abstraction"
+        assert relaxed.construction[0] == "relax_guard"
+    # a nested ``and`` flattens — the conjuncts are the leaf clauses
+    rlx = synth.relax_guard(
+        _BY_NAME["rms_norm_fold"], ("attr-is", "MK", True)
+    )
+    assert rlx.rule.cond == (
+        "and",
+        ("const-num", "EPS"),
+        ("const-cmp", "P", "==", 2),
+        ("shape-eq", "w", ("tail-block", "u", "MD")),
+    )
+    # …and the declines: a clause not in the guard, an index past the
+    # conjunction, an unguarded object, and a procedural guard (code is
+    # not a clause — it cannot be dropped).
+    assert synth.relax_guard(obj, ("concrete", "X")) is None
+    assert synth.relax_guard(obj, 5) is None
+    assert synth.relax_guard(_softsign_fold(), 0) is None
+    assert synth.relax_guard(_om_chunk2(), 0) is None
+
+
+def test_relax_guard_to_unguarded():
+    """Dropping the last conjunct unguards the object — ``cond=None``
+    and no procedural remainder rides along."""
+    obj = _guarded_softsign()
+    r1 = synth.relax_guard(obj, 0)
+    assert r1.rule.cond == ("rank", "X", "<=", 2)
+    r2 = synth.relax_guard(r1, 0)
+    assert r2.rule.cond is None
+    assert r2.rule.check is None
+
+
+def test_relax_guard_region_grows_monotonically():
+    """Measured monotonicity: every binding the guarded object accepts
+    the relaxed one accepts (superset), the sweep counts the growth,
+    and the grown region re-measures clean — softsign holds on the
+    rank-3 sites the dropped clause had declined."""
+    obj = _guarded_softsign()
+    relaxed = synth.relax_guard(obj, 1).rule
+    sites = list(ev._synth_sites(obj.rule.lhs, obj.rule.rhs, limit=200))
+    assert sites
+    # Pointwise superset — no accepted binding is ever lost.
+    for subst, _lhs_i in sites:
+        if eval_cond(obj.rule.cond, subst):
+            assert eval_cond(relaxed.cond, subst)
+    base = ev._guarded_evals(obj.rule, sites)
+    grown = ev._guarded_evals(relaxed, sites)
+    assert grown.accepted > base.accepted  # the growth is measured
+    assert grown.equal >= base.equal
+    # The grown sites re-measure clean: no counterexample enters.
+    assert grown.unequal == grown.rhs_err == grown.guard_err == 0
+    assert grown.equal == grown.accepted
+
+
+def test_relaxed_object_stores_reconstructs_and_admits(tmp_path):
+    """The same record path as every constructor: the relaxed sdpa
+    fold — weakened to the load-bearing clauses — serializes,
+    rebuilds, and clears the gauntlet on its corpus case."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    obj = synth.relax_guard(
+        _sdpa_fold_nomask(), ("attr-type", "TD1", "int")
+    )
+    assert obj is not None and obj.kind == "abstraction"
+    key = synth.store_constructed(conn, obj)
+    record = ev.stored_object(conn, key)
+    assert record["serializable"] is True
+    rule, _ = ev.admit_object(conn, key)
+    assert rule.cond == (
+        "and",
+        ("concrete", "K"),
+        ("attr-type", "TD2", "int"),
+        ("axes-last2", "K", "TD1", "TD2"),
+    )
+    rep = ev.run_gauntlet(
+        conn, key, corpus=_corpus(_attn_nomask_case())
+    )
+    conn.close()
+    assert rep.usable, rep.reason
+    assert rep.synth_region.unequal == rep.real_region.unequal == 0
+
+
+# ---------------------------------------------------------------------------
+#  Specialize — the narrower instance family
+# ---------------------------------------------------------------------------
+
+
+def _fold_bound(node, bound, dead, env):
+    return synth._fold_bound(node, bound, dead, env)
+
+
+def test_specialize_fold_bound_contract():
+    """The partial evaluator: a fully-bound clause folds, a falsified
+    or dangling one refuses, a live one keeps verbatim."""
+    env = {"S": Const(4.0), "$attr:D": 0}
+    bound = {"S", "$attr:D"}
+    dead = {"S"}
+    # decided-True → discharged
+    assert _fold_bound(("const-num", "S"), bound, dead, env) is True
+    # decided-False → the binding falsifies it → refuse
+    assert (
+        _fold_bound(("const-cmp", "S", ">", 9), bound, dead, env)
+        is False
+    )
+    # dangling (a dead ref mixed with a live one) → unexpressible
+    assert (
+        _fold_bound(("dim-eq", "S", 0, "T", 0), bound, dead, env)
+        is None
+    )
+    # untouched by the binding → verbatim
+    node = ("rank", "Q", ">=", 2)
+    assert _fold_bound(node, bound, dead, env) == node
+    # combinator fold: True absorbs or, drops from and; not(True)→False
+    assert (
+        _fold_bound(
+            ("or", ("attr-eq", "D", 0), ("leaf", "Q")),
+            bound,
+            dead,
+            env,
+        )
+        is True
+    )
+    assert _fold_bound(
+        ("and", ("attr-eq", "D", 0), ("leaf", "Q")), bound, dead, env
+    ) == ("leaf", "Q")
+    assert (
+        _fold_bound(("not", ("attr-eq", "D", 0)), bound, dead, env)
+        is False
+    )
+
+
+def test_specialize_attr_pin_narrows_the_region():
+    """``select_mul`` under ``D=0``: the ``dim`` metavar stays bound —
+    the pin rides the cond as a new conjunct — and the measured region
+    is exactly the D=0 slice of the parent's."""
+    parent = _BY_NAME["select_mul"]
+    obj = synth.specialize(parent, {"D": 0})
+    assert obj is not None
+    rule = obj.rule
+    assert rule.lhs == parent.lhs  # the pattern is unspelled
+    assert ("attr-eq", "D", 0) in rule.cond[1:]
+    assert obj.construction == ("specialize", "select_mul", "D=0")
+    # the explicit $attr: spelling is the same binding
+    twin = synth.specialize(parent, {"$attr:D": 0})
+    assert twin.rule.cond == rule.cond
+    sites = list(ev._synth_sites(rule.lhs, rule.rhs, limit=600))
+    assert sites
+    base = ev._guarded_evals(parent, sites)
+    child = ev._guarded_evals(rule, sites)
+    # strictly narrower: the parent's D!=0 accepted sites are gone —
+    # and every child-accepted env binds D=0
+    assert 0 < child.accepted < base.accepted
+    assert child.unequal == child.rhs_err == 0
+    assert child.equal <= base.equal
+    for subst, _lhs_i in sites:
+        if eval_cond(rule.cond, subst):
+            assert subst["$attr:D"] == 0
+
+
+def test_specialized_object_stores_reconstructs_and_fires(tmp_path):
+    """store → admit → apply: the D=0 instance fires on dim-0 selects
+    and declines dim-1 — the pin, not the pattern, narrows."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    obj = synth.specialize(_BY_NAME["select_mul"], {"D": 0})
+    key = synth.store_constructed(conn, obj)
+    record = ev.stored_object(conn, key)
+    assert record["serializable"] is True
+    rule, _ = ev.admit_object(conn, key)
+    conn.close()
+    u, v = _v("u", 2, 4), _v("v", 2, 4)
+    src = _p(
+        "mul",
+        _p("select", u, dim=0, index=1),
+        _p("select", v, dim=0, index=1),
+    )
+    eg = EGraph()
+    root = eg.add_term(src)
+    eg.run([rule], root, max_iterations=4, max_nodes=10_000)
+    assert eg.rule_fires.get(rule.name) == 1
+    assert eg.find(root) == eg.find(
+        eg.add_term(_p("select", _p("mul", u, v), dim=0, index=1))
+    )
+    # dim=1 declines the pin — where the un-specialized parent fires.
+    src1 = _p(
+        "mul",
+        _p("select", u, dim=1, index=1),
+        _p("select", v, dim=1, index=1),
+    )
+    eg2 = EGraph()
+    r2 = eg2.add_term(src1)
+    eg2.run([rule], r2, max_iterations=4, max_nodes=10_000)
+    assert not eg2.rule_fires
+    eg3 = EGraph()
+    r3 = eg3.add_term(src1)
+    eg3.run(
+        [_BY_NAME["select_mul"]], r3, max_iterations=4, max_nodes=10_000
+    )
+    assert eg3.rule_fires.get("select_mul") == 1
+
+
+def test_specialize_leaf_binds_a_const_and_folds_the_derive(tmp_path):
+    """``sdpa_fold_div_nomask`` under ``S=4.0``: the divisor becomes a
+    literal ``Const``, the scale derive folds to ``("lit", 0.25)``, and
+    the narrower object admits on its corpus case."""
+    obj = synth.specialize(_sdpa_fold_div_nomask(), {"S": 4.0})
+    assert obj is not None
+    rule = obj.rule
+    assert rule.lhs == _p(
+        "matmul",
+        _p(
+            "softmax",
+            _p(
+                "div",
+                _p(
+                    "matmul",
+                    "Q",
+                    _p("transpose", "K", dim0=-1, dim1=-2),
+                ),
+                Const(4.0),
+            ),
+            dim=-1,
+        ),
+        "V",
+    )
+    assert rule.dspec == (("SC", ("lit", 0.25)),)
+    assert rule.derive({}) == {"$attr:SC": 0.25}
+    assert serialize.missing_hooks(rule) == ()
+    conn = ev.connect(str(tmp_path / "s.db"))
+    key = synth.store_constructed(conn, obj)
+    rule2, record = ev.admit_object(conn, key)
+    assert record["serializable"] is True
+    rep = ev.run_gauntlet(
+        conn, key, corpus=_corpus(_attn_div_nomask_case())
+    )
+    conn.close()
+    assert rep.usable, rep.reason
+    # the admitted instance mints sdpa(scale=0.25)
+    q, k, v = _v("q", 2, 4), _v("k", 3, 4), _v("v", 3, 4)
+    src = _p(
+        "matmul",
+        _p(
+            "softmax",
+            _p(
+                "div",
+                _p("matmul", q, _p("transpose", k, dim0=-1, dim1=-2)),
+                Const(4.0),
+            ),
+            dim=-1,
+        ),
+        v,
+    )
+    eg = EGraph()
+    root = eg.add_term(src)
+    eg.run([rule2], root, max_iterations=4, max_nodes=10_000)
+    assert eg.rule_fires.get(rule2.name) == 1
+    assert eg.find(root) == eg.find(
+        eg.add_term(_p("sdpa", q, k, v, scale=0.25))
+    )
+
+
+def test_specialize_reintroduced_metavar_keeps_its_guard():
+    """``h ↦ add(mul(a1,h),x1)`` reintroduces ``h`` — the state guard
+    survives verbatim and now reads the *inner* state metavar."""
+    obj = synth.specialize(
+        _affd_step_lift(), {"h": ("add", ("mul", "a1", "h"), "x1")}
+    )
+    assert obj is not None
+    assert obj.rule.lhs == _p(
+        "add",
+        _p("mul", "a", _p("add", _p("mul", "a1", "h"), "x1")),
+        "x",
+    )
+    assert obj.rule.cond == _COND_AFFD_STATE
+
+
+def test_specialize_declines_honestly():
+    """``None`` on every non-construction: empty binding, a name the
+    LHS binds nowhere, a metavar rename, a contradictory pin, and a
+    dangling mixed clause."""
+    sel = _BY_NAME["select_mul"]
+    assert synth.specialize(sel, {}) is None
+    assert synth.specialize(sel, {"ZZ": 0}) is None
+    assert synth.specialize(sel, {"u": "w"}) is None  # a rename
+    # the pin contradicts a guard that already fixes D
+    pinned = Rewrite(
+        "t_pinned",
+        _p("select", "u", dim="D", index="I"),
+        "u",
+        cond=("attr-eq", "D", 5),
+    )
+    assert synth.specialize(pinned, {"D": 0}) is None
+    # the bound leaf's clause also reads a live metavar — dangling
+    mixed = Rewrite(
+        "t_mixed",
+        _p("add", "X", "Y"),
+        _p("add", "Y", "X"),
+        cond=("dim-eq", "X", 0, "Y", 0),
+    )
+    assert synth.specialize(mixed, {"X": 2}) is None
+
+
+def test_construct_dispatches_the_ops_by_name(tmp_path):
+    """``construct(op, *args, store)`` is the arena entry point: one
+    name → one constructor → the same store-able record path."""
+    conn = ev.connect(str(tmp_path / "s.db"))
+    assert set(synth.CONSTRUCTORS) >= {
+        "fold",
+        "lift",
+        "compose",
+        "auto_cond",
+        "relax_guard",
+        "specialize",
+    }
+    rec = synth.construct(
+        "relax_guard", _guarded_softsign(), 1, store=conn
+    )
+    assert rec is not None
+    assert rec["serializable"] is True
+    assert rec["cond"] == ["shaped", "X"]
+    assert rec["kind"] == "abstraction"
+    # unstored — the bare object record, not a row
+    rec2 = synth.construct(
+        "specialize", _BY_NAME["select_mul"], {"D": 0}
+    )
+    assert rec2 is not None and rec2["cond"][-1] == ["attr-eq", "D", 0]
+    rec3 = synth.construct(
+        "fold",
+        "softsign_2",
+        ("div", "X", ("add", ("abs", "X"), 1)),
+        "softsign",
+    )
+    assert rec3 is not None and rec3["name"] == "softsign_2"
+    # a declined construction is honest None; an unknown op raises
+    assert synth.construct("relax_guard", _softsign_fold(), 0) is None
+    assert (
+        synth.construct(
+            "compose", "x", _BY_NAME["comm_mul"], _BY_NAME["silu_fold"]
+        )
+        is None
+    )
+    try:
+        synth.construct("frobnicate", _softsign_fold())
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown op must raise")
+    conn.close()
