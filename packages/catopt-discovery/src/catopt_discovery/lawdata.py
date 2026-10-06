@@ -68,6 +68,8 @@ __all__ = [
     "INSTANCE_SCALAR_MVARS",
     "LINEAR_HELD_SHAPES",
     "LINEAR_TRAIN_SHAPES",
+    "META_ARENA_REWARD",
+    "META_SATURATE_BUDGETS",
     "MV_NAMES",
     "PRIOR_WEIGHTS",
     "PURPOSE_BUILT",
@@ -1207,3 +1209,27 @@ SPECIALIZE_SCALARS: tuple[float, ...] = (0, 1, -1, 0.5, 2)
 #: worth trying (the last/two-last axes are where view patterns
 #: live; 0 keeps the first axis reachable).
 SPECIALIZE_AXES: tuple[int, ...] = (-2, -1, 0, 1)
+
+#: The meta-arena reward composition — the weights of plan 0021's
+#: mixed board, shaped like :data:`ARENA_REWARD`: the objective
+#: dominates the spend signal.  ``step`` is the flat per-applied-
+#: action cost; ``enode`` the per-enode price of graph growth (the
+#: measured schedule dimension — a ``fire``/``saturate`` pays for
+#: the board it spends); ``delta`` scales the terminal payout —
+#: ``(baseline - extracted)/baseline``, collected only when the
+#: certificate replays; ``saturate_est`` is the greedy player's
+#: enode-spend estimate for an unbudgeted ``saturate`` (a scoring
+#: prior, not a budget).
+META_ARENA_REWARD: dict[str, float] = {
+    "step": 0.05,
+    "enode": 0.001,
+    "delta": 1.0,
+    "saturate_est": 512.0,
+}
+
+#: The ``saturate`` move's enumerated arms — the per-rule enode
+#: budgets offered by ``meta_arena.legal_actions``.  ``None`` is the
+#: unbudgeted closure step (the old game's whole move); the small
+#: budget arm is the bounded variant.  A player that wants a
+#: different budget spells it on the action — the menu is data.
+META_SATURATE_BUDGETS: tuple = (None, 256)
