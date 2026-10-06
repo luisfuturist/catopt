@@ -1925,3 +1925,25 @@ def test_offer_witness_eid_only_resolves_rhs_term():
     )
     assert merged
     assert eg.find(fx) == eg.find(x)
+
+
+def test_apply_rule_declines_an_unrealizable_rhs():
+    """A match whose RHS cites a metavariable the LHS never bound
+    declines the firing — the referee stays total over the board.
+
+    Constructed objects (``specialize`` maps, composed rules) can
+    carry a free attr metavariable; instantiating the RHS raises
+    ``KeyError`` — the firing cannot be built, so it is skipped like
+    a check veto rather than crashing the run.
+    """
+    eg = EGraph()
+    x = _v("x")
+    eid = eg.add_term(Op.make("neg", x))
+    # a free LEAF metavariable is the KeyError path — attr
+    # metavars fall back to the literal spelling instead
+    rule = Rewrite(
+        "free_mvar",
+        Op.make("neg", "X"),
+        Op.make("add", "X", "FREE"),
+    )
+    assert eg.apply_rule(rule, eg.find(eid)) is False

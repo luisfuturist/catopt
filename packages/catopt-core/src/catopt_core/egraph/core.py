@@ -1419,22 +1419,31 @@ class EGraph(_ExtractMixin, _ProofMixin):
                                 continue
                             subst = {**subst, **extra}
                     created = None
-                    if self._track:
-                        self._tag_rule = rule.name
-                        self._collect = []
-                        self._inst_last_enode = None
-                        try:
+                    try:
+                        if self._track:
+                            self._tag_rule = rule.name
+                            self._collect = []
+                            self._inst_last_enode = None
+                            try:
+                                rhs_eid = self._instantiate(
+                                    rhs_prog.root, subst
+                                )
+                            finally:
+                                self._tag_rule = None
+                                created = self._collect
+                                self._collect = None
+                        else:
                             rhs_eid = self._instantiate(
                                 rhs_prog.root, subst
                             )
-                        finally:
-                            self._tag_rule = None
-                            created = self._collect
-                            self._collect = None
-                    else:
-                        rhs_eid = self._instantiate(
-                            rhs_prog.root, subst
-                        )
+                    except KeyError:
+                        # A binding that cannot realize the RHS — the
+                        # match bound less than the pattern needs (a
+                        # free metavariable, e.g. an attr left open by
+                        # a constructed object's specialize map).
+                        # The firing cannot be built: skip it, like a
+                        # check veto.
+                        continue
                     self._rule_objs.setdefault(rule.name, rule)
                     merged = self.union(
                         eid, rhs_eid, rule=rule.name, subst=subst
