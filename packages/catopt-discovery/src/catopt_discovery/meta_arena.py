@@ -33,13 +33,43 @@ gauntlet that rules on claims lives in ``arena``/``evidence`` and
 is deliberately not wired in).  Folds to fresh names are
 definitions, not claims, and stay sound.
 
-The honest columns: ``cost`` prices the extraction under
-``cost_fn`` — a fresh declared op hits the table default
-(1 flop/elem), so a fresh-name fold wins *by cost-model
-construction*.  ``cost_unfolded`` expands every declared
-abbreviation back and reprices — a real gain survives unfolding; an
-unpriced-op gain collapses to baseline.  ``used_declared`` names
-the declared kernels the extraction picked.
+Extraction is *feasibility-priced*: every extraction on the board
+(``observe``'s ``best_cost``, ``saturate``'s improving probe, the
+terminal ``extract``) runs the arena's ``feasible_cost`` —
+:func:`catopt_core.cost.backend_cost` bound to the board's
+``supported`` op set, composed with an expansion pass:
+
+* an op in ``supported`` keeps its ``cost_fn`` price — a sink can
+  lower it, so the model's number is the claim;
+* a *declared* op the bound does not know — a name ``declare``
+  minted, with its definitional unfold recorded in
+  ``definitions`` — bills at its *spelled* form: an abbreviation
+  can never extract cheaper than what it abbreviates (the
+  fresh-name artifact: a ``foldabs_*`` priced at the table default
+  of 1 flop/elem "halved" measured cost with no kernel behind it);
+* a name that is neither supported nor defined is infeasible —
+  priced at ``_INVALID_COST`` (the shipped "never wins" sentinel —
+  finite, so the extraction decomposition ``local = c(t) -
+  Σc(children)`` never hits ``inf - inf = nan``), reported as
+  ``+inf``: a program spelled over ops no sink runs and nothing
+  defines is not a program on this board.
+
+The bound is data, not a torch import: ``MetaArena(supported=)``
+takes a sink's ``supported_ops`` for the production price; the
+default is the ambient vocabulary — every op the program or the
+*base* ruleset spells (the shipped library's names are the ops
+real kernels exist for; a fresh ``declare`` name is never among
+them).
+
+The honest columns: ``cost`` is that feasible price, so a
+declared-but-unlowered pick reads its spelled cost — the columns
+coincide there — while for a *supported* kernel the gap
+``cost_unfolded - cost`` is exactly the premium the claimed kernel
+earns (``sub(x,y)`` at 16 vs the spelled ``add(x,-y)`` at 32).
+``used_declared`` names the declared kernels the extraction
+picked; an unlowered pick is sound-by-definition — the spelled
+member sits in the same e-class under the minted unfold law, and
+``unfold`` materialises the runnable program.
 
 The reward is :data:`lawdata.META_ARENA_REWARD`, all data: an
 applied non-terminal move pays ``step + enode·<enodes added>``;
@@ -52,6 +82,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import random
 import sys
 from collections import deque
@@ -59,7 +90,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, overload
 
-from catopt_core.cost import dag_cost, flops_cost
+from catopt_core.cost import (
+    _INVALID_COST,
+    backend_cost,
+    dag_cost,
+    flops_cost,
+)
 from catopt_core.egraph import (
     CertificateVerificationError,
     EGraph,
@@ -469,6 +505,116 @@ def _unfold_for(obj: Any) -> tuple | None:
 
 
 # ---------------------------------------------------------------------------
+#  Feasibility pricing — the supported-op bound
+# ---------------------------------------------------------------------------
+
+
+def _supported_or(supported: Any, term: Any, rules: Any) -> frozenset:
+    """Resolve the board's supported-op bound.
+
+    An explicit *supported* is a sink's ``supported_ops`` — the
+    production bound.  ``None`` derives the ambient vocabulary:
+    every op the program itself spells plus every op a *base* rule's
+    pattern names — the shipped library's names are ops real
+    kernels exist for.  The set freezes at board open: names a
+    ``declare`` mints mid-episode are never added (that is the
+    whole point — a fresh name has no lowering).
+    """
+    if supported is not None:
+        return frozenset(supported)
+    out = _ops_of(term)
+    for r in rules:
+        _ops_of(r.lhs, out)
+        _ops_of(r.rhs, out)
+    return frozenset(out)
+
+
+def _feasible_cost(
+    cost_fn: Any, supported: frozenset, defs: dict
+) -> Any:
+    """Compose ``backend_cost`` with the declared-op expansion.
+
+    The returned ``(term, memo=None)`` cost fn first rewrites every
+    op that is *outside* ``supported`` but recorded in *defs* (a
+    ``declare``'s definitional unfold record ``op -> (mvs,
+    spelled)``) back to its instantiated spelled form — so a
+    declared-but-unlowered abbreviation bills exactly what it
+    abbreviates — then hands the expanded term to
+    ``backend_cost(cost_fn, supported)``: supported ops keep the
+    model's price, anything else is ``+inf``.  *defs* is read live
+    (the arena's ``definitions`` dict), so a ``declare`` reprices
+    the board mid-episode.  The wrapper declares ``memo`` and
+    forwards the model's cost markers, matching
+    ``backend_cost``'s contract with ``extract_best`` /
+    ``dag_cost``.
+    """
+    bound = backend_cost(cost_fn, supported)
+
+    def expand(t: Any) -> Any:
+        """Expand the unsupported-and-defined ops of *t* (one bound)."""
+        if not isinstance(t, Op):
+            return t
+        args = tuple(expand(a) for a in t.args)
+        if t.op in supported or t.op not in defs:
+            return Op.make(t.op, *args, **dict(t.attrs))
+        mvs, spelled = defs[t.op]
+        return _term_instantiate(
+            spelled, dict(zip(mvs, args, strict=True))
+        )
+
+    def priced(term: Any, memo: dict | None = None) -> float:
+        """Price *term* under the supported-op bound.
+
+        ``backend_cost``'s ``+inf`` is mapped to ``_INVALID_COST``:
+        the sentinel is the same "never wins" verdict but finite,
+        so the ``local = c(t) - Σc(children)`` decomposition inside
+        ``extract_best`` / ``dag_cost`` never degenerates to ``nan``
+        (an ``inf - inf`` over an infeasible child would compare
+        false against everything — including feasible siblings).
+        """
+        v = bound(expand(term), memo)
+        return v if math.isfinite(v) else _INVALID_COST
+
+    priced.__name__ = getattr(cost_fn, "__name__", "feasible_cost")
+    for marker in ("charges_param_only", "dag_exact", "profile"):
+        if hasattr(cost_fn, marker):
+            setattr(priced, marker, getattr(cost_fn, marker))
+    return priced
+
+
+def _reported(v: float) -> float:
+    """Normalise a priced term for the report: infeasible → ``+inf``.
+
+    The engine reads ``_INVALID_COST`` (finite — extraction ordering
+    stays strict); the columns show ``inf``, the honest "no sink
+    runs this".  ``nan`` — the residue of an ``inf - inf``
+    decomposition inside the engine — reports the same way.
+    """
+    if math.isfinite(v) and v < _INVALID_COST:
+        return v
+    return float("inf")
+
+
+def _rel_delta(base: float, cost: float) -> float:
+    """Relative extraction improvement; 0 when the board can't price it.
+
+    A ``supported`` bound that does not cover the program's own ops
+    reports a ``+inf`` baseline — the board genuinely cannot run
+    the term it was opened on, so the extract pays no delta (the
+    alternative ``inf - cost`` is ``nan`` arithmetic, not signal).
+    An infeasible extraction pays the step and nothing else.
+    """
+    if not math.isfinite(base) or not math.isfinite(cost) or base <= 0:
+        return 0.0
+    return (base - cost) / base
+
+
+def _arg_at(seq: Any, i: int, default: Any) -> Any:
+    """``seq[i]`` when present — a case tuple's optional tail."""
+    return seq[i] if len(seq) > i else default
+
+
+# ---------------------------------------------------------------------------
 #  The move handlers
 # ---------------------------------------------------------------------------
 
@@ -518,7 +664,7 @@ def _saturate(arena: MetaArena, action: Action) -> _Outcome:
         rule_budgets=budgets,
         stop=p.get("stop", "fixed_point"),
         patience=int(p.get("patience", 3)),
-        cost_fn=arena.cost_fn,
+        cost_fn=arena.feasible_cost,
     )
     return _Outcome(
         note=(
@@ -574,17 +720,20 @@ def _declare(arena: MetaArena, action: Action) -> _Outcome:
 @register_action("extract")
 def _extract(arena: MetaArena, action: Action) -> _Outcome:
     """Terminal: extract, certify the derivation, score the delta."""
-    best = arena.eg.extract_best(arena.root, arena.cost_fn)
+    best = arena.eg.extract_best(arena.root, arena.feasible_cost)
     if best is None:
         return _Outcome(
             applied=False, terminal=True, note="extract: no member"
         )
-    cost = float(dag_cost(best, arena.cost_fn))
+    cost = _reported(dag_cost(best, arena.feasible_cost))
     ok = False
     note = ""
     try:
         cert = arena.eg.certificate(
-            arena.term, best, root_eid=arena.root, cost_fn=arena.cost_fn
+            arena.term,
+            best,
+            root_eid=arena.root,
+            cost_fn=arena.feasible_cost,
         )
         replayed = verify_certificate(arena.term, cert)
         ok = op_repr(replayed) == op_repr(best)
@@ -599,7 +748,9 @@ def _extract(arena: MetaArena, action: Action) -> _Outcome:
     return _Outcome(
         terminal=True,
         cost=cost,
-        cost_unfolded=float(dag_cost(unfolded, arena.cost_fn)),
+        cost_unfolded=_reported(
+            dag_cost(unfolded, arena.feasible_cost)
+        ),
         certificate_ok=ok,
         used_declared=used,
         note=f"extract → {cost:.6g}" + ("" if ok else f" ({note})"),
@@ -622,7 +773,9 @@ class MetaState:
     ``rules`` is the live ruleset (base + declared, in play order);
     ``specs`` the mined composite-subterm inventory the ``declare``
     enumerator reads — pure spec data, no term objects cross.
-    ``best_cost`` is the current extraction's price.
+    ``best_cost`` is the current extraction's price under the
+    board's feasible bound (a declared-but-unlowered member reads
+    its spelled cost).
     """
 
     rules: tuple[str, ...]
@@ -670,10 +823,22 @@ class MetaArena:
     live set is a list ``declare`` appends to mid-episode); *corpus*
     the extra terms the ``declare`` inventory mines (the board term
     itself when omitted); *cost_fn* prices extraction
-    (``flops_cost`` default); *max_nodes* the enode budget every
+    (``flops_cost`` default); *supported* is the feasibility bound
+    — a sink's ``supported_ops``, or ``None`` for the ambient
+    vocabulary of *term* plus the base ruleset (see
+    :func:`_supported_or`); *max_nodes* the enode budget every
     growth move spends against; *max_specs* caps the mined
     ``declare`` inventory; *weights* overrides
     :data:`lawdata.META_ARENA_REWARD`.
+
+    ``cost_fn`` stays the raw model; the bound wrapper is
+    :attr:`feasible_cost` — every extraction on the board runs
+    under it (so does ``cost_unfolded``: :meth:`unfold` expands
+    *every* declaration, supported or not, then the bound reprices —
+    the gap ``unfolded - cost`` is the premium a supported kernel
+    earns).  A declared-but-unlowered name bills its spelled form;
+    a name with neither lowering nor definition is infeasible
+    (``+inf``).
     """
 
     def __init__(
@@ -683,11 +848,12 @@ class MetaArena:
         *,
         corpus: Iterable = (),
         cost_fn: Any = None,
+        supported: Any = None,
         max_nodes: int = 20_000,
         max_specs: int = 32,
         weights: dict | None = None,
     ) -> None:
-        """Bind the program, the library, and the budget."""
+        """Bind the program, the library, the bound, and the budget."""
         self.term = term
         self.eg = EGraph()
         self.root = self.eg.add_term(term)
@@ -698,9 +864,15 @@ class MetaArena:
         self.definitions: dict[str, tuple] = {}
         self.corpus = tuple(corpus) or (term,)
         self.cost_fn = cost_fn if cost_fn is not None else flops_cost
+        self.supported = _supported_or(supported, term, self.rules)
+        self.feasible_cost = _feasible_cost(
+            self.cost_fn, self.supported, self.definitions
+        )
         self.max_nodes = int(max_nodes)
         self.weights = {**lawdata.META_ARENA_REWARD, **(weights or {})}
-        self.baseline_cost = float(dag_cost(term, self.cost_fn))
+        self.baseline_cost = _reported(
+            dag_cost(term, self.feasible_cost)
+        )
         self.steps = 0
         self.done = False
         self._specs = _composite_specs(self.corpus, max_specs)
@@ -753,11 +925,12 @@ class MetaArena:
     def unfold(self, term: Any) -> Any:
         """Expand every declared abbreviation back to its spelled form.
 
-        The honest-cost view: a ``foldabs(x)`` the extraction picked
-        becomes the composite it denotes; non-declared ops pass
-        through (``sub`` stays ``sub`` — a *real* op, priced as
-        itself; the definition is only recorded for honest
-        accounting of fresh names).
+        The honest-cost view ``cost_unfolded`` prices: a
+        ``foldabs(x)`` the extraction picked becomes the composite
+        it denotes.  Unlike the ``feasible_cost`` expansion — which
+        leaves *supported* declared ops alone so their kernel price
+        counts — this walk expands *all* of them, so the column
+        also shows what a ``sub`` claim is worth in spelled ops.
         """
         if isinstance(term, Op):
             args = tuple(self.unfold(a) for a in term.args)
@@ -771,9 +944,9 @@ class MetaArena:
 
     def observe(self) -> MetaState:
         """Build the read-only snapshot — live ruleset and board size."""
-        best = self.eg.extract_best(self.root, self.cost_fn)
+        best = self.eg.extract_best(self.root, self.feasible_cost)
         best_cost = (
-            float(dag_cost(best, self.cost_fn))
+            _reported(dag_cost(best, self.feasible_cost))
             if best is not None
             else float("inf")
         )
@@ -830,8 +1003,7 @@ class MetaArena:
             if not out.certificate_ok:
                 # the referee refused: spent the move, no payout
                 return -w["step"]
-            base = self.baseline_cost
-            rel = (base - out.cost) / base if base > 0 else 0.0
+            rel = _rel_delta(self.baseline_cost, out.cost)
             return w["delta"] * rel - w["step"]
         return -(w["step"] + w["enode"] * spent)
 
@@ -936,8 +1108,11 @@ def declare_candidates(
     (module docstring — the certificate certifies the derivation,
     not the claim), so the enumerator does not invent them: a
     kernel vocabulary mined from every rule pattern mostly mints
-    nonsense (``add(x,-y) → aff(x,y)``), and an unrefereed junk claim
-    can win the probe on the unpriced-op artifact alone.
+    nonsense (``add(x,-y) → aff(x,y)``), and an unrefereed claim
+    does not belong in the enumerated set.  Feasibility pricing
+    keeps them honest in the probe anyway — a claim on a supported
+    kernel earns its real price, a fresh name only its spelled
+    form's.
     """
     kernels = set(extra_kernels)
     state = arena.observe()
@@ -1044,8 +1219,7 @@ class GreedyPlayer:
         """Estimate the immediate reward of one move, statically."""
         w = self._weights
         if action.op == "extract":
-            base = state.baseline_cost
-            rel = (base - state.best_cost) / base if base > 0 else 0.0
+            rel = _rel_delta(state.baseline_cost, state.best_cost)
             return w["delta"] * rel - w["step"]
         if action.op == "saturate":
             est = action.params.get("budget")
@@ -1165,6 +1339,7 @@ def meta_probe(
     rules: Any = None,
     *,
     cost_fn: Any = None,
+    supported: Any = None,
     seed: int = 0,
     budget: int = 160,
     max_nodes: int = 20_000,
@@ -1173,7 +1348,10 @@ def meta_probe(
 ) -> list[dict]:
     """Play the arms on 3-5 corpus terms; answer Q2, honestly.
 
-    Per case ``(name, term[, rules[, declares]])`` on a fresh board:
+    Per case ``(name, term[, rules[, declares[, supported]]])`` on
+    a fresh board — ``supported`` is the feasibility bound (a
+    sink's ``supported_ops``; ``None`` = the ambient vocabulary —
+    see :func:`_supported_or`), the case's own fifth element wins:
 
     * ``scripted`` — the human baseline, saturate-then-extract;
     * ``greedy`` / ``random`` — the live legal set under the two
@@ -1181,9 +1359,11 @@ def meta_probe(
     * ``declare`` — for each candidate (explicit *declares* + mined
       fresh folds + spec/kernel claims, capped at *declare_limit*) a
       scripted ``declare → saturate → extract`` episode; the winner
-      is the cheapest certified extraction.  ``unfolded`` is the
-      honest price — a gain that collapses to baseline under
-      unfolding is a cost-model artifact, not a reached program.
+      is the cheapest certified extraction.  ``cost`` is the
+      feasible price — a fresh-name fold bills its spelled form
+      and can no longer win on the unpriced-op artifact; the
+      ``unfolded`` column shows the spelled premium a supported
+      kernel earns.
     """
     if sys.getrecursionlimit() < 40_000:
         sys.setrecursionlimit(40_000)
@@ -1193,10 +1373,18 @@ def meta_probe(
         name, term = case[0], case[1]
         rset = case[2] if len(case) > 2 else (rules or DEFAULT)
         decls = tuple(case[3]) if len(case) > 3 else ()
+        sup = _arg_at(case, 4, supported)
 
-        def board(t: Any = term, rs: Any = rset) -> MetaArena:
+        def board(
+            t: Any = term, rs: Any = rset, sp: Any = sup
+        ) -> MetaArena:
             return MetaArena(
-                t, rs, corpus=[t], cost_fn=cf, max_nodes=max_nodes
+                t,
+                rs,
+                corpus=[t],
+                cost_fn=cf,
+                supported=sp,
+                max_nodes=max_nodes,
             )
 
         base = board().baseline_cost
@@ -1363,6 +1551,22 @@ def _demo_cases() -> list:
     ]
 
 
+def _torch_supported() -> frozenset | None:
+    """Return the torch sink's ``supported_ops`` — the bound.
+
+    Lazy: the module stays torch-free for the torch-free board; the
+    demo binds the real sink's op set so kernel claims
+    (``softsign``, ``sub``) carry a sink-backed price.  ``None``
+    when catopt-torch is absent — the ambient-vocabulary default
+    then applies.
+    """
+    try:
+        from catopt_torch.adapters import TorchSink
+    except ImportError:
+        return None
+    return TorchSink().supported_ops
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the Q2 probe on the demo corpus; print the table."""
     p = argparse.ArgumentParser(description=__doc__)
@@ -1373,6 +1577,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     rows = meta_probe(
         _demo_cases(),
+        supported=_torch_supported(),
         seed=args.seed,
         budget=args.budget,
         declare_limit=args.declare_limit,

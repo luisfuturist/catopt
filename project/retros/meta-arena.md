@@ -25,17 +25,44 @@ enumerates the saturate arms.  Players: `ScriptedPlayer`
 beats baseline), `RandomPlayer`.  `python -m
 catopt_discovery.meta_arena` reproduces the table.
 
-## The honest columns
+## Feasibility pricing (the artifact fix)
 
-Two report fields exist because a naive read of `cost` lies:
+The first probe's hole: a `declare` minting a *fresh op name* was
+priced by the `_OP_FLOPS` default (1 flop/elem), so
+`sub(x,y) → foldabs_0(x,y)` "halved" measured cost with no kernel
+behind it.  Fixed at the extraction boundary, not in a report
+column — the board's `feasible_cost` is
+`backend_cost(cost_fn, supported)` composed with a declared-op
+expansion (`meta_arena._feasible_cost`):
 
-* `cost_unfolded` — the extracted term with every declared
-  abbreviation expanded back to its spelled form, repriced.  A
-  fresh declared op prices at the `_OP_FLOPS` default
-  (1 flop/elem), so a fresh-name fold "wins" *by cost-model
-  construction*; unfolding collapses it to baseline.  A real gain
-  survives unfolding.
-* `used_declared` — the declared kernel ops the extraction picked.
+* op in `supported` → its `cost_fn` price (a sink lowers it);
+* declared-but-unlowered op (a minted name with a recorded
+  definitional unfold) → bills its *spelled* form: an abbreviation
+  never extracts cheaper than what it abbreviates;
+* neither supported nor defined → the never-win sentinel
+  (`_INVALID_COST` — finite, so the `local = c(t) − Σc(children)`
+  decomposition inside `extract_best`/`dag_cost` never degenerates
+  to `inf − inf = nan`; reported as `+inf`).
+
+`supported` is a board parameter (`MetaArena(supported=)`): bind a
+sink's `supported_ops` for the production price — `main()` does
+exactly that (`_torch_supported()` — lazy, the module stays
+torch-free).  The default is the ambient vocabulary — every op the
+program or the *base* ruleset spells — which is honest for this
+board because the shipped library's names are ops real kernels
+exist for; a `declare`-minted name is never among them, so the
+bound freezes fresh names out by construction.
+
+Extraction stays sound: a declared-but-unlowered member extracts
+at *parity* with its spelled form (same e-class under the minted
+unfold law — `unfold()` materialises the runnable program), never
+below it; a name with no definition at all is infeasible and the
+extraction simply cannot pick it.
+
+The columns post-fix: `cost` is the feasible price; `cost_unfolded`
+still expands *every* declaration (supported ones too), so the gap
+`unfolded − cost` is exactly the premium a supported kernel earns;
+`used_declared` names the declared ops the extraction picked.
 
 A caveat kept explicit (module docstring): a fold to an
 *already-named* op is a *claim* — the certificate certifies the
@@ -44,61 +71,88 @@ derivation, not the claim (the gauntlet lives in
 `legal_actions` enumerator therefore only offers fresh-name folds
 (sound by definition); kernel claims stay playbook/probe-reachable.
 
-## The Q2 probe (5 corpus terms)
+## The Q2 probe, re-run under the bound (5 corpus terms)
 
-Arms per case: `scripted` (search-only), `greedy`, `random`
-(budget 160), `declare` (declare → saturate → extract per
-candidate; best certified win).  `cost` = extracted flops_cost;
-`unfold` = `cost_unfolded`; every extraction's certificate
-replayed.
+Same arms as before (`scripted` / `greedy` / `random` budget 160 /
+`declare`), now feasibility-priced.  Bound:
+`TorchSink().supported_ops` — `sub`, `silu`, `softsign` are all
+torch-lowerable, so a kernel claim on them earns its `cost_fn`
+price; `foldabs_*` names are unlowered, so they bill their spelled
+form.  Every terminal extraction's certificate replayed.
 
 | case | base | scripted | greedy | random | declare | unfold | winner |
 |---|---|---|---|---|---|---|---|
-| silu_site (`mul(x,σx)`, DEFAULT−silu_fold) | 48.0 | 48.0 | 16.0¹ | 16.0¹ | 16.0 | 48.0 | foldabs_0 (+unfold) |
-| softsign_site (`div(x,|x|+1)`, DEFAULT−softsign_fold) | 96.0 | 96.0 | 80.0¹ | 96.0 | 16.0 | 96.0 | softsign_decl (+unfold) |
-| sub_gap (`add(x,−y)`, full DEFAULT) | 32.0 | 32.0 | 16.0¹ | 32.0 | 16.0 | 32.0 | sub_decl (+unfold) |
-| nested_site (`tanh(div(x,|x|+1))`, DEFAULT−softsign_fold) | 128.0 | 128.0 | 112.0¹ | 112.0¹ | 16.0 | 128.0 | foldabs_2 (+unfold) |
-| control (`add(mul,matmul)`, full DEFAULT) | 160.0 | 160.0 | 16.0¹ | 160.0 | 16.0 | 160.0 | foldabs_0 (+unfold) |
+| silu_site (`mul(x,σx)`, DEFAULT−silu_fold) | 48.0 | 48.0 | 48.0 | 48.0 | 48.0 | 48.0 | silu_decl (+unfold) |
+| softsign_site (`div(x,|x|+1)`, DEFAULT−softsign_fold) | 96.0 | 96.0 | 96.0 | 96.0 | 16.0 | 96.0 | softsign_decl (+unfold) |
+| sub_gap (`add(x,-y)`, full DEFAULT) | 32.0 | 32.0 | 32.0 | 32.0 | 16.0 | 32.0 | sub_decl (+unfold) |
+| nested_site (`tanh(div(x,|x|+1))`, DEFAULT−softsign_fold) | 128.0 | 128.0 | 128.0 | 128.0 | 48.0 | 128.0 | softsign_decl (+unfold) |
+| control (`add(mul,matmul)`, full DEFAULT) | 160.0 | 160.0 | 160.0 | 160.0 | 160.0 | 160.0 | foldabs_0 (+unfold) |
 
-¹ every non-scripted "win" carries `used_declared = foldabs_*` —
-the same artifact the `unfold` column exposes.  All 30 terminal
-extractions verified.
+What changed, reading down the columns:
+
+* **The artifact is gone from the reward, not just the report.**
+  Greedy and random now land on baseline *everywhere* — a
+  fresh-name fold spends a move and buys nothing (it extracts at
+  spelled parity, `cost == baseline`, reward `−step`), so
+  cheapest-immediate play correctly finds no payout in it.
+* **The real declares still win — now provably sink-backed.**
+  `sub_gap` 32→16 (`sub` is torch-lowerable and priced 1 flop/elem
+  — vs the spelled `add(x,-y)`'s 32, so `unfolded − cost = 16` is
+  the claim's earned premium); `softsign_site` 96→16 and
+  `nested_site` 128→48 (`tanh(softsign(x))`) the same way — claims
+  whose kernel names exist in the bound.
+* **`silu_site` is the honest flat case.**  `silu` is supported,
+  and `flops_cost` prices it 3 flops/elem — identical to the
+  spelled `mul(x,σx)` (16+32).  The shipped fold is a *launch-count*
+  win, invisible to a FLOPs model: `cost == unfolded == 48`.
+  Under the bound the board now reports that plainly instead of
+  crediting a fresh name for it.
+* **Control stays flat** — `foldabs_0` "wins" the declare column
+  only by being the first certified candidate at baseline cost.
 
 ## Verdict
 
 **Q2: yes — mid-search abstraction reaches optima no law sequence
-reaches, on the cases where the declared object is real.**
+reaches, and after feasibility pricing every surviving win names a
+kernel a sink can lower.**
 
 * `sub_gap` is the clean witness: under the *full* `DEFAULT` set
   `sub(x, y)` is unreachable (the library only spells it
-  `add(x, −y)` — `sub_to_add` fires the expand direction);
+  `add(x, -y)` — `sub_to_add` fires the expand direction);
   scripted extraction stays at baseline.  One `declare` inserts
   the fold+unfold pair, and the certified extraction is
-  `sub(x, y)` at half the FLOPs.  `softsign_site` recovers the
-  withheld shipped fold the same way (96 → 16).
-* **But the dominant strategy on this board is minting unpriced
-  names.**  Wherever a fresh `foldabs_*` fold is legal, *every*
-  non-scripted player finds it — greedy and random "beat"
-  scripted on four of five cases, always via the 1 flop/elem
-  default price of a name nothing can lower.  `cost_unfolded`
-  collapses every one of those to baseline.  The schedule game
-  taught that order is a cost lever; this board teaches that
-  *price* is the quality lever: `backend_cost(cost_fn,
-  sink.supported_ops)` is the documented fix — a declared op
-  outside `supported_ops` prices infinite and the artifact
-  disappears from the reward entirely.
+  `sub(x, y)` at half the FLOPs — `sub` is in the bound, so the
+  supported price counts.  `softsign_site` recovers the withheld
+  shipped fold the same way (96 → 16), and `nested_site` reuses
+  the same claim inside a `tanh` wrapper (128 → 48).
+* **The unpriced-name strategy is dead by construction.**  In the
+  first run greedy and random "beat" scripted on four of five
+  cases, always via the 1 flop/elem default price of a name
+  nothing could lower.  Under the bound those folds extract at
+  spelled parity — `cost == baseline`, reward `−step` — so no arm
+  finds payout in them, and the reward needs no separate honesty
+  column to stay truthful (`cost_unfolded` now *confirms* rather
+  than *corrects*: `unfolded − cost` is the claimed kernel's
+  premium, zero for a fresh name).  The one caveat that survives:
+  a *supported* name still prices at the model's table weight —
+  `silu`'s 3 flops/elem happens to equal its spelled form, so the
+  board honestly reports "no FLOPs win"; whether the claim's
+  *kernel* is actually faster is the meter's question, not the
+  search's.
 * Q3 (is the mixed game non-shallow?) is *suggestive, not
-  settled*: the winning moves on every case were construction
-  moves, never scheduling moves — matching the law-order verdict
-  (order is a cost lever).  Whether a learned player beats the
-  scripted baseline *once artifacts are priced out* is the next
-  measurement; the board, referee and honest columns for it now
-  exist.
+  settled*: every win on the board is a construction move — and
+  specifically a kernel *claim* against the bound, never a
+  scheduling move or a fresh-name definition.  Whether a learned
+  player beats the scripted baseline is the next measurement; the
+  board, referee and honest pricing for it now exist.
 
 ## Housekeeping notes
 
 * `MetaArena.step` / `meta_probe` were refactored to fit the
-  radon ratchet (`_accept`/`_reward`/`_declare_best` split).
+  radon ratchet (`_accept`/`_reward`/`_declare_best` split); the
+  feasibility change added `_supported_or` / `_feasible_cost` /
+  `_reported` / `_rel_delta` / `_arg_at` helpers — all under the
+  rank-C ceiling, existing baselines unchanged.
 * One uncovered arc remains in the module (99% file coverage):
   `extract`'s `best is None` early return — the root class
   always has members, so it is unreachable-defensive.

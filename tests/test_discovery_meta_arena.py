@@ -5,14 +5,24 @@ search moves (``fire`` / ``saturate`` — the measured schedule
 dimension), construction moves (``declare`` — the quality lever that
 inserts mid-search objects), and the terminal ``extract`` referee'd
 by certificate replay.  These tests play small boards end to end,
-pin the honest columns (``cost_unfolded`` is the artifact test),
-and pin the reward composition from ``lawdata``.
+pin the honest columns (``cost_unfolded`` and the supported-op
+bound — the unpriced-fresh-name artifact), and pin the reward
+composition from ``lawdata``.
 """
 
+import math
 import random
+import sys
 
 import pytest
-from catopt_core.cost import count_cost, dag_cost, flops_cost
+from catopt_core.cost import (
+    _INVALID_COST,
+    backend_cost,
+    count_cost,
+    dag_cost,
+    flops_cost,
+    param_bytes_cost,
+)
 from catopt_core.egraph import CertificateVerificationError
 from catopt_core.ir import Const, Op, TensorType, Var, op_repr
 from catopt_core.laws import DEFAULT
@@ -260,11 +270,12 @@ class TestDeclareQ2:
         traj = _scripted(board, act)
         t = traj.terminal
         assert t.certificate_ok and t.used_declared == ("abs0",)
-        # 16 elems: abs0 prices at the 1-flop default vs add+neg's 32
-        assert t.cost == pytest.approx(16.0)
-        # the honest column: expand the abbreviation — the gain was
-        # an unpriced-op artifact, not a cheaper program
-        assert t.cost_unfolded == pytest.approx(board.baseline_cost)
+        # feasibility pricing: abs0 is declared-but-unlowered, so it
+        # bills its spelled form — the extraction may still carry the
+        # abbreviation (a sound definition), but it can no longer win
+        # on the 1-flop default of a name nothing can lower
+        assert t.cost == pytest.approx(board.baseline_cost)
+        assert t.cost_unfolded == pytest.approx(t.cost)
 
     def test_unfold_roundtrip(self):
         board = ma.MetaArena(_sub_gap())
@@ -277,8 +288,161 @@ class TestDeclareQ2:
             )
         )
         board.step(ma.Action.saturate())
-        best = board.eg.extract_best(board.root, board.cost_fn)
+        best = board.eg.extract_best(board.root, board.feasible_cost)
         assert op_repr(board.unfold(best)) == op_repr(board.term)
+
+
+class TestFeasibilityPricing:
+    """The supported-op bound: extraction can no longer mint names.
+
+    ``feasible_cost`` = ``backend_cost(cost_fn, supported)`` over the
+    declared-op expansion — a supported op keeps its model price, a
+    declared-but-unlowered op bills its spelled form, and a name
+    that is neither is infeasible (``+inf``).
+    """
+
+    def test_supported_bound_defaults_to_library_vocabulary(self):
+        board = ma.MetaArena(_sub_gap())
+        # every op the base ruleset spells is presumed lowerable —
+        # ``sub`` is in DEFAULT's vocabulary (sub_to_add's lhs)
+        assert "sub" in board.supported and "add" in board.supported
+        assert board.feasible_cost(_sub_gap()) == pytest.approx(32.0)
+        # a name no rule mentions is unsupported — and, undeclared,
+        # infeasible outright (the finite never-win sentinel)
+        x = _v("x", 4, 4)
+        assert board.feasible_cost(_p("mystery", x)) >= _INVALID_COST
+
+    def test_declared_fresh_name_prices_at_spelled_form(self):
+        board = ma.MetaArena(_sub_gap())
+        x, y = _v("x", 4, 4), _v("y", 4, 4)
+        fresh = _p("abs0", x, y)
+        assert board.feasible_cost(fresh) >= _INVALID_COST
+        board.step(
+            _decl(
+                "fold",
+                name="abs0",
+                spelled=("add", "X", ("neg", "Y")),
+                kernel=("abs0", "X", "Y"),
+            )
+        )
+        # the bound froze at board open — the minted name is not in it
+        assert "abs0" not in board.supported
+        spelled = _p("add", x, _p("neg", y))
+        assert board.feasible_cost(fresh) == pytest.approx(
+            board.feasible_cost(spelled)
+        )
+        # and the composition is literally backend_cost over the
+        # expanded term (its +inf shows here as _INVALID_COST — the
+        # finite never-win sentinel the report layer reads as inf)
+        bound = backend_cost(flops_cost, board.supported)
+        assert board.feasible_cost(spelled) == bound(spelled)
+        mystery = _p("mystery", x)
+        assert bound(mystery) == float("inf")
+        assert board.feasible_cost(mystery) >= _INVALID_COST
+
+    def test_unfoldless_declare_is_infeasible_not_cheap(self):
+        # unfold=False mints no definition — the fresh name is an op
+        # nothing can run, so it prices at the never-win sentinel,
+        # not the 1-flop default
+        board = ma.MetaArena(_sub_gap())
+        board.step(
+            ma.Action.declare(
+                {
+                    "op": "fold",
+                    "params": {
+                        "name": "k0",
+                        "spelled": ("add", "X", ("neg", "Y")),
+                        "kernel": ("k0", "X", "Y"),
+                    },
+                },
+                unfold=False,
+            )
+        )
+        assert board.definitions == {}
+        traj = _scripted(board)
+        t = traj.terminal
+        assert t.certificate_ok
+        assert t.used_declared == ()
+        assert t.cost == pytest.approx(board.baseline_cost)
+
+    def test_supported_bound_gates_the_declared_price(self):
+        decl = _decl(
+            "fold",
+            name="subfold",
+            spelled=("add", "X", ("neg", "Y")),
+            kernel=("sub", "X", "Y"),
+        )
+        # a sink that knows ``sub``: the claim earns its kernel price
+        board = ma.MetaArena(
+            _sub_gap(), supported=frozenset({"add", "neg", "sub"})
+        )
+        traj = _scripted(board, decl)
+        assert traj.terminal.certificate_ok
+        assert traj.cost == pytest.approx(16.0)
+        # the same object on a board that cannot lower ``sub``: the
+        # extraction still certifies — at the spelled price
+        board2 = ma.MetaArena(
+            _sub_gap(), supported=frozenset({"add", "neg"})
+        )
+        traj2 = _scripted(board2, decl)
+        t2 = traj2.terminal
+        assert t2.certificate_ok
+        assert t2.cost == pytest.approx(32.0)
+        assert t2.cost_unfolded == pytest.approx(t2.cost)
+
+    def test_artifact_pays_no_delta(self):
+        board = ma.MetaArena(_sub_gap())
+        act = _decl(
+            "fold",
+            name="abs0",
+            spelled=("add", "X", ("neg", "Y")),
+            kernel=("abs0", "X", "Y"),
+        )
+        traj = _scripted(board, act)
+        t = traj.terminal
+        # delta*(base-cost)/base - step: cost == baseline -> -step
+        assert t.reward == pytest.approx(-lawdata.META_ARENA_REWARD["step"])
+
+    def test_greedy_finds_no_artifact_win(self):
+        # under DEFAULT minus the shipped folds the only declares the
+        # enumerator offers are fresh names — parity-priced now, so
+        # cheapest-immediate play lands back on baseline
+        sans = DEFAULT - DEFAULT.named("silu_fold", "softsign_fold")
+        board = ma.MetaArena(_silu_site(), sans)
+        traj = ma.run_episode(board, ma.GreedyPlayer(), 200)
+        t = traj.terminal
+        assert t is not None and t.certificate_ok
+        assert t.cost == pytest.approx(board.baseline_cost)
+
+    def test_unrunnable_baseline_pays_no_delta(self):
+        # a bound that excludes the program's own ops is an honest
+        # "this board cannot run it" — not a nan payout
+        board = ma.MetaArena(_sub_gap(), supported=frozenset())
+        assert not math.isfinite(board.baseline_cost)
+        assert board.observe().best_cost == float("inf")
+        _st, rep = board.step(ma.Action.extract())
+        assert rep.terminal and rep.certificate_ok
+        assert rep.reward == pytest.approx(-lawdata.META_ARENA_REWARD["step"])
+        # and a zero-cost baseline (a bare leaf) divides by nothing
+        leaf = ma.MetaArena(_v("x", 4, 4))
+        assert leaf.baseline_cost == 0.0
+        _st, rep = leaf.step(ma.Action.extract())
+        assert rep.terminal and rep.reward == pytest.approx(
+            -lawdata.META_ARENA_REWARD["step"]
+        )
+
+    def test_torch_supported_falls_back(self, monkeypatch):
+        # without catopt-torch the demo bound is None — the board
+        # falls back to the ambient-vocabulary bound
+        monkeypatch.setitem(sys.modules, "catopt_torch.adapters", None)
+        assert ma._torch_supported() is None
+
+    def test_feasible_cost_forwards_model_markers(self):
+        # a storage-pricing model's markers ride the wrapper so
+        # extract_best / dag_cost keep billing params correctly
+        board = ma.MetaArena(_sub_gap(), cost_fn=param_bytes_cost)
+        assert board.feasible_cost.charges_param_only is True
+        assert board.feasible_cost.dag_exact is True
 
 
 class TestPlayers:
@@ -579,3 +743,30 @@ class TestProbe:
             if v["cert"] is not None
         )
         assert "sub_gap" in ma.probe_table(rows)
+
+    def test_meta_probe_supported_bound(self):
+        # the same kernel claim prices honestly both ways: unnamed
+        # under the ambient vocabulary it earns its spelled form;
+        # under a bound that knows it, its supported price
+        x = _v("x", 4, 4)
+        site = _p("div", x, _p("add", _p("abs", x), Const(1)))
+        sans = DEFAULT - DEFAULT.named("silu_fold", "softsign_fold")
+        decl = {
+            "op": "fold",
+            "params": {
+                "name": "softsign_decl",
+                "spelled": ("div", "X", ("add", ("abs", "X"), 1)),
+                "kernel": "softsign",
+            },
+        }
+        rows = ma.meta_probe(
+            [("ss", site, sans, (decl,))], budget=8, declare_limit=4
+        )
+        assert rows[0]["declare"]["cost"] == pytest.approx(
+            rows[0]["baseline"]
+        )
+        sup = frozenset({"div", "add", "abs", "softsign"})
+        rows = ma.meta_probe(
+            [("ss", site, sans, (decl,), sup)], budget=8, declare_limit=4
+        )
+        assert rows[0]["declare"]["cost"] == pytest.approx(16.0)
