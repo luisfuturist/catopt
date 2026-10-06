@@ -32,6 +32,16 @@ What the registry deliberately does *not* hold:
 
 The tag vocabulary is closed: a new concept is a new tag here, never a
 new hand list elsewhere.
+
+The registry is also the *declaration seam*: :func:`register_op_meta`
+adds an op to the live registry (and its attr schema to
+``ATTR_SCHEMA``/``ATTR_REQUIRED``), and :func:`reset_declared` undoes
+it.  The declaration *model* — an op definition as data plus its shape
+rule — lives in :mod:`catopt_core.opdata`; this module is the registry
+half.  A declared op is visible through the live accessors and the
+live ``REGISTRY``, but the ``*_OPS`` projections below are
+import-time snapshots of the *shipped* vocabulary (see
+``project/plans/0019-ops-as-data.md``, *Honest boundary*).
 """
 
 from __future__ import annotations
@@ -73,7 +83,9 @@ __all__ = [
     "attrs",
     "meta",
     "ops",
+    "register_op_meta",
     "required",
+    "reset_declared",
     "tags_of",
     "validate_aten_map",
 ]
@@ -411,8 +423,68 @@ def _build_registry() -> dict[str, OpMeta]:
 
 
 #: ``op name -> OpMeta``.  Immutable — a mapping proxy over the built
-#: dict, so a caller cannot mutate the single source.
-REGISTRY: Mapping[str, OpMeta] = MappingProxyType(_build_registry())
+#: dict, so a caller cannot mutate the single source.  The proxy is
+#: *live*: the declaration seam (:func:`register_op_meta`) writes into
+#: the underlying dict, so a declared op joins the registry in place.
+_REGISTRY: dict[str, OpMeta] = _build_registry()
+REGISTRY: Mapping[str, OpMeta] = MappingProxyType(_REGISTRY)
+
+#: The shipped vocabulary's names — a declaration may not shadow one
+#: of these (a declaration adds a primitive, it never redefines one).
+_BUILTIN_NAMES: frozenset[str] = frozenset(_REGISTRY)
+
+#: Names declared through :func:`register_op_meta`, in declaration
+#: order — what :func:`reset_declared` removes.
+_DECLARED_NAMES: list[str] = []
+
+
+def register_op_meta(
+    meta: OpMeta,
+    *,
+    attrs: Mapping[int, str] | None = None,
+    required: frozenset[str] | None = None,
+) -> None:
+    """Register a *declared* op — the additive declaration seam.
+
+    Inserts *meta* into the live registry (so ``REGISTRY`` and every
+    accessor see it) and, when supplied, its positional attr schema
+    into ``ATTR_SCHEMA`` / ``ATTR_REQUIRED`` — the same single home the
+    shipped schema lives in, so :meth:`catopt_core.ir.Op.make` enforces
+    it at mint.  Declaring a name a shipped op already uses is a
+    ``ValueError``.  Re-declaring a previously declared name overwrites
+    it (idempotent); :func:`reset_declared` removes every declared op.
+
+    The declaration *model* — an ``OpDef`` plus its shape rule — lives
+    in :mod:`catopt_core.opdata`; this is the registry half of the
+    seam, and the only place a caller may extend the vocabulary.
+    """
+    if meta.name in _BUILTIN_NAMES:
+        raise ValueError(
+            f"{meta.name!r} is a shipped op — a declaration adds a "
+            f"primitive, it does not shadow one"
+        )
+    _REGISTRY[meta.name] = meta
+    if attrs:
+        ATTR_SCHEMA[meta.name] = dict(attrs)
+        if required:
+            ATTR_REQUIRED[meta.name] = frozenset(required)
+    if meta.name not in _DECLARED_NAMES:
+        _DECLARED_NAMES.append(meta.name)
+
+
+def reset_declared() -> list[str]:
+    """Remove every declared op; return the names removed, in order.
+
+    Restores the registry and the attr schema to the shipped state.
+    A no-op (returning ``[]``) when nothing has been declared.
+    """
+    removed = list(_DECLARED_NAMES)
+    for name in removed:
+        _REGISTRY.pop(name, None)
+        ATTR_SCHEMA.pop(name, None)
+        ATTR_REQUIRED.pop(name, None)
+    _DECLARED_NAMES.clear()
+    return removed
 
 
 # ---------------------------------------------------------------------------
