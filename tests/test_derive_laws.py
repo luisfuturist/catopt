@@ -413,7 +413,7 @@ def test_fingerprint_covers_dspec_data():
 
 
 def test_every_shipped_dspec_roundtrips_through_json():
-    """All 20 spec-carrying rules' dspecs survive the store wire format."""
+    """All 22 spec-carrying rules' dspecs survive the store wire format."""
     seen = 0
     for rule in [*ALL_RULES, *SCAN_DIAG_LAWS]:
         if rule.dspec is None:
@@ -429,7 +429,7 @@ def test_every_shipped_dspec_roundtrips_through_json():
             dspec=json.loads(blob),
         )
         assert rebuilt.dspec == rule.dspec
-    assert seen == 20
+    assert seen == 22
 
 
 def test_migrated_alias_partials_are_the_same_data():
