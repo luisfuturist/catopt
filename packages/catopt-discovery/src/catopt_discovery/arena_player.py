@@ -1011,9 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
     top = sorted(
         player.weights_dict().items(), key=lambda kv: -abs(kv[1])
     )[:12]
-    print(
+    print(  # stdout-compat
         "top weights:", [(k, round(v, 3)) for k, v in top]
-    )  # stdout-compat
+    )
 
     cold = LearnedPlayer(seed=args.seed, learn=False)
     arms: dict[str, Callable[[int], Any]] = {

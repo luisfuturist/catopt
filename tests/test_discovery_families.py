@@ -61,9 +61,11 @@ def test_dup_programs_both_spellings():
             sq, mm = p.args
             assert p.op == "add"
             assert sq.op == "square" and mm.op == "mul"
-            # The same t object is shared across all three slots —
+            # The same t term is shared across all three slots —
             # that is the duplication ``square_expand`` collapses.
-            assert sq.args[0] is mm.args[0] is mm.args[1]
+            # Structural equality: ``Op.make`` hash-conses, so cache
+            # state decides *which* equal object each slot holds.
+            assert sq.args[0] == mm.args[0] == mm.args[1]
             if isinstance(sq.args[0], Op):
                 saw_op = True
             else:
