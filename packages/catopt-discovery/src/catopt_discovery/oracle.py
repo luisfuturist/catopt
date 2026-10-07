@@ -95,6 +95,17 @@ _TOL = 1e-6
 #: Cap on synthesized instances per candidate — the default window.
 _MAX_INSTANCES = 360
 
+#: Cap on the viewed-binding rows the domain enumeration opens.
+#: ``_synth_bases`` materializes one :class:`_LazySeq` per viewed
+#: binding; a fold over a deep view chain can put ~10 metavars under
+#: views, and ``_viewed_bindings``' diagonal product of their banks
+#: is unbounded (measured: a 9-ary kernel fold OOMed an 11 GB host
+#: pulling group ~10⁴ of ~10¹³).  The cap truncates the *tail* of
+#: the viewed-binding order — the diagonal keeps the low-index
+#: corner covered, and over-budget coverage is a partial sweep, the
+#: same honesty the instance cap already documents.
+_MAX_VIEWED_BINDINGS = 512
+
 #: Second-phase cap for a *starved* guarded-region sweep.  A
 #: multi-clause guard's accepted corner sits deep in the fair-order
 #: enumeration: the diagonal interleaves every ``(viewed x attr)``
@@ -1283,7 +1294,9 @@ def _synth_bases(lhs_pat: Any, rhs_pat: Any) -> Iterable:
     )
     extra = _CHAIN_VIEWED_SHAPES if _has_chained_view(nodes) else ()
     groups: list = []
-    for viewed in _viewed_bindings(mvs, parents, extra):
+    for viewed in itertools.islice(
+        _viewed_bindings(mvs, parents, extra), _MAX_VIEWED_BINDINGS
+    ):
         domains = _attr_domains(nodes, viewed)
         if domains is None:
             continue

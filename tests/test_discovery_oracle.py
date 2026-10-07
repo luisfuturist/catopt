@@ -1803,3 +1803,36 @@ def test_rms_norm_fold_guard_accepts_a_tail_block_binding():
     assert gained.check(multi)
     # a scalar u has no trailing block — the guard declines.
     assert not gained.check(dict(base, u=_v("u")))
+
+
+def test_synth_domain_enumeration_is_bounded():
+    """A deep-view fold cannot OOM the viewed-binding enumeration.
+
+    ``_synth_bases`` materializes one ``_LazySeq`` per viewed
+    binding; a pattern with ~8 leaf metavars under view ops opens a
+    diagonal product of ~30^8 rows — the measured OOM a 9-ary kernel
+    fold caused on an 11 GB host.  ``_MAX_VIEWED_BINDINGS`` caps the
+    opened rows: the sweep stays a bounded corner (the same honesty
+    ``_MAX_INSTANCES`` documents) instead of an unbounded pull.
+
+    Pre-fix this call did not return — the test is the regression
+    pin, not a timing assertion.
+    """
+    from catopt_discovery.object_synthesis import term_from_spec
+
+    # eight leaves, each under a view op — the OOM shape
+    spelled = (
+        "add",
+        *(("unsqueeze", f"X{i}", {"dim": i % 3}) for i in range(1, 5)),
+        (
+            "transpose",
+            "X5",
+            {"dim0": 0, "dim1": 1},
+        ),
+        ("squeeze", "X6", {"dim": 0}),
+        ("unflatten", "X7", {"dim": 0, "sizes": (2, 2)}),
+        ("reshape", "X8", {"shape": (2, 2, 2)}),
+    )
+    obj = term_from_spec(spelled)
+    inst = vo.synthesize(obj, Var("Y", TensorType(())), limit=16)
+    assert len(inst) <= 16
