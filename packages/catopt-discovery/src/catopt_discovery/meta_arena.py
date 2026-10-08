@@ -203,6 +203,20 @@ class Action:
         """``extract()`` — the terminal move: certify and score."""
         return cls("extract", {})
 
+    @classmethod
+    def handle(cls, obj: str, handler: str) -> Action:
+        """``handle(obj, handler)`` — interpret a declared object.
+
+        The Sanada move: a ``declare`` mints the pure request;
+        ``handle`` assigns its scoped interpretation — a row of
+        :data:`lawdata.HANDLERS` whose ``pattern`` must alpha-cover the
+        object's spelled body.  A handled name prices at the
+        handler's ``kernel`` under the feasibility bound instead of
+        spelled parity; a kernel outside ``supported`` prices
+        infeasible.  Re-handling replaces the interpretation.
+        """
+        return cls("handle", {"object": obj, "handler": handler})
+
 
 #: Handler contract — ``(arena, action) -> _Outcome``, mirroring
 #: the construction arena's registry seam.
@@ -283,6 +297,31 @@ def _spec_of(term: Any, names: dict) -> Any:
     if key not in names:
         names[key] = f"X{len(names) + 1}"
     return names[key]
+
+
+def _canon_spec(spec: Any, names: dict | None = None) -> Any:
+    """alpha-normalise *spec*: metavar leaves → ``X1``, ``X2``, … .
+
+    Two specs are alpha-equivalent iff their canonical forms are equal —
+    the legality check between a ``handle`` pattern and a declared
+    object's spelled body.  Attr dicts compare literally (handlers
+    do not bind attr metavars yet — a pattern with attrs must match
+    the spelled attrs exactly).
+    """
+    if names is None:
+        names = {}
+    if isinstance(spec, str):
+        if spec not in names:
+            names[spec] = f"X{len(names) + 1}"
+        return names[spec]
+    if isinstance(spec, (tuple, list)):
+        return tuple(
+            _canon_spec(e, names)
+            if not isinstance(e, dict)
+            else dict(e)
+            for e in spec
+        )
+    return spec
 
 
 def _spec_children(spec: Any) -> Iterable:
@@ -509,6 +548,11 @@ def _unfold_for(obj: Any) -> tuple | None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_handlers(handlers: dict | None) -> dict:
+    """Resolve the board's handler table — the shipped menu by default."""
+    return lawdata.HANDLERS if handlers is None else handlers
+
+
 def _supported_or(supported: Any, term: Any, rules: Any) -> frozenset:
     """Resolve the board's supported-op bound.
 
@@ -529,8 +573,35 @@ def _supported_or(supported: Any, term: Any, rules: Any) -> frozenset:
     return frozenset(out)
 
 
+def _bound_node(
+    t: Any,
+    args: tuple,
+    supported: frozenset,
+    defs: dict,
+    interp: dict | None,
+) -> Any:
+    """Re-root one expanded op node under the bound.
+
+    A *handled* op (in *interp* — the live ``interpretations``
+    table ``op -> (kernel, arg_positions)``) is rewritten to its
+    kernel first: the interpretation wins over spelled parity, and
+    a kernel outside *supported* prices infeasible — the honest
+    cost of interpreting an object the bound cannot run.
+    """
+    if interp and t.op in interp:
+        kernel, pos = interp[t.op]
+        return Op.make(kernel, *(args[i] for i in pos), **dict(t.attrs))
+    if t.op in supported or t.op not in defs:
+        return Op.make(t.op, *args, **dict(t.attrs))
+    mvs, spelled = defs[t.op]
+    return _term_instantiate(spelled, dict(zip(mvs, args, strict=True)))
+
+
 def _feasible_cost(
-    cost_fn: Any, supported: frozenset, defs: dict
+    cost_fn: Any,
+    supported: frozenset,
+    defs: dict,
+    interp: dict | None = None,
 ) -> Any:
     """Compose ``backend_cost`` with the declared-op expansion.
 
@@ -551,16 +622,11 @@ def _feasible_cost(
     bound = backend_cost(cost_fn, supported)
 
     def expand(t: Any) -> Any:
-        """Expand the unsupported-and-defined ops of *t* (one bound)."""
+        """Expand *t*'s unsupported-and-defined ops (one bound)."""
         if not isinstance(t, Op):
             return t
         args = tuple(expand(a) for a in t.args)
-        if t.op in supported or t.op not in defs:
-            return Op.make(t.op, *args, **dict(t.attrs))
-        mvs, spelled = defs[t.op]
-        return _term_instantiate(
-            spelled, dict(zip(mvs, args, strict=True))
-        )
+        return _bound_node(t, args, supported, defs, interp)
 
     def priced(term: Any, memo: dict | None = None) -> float:
         """Price *term* under the supported-op bound.
@@ -717,6 +783,67 @@ def _declare(arena: MetaArena, action: Action) -> _Outcome:
     )
 
 
+@register_action("handle")
+def _handle(arena: MetaArena, action: Action) -> _Outcome:
+    """Assign a declared object a scoped interpretation.
+
+    Legality: *object* must be a declared definition (a ``declare``
+    whose unfold recorded ``defs[op] = (mvs, spelled)``), the
+    *handler* a row of the board's handler table, and the handler's
+    ``pattern`` alpha-equal to the spelled body.  The kernel's
+    ``args`` name pattern metavars whose binding positions index
+    the fold's argument order — recorded so pricing instantiates
+    ``kernel(*args[pos])``.
+    """
+    p = action.params
+    op = str(p.get("object", ""))
+    tag = str(p.get("handler", ""))
+    entry = arena.definitions.get(op)
+    if entry is None:
+        return _Outcome(
+            applied=False,
+            note=f"handle: {op!r} is not a declared definition",
+        )
+    h = arena.handlers.get(tag)
+    if h is None:
+        return _Outcome(
+            applied=False, note=f"handle: unknown handler {tag!r}"
+        )
+    mvs, spelled = entry
+    spelled_spec = _spec_of(spelled, {})
+    if _canon_spec(spelled_spec) != _canon_spec(h["pattern"]):
+        return _Outcome(
+            applied=False,
+            note=f"handle: {tag!r} does not cover {op!r}",
+        )
+    smvs = _spec_metavars(spelled_spec)
+    hmvs = _spec_metavars(h["pattern"])
+    try:
+        pos = tuple(mvs.index(smvs[hmvs.index(a)]) for a in h["args"])
+    except (ValueError, IndexError):
+        return _Outcome(
+            applied=False,
+            note=f"handle: {tag!r} args bind outside {op!r}'s metavars",
+        )
+    arena.interpretations[op] = (h["kernel"], pos)
+    # The e-graph's shared cost memo keys ``(cost_fn, term)`` — pure
+    # under a fixed interpretation, stale the moment one changes.
+    # Clearing it re-prices every term under the new handler.
+    memos = getattr(arena.eg, "_cost_memos", None)
+    if memos is not None:
+        ent = memos.get(id(arena.feasible_cost))
+        if ent is not None:
+            ent[1].clear()
+    return _Outcome(
+        note=f"handle {op} with {tag} → {h['kernel']}",
+        detail={
+            "object": op,
+            "handler": tag,
+            "kernel": h["kernel"],
+        },
+    )
+
+
 @register_action("extract")
 def _extract(arena: MetaArena, action: Action) -> _Outcome:
     """Terminal: extract, certify the derivation, score the delta."""
@@ -789,6 +916,9 @@ class MetaState:
     baseline_cost: float
     budget_left: int
     specs: tuple
+    declared_bodies: tuple = ()
+    handles: tuple = ()
+    handler_specs: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -852,6 +982,7 @@ class MetaArena:
         max_nodes: int = 20_000,
         max_specs: int = 32,
         weights: dict | None = None,
+        handlers: dict | None = None,
     ) -> None:
         """Bind the program, the library, the bound, and the budget."""
         self.term = term
@@ -862,11 +993,16 @@ class MetaArena:
         self._by_name = {r.name: r for r in self.rules}
         self.declared: dict[str, Rewrite] = {}
         self.definitions: dict[str, tuple] = {}
+        self.interpretations: dict[str, tuple] = {}
+        self.handlers = _resolve_handlers(handlers)
         self.corpus = tuple(corpus) or (term,)
         self.cost_fn = cost_fn if cost_fn is not None else flops_cost
         self.supported = _supported_or(supported, term, self.rules)
         self.feasible_cost = _feasible_cost(
-            self.cost_fn, self.supported, self.definitions
+            self.cost_fn,
+            self.supported,
+            self.definitions,
+            self.interpretations,
         )
         self.max_nodes = int(max_nodes)
         self.weights = {**lawdata.META_ARENA_REWARD, **(weights or {})}
@@ -950,6 +1086,7 @@ class MetaArena:
             if best is not None
             else float("inf")
         )
+        bodies, handles, handler_specs = self._interp_state()
         return MetaState(
             rules=tuple(r.name for r in self.rules),
             declared=tuple(sorted(self.declared)),
@@ -962,7 +1099,38 @@ class MetaArena:
             baseline_cost=self.baseline_cost,
             budget_left=max(0, self.max_nodes - self.eg.n_enodes),
             specs=self._specs,
+            declared_bodies=bodies,
+            handles=handles,
+            handler_specs=handler_specs,
         )
+
+    def _interp_state(self) -> tuple:
+        """Return the interpretation view: declared bodies, assignments, menu.
+
+        ``(declared_bodies, handles, handler_specs)`` — canonical
+        specs for the ``handle`` enumerator's coverage check, the
+        live ``op -> kernel`` assignments, and each handler's
+        canonical pattern.
+        """
+        bodies = tuple(
+            sorted(
+                (op, _canon_spec(_spec_of(spelled, {})))
+                for op, (_mvs, spelled) in self.definitions.items()
+            )
+        )
+        handles = tuple(
+            sorted(
+                (op, kernel)
+                for op, (kernel, _pos) in self.interpretations.items()
+            )
+        )
+        specs = tuple(
+            sorted(
+                (tag, _canon_spec(h["pattern"]))
+                for tag, h in self.handlers.items()
+            )
+        )
+        return bodies, handles, specs
 
     def _accept(self, out: _Outcome) -> tuple[_Outcome, tuple]:
         """Insert a declare's rules, two-phase; return (out', names).
@@ -1075,6 +1243,22 @@ def _fresh_fold(i: int, spec: Any) -> Action:
     )
 
 
+def _handle_actions(state: MetaState) -> list[Action]:
+    """``handle`` moves for handler patterns covering a declared body.
+
+    Only unhandled names are offered — a handled object is already
+    interpreted (re-interpretation stays spellable explicitly).
+    """
+    handled = {op for op, _kernel in state.handles}
+    return [
+        Action.handle(op, tag)
+        for op, body in state.declared_bodies
+        if op not in handled
+        for tag, pspec in state.handler_specs
+        if pspec == body
+    ]
+
+
 def legal_actions(state: MetaState) -> tuple[Action, ...]:
     """Enumerate the moves *state* affords, deterministically.
 
@@ -1093,6 +1277,7 @@ def legal_actions(state: MetaState) -> tuple[Action, ...]:
         Action.saturate(budget=b) for b in lawdata.META_SATURATE_BUDGETS
     ]
     out += [_fresh_fold(i, s) for i, s in enumerate(state.specs)]
+    out += _handle_actions(state)
     out.append(Action.extract())
     return tuple(out)
 

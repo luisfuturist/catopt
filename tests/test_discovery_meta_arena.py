@@ -113,7 +113,9 @@ class TestBoard:
         w = lawdata.META_ARENA_REWARD
         board = ma.MetaArena(_id_site())
         _st, rep = board.step(ma.Action.fire("id_mul"))
-        assert rep.reward == -(w["step"] + w["enode"] * rep.enodes_delta)
+        assert rep.reward == -(
+            w["step"] + w["enode"] * rep.enodes_delta
+        )
 
 
 class TestMoves:
@@ -231,9 +233,11 @@ class TestExtract:
         board.step(ma.Action.fire("id_mul"))
         _st, rep = board.step(ma.Action.extract())
         base = board.baseline_cost
-        want = lawdata.META_ARENA_REWARD["delta"] * (
-            (base - rep.cost) / base
-        ) - lawdata.META_ARENA_REWARD["step"]
+        want = (
+            lawdata.META_ARENA_REWARD["delta"]
+            * ((base - rep.cost) / base)
+            - lawdata.META_ARENA_REWARD["step"]
+        )
         assert rep.reward == pytest.approx(want)
 
 
@@ -401,7 +405,9 @@ class TestFeasibilityPricing:
         traj = _scripted(board, act)
         t = traj.terminal
         # delta*(base-cost)/base - step: cost == baseline -> -step
-        assert t.reward == pytest.approx(-lawdata.META_ARENA_REWARD["step"])
+        assert t.reward == pytest.approx(
+            -lawdata.META_ARENA_REWARD["step"]
+        )
 
     def test_greedy_finds_no_artifact_win(self):
         # under DEFAULT minus the shipped folds the only declares the
@@ -422,7 +428,9 @@ class TestFeasibilityPricing:
         assert board.observe().best_cost == float("inf")
         _st, rep = board.step(ma.Action.extract())
         assert rep.terminal and rep.certificate_ok
-        assert rep.reward == pytest.approx(-lawdata.META_ARENA_REWARD["step"])
+        assert rep.reward == pytest.approx(
+            -lawdata.META_ARENA_REWARD["step"]
+        )
         # and a zero-cost baseline (a bare leaf) divides by nothing
         leaf = ma.MetaArena(_v("x", 4, 4))
         assert leaf.baseline_cost == 0.0
@@ -448,9 +456,7 @@ class TestFeasibilityPricing:
 class TestPlayers:
     def test_greedy_extracts_once_improved(self):
         rules = DEFAULT.named("silu_fold")
-        board = ma.MetaArena(
-            _silu_site(), rules, cost_fn=count_cost
-        )
+        board = ma.MetaArena(_silu_site(), rules, cost_fn=count_cost)
         traj = ma.run_episode(board, ma.GreedyPlayer(), 10)
         t = traj.terminal
         assert t is not None and t.certificate_ok
@@ -615,7 +621,11 @@ class TestEnumerationAndDrivers:
         )
         st = ma.MetaArena(term).observe()
         # the whole composite appears, canonicalized with attr data
-        whole = ("add", ("unsqueeze", "X1", {"dim": 0}), ("mul", "X2", 1))
+        whole = (
+            "add",
+            ("unsqueeze", "X1", {"dim": 0}),
+            ("mul", "X2", 1),
+        )
         assert whole in st.specs
         assert ma._spec_metavars(whole) == ("X1", "X2")
         assert ma._spec_ops("bare") == set()
@@ -767,6 +777,132 @@ class TestProbe:
         )
         sup = frozenset({"div", "add", "abs", "softsign"})
         rows = ma.meta_probe(
-            [("ss", site, sans, (decl,), sup)], budget=8, declare_limit=4
+            [("ss", site, sans, (decl,), sup)],
+            budget=8,
+            declare_limit=4,
         )
         assert rows[0]["declare"]["cost"] == pytest.approx(16.0)
+
+
+class TestHandleMove:
+    """``handle`` — the scoped-interpretation move (Sanada-style)."""
+
+    def _arena(self, cost_fn=None):
+        from catopt_core.cost.basic import count_cost
+
+        x = _v("x", 4, 4)
+        c = _v("c", 4, 4)
+        term = _p("add", _p("mul", x, _p("sigmoid", x)), c)
+        sup = {"add", "mul", "sigmoid", "silu"}
+        arena = ma.MetaArena(
+            term,
+            rules=[],
+            supported=sup,
+            cost_fn=cost_fn or count_cost,
+            max_specs=8,
+        )
+        arena.step(
+            ma.Action.declare(
+                {
+                    "op": "fold",
+                    "params": {
+                        "name": "mysilu",
+                        "spelled": ("mul", "X1", ("sigmoid", "X1")),
+                        "kernel": ("mysilu", "X1"),
+                    },
+                }
+            )
+        )
+        arena.step(ma.Action.saturate(budget=512))
+        return arena
+
+    def test_handle_reprices_to_kernel(self):
+        # handled: the declared name reads as one `silu` op (2 ops
+        # total incl. add); unhandled: spelled parity (3 ops)
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.handle("mysilu", "silu"))
+        assert rep.applied
+        assert rep.detail["kernel"] == "silu"
+        st = arena.observe()
+        assert st.handles == (("mysilu", "silu"),)
+        _, rep = arena.step(ma.Action.extract())
+        assert rep.applied and rep.certificate_ok
+        assert rep.cost == pytest.approx(2.0)
+        # cost_unfolded stays the honest spelled price
+        assert rep.cost_unfolded == pytest.approx(3.0)
+
+    def test_unhandled_prices_spelled_parity(self):
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.extract())
+        assert rep.cost == pytest.approx(3.0)
+        assert rep.cost_unfolded == pytest.approx(3.0)
+
+    def test_handle_requires_declaration(self):
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.handle("nope", "silu"))
+        assert not rep.applied
+        assert "not a declared definition" in rep.note
+
+    def test_handle_requires_known_handler(self):
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.handle("mysilu", "bogus"))
+        assert not rep.applied
+        assert "unknown handler" in rep.note
+
+    def test_handle_requires_covering_pattern(self):
+        # `square` covers mul(X,X) — mysilu's body has distinct arg
+        # positions; the mismatch declines honestly
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.handle("mysilu", "square"))
+        assert not rep.applied
+        assert "does not cover" in rep.note
+
+    def test_handle_unsupported_kernel_is_infeasible(self):
+        # a handler whose kernel the bound cannot run applies (the
+        # interpretation is real) but prices the member infeasible
+        x = _v("x", 4, 4)
+        c = _v("c", 4, 4)
+        term = _p("add", _p("mul", x, _p("sigmoid", x)), c)
+        arena = ma.MetaArena(
+            term,
+            rules=[],
+            supported={"add", "mul", "sigmoid"},  # no silu
+            cost_fn=None,
+            max_specs=8,
+        )
+        arena.step(
+            ma.Action.declare(
+                {
+                    "op": "fold",
+                    "params": {
+                        "name": "mysilu",
+                        "spelled": ("mul", "X1", ("sigmoid", "X1")),
+                        "kernel": ("mysilu", "X1"),
+                    },
+                }
+            )
+        )
+        arena.step(ma.Action.saturate(budget=512))
+        _, rep = arena.step(ma.Action.handle("mysilu", "silu"))
+        assert rep.applied
+        _, rep = arena.step(ma.Action.extract())
+        # extraction falls back to the spelled member — the fused
+        # member is infeasible under this bound
+        assert rep.applied
+        assert rep.cost == pytest.approx(rep.cost_unfolded)
+
+    def test_legal_actions_enumerates_covering_handlers(self):
+        arena = self._arena()
+        st = arena.observe()
+        handles = [a for a in ma.legal_actions(st) if a.op == "handle"]
+        assert handles == [ma.Action.handle("mysilu", "silu")]
+        # already-handled ops are not re-offered
+        arena.step(ma.Action.handle("mysilu", "silu"))
+        st = arena.observe()
+        assert not any(a.op == "handle" for a in ma.legal_actions(st))
+
+    def test_handle_reassign_replaces_interpretation(self):
+        # re-handling the same op swaps its priced kernel
+        arena = self._arena()
+        arena.step(ma.Action.handle("mysilu", "silu"))
+        assert arena.interpretations["mysilu"][0] == "silu"

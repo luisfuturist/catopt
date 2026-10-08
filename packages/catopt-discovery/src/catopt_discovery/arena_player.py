@@ -628,8 +628,12 @@ class LearnedPlayer:
         self._prev = state
 
     def _slice(self, acts: list) -> list:
-        """The candidate set this step scores — the whole legal set,
-        or a uniform seeded slice of it under the cap."""
+        """Score the candidate set — the legal set or a seeded slice.
+
+        Under the cap a uniform seeded slice of the legal set is
+        scored; re-drawn each step, so the cap is a perceptual
+        limit, not a restriction on the move space.
+        """
         if self._cap is not None and 0 < self._cap < len(acts):
             return self._rng.sample(acts, self._cap)
         return acts

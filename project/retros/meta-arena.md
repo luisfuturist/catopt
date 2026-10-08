@@ -159,3 +159,36 @@ kernel a sink can lower.**
 * Pre-existing ratchet drift (not this change): `EGraph.apply_rule`
   reads 25 vs baseline 24 — commit 7ed07f0 added a branch without
   regenerating `tools/complexity_baseline.json`.
+
+## The ``handle`` move — scoped interpretation, landed
+
+Sanada's arrow handler as an arena move: ``declare`` mints the
+request, ``Action.handle(obj, handler)`` assigns its scoped
+interpretation — a row of :data:`lawdata.HANDLERS`
+(tag → ``{pattern, kernel, args}``, pure data).
+
+* **Legality is checked, not trusted** — the handler's pattern
+  must alpha-cover the object's spelled body (canonical spec
+  comparison, metavar repeats enforced); a non-covering handler
+  declines honestly.
+* **Pricing** — the live ``interpretations`` table sits inside
+  ``feasible_cost``'s expand: a handled name rewrites to its
+  kernel *before* the spelled-parity expansion, so a supported
+  kernel earns its real cost and an unsupported one prices
+  infeasible (the move applies; the bound refuses it at pricing).
+* **Measured delta** — under ``count_cost`` a ``mysilu`` fold
+  priced 3 spelled / **2 handled**; ``cost_unfolded`` still
+  reports spelled (3) — the fused premium is visible per column.
+  Under ``flops_cost`` the same pair is flat: fused and spelled
+  move the same data — the launch-count evaluation gap made
+  *playable*, not just documented.
+* **Memo caveat found the honest way** — the e-graph's shared
+  cost memo assumes ``(cost_fn, term)`` purity; a handler makes
+  pricing stateful, so ``_handle`` clears the memo on assignment.
+  Pinned by ``TestHandleMove``.
+
+Enumeration: ``legal_actions`` offers a ``handle`` per declared
+body x covering handler (once — already-handled names are not
+re-offered; re-interpretation is still spellable explicitly).
+8 tests pin legality, pricing, memo invalidation and the
+supported-bound honesty.

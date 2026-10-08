@@ -68,6 +68,7 @@ __all__ = [
     "GRAMMAR_LITERALS",
     "GRAMMAR_SCHEMAS",
     "GRAMMAR_UNARY_OPS",
+    "HANDLERS",
     "INSTANCE_ATTR_DEFAULTS",
     "INSTANCE_LEAF_SHAPES",
     "INSTANCE_SCALAR_MVARS",
@@ -1239,6 +1240,41 @@ META_ARENA_REWARD: dict[str, float] = {
 #: different budget spells it on the action — the menu is data.
 META_SATURATE_BUDGETS: tuple = (None, 256)
 
+#: The ``handle`` move's interpretation table — the Sanada arrow
+#: handler made data: tag → ``{pattern, kernel, args}``.  A handler
+#: is a *scoped interpretation* of a declared object: ``pattern`` is
+#: the spelled form the kernel covers (spec syntax — ``str`` leaves
+#: are metavars), ``kernel`` the op name the interpretation lowers
+#: the declared abbreviation to, ``args`` the kernel's argument
+#: order over the pattern's metavars.  The meta-arena prices a
+#: handled name at the kernel's cost instead of spelled parity —
+#: under an op-count/launch-aware model the fused interpretation is
+#: measurably cheaper; under ``flops_cost`` it is honestly flat
+#: (fused and spelled move the same data — the evaluation gap the
+#: arena-probe retro documented).  A handler whose kernel is outside
+#: the board's ``supported`` bound applies but prices infeasible.
+HANDLERS: dict[str, dict] = {
+    "silu": {
+        "pattern": ("mul", "X", ("sigmoid", "X")),
+        "kernel": "silu",
+        "args": ("X",),
+    },
+    "square": {
+        "pattern": ("mul", "X", "X"),
+        "kernel": "square",
+        "args": ("X",),
+    },
+    "swiglu": {
+        "pattern": (
+            "mul",
+            ("mul", "A", ("sigmoid", "A")),
+            "B",
+        ),
+        "kernel": "swiglu",
+        "args": ("A", "B"),
+    },
+}
+
 # ---------------------------------------------------------------------------
 #  The learned arena player — feature schema and weight table
 # ---------------------------------------------------------------------------
@@ -1302,7 +1338,7 @@ ARENA_FEATURES: tuple[str, ...] = (
     "st:guarded",
     # op one-hot
     *(f"op:{op}" for op in ARENA_MOVE_ORDER),
-    # op × state interactions — a broadcast state feature shifts
+    # op x state interactions — a broadcast state feature shifts
     # every logit together and cancels in the softmax, so state can
     # only steer the policy through a product term ("auto_cond when
     # unguarded objects exist", "lift while the episode is paying").
