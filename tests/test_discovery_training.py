@@ -214,3 +214,45 @@ class TestShapedVJPs:
             _autograd(term, env, leaf, torch.ones(4, 8, 2)),
             1e-4,
         )
+
+    def test_expand_matches_autograd(self):
+        # x (4,1) expanded to (4,8): the grad sums the copies back
+        x = _v("x", 4, 1)
+        term = _p("expand", x, shape=(4, 8))
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 8))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf, torch.ones(4, 8)),
+            1e-4,
+        )
+
+    def test_broadcast_to_matches_autograd(self):
+        x = _v("x", 1, 8)
+        term = _p("broadcast_to", x, shape=(4, 8))
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 8))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf, torch.ones(4, 8)),
+            1e-4,
+        )
+
+
+class TestTrainingProbe:
+    def test_backward_programs_certify_on_the_board(self):
+        # real-shaped forwards → derived gradients → the board's
+        # saturate/extract/certify pipeline, unchanged
+        rows = training.training_probe()
+        names = {r["name"] for r in rows}
+        assert {"silu_fwd", "softmax_fwd", "linear_fwd"} <= names
+        certified = [r for r in rows if r.get("cert")]
+        assert len(certified) == 3
+        # the e-graph grew: laws fired on the gradient programs
+        assert all(r["n_enodes"] > 5 for r in certified)
+        text = training.training_table(rows)
+        assert "softmax_fwd" in text

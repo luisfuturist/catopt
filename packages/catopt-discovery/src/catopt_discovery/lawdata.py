@@ -1503,4 +1503,30 @@ REVERSE: dict[str, Any] = {
     ],
     "reshape": (("reshape", "$g", {"shape": "$shape:0"}),),
     "permute": (("permute", "$g", {"dims": "$invdims"}),),
+    # an expand/broadcast copies the input along $expdims; the
+    # cotangent sums those copies back, keepdim keeps the rank,
+    # reshape restores the exact input shape (new leading dims
+    # drop out through the same sum-then-reshape).
+    "expand": (
+        (
+            "reshape",
+            (
+                "sum",
+                "$g",
+                {"dim": "$expdims", "keepdim": True},
+            ),
+            {"shape": "$shape:0"},
+        ),
+    ),
+    "broadcast_to": (
+        (
+            "reshape",
+            (
+                "sum",
+                "$g",
+                {"dim": "$expdims", "keepdim": True},
+            ),
+            {"shape": "$shape:0"},
+        ),
+    ),
 }

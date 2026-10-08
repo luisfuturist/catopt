@@ -126,17 +126,11 @@ def _node_env(node: Any, g: Any, memo: dict) -> dict:
     dims = node.attrs.get("dim", node.attrs.get("dims"))
     inshape = env.get("$shape:0")
     if isinstance(inshape, tuple):
-        if dims is None:
-            env["$rcount"] = Const(_numel(inshape))
-        else:
-            dd = dims if isinstance(dims, (tuple, list)) else (dims,)
-            env["$rcount"] = Const(
-                _numel(
-                    tuple(inshape[int(d) % len(inshape)] for d in dd)
-                )
-            )
+        env["$rcount"] = Const(_reduced_count(inshape, dims))
     if node.op == "permute" and isinstance(dims, (tuple, list)):
         env["$invdims"] = tuple(dims.index(i) for i in range(len(dims)))
+    if node.op in ("expand", "broadcast_to"):
+        env["$expdims"] = _expanded_dims(node, inshape)
     return env
 
 
@@ -146,6 +140,29 @@ def _numel(shape: tuple) -> int:
     for d in shape:
         n *= int(d)
     return n
+
+
+def _reduced_count(inshape: tuple, dims: Any) -> int:
+    """Count the elements a ``mean`` reduction divided by."""
+    if dims is None:
+        return _numel(inshape)
+    dd = dims if isinstance(dims, (tuple, list)) else (dims,)
+    return _numel(tuple(inshape[int(d) % len(inshape)] for d in dd))
+
+
+def _expanded_dims(node: Any, inshape: Any) -> tuple:
+    """Dims an expand/broadcast grew (input 1-or-absent, target > 1)."""
+    target = node.attrs.get("shape") or node.attrs.get("dim")
+    if not isinstance(target, (tuple, list)) or not isinstance(
+        inshape, tuple
+    ):
+        return ()
+    pad = (1,) * (len(target) - len(inshape)) + tuple(inshape)
+    return tuple(
+        i
+        for i, (t_, d_) in enumerate(zip(target, pad, strict=False))
+        if d_ == 1 and t_ not in (1, -1)
+    )
 
 
 def _accumulate(
@@ -219,3 +236,139 @@ def grad_program(
     if names is None:
         return grads
     return {n: grads[n] for n in names if n in grads}
+
+
+# ---------------------------------------------------------------------------
+#  The training-graph probe — do the laws optimize backward programs?
+# ---------------------------------------------------------------------------
+
+
+def _demo_forwards() -> list:
+    """Forward programs shaped like real model sites.
+
+    Silu (SwiGLU's activation), a manual softmax
+    (``exp(x)/sum(exp(x), keepdim)`` — attention's spine), and a
+    matmul+bias+tanh linear block.  The keepdim spellings are the
+    ones real lowering emits.
+    """
+    from catopt_core.ir import TensorType, Var
+
+    x = Var("x", TensorType((4, 4)))
+    w = Var("w", TensorType((4, 4)))
+    b = Var("b", TensorType((4, 4)))
+    return [
+        ("silu_fwd", Op.make("mul", x, Op.make("sigmoid", x)), "x"),
+        (
+            "softmax_fwd",
+            Op.make(
+                "div",
+                Op.make("exp", x),
+                Op.make(
+                    "sum",
+                    Op.make("exp", x),
+                    dim=1,
+                    keepdim=True,
+                ),
+            ),
+            "x",
+        ),
+        (
+            "linear_fwd",
+            Op.make(
+                "tanh",
+                Op.make("add", Op.make("matmul", x, w), b),
+            ),
+            "w",
+        ),
+    ]
+
+
+def training_probe(
+    *,
+    cost_fn: Any = None,
+    budget: int = 24,
+    cotangents: dict | None = None,
+) -> list[dict]:
+    """Backward each demo forward; run the board on its gradient.
+
+    Per case: the forward term's ``backward`` produces the gradient
+    term; a ``MetaArena`` (ambient vocabulary, scripted
+    saturate→extract) optimizes it.  Rows report the certified
+    extraction cost vs the term's own baseline — the training-graph
+    domain running on the *same* machinery, no new semantics.
+    """
+    from catopt_core.cost.basic import count_cost
+    from catopt_core.cost.params import dag_cost
+
+    from . import meta_arena as ma
+
+    cf = cost_fn or count_cost
+    rows: list[dict] = []
+    for name, fwd, leaf in _demo_forwards():
+        grads = backward(
+            fwd,
+            cotangent=(cotangents or {}).get(name),
+        )
+        if leaf not in grads:
+            rows.append({"name": name, "declined": "no grad for leaf"})
+            continue
+        g = grads[leaf]
+        try:
+            arena = ma.MetaArena(
+                g, supported=None, cost_fn=cf, max_specs=8
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            rows.append({"name": name, "declined": str(exc)})
+            continue
+        base = ma._reported(dag_cost(g, arena.feasible_cost))
+        arena.step(ma.Action.saturate(budget=512))
+        _, rep = arena.step(ma.Action.extract())
+        rows.append(
+            {
+                "name": name,
+                "baseline": base,
+                "cost": rep.cost if rep.applied else None,
+                "cert": rep.certificate_ok if rep.applied else None,
+                "n_enodes": arena.eg.n_enodes,
+            }
+        )
+    return rows
+
+
+def training_table(rows: list[dict]) -> str:
+    """Render the training-graph probe rows."""
+    head = f"{'forward':<14} {'baseline':>9} {'extract':>8} {'cert':>5} {'enodes':>7}"
+    lines = [head, "-" * len(head)]
+    for r in rows:
+        if "declined" in r:
+            lines.append(f"{r['name']:<14} declined: {r['declined']}")
+            continue
+        cost = r["cost"]
+        cc = f"{cost:>8.3f}" if isinstance(cost, float) else f"{'-':>8}"
+        lines.append(
+            f"{r['name']:<14} {r['baseline']:>9.3f} "
+            f"{cc} {r['cert']!s:>5} {r['n_enodes']:>7}"
+        )
+    return "\n".join(lines)
+
+
+def main(argv: list | None = None) -> int:
+    """Run the training-graph probe; print the table."""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description=(
+            "backward() the demo forwards and optimize the "
+            "derived gradient programs on the meta-arena board"
+        )
+    )
+    ap.add_argument("--budget", type=int, default=24)
+    args = ap.parse_args(argv)
+    print(  # stdout-compat
+        training_table(training_probe(budget=args.budget))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -100,3 +100,16 @@ declare arm reports ``handled`` — the cheapest certified
 extraction after applying every afforded ``handle`` — so a
 candidate worthless under spelled parity but cheap once
 interpreted surfaces on the board.
+
+
+*Update 2 — the corpus grew.*  ``expand``/``broadcast_to`` VJPs
+landed via ``$expdims`` (dims the target grew over the
+left-padded input) spelled as ``reshape(sum(g, dims,
+keepdim), shape=in)``; all checked against autograd.  And the
+domain claim is now a running probe — ``python -m
+catopt_discovery.training`` derives gradients for real-shaped
+forwards (silu, keepdim softmax, matmul+bias+tanh) and
+saturate→extract→certifies each on the meta-arena board: all
+three certify, laws fire on the gradient programs (enodes grow
+12–18).  A training graph is a board citizen today — measured,
+not just designed.
