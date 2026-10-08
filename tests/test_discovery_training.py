@@ -6,13 +6,12 @@ the result is an ordinary term the board optimizes unchanged, and
 an op with no VJP row declines honestly.
 """
 
+import pytest
 import torch
 from catopt_core.ir import Const, Op, TensorType, Var
-from catopt_torch.meta_eval import _eval_allclose, _eval_term
-import pytest
-
 from catopt_discovery import meta_arena as ma
 from catopt_discovery import training
+from catopt_torch.meta_eval import _eval_allclose, _eval_term
 
 
 def _v(name: str, *shape: int) -> Var:
@@ -256,3 +255,88 @@ class TestTrainingProbe:
         assert all(r["n_enodes"] > 5 for r in certified)
         text = training.training_table(rows)
         assert "softmax_fwd" in text
+
+    def test_relu_matches_autograd(self):
+        x = _v("x", 4, 4)
+        term = _p("relu", x)
+        grads = training.backward(term)
+        env = _env(term)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env).double(),
+            _autograd(term, env, leaf),
+            1e-9,
+        )
+
+    def test_unsqueeze_squeeze_match_autograd(self):
+        x = _v("x", 4, 4)
+        term = _p("squeeze", _p("unsqueeze", x, dim=1), dim=1)
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 4))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf, torch.ones(4, 4)),
+            1e-4,
+        )
+
+
+class TestRealModels:
+    """The domain claim end-to-end: a torch module's backward."""
+
+    def test_linear_relu_backward_matches_autograd(self):
+        import torch.nn as nn
+        from catopt_torch.adapters import TorchSource
+
+        torch.manual_seed(0)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(8, 8)
+
+            def forward(self, x):
+                return torch.relu(self.fc(x))
+
+        mod = MLP().eval()
+        xin = torch.randn(4, 8)
+        ir, leaves = TorchSource().to_ir(mod, xin)
+        grads = training.backward(
+            ir.root,
+            cotangent=Op.make(
+                "broadcast_to", Const(1.0), shape=tuple(xin.shape)
+            ),
+        )
+        # the real claim: params got gradient terms
+        names = set(grads)
+        assert ir.params and names & set(ir.params)
+
+        # numeric check vs autograd on the same weights
+        mod2 = MLP().eval()
+        mod2.load_state_dict(mod.state_dict())
+        x2 = xin.clone().requires_grad_(True)
+        torch.manual_seed(0)
+        out = mod2(x2)
+        out.sum().backward()
+        leaves_ = training.leaves_of(ir.root)
+        env = {lf: v for lf, v in zip(leaves_.values(), [xin])}
+        env.update(
+            {
+                leaves_[n]: t
+                for n, t in mod.state_dict().items()
+                if n in leaves_
+            }
+        )
+        for name, tensor in mod.state_dict().items():
+            if name not in grads:
+                continue
+            assert _eval_allclose(
+                _eval_term(grads[name], env).double(),
+                dict(
+                    (n, p.grad)
+                    for n, p in mod2.named_parameters()
+                    if p.grad is not None
+                ).get(name),
+                1e-5,
+            )

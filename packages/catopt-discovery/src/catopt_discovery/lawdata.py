@@ -1503,6 +1503,18 @@ REVERSE: dict[str, Any] = {
     ],
     "reshape": (("reshape", "$g", {"shape": "$shape:0"}),),
     "permute": (("permute", "$g", {"dims": "$invdims"}),),
+    # relu: grad = g * (x > 0) — the mask is a gt on the input
+    "relu": (("mul", "$g", ("gt", "$a0", 0)),),
+    # rank ops: backward swaps squeeze/unsqueeze, same dims
+    "unsqueeze": (("squeeze", "$g", "$attrs"),),
+    "squeeze": (("unsqueeze", "$g", "$attrs"),),
+    # linear(x, W, b) = xW^T + b:  dx = gW, dW = g^T x,
+    # db = sum over the batch dims ($batchsum — leading dims of g)
+    "linear": (
+        ("matmul", "$g", "$a1"),
+        ("matmul", ("transpose", "$g"), "$a0"),
+        "$batchsum",
+    ),
     # an expand/broadcast copies the input along $expdims; the
     # cotangent sums those copies back, keepdim keeps the rank,
     # reshape restores the exact input shape (new leading dims

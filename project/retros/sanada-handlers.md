@@ -113,3 +113,13 @@ saturate→extract→certifies each on the meta-arena board: all
 three certify, laws fire on the gradient programs (enodes grow
 12–18).  A training graph is a board citizen today — measured,
 not just designed.
+
+
+*Update 3 — a real module's backward, end-to-end.*  ``relu``
+(``mul(g, gt(x,0))``), ``squeeze``/``unsqueeze`` (attr-swap), and
+``linear`` (``dx = gW``, ``dW = g^Tx``, ``db = $batchsum`` —
+cotangent summed over leading dims) joined the table.  The check
+that matters: ``TorchSource``-exported ``Linear→ReLU`` module →
+``backward(ir.root)`` produces param gradient terms that match
+``torch.autograd`` numerically — the reverse handler on real
+lowered code, not hand-built terms.

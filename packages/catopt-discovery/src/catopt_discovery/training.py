@@ -131,7 +131,17 @@ def _node_env(node: Any, g: Any, memo: dict) -> dict:
         env["$invdims"] = tuple(dims.index(i) for i in range(len(dims)))
     if node.op in ("expand", "broadcast_to"):
         env["$expdims"] = _expanded_dims(node, inshape)
+    out_shape = _shape_of(node, memo)
+    if isinstance(out_shape, tuple):
+        env["$batchsum"] = _leading_sum(g, len(out_shape) - 1)
     return env
+
+
+def _leading_sum(g: Any, ndim: int) -> Any:
+    """``g`` summed over its first *ndim* dims (identity at ≤ 0)."""
+    if ndim <= 0:
+        return g
+    return Op.make("sum", g, dim=tuple(range(ndim)), keepdim=False)
 
 
 def _numel(shape: tuple) -> int:
