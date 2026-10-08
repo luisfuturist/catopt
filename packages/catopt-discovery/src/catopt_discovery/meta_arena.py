@@ -1596,40 +1596,82 @@ def meta_probe(
     return rows
 
 
+def _declare_episode(
+    board: MetaArena, cand: Action, handle: bool
+) -> Trajectory:
+    """One declare-then-search episode, optionally handled.
+
+    With *handle*, every ``handle`` move the post-saturate state
+    affords is applied before ``extract`` — the interpretation arm.
+    """
+    reports: list[StepReport] = []
+    _, rep = board.step(cand)
+    reports.append(rep)
+    state, rep = board.step(Action.saturate())
+    reports.append(rep)
+    if handle:
+        for a in legal_actions(state):
+            if a.op == "handle":
+                state, rep = board.step(a)
+                reports.append(rep)
+    _, rep = board.step(Action.extract())
+    reports.append(rep)
+    return Trajectory(reports)
+
+
 def _declare_best(
     board: Callable[[], MetaArena], cands: list, limit: int
 ) -> dict | None:
-    """Try each declare-then-search episode; keep the cheapest win."""
+    """Try each declare-then-search episode; keep the cheapest win.
+
+    Reports ``handled`` — the same episode's extraction price with
+    every afforded ``handle`` applied — so the interpretation's
+    premium is a column, not an anecdote.
+    """
+    # ``handled`` has its own winner: a candidate worthless under
+    # spelled parity can be the cheapest once its interpretation
+    # prices — the two columns report their own argmin.
     best: dict | None = None
+    best_handled: float | None = None
     for cand in cands[:limit]:
-        traj = run_episode(
-            board(),
-            ScriptedPlayer([cand, Action.saturate(), Action.extract()]),
-            3,
-        )
-        t = traj.terminal
-        if (
-            t is not None
-            and t.certificate_ok
-            and (best is None or t.cost < best["cost"])
-        ):
-            best = {
-                "cost": t.cost,
-                "unfolded": t.cost_unfolded,
-                "inserted": tuple(
-                    n for r in traj.reports for n in r.inserted
-                ),
-                "used_declared": t.used_declared,
-                "cert": t.certificate_ok,
-            }
+        traj = _declare_episode(board(), cand, handle=False)
+        th = _declare_episode(board(), cand, handle=True).terminal
+        best_handled = _min_certified(best_handled, th)
+        best = _better_declare(best, traj)
+    if best is not None:
+        best["handled"] = best_handled
     return best
+
+
+def _better_declare(best: dict | None, traj: Trajectory) -> dict | None:
+    """Keep *best* unless *traj*'s certified extraction is cheaper."""
+    t = traj.terminal
+    if t is None or not t.certificate_ok:
+        return best
+    if best is not None and t.cost >= best["cost"]:
+        return best
+    return {
+        "cost": t.cost,
+        "unfolded": t.cost_unfolded,
+        "inserted": tuple(n for r in traj.reports for n in r.inserted),
+        "used_declared": t.used_declared,
+        "cert": t.certificate_ok,
+    }
+
+
+def _min_certified(cur: float | None, t: Any) -> float | None:
+    """Track the cheapest certified extraction cost."""
+    if t is None or not t.certificate_ok:
+        return cur
+    return t.cost if cur is None else min(cur, t.cost)
 
 
 def probe_table(rows: list[dict]) -> str:
     """Render the probe rows — the Q2 table the retro ships."""
     head = (
         f"{'case':<14} {'base':>8} {'script':>8} {'greedy':>8} "
-        f"{'random':>8} {'declare':>8} {'unfold':>8} {'cert':>5}  winner"
+        f"{'random':>8} {'declare':>8} {'handled':>8} "
+        f"{'unfold':>8} {'cert':>5}  winner"
     )
     lines = [head, "-" * len(head)]
 
@@ -1639,6 +1681,9 @@ def probe_table(rows: list[dict]) -> str:
     for r in rows:
         a = r["arms"]
         d = r["declare"]
+        c_d = h_d = u_d = None
+        if d:
+            c_d, h_d, u_d = d["cost"], d["handled"], d["unfolded"]
         ok = all(v["cert"] is not False for v in a.values()) and (
             d is None or d["cert"]
         )
@@ -1646,8 +1691,9 @@ def probe_table(rows: list[dict]) -> str:
         lines.append(
             f"{r['name']:<14} {_c(r['baseline'])}"
             f"{_c(a['scripted']['cost'])}{_c(a['greedy']['cost'])}"
-            f"{_c(a['random']['cost'])}{_c(d['cost'] if d else None)}"
-            f"{_c(d['unfolded'] if d else None)}{ok!s:>5}  {win}"
+            f"{_c(a['random']['cost'])}{_c(c_d)}"
+            f"{_c(h_d)}"
+            f"{_c(u_d)}{ok!s:>5}  {win}"
         )
     return "\n".join(lines)
 

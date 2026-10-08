@@ -84,3 +84,19 @@ reductions need a broadcast spelled with output shape (expressible
 via a caller-supplied cotangent), and view ops need shape
 information the spec grammar does not bind yet.  Extending the
 table is a data edit, not an engine change — that was the point.
+
+*Update — the shape gap closed.*  ``$shape:N`` splices an arg's
+inferred shape (``_shape_of``), ``$rcount`` counts reduced
+elements, ``$invdims`` inverts a permute, and alternative rows
+with ``requires`` guards (``"$ABSENT"`` = attr must be missing)
+encode conditional VJPs.  ``sum``/``mean`` (full-reduce or
+keepdim), ``reshape`` and ``permute`` are live; ``sum`` with
+``dim`` + ``keepdim=False`` still declines honestly — the
+cotangent needs an un-reduce the grammar does not spell.
+Everything checked against ``torch.autograd``.
+
+And the interpretation is now a *probe column*: ``meta_probe``'s
+declare arm reports ``handled`` — the cheapest certified
+extraction after applying every afforded ``handle`` — so a
+candidate worthless under spelled parity but cheap once
+interpreted surfaces on the board.

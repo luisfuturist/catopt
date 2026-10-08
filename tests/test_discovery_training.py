@@ -103,7 +103,7 @@ class TestBackward:
 
     def test_unknown_op_declines(self):
         term = _p("freeze_dry", _v("x", 4, 4))
-        with pytest.raises(ValueError, match="no VJP row"):
+        with pytest.raises(ValueError, match="no applicable VJP row"):
             training.backward(term)
 
     def test_param_leaves_get_grads(self):
@@ -139,4 +139,78 @@ class TestBackward:
             _eval_term(best, env),
             _autograd(fwd, env, training.leaves_of(fwd)["x"]),
             1e-9,
+        )
+
+
+class TestShapedVJPs:
+    """Reduction/view VJPs — the shape-binding extension."""
+
+    def test_sum_full_reduce_matches_autograd(self):
+        # f = sum(x): every input element's grad is the cotangent
+        x = _v("x", 4, 4)
+        term = _p("sum", x)
+        grads = training.backward(term)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf),
+            1e-4,
+        )
+
+    def test_sum_dim_keepdim_matches_autograd(self):
+        x = _v("x", 4, 4)
+        term = _p("sum", x, dim=1, keepdim=True)
+        grads = training.backward(term)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf),
+            1e-4,
+        )
+
+    def test_sum_dim_no_keepdim_declines(self):
+        # keepdim=False needs an un-reduce the spec cannot spell
+        x = _v("x", 4, 4)
+        term = _p("sum", x, dim=1, keepdim=False)
+        with pytest.raises(ValueError, match="declines"):
+            training.backward(term)
+
+    def test_mean_full_reduce_matches_autograd(self):
+        x = _v("x", 4, 4)
+        term = _p("mean", x)
+        grads = training.backward(term)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf),
+            1e-4,
+        )
+
+    def test_reshape_matches_autograd(self):
+        x = _v("x", 4, 4)
+        term = _p("reshape", x, shape=(2, 8))
+        g0 = _p("broadcast_to", Const(1.0), shape=(2, 8))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf, torch.ones(2, 8)),
+            1e-4,
+        )
+
+    def test_permute_matches_autograd(self):
+        x = _v("x", 2, 4, 8)
+        term = _p("permute", x, dims=(1, 2, 0))
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 8, 2))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term, dtype=torch.float32)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf, torch.ones(4, 8, 2)),
+            1e-4,
         )

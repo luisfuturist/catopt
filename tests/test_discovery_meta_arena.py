@@ -906,3 +906,26 @@ class TestHandleMove:
         arena = self._arena()
         arena.step(ma.Action.handle("mysilu", "silu"))
         assert arena.interpretations["mysilu"][0] == "silu"
+
+    def test_declare_probe_reports_handled_cost(self):
+        # the handled column prices the interpretation: a silu
+        # fold over a silu-shaped site under count_cost reads 3
+        # spelled / 2 handled — the fused premium as a column
+        from catopt_core.cost.basic import count_cost
+
+        x, c = _v("x", 4, 4), _v("c", 4, 4)
+        term = _p("add", _p("mul", x, _p("sigmoid", x)), c)
+        sans = DEFAULT - DEFAULT.named(
+            "silu_fold", "softsign_fold", "swiglu_fold"
+        )
+        sup = frozenset({"add", "mul", "sigmoid", "silu"})
+        rows = ma.meta_probe(
+            [("silu_site", term, sans, (), sup)],
+            cost_fn=count_cost,
+            budget=8,
+            declare_limit=12,
+        )
+        d = rows[0]["declare"]
+        assert d is not None and d["cert"]
+        assert d["handled"] is not None
+        assert d["handled"] < d["cost"]

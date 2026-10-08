@@ -22,7 +22,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from catopt_core.ir import Const, Op, Param, Var
+from catopt_core.ir import Const, Op, Param, Var, op_repr
+from catopt_core.typing import _shape_of
 
 from . import lawdata
 
@@ -57,7 +58,8 @@ def _inst_grad(spec: Any, env: dict, attrs: dict) -> Any:
     ``"$g"``/``"$a<i>"`` look up the cotangent/forward args; a bare
     str is a literal leaf name; numbers become ``Const``; a tuple
     builds an ``Op`` with ``"$attrs"`` splicing the forward node's
-    attrs.
+    attrs, and a dict element splices an attr map whose ``"$…"``
+    values resolve through *env* (``"$shape:N"`` & co.).
     """
     if isinstance(spec, str):
         return env[spec] if spec.startswith("$") else spec
@@ -70,22 +72,92 @@ def _inst_grad(spec: Any, env: dict, attrs: dict) -> Any:
         if e == "$attrs":
             node_attrs = dict(attrs)
         elif isinstance(e, dict):
-            node_attrs = dict(e)
+            node_attrs = {
+                k: env[v]
+                if isinstance(v, str) and v.startswith("$")
+                else v
+                for k, v in e.items()
+            }
         else:
             args.append(_inst_grad(e, env, attrs))
     return Op.make(op, *args, **node_attrs)
 
 
-def _accumulate(node: Any, rules: tuple, env: dict, grads: dict) -> None:
+def _row_for(node: Any, row: Any) -> dict | None:
+    """Pick the first VJP row of *row* whose ``requires`` hold.
+
+    ``requires`` entries are ``(attr, value)`` — ``"$ABSENT"`` means
+    the attr must be missing, else the attr must equal *value*.  A
+    plain tuple row normalises to one unconditional entry.
+    """
+    rows = row if isinstance(row, list) else [row]
+    for r in rows:
+        if not r:
+            continue  # no row data = no VJP for this op
+        r = r if isinstance(r, dict) else {"args": r}
+        ok = True
+        for attr, want in r.get("requires", ()):
+            have = node.attrs.get(attr, "$ABSENT")
+            if (want == "$ABSENT") != (have == "$ABSENT") or (
+                want != "$ABSENT" and have != want
+            ):
+                ok = False
+                break
+        if ok:
+            return r
+    return None
+
+
+def _node_env(node: Any, g: Any, memo: dict) -> dict:
+    """Build the node's VJP env — args, shapes, and the splices.
+
+    ``$shape:N`` is arg N's inferred shape (``_shape_of``); an op
+    whose row references a shape an input lacks declines at
+    instantiation.  ``$rcount`` counts the elements a ``mean``
+    reduction divided by (full-reduce → numel, else the listed
+    dims).  ``$invdims`` is a ``permute``'s inverse permutation.
+    """
+    env = {"$g": g}
+    for i, a in enumerate(node.args):
+        env[f"$a{i}"] = a
+        shape = _shape_of(a, memo)
+        if isinstance(shape, tuple):
+            env[f"$shape:{i}"] = shape
+    dims = node.attrs.get("dim", node.attrs.get("dims"))
+    inshape = env.get("$shape:0")
+    if isinstance(inshape, tuple):
+        if dims is None:
+            env["$rcount"] = Const(_numel(inshape))
+        else:
+            dd = dims if isinstance(dims, (tuple, list)) else (dims,)
+            env["$rcount"] = Const(
+                _numel(
+                    tuple(inshape[int(d) % len(inshape)] for d in dd)
+                )
+            )
+    if node.op == "permute" and isinstance(dims, (tuple, list)):
+        env["$invdims"] = tuple(dims.index(i) for i in range(len(dims)))
+    return env
+
+
+def _numel(shape: tuple) -> int:
+    """Product of a shape tuple — the reduction element count."""
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return n
+
+
+def _accumulate(
+    node: Any, rules: tuple, env: dict, grads: dict
+) -> None:
     """Route one node's cotangent to its children per *rules*."""
     for child, spec in zip(node.args, rules, strict=False):
         if spec is None:
             continue
         cg = _inst_grad(spec, env, node.attrs)
         grads[child] = (
-            Op.make("add", grads[child], cg)
-            if child in grads
-            else cg
+            Op.make("add", grads[child], cg) if child in grads else cg
         )
 
 
@@ -111,6 +183,7 @@ def backward(
     """
     vjp = lawdata.REVERSE if table is None else table
     g0 = cotangent if cotangent is not None else Const(1.0)
+    shape_memo: dict = {}
     order: list = []
     _topo(term, set(), order)
     grads: dict[Any, Any] = {term: g0}
@@ -118,17 +191,15 @@ def backward(
         g = grads.get(node)
         if g is None:
             continue
-        rules = vjp.get(node.op)
-        if rules is None:
+        row = _row_for(node, vjp.get(node.op, ()))
+        if row is None:
             raise ValueError(
-                f"backward: no VJP row for {node.op!r} — "
-                "the reverse handler declines (add it to "
-                "lawdata.REVERSE)"
+                f"backward: no applicable VJP row for "
+                f"{op_repr(node)} — the reverse handler declines "
+                "(add one to lawdata.REVERSE)"
             )
-        env = {"$g": g}
-        for i, a in enumerate(node.args):
-            env[f"$a{i}"] = a
-        _accumulate(node, rules, env, grads)
+        env = _node_env(node, g, shape_memo)
+        _accumulate(node, row["args"], env, grads)
     out: dict[str, Any] = {}
     for name, leaf in leaves_of(term).items():
         if leaf in grads:

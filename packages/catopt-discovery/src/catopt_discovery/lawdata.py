@@ -69,7 +69,6 @@ __all__ = [
     "GRAMMAR_SCHEMAS",
     "GRAMMAR_UNARY_OPS",
     "HANDLERS",
-    "REVERSE",
     "INSTANCE_ATTR_DEFAULTS",
     "INSTANCE_LEAF_SHAPES",
     "INSTANCE_SCALAR_MVARS",
@@ -81,6 +80,7 @@ __all__ = [
     "PRIOR_WEIGHTS",
     "PURPOSE_BUILT",
     "REFEREE_SCORE",
+    "REVERSE",
     "SEED_TERMS",
     "SHAPE_POOL",
     "SHAPE_SCHEMAS",
@@ -1419,6 +1419,13 @@ ARENA_PLAYER_CANDIDATES: int | None = 2048
 #: handler is interpretation, not a hand-written optimizer rule.
 #: ``"$attrs"`` inside a spec splices the forward node's attrs onto
 #: the built op (transpose re-applies with its dims, etc.).
+#: Shape-position splices resolve from the forward node's inputs:
+#: ``"$shape:N"`` is arg N's inferred shape, ``"$rcount"`` a Const
+#: counting a reduction's elements, ``"$invdims"`` a permute's
+#: inverse permutation.  A row may be ``{"args": (…), "requires":
+#: ((attr, value), …)}`` — ``backward`` declines (ValueError) when
+#: the node's attrs fail the guard, e.g. ``sum`` with
+#: ``keepdim=False`` whose cotangent needs an un-reduce first.
 #:
 #: Honest scope: shape-free ops only.  Reductions (``sum``/``mean``)
 #: need a broadcast back to the input's shape — spelled with
@@ -1426,7 +1433,7 @@ ARENA_PLAYER_CANDIDATES: int | None = 2048
 #: and reshape/expand-class ops are view-shaped.  Those VJPs are
 #: expressible but carry shape data the spec grammar does not yet
 #: bind; they decline (``backward`` raises) rather than guess.
-REVERSE: dict[str, tuple] = {
+REVERSE: dict[str, Any] = {
     "add": ("$g", "$g"),
     "sub": ("$g", ("neg", "$g")),
     "neg": (("neg", "$g"),),
@@ -1458,4 +1465,42 @@ REVERSE: dict[str, tuple] = {
     "log": (("div", "$g", "$a0"),),
     "sqrt": (("div", "$g", ("mul", 2, ("sqrt", "$a0"))),),
     "square": (("mul", "$g", ("mul", 2, "$a0")),),
+    # alternative rows: the first whose ``requires`` all hold wins;
+    # ``"$ABSENT"`` means the attr must be missing.  sum/mean with a
+    # dim but keepdim=False decline — the cotangent would need an
+    # un-reduce the spec cannot spell.
+    "sum": [
+        {
+            "args": (("broadcast_to", "$g", {"shape": "$shape:0"}),),
+            "requires": (("keepdim", True),),
+        },
+        {
+            "args": (("broadcast_to", "$g", {"shape": "$shape:0"}),),
+            "requires": (("dim", "$ABSENT"),),
+        },
+    ],
+    "mean": [
+        {
+            "args": (
+                (
+                    "div",
+                    ("broadcast_to", "$g", {"shape": "$shape:0"}),
+                    "$rcount",
+                ),
+            ),
+            "requires": (("keepdim", True),),
+        },
+        {
+            "args": (
+                (
+                    "div",
+                    ("broadcast_to", "$g", {"shape": "$shape:0"}),
+                    "$rcount",
+                ),
+            ),
+            "requires": (("dim", "$ABSENT"),),
+        },
+    ],
+    "reshape": (("reshape", "$g", {"shape": "$shape:0"}),),
+    "permute": (("permute", "$g", {"dims": "$invdims"}),),
 }
