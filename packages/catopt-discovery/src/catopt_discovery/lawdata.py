@@ -69,6 +69,7 @@ __all__ = [
     "GRAMMAR_SCHEMAS",
     "GRAMMAR_UNARY_OPS",
     "HANDLERS",
+    "REVERSE",
     "INSTANCE_ATTR_DEFAULTS",
     "INSTANCE_LEAF_SHAPES",
     "INSTANCE_SCALAR_MVARS",
@@ -1405,3 +1406,56 @@ ARENA_PLAYER_WEIGHTS: dict[str, float] = {}
 #: unbounded form; the probe uses the cap to keep a step at the
 #: gauntlet's pace rather than the scorer's.
 ARENA_PLAYER_CANDIDATES: int | None = 2048
+
+# ---------------------------------------------------------------------------
+#  The reverse handler — backprop as a data-driven interpretation
+# ---------------------------------------------------------------------------
+
+#: Reverse-mode VJP table — ``op -> (per-arg grad spec, ...)``.  A
+#: spec is data: ``"$g"`` is the node's output cotangent, ``"$a0"``,
+#: ``"$a1"``… its forward arguments; ``None`` marks a child that
+#: receives no gradient (index/shape arguments).  ``backward()``
+#: reads this table to *derive* the gradient program — the reverse
+#: handler is interpretation, not a hand-written optimizer rule.
+#: ``"$attrs"`` inside a spec splices the forward node's attrs onto
+#: the built op (transpose re-applies with its dims, etc.).
+#:
+#: Honest scope: shape-free ops only.  Reductions (``sum``/``mean``)
+#: need a broadcast back to the input's shape — spelled with
+#: ``broadcast_to`` when the caller supplies a shaped cotangent —
+#: and reshape/expand-class ops are view-shaped.  Those VJPs are
+#: expressible but carry shape data the spec grammar does not yet
+#: bind; they decline (``backward`` raises) rather than guess.
+REVERSE: dict[str, tuple] = {
+    "add": ("$g", "$g"),
+    "sub": ("$g", ("neg", "$g")),
+    "neg": (("neg", "$g"),),
+    "mul": (("mul", "$g", "$a1"), ("mul", "$g", "$a0")),
+    "div": (
+        ("div", "$g", "$a1"),
+        ("mul", "$g", ("neg", ("div", "$a0", ("mul", "$a1", "$a1")))),
+    ),
+    "matmul": (
+        ("matmul", "$g", ("transpose", "$a1")),
+        ("matmul", ("transpose", "$a0"), "$g"),
+    ),
+    "transpose": (("transpose", "$g", "$attrs"),),
+    "sigmoid": (
+        (
+            "mul",
+            "$g",
+            ("mul", ("sigmoid", "$a0"), ("sub", 1, ("sigmoid", "$a0"))),
+        ),
+    ),
+    "tanh": (
+        (
+            "mul",
+            "$g",
+            ("sub", 1, ("mul", ("tanh", "$a0"), ("tanh", "$a0"))),
+        ),
+    ),
+    "exp": (("mul", "$g", ("exp", "$a0")),),
+    "log": (("div", "$g", "$a0"),),
+    "sqrt": (("div", "$g", ("mul", 2, ("sqrt", "$a0"))),),
+    "square": (("mul", "$g", ("mul", 2, "$a0")),),
+}

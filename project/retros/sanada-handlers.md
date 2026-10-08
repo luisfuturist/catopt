@@ -56,3 +56,31 @@ Two papers by Takahiro Sanada that HANDL's GMSAC kernel builds on
   construction — is there an optimizer move that *inverts* a
   handler (search the program that a cheaper interpretation would
   have produced)?
+
+
+## Landed: both directions
+
+* **`handle` as a move** (`meta_arena.Action.handle` +
+  `lawdata.HANDLERS`): a declared object's interpretation is a
+  scoped, legal-checked, repricing move — the "execution-strategy
+  action" the table above predicted.  Legality is alpha-coverage
+  of the object's spelled body; a handled name prices at its
+  kernel under the supported bound (measurably cheaper under
+  op-count, honestly flat under flops).
+
+* **Reverse handlers** (`catopt_discovery.training` +
+  `lawdata.REVERSE`): `backward(term)` derives the gradient
+  program as an *interpretation of the forward term* — a data
+  VJP table, not a second semantics stack.  The result is an
+  ordinary term: `tests/test_discovery_training.py` checks it
+  against `torch.autograd` numerically (elementwise, shared-leaf
+  accumulation, matmul with a shaped cotangent, a matmul+tanh
+  chain) and shows it lives on the board — saturate/extract/
+  certify run on the gradient program unchanged.  Missing VJP
+  rows decline (`ValueError`), never silently zero.
+
+The honest limit: the REVERSE table covers shape-free ops only —
+reductions need a broadcast spelled with output shape (expressible
+via a caller-supplied cotangent), and view ops need shape
+information the spec grammar does not bind yet.  Extending the
+table is a data edit, not an engine change — that was the point.
