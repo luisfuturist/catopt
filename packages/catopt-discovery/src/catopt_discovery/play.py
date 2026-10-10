@@ -303,6 +303,7 @@ class _SearchState:
     """The search board's observable: rule names, cursor, terminator."""
 
     actions: tuple[str, ...]
+    ops: frozenset
     steps: int
     done: bool
     cost: float
@@ -323,16 +324,29 @@ class SearchBoard:
         term: Any,
         rules: Any,
         *,
-        horizon: int = 6,
-        patience: int = 2,
+        horizon: int = 12,
+        patience: int | None = None,
     ) -> None:
-        """Bind the program, rules, and episode bounds."""
-        self.env = SearchEnv(term, rules, cost_fn=count_cost)
+        """Bind the program, rules, and episode bounds.
+
+        *patience* defaults to the ruleset size — a playbook that
+        tries every rule once must not stall out mid-way; the
+        episode still ends at *horizon* or when the player drains.
+        """
+        rules = tuple(rules)
+        self.env = SearchEnv(
+            term,
+            rules,
+            cost_fn=count_cost,
+            horizon=horizon,
+            patience=len(rules) if patience is None else patience,
+        )
         self._h = horizon
         self._p = patience
         self._steps = 0
         self._done = True
         self._baseline = float("inf")
+        self._ops = frozenset(t.op for t in _ops_walk(term))
 
     def observe(self) -> _SearchState:
         """Return the board view — reset lazily on first look."""
@@ -342,6 +356,7 @@ class SearchBoard:
             self._baseline = self.env.cost
         return _SearchState(
             actions=self.env.action_names,
+            ops=self._ops,
             steps=self._steps,
             done=self._done,
             cost=self.env.cost,
@@ -363,7 +378,13 @@ class SearchBoard:
 
 
 def _search_cases(seed: int, n: int) -> list:
-    """Rule-fire boards: the demo forwards plus small variants."""
+    """Rule-fire boards — half the pool carries a paying fold.
+
+    ``add(x,0)`` / ``mul(x,1)`` / ``neg(neg(x))`` collapse under
+    the identity laws (cost→0); the silu spelling folds to the
+    fused op; the rest are honest flat boards — the corpus the
+    stoppable-vs-search signal lives on.
+    """
     rng = random.Random(seed)
     x = Var("x", TensorType((4, 4)))
     y = Var("y", TensorType((4, 4)))
@@ -372,6 +393,9 @@ def _search_cases(seed: int, n: int) -> list:
         Op.make("add", Op.make("mul", x, y), Op.make("matmul", x, y)),
         Op.make("mul", x, x),
         Op.make("div", x, Op.make("add", Op.make("abs", x), Const(1))),
+        Op.make("add", x, Const(0)),
+        Op.make("mul", x, Const(1)),
+        Op.make("neg", Op.make("neg", x)),
     ]
     return [
         (f"search{i}", pool[rng.randrange(len(pool))]) for i in range(n)
@@ -381,6 +405,14 @@ def _search_cases(seed: int, n: int) -> list:
 def _search_board(case: Any) -> SearchBoard:
     """Board a search case under the rule-fire game."""
     return SearchBoard(case[1], DEFAULT_SEARCH_RULES)
+
+
+def _ops_walk(term: Any):
+    """Yield every Op node reachable in *term* (args-first)."""
+    if isinstance(term, Op):
+        yield term
+        for a in term.args:
+            yield from _ops_walk(a)
 
 
 def _search_legal(state: _SearchState) -> tuple:
@@ -428,16 +460,28 @@ def _random_policy(legal: Any) -> Any:
 
 
 def _scripted_search() -> Any:
-    """Fire every rule once in order — the search board's playbook."""
-    it = {"i": 0}
-    order = tuple(r.name for r in DEFAULT_SEARCH_RULES)
+    """Fire each rule once, matching-head-first — the playbook.
+
+    Rules whose LHS root op occurs in the program go first (the
+    only ones that can change the graph); the rest are dead budget.
+    """
+    heads = {
+        r.name: getattr(r.lhs, "op", None) for r in DEFAULT_SEARCH_RULES
+    }
+    played: set = set()
 
     def go(state: _SearchState) -> Any | None:
-        if state.done or it["i"] >= len(order):
+        if state.done:
             return None
-        name = order[it["i"]]
-        it["i"] += 1
-        return name
+        for name in state.actions:
+            if name not in played and heads.get(name) in state.ops:
+                played.add(name)
+                return name
+        for name in state.actions:
+            if name not in played:
+                played.add(name)
+                return name
+        return None
 
     return go
 
