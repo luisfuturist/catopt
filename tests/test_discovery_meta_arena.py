@@ -929,3 +929,119 @@ class TestHandleMove:
         assert d is not None and d["cert"]
         assert d["handled"] is not None
         assert d["handled"] < d["cost"]
+
+
+class TestClaimMove:
+    """``claim`` — the option move: declare + fire + handle, fused."""
+
+    def _arena(self):
+        from catopt_core.cost.basic import count_cost
+
+        x = _v("x", 4, 4)
+        term = _p("mul", x, _p("sigmoid", x))
+        return ma.MetaArena(
+            term,
+            rules=[],
+            supported={"mul", "sigmoid", "silu"},
+            cost_fn=count_cost,
+            max_specs=8,
+        )
+
+    def test_claim_pays_in_one_move(self):
+        # the declare→saturate→handle line as one action: claim
+        # lands the handled member; extract prices it at the kernel
+        arena = self._arena()
+        st = arena.observe()
+        claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
+        assert [a.params["handler"] for a in claims] == ["silu"]
+        st, rep = arena.step(claims[0])
+        assert rep.applied
+        assert rep.detail["object"] == "claim_silu_0"
+        _, rep = arena.step(ma.Action.extract())
+        assert rep.applied and rep.certificate_ok
+        assert rep.cost == pytest.approx(1.0)
+        assert rep.cost_unfolded == pytest.approx(2.0)
+
+    def test_claim_reoffers_until_covered_specs_claimed(self):
+        # one covered spec → after claiming, no further claim offers
+        arena = self._arena()
+        arena.step(ma.Action.claim("silu"))
+        st = arena.observe()
+        assert not [a for a in ma.legal_actions(st) if a.op == "claim"]
+
+    def test_claim_unknown_handler_declines(self):
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.claim("bogus"))
+        assert not rep.applied
+        assert "unknown handler" in rep.note
+
+    def test_claim_no_covered_spec_declines(self):
+        from catopt_core.cost.basic import count_cost
+
+        x = _v("x", 4, 4)
+        arena = ma.MetaArena(
+            _p("add", x, x),
+            rules=[],
+            supported={"add", "silu"},
+            cost_fn=count_cost,
+            max_specs=8,
+        )
+        _, rep = arena.step(ma.Action.claim("silu"))
+        assert not rep.applied
+        assert "no uncovered spec" in rep.note
+
+    def test_claim_unsupported_kernel_stays_parity(self):
+        # claim mints and binds even when the kernel is unsupported —
+        # feasibility pricing then keeps the spelled form honest
+        from catopt_core.cost.basic import count_cost
+
+        x = _v("x", 4, 4)
+        arena = ma.MetaArena(
+            _p("mul", x, _p("sigmoid", x)),
+            rules=[],
+            supported={"mul", "sigmoid"},  # silu NOT supported
+            cost_fn=count_cost,
+            max_specs=8,
+        )
+        st = arena.observe()
+        claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
+        assert claims  # legality is structural, not support-based
+        arena.step(claims[0])
+        _, rep = arena.step(ma.Action.extract())
+        assert rep.applied and rep.certificate_ok
+        assert rep.cost == pytest.approx(2.0)  # spelled parity
+
+    def test_claim_fire_skipped_when_budget_spent(self):
+        # enode budget exhausted before claim: the fused move still
+        # declares and binds — firing is conditional, the outcome
+        # honestly reports the claim
+        arena = self._arena()
+        arena.max_nodes = 0
+        st = arena.observe()
+        claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
+        _, rep = arena.step(claims[0])
+        assert rep.applied
+        assert rep.detail["object"] == "claim_silu_0"
+
+    def test_claim_declines_when_handle_cannot_bind(self):
+        # a handler whose args index metavars the spec does not have:
+        # declare lands, the bind refuses, claim reports declined
+        arena = self._arena()
+        arena.handlers["wide"] = {
+            "pattern": ("mul", "X1", ("sigmoid", "X1")),
+            "args": ("X1", "X2", "X3"),
+            "kernel": "silu",
+        }
+        _, rep = arena.step(ma.Action.claim("wide"))
+        assert not rep.applied
+        assert "handle declined" in rep.note
+
+    def test_claim_declines_when_declare_refuses(self, monkeypatch):
+        # the fold constructor refuses → claim relays the decline
+        monkeypatch.setitem(
+            ma._CONSTRUCTION, "fold", lambda arena, name, cp: None
+        )
+        arena = self._arena()
+        _, rep = arena.step(ma.Action.claim("silu"))
+        assert not rep.applied
+        assert "declare declined" in rep.note

@@ -1596,11 +1596,13 @@ META_ARENA_FEATURES: tuple[str, ...] = (
     "h:saturate",
     "h:declare",
     "h:handle",
+    "h:claim",
     # op one-hots
     "op:fire",
     "op:saturate",
     "op:declare",
     "op:handle",
+    "op:claim",
     "op:extract",
     # action parameters
     "a:budget",
@@ -1617,6 +1619,7 @@ META_ARENA_FEATURES: tuple[str, ...] = (
     "x:unhandled:handle",
     "x:specs:declare",
     "x:handleable:declare",
+    "x:handleable:claim",
 )
 
 #: The learned weight table — empty is the honest uniform cold start;

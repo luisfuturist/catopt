@@ -199,6 +199,19 @@ class Action:
         )
 
     @classmethod
+    def claim(cls, handler: str) -> Action:
+        """``claim(tag)`` — a handled declaration in one move.
+
+        Sanada's ``handle (declare spec) with H`` fused: declare a
+        fresh fold of a mined spec the handler's pattern covers,
+        fire the minted rule so the member lands, bind the
+        interpretation.  The composed declare→saturate→handle line
+        as a single action — an *option* move: the structure a
+        learned player's winning trace compresses into.
+        """
+        return cls("claim", {"handler": handler})
+
+    @classmethod
     def extract(cls) -> Action:
         """``extract()`` — the terminal move: certify and score."""
         return cls("extract", {})
@@ -844,6 +857,76 @@ def _handle(arena: MetaArena, action: Action) -> _Outcome:
     )
 
 
+@register_action("claim")
+def _claim(arena: MetaArena, action: Action) -> _Outcome:
+    """Declare a handler-covered spec, fire its rule, bind it.
+
+    Composes the board's own handlers — ``_declare`` → ``_accept``
+    → fire once → ``_handle`` — so the option stays refereed:
+    pricing, legality and the certificate see exactly what the
+    spelled line would have done.
+    """
+    tag = str(action.params.get("handler", ""))
+    h = arena.handlers.get(tag)
+    if h is None:
+        return _Outcome(
+            applied=False, note=f"claim: unknown handler {tag!r}"
+        )
+    pspec = _canon_spec(h["pattern"])
+    for i, spec in enumerate(arena._specs):
+        name = f"claim_{tag}_{i}"
+        if (
+            _canon_spec(spec) != pspec
+            or name in arena._by_name
+            or name in arena.definitions
+        ):
+            continue
+        out = _declare(
+            arena,
+            Action.declare(
+                {
+                    "op": "fold",
+                    "params": {
+                        "name": name,
+                        "spelled": spec,
+                        "kernel": (name, *_spec_metavars(spec)),
+                    },
+                }
+            ),
+        )
+        if not out.applied:
+            return _Outcome(
+                applied=False,
+                note=f"claim: declare declined ({out.note})",
+            )
+        _out, inserted = arena._accept(out)
+        rule = arena.resolve_ref(name)
+        remaining = arena.max_nodes - arena.eg.n_enodes
+        if rule is not None and remaining > 0:
+            arena.eg.apply_rule(
+                rule, arena.root, enode_budget=remaining
+            )
+            arena.eg.rebuild()
+        hout = _handle(arena, Action.handle(name, tag))
+        if not hout.applied:
+            return _Outcome(
+                applied=False,
+                note=f"claim: handle declined ({hout.note})",
+            )
+        return _Outcome(
+            note=f"claim {name} with {tag} → {h['kernel']}",
+            detail={
+                "object": name,
+                "handler": tag,
+                "kernel": h["kernel"],
+                "inserted": inserted,
+            },
+        )
+    return _Outcome(
+        applied=False, note=f"claim: no uncovered spec for {tag!r}"
+    )
+
+
 @register_action("extract")
 def _extract(arena: MetaArena, action: Action) -> _Outcome:
     """Terminal: extract, certify the derivation, score the delta."""
@@ -1259,6 +1342,27 @@ def _handle_actions(state: MetaState) -> list[Action]:
     ]
 
 
+def _claim_actions(state: MetaState) -> list[Action]:
+    """``claim`` per handler whose pattern covers an unclaimed spec.
+
+    One offer per tag — the handler takes the first covered spec
+    whose ``claim_<tag>_<i>`` name is still free, so a second claim
+    under the same tag lands on the next spec.  Re-offering stops
+    when every covered spec is claimed (all names bound).
+    """
+    claimed = {op for op, _body in state.declared_bodies}
+    out: list[Action] = []
+    for tag, pspec in state.handler_specs:
+        for i, s in enumerate(state.specs):
+            if (
+                _canon_spec(s) == pspec
+                and f"claim_{tag}_{i}" not in claimed
+            ):
+                out.append(Action.claim(tag))
+                break
+    return out
+
+
 def legal_actions(state: MetaState) -> tuple[Action, ...]:
     """Enumerate the moves *state* affords, deterministically.
 
@@ -1268,7 +1372,8 @@ def legal_actions(state: MetaState) -> tuple[Action, ...]:
     composite spec, folded to the fresh declared op the move names —
     the enumerator only offers *sound-by-definition* candidates
     (existing-kernel folds are claims: playbook-reachable, not
-    enumerated); ``extract`` last.
+    enumerated); ``claim`` once per handler covering an unclaimed
+    spec; ``extract`` last.
     """
     if state.done:
         return ()
@@ -1278,6 +1383,7 @@ def legal_actions(state: MetaState) -> tuple[Action, ...]:
     ]
     out += [_fresh_fold(i, s) for i, s in enumerate(state.specs)]
     out += _handle_actions(state)
+    out += _claim_actions(state)
     out.append(Action.extract())
     return tuple(out)
 

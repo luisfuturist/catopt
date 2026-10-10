@@ -113,6 +113,7 @@ def _state_feats(state: ma.MetaState, hist: _Hist) -> dict[str, float]:
         "h:saturate": hist.rate("saturate"),
         "h:declare": hist.rate("declare"),
         "h:handle": hist.rate("handle"),
+        "h:claim": hist.rate("claim"),
     }
 
 
@@ -172,6 +173,11 @@ def _act_feats(
         )
         out["x:declared:handle"] = sf["st:declared"]
         out["x:unhandled:handle"] = sf["st:unhandled"]
+    elif op == "claim":
+        out[
+            f"a:h:{_bucket(action.params.get('handler'), 'handler')}"
+        ] = 1.0
+        out["x:handleable:claim"] = sf["st:handleable"]
     elif op == "extract":
         out["x:extract:improve"] = sf["st:improve"]
         out["x:late:extract"] = sf["st:steps"]
