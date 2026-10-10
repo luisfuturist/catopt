@@ -10,7 +10,14 @@ evidence store (:mod:`.evidence`), the coherence catalogue
 (:mod:`.intake`, :mod:`.workload_gen`), and the emit/vocab/meta-game
 helpers, and the object constructor (:mod:`.object_synthesis` — the
 ADR-0004 "construction operations" that *build* declared objects for
-the evidence store to admit).  Formerly the ``tools/law_*.py``
+the evidence store to admit).  The game layer: boards
+(:mod:`.arena`, :mod:`.meta_arena`), the generic driver
+(:mod:`.engine` — one ``Board`` protocol over all of them), the
+reusable learner (:mod:`.players.LinearPolicy`,
+:mod:`.meta_player`), the reverse handler (:mod:`.training`), and
+the domain registry + CLI (:mod:`.play` —
+``python -m catopt_discovery.play --domain meta|joint|search``).
+Formerly the ``tools/law_*.py``
 scripts; every module keeps its CLI — invoke as
 ``python -m catopt_discovery.<module>``.
 

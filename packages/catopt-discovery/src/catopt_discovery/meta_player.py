@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import math
 import random
 import sys
 from collections.abc import Callable, Iterable
@@ -42,6 +41,7 @@ from catopt_core.laws import DEFAULT
 
 from . import lawdata
 from . import meta_arena as ma
+from .players import LinearPolicy
 
 __all__ = [
     "MetaLearnedPlayer",
@@ -52,12 +52,8 @@ __all__ = [
     "train_player",
 ]
 
-#: REINFORCE constants — same contract as ``arena_player``'s:
-#: per-episode-return update normalized by step count, EMA running
-#: baseline, clipped advantage.
+#: REINFORCE default — re-exposed for the preset's signature.
 _LR = 0.1
-_BASELINE_EMA = 0.2
-_CLIP = 40.0
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +66,6 @@ def _bucket(name: Any, kind: str) -> int:
     width = lawdata.META_ARENA_HASH_BUCKETS[kind]
     h = hashlib.sha256(str(name).encode("utf-8")).digest()
     return int.from_bytes(h[:4]) % width
-
-
-def _dot(w: dict, feats: dict) -> float:
-    """Return the linear score ``w·feats`` over a sparse feature dict."""
-    s = 0.0
-    for k, v in feats.items():
-        wv = w.get(k)
-        if wv:
-            s += wv * v
-    return s
 
 
 class _Hist:
@@ -138,8 +124,12 @@ def _handleable(state: ma.MetaState) -> int:
     spec is coverable iff its alpha-canonical form equals a handler
     pattern's (``meta_arena._handle_actions``' own test).
     """
-    pats = {p for _, p in state.handler_specs}
-    return sum(1 for s in state.specs if ma._canon_spec(s) in pats)
+    pats = [p for _, p in state.handler_specs]
+    return sum(
+        1
+        for s in state.specs
+        if any(ma._canon_spec(s) == p for p in pats)
+    )
 
 
 def _spec_index(action: ma.Action) -> float:
@@ -207,26 +197,18 @@ def featurize(
 # ---------------------------------------------------------------------------
 
 
-def _key(action: ma.Action) -> tuple:
-    """Stable dedup key — played-move mask, replayable."""
-    params = action.params
-    return (
-        action.op,
-        repr(sorted(params.items(), key=lambda kv: kv[0])),
-    )
+class MetaLearnedPlayer(LinearPolicy):
+    """The meta-arena preset — meta featurizer and schema bound.
 
-
-class MetaLearnedPlayer:
-    """A softmax linear policy over the meta-arena's legal moves.
-
-    ``score(move) = w·φ(state, move)`` over
-    :data:`lawdata.META_ARENA_FEATURES`; a step samples the softmax
-    over the *unplayed* legal set (``greedy=True`` takes the argmax,
-    ``temperature`` scales the logits).  *weights* is a
-    ``{feature_name: float}`` table — ``None`` binds the shipped
+    A :class:`~catopt_discovery.players.LinearPolicy` over
+    ``meta_arena.legal_actions`` scored by this module's
+    ``featurize``; *weights* defaults to
     :data:`lawdata.META_ARENA_PLAYER_WEIGHTS` (empty ⇒ uniform, the
-    honest cold start).  ``learn=False`` freezes the policy for eval.
+    honest cold start).  ``learn=False`` freezes the policy for
+    eval; ``frozen`` returns a non-learning copy.
     """
+
+    FEATURES = lawdata.META_ARENA_FEATURES
 
     def __init__(
         self,
@@ -238,141 +220,38 @@ class MetaLearnedPlayer:
         greedy: bool = False,
         learn: bool = True,
         legal: Any = None,
+        featurizer: Any = None,
         epsilon: float = 0.0,
     ) -> None:
-        """Bind the weight table, the sampler and the learn flag.
-
-        *epsilon* mixes uniform exploration into the sample — the
-        standard sparse-reward lever: with probability ε the step
-        picks uniformly over the unplayed set (still scored into the
-        gradient row at its softmax mass).  Eval arms run ε=0.
-        """
-        self._rng = random.Random(seed)
-        self._lr = lr
-        self._temp = max(temperature, 1e-6)
-        self._greedy = greedy
-        self._learn = learn
-        self._eps = epsilon
-        self._legal = ma.legal_actions if legal is None else legal
-        self._w = dict(
-            lawdata.META_ARENA_PLAYER_WEIGHTS
-            if weights is None
-            else weights
-        )
-        self._baseline = 0.0
-        self._played: set = set()
-        self._hist = _Hist()
-        self._ep: list = []
-        self._prev_steps = -1
-
-    def frozen(self, seed: int = 0, *, greedy: bool = False) -> Any:
-        """Return a non-learning copy sharing the trained weights."""
-        return MetaLearnedPlayer(
-            seed=seed,
-            weights=self.weights_dict(),
-            temperature=self._temp,
+        """Bind the meta enumerator, featurizer and sampler."""
+        super().__init__(
+            seed,
+            legal=ma.legal_actions if legal is None else legal,
+            featurizer=featurize if featurizer is None else featurizer,
+            weights=(
+                lawdata.META_ARENA_PLAYER_WEIGHTS
+                if weights is None
+                else weights
+            ),
+            lr=lr,
+            temperature=temperature,
             greedy=greedy,
-            learn=False,
-            legal=self._legal,
+            learn=learn,
+            epsilon=epsilon,
         )
 
-    def weights_dict(self) -> dict[str, float]:
-        """Return the weight table — ``{name: w}`` over the schema."""
-        return {
-            n: self._w.get(n, 0.0) for n in lawdata.META_ARENA_FEATURES
-        }
-
-    def _observe(self, state: ma.MetaState) -> None:
-        """Detect the episode boundary — a fresh board resets state."""
-        if state.steps == 0 and self._prev_steps > 0:
-            self._played.clear()
-            self._hist = _Hist()
-        self._prev_steps = state.steps
-
-    def __call__(self, state: ma.MetaState) -> ma.Action | None:
-        """Score the unplayed legal moves, sample one, remember it."""
-        self._observe(state)
-        acts = [
-            a for a in self._legal(state) if _key(a) not in self._played
-        ]
-        if not acts:
-            return None
-        feats = [featurize(state, a, self._hist) for a in acts]
-        logits = [_dot(self._w, f) / self._temp for f in feats]
-        top = max(logits)
-        exps = [math.exp(x - top) for x in logits]
-        if self._greedy:
-            i = logits.index(top)
-        elif self._eps and self._rng.random() < self._eps:
-            i = self._rng.randrange(len(acts))
-        else:
-            i = self._sample(exps)
-        if self._learn:
-            self._ep.append(_grad_row(feats, exps, i))
-        chosen = acts[i]
-        self._played.add(_key(chosen))
-        self._hist.record(chosen.op)
-        return chosen
-
-    def _sample(self, exps: list[float]) -> int:
-        """Draw an index proportionally to the unnormalized weights."""
-        r = self._rng.random() * sum(exps)
-        acc = 0.0
-        for i, e in enumerate(exps):
-            acc += e
-            if r <= acc:
-                return i
-        return len(exps) - 1
-
-    def finish_episode(
-        self, total: float, rewards: Iterable[float] | None = None
-    ) -> None:
-        """REINFORCE — reward-to-go per step, not just the total.
-
-        Per step ``t``: ``G_t = Σ_{k≥t} r_k`` (the remaining episode
-        reward — the *causal* credit: a ``declare`` gets the terminal
-        payout it armed, moves after it don't).  The update is
-        ``w += lr·(G_t - baseline)·(φ_t - E_π[φ_t])`` accumulated
-        over the episode; *rewards* comes from
-        ``Trajectory.reports`` — ``None`` falls back to the flat
-        episode return (the causal credit is the point; the fallback
-        exists for callers that only have the total).  The EMA
-        baseline updates from the raw total; advantages are clipped
-        so one paying episode cannot blow the weights up.  No-op
-        when ``learn=False``.
-        """
-        adv = total - self._baseline
-        self._baseline += _BASELINE_EMA * adv
-        if not (self._learn and self._ep):
-            self._ep = []
-            return
-        rs = list(rewards) if rewards is not None else None
-        n = len(self._ep)
-        grad: dict[str, float] = {}
-        for t, (phi, ephi) in enumerate(self._ep):
-            g_t = (
-                sum(rs[t:]) if rs is not None and t < len(rs) else total
-            )
-            a = max(-_CLIP, min(_CLIP, g_t - self._baseline))
-            for k, v in phi.items():
-                grad[k] = grad.get(k, 0.0) + self._lr * a / n * v
-            for k, v in ephi.items():
-                grad[k] = grad.get(k, 0.0) - self._lr * a / n * v
-        for k, g in grad.items():
-            self._w[k] = self._w.get(k, 0.0) + g
-        self._ep = []
+    def fresh_hist(self) -> Any:
+        """Return the meta-arena history object."""
+        return _Hist()
 
 
-def _grad_row(
-    feats: list[dict], exps: list[float], i: int
-) -> tuple[dict, dict]:
-    """``(φ_chosen, E_π[φ])`` under the softmax over unplayed moves."""
-    z = sum(exps)
-    ephi: dict[str, float] = {}
-    for f, e in zip(feats, exps, strict=True):
-        for k, v in f.items():
-            ephi[k] = ephi.get(k, 0.0) + v * e / z
-    return feats[i], ephi
+def _key(action: ma.Action) -> tuple:
+    """Stable dedup key — the played-move mask, replayable."""
+    params = action.params
+    return (
+        action.op,
+        repr(sorted(params.items(), key=lambda kv: kv[0])),
+    )
 
 
 # ---------------------------------------------------------------------------

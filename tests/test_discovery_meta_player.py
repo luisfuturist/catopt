@@ -15,6 +15,7 @@ from catopt_core.laws import DEFAULT
 from catopt_discovery import lawdata
 from catopt_discovery import meta_arena as ma
 from catopt_discovery import meta_player as mp
+from catopt_discovery import players
 
 
 def _v(name: str, *shape: int) -> Var:
@@ -282,10 +283,10 @@ class TestInternals:
         assert 0 <= mp._bucket("x", "handler") < 4
 
     def test_dot(self):
-        assert mp._dot({"a": 2.0}, {"a": 3.0, "b": 1.0}) == 6.0
+        assert players._dot({"a": 2.0}, {"a": 3.0, "b": 1.0}) == 6.0
 
     def test_grad_row(self):
-        phi, ephi = mp._grad_row(
+        phi, ephi = players._grad_row(
             [{"a": 1.0}, {"a": 0.0, "b": 1.0}], [1.0, 1.0], 0
         )
         assert phi == {"a": 1.0}
