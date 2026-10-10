@@ -7,7 +7,13 @@ live under `packages/` (`catopt-core` — the torch-free engine;
 laws/executors; `catopt-cuda` — the CUDA-graph runner;
 `catopt-orchestrator` — the backend-neutral pipeline;
 `catopt-discovery` — the law-discovery engine, formerly
-`tools/law_*.py`; invoke as `python -m catopt_discovery.<mod>`).
+`tools/law_*.py`; invoke as `python -m catopt_discovery.<mod>`;
+the game layer is `engine` (the `Board` protocol + generic
+episode/train/eval drivers), `players` (`LinearPolicy`, the
+featurizer-injected learned arm), `play` (the domain registry +
+`python -m catopt_discovery.play --domain meta|joint|search|torch`
+CLI; `--deliver` lowers+verifies the winning extraction on domains
+that ship a deliver hook — torch does)).
 The optional
 `catopt-native` package — the PyO3/Rust search engine, excluded from
 the uv workspace and built with maturin — is opt-in via `engine=`.
