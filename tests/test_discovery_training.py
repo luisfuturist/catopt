@@ -340,3 +340,76 @@ class TestRealModels:
                 ).get(name),
                 1e-5,
             )
+
+
+class TestJointProbe:
+    """Forward+backward on one e-graph — the cross-boundary claim."""
+
+    def test_joint_rows(self):
+        rows = training.joint_probe()
+        names = {r["name"] for r in rows}
+        assert {"silu_fwd", "softmax_fwd", "linear_fwd"} <= names
+        for r in rows:
+            # sharing never costs more than two pipelines
+            assert r["joint"] <= r["separate"]
+            assert r["enodes_joint"] <= r["enodes_sep"]
+        # measured sharing: at least one case bills shared work once
+        assert any(r["joint"] < r["separate"] for r in rows)
+        assert all(r["shared"] > 0 for r in rows)
+        text = training.joint_table(rows)
+        assert "linear_fwd" in text
+
+    def test_joint_declines(self):
+        rows = training.joint_probe(
+            forwards=[
+                ("const", Const(1.0), "x"),
+                ("no_vjp", _p("nonexistent_op", _v("x", 2, 2)), "x"),
+            ]
+        )
+        assert [r["name"] for r in rows] == ["const", "no_vjp"]
+        assert all("declined" in r for r in rows)
+        text = training.joint_table(rows)
+        assert "declined" in text
+
+    def test_joint_extraction_stays_correct(self):
+        # the winning case end-to-end: extract grads THROUGH the
+        # shared e-graph, still numerically equal to autograd
+        from catopt_core.cost.basic import count_cost
+        from catopt_core.egraph import EGraph
+        from catopt_core.laws import DEFAULT
+
+        x, w, b = _v("x", 4, 4), _v("w", 4, 4), _v("b", 4, 4)
+        fwd = _p("tanh", _p("add", _p("matmul", x, w), b))
+        cot = _p("broadcast_to", Const(1.0), shape=(4, 4))
+        grads = training.backward(fwd, cotangent=cot)
+        eg = EGraph()
+        rf = eg.add_term(fwd)
+        rg = {n: eg.add_term(g) for n, g in grads.items()}
+        eg.run(DEFAULT, rf, max_nodes=20_000)
+        env = _env(fwd, dtype=torch.float32)
+        leaves = training.leaves_of(fwd)
+        for name, rid in rg.items():
+            got = _eval_term(eg.extract_best(rid, count_cost), env)
+            true = _autograd(fwd, env, leaves[name], torch.ones(4, 4))
+            assert _eval_allclose(got, true, 1e-4)
+
+    def test_main_joint(self, capsys):
+        assert training.main(["--joint"]) == 0
+        assert "separate" in capsys.readouterr().out
+
+    def test_main_default(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            training,
+            "training_probe",
+            lambda **kw: [
+                {
+                    "name": "stub",
+                    "baseline": 1.0,
+                    "cost": 1.0,
+                    "cert": True,
+                    "n_enodes": 1,
+                }
+            ],
+        )
+        assert training.main([]) == 0
+        assert "baseline" in capsys.readouterr().out

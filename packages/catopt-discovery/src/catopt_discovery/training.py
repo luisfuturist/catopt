@@ -362,6 +362,148 @@ def training_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+#  The joint probe — forward and backward on ONE e-graph
+# ---------------------------------------------------------------------------
+
+
+def _reachable(eg: Any, root: int) -> set[int]:
+    """Canonical e-class ids reachable from *root*."""
+    seen: set[int] = set()
+    stack = [eg.find(root)]
+    while stack:
+        eid = stack.pop()
+        if eid in seen:
+            continue
+        seen.add(eid)
+        for n in eg.get_class(eid).nodes:
+            stack.extend(eg.find(a) for a in n.children)
+    return seen
+
+
+def _join(terms: list) -> Any:
+    """Wrap roots under one head for a shared-subtree ``dag_cost``."""
+    return Op.make("joint", *terms, validate=False)
+
+
+def _cotangent_for(fwd: Any) -> Any:
+    """Shaped all-ones cotangent when the shape is known."""
+    shape = _shape_of(fwd)
+    if isinstance(shape, tuple) and shape:
+        return Op.make("broadcast_to", Const(1.0), shape=shape)
+    return Const(1.0)
+
+
+def _saturate_extract(
+    terms: list, rules: Any, cost_fn: Any, max_nodes: int
+) -> tuple:
+    """One e-graph, every term a root; saturate once, extract each."""
+    from catopt_core.egraph import EGraph
+
+    eg = EGraph()
+    rids = [eg.add_term(t) for t in terms]
+    eg.run(rules, rids[0], max_nodes=max_nodes)
+    return eg, rids, [eg.extract_best(r, cost_fn) for r in rids]
+
+
+def _joint_row(
+    name: str, fwd: Any, cot: Any, cf: Any, rs: Any, max_nodes: int
+) -> dict:
+    """One forward: separate-pipeline vs joint-e-graph cost."""
+    from catopt_core.cost.params import dag_cost
+
+    try:
+        grads = backward(fwd, cotangent=cot)
+    except ValueError as exc:
+        return {"name": name, "declined": str(exc)}
+    g_terms = [grads[n] for n in sorted(grads)]
+    if not g_terms:
+        return {"name": name, "declined": "no leaf grads"}
+
+    # separate: forward pipeline + gradient pipeline, billed apart
+    eg_f, _, (f_ext,) = _saturate_extract([fwd], rs, cf, max_nodes)
+    eg_g, _, g_ext = _saturate_extract(g_terms, rs, cf, max_nodes)
+    sep = dag_cost(f_ext, cf) + dag_cost(_join(g_ext), cf)
+
+    # joint: one e-graph over every root, one saturation
+    eg, jrid, j_ext = _saturate_extract(
+        [fwd, *g_terms], rs, cf, max_nodes
+    )
+    shared = len(
+        _reachable(eg, jrid[0])
+        & set().union(*(_reachable(eg, r) for r in jrid[1:]))
+    )
+    return {
+        "name": name,
+        "separate": sep,
+        "joint": dag_cost(_join(j_ext), cf),
+        "shared": shared,
+        "enodes_sep": eg_f.n_enodes + eg_g.n_enodes,
+        "enodes_joint": eg.n_enodes,
+    }
+
+
+def joint_probe(
+    *,
+    forwards: list | None = None,
+    cost_fn: Any = None,
+    rules: Any = None,
+    cotangents: dict | None = None,
+    max_nodes: int = 20_000,
+) -> list[dict]:
+    """Forward + gradients on ONE e-graph vs two — the boundary claim.
+
+    Per case: ``backward`` derives every leaf's gradient term.  The
+    *separate* arm is the autograd comparison — the forward saturates
+    in one e-graph, the whole gradient program in a second, and the
+    two extracted programs are billed independently (two pipelines
+    cannot share work across the boundary).  The *joint* arm adds the
+    forward and every gradient root to one e-graph and saturates
+    once: identical subterms are the same e-class from the start,
+    and any rewrite that makes a backward subterm equal to a forward
+    one merges them.  ``dag_cost`` dedups shared subtrees within a
+    program, so ``joint < separate`` is measured cross-boundary
+    sharing — work autograd's two graphs must pay twice.
+    """
+    from catopt_core.cost.basic import count_cost
+    from catopt_core.laws import DEFAULT
+
+    cf = cost_fn or count_cost
+    rs = DEFAULT if rules is None else rules
+    cases = _demo_forwards() if forwards is None else forwards
+    cots = cotangents or {}
+    return [
+        _joint_row(
+            name,
+            fwd,
+            cots.get(name) or _cotangent_for(fwd),
+            cf,
+            rs,
+            max_nodes,
+        )
+        for name, fwd, _leaf in cases
+    ]
+
+
+def joint_table(rows: list[dict]) -> str:
+    """Render the joint-probe rows."""
+    head = (
+        f"{'forward':<14} {'separate':>9} {'joint':>8} {'shared':>7}"
+        f" {'enodes s/j':>10}"
+    )
+    lines = [head, "-" * len(head)]
+    for r in rows:
+        if "declined" in r:
+            lines.append(f"{r['name']:<14} declined: {r['declined']}")
+            continue
+        lines.append(
+            f"{r['name']:<14} {r['separate']:>9.3f} {r['joint']:>8.3f} "
+            f"{r['shared']:>7} "
+            f"{r['enodes_sep']:>5}/{r['enodes_joint']:<5}"
+        )
+    return "\n".join(lines)
+
+
 def main(argv: list | None = None) -> int:
     """Run the training-graph probe; print the table."""
     import argparse
@@ -373,7 +515,17 @@ def main(argv: list | None = None) -> int:
         )
     )
     ap.add_argument("--budget", type=int, default=24)
+    ap.add_argument(
+        "--joint",
+        action="store_true",
+        help="forward+gradients on ONE e-graph vs two pipelines",
+    )
     args = ap.parse_args(argv)
+    if args.joint:
+        print(  # stdout-compat
+            joint_table(joint_probe())
+        )
+        return 0
     print(  # stdout-compat
         training_table(training_probe(budget=args.budget))
     )
