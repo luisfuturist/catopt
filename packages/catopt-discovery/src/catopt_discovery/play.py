@@ -811,6 +811,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="lower + verify the first eval case's extraction",
     )
+    ap.add_argument(
+        "--probe",
+        action="store_true",
+        help="run the gen domain's claim→deliver→time probe per eval case",
+    )
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
     if sys.getrecursionlimit() < 40_000:
@@ -848,6 +853,12 @@ def main(argv: list[str] | None = None) -> int:
         res = deliver(args.domain, ev[0], arm, budget=args.budget)
         shown = {k: v for k, v in res.items() if k != "module"}
         print(f"deliver[{ev[0][0]}]: {shown}")  # stdout-compat
+    if args.probe:
+        for case in ev:
+            if DOMAINS[args.domain] is DOMAINS["gen"]:
+                print(  # stdout-compat
+                    f"probe[{case[0]}]: {gen_probe(case)}"
+                )
     if args.json:
         import json
 
