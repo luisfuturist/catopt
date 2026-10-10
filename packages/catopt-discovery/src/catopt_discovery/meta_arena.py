@@ -947,19 +947,21 @@ def _claim(arena: MetaArena, action: Action) -> _Outcome:
             applied=False,
             note=f"claim: {tag!r}'s pattern is absent from the program",
         )
-    pspec = _canon_concrete(h["pattern"])
-    for i, spec in enumerate(arena._specs):
-        name = f"claim_{tag}_{i}"
-        if (
-            _canon_concrete(spec) != pspec
-            or name in arena._by_name
-            or name in arena.definitions
-        ):
-            continue
-        return _claim_one(arena, name, spec, tag, h["kernel"])
-    return _Outcome(
-        applied=False,
-        note=f"claim: no occurring covered spec for {tag!r}",
+    # the declared body is the handler's own pattern — its
+    # semantics ARE the kernel's by construction.  (Picking a
+    # mined spec by skeleton-equality — the earlier path — could
+    # declare a concretely different body and bind the kernel to
+    # it, which is where the soundness hole was.)  The canonical
+    # spec keeps the metavar names positional so ``handle``'s
+    # arg-position check matches.
+    name = f"claim_{tag}_0"
+    if name in arena._by_name or name in arena.definitions:
+        return _Outcome(
+            applied=False,
+            note=f"claim: {tag!r} already claimed",
+        )
+    return _claim_one(
+        arena, name, _canon_concrete(h["pattern"]), tag, h["kernel"]
     )
 
 
@@ -1084,11 +1086,10 @@ class MetaState:
     handles: tuple = ()
     handler_specs: tuple = ()
     #: ``sites`` — indices of mined specs occurring as a program
-    #: subterm (canon-equal); ``claim_tags`` — ``(handler, spec_idx)``
-    #: pairs whose *concrete* pattern both occurs in the program and
-    #: equals a mined spec, with a supported kernel: the paying
-    #: precondition for ``claim`` (and ``declare``) that pure spec
-    #: data hides.  ``claimable`` keeps the count for feature use.
+    #: subterm (canon-equal); ``claim_tags`` — handler tags whose
+    #: *concrete* pattern occurs in the program: the paying
+    #: precondition for ``claim`` that pure spec data hides.
+    #: ``claimable`` keeps the count for feature use.
     sites: tuple = ()
     claim_tags: tuple = ()
     claimable: int = 0
@@ -1356,28 +1357,22 @@ class MetaArena:
         )
 
     def _claim_tags(self, handler_specs: tuple, sites: tuple) -> tuple:
-        """``(tag, spec_index)`` pairs a ``claim`` would honour.
+        """Return handler tags a ``claim`` would honour.
 
-        The soundness-level precondition, both halves: the
-        handler's *concrete* pattern occurs as a program subterm
-        (the minted rule can fire) and a mined spec is concretely
-        alpha-equal to that pattern (the declared body's semantics
-        equal the kernel's).  Whether the kernel is *supported* is
-        a pricing question, not legality — an unsupported claim
-        binds honestly and feasible pricing holds it at parity.
+        The soundness-level precondition: the handler's *concrete*
+        pattern occurs as a program subterm (the minted rule can
+        fire) — and since ``claim`` declares the handler's own
+        pattern as the object body, its semantics equal the
+        kernel's by construction.  Whether the kernel is
+        *supported* is a pricing question, not legality — an
+        unsupported claim binds honestly and feasible pricing
+        holds it at parity.
         """
-        out: list = []
-        for tag, _hp in handler_specs:
-            h = self.handlers[tag]
-            if not self._concrete_occurs(h["pattern"]):
-                continue
-            hc = _canon_concrete(h["pattern"])
-            out += [
-                (tag, i)
-                for i in sites
-                if _canon_concrete(self._specs[i]) == hc
-            ]
-        return tuple(out)
+        return tuple(
+            tag
+            for tag, _hp in handler_specs
+            if self._concrete_occurs(self.handlers[tag]["pattern"])
+        )
 
     def _interp_state(self) -> tuple:
         """Return the interpretation view: declared bodies, assignments, menu.
@@ -1538,20 +1533,16 @@ def _claim_actions(state: MetaState) -> list[Action]:
     """``claim`` per handler whose pattern occurs and is unclaimed.
 
     Offers come from ``state.claim_tags`` — concrete-occurrence-
-    checked ``(tag, spec_index)`` pairs — so a skeleton-collision
-    can't offer a dead move.  One offer per tag — the handler takes
-    the first matching spec whose ``claim_<tag>_<i>`` name is still
-    free — and re-offering stops when every covered spec is
-    claimed (all names bound).
+    checked tags — so a skeleton-collision can't offer a dead
+    move.  One offer per tag — the claimed object is named
+    ``claim_<tag>_0``, and re-offering stops once it's bound.
     """
     claimed = {op for op, _body in state.declared_bodies}
-    out: list[Action] = []
-    for tag, _pspec in state.handler_specs:
-        for _t, i in state.claim_tags:
-            if _t == tag and f"claim_{tag}_{i}" not in claimed:
-                out.append(Action.claim(tag))
-                break
-    return out
+    return [
+        Action.claim(tag)
+        for tag in state.claim_tags
+        if f"claim_{tag}_0" not in claimed
+    ]
 
 
 def legal_actions(state: MetaState) -> tuple[Action, ...]:

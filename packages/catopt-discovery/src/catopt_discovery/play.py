@@ -306,24 +306,64 @@ def _torch_deliver(board: ma.MetaArena, case: Any, traj: Any) -> dict:
 #  a kernel nobody wrote.
 
 
-def _fusion_sites(term: Any) -> list:
-    """Elementwise subterms of size ≥2 — generated-fusion candidates."""
+def _fusion_pattern(t: Any, names: dict) -> Any:
+    """Return the elementwise-closure pattern at *t*, leaves abstracted.
+
+    A subterm fuses iff its *head* is elementwise — children below
+    the elementwise boundary (matmuls, reductions, …) become bound
+    metavariables, consistently named by subtree identity.  So
+    ``mul(y, relu(y))`` over ``y = mm(…)`` yields
+    ``("mul", "X1", ("relu", "X1"))`` — ``X1`` binds the whole
+    folded matmul, and the generated kernel computes it once.
+    """
+    from catopt_core.ir import Const
+
     from catopt_discovery import genkernel as gk
-    from catopt_discovery.meta_arena import _spec_of
+
+    if isinstance(t, Op) and t.op in gk.ELEMENTWISE:
+        kids = [_fusion_pattern(a, names) for a in t.args]
+        if t.attrs:
+            kids.append(dict(t.attrs))
+        return (t.op, *kids)
+    if isinstance(t, Const):
+        return t.value
+    key = repr(t)
+    if key not in names:
+        names[key] = f"X{len(names) + 1}"
+    return names[key]
+
+
+def _fusion_sites(term: Any) -> list:
+    """Elementwise-connex subterms of size ≥2, leaves abstracted.
+
+    Each entry is a *pattern tuple* (metavar leaves for the
+    non-elementwise boundary), the shape ``gen_handlers`` consumes.
+    """
+    from catopt_discovery import genkernel as gk
 
     out: list = []
 
     def walk(t: Any) -> None:
-        if not isinstance(t, Op):
-            return
-        spec = _spec_of(t, {})
-        if len(gk._spec_ops(spec)) >= 2 and gk.elementwise_spec(spec):
-            out.append(t)
-        for a in t.args:
-            walk(a)
+        if isinstance(t, Op) and t.op in gk.ELEMENTWISE:
+            spec = _fusion_pattern(t, {})
+            ops = {e for e in _flat_ops(spec)}
+            if len(ops) >= 2:
+                out.append(spec)
+        if isinstance(t, Op):
+            for a in t.args:
+                walk(a)
 
     walk(term)
     return out
+
+
+def _flat_ops(spec: Any):
+    """Yield op names inside a fusion pattern tuple."""
+    if isinstance(spec, (tuple, list)) and spec:
+        yield spec[0]
+        for e in spec[1:]:
+            if not isinstance(e, dict):
+                yield from _flat_ops(e)
 
 
 def _gen_cases(seed: int, n: int) -> list:
@@ -392,6 +432,30 @@ def _gen_cases(seed: int, n: int) -> list:
             y = x @ self.a @ self.b @ self.c
             return y * torch.relu(y)
 
+    class _ChainFuse(nn.Module):
+        """Fold-able mm chain + a 6-op pointwise tail needing gen.
+
+        The folded chain is a laws win; the tail's fused form exists
+        only via ``claim(gen_*)`` — the win that needs the generated
+        kernel.
+        """
+
+        def __init__(self, d: int = 512) -> None:
+            super().__init__()
+            self.a = nn.Parameter(torch.randn(d, d) / d**0.5)
+            self.b = nn.Parameter(torch.randn(d, d) / d**0.5)
+            self.c = nn.Parameter(torch.randn(d, d) / d**0.5)
+
+        def forward(self, x):
+            """Chain, then a long elementwise tail over the result."""
+            y = x @ self.a @ self.b @ self.c
+            return (
+                y * torch.relu(y)
+                - torch.nn.functional.softplus(y)
+                + torch.tanh(y * y)
+                * torch.nn.functional.softplus(y * torch.sigmoid(y))
+            )
+
     rng = random.Random(seed)
     src = TorchSource()
     covered = {
@@ -405,6 +469,7 @@ def _gen_cases(seed: int, n: int) -> list:
         ("bigfuse", lambda: _Fuse("bigfuse"), (256, 512)),
         ("swiglu_mlp", _SwigluMLP, (16, 64)),
         ("chain_mlp", _ChainMLP, (16, 64)),
+        ("chainfuse", _ChainFuse, (256, 512)),
         (
             "mlp",
             lambda d=64: nn.Sequential(
@@ -484,7 +549,7 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     board = _gen_board(case)
     st = board.observe()
-    tags = [t for t, _i in st.claim_tags]
+    tags = list(st.claim_tags)
     claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
     # the maximal automated line: every claim offer, then saturate
     # (the shipped laws — reassociation &c.), then extract

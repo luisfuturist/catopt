@@ -344,3 +344,69 @@ class TestEdges:
         )
         assert rc == 0 and bumped == [40_000]
         capsys.readouterr()
+
+
+class TestFusionSites:
+    """``_fusion_sites`` boundary abstraction (plan: gen at non-ew leaves)."""
+
+    def _site(self):
+        # mul(y, relu(y)) where y = x@p — the arg is NOT elementwise
+        x = Var("x", TensorType((4, 4)))
+        p = Var("p", TensorType((4, 4)))
+        y = Op.make("matmul", x, p)
+        return Op.make("mul", y, Op.make("relu", y))
+
+    def test_boundary_children_become_metavars(self):
+        sites = play._fusion_sites(self._site())
+        assert sites == [("mul", "X1", ("relu", "X1"))]
+
+    def test_identical_subtrees_share_metavar(self):
+        # two DIFFERENT spelled args → distinct metas, identical → same
+        x = Var("x", TensorType((4, 4)))
+        a = Op.make("matmul", x, Var("a", TensorType((4, 4))))
+        b = Op.make("matmul", x, Var("b", TensorType((4, 4))))
+        sites = play._fusion_sites(
+            Op.make("add", Op.make("relu", a), Op.make("relu", b))
+        )
+        assert sites == [("add", ("relu", "X1"), ("relu", "X2"))]
+
+    def test_const_leaf_stays_literal(self):
+        x = Var("x", TensorType((4, 4)))
+        spec = play._fusion_pattern(
+            Op.make("mul", x, Op.make("relu", x)), {}
+        )
+        assert spec == ("mul", "X1", ("relu", "X1"))
+
+    def test_non_elementwise_head_not_a_site(self):
+        x = Var("x", TensorType((4, 4)))
+        assert play._fusion_sites(
+            Op.make("matmul", x, Op.make("relu", x))
+        ) == []
+
+    def test_chainfuse_claim_binds_gen_over_mm(self):
+        # the headline: claim(gen) on a metavar-boundary site —
+        # delivered term is gen_*_k(folded mm)
+        pytest.importorskip("torch")
+        for s in range(12):
+            for c in play._gen_cases(s, 8):
+                if "chainfuse" not in c[0]:
+                    continue
+                board = play._gen_board(c)
+                st = board.observe()
+                claims = [
+                    a for a in ma.legal_actions(st) if a.op == "claim"
+                ]
+                assert claims  # gen_0 site + silu + square
+                for a in claims:
+                    board.step(a)
+                board.step(ma.Action.saturate())
+                board.step(ma.Action.extract())
+                best = board.eg.extract_best(
+                    board.root, board.feasible_cost
+                )
+                from catopt_core.ir import op_repr
+
+                delivered = op_repr(board.deliverable(best))
+                assert delivered.startswith("(gen_0_k (matmul")
+                return
+        raise AssertionError("no chainfuse case generated")

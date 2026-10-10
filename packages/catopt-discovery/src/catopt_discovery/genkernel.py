@@ -112,11 +112,11 @@ def elementwise_spec(spec: Any) -> bool:
 
 
 def gen_handlers(terms: list, *, covered: set | None = None) -> dict:
-    """Mint a handler table for concrete subterms.
+    """Mint a handler table for concrete subterms or patterns.
 
-    Each term yields ``gen_<i>: {pattern, kernel, args}`` — the
+    Each entry yields ``gen_<i>: {pattern, kernel, args}`` — the
     same entry shape ``lawdata.HANDLERS`` ships, so ``claim``
-    binds them with no new machinery.  Terms whose *concrete*
+    binds them with no new machinery.  Entries whose *concrete*
     pattern already exists — in *covered* (e.g. the shipped
     handlers' canon-concrete patterns) or earlier in the list —
     are skipped: the generated vocabulary adds names only where
@@ -130,7 +130,11 @@ def gen_handlers(terms: list, *, covered: set | None = None) -> dict:
     skip = covered if covered is not None else set()
     out: dict[str, dict] = {}
     for term in terms:
-        pattern = _spec_of(term, {})
+        pattern = (
+            term
+            if isinstance(term, (tuple, list))
+            else _spec_of(term, {})
+        )
         canon = _canon_concrete(pattern)
         if canon in skip or not elementwise_spec(pattern):
             continue

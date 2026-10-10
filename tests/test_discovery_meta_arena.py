@@ -1082,13 +1082,13 @@ class TestClaimMove:
         assert "mysilu" not in op_repr(arena.deliverable(best))
 
     def test_claim_second_offer_declines(self):
-        # all covered specs claimed → the move declines rather
-        # than re-minting (the enumerator stopped offering first)
+        # the tag's object is already minted → the move declines
+        # rather than re-minting (the enumerator stopped offering)
         arena = self._arena()
         arena.step(ma.Action.claim("silu"))
         _, rep = arena.step(ma.Action.claim("silu"))
         assert not rep.applied
-        assert "no occurring covered spec" in rep.note
+        assert "already claimed" in rep.note
 
     def test_deliverable_plain_term_passthrough(self):
         # no declarations: deliverable rebuilds the term unchanged
