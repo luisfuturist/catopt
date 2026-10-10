@@ -282,7 +282,7 @@ class TestTrainingProbe:
         )
 
     def test_softmax_matches_autograd(self):
-        # d softmax(x)_i = s_i (g_i − Σ_j g_j s_j) — the VJP re-spells
+        # d softmax(x)_i = s_i (g_i - Σ_j g_j s_j) — the VJP re-spells
         # the forward output twice; the joint e-graph is where those
         # dedup.  dim plumbs through ``$dim``.
         x = _v("x", 4, 4)
@@ -298,7 +298,7 @@ class TestTrainingProbe:
         )
 
     def test_log_softmax_matches_autograd(self):
-        # d lsm_i = g_i − s_i Σ_j g_j with s = exp(lsm(x))
+        # d lsm_i = g_i - s_i Σ_j g_j with s = exp(lsm(x))
         x = _v("x", 4, 4)
         term = _p("log_softmax", x, dim=-1)
         g0 = _p("broadcast_to", Const(1.0), shape=(4, 4))
