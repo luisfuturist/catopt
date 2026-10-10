@@ -63,6 +63,28 @@ quality lever.
 Q2/Q3 are open; the construction arena (0020) is live and shows
 real depth (150k moves, move choice matters on holdout pay).
 
+### Update 2 — Q2 and Q3 measured (same branch, later)
+
+**Q2 confirmed with numbers.** On the mixed board, search-only
+players (scripted/greedy/random) tie at baseline on every demo
+case while `declare`-armed lines win 2–6× certified (softsign
+96→16, sub_gap 32→16, nested 128→48); the fused
+`declare → saturate → handle → extract` line takes a silu site
+2→1.  Mid-search abstraction reaches optima no law sequence
+reaches — measured.
+
+**Q3 answered with a caveat.** `MetaLearnedPlayer`
+(`catopt_discovery.meta_player`, a preset of the generic
+`players.LinearPolicy`) trained cold over the mixed corpus:
+learned −0.03 vs scripted −0.10 mean reward on 40 held-out
+cases, *plus* 3 certified structural wins the scripted playbook
+cannot reach — but only after the `claim(tag)` option move
+fused the paying line into one refereed action, and the wins
+ride sampling variance rather than consolidated preference
+(learned-greedy never claims).  Action-space structure was the
+binding constraint; policy capacity is next.
+Retro: `project/retros/meta-arena-player.md`.
+
 ## HANDL formalism notes (for the mixed arena's vocabulary)
 
 From `handl-lang/platform/research/PAPER.md`:

@@ -278,7 +278,7 @@ def _torch_deliver(board: ma.MetaArena, case: Any, traj: Any) -> dict:
         input_names=set(ex["ir"].input_names),
         params=dict(ex["ir"].params),
     )
-    sink = TorchSink()
+    sink = ex.get("sink") or TorchSink()
     module = sink.lower(ir, params=ex["leaves"])
     rep = sink.verify(ex["model"], module, (ex["input"],))
     t = traj.terminal
@@ -291,6 +291,233 @@ def _torch_deliver(board: ma.MetaArena, case: Any, traj: Any) -> dict:
         "cert": getattr(t, "certificate_ok", None),
         "reward": traj.total,
     }
+
+
+# ---------------------------------------------------------------------------
+#  Domain: gen — generated kernels over real torch modules
+# ---------------------------------------------------------------------------
+#
+#  The "discovery builds lowerings" story end to end: spell fusion
+#  patterns the ambient handler table has no name for (``x·relu(x)``,
+#  ``x·gelu(x)``, …) plus stock-model pieces; the board mints a gen
+#  handler + kernel per occurring elementwise subterm; ``claim``
+#  binds it; ``deliver`` lowers it through a ``TorchSink`` whose op
+#  table includes the generated binding — a runnable module calling
+#  a kernel nobody wrote.
+
+
+def _fusion_sites(term: Any) -> list:
+    """Elementwise subterms of size ≥2 — generated-fusion candidates."""
+    from catopt_discovery import genkernel as gk
+    from catopt_discovery.meta_arena import _spec_of
+
+    out: list = []
+
+    def walk(t: Any) -> None:
+        if not isinstance(t, Op):
+            return
+        spec = _spec_of(t, {})
+        if len(gk._spec_ops(spec)) >= 2 and gk.elementwise_spec(spec):
+            out.append(t)
+        for a in t.args:
+            walk(a)
+
+    walk(term)
+    return out
+
+
+def _gen_cases(seed: int, n: int) -> list:
+    """Torch modules over fusion-spelling and stock-model builders.
+
+    The fusion builders spell pointwise patterns the ambient
+    handler table has no fused op for — the candidates ``claim``
+    can only reach through a *generated* kernel.  Stock pieces
+    (mlp/attn chains) give the board real shape.
+    """
+    import torch
+    import torch.nn as nn
+    from catopt_torch.adapters import TorchSource
+
+    from catopt_discovery import genkernel as gk
+    from catopt_discovery import lawdata
+    from catopt_discovery.meta_arena import _canon_concrete
+
+    class _Fuse(nn.Module):
+        def __init__(self, kind: str) -> None:
+            super().__init__()
+            self.kind = kind
+
+        def forward(self, x):
+            """Spell the pointwise pattern — no fused op named."""
+            if self.kind == "mulrelu":
+                return x * torch.relu(x)
+            if self.kind == "mulgelu":
+                return x * torch.nn.functional.gelu(x)
+            if self.kind == "mulsoftplus":
+                return x * torch.nn.functional.softplus(x)
+            if self.kind == "bigfuse":
+                return (
+                    x * torch.relu(x)
+                    + torch.sigmoid(x)
+                    - torch.tanh(x) * torch.abs(x)
+                    + x * x
+                )
+            return x * torch.tanh(x)
+
+    rng = random.Random(seed)
+    src = TorchSource()
+    covered = {
+        _canon_concrete(h["pattern"]) for h in lawdata.HANDLERS.values()
+    }
+    builders = [
+        ("mulrelu", lambda: _Fuse("mulrelu")),
+        ("mulgelu", lambda: _Fuse("mulgelu")),
+        ("mulsoftplus", lambda: _Fuse("mulsoftplus")),
+        ("multanh", lambda: _Fuse("multanh")),
+        ("bigfuse", lambda: _Fuse("bigfuse")),
+        (
+            "mlp",
+            lambda d=64: nn.Sequential(
+                nn.Linear(d, d * 2), nn.ReLU(), nn.Linear(d * 2, d)
+            ),
+        ),
+    ]
+    out = []
+    for i in range(n):
+        name, build = builders[rng.randrange(len(builders))]
+        model = build().eval()
+        gen = torch.Generator().manual_seed(seed * 997 + i)
+        x = torch.randn(256, 512, generator=gen)
+        ir, leaves = src.to_ir(model, x)
+        sites = _fusion_sites(ir.root)
+        genh = gk.gen_handlers(sites, covered=covered)
+        sink = gk.gen_sink(genh, compile_kernels=False)
+        handlers = dict(lawdata.HANDLERS) | genh
+        out.append(
+            (
+                f"gen{i}:{name}",
+                ir.root,
+                {"gen": len(genh)},
+                name,
+                sink.supported_ops,
+                {
+                    "ir": ir,
+                    "leaves": leaves,
+                    "model": model,
+                    "input": x,
+                    "sink": sink,
+                    "handlers": handlers,
+                    "gen_handlers": genh,
+                },
+            )
+        )
+    return out
+
+
+def _gen_board(case: Any) -> ma.MetaArena:
+    """Board a gen case under its generated handler table."""
+    from catopt_core.cost.basic import count_cost
+
+    from catopt_discovery import genkernel as gk
+
+    ex = case[5]
+
+    def novel(op: str) -> bool:
+        return op.startswith(("claim_", "foldabs_", "gen_"))
+
+    return ma.MetaArena(
+        case[1],
+        handlers=ex["handlers"],
+        supported=case[4],
+        corpus=[case[1]],
+        cost_fn=gk.novel_cost(count_cost, novel, 0.5),
+    )
+
+
+def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
+    """Measure the novelty claim: baseline vs generated-kernel module.
+
+    For every claim the board offers: play it, extract, deliver
+    through the case's gen sink (bindings compiled — the fused
+    kernel is a real inductor graph), verify numerically against
+    the source module, and time both sides.  The row answers the
+    product question: did the search produce a *runnable module
+    that is faster* than the spelled source, not just a new
+    spelling.
+    """
+    import torch
+
+    from catopt_discovery import genkernel as gk
+
+    ex = case[5]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    board = _gen_board(case)
+    st = board.observe()
+    tags = [t for t, _i in st.claim_tags]
+    claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
+    # one fused line per offer: claim → extract
+    for a in claims:
+        _, rep = board.step(a)
+        if rep.applied:
+            break
+    board.step(ma.Action.extract())
+    best = board.eg.extract_best(board.root, board.feasible_cost)
+    rows: list[dict] = []
+    base_model = ex["model"].to(device)
+    xin = ex["input"].to(device)
+    t_base = _time_module(base_model, xin, reps)
+    if best is None:
+        return {"case": case[0], "delivered": False, "claims": tags}
+    sink = gk.gen_sink(ex["gen_handlers"], compile_kernels=True)
+    term = board.deliverable(best)
+    from catopt_core.ir import IR
+
+    ir = IR(
+        root=term,
+        inputs=list(ex["ir"].inputs),
+        input_names=set(ex["ir"].input_names),
+        params=dict(ex["ir"].params),
+    )
+    module = sink.lower(ir, params=ex["leaves"]).to(device)
+    rep = sink.verify(ex["model"], module, (ex["input"],))
+    t_gen = _time_module(module, xin, reps)
+    rows.append(
+        {
+            "case": case[0],
+            "claims": tags,
+            "delivered": True,
+            "verified": rep.passed,
+            "max_abs": rep.max_abs,
+            "cost": getattr(board.observe(), "cost", float("nan")),
+            "baseline_us": t_base,
+            "gen_us": t_gen,
+            "speedup": round(t_base / t_gen, 3) if t_gen else None,
+            "device": device,
+        }
+    )
+    return rows[0]
+
+
+def _time_module(model: Any, x: Any, reps: int) -> float:
+    """Median per-call latency (µs) of ``model(x)`` on ``x``'s device."""
+    import torch
+
+    dev = x.device
+    for _ in range(10):
+        model(x)
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    import time
+
+    ts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        model(x)
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        ts.append((time.perf_counter() - t0) * 1e6)
+    ts.sort()
+    return ts[len(ts) // 2]
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +746,15 @@ DOMAINS: dict[str, Domain] = {
         featurizer=_search_featurizer,
         features=SEARCH_FEATURES,
         scripted=_scripted_search,
+    ),
+    "gen": Domain(
+        cases=_gen_cases,
+        board_of=_gen_board,
+        legal=ma.legal_actions,
+        featurizer=mp.featurize,
+        features=lawdata.META_ARENA_FEATURES,
+        scripted=ma.ScriptedPlayer,
+        deliver=_torch_deliver,
     ),
 }
 

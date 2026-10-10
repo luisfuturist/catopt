@@ -313,13 +313,15 @@ def _spec_of(term: Any, names: dict) -> Any:
 
 
 def _canon_spec(spec: Any, names: dict | None = None) -> Any:
-    """alpha-normalise *spec*: metavar leaves → ``X1``, ``X2``, … .
+    """alpha-normalise *spec*: EVERY atom → ``X1``, ``X2``, … .
 
-    Two specs are alpha-equivalent iff their canonical forms are equal —
-    the legality check between a ``handle`` pattern and a declared
-    object's spelled body.  Attr dicts compare literally (handlers
-    do not bind attr metavars yet — a pattern with attrs must match
-    the spelled attrs exactly).
+    Two specs are *structurally* equivalent iff their canonical
+    forms are equal — the coverage skeleton: the mined-spec
+    inventory, ``sites``/``claimable`` occurrence and the
+    ``handle`` coverage check all live at this level, where op
+    names are stripped along with leaf names.  For the
+    soundness-level comparison (is the *same* op tree meant?) use
+    :func:`_canon_concrete`.
     """
     if names is None:
         names = {}
@@ -335,6 +337,74 @@ def _canon_spec(spec: Any, names: dict | None = None) -> Any:
             for e in spec
         )
     return spec
+
+
+def _canon_concrete(spec: Any, names: dict | None = None) -> Any:
+    """alpha-normalise leaf metavars only — op names stay concrete.
+
+    The *soundness* comparison: two specs are the same pattern iff
+    their concrete op trees agree and their metavar leaves line
+    up.  ``handle``/``claim`` bind a spelled body to a kernel — the
+    kernel's semantics must equal the body's — so the check is at
+    this level, not the skeleton's: ``mul(X, relu(X))`` and
+    ``mul(X, sigmoid(X))`` share a skeleton but are different ops.
+    """
+    if names is None:
+        names = {}
+    if isinstance(spec, (tuple, list)) and spec:
+        return (
+            spec[0],
+            *(
+                dict(e)
+                if isinstance(e, dict)
+                else _canon_concrete(e, names)
+                for e in spec[1:]
+            ),
+        )
+    if isinstance(spec, str):
+        if spec not in names:
+            names[spec] = f"X{len(names) + 1}"
+        return names[spec]
+    return spec
+
+
+def _bind_meta(pattern: str, term: Any, env: dict) -> bool:
+    """Bind or check a metavar leaf: consistent binding only."""
+    bound = env.get(pattern)
+    if bound is None:
+        env[pattern] = term
+        return True
+    return bool(bound == term)
+
+
+def _match_node(pattern: Any, term: Any, env: dict) -> bool:
+    """Check an op-node pattern against an ``Op`` term, childwise."""
+    if not isinstance(term, Op) or term.op != pattern[0]:
+        return False
+    kids = [e for e in pattern[1:] if not isinstance(e, dict)]
+    if len(kids) != len(term.args):
+        return False
+    attrs = next((e for e in pattern[1:] if isinstance(e, dict)), {})
+    if dict(term.attrs) != attrs:
+        return False
+    return all(
+        _concrete_match(p, t, env)
+        for p, t in zip(kids, term.args, strict=True)
+    )
+
+
+def _concrete_match(pattern: Any, term: Any, env: dict) -> bool:
+    """Check concrete *pattern* matches *term* under a metavar env.
+
+    Metavar leaves bind consistently (the same metavar must match
+    equal terms — ``mul(X, sigmoid(X))`` needs ``x`` at both
+    positions); op heads and attrs must equal literally.
+    """
+    if isinstance(pattern, str):
+        return _bind_meta(pattern, term, env)
+    if isinstance(pattern, (tuple, list)) and pattern:
+        return _match_node(pattern, term, env)
+    return isinstance(term, Const) and term.value == pattern
 
 
 def _spec_children(spec: Any) -> Iterable:
@@ -824,7 +894,7 @@ def _handle(arena: MetaArena, action: Action) -> _Outcome:
         )
     mvs, spelled = entry
     spelled_spec = _spec_of(spelled, {})
-    if _canon_spec(spelled_spec) != _canon_spec(h["pattern"]):
+    if _canon_concrete(spelled_spec) != _canon_concrete(h["pattern"]):
         return _Outcome(
             applied=False,
             note=f"handle: {tag!r} does not cover {op!r}",
@@ -872,17 +942,16 @@ def _claim(arena: MetaArena, action: Action) -> _Outcome:
         return _Outcome(
             applied=False, note=f"claim: unknown handler {tag!r}"
         )
-    pspec = _canon_spec(h["pattern"])
-    occurring = arena._program_specs()
-    if not any(pspec == p for p in occurring):
+    if not arena._concrete_occurs(h["pattern"]):
         return _Outcome(
             applied=False,
             note=f"claim: {tag!r}'s pattern is absent from the program",
         )
+    pspec = _canon_concrete(h["pattern"])
     for i, spec in enumerate(arena._specs):
         name = f"claim_{tag}_{i}"
         if (
-            _canon_spec(spec) != pspec
+            _canon_concrete(spec) != pspec
             or name in arena._by_name
             or name in arena.definitions
         ):
@@ -1015,10 +1084,13 @@ class MetaState:
     handles: tuple = ()
     handler_specs: tuple = ()
     #: ``sites`` — indices of mined specs occurring as a program
-    #: subterm (canon-equal); ``claimable`` — those also covered by
-    #: a handler whose kernel is supported: the paying precondition
-    #: for ``claim`` (and ``declare``) that pure spec data hides.
+    #: subterm (canon-equal); ``claim_tags`` — ``(handler, spec_idx)``
+    #: pairs whose *concrete* pattern both occurs in the program and
+    #: equals a mined spec, with a supported kernel: the paying
+    #: precondition for ``claim`` (and ``declare``) that pure spec
+    #: data hides.  ``claimable`` keeps the count for feature use.
     sites: tuple = ()
+    claim_tags: tuple = ()
     claimable: int = 0
 
 
@@ -1214,7 +1286,7 @@ class MetaArena:
         )
         bodies, handles, handler_specs = self._interp_state()
         sites = self._sites()
-        claimable = self._claimable(handler_specs, sites)
+        claim_tags = self._claim_tags(handler_specs, sites)
         return MetaState(
             rules=tuple(r.name for r in self.rules),
             declared=tuple(sorted(self.declared)),
@@ -1231,7 +1303,8 @@ class MetaArena:
             handles=handles,
             handler_specs=handler_specs,
             sites=sites,
-            claimable=claimable,
+            claim_tags=claim_tags,
+            claimable=len(claim_tags),
         )
 
     def _program_specs(self) -> list:
@@ -1255,6 +1328,24 @@ class MetaArena:
         _walk(self.term)
         return out
 
+    def _concrete_occurs(self, pattern: Any) -> bool:
+        """Check a concrete pattern matches some program subterm.
+
+        The claim/handle soundness test: a mined spec's *skeleton*
+        occurring is not enough — the pattern's op tree itself must
+        match a real subterm or the minted rule never fires (and a
+        bound interpretation would read the wrong ops).
+        """
+
+        def _walk(t: Any) -> bool:
+            if _concrete_match(pattern, t, {}):
+                return True
+            if isinstance(t, Op):
+                return any(_walk(a) for a in t.args)
+            return False
+
+        return _walk(self.term)
+
     def _sites(self) -> tuple:
         """Return indices of mined specs occurring in the program."""
         pspecs = self._program_specs()
@@ -1264,20 +1355,29 @@ class MetaArena:
             if any(_canon_spec(s) == p for p in pspecs)
         )
 
-    def _claimable(self, handler_specs: tuple, sites: tuple) -> int:
-        """Covered, occurring, supported-kernel specs — the payers."""
-        n = 0
-        for tag, hp in handler_specs:
-            kernel = self.handlers[tag]["kernel"]
-            if (
-                self.supported is not None
-                and kernel not in self.supported
-            ):
+    def _claim_tags(self, handler_specs: tuple, sites: tuple) -> tuple:
+        """``(tag, spec_index)`` pairs a ``claim`` would honour.
+
+        The soundness-level precondition, both halves: the
+        handler's *concrete* pattern occurs as a program subterm
+        (the minted rule can fire) and a mined spec is concretely
+        alpha-equal to that pattern (the declared body's semantics
+        equal the kernel's).  Whether the kernel is *supported* is
+        a pricing question, not legality — an unsupported claim
+        binds honestly and feasible pricing holds it at parity.
+        """
+        out: list = []
+        for tag, _hp in handler_specs:
+            h = self.handlers[tag]
+            if not self._concrete_occurs(h["pattern"]):
                 continue
-            n += sum(
-                1 for i in sites if _canon_spec(self._specs[i]) == hp
-            )
-        return n
+            hc = _canon_concrete(h["pattern"])
+            out += [
+                (tag, i)
+                for i in sites
+                if _canon_concrete(self._specs[i]) == hc
+            ]
+        return tuple(out)
 
     def _interp_state(self) -> tuple:
         """Return the interpretation view: declared bodies, assignments, menu.
@@ -1435,21 +1535,20 @@ def _handle_actions(state: MetaState) -> list[Action]:
 
 
 def _claim_actions(state: MetaState) -> list[Action]:
-    """``claim`` per handler whose pattern covers an unclaimed spec.
+    """``claim`` per handler whose pattern occurs and is unclaimed.
 
-    One offer per tag — the handler takes the first covered spec
-    whose ``claim_<tag>_<i>`` name is still free, so a second claim
-    under the same tag lands on the next spec.  Re-offering stops
-    when every covered spec is claimed (all names bound).
+    Offers come from ``state.claim_tags`` — concrete-occurrence-
+    checked ``(tag, spec_index)`` pairs — so a skeleton-collision
+    can't offer a dead move.  One offer per tag — the handler takes
+    the first matching spec whose ``claim_<tag>_<i>`` name is still
+    free — and re-offering stops when every covered spec is
+    claimed (all names bound).
     """
     claimed = {op for op, _body in state.declared_bodies}
     out: list[Action] = []
-    for tag, pspec in state.handler_specs:
-        for i in state.sites:
-            if (
-                _canon_spec(state.specs[i]) == pspec
-                and f"claim_{tag}_{i}" not in claimed
-            ):
+    for tag, _pspec in state.handler_specs:
+        for _t, i in state.claim_tags:
+            if _t == tag and f"claim_{tag}_{i}" not in claimed:
                 out.append(Action.claim(tag))
                 break
     return out

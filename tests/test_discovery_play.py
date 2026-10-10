@@ -133,7 +133,9 @@ class TestLinearPolicy:
 
 class TestDomains:
     def test_registry(self):
-        assert set(play.DOMAINS) == {"meta", "joint", "search", "torch"}
+        assert set(play.DOMAINS) == {
+            "meta", "joint", "search", "torch", "gen"
+        }
 
     def test_torch_domain(self):
         # real modules export and board under the sink bound
