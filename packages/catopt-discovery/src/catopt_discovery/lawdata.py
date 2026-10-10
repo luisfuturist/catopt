@@ -74,6 +74,9 @@ __all__ = [
     "INSTANCE_SCALAR_MVARS",
     "LINEAR_HELD_SHAPES",
     "LINEAR_TRAIN_SHAPES",
+    "META_ARENA_FEATURES",
+    "META_ARENA_HASH_BUCKETS",
+    "META_ARENA_PLAYER_WEIGHTS",
     "META_ARENA_REWARD",
     "META_SATURATE_BUDGETS",
     "MV_NAMES",
@@ -1542,3 +1545,81 @@ REVERSE: dict[str, Any] = {
         ),
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+#  The learned meta-arena player — feature schema and weight table
+# ---------------------------------------------------------------------------
+#
+#  ``meta_player.MetaLearnedPlayer`` is a linear softmax policy over
+#  ``meta_arena.legal_actions`` — the same architecture as
+#  ``arena_player.LearnedPlayer``, featurizing ``MetaState`` instead of
+#  ``ArenaState``.  The schema and bucket widths are content, so they
+#  live here; the learned weights are a ``{name: float}`` table.
+
+#: Bucket widths for the identity-flavoured action features —
+#: ``fire``'s rule name, ``handle``'s handler tag and target object.
+#: A linear policy cannot name "the silu handler" — vocabulary is
+#: dynamic — so identities enter as stable-sha256 buckets (the same
+#: name lands in the same bucket on any board; collisions merge two
+#: names' weights, which a linear probe tolerates).
+META_ARENA_HASH_BUCKETS: dict[str, int] = {
+    "rule": 16,
+    "handler": 4,
+    "object": 8,
+}
+
+#: The feature schema — ``weight[META_ARENA_FEATURES[i]]`` is the
+#: learned player's scorer.  ``st:*`` rows broadcast board summaries
+#: to every move; ``op:*`` the move-kind one-hot; ``h:*`` the
+#: within-episode play rates (the adaptation channel — "declares
+#: haven't been tried yet" is a feature); ``a:*`` the move's own
+#: parameters (saturate budget, spec index, rule/handler/object
+#: identity buckets); ``x:*`` the interaction terms — a broadcast
+#: state feature cancels in the softmax, so state can only steer the
+#: policy through products like ``x:extract:improve``.
+META_ARENA_FEATURES: tuple[str, ...] = (
+    "bias",
+    # state broadcasts
+    "st:steps",
+    "st:enodes_frac",
+    "st:classes_frac",
+    "st:improve",
+    "st:declared",
+    "st:handled",
+    "st:unhandled",
+    "st:handleable",
+    "st:specs",
+    "st:fires",
+    # within-episode play rates
+    "h:fire",
+    "h:saturate",
+    "h:declare",
+    "h:handle",
+    # op one-hots
+    "op:fire",
+    "op:saturate",
+    "op:declare",
+    "op:handle",
+    "op:extract",
+    # action parameters
+    "a:budget",
+    "a:unbounded",
+    "a:spec_i",
+    *(f"a:r:{b:02d}" for b in range(META_ARENA_HASH_BUCKETS["rule"])),
+    *(f"a:h:{b}" for b in range(META_ARENA_HASH_BUCKETS["handler"])),
+    *(f"a:o:{b}" for b in range(META_ARENA_HASH_BUCKETS["object"])),
+    # interactions
+    "x:extract:improve",
+    "x:late:extract",
+    "x:pressure:saturate",
+    "x:declared:handle",
+    "x:unhandled:handle",
+    "x:specs:declare",
+    "x:handleable:declare",
+)
+
+#: The learned weight table — empty is the honest uniform cold start;
+#: a trained snapshot (``meta_player.MetaLearnedPlayer.weights_dict``)
+#: ships here when a trained player earns it.
+META_ARENA_PLAYER_WEIGHTS: dict[str, float] = {}
