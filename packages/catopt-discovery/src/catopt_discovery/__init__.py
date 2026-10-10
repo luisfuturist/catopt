@@ -14,9 +14,11 @@ the evidence store to admit).  The game layer: boards
 (:mod:`.arena`, :mod:`.meta_arena`), the generic driver
 (:mod:`.engine` — one ``Board`` protocol over all of them), the
 reusable learner (:mod:`.players.LinearPolicy`,
-:mod:`.meta_player`), the reverse handler (:mod:`.training`), and
-the domain registry + CLI (:mod:`.play` —
-``python -m catopt_discovery.play --domain meta|joint|search``).
+:mod:`.meta_player`), the reverse handler (:mod:`.training`), the
+generated-kernel machinery (:mod:`.genkernel` — minted handlers +
+bindings + gen sink — the lowerings the search itself builds),
+and the domain registry + CLI (:mod:`.play` —
+``python -m catopt_discovery.play --domain meta|joint|search|torch|gen``).
 Formerly the ``tools/law_*.py``
 scripts; every module keeps its CLI — invoke as
 ``python -m catopt_discovery.<module>``.

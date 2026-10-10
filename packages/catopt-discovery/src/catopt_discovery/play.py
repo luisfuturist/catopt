@@ -370,24 +370,25 @@ def _gen_cases(seed: int, n: int) -> list:
         _canon_concrete(h["pattern"]) for h in lawdata.HANDLERS.values()
     }
     builders = [
-        ("mulrelu", lambda: _Fuse("mulrelu")),
-        ("mulgelu", lambda: _Fuse("mulgelu")),
-        ("mulsoftplus", lambda: _Fuse("mulsoftplus")),
-        ("multanh", lambda: _Fuse("multanh")),
-        ("bigfuse", lambda: _Fuse("bigfuse")),
+        ("mulrelu", lambda: _Fuse("mulrelu"), (256, 512)),
+        ("mulgelu", lambda: _Fuse("mulgelu"), (256, 512)),
+        ("mulsoftplus", lambda: _Fuse("mulsoftplus"), (256, 512)),
+        ("multanh", lambda: _Fuse("multanh"), (256, 512)),
+        ("bigfuse", lambda: _Fuse("bigfuse"), (256, 512)),
         (
             "mlp",
             lambda d=64: nn.Sequential(
                 nn.Linear(d, d * 2), nn.ReLU(), nn.Linear(d * 2, d)
             ),
+            (8, 64),
         ),
     ]
     out = []
     for i in range(n):
-        name, build = builders[rng.randrange(len(builders))]
+        name, build, shape = builders[rng.randrange(len(builders))]
         model = build().eval()
         gen = torch.Generator().manual_seed(seed * 997 + i)
-        x = torch.randn(256, 512, generator=gen)
+        x = torch.randn(*shape, generator=gen)
         ir, leaves = src.to_ir(model, x)
         sites = _fusion_sites(ir.root)
         genh = gk.gen_handlers(sites, covered=covered)
@@ -479,7 +480,7 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
         params=dict(ex["ir"].params),
     )
     module = sink.lower(ir, params=ex["leaves"]).to(device)
-    rep = sink.verify(ex["model"], module, (ex["input"],))
+    rep = sink.verify(base_model, module, (xin,))
     t_gen = _time_module(module, xin, reps)
     rows.append(
         {

@@ -160,3 +160,68 @@ class TestGenDomain:
                 assert "gen_" in op_repr(board.deliverable(best))
                 return
         raise AssertionError("no gen claim landed")
+
+    def test_spec_ops_skips_attr_dicts(self):
+        spec = ("add", "X1", {"dim": 1})
+        assert gk._spec_ops(spec) == {"add"}
+        # and a const leaf walks through without touching metas
+        assert gk._spec_metas(("mul", "X1", 2.0)) == ["X1"]
+
+    def test_eval_spec_const_leaf(self):
+        from catopt_core.ops import OpTable
+
+        import catopt_torch.torch_bridge as tb
+
+        out = gk._eval_spec(
+            ("mul", "X1", 2.0), {"X1": torch.ones(2)},
+            dict(tb._IR_TO_TORCH),
+        )
+        torch.testing.assert_close(out, torch.ones(2) * 2.0)
+
+
+class TestProbe:
+    def test_gen_probe_delivers(self, monkeypatch):
+        pytest = __import__("pytest")
+        pytest.importorskip("torch")
+        real = gk.gen_sink
+        monkeypatch.setattr(
+            gk, "gen_sink", lambda h, **kw: real(h, compile_kernels=False)
+        )
+        for s in range(8):
+            for c in play._gen_cases(s, 4):
+                if "mulrelu" in c[0]:
+                    r = play.gen_probe(c, reps=3)
+                    assert r["delivered"] and r["verified"]
+                    assert r["claims"] and r["speedup"] is not None
+                    return
+        raise AssertionError("no mulrelu case found")
+
+    def test_spec_metas_skips_attr_dicts(self):
+        assert gk._spec_metas(
+            ("add", "X1", {"dim": 1})
+        ) == ["X1"]
+
+    def test_probe_empty_claims_and_no_best(self, monkeypatch):
+        pytest = __import__("pytest")
+        pytest.importorskip("torch")
+        real = gk.gen_sink
+        monkeypatch.setattr(
+            gk, "gen_sink", lambda h, **kw: real(h, compile_kernels=False)
+        )
+        # an mlp case: no fusion sites → no claims → still probes
+        for s in range(12):
+            for c in play._gen_cases(s, 4):
+                if "mlp" in c[0]:
+                    r = play.gen_probe(c, reps=3)
+                    assert r["delivered"]
+                    break
+            else:
+                continue
+            break
+        # extract empty → honest undelivered report
+        c2 = play._gen_cases(0, 1)[0]
+        monkeypatch.setattr(
+            ma.EGraph, "extract_best", lambda *a, **k: None
+        )
+        r2 = play.gen_probe(c2, reps=2)
+        assert r2["delivered"] is False
