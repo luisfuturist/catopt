@@ -70,6 +70,7 @@ class Domain:
     featurizer: Any  # (state, action, hist) -> dict
     features: Any = ()  # the learned arm's schema
     scripted: Any = None  # () -> player, or None
+    deliver: Any = None  # (board, case, traj) -> artifact | None
 
 
 def play(
@@ -82,6 +83,30 @@ def play(
     """Play one episode of *domain*/*case* under *player*."""
     d = DOMAINS[domain]
     return engine.run_episode(d.board_of(case), player, budget)
+
+
+def deliver(
+    domain: str,
+    case: Any,
+    player: Any,
+    *,
+    budget: int = 24,
+) -> dict:
+    """Play an episode on *case*; return the lowered artifact.
+
+    The product loop: the board's winning extraction resolved by
+    ``MetaArena.deliverable`` (handled ops instantiate their
+    kernels, unhandled abbreviations spell back), lowered through
+    the domain's sink, verified against the source model.  Domains
+    without a ``deliver`` hook raise — the game score needs no
+    artifact; delivery does.
+    """
+    d = DOMAINS[domain]
+    if d.deliver is None:
+        raise ValueError(f"domain {domain!r} has no deliver hook")
+    board = d.board_of(case)
+    traj = engine.run_episode(board, player, budget)
+    return d.deliver(board, case, traj)
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +212,24 @@ def _torch_cases(seed: int, n: int) -> list:
         d = 4 * rng.choice((1, 2, 4))
         kind, mk = builders[rng.randrange(len(builders))]
         torch.manual_seed(seed * 10_007 + i)
-        ir, _leaves = src.to_ir(mk(d).eval(), torch.randn(4, d))
-        out.append((f"torch{i}:{kind}", ir.root, None, (), supported))
+        model = mk(d).eval()
+        example = torch.randn(4, d)
+        ir, leaves = src.to_ir(model, example)
+        out.append(
+            (
+                f"torch{i}:{kind}",
+                ir.root,
+                None,
+                (),
+                supported,
+                {
+                    "ir": ir,
+                    "leaves": leaves,
+                    "input": example,
+                    "model": model,
+                },
+            )
+        )
     return out
 
 
@@ -201,6 +242,43 @@ def _torch_board(case: Any) -> ma.MetaArena:
         cost_fn=count_cost,
         supported=case[4] if len(case) > 4 else None,
     )
+
+
+def _torch_deliver(board: ma.MetaArena, case: Any, traj: Any) -> dict:
+    """Lower the winning extraction and verify it against the model.
+
+    ``deliverable`` resolves handled claims to their kernels and
+    unhandled abbreviations to spelled form; ``TorchSink.lower``
+    rebuilds the module from it; ``verify`` runs both on the case's
+    example input.  The game score becomes a delivered artifact.
+    """
+    from catopt_core.ir import IR
+    from catopt_torch.adapters import TorchSink
+
+    ex = case[5]
+    best = board.eg.extract_best(board.root, board.feasible_cost)
+    if best is None:
+        return {"delivered": False, "reward": traj.total}
+    term = board.deliverable(best)
+    ir = IR(
+        root=term,
+        inputs=list(ex["ir"].inputs),
+        input_names=set(ex["ir"].input_names),
+        params=dict(ex["ir"].params),
+    )
+    sink = TorchSink()
+    module = sink.lower(ir, params=ex["leaves"])
+    rep = sink.verify(ex["model"], module, (ex["input"],))
+    t = traj.terminal
+    return {
+        "delivered": True,
+        "module": module,
+        "verified": rep.passed,
+        "max_abs": rep.max_abs,
+        "cost": getattr(t, "cost", None),
+        "cert": getattr(t, "certificate_ok", None),
+        "reward": traj.total,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +454,7 @@ DOMAINS: dict[str, Domain] = {
         featurizer=mp.featurize,
         features=lawdata.META_ARENA_FEATURES,
         scripted=ma.ScriptedPlayer,
+        deliver=_torch_deliver,
     ),
     "search": Domain(
         cases=_search_cases,
@@ -431,6 +510,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--budget", type=int, default=24)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--epsilon", type=float, default=0.0)
+    ap.add_argument(
+        "--deliver",
+        action="store_true",
+        help="lower + verify the first eval case's extraction",
+    )
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
     if sys.getrecursionlimit() < 40_000:
@@ -461,6 +545,13 @@ def main(argv: list[str] | None = None) -> int:
         for i in range(0, len(totals) - decade + 1, decade)
     ]
     print(f"train decade means: {means}")  # stdout-compat
+    if args.deliver:
+        arm = (
+            d.scripted() if d.scripted is not None else player.frozen(0)
+        )
+        res = deliver(args.domain, ev[0], arm, budget=args.budget)
+        shown = {k: v for k, v in res.items() if k != "module"}
+        print(f"deliver[{ev[0][0]}]: {shown}")  # stdout-compat
     if args.json:
         import json
 

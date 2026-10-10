@@ -1045,3 +1045,38 @@ class TestClaimMove:
         _, rep = arena.step(ma.Action.claim("silu"))
         assert not rep.applied
         assert "declare declined" in rep.note
+
+    def test_deliverable_realizes_handled_ops(self):
+        # claim_silu_0 → silu (the kernel the sink lowers), while
+        # unfold spells it back — the two honest views of one win
+        from catopt_core.ir import op_repr
+
+        arena = self._arena()
+        arena.step(ma.Action.claim("silu"))
+        arena.step(ma.Action.extract())
+        best = arena.eg.extract_best(arena.root, arena.feasible_cost)
+        assert op_repr(arena.deliverable(best)) == "(silu x)"
+        assert op_repr(arena.unfold(best)) == "(mul x, (sigmoid x))"
+
+    def test_deliverable_spells_unhandled(self):
+        # declared but never handled: deliverable expands to the
+        # spelled body — no fresh name reaches lowering
+        from catopt_core.ir import op_repr
+
+        arena = self._arena()
+        arena.step(
+            ma.Action.declare(
+                {
+                    "op": "fold",
+                    "params": {
+                        "name": "mysilu",
+                        "spelled": ("mul", "X1", ("sigmoid", "X1")),
+                        "kernel": ("mysilu", "X1"),
+                    },
+                }
+            )
+        )
+        arena.step(ma.Action.saturate(budget=512))
+        arena.step(ma.Action.extract())
+        best = arena.eg.extract_best(arena.root, arena.feasible_cost)
+        assert "mysilu" not in op_repr(arena.deliverable(best))

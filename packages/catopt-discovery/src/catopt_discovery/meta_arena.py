@@ -1161,6 +1161,31 @@ class MetaArena:
             return Op.make(term.op, *args, **dict(term.attrs))
         return term
 
+    def deliverable(self, term: Any) -> Any:
+        """Resolve the extraction to a *lowering-ready* term.
+
+        The runnable counterpart of :meth:`unfold`: a handled op
+        (in *interpretations*) instantiates its kernel exactly as
+        ``feasible_cost`` prices it — the win the player earned is
+        what the sink receives; a declared-but-unhandled op expands
+        to its spelled body (definitions), so no fresh name ever
+        reaches the lowering table.
+        """
+        if isinstance(term, Op):
+            args = tuple(self.deliverable(a) for a in term.args)
+            if term.op in self.interpretations:
+                kernel, pos = self.interpretations[term.op]
+                return Op.make(
+                    kernel, *(args[i] for i in pos), **dict(term.attrs)
+                )
+            if term.op in self.definitions:
+                mvs, spelled = self.definitions[term.op]
+                return _term_instantiate(
+                    spelled, dict(zip(mvs, args, strict=True))
+                )
+            return Op.make(term.op, *args, **dict(term.attrs))
+        return term
+
     def observe(self) -> MetaState:
         """Build the read-only snapshot — live ruleset and board size."""
         best = self.eg.extract_best(self.root, self.feasible_cost)

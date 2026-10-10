@@ -14,6 +14,7 @@ from catopt_core.cost.basic import count_cost
 from catopt_core.ir import Op, TensorType, Var
 from catopt_core.laws import DEFAULT
 from catopt_discovery import engine, meta_arena as ma
+from catopt_discovery import meta_player as mp
 from catopt_discovery import play, players
 from catopt_discovery.players import LinearPolicy
 
@@ -139,7 +140,7 @@ class TestDomains:
         pytest.importorskip("torch")
         cases = play._torch_cases(0, 3)
         assert cases
-        name, term, _r, _d, sup = cases[0]
+        name, term, _r, _d, sup = cases[0][:5]
         assert isinstance(sup, frozenset)
         arena = play._torch_board(cases[0])
         assert isinstance(arena, ma.MetaArena)
@@ -253,3 +254,17 @@ class TestEdges:
         import json
 
         assert "table" in json.loads(out_path.read_text())
+
+    def test_deliver_torch_artifact(self):
+        # the product loop end to end: play -> lower -> verified module
+        pytest.importorskip("torch")
+        cases = play._torch_cases(0, 2)
+        res = play.deliver("torch", cases[0], ma.ScriptedPlayer(), budget=6)
+        assert res["delivered"] and res["verified"]
+        assert res["cert"] is True
+        assert res["max_abs"] == 0.0
+
+    def test_deliver_rejects_deliverless_domain(self):
+        with pytest.raises(ValueError, match="no deliver hook"):
+            play.deliver("meta", mp.gen_cases(0, 1)[0],
+                         ma.ScriptedPlayer(), budget=4)
