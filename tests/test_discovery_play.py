@@ -207,7 +207,7 @@ class TestEdges:
         for s in range(20):
             for c in play._joint_cases(s, 6):
                 seen.add(c[0].split(":")[1])
-        assert seen == {"0", "1", "2"}
+        assert seen == {"0", "1", "2", "3"}
 
     def test_scripted_search_drains(self):
         go = play._scripted_search()

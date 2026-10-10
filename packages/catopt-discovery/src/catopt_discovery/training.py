@@ -124,6 +124,9 @@ def _node_env(node: Any, g: Any, memo: dict) -> dict:
         if isinstance(shape, tuple):
             env[f"$shape:{i}"] = shape
     dims = node.attrs.get("dim", node.attrs.get("dims"))
+    # ``$dim`` — the node's axis attr (softmax's ``dim``, …), defaulting
+    # to the last axis so a dim-less node still instantiates.
+    env["$dim"] = dims if dims is not None else -1
     inshape = env.get("$shape:0")
     if isinstance(inshape, tuple):
         env["$rcount"] = Const(_reduced_count(inshape, dims))

@@ -281,6 +281,37 @@ class TestTrainingProbe:
             1e-4,
         )
 
+    def test_softmax_matches_autograd(self):
+        # d softmax(x)_i = s_i (g_i − Σ_j g_j s_j) — the VJP re-spells
+        # the forward output twice; the joint e-graph is where those
+        # dedup.  dim plumbs through ``$dim``.
+        x = _v("x", 4, 4)
+        term = _p("softmax", x, dim=-1)
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 4))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term)
+        leaf = training.leaves_of(term)["x"]
+        assert _eval_allclose(
+            _eval_term(grads["x"], env),
+            _autograd(term, env, leaf, torch.ones(4, 4).double()),
+            1e-9,
+        )
+
+    def test_log_softmax_matches_autograd(self):
+        # d lsm_i = g_i − s_i Σ_j g_j with s = exp(lsm(x))
+        x = _v("x", 4, 4)
+        term = _p("log_softmax", x, dim=-1)
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 4))
+        grads = training.backward(term, cotangent=g0)
+        env = _env(term)
+        leaf = training.leaves_of(term)["x"]
+        tenv = {k: v.clone().requires_grad_(True) for k, v in env.items()}
+        out = torch.log_softmax(tenv[leaf], dim=-1)
+        out.backward(torch.ones_like(out))
+        assert _eval_allclose(
+            _eval_term(grads["x"], env), tenv[leaf].grad, 1e-9
+        )
+
 
 class TestRealModels:
     """The domain claim end-to-end: a torch module's backward."""

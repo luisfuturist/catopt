@@ -113,10 +113,12 @@ def _joint_cases(seed: int, n: int) -> list:
         d, b = 4 * rng.choice((1, 2)), 4 * rng.choice((1, 2))
         x = Var("x", TensorType((b, d)))
         w = Var("w", TensorType((d, d)))
-        archetype = rng.randrange(3)
+        archetype = rng.randrange(4)
         if archetype == 0:
             fwd = Op.make("mul", x, Op.make("sigmoid", x))
         elif archetype == 1:
+            fwd = Op.make("softmax", x, dim=-1)
+        elif archetype == 2:
             fwd = Op.make(
                 "div",
                 Op.make("exp", x),

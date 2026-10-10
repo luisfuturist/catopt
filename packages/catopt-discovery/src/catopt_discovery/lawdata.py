@@ -1506,6 +1506,38 @@ REVERSE: dict[str, Any] = {
     ],
     "reshape": (("reshape", "$g", {"shape": "$shape:0"}),),
     "permute": (("permute", "$g", {"dims": "$invdims"}),),
+    # softmax(x)⊙(g - Σ_dim g⊙softmax(x)) — the spelled body
+    # references its own forward output by re-spelling it; the
+    # joint e-graph is where that reuse dedups.
+    "softmax": (
+        (
+            "mul",
+            ("softmax", "$a0", "$attrs"),
+            (
+                "sub",
+                "$g",
+                (
+                    "sum",
+                    ("mul", "$g", ("softmax", "$a0", "$attrs")),
+                    {"dim": "$dim", "keepdim": True},
+                ),
+            ),
+        ),
+    ),
+    # log_softmax: s = exp(lsm(x)); dx = g - s⊙(Σ_dim g) — the
+    # forward output is again spelled inside (exp∘lsm), deduping
+    # under the joint e-graph.
+    "log_softmax": (
+        (
+            "sub",
+            "$g",
+            (
+                "mul",
+                ("exp", ("log_softmax", "$a0", "$attrs")),
+                ("sum", "$g", {"dim": "$dim", "keepdim": True}),
+            ),
+        ),
+    ),
     # relu: grad = g * (x > 0) — the mask is a gt on the input
     "relu": (("mul", "$g", ("gt", "$a0", 0)),),
     # rank ops: backward swaps squeeze/unsqueeze, same dims
