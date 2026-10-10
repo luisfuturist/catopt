@@ -364,6 +364,34 @@ def _gen_cases(seed: int, n: int) -> list:
                 )
             return x * torch.tanh(x)
 
+    class _SwigluMLP(nn.Module):
+        """Stock llama-MLP shape: ``down(silu(gate) * up)`` — spelled."""
+
+        def __init__(self, d: int = 64) -> None:
+            super().__init__()
+            self.gate = nn.Linear(d, d * 2, bias=False)
+            self.up = nn.Linear(d, d * 2, bias=False)
+            self.down = nn.Linear(d * 2, d, bias=False)
+
+        def forward(self, x):
+            """Spell the swiglu — the site a claim can name."""
+            g = self.gate(x)
+            return self.down(g * torch.sigmoid(g) * self.up(x))
+
+    class _ChainMLP(nn.Module):
+        """A spelled matmul chain + pointwise tail — the reassoc story."""
+
+        def __init__(self, d: int = 64) -> None:
+            super().__init__()
+            self.a = nn.Parameter(torch.randn(d, d) / d**0.5)
+            self.b = nn.Parameter(torch.randn(d, d) / d**0.5)
+            self.c = nn.Parameter(torch.randn(d, d) / d**0.5)
+
+        def forward(self, x):
+            """Three spelled mms, then a pointwise tail."""
+            y = x @ self.a @ self.b @ self.c
+            return y * torch.relu(y)
+
     rng = random.Random(seed)
     src = TorchSource()
     covered = {
@@ -375,6 +403,8 @@ def _gen_cases(seed: int, n: int) -> list:
         ("mulsoftplus", lambda: _Fuse("mulsoftplus"), (256, 512)),
         ("multanh", lambda: _Fuse("multanh"), (256, 512)),
         ("bigfuse", lambda: _Fuse("bigfuse"), (256, 512)),
+        ("swiglu_mlp", _SwigluMLP, (16, 64)),
+        ("chain_mlp", _ChainMLP, (16, 64)),
         (
             "mlp",
             lambda d=64: nn.Sequential(
@@ -456,11 +486,11 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
     st = board.observe()
     tags = [t for t, _i in st.claim_tags]
     claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
-    # one fused line per offer: claim → extract
+    # the maximal automated line: every claim offer, then saturate
+    # (the shipped laws — reassociation &c.), then extract
     for a in claims:
-        _, rep = board.step(a)
-        if rep.applied:
-            break
+        board.step(a)
+    board.step(ma.Action.saturate())
     board.step(ma.Action.extract())
     best = board.eg.extract_best(board.root, board.feasible_cost)
     rows: list[dict] = []
@@ -469,6 +499,10 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
     t_base = _time_module(base_model, xin, reps)
     if best is None:
         return {"case": case[0], "delivered": False, "claims": tags}
+    import torch as _torch
+
+    compiled = _torch.compile(base_model)
+    t_comp = _time_module(compiled, xin, reps)
     sink = gk.gen_sink(ex["gen_handlers"], compile_kernels=True)
     term = board.deliverable(best)
     from catopt_core.ir import IR
@@ -491,8 +525,10 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
             "max_abs": rep.max_abs,
             "cost": getattr(board.observe(), "cost", float("nan")),
             "baseline_us": t_base,
+            "compiled_us": t_comp,
             "gen_us": t_gen,
             "speedup": round(t_base / t_gen, 3) if t_gen else None,
+            "vs_compiled": round(t_comp / t_gen, 3) if t_gen else None,
             "device": device,
         }
     )

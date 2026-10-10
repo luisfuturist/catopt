@@ -444,3 +444,40 @@ class TestJointProbe:
         )
         assert training.main([]) == 0
         assert "baseline" in capsys.readouterr().out
+
+    def test_joint_step_shared_memo(self):
+        # the delivered joint artifact: fwd+grads under one memo —
+        # grads verified vs autograd
+        torch = pytest.importorskip("torch")
+        import catopt_torch.torch_bridge as tb
+
+        class T(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = torch.nn.Linear(8, 8)
+
+            def forward(self, x):
+                return torch.tanh(self.fc(x)) @ self.fc.weight
+
+        torch.manual_seed(0)
+        m = T().eval()
+        x = torch.randn(4, 8, requires_grad=True)
+        from catopt_torch.adapters import TorchSource
+
+        ir, leaves = TorchSource().to_ir(m, x.detach())
+        g0 = _p("broadcast_to", Const(1.0), shape=(4, 8))
+        grads = training.backward(ir.root, cotangent=g0)
+        step = training.joint_step(
+            ir.root, grads, tb._IR_TO_TORCH
+        )
+        out, g = step({"x": x.detach()}, dict(leaves))
+        xg = x.detach().clone().requires_grad_(True)
+        m(xg).sum().backward()
+        torch.testing.assert_close(out, m(x.detach()))
+        refs = {
+            "x": xg.grad,
+            "p_fc_weight": m.fc.weight.grad,
+            "p_fc_bias": m.fc.bias.grad,
+        }
+        for name, gv in g.items():
+            torch.testing.assert_close(gv, refs[name], atol=1e-5, rtol=1e-4)

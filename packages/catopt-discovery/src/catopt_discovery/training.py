@@ -27,7 +27,7 @@ from catopt_core.typing import _shape_of
 
 from . import lawdata
 
-__all__ = ["backward", "grad_program", "leaves_of"]
+__all__ = ["backward", "grad_program", "joint_step", "leaves_of"]
 
 
 def _topo(term: Any, seen: set, out: list) -> None:
@@ -486,6 +486,47 @@ def joint_probe(
         )
         for name, fwd, _leaf in cases
     ]
+
+
+def joint_step(forward: Any, grads: dict, bindings: Any) -> Any:
+    """Build a shared-memo step: forward once, all grads under it.
+
+    The delivered artifact of the joint board — a callable that
+    evaluates the forward term and every derived gradient term
+    against one memo table.  Subterms the boundary shares (the
+    forward's activations spelled inside the VJPs) evaluate once:
+    the runtime expression of what ``joint_probe`` measures
+    statically.  ``bindings`` is a torch lowering dict —
+    ``catopt_torch.torch_bridge._IR_TO_TORCH`` or a gen-table —
+    injected at call time so this module stays torch-free.
+    """
+    from catopt_torch.torch_bridge import eval_term
+
+    def step(var_env: dict, param_env: dict) -> tuple:
+        """Evaluate forward + all grads with a shared memo."""
+        memo: dict = {}
+        out = eval_term(
+            forward,
+            var_env=var_env,
+            param_env=param_env,
+            bindings=bindings,
+            memo_env=memo,
+            strict=True,
+        )
+        g = {
+            name: eval_term(
+                gt,
+                var_env=var_env,
+                param_env=param_env,
+                bindings=bindings,
+                memo_env=memo,
+                strict=True,
+            )
+            for name, gt in grads.items()
+        }
+        return out, g
+
+    return step
 
 
 def joint_table(rows: list[dict]) -> str:
