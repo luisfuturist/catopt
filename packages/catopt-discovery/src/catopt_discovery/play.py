@@ -530,6 +530,22 @@ def _gen_board(case: Any) -> ma.MetaArena:
     )
 
 
+def _probe_play(board: Any) -> Any:
+    """Play the maximal automated line; return the best extraction.
+
+    Every claim offer, then ``saturate`` (the shipped laws —
+    reassociation &c.), then ``extract``.
+    """
+    from catopt_discovery import meta_arena as ma
+
+    st = board.observe()
+    for a in [a for a in ma.legal_actions(st) if a.op == "claim"]:
+        board.step(a)
+    board.step(ma.Action.saturate())
+    board.step(ma.Action.extract())
+    return board.eg.extract_best(board.root, board.feasible_cost)
+
+
 def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
     """Measure the novelty claim: baseline vs generated-kernel module.
 
@@ -545,30 +561,42 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
 
     from catopt_discovery import genkernel as gk
 
+    # measurement integrity: each gen kernel is a distinct code
+    # object recompiled under varying global state; dynamo's
+    # default limit (8) would silently degrade late compiles —
+    # and late *baseline* compiles — to eager.  Raise it so both
+    # sides are measured as compiled, not corrupted by the cache.
+    torch._dynamo.config.recompile_limit = max(
+        int(torch._dynamo.config.recompile_limit), 256
+    )
+
     ex = case[5]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     board = _gen_board(case)
-    st = board.observe()
-    tags = list(st.claim_tags)
-    claims = [a for a in ma.legal_actions(st) if a.op == "claim"]
-    # the maximal automated line: every claim offer, then saturate
-    # (the shipped laws — reassociation &c.), then extract
-    for a in claims:
-        board.step(a)
-    board.step(ma.Action.saturate())
-    board.step(ma.Action.extract())
-    best = board.eg.extract_best(board.root, board.feasible_cost)
+    tags = list(board.observe().claim_tags)
+    best = _probe_play(board)
     rows: list[dict] = []
     base_model = ex["model"].to(device)
-    xin = ex["input"].to(device)
-    t_base = _time_module(base_model, xin, reps)
+    xin = (
+        tuple(t.to(device) for t in ex["input"])
+        if isinstance(ex["input"], (tuple, list))
+        else ex["input"].to(device)
+    )
+    try:
+        t_base = _time_module(base_model, xin, reps)
+    except Exception as exc:
+        return {
+            "case": case[0],
+            "delivered": False,
+            "note": f"baseline failed: {type(exc).__name__}: {exc}",
+        }
     if best is None:
         return {"case": case[0], "delivered": False, "claims": tags}
     import torch as _torch
 
     compiled = _torch.compile(base_model)
     t_comp = _time_module(compiled, xin, reps)
-    sink = gk.gen_sink(ex["gen_handlers"], compile_kernels=True)
+    sink = gk.hybrid_sink(ex["gen_handlers"], compile_kernels=True)
     term = board.deliverable(best)
     from catopt_core.ir import IR
 
@@ -578,9 +606,19 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
         input_names=set(ex["ir"].input_names),
         params=dict(ex["ir"].params),
     )
-    module = sink.lower(ir, params=ex["leaves"]).to(device)
-    rep = sink.verify(base_model, module, (xin,))
-    t_gen = _time_module(module, xin, reps)
+    try:
+        rep, t_gen = _probe_delivery(
+            sink, ir, ex, base_model, xin, device, reps
+        )
+    except Exception as exc:
+        return {
+            "case": case[0],
+            "claims": tags,
+            "delivered": False,
+            "note": f"deliver failed: {type(exc).__name__}: {exc}",
+            "baseline_us": t_base,
+            "compiled_us": t_comp,
+        }
     rows.append(
         {
             "case": case[0],
@@ -600,13 +638,108 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
     return rows[0]
 
 
+def _probe_delivery(
+    sink: Any,
+    ir: Any,
+    ex: dict,
+    base_model: Any,
+    xin: Any,
+    device: str,
+    reps: int,
+) -> Any:
+    """Lower → verify → time the delivered module; returns (rep, µs)."""
+    module = sink.lower(ir, params=ex["leaves"]).to(device)
+    rep = sink.verify(
+        base_model,
+        module,
+        xin if isinstance(xin, (tuple, list)) else (xin,),
+    )
+    return rep, _time_module(module, xin, reps)
+
+
+def _zoo_case(wl: Any) -> Any:
+    """Build a held-out zoo workload as a gen-domain case tuple."""
+    from catopt_torch.adapters import TorchSource
+
+    from catopt_discovery import genkernel as gk
+    from catopt_discovery.meta_arena import _canon_concrete
+
+    model, feed = wl.build()
+    model = model.double()  # the intake convention is fp64 feeds
+    ir, leaves = TorchSource().to_ir(model, feed)
+    sites = _fusion_sites(ir.root)
+    covered = {
+        _canon_concrete(h["pattern"]) for h in lawdata.HANDLERS.values()
+    }
+    genh = gk.gen_handlers(sites, covered=covered)
+    # the measured-cost referee: mint only claims whose generated
+    # kernel actually beats its spelled site on the real values
+    genh = gk.profitable(genh, ir.root, dict(leaves), reps=20)
+    sink = gk.gen_sink(genh, compile_kernels=False)
+    return (
+        f"zoo:{wl.name}",
+        ir.root,
+        {"gen": len(genh)},
+        wl.name,
+        sink.supported_ops,
+        {
+            "ir": ir,
+            "leaves": leaves,
+            "model": model,
+            "input": feed,
+            "sink": sink,
+            "handlers": dict(lawdata.HANDLERS) | genh,
+            "gen_handlers": genh,
+        },
+    )
+
+
+def _zoo_rows() -> None:
+    """Print the zoo probe rows — the ``--zoo`` CLI arm."""
+    for row in zoo_probe():
+        print(f"zoo[{row['case']}]: {row}")  # stdout-compat
+
+
+def zoo_probe(*, reps: int = 100) -> list[dict]:
+    """``gen_probe`` over the held-out model zoo — the real corpus.
+
+    Untraceable workloads are reported honestly rather than dropped
+    silently; each surviving row is the full claim → deliver →
+    verify → time table vs eager *and* ``torch.compile``.
+    """
+    from catopt_discovery import zoo as _zoo
+
+    rows: list[dict] = []
+    for wl in _zoo.zoo():
+        try:
+            case = _zoo_case(wl)
+        except Exception as exc:
+            rows.append(
+                {
+                    "case": f"zoo:{wl.name}",
+                    "delivered": False,
+                    "note": (
+                        f"export declined: {type(exc).__name__}: {exc}"
+                    ),
+                }
+            )
+            continue
+        rows.append(gen_probe(case, reps=reps))
+    return rows
+
+
 def _time_module(model: Any, x: Any, reps: int) -> float:
-    """Median per-call latency (µs) of ``model(x)`` on ``x``'s device."""
+    """Median per-call latency (µs) of ``model(*x)`` on its device.
+
+    ``x`` is a tuple of positional inputs — a single-tensor feed is
+    ``(x,)``.
+    """
     import torch
 
-    dev = x.device
+    args = x if isinstance(x, (tuple, list)) else (x,)
+    dev = args[0].device
     for _ in range(10):
-        model(x)
+        model(*args)
     if dev.type == "cuda":
         torch.cuda.synchronize()
     import time
@@ -614,7 +747,7 @@ def _time_module(model: Any, x: Any, reps: int) -> float:
     ts = []
     for _ in range(reps):
         t0 = time.perf_counter()
-        model(x)
+        model(*args)
         if dev.type == "cuda":
             torch.cuda.synchronize()
         ts.append((time.perf_counter() - t0) * 1e6)
@@ -894,6 +1027,25 @@ def _table(table: dict[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
+def _extras(args: Any, d: Any, ev: list, player: Any) -> None:
+    """Run the ``--deliver`` / ``--probe`` / ``--zoo`` report arms."""
+    if args.deliver:
+        arm = (
+            d.scripted() if d.scripted is not None else player.frozen(0)
+        )
+        res = deliver(args.domain, ev[0], arm, budget=args.budget)
+        shown = {k: v for k, v in res.items() if k != "module"}
+        print(f"deliver[{ev[0][0]}]: {shown}")  # stdout-compat
+    if args.probe:
+        for case in ev:
+            if DOMAINS[args.domain] is DOMAINS["gen"]:
+                print(  # stdout-compat
+                    f"probe[{case[0]}]: {gen_probe(case)}"
+                )
+    if args.zoo:
+        _zoo_rows()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Train the learned arm on one case stream, eval on another."""
     ap = argparse.ArgumentParser(
@@ -916,6 +1068,11 @@ def main(argv: list[str] | None = None) -> int:
         "--probe",
         action="store_true",
         help="run the gen domain's claim→deliver→time probe per eval case",
+    )
+    ap.add_argument(
+        "--zoo",
+        action="store_true",
+        help="run the claim→deliver→time probe over the held-out zoo",
     )
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
@@ -947,19 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
         for i in range(0, len(totals) - decade + 1, decade)
     ]
     print(f"train decade means: {means}")  # stdout-compat
-    if args.deliver:
-        arm = (
-            d.scripted() if d.scripted is not None else player.frozen(0)
-        )
-        res = deliver(args.domain, ev[0], arm, budget=args.budget)
-        shown = {k: v for k, v in res.items() if k != "module"}
-        print(f"deliver[{ev[0][0]}]: {shown}")  # stdout-compat
-    if args.probe:
-        for case in ev:
-            if DOMAINS[args.domain] is DOMAINS["gen"]:
-                print(  # stdout-compat
-                    f"probe[{case[0]}]: {gen_probe(case)}"
-                )
+    _extras(args, d, ev, player)
     if args.json:
         import json
 

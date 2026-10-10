@@ -6,6 +6,7 @@ soundness of ``claim``), the sink extension (gen ops are
 supported + lowerable), and the novelty cost wrapper.
 """
 
+import pytest
 import torch
 
 from catopt_core.ir import Op, TensorType, Var
@@ -225,3 +226,112 @@ class TestProbe:
         )
         r2 = play.gen_probe(c2, reps=2)
         assert r2["delivered"] is False
+
+
+class TestTritonTier:
+    """Generated Triton source — a kernel inductor doesn't produce."""
+
+    def test_triton_expr_binary_and_unary(self):
+        e = gk._triton_expr(("mul", "X1", ("relu", "X1")))
+        assert e == "((X1) * (tl.maximum(X1, 0.0)))"
+        assert "libdevice.tanh" in gk._triton_expr(
+            ("tanh", "X1")
+        )
+
+    def test_triton_expr_declines_attr_and_unknown(self):
+        assert gk._triton_expr(("sum", "X1", {"dim": 1})) is None
+        assert gk._triton_expr(("matmul", "X1", "X2")) is None
+        assert gk._triton_expr(("pow", "X1", "X2")) is not None
+        assert gk._triton_expr(("mul", "X1", 2.0)) is not None
+
+    def test_triton_bindings_correct_and_fused(self):
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("triton")
+        if not torch.cuda.is_available():
+            pytest.skip("needs cuda for triton")
+        h = {
+            "g": {
+                "pattern": ("mul", "X1", ("sigmoid", "X1")),
+                "kernel": "gk_t",
+                "args": ("X1",),
+            }
+        }
+        b = gk.triton_bindings(h)
+        x = torch.randn(512, device="cuda")
+        torch.testing.assert_close(
+            b["gk_t"](x), x * torch.sigmoid(x), atol=1e-5, rtol=1e-5
+        )
+
+    def test_triton_sink_supported(self):
+        pytest.importorskip("torch")
+        pytest.importorskip("triton")
+        h = {
+            "g": {
+                "pattern": ("mul", "X1", ("relu", "X1")),
+                "kernel": "gk_t2",
+                "args": ("X1",),
+            }
+        }
+        sink = gk.triton_sink(h)
+        assert "gk_t2" in sink.supported_ops
+
+    def test_kernel_files_landed_on_disk(self):
+        pytest.importorskip("torch")
+        pytest.importorskip("triton")
+        h = {
+            "g": {
+                "pattern": ("mul", "X1", ("relu", "X1")),
+                "kernel": "gk_disk",
+                "args": ("X1",),
+            }
+        }
+        gk.triton_bindings(h)
+        f = gk._kernel_cache() / "_gk_gk_disk.py"
+        assert f.exists() and "triton.jit" in f.read_text()
+
+    def test_unsupported_spec_gets_no_binding(self):
+        pytest.importorskip("torch")
+        pytest.importorskip("triton")
+        h = {
+            "g": {
+                "pattern": ("matmul", "X1", "X2"),
+                "kernel": "gk_no",
+                "args": ("X1", "X2"),
+            }
+        }
+        assert gk.triton_bindings(h) == {}
+
+
+class TestMeasuredReferee:
+    """``profitable`` — mint only claims whose kernel beats spelled."""
+
+    def test_paying_kernel_kept_losing_dropped(self):
+        torch = pytest.importorskip("torch")
+        from catopt_core.ir import TensorType, Var
+
+        x = Var("x", TensorType((256, 256)))
+        # a big tail — fusion pays; a 1-op site — overhead doesn't
+        big = _p("add", _p("mul", x, _p("relu", x)),
+                 _p("mul", _p("tanh", _p("mul", x, x)),
+                    _p("softplus", _p("mul", x, _p("sigmoid", x)))))
+        term = _p("add", big, _p("relu", x))
+        leaves = {"x": torch.randn(256, 256)}
+        handlers = {
+            "g_big": {
+                "pattern": (
+                    "add",
+                    ("mul", "X1", ("relu", "X1")),
+                    ("mul", ("tanh", ("mul", "X1", "X1")),
+                     ("softplus", ("mul", "X1", ("sigmoid", "X1")))),
+                ),
+                "kernel": "gk_big",
+                "args": ("X1",),
+            },
+            "g_tiny": {
+                "pattern": ("relu", "X1"),
+                "kernel": "gk_tiny",
+                "args": ("X1",),
+            },
+        }
+        keep = gk.profitable(handlers, term, leaves, reps=5)
+        assert "g_big" in keep and "g_tiny" not in keep

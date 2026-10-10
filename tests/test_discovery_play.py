@@ -410,3 +410,45 @@ class TestFusionSites:
                 assert delivered.startswith("(gen_0_k (matmul")
                 return
         raise AssertionError("no chainfuse case generated")
+
+
+class TestZooProbe:
+    """``zoo_probe`` — the held-out corpus driver."""
+
+    def test_zoo_case_builds(self):
+        pytest.importorskip("torch")
+        from catopt_discovery import zoo as _zoo
+
+        wl = _zoo.zoo()[0]
+        case = play._zoo_case(wl)
+        assert case[0].startswith("zoo:") and case[5]["gen_handlers"] is not None
+
+    def test_zoo_probe_records_declines(self, monkeypatch):
+        pytest.importorskip("torch")
+        from catopt_discovery import intake
+
+        calls = []
+
+        class _W(intake.Workload):
+            pass
+
+        def _boom():
+            raise RuntimeError("no trace")
+
+        def _ok():
+            import torch.nn as nn
+
+            return nn.Linear(4, 4), __import__("torch").randn(2, 4).double()
+
+        monkeypatch.setattr(
+            "catopt_discovery.zoo.zoo",
+            lambda: [_W("bad", _boom), _W("ok", _ok)],
+        )
+        monkeypatch.setattr(
+            play, "gen_probe",
+            lambda c, **k: calls.append(c[0]) or {"case": c[0]},
+        )
+        rows = play.zoo_probe()
+        assert rows[0]["delivered"] is False
+        assert "export declined" in rows[0]["note"]
+        assert calls == ["zoo:ok"]
