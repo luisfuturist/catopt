@@ -142,6 +142,66 @@ def _joint_board(case: Any) -> ma.MetaArena:
 
 
 # ---------------------------------------------------------------------------
+#  Domain: torch — real modules under the sink's bound
+# ---------------------------------------------------------------------------
+
+
+def _torch_cases(seed: int, n: int) -> list:
+    """Small real ``nn.Module``s lifted to IR — the product board.
+
+    Each case is a torch module exported through
+    ``catopt_torch.adapters.TorchSource`` and played under the real
+    sink's ``supported_ops`` bound — kernel claims price at sink
+    costs, not ambient vocabulary.  Modules that fail to export are
+    skipped honestly.  Torch is imported lazily — the registry
+    itself stays torch-free.
+    """
+    import torch
+    import torch.nn as nn
+    from catopt_torch.adapters import TorchSink, TorchSource
+
+    rng = random.Random(seed)
+    supported = TorchSink().supported_ops
+    src = TorchSource()
+    builders = [
+        (
+            "mlp",
+            lambda d: nn.Sequential(
+                nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d)
+            ),
+        ),
+        (
+            "relu_lin",
+            lambda d: nn.Sequential(nn.Linear(d, d), nn.ReLU()),
+        ),
+        ("lin", lambda d: nn.Linear(d, d)),
+        (
+            "softsign_mlp",
+            lambda d: nn.Sequential(nn.Linear(d, d), nn.Softsign()),
+        ),
+    ]
+    out = []
+    for i in range(n):
+        d = 4 * rng.choice((1, 2, 4))
+        kind, mk = builders[rng.randrange(len(builders))]
+        torch.manual_seed(seed * 10_007 + i)
+        ir, _leaves = src.to_ir(mk(d).eval(), torch.randn(4, d))
+        out.append((f"torch{i}:{kind}", ir.root, None, (), supported))
+    return out
+
+
+def _torch_board(case: Any) -> ma.MetaArena:
+    """Board a torch-lifted program under the real sink bound."""
+    rules = case[2] if len(case) > 2 else None
+    return ma.MetaArena(
+        case[1],
+        rules,
+        cost_fn=count_cost,
+        supported=case[4] if len(case) > 4 else None,
+    )
+
+
+# ---------------------------------------------------------------------------
 #  Domain: search — SearchEnv adapted to the Board contract
 # ---------------------------------------------------------------------------
 
@@ -302,6 +362,14 @@ DOMAINS: dict[str, Domain] = {
     "joint": Domain(
         cases=_joint_cases,
         board_of=_joint_board,
+        legal=ma.legal_actions,
+        featurizer=mp.featurize,
+        features=lawdata.META_ARENA_FEATURES,
+        scripted=ma.ScriptedPlayer,
+    ),
+    "torch": Domain(
+        cases=_torch_cases,
+        board_of=_torch_board,
         legal=ma.legal_actions,
         featurizer=mp.featurize,
         features=lawdata.META_ARENA_FEATURES,

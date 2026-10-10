@@ -8,6 +8,8 @@ is domain-agnostic (featurizer injected, not domain-bound).
 
 import random
 
+import pytest
+
 from catopt_core.cost.basic import count_cost
 from catopt_core.ir import Op, TensorType, Var
 from catopt_core.laws import DEFAULT
@@ -130,7 +132,20 @@ class TestLinearPolicy:
 
 class TestDomains:
     def test_registry(self):
-        assert set(play.DOMAINS) == {"meta", "joint", "search"}
+        assert set(play.DOMAINS) == {"meta", "joint", "search", "torch"}
+
+    def test_torch_domain(self):
+        # real modules export and board under the sink bound
+        pytest.importorskip("torch")
+        cases = play._torch_cases(0, 3)
+        assert cases
+        name, term, _r, _d, sup = cases[0]
+        assert isinstance(sup, frozenset)
+        arena = play._torch_board(cases[0])
+        assert isinstance(arena, ma.MetaArena)
+        # the scripted arm plays the whole game
+        traj = play.play("torch", cases[0], ma.ScriptedPlayer(), budget=6)
+        assert traj.terminal is not None
 
     def test_play_api_meta(self):
         traj = play.play(

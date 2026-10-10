@@ -111,6 +111,16 @@ Two games are played on that tower:
   the live ruleset*), and a terminal `extract()` refereed by
   certificate replay.  Measured: mid-search `declare` reaches
   certified extractions no law sequence can reach.
+- **The game layer** (`catopt_discovery.play`) — every board is a
+  domain registration (`cases` corpus, `case -> Board` factory,
+  `legal` enumerator, the learned player's `featurizer`): the
+  meta-arena, the *joint* board (a forward program plus every
+  derived gradient under one root — the reverse handler's terms are
+  ordinary citizens), `SearchEnv`, and real `nn.Module`s lifted
+  through `TorchSource` under the sink's `supported_ops` bound.
+  `LinearPolicy` is the one learner for all of them —
+  `python -m catopt_discovery.play --domain torch` plays a real
+  model.
 
 Then the shared equipment:
 
