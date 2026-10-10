@@ -284,3 +284,29 @@ class TestEdges:
         res = play.deliver("torch", case, ma.ScriptedPlayer(), budget=10)
         assert res["delivered"] and res["verified"]
         assert res["cost"] is not None and res["cost"] <= 1.0
+
+    def test_deliver_no_member(self, monkeypatch):
+        # extraction empty → deliver reports undelivered honestly
+        pytest.importorskip("torch")
+        cases = play._torch_cases(0, 1)
+        board = play._torch_board(cases[0])
+        monkeypatch.setattr(
+            board.eg, "extract_best", lambda *a, **k: None
+        )
+        res = play._torch_deliver(board, cases[0],
+                                  engine.Trajectory([]))
+        assert res == {"delivered": False, "reward": 0.0}
+
+    def test_main_deliver_flag(self, capsys):
+        pytest.importorskip("torch")
+        rc = play.main(
+            [
+                "--domain", "torch",
+                "--train-cases", "1",
+                "--eval-cases", "1",
+                "--budget", "6",
+                "--deliver",
+            ]
+        )
+        assert rc == 0
+        assert "deliver[" in capsys.readouterr().out

@@ -300,3 +300,21 @@ class TestInternals:
         feats = mp.featurize(st, ma.Action("bogus", {}))
         assert set(feats) <= set(lawdata.META_ARENA_FEATURES)
         assert not any(k.startswith("op:") for k in feats)
+
+    def test_main_bumps_recursion_limit(self, capsys, monkeypatch):
+        import sys
+
+        real = mp.gen_cases
+        bumped = []
+        monkeypatch.setattr(sys, "getrecursionlimit", lambda: 100)
+        monkeypatch.setattr(
+            sys, "setrecursionlimit", lambda n: bumped.append(n)
+        )
+        monkeypatch.setattr(
+            mp, "gen_cases", lambda s, n: real(0, 2)
+        )
+        assert mp.main(
+            ["--train-cases", "1", "--eval-cases", "1", "--budget", "4"]
+        ) == 0
+        assert bumped == [40_000]
+        capsys.readouterr()
