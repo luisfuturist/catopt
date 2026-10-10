@@ -1621,6 +1621,8 @@ META_ARENA_FEATURES: tuple[str, ...] = (
     "st:handled",
     "st:unhandled",
     "st:handleable",
+    "st:sites",
+    "st:claimable",
     "st:specs",
     "st:fires",
     # within-episode play rates
@@ -1652,6 +1654,8 @@ META_ARENA_FEATURES: tuple[str, ...] = (
     "x:specs:declare",
     "x:handleable:declare",
     "x:handleable:claim",
+    "x:claimable:declare",
+    "x:claimable:claim",
 )
 
 #: The learned weight table — empty is the honest uniform cold start;

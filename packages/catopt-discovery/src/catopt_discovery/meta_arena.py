@@ -873,6 +873,12 @@ def _claim(arena: MetaArena, action: Action) -> _Outcome:
             applied=False, note=f"claim: unknown handler {tag!r}"
         )
     pspec = _canon_spec(h["pattern"])
+    occurring = arena._program_specs()
+    if not any(pspec == p for p in occurring):
+        return _Outcome(
+            applied=False,
+            note=f"claim: {tag!r}'s pattern is absent from the program",
+        )
     for i, spec in enumerate(arena._specs):
         name = f"claim_{tag}_{i}"
         if (
@@ -881,49 +887,55 @@ def _claim(arena: MetaArena, action: Action) -> _Outcome:
             or name in arena.definitions
         ):
             continue
-        out = _declare(
-            arena,
-            Action.declare(
-                {
-                    "op": "fold",
-                    "params": {
-                        "name": name,
-                        "spelled": spec,
-                        "kernel": (name, *_spec_metavars(spec)),
-                    },
-                }
-            ),
-        )
-        if not out.applied:
-            return _Outcome(
-                applied=False,
-                note=f"claim: declare declined ({out.note})",
-            )
-        _out, inserted = arena._accept(out)
-        rule = arena.resolve_ref(name)
-        remaining = arena.max_nodes - arena.eg.n_enodes
-        if rule is not None and remaining > 0:
-            arena.eg.apply_rule(
-                rule, arena.root, enode_budget=remaining
-            )
-            arena.eg.rebuild()
-        hout = _handle(arena, Action.handle(name, tag))
-        if not hout.applied:
-            return _Outcome(
-                applied=False,
-                note=f"claim: handle declined ({hout.note})",
-            )
+        return _claim_one(arena, name, spec, tag, h["kernel"])
+    return _Outcome(
+        applied=False,
+        note=f"claim: no occurring covered spec for {tag!r}",
+    )
+
+
+def _claim_one(
+    arena: MetaArena, name: str, spec: Any, tag: str, kernel: str
+) -> _Outcome:
+    """One fused claim: declare → accept → fire → handle."""
+    out = _declare(
+        arena,
+        Action.declare(
+            {
+                "op": "fold",
+                "params": {
+                    "name": name,
+                    "spelled": spec,
+                    "kernel": (name, *_spec_metavars(spec)),
+                },
+            }
+        ),
+    )
+    if not out.applied:
         return _Outcome(
-            note=f"claim {name} with {tag} → {h['kernel']}",
-            detail={
-                "object": name,
-                "handler": tag,
-                "kernel": h["kernel"],
-                "inserted": inserted,
-            },
+            applied=False,
+            note=f"claim: declare declined ({out.note})",
+        )
+    _out, inserted = arena._accept(out)
+    rule = arena.resolve_ref(name)
+    remaining = arena.max_nodes - arena.eg.n_enodes
+    if rule is not None and remaining > 0:
+        arena.eg.apply_rule(rule, arena.root, enode_budget=remaining)
+        arena.eg.rebuild()
+    hout = _handle(arena, Action.handle(name, tag))
+    if not hout.applied:
+        return _Outcome(
+            applied=False,
+            note=f"claim: handle declined ({hout.note})",
         )
     return _Outcome(
-        applied=False, note=f"claim: no uncovered spec for {tag!r}"
+        note=f"claim {name} with {tag} → {kernel}",
+        detail={
+            "object": name,
+            "handler": tag,
+            "kernel": kernel,
+            "inserted": inserted,
+        },
     )
 
 
@@ -1002,6 +1014,12 @@ class MetaState:
     declared_bodies: tuple = ()
     handles: tuple = ()
     handler_specs: tuple = ()
+    #: ``sites`` — indices of mined specs occurring as a program
+    #: subterm (canon-equal); ``claimable`` — those also covered by
+    #: a handler whose kernel is supported: the paying precondition
+    #: for ``claim`` (and ``declare``) that pure spec data hides.
+    sites: tuple = ()
+    claimable: int = 0
 
 
 @dataclass(frozen=True)
@@ -1195,6 +1213,8 @@ class MetaArena:
             else float("inf")
         )
         bodies, handles, handler_specs = self._interp_state()
+        sites = self._sites()
+        claimable = self._claimable(handler_specs, sites)
         return MetaState(
             rules=tuple(r.name for r in self.rules),
             declared=tuple(sorted(self.declared)),
@@ -1210,7 +1230,54 @@ class MetaArena:
             declared_bodies=bodies,
             handles=handles,
             handler_specs=handler_specs,
+            sites=sites,
+            claimable=claimable,
         )
+
+    def _program_specs(self) -> list:
+        """Render the program's subterms as canonical spec forms.
+
+        A mined spec *occurs* iff its canon form equals some
+        subterm's — the occurrence test ``declare``/``claim`` moves
+        actually need (a covered spec absent from the program can
+        mint a rule, but the rule never fires).
+        """
+        out: list = []
+
+        def _walk(t: Any) -> None:
+            if isinstance(t, Op):
+                s = _canon_spec(_spec_of(t, {}))
+                if not any(s == p for p in out):
+                    out.append(s)
+                for a in t.args:
+                    _walk(a)
+
+        _walk(self.term)
+        return out
+
+    def _sites(self) -> tuple:
+        """Return indices of mined specs occurring in the program."""
+        pspecs = self._program_specs()
+        return tuple(
+            i
+            for i, s in enumerate(self._specs)
+            if any(_canon_spec(s) == p for p in pspecs)
+        )
+
+    def _claimable(self, handler_specs: tuple, sites: tuple) -> int:
+        """Covered, occurring, supported-kernel specs — the payers."""
+        n = 0
+        for tag, hp in handler_specs:
+            kernel = self.handlers[tag]["kernel"]
+            if (
+                self.supported is not None
+                and kernel not in self.supported
+            ):
+                continue
+            n += sum(
+                1 for i in sites if _canon_spec(self._specs[i]) == hp
+            )
+        return n
 
     def _interp_state(self) -> tuple:
         """Return the interpretation view: declared bodies, assignments, menu.
@@ -1378,9 +1445,9 @@ def _claim_actions(state: MetaState) -> list[Action]:
     claimed = {op for op, _body in state.declared_bodies}
     out: list[Action] = []
     for tag, pspec in state.handler_specs:
-        for i, s in enumerate(state.specs):
+        for i in state.sites:
             if (
-                _canon_spec(s) == pspec
+                _canon_spec(state.specs[i]) == pspec
                 and f"claim_{tag}_{i}" not in claimed
             ):
                 out.append(Action.claim(tag))

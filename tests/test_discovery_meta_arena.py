@@ -988,7 +988,7 @@ class TestClaimMove:
         )
         _, rep = arena.step(ma.Action.claim("silu"))
         assert not rep.applied
-        assert "no uncovered spec" in rep.note
+        assert "absent from the program" in rep.note
 
     def test_claim_unsupported_kernel_stays_parity(self):
         # claim mints and binds even when the kernel is unsupported —
@@ -1080,3 +1080,20 @@ class TestClaimMove:
         arena.step(ma.Action.extract())
         best = arena.eg.extract_best(arena.root, arena.feasible_cost)
         assert "mysilu" not in op_repr(arena.deliverable(best))
+
+    def test_claim_second_offer_declines(self):
+        # all covered specs claimed → the move declines rather
+        # than re-minting (the enumerator stopped offering first)
+        arena = self._arena()
+        arena.step(ma.Action.claim("silu"))
+        _, rep = arena.step(ma.Action.claim("silu"))
+        assert not rep.applied
+        assert "no occurring covered spec" in rep.note
+
+    def test_deliverable_plain_term_passthrough(self):
+        # no declarations: deliverable rebuilds the term unchanged
+        from catopt_core.ir import op_repr
+
+        arena = self._arena()
+        t = _p("mul", _v("x", 4, 4), _p("sigmoid", _v("x", 4, 4)))
+        assert op_repr(arena.deliverable(t)) == op_repr(t)

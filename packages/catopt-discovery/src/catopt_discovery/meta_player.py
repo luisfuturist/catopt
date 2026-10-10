@@ -107,6 +107,8 @@ def _state_feats(state: ma.MetaState, hist: _Hist) -> dict[str, float]:
         )
         / 8.0,
         "st:handleable": _handleable(state) / 8.0,
+        "st:sites": len(state.sites) / 8.0,
+        "st:claimable": state.claimable / 8.0,
         "st:specs": len(state.specs) / 32.0,
         "st:fires": sum(c for _, c in state.rule_fires) / 64.0,
         "h:fire": hist.rate("fire"),
@@ -164,6 +166,7 @@ def _act_feats(
         out["a:spec_i"] = _spec_index(action)
         out["x:specs:declare"] = sf["st:specs"]
         out["x:handleable:declare"] = sf["st:handleable"]
+        out["x:claimable:declare"] = sf["st:claimable"]
     elif op == "handle":
         out[
             f"a:h:{_bucket(action.params.get('handler'), 'handler')}"
@@ -178,6 +181,7 @@ def _act_feats(
             f"a:h:{_bucket(action.params.get('handler'), 'handler')}"
         ] = 1.0
         out["x:handleable:claim"] = sf["st:handleable"]
+        out["x:claimable:claim"] = sf["st:claimable"]
     elif op == "extract":
         out["x:extract:improve"] = sf["st:improve"]
         out["x:late:extract"] = sf["st:steps"]
@@ -467,9 +471,9 @@ def main(argv: list[str] | None = None) -> int:
     table = evaluate(
         arms, ev, budget=args.budget, max_nodes=args.max_nodes
     )
-    print(
+    print(  # stdout-compat
         "== meta-arena player — learned vs baselines =="
-    )  # stdout-compat
+    )
     print(player_table(table))  # stdout-compat
     decade = max(len(totals) // 10, 1)
     means = [
