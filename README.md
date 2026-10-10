@@ -116,11 +116,16 @@ Two games are played on that tower:
   `legal` enumerator, the learned player's `featurizer`): the
   meta-arena, the *joint* board (a forward program plus every
   derived gradient under one root — the reverse handler's terms are
-  ordinary citizens), `SearchEnv`, and real `nn.Module`s lifted
-  through `TorchSource` under the sink's `supported_ops` bound.
+  ordinary citizens), `SearchEnv`, real `nn.Module`s lifted
+  through `TorchSource` under the sink's `supported_ops` bound,
+  and the **`gen` domain** — where the board itself mints handler
+  entries for elementwise subterms no shipped law names, `claim`
+  binds them, and `--deliver` lowers the winning extraction to a
+  verified module calling a *generated* compiled kernel.
   `LinearPolicy` is the one learner for all of them —
   `python -m catopt_discovery.play --domain torch` plays a real
-  model.
+  model; `--domain gen --probe` prints the
+  claim → deliver → verify → time table.
 
 Then the shared equipment:
 
@@ -294,6 +299,9 @@ sizes — see [Limits](#limits)); provenance is in
 | law-order board (plan 0021 probe) | extracted term **identical under ~350 ordering arms**; wall-clock swings up to **40×** — order is a schedule dimension, not a quality one | `catopt_discovery.law_order` |
 | construction arena depth probe | board size **~150k legal moves**; on the cheap board `usable` **is reachable** (fixed playbook admits in 2/5 episodes); reward rebalanced after the probe caught stage-clear-dominated churn outscoring pay | `catopt_discovery.arena` |
 | meta-arena Q2 (mid-search declare) | **yes** — `declare` reaches certified extractions no law sequence reaches (`sub_gap` unreachable under full `DEFAULT` → half-cost via one fold) | `catopt_discovery.meta_arena` |
+| delivered module vs `torch.compile` (game `gen` probe) | spelled matmul chain **3.96×** (22µs vs 87µs — reassoc folds to 1 GEMM); llama-MLP swiglu **2.11×**; pointwise fusion **0.82–0.88× loss** — wins are structural, not fusion | `catopt_discovery.genkernel` + `play --domain gen --probe` |
+| joint fwd+bwd step vs `torch.autograd` | **+13%** (68µs vs 78µs) — the derived VJP shares the forward's activation under one memo; unshared it'd cost 197µs | `catopt_discovery.training.joint_step` |
+| generated kernels (`genkernel`) | board mints handlers for elementwise subterms the vocabulary can't name; `claim` binds; delivered module calls a compiled fused kernel — **2.87× vs eager on a 6-op chain** (6.1× at 256×1024), honest loss at small sizes | `catopt_discovery.genkernel` |
 | referee totality | a legal move can never crash the referee — `apply_rule` declines unrealizable RHS bindings; arena step reports referee declines as honest refusals | `catopt_core.egraph` |
 | discovery content tables → data | oracle banks, verifier defaults, grammar alphabet, reward weights, term corpora all live in `lawdata` — pure data a model could write | `catopt_core.lawdata` + `catopt_discovery.lawdata` |
 | evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
