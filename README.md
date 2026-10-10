@@ -64,7 +64,7 @@ import the domain packages directly, plan 0008):
 | `catopt-carriers` | carrier laws and executors (scan, attention) |
 | `catopt-cuda` | the CUDA-graph runner (`CudaGraphRunner`) |
 | `catopt-orchestrator` | the backend-neutral pipeline: `Optimizer`, strategies, morphisms |
-| `catopt-discovery` | the law-discovery engine — invoke as `python -m catopt_discovery.<mod>` |
+| `catopt-discovery` | the law-discovery engine and the game layer (`engine`/`players`/`play`), incl. the `gen` domain's `genkernel` + Triton codegen — invoke as `python -m catopt_discovery.<mod>` |
 | `catopt-native` | optional PyO3/Rust search engine (excluded from the workspace; opt-in via `engine=`) |
 
 The dependency arrow points core ◀ adapter, never core ▶ CUDA.  The
@@ -111,21 +111,38 @@ Two games are played on that tower:
   the live ruleset*), and a terminal `extract()` refereed by
   certificate replay.  Measured: mid-search `declare` reaches
   certified extractions no law sequence can reach.
-- **The game layer** (`catopt_discovery.play`) — every board is a
-  domain registration (`cases` corpus, `case -> Board` factory,
-  `legal` enumerator, the learned player's `featurizer`): the
-  meta-arena, the *joint* board (a forward program plus every
-  derived gradient under one root — the reverse handler's terms are
-  ordinary citizens), `SearchEnv`, real `nn.Module`s lifted
-  through `TorchSource` under the sink's `supported_ops` bound,
-  and the **`gen` domain** — where the board itself mints handler
-  entries for elementwise subterms no shipped law names, `claim`
-  binds them, and `--deliver` lowers the winning extraction to a
-  verified module calling a *generated* compiled kernel.
-  `LinearPolicy` is the one learner for all of them —
-  `python -m catopt_discovery.play --domain torch` plays a real
-  model; `--domain gen --probe` prints the
-  claim → deliver → verify → time table.
+- **The game layer** (`catopt_discovery.engine` / `players` /
+  `play`) — `engine` names the `Board` protocol once and puts the
+  generic drivers over it (`run_episode`, `evaluate`,
+  `train_policy`); `players` holds `LinearPolicy`, the one
+  featurizer-injected learned arm shared by every board; `play`
+  is the domain registry *as data* — a domain is a `cases`
+  corpus, a `case -> Board` factory, a `legal` enumerator and a
+  featurizer, plus an optional scripted arm and `deliver` hook —
+  behind one CLI, `python -m catopt_discovery.play --domain
+  meta|joint|search|torch|gen` with `--train-cases`/
+  `--eval-cases`/`--budget`/`--deliver`/`--probe`/`--zoo`/`--json`.
+  The boards: the meta-arena; the *joint* board — a forward
+  program plus every derived gradient under one root, the reverse
+  handler's terms ordinary citizens; `SearchEnv` adapted to
+  `Board`; and real `nn.Module`s lifted through `TorchSource`
+  under the sink's `supported_ops` bound, where `--deliver`
+  lowers the winning extraction to a verified module.
+- **The `gen` domain** — the board grows its own vocabulary.
+  `genkernel` mints a handler entry for each elementwise subterm
+  no shipped handler names; non-elementwise children become bound
+  metavariables, so `mul(y,relu(y))` over `y = x@A@B@C` yields the
+  pattern `("mul","X1",("relu","X1"))` with `X1` binding the
+  folded matmul.  `claim(tag)` declares the handler's *own
+  pattern* as the object — one `claim_<tag>_0` per occurring tag,
+  `claim_tags` enumerating the offers — sound by construction
+  (the skeleton-collision hole is gone), and `deliver` lowers the
+  winning extraction to a verified `nn.Module` calling a
+  *generated* kernel: real `triton.jit` source written to
+  inspectable `.py` files (the hybrid sink prefers Triton, falls
+  back to `torch.compile`).  `--domain gen --probe` prints the
+  claim → deliver → verify → time table per case; `--zoo` runs it
+  over the held-out model zoo.
 
 Then the shared equipment:
 
@@ -275,7 +292,9 @@ See [`admission-gauntlet.md`](project/retros/admission-gauntlet.md) and
 
 Every number is measured on the dev box (RTX 2050, fp64, launch-bound
 sizes — see [Limits](#limits)); provenance is in
-[`docs/results.md`](docs/results.md).
+[`docs/results.md`](docs/results.md).  The timing probes raise
+dynamo's `recompile_limit` — at its default it silently degrades
+late `torch.compile` calls, baselines included, to eager.
 
 | measurement | result | source |
 |---|---|---|
@@ -299,10 +318,10 @@ sizes — see [Limits](#limits)); provenance is in
 | law-order board (plan 0021 probe) | extracted term **identical under ~350 ordering arms**; wall-clock swings up to **40×** — order is a schedule dimension, not a quality one | `catopt_discovery.law_order` |
 | construction arena depth probe | board size **~150k legal moves**; on the cheap board `usable` **is reachable** (fixed playbook admits in 2/5 episodes); reward rebalanced after the probe caught stage-clear-dominated churn outscoring pay | `catopt_discovery.arena` |
 | meta-arena Q2 (mid-search declare) | **yes** — `declare` reaches certified extractions no law sequence reaches (`sub_gap` unreachable under full `DEFAULT` → half-cost via one fold) | `catopt_discovery.meta_arena` |
-| delivered module vs `torch.compile` (game `gen` probe) | spelled matmul chain **3.96×** (22µs vs 87µs — reassoc folds to 1 GEMM); llama-MLP swiglu **2.11×**; pointwise fusion **0.82–0.88× loss** — wins are structural, not fusion | `catopt_discovery.genkernel` + `play --domain gen --probe` |
-| joint fwd+bwd step vs `torch.autograd` | **+13%** (68µs vs 78µs) — the derived VJP shares the forward's activation under one memo; unshared it'd cost 197µs | `catopt_discovery.training.joint_step` |
-| generated kernels (`genkernel`) | board mints handlers for elementwise sites (non-ew children become bound metavars); `claim` binds; delivered module calls a generated **Triton** kernel (real `.py` artifact, inductor doesn't produce it) — chain+6-op-tail **2.94× vs `torch.compile`** where laws alone reach 1.34× | `catopt_discovery.genkernel` |
-| held-out zoo probe (`play --zoo`) | **11/18 delivered verified modules beat `torch.compile`** — LoRAAdapter 2.18×, WaveNetGate 1.51×, DeepEquilibrium 1.35×; wins are laws/extraction (claims filtered by the measured-cost referee); honest losses reported | `play.zoo_probe` |
+| delivered module vs `torch.compile` (`gen` probe) | spelled matmul chain **3.96×** (22µs vs 87µs — reassoc folds to 1 GEMM; Inductor keeps all three even under `freezing`); llama-MLP swiglu **2.11×**; pointwise fusion **0.82–0.88× loss** — wins are structural, not fusion | `catopt_discovery.genkernel` + `play --domain gen --probe` |
+| joint fwd+bwd step vs `torch.autograd` | **+13%** (68µs vs 78µs, verified 9.5e-07) — the derived VJP shares the forward's activation under one memo; unshared it costs 197µs | `catopt_discovery.training.joint_step` |
+| `chainfuse` — laws + `claim(gen_0)`, Triton-bound | synthetic composite (`x@A@B@C` + 6-op pointwise tail, 256×512): eager 315µs · compile 253µs · laws only 181µs · **delivered 86µs = 2.94× vs compile**, verified 1.7e-05 — the fused tail exists only via the generated kernel | `catopt_discovery.genkernel` + `play --domain gen --probe` |
+| held-out zoo probe (`play --zoo`) | **11/18 delivered verified modules beat `torch.compile`** — LoRAAdapter 2.18×, WaveNetGate 1.51×, DeepEquilibrium 1.35×; every winner ran `claims=[]` (the `gk.profitable` measured referee filtered the minted claims — the wins are the laws); losses reported honestly | `play.zoo_probe` |
 | referee totality | a legal move can never crash the referee — `apply_rule` declines unrealizable RHS bindings; arena step reports referee declines as honest refusals | `catopt_core.egraph` |
 | discovery content tables → data | oracle banks, verifier defaults, grammar alphabet, reward weights, term corpora all live in `lawdata` — pure data a model could write | `catopt_core.lawdata` + `catopt_discovery.lawdata` |
 | evidence store, second run | **19× faster** (verdicts cached by corpus × rules × revision) | `catopt_discovery.pipeline --evidence-db` |
@@ -449,6 +468,15 @@ The negatives are load-bearing, not footnotes:
   `getitem`), and `0 * x` canonicalises to `mul(x, 0)`.  No workload can
   reach them as spelled
   ([corpus-round-4.md](project/retros/corpus-round-4.md)).
+- **Generated pointwise fusion loses to Inductor.**  `claim(gen_*)`
+  pays only where kernel-launch count dominates: 2-op fusions at
+  (256,512) lose ~14% to compile, tiny 8×64 sites ~2.5× — Inductor
+  already fuses pointwise inside a compiled graph.  The `gen`
+  headline (2.94×) is a synthetic composite — laws alone reach
+  1.34× and the minted kernel roughly doubles it; on the real zoo
+  the measured referee dropped nearly every minted claim and every
+  delivered winner ran `claims=[]` — op-count pricing can't see
+  what the clock sees.
 - **The framework is general; the law library is narrow.**  Like every
   rule-based optimizer, catopt finds the structures its laws describe —
   an unmatched block is an opaque boundary, never a wrong answer.
@@ -503,6 +531,16 @@ python -m catopt_discovery.evidence --report /tmp/laws.db \
     --admit-object '<alpha_key>' --gauntlet --auto-cond
 ```
 
+**Play the game** — one registry, five domains (meta / joint /
+search / torch / gen); `--train-cases`/`--eval-cases`/`--budget`
+size the run, `--json` dumps the table:
+
+```bash
+python -m catopt_discovery.play --domain torch --deliver   # play a real module; lower + verify the win
+python -m catopt_discovery.play --domain gen --probe       # claim → deliver → verify → time per case
+python -m catopt_discovery.play --zoo                      # that probe over the held-out model zoo
+```
+
 **Train a search policy** on your own programs:
 
 ```bash
@@ -522,7 +560,7 @@ packages/
   catopt-carriers/     carrier laws / executors (scan, attention)
   catopt-cuda/         CUDA-graph runner
   catopt-orchestrator/ backend-neutral pipeline + morphisms
-  catopt-discovery/    law discovery (python -m catopt_discovery.<mod>)
+  catopt-discovery/    law discovery + the game layer (python -m catopt_discovery.<mod>)
   catopt-native/       optional PyO3/Rust search engine
 tests/                 pytest suite (100% coverage on the engine packages)
 bench/                 benchmark suites + registry (python -m bench)

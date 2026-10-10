@@ -11,7 +11,7 @@ laws/executors; `catopt-cuda` — the CUDA-graph runner;
 the game layer is `engine` (the `Board` protocol + generic
 episode/train/eval drivers), `players` (`LinearPolicy`, the
 featurizer-injected learned arm), `play` (the domain registry +
-`python -m catopt_discovery.play --domain meta|joint|search|torch`
+`python -m catopt_discovery.play --domain meta|joint|search|torch|gen`
 CLI; `--deliver` lowers+verifies the winning extraction on domains
 that ship a deliver hook — torch does)).
 The optional
