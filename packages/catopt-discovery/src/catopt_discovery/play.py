@@ -25,7 +25,11 @@ Shipped domains:
   board (the reverse handler's programs are ordinary terms);
 * ``search`` — the core :class:`~catopt_core.search_env.SearchEnv`:
   one rule per step under a horizon/patience bound, adapted to the
-  :class:`~catopt_discovery.engine.Board` contract.
+  :class:`~catopt_discovery.engine.Board` contract;
+* ``torch`` — real ``nn.Module``s lifted through
+  ``catopt_torch.adapters.TorchSource`` and played under the real
+  sink's ``supported_ops`` bound; the ``--deliver`` flag lowers
+  the winning extraction to a verified runnable module.
 
 Run it::
 
@@ -510,7 +514,10 @@ def _table(table: dict[str, list[dict]]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     """Train the learned arm on one case stream, eval on another."""
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--domain", choices=sorted(DOMAINS), default="meta")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--train-cases", type=int, default=40)
