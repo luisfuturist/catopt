@@ -310,3 +310,35 @@ class TestEdges:
         )
         assert rc == 0
         assert "deliver[" in capsys.readouterr().out
+
+    def test_scripted_search_drains_at_all_played(self):
+        # every rule played while the board lives → the playbook
+        # stops, no dead moves (unreachable under the horizon
+        # without a fabricated state — the horizon ends first)
+        go = play._scripted_search()
+        st = play._SearchState(
+            actions=("a", "b"), ops=frozenset({"x"}),
+            steps=0, done=False, cost=1.0, baseline=1.0,
+        )
+        assert go(st) in ("a", "b")
+        assert go(st) in ("a", "b")
+        assert go(st) is None
+
+    def test_main_bumps_recursion_limit(self, capsys, monkeypatch):
+        import sys
+
+        bumped = []
+        monkeypatch.setattr(sys, "getrecursionlimit", lambda: 100)
+        monkeypatch.setattr(
+            sys, "setrecursionlimit", lambda n: bumped.append(n)
+        )
+        rc = play.main(
+            [
+                "--domain", "search",
+                "--train-cases", "1",
+                "--eval-cases", "1",
+                "--budget", "4",
+            ]
+        )
+        assert rc == 0 and bumped == [40_000]
+        capsys.readouterr()

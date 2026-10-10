@@ -402,3 +402,30 @@ def test_weights_dict_roundtrips_through_the_schema():
     assert wd["bias"] == 0.25
     clone = ap.LearnedPlayer(seed=1, weights=wd)
     assert clone.weights_dict() == wd
+
+
+def test_main_smoke(tmp_path, capsys, monkeypatch):
+    """The CLI driver runs end-to-end on a stub board factory."""
+    import json
+
+    monkeypatch.setattr(
+        ap.ar, "make_arena", lambda seed, **kw: _lift_board()
+    )
+    out = tmp_path / "run.json"
+    rc = ap.main(
+        [
+            "--train-episodes",
+            "1",
+            "--episodes",
+            "1",
+            "--budget",
+            "6",
+            "--json",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "learned-player comparison" in text
+    assert "stage failures" in text
+    assert "table" in json.loads(out.read_text())
