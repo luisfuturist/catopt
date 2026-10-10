@@ -187,10 +187,18 @@ def _torch_cases(seed: int, n: int) -> list:
     import torch.nn as nn
     from catopt_torch.adapters import TorchSink, TorchSource
 
+    class _SpelledSiLU(nn.Module):
+        """x·sigmoid(x) spelled out — the claim move's live site."""
+
+        def forward(self, x):
+            """Spell ``x·sigmoid(x)`` — no fused op named."""
+            return x * torch.sigmoid(x)
+
     rng = random.Random(seed)
     supported = TorchSink().supported_ops
     src = TorchSource()
     builders = [
+        ("spelled_silu", lambda d: _SpelledSiLU()),
         (
             "mlp",
             lambda d: nn.Sequential(

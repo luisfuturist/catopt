@@ -268,3 +268,19 @@ class TestEdges:
         with pytest.raises(ValueError, match="no deliver hook"):
             play.deliver("meta", mp.gen_cases(0, 1)[0],
                          ma.ScriptedPlayer(), budget=4)
+
+    def test_torch_spelled_silu_delivers_fused(self):
+        # a module spelling x*sigmoid(x) plays to a verified silu
+        # module — shipped fold law or claim, the artifact is real
+        pytest.importorskip("torch")
+        for s in range(8):
+            cases = play._torch_cases(s, 6)
+            case = next(
+                (c for c in cases if "spelled_silu" in c[0]), None
+            )
+            if case is not None:
+                break
+        assert case is not None
+        res = play.deliver("torch", case, ma.ScriptedPlayer(), budget=10)
+        assert res["delivered"] and res["verified"]
+        assert res["cost"] is not None and res["cost"] <= 1.0
