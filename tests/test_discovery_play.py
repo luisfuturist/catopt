@@ -423,6 +423,36 @@ class TestZooProbe:
         case = play._zoo_case(wl)
         assert case[0].startswith("zoo:") and case[5]["gen_handlers"] is not None
 
+    def test_zoo_case_binds_input_vars_for_profitable(
+        self, monkeypatch
+    ):
+        # the referee's env must include the feed vars ('x'/'q'…):
+        # a param-only env makes every site touching the input
+        # eval-fail and silently skip — decline by measurement, not
+        # by accident.
+        pytest.importorskip("torch")
+        from catopt_discovery import genkernel as gk
+        from catopt_discovery import zoo as _zoo
+
+        seen: dict = {}
+        real = gk.profitable
+
+        def spy(handlers, term, var_env, **kw):
+            seen["var_env"] = dict(var_env)
+            return real(handlers, term, var_env, **kw)
+
+        monkeypatch.setattr(gk, "profitable", spy)
+        case = play._zoo_case(_zoo.zoo()[0])
+        feeds = case[5]["input"]
+        names = {
+            v.name
+            for v, _t in zip(
+                case[5]["ir"].inputs,
+                feeds if isinstance(feeds, tuple) else (feeds,),
+            )
+        }
+        assert names <= set(seen["var_env"])
+
     def test_zoo_probe_records_declines(self, monkeypatch):
         pytest.importorskip("torch")
         from catopt_discovery import intake

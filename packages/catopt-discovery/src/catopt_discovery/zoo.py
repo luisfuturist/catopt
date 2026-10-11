@@ -647,16 +647,18 @@ def _rand(*shape: int) -> torch.Tensor:
     return torch.rand(tuple(shape), dtype=torch.float64)
 
 
-def zoo() -> list[Workload]:
+def zoo(d: int = 16) -> list[Workload]:
     """Return the held-out registry — thunks like the intake's.
 
     Every workload builds a fresh module plus its example input under
     the caller's seed, exactly like ``intake.candidates`` — the same
     ``(model, feed)`` contract, ``kind="zoo"`` for the report tables,
     and ``purpose_built=False``: these are architectures chosen for
-    family coverage, not spellings of a known law's region.
+    family coverage, not spellings of a known law's region.  ``d``
+    is the model width — the default keeps the honest small-scale
+    probe; a bigger ``d`` checks the wins at sizes where pointwise
+    tails carry real work.
     """
-    d = 16
     return [
         # --- attention variants ----------------------------------
         Workload(

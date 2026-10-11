@@ -672,8 +672,15 @@ def _zoo_case(wl: Any) -> Any:
     }
     genh = gk.gen_handlers(sites, covered=covered)
     # the measured-cost referee: mint only claims whose generated
-    # kernel actually beats its spelled site on the real values
-    genh = gk.profitable(genh, ir.root, dict(leaves), reps=20)
+    # kernel actually beats its spelled site on the real values;
+    # the env must bind the input vars too — a param-only env makes
+    # every site touching the feed eval-fail and silently skip.
+    feeds = tuple(feed) if isinstance(feed, (tuple, list)) else (feed,)
+    var_env = dict(leaves)
+    var_env.update(
+        {v.name: t for v, t in zip(ir.inputs, feeds, strict=False)}
+    )
+    genh = gk.profitable(genh, ir.root, var_env, reps=20)
     sink = gk.gen_sink(genh, compile_kernels=False)
     return (
         f"zoo:{wl.name}",
