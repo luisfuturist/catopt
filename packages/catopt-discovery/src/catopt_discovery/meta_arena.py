@@ -90,6 +90,14 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, overload
 
+from catopt_core.cells import (
+    OBJECT_CELL_KINDS,
+    Fragment,
+    Provenance,
+    handle_cell,
+    laws_fragment,
+    merge_fragments,
+)
 from catopt_core.cost import (
     _INVALID_COST,
     backend_cost,
@@ -636,6 +644,15 @@ def _resolve_handlers(handlers: dict | None) -> dict:
     return lawdata.HANDLERS if handlers is None else handlers
 
 
+def _constructed_prov(construction: tuple) -> Provenance:
+    """Flatten ``(move, *premises)`` into a Provenance record."""
+    return Provenance(
+        "constructed",
+        op=construction[0] if construction else "",
+        premises=construction[1:],
+    )
+
+
 def _supported_or(supported: Any, term: Any, rules: Any) -> frozenset:
     """Resolve the board's supported-op bound.
 
@@ -1165,6 +1182,7 @@ class MetaArena:
         base = DEFAULT if rules is None else rules
         self.rules = list(base)
         self._by_name = {r.name: r for r in self.rules}
+        self._cells: dict[str, Any] = {}
         self.declared: dict[str, Rewrite] = {}
         self.definitions: dict[str, tuple] = {}
         self.interpretations: dict[str, tuple] = {}
@@ -1226,11 +1244,80 @@ class MetaArena:
         ) == op_repr(rule.rhs)
         return "same" if same else "conflict"
 
-    def _insert(self, rule: Rewrite) -> None:
+    def _insert(self, rule: Rewrite, *, cell: Any = None) -> None:
         """Add *rule* to the live set (caller checked the status)."""
+        from catopt_core.cells import law_cell
+
         self.rules.append(rule)
         self._by_name[rule.name] = rule
         self.declared[rule.name] = rule
+        self._cells[rule.name] = (
+            cell
+            if cell is not None
+            else law_cell(rule, provenance=_constructed_prov(()))
+        )
+
+    def _cell_for(self, out: _Outcome, i: int, rule: Rewrite) -> Any:
+        """Build the cell an inserted rule records in the store.
+
+        The first rule a ``declare`` outcome inserts is the declared
+        object — its kind and construction trace live in
+        ``out.detail``.  Rules after it are synthesized companions
+        (the definitional unfold): law cells whose provenance names
+        the object they were derived from.
+        """
+        from catopt_core.cells import law_cell, object_cell
+
+        construction = tuple(out.detail.get("construction", ()))
+        kind = out.detail.get("kind")
+        if i == 0 and kind in OBJECT_CELL_KINDS:
+            return object_cell(
+                rule,
+                kind=kind,
+                provenance=_constructed_prov(construction),
+            )
+        if i:
+            prov = Provenance(
+                "constructed",
+                op="unfold",
+                premises=(out.rules[0].name,) if out.rules else (),
+            )
+        else:
+            prov = _constructed_prov(construction)
+        return law_cell(rule, provenance=prov)
+
+    def cellstore(self) -> Any:
+        """Return the board's live vocabulary as a merged cell store.
+
+        Three fragments: ``"base"`` — the ruleset the board opened
+        with (shipped or caller-passed); ``"constructed"`` — the
+        cells declares inserted this episode, carrying kind and
+        provenance; ``"handlers"`` — the board's handler table as
+        handle cells.  The merged store's :meth:`laws` view equals
+        the live ``self.rules`` — the same vocabulary, one spelling.
+        """
+        declared = set(self.declared)
+        frags = [
+            laws_fragment(
+                "base",
+                (r for r in self.rules if r.name not in declared),
+            )
+        ]
+        constructed = tuple(
+            self._cells[n] for n in self.declared if n in self._cells
+        )
+        if constructed:
+            frags.append(Fragment("constructed", constructed))
+        frags.append(
+            Fragment(
+                "handlers",
+                tuple(
+                    handle_cell(h["kernel"], h, provenance=Provenance())
+                    for h in self.handlers.values()
+                ),
+            )
+        )
+        return merge_fragments(*frags)
 
     def unfold(self, term: Any) -> Any:
         """Expand every declared abbreviation back to its spelled form.
@@ -1425,9 +1512,9 @@ class MetaArena:
                 (),
             )
         inserted = tuple(r.name for r, s in statuses if s == "new")
-        for r, s in statuses:
+        for i, (r, s) in enumerate(statuses):
             if s == "new":
-                self._insert(r)
+                self._insert(r, cell=self._cell_for(out, i, r))
         for op_name, mvs, spelled in out.defs:
             self.definitions[op_name] = (mvs, spelled)
         return out, inserted

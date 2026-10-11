@@ -535,6 +535,7 @@ def store_object(
     kind: str = "law",
     cert: Any = _UNSET,
     universe: Any = None,
+    provenance: Any = None,
 ) -> str:
     """Persist *rule* as a declared-object row; return its alpha key.
 
@@ -557,12 +558,21 @@ def store_object(
     given; an explicit ``None`` stores ``cert: null``.  Whatever the
     path, the stored cert is the honest boundary — ``null`` where no
     derivation replays, never a stub.
+
+    *provenance* is an optional data record (e.g. the cell-store
+    ``Provenance`` fields ``origin`` / ``op`` / ``premises`` /
+    ``note``) merged into ``law_json`` as ``record["provenance"]``
+    — the construction trace admission otherwise discards.
+    ``object_from_data`` ignores unknown keys, so older readers
+    keep working.
     """
     from catopt_core.laws.serialize import alpha_key, object_to_data
 
     if cert is _UNSET:
         cert = _materialize_cert(rule, universe)
     data = object_to_data(rule, cert=cert, kind=kind)
+    if provenance is not None:
+        data["provenance"] = dict(provenance)
     key = repr(alpha_key(rule.lhs, rule.rhs))
     with conn:
         conn.execute(

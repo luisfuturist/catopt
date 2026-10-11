@@ -1728,6 +1728,13 @@ def store_constructed(
     kwargs: dict[str, Any] = {"kind": obj.kind, "universe": universe}
     if env is not None and obj.rule.derivation:
         kwargs["cert"] = _certify(obj.rule, universe, env)
+    parts = tuple(obj.construction)
+    kwargs["provenance"] = {
+        "origin": "constructed",
+        "op": parts[0] if parts else "",
+        "premises": list(parts[1:]),
+        "note": obj.note,
+    }
     return ev.store_object(conn, obj.rule, corpus_hash, **kwargs)
 
 
