@@ -27,10 +27,56 @@ Feasibility stays honest: a gen op is only priced low when it is in
 the board's ``supported`` set, and kernels are only *generated* for
 elementwise bodies — the narrow claim this module makes (pointwise
 fusion), not a general codegen story.
+
+THE SCAN TIER
+    ``triton_bindings`` covers pointwise bodies.  The second codegen
+    tier lowers *carrier* terms — the diagonal-affine scan the
+    ``affd_*_lift`` family mints — into ONE sequential Triton kernel.
+    Two spec forms are recognised (:func:`scan_spec`):
+
+    * ``("applyd", ("aff_diag", a, b), h)`` — the *sequence* form.
+      The leaf operands are per-step tensors carrying a step axis
+      (``axis``, default ``-2`` — the token axis of ``(B, T, d)``);
+      the kernel folds ``h_t = a_t ⊙ h + b_t`` along it and returns
+      the final state ``h_T``.  Operands may be metavars, constants,
+      or elementwise sub-specs — every metavar inside is a sequence
+      operand, so ``aff_diag(("sigmoid", "G"), ("mul", "B", "X"))``
+      generates the fully-fused selective step.
+    * ``("applyd", <affd_compose tree>, h)`` — the *unrolled* form.
+      Each ``aff_diag`` leaf is one carrier step (state-shaped
+      operands, no step axis); the kernel applies them in
+      chronological order — in-order leaves are reverse-chronological
+      (``affd_compose(f, g)`` applies ``g`` first) — in one pass.
+      This is the carrier semantics *verbatim*.
+
+    The generated binding is a NEW kernel name (``scan_<i>_k``), not
+    ``applyd`` itself: the sequence interpretation is the minted op's
+    declared semantics, never a silent override of the ambient
+    carrier binding.  Call-time shape violations — no step axis, an
+    ``h`` that cannot broadcast to the state shape, non-CUDA tensors
+    — raise rather than fall back, so a wrong binding fails loudly.
+
+    Delivery seam: ``scan_handlers`` entries merge into a handler
+    table exactly as :func:`gen_handlers` output does — the arena's
+    ``claim`` binds them with no new machinery, and
+    :func:`hybrid_sink` (the sink ``gen_probe`` lowers through)
+    consults both codegen tiers, so a minted scan op is deliverable
+    end to end.  :func:`scan_triton_sink` is the scan-only sink.
+    What is NOT wired is *minting*: raw exported IR carries no
+    ``applyd`` sites — carrier members only appear once lifts run —
+    so case builders do not call ``scan_handlers``; a caller that
+    can vouch for a site mints the entry itself.  A claim's
+    soundness is the minter's burden: the unrolled form is the
+    ambient carrier semantics verbatim; the sequence form is a NEW
+    declared semantics — the ambient
+    ``applyd(aff_diag(a, b), h)`` is one map application
+    (``a⊙h+b``), not a fold — so mint it only where the fold
+    reading is what the site means.
 """
 
 from __future__ import annotations
 
+import keyword
 from typing import Any
 
 __all__ = [
@@ -40,6 +86,10 @@ __all__ = [
     "gen_handlers",
     "gen_sink",
     "novel_cost",
+    "scan_handlers",
+    "scan_spec",
+    "scan_triton_bindings",
+    "scan_triton_sink",
 ]
 
 #: Ops whose torch bindings are pointwise (shape-preserving) — the
@@ -288,6 +338,17 @@ def profitable(
 
         kernel = torch.compile(kerneled)
         mvs = _spec_metas(h["pattern"])
+        # the referee verifies before it times: the kernel must
+        # reproduce the spelled body on the bound values — an
+        # inductor miscompile or dtype drift would otherwise win
+        # the timing race it should have lost.
+        if not torch.allclose(
+            kerneled(*[vals[m] for m in mvs]),
+            spelled(),
+            rtol=1e-4,
+            atol=1e-5,
+        ):
+            continue
 
         def _t(fn: Any) -> float:
             import time
@@ -326,6 +387,25 @@ def _kernel_cache() -> Any:
     d = Path(tempfile.gettempdir()) / "catopt_genkernels"
     d.mkdir(exist_ok=True)
     return d
+
+
+def _load_generated(path: Any, name: str) -> Any:
+    """Import a generated ``.py`` kernel module; ``None`` to decline.
+
+    The artifact is a real module file — inspectable on disk, not an
+    exec'd string.  Loading through importlib keeps the repo's
+    no-eval/exec invariant intact.  A ``None`` spec/loader means the
+    import machinery declined the file; the caller keeps whatever
+    fallback path it had.
+    """
+    import importlib.util
+
+    spec_ = importlib.util.spec_from_file_location(path.stem, path)
+    if spec_ is None or spec_.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(mod)
+    return getattr(mod, name)
 
 
 _TRITON_UNARY = {
@@ -406,8 +486,6 @@ def triton_bindings(handlers: dict) -> dict:
     flat index space.  Specs whose ops the codegen doesn't model
     are skipped — the handler keeps its torch path instead.
     """
-    import importlib.util
-
     import torch
 
     out: dict[str, Any] = {}
@@ -439,12 +517,9 @@ def triton_bindings(handlers: dict) -> dict:
         # repo's no-eval/exec invariant intact.
         path = _kernel_cache() / f"_gk_{h['kernel']}.py"
         path.write_text(src)
-        spec_ = importlib.util.spec_from_file_location(path.stem, path)
-        if spec_ is None or spec_.loader is None:
+        kern = _load_generated(path, "_gk")
+        if kern is None:
             continue  # module load declined — keep the torch path
-        mod = importlib.util.module_from_spec(spec_)
-        spec_.loader.exec_module(mod)
-        kern = mod._gk
 
         def fn(*args: Any, kern=kern, **_attrs: Any) -> Any:
             xs = [
@@ -484,22 +559,43 @@ def triton_sink(handlers: dict) -> Any:
     return TorchSink(ops=table)
 
 
+def _seq_scan_spec(spec: Any) -> bool:
+    """Check *spec* is a scan spec in the sequence (fold) form."""
+    info = scan_spec(spec)
+    return info is not None and info["kind"] == "seq"
+
+
 def hybrid_sink(handlers: dict, *, compile_kernels: bool = True) -> Any:
     """Build a sink preferring Triton codegen, compile fallback.
 
-    Triton-accepted specs bind to the generated ``.py`` kernel —
-    a kernel no incumbent compiler produces; specs the codegen
-    declines fall back to the ``torch.compile``-wrapped body.
+    Both codegen tiers are consulted.  Triton-accepted elementwise
+    specs bind to the generated ``.py`` kernel — a kernel no
+    incumbent compiler produces — and ``applyd``-carrier specs the
+    scan codegen accepts bind to their generated fold kernel.
+    Specs the codegen declines fall back to the
+    ``torch.compile``-wrapped body — EXCEPT sequence-form scan
+    specs: their spelled body evaluates as one map application
+    (``a⊙h+b``), not the fold the minted op declares, so a seq spec
+    the scan codegen cannot lower stays unbound (unpriced-
+    unlowerable) rather than silently delivering a different
+    function.  Unrolled compose-tree specs keep the fallback —
+    their spelled eval IS the carrier semantics, just serial.
     """
     import catopt_torch.torch_bridge as tb
     from catopt_core.ops import OpTable
     from catopt_torch.adapters import TorchSink
 
+    plain = {
+        k: h
+        for k, h in handlers.items()
+        if not _seq_scan_spec(h["pattern"])
+    }
     bindings = dict(tb._IR_TO_TORCH)
     bindings.update(
-        gen_bindings(handlers, compile_kernels=compile_kernels)
+        gen_bindings(plain, compile_kernels=compile_kernels)
     )
-    bindings.update(triton_bindings(handlers))
+    bindings.update(triton_bindings(plain))
+    bindings.update(scan_triton_bindings(handlers))
     table = OpTable.core().register(torch_bindings=bindings)
     return TorchSink(ops=table)
 
@@ -522,3 +618,485 @@ def novel_cost(base: Any, is_novel: Any, bonus: float = 0.5) -> Any:
         return c
 
     return cost
+
+
+# ---------------------------------------------------------------------------
+#  The scan tier — generated kernels for the diagonal-affine carrier
+# ---------------------------------------------------------------------------
+
+#: Tile width for generated scan kernels — one Triton program per
+#: ``BLOCK`` columns of the flattened state space.
+_SCAN_BLOCK = 1024
+
+#: Names the generated scan source already binds — a metavar colliding
+#: with one (or with the generated ``*_ptr`` parameter suffix) would
+#: silently shadow a program variable, so such specs decline codegen.
+_SCAN_RESERVED = frozenset(
+    {
+        "acc",
+        "off",
+        "mask",
+        "row",
+        "n",
+        "N",
+        "T",
+        "t",
+        "BLOCK",
+        "out",
+        "program_id",
+    }
+)
+
+
+def _meta_name_ok(name: Any) -> bool:
+    """Check *name* is safe as a generated-kernel variable."""
+    return (
+        isinstance(name, str)
+        and name.isidentifier()
+        and not keyword.iskeyword(name)
+        and not name.endswith("_ptr")
+        and name not in _SCAN_RESERVED
+    )
+
+
+def _affd_leaves(f_spec: Any) -> list | None:
+    """In-order ``(a, b)`` operand pairs of a pure aff_diag map spec.
+
+    ``None`` when *f_spec* is not an ``aff_diag`` leaf or an
+    ``affd_compose`` tree over such leaves (attr-carrying or foreign
+    nodes included — the map spec must be exactly the carrier's).
+    """
+    if not (
+        isinstance(f_spec, (tuple, list))
+        and len(f_spec) == 3
+        and all(not isinstance(e, dict) for e in f_spec)
+    ):
+        return None
+    if f_spec[0] == "aff_diag":
+        return [(f_spec[1], f_spec[2])]
+    if f_spec[0] != "affd_compose":
+        return None
+    left = _affd_leaves(f_spec[1])
+    right = _affd_leaves(f_spec[2])
+    if left is None or right is None:
+        return None
+    return [*left, *right]
+
+
+def _leaf_exprs(leaves: list, h: str) -> tuple[list, list] | None:
+    """Render leaf operands to Triton exprs, in chronological order.
+
+    In-order leaves of an ``affd_compose`` tree are REVERSE
+    chronological — ``affd_compose(f, g)`` applies ``g`` first — so
+    the list is flipped here.  Returns ``(metas, steps)`` where
+    *metas* are the operand metavars in spec order and *steps* the
+    ``(a_expr, b_expr)`` rendered pairs.  ``None`` declines: an
+    operand the elementwise renderer cannot express, a metavar that
+    collides with kernel names, or the state meta rebound as a
+    sequence operand.
+    """
+    metas: list = []
+    for a_spec, b_spec in leaves:
+        for m in _spec_metas(("aff_diag", a_spec, b_spec)):
+            if m not in metas:
+                metas.append(m)
+    if (
+        not metas
+        or h in metas
+        or any(not _meta_name_ok(m) for m in metas)
+    ):
+        return None
+    steps = []
+    for a_spec, b_spec in reversed(leaves):
+        ea, eb = _triton_expr(a_spec), _triton_expr(b_spec)
+        if ea is None or eb is None:
+            return None
+        steps.append((ea, eb))
+    return metas, steps
+
+
+def _applyd_operands(spec: Any) -> tuple | None:
+    """Split an ``applyd`` spec into ``(map spec, state meta, attrs)``.
+
+    ``None`` when the node is not a two-operand ``applyd`` over a
+    metavar state — malformed arities, a non-metavar ``h``, or a
+    kernel-name-colliding state all decline here.
+    """
+    if not (
+        isinstance(spec, (tuple, list))
+        and len(spec) >= 3
+        and spec[0] == "applyd"
+    ):
+        return None
+    kids = [e for e in spec[1:] if not isinstance(e, dict)]
+    if len(kids) != 2 or not _meta_name_ok(kids[1]):
+        return None
+    attrs = next((e for e in spec[1:] if isinstance(e, dict)), None)
+    return kids[0], kids[1], attrs
+
+
+def scan_spec(spec: Any) -> dict | None:
+    """Recognise an ``applyd``-carrier spec the scan codegen accepts.
+
+    Returns a descriptor dict, or ``None`` when the spec is outside
+    the tier's grammar (decline — the handler keeps its torch path):
+
+    * ``{"kind": "seq", ...}`` for ``("applyd", ("aff_diag", a, b),
+      h)`` — the sequence form.  ``"seq"`` lists the operand metavars
+      (each a per-step tensor on the step axis), ``"a"``/``"b"`` the
+      rendered per-step expressions, ``"h"`` the state metavar.
+    * ``{"kind": "unrolled", ...}`` for ``("applyd",
+      <affd_compose tree>, h)`` — ``"steps"`` the rendered ``(a, b)``
+      pairs in chronological order.
+
+    Both carry ``"params"`` — the spec's metavars in order, i.e. the
+    generated binding's positional signature.  A trailing attr dict
+    on the ``applyd`` node may declare ``{"axis": int}`` — surfaced
+    as ``info["axis"]``; a ``None``/absent axis defers to the
+    binding's default or its derive-from-``h`` rule.
+    """
+    parts = _applyd_operands(spec)
+    if parts is None:
+        return None
+    f_spec, h_spec, attrs = parts
+    leaves = _affd_leaves(f_spec)
+    if leaves is None:
+        return None
+    rendered = _leaf_exprs(leaves, h_spec)
+    if rendered is None:
+        return None
+    metas, steps = rendered
+    info: dict[str, Any] = {
+        "h": h_spec,
+        "seq": metas,
+        "params": [*metas, h_spec],
+    }
+    if len(leaves) == 1:
+        (ea, eb) = steps[0]
+        info.update({"kind": "seq", "a": ea, "b": eb})
+    else:
+        info.update({"kind": "unrolled", "steps": steps})
+    if attrs is not None and "axis" in attrs:
+        info["axis"] = attrs["axis"]
+    return info
+
+
+def _seq_triton_source(info: dict) -> str:
+    """Emit the sequential-scan kernel module for a ``seq`` spec.
+
+    One program per ``BLOCK`` columns of the flattened state space;
+    each walks the step axis serially — ``acc = a_t * acc + b_t``.
+    Row offsets are computed in int64 so ``T * N`` may exceed int32.
+    """
+    params = ", ".join(f"{m}_ptr" for m in info["params"])
+    loads = "".join(
+        f"        {m} = tl.load({m}_ptr + row + off,"
+        " mask=mask, other=0.0)\n"
+        for m in info["seq"]
+    )
+    return (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "import triton.language.extra.libdevice as libdevice\n"
+        "\n\n@triton.jit\n"
+        f"def _gs({params}, out_ptr, T, N, BLOCK: tl.constexpr):\n"
+        "    off = tl.program_id(0).to(tl.int64) * BLOCK"
+        " + tl.arange(0, BLOCK)\n"
+        "    mask = off < N\n"
+        f"    acc = tl.load({info['h']}_ptr + off,"
+        " mask=mask, other=0.0)\n"
+        "    for t in range(T):\n"
+        "        row = t.to(tl.int64) * N\n"
+        f"{loads}"
+        f"        acc = ({info['a']}) * acc + ({info['b']})\n"
+        "    tl.store(out_ptr + off, acc, mask=mask)\n"
+    )
+
+
+def _unrolled_triton_source(info: dict) -> str:
+    """Emit the unrolled carrier kernel for a compose-tree spec.
+
+    One flat pass over the broadcast state space applying each leaf
+    step in chronological order — ``acc = a_i * acc + b_i`` — exactly
+    the ambient ``applyd``/``affd_compose`` semantics fused into one
+    kernel.
+    """
+    params = ", ".join(f"{m}_ptr" for m in info["params"])
+    loads = "".join(
+        f"    {m} = tl.load({m}_ptr + off, mask=mask, other=0.0)\n"
+        for m in info["seq"]
+    )
+    steps = "".join(
+        f"    acc = ({ea}) * acc + ({eb})\n" for ea, eb in info["steps"]
+    )
+    return (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "import triton.language.extra.libdevice as libdevice\n"
+        "\n\n@triton.jit\n"
+        f"def _gs({params}, out_ptr, n, BLOCK: tl.constexpr):\n"
+        "    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
+        "    mask = off < n\n"
+        f"{loads}"
+        f"    acc = tl.load({info['h']}_ptr + off,"
+        " mask=mask, other=0.0)\n"
+        f"{steps}"
+        "    tl.store(out_ptr + off, acc, mask=mask)\n"
+    )
+
+
+def _scan_triton_source(info: dict) -> str:
+    """Emit the generated scan kernel module for a recognised spec.
+
+    *info* is a :func:`scan_spec` descriptor; ``"seq"`` emits the
+    sequential step-axis fold, ``"unrolled"`` the flat chronological
+    pass.  The source is a real module — written to the kernel cache
+    by the caller.
+    """
+    if info["kind"] == "seq":
+        return _seq_triton_source(info)
+    return _unrolled_triton_source(info)
+
+
+def _broadcasts_into(src: Any, dst: tuple) -> bool:
+    """Check a tensor shaped *src* broadcasts to *dst*."""
+    import torch
+
+    try:
+        got = torch.broadcast_shapes(tuple(src), tuple(dst))
+    except RuntimeError:
+        return False
+    return tuple(got) == tuple(dst)
+
+
+def _seq_axis(full: tuple, h_shape: Any, axis: int | None) -> int:
+    """Resolve the step axis of the common sequence shape.
+
+    An explicit *axis* is normalised against ``len(full)``.  ``None``
+    derives it: the step axis is the one whose removal leaves the
+    state shape *h* broadcasts into — requiring exactly one
+    candidate.  Zero candidates means *h* matches no contraction of
+    the operands' shape; several means the shapes alone cannot tell
+    (e.g. a square ambiguous state/step extent) — both are honest
+    ``ValueError``s, not guesses.
+    """
+    if axis is not None:
+        return axis % len(full)
+    cand = [
+        i
+        for i in range(len(full))
+        if _broadcasts_into(h_shape, full[:i] + full[i + 1 :])
+    ]
+    if len(cand) != 1:
+        raise ValueError(
+            f"scan axis is not determined by the shapes:"
+            f" candidates={tuple(cand)} for full={tuple(full)}"
+            f" h={tuple(h_shape)}"
+        )
+    return cand[0]
+
+
+def _scan_dtype(vals: dict, metas: list) -> Any:
+    """Promoted dtype over the bound meta values."""
+    import torch
+
+    dt = vals[metas[0]].dtype
+    for m in metas[1:]:
+        dt = torch.promote_types(dt, vals[m].dtype)
+    return dt
+
+
+def _seq_args(vals: dict, info: dict, axis: int | None) -> tuple:
+    """Normalise bound sequence operands to ``(T, N)`` row tensors.
+
+    Returns ``(rows, h_flat, state_shape, T, n, dtype)`` — the launch
+    arguments in kernel order.  Broadcasting is right-aligned: each
+    operand's trailing dims land on state axes, so an operand without
+    a step axis (a shared ``(d,)`` decay under ``(T, d)`` inputs, or
+    a scalar) broadcasts over steps automatically.  Every sequence
+    operand is materialised contiguous — the price of generality
+    over strides, stated plainly.
+    """
+    import torch
+
+    xs = torch.broadcast_tensors(*(vals[m] for m in info["seq"]))
+    full = xs[0].shape
+    if not full:
+        raise ValueError("scan operands carry no step axis")
+    if not xs[0].is_cuda:
+        raise RuntimeError("generated scan kernels need CUDA tensors")
+    ax = _seq_axis(full, vals[info["h"]].shape, axis)
+    t_len = full[ax]
+    state = full[:ax] + full[ax + 1 :]
+    dt = _scan_dtype(vals, info["params"])
+    rows = {
+        m: x.to(dt).movedim(ax, 0).contiguous().view(t_len, -1)
+        for m, x in zip(info["seq"], xs, strict=True)
+    }
+    h_flat = (
+        torch.broadcast_to(vals[info["h"]].to(dt), state)
+        .contiguous()
+        .view(-1)
+    )
+    return rows, h_flat, state, t_len, h_flat.numel(), dt
+
+
+def _seq_binding(kern: Any, info: dict, axis: int | None) -> Any:
+    """Host wrapper for the sequential-scan kernel.
+
+    ``fn(*vals)`` binds the spec metavars positionally (the handler's
+    ``args`` order), normalises the sequence operands, and launches
+    the fold.  ``axis`` is the declared step axis — ``None`` derives
+    it from the state shape each call.
+    """
+
+    def fn(*args: Any, **_attrs: Any) -> Any:
+        import torch
+
+        vals = dict(zip(info["params"], args, strict=True))
+        rows, h_flat, state, t_len, n, dt = _seq_args(vals, info, axis)
+        out = torch.empty(n, dtype=dt, device=h_flat.device)
+        kern[((n + _SCAN_BLOCK - 1) // _SCAN_BLOCK,)](
+            *(rows[m] for m in info["seq"]),
+            h_flat,
+            out,
+            t_len,
+            n,
+            BLOCK=_SCAN_BLOCK,
+        )
+        return out.view(state)
+
+    return fn
+
+
+def _unrolled_binding(kern: Any, info: dict) -> Any:
+    """Host wrapper for the unrolled carrier kernel.
+
+    ``fn(*vals)`` binds the spec metavars positionally, broadcasts
+    every operand (and the state) to one flat index space, and
+    applies each leaf step in chronological order inside the kernel.
+    """
+
+    def fn(*args: Any, **_attrs: Any) -> Any:
+        import torch
+
+        vals = dict(zip(info["params"], args, strict=True))
+        xs = torch.broadcast_tensors(*(vals[m] for m in info["params"]))
+        if not xs[0].is_cuda:
+            raise RuntimeError(
+                "generated scan kernels need CUDA tensors"
+            )
+        shape = xs[0].shape
+        dt = _scan_dtype(vals, info["params"])
+        flats = [x.to(dt).contiguous().view(-1) for x in xs]
+        n = flats[0].numel()
+        out = torch.empty(n, dtype=dt, device=flats[0].device)
+        kern[((n + _SCAN_BLOCK - 1) // _SCAN_BLOCK,)](
+            *flats, out, n, BLOCK=_SCAN_BLOCK
+        )
+        return out.view(shape)
+
+    return fn
+
+
+def scan_triton_bindings(
+    handlers: dict, *, axis: int | None = -2
+) -> dict:
+    """Generate a Triton scan kernel per ``applyd``-carrier handler.
+
+    The second codegen tier: each handler whose *pattern*
+    :func:`scan_spec` recognises gets a binding whose callable runs a
+    generated sequential-scan kernel — one launch for the whole
+    recurrence, real ``triton.jit`` source on disk under the kernel
+    cache.  The step axis defaults to ``-2`` (the token axis of
+    ``(B, T, d)`` layouts); a handler may pin ``"axis"`` (or the spec
+    may declare it as an ``applyd`` attr), and ``axis=None`` derives
+    the axis from the state shape at call time.
+
+    Unrecognised or un-generatable specs are skipped — the handler
+    keeps its torch path, exactly as the elementwise tier declines.
+    """
+    out: dict[str, Any] = {}
+    for h in handlers.values():
+        info = scan_spec(h["pattern"])
+        if info is None:
+            continue
+        ax = h.get("axis", info.get("axis", axis))
+        src = _scan_triton_source(info)
+        path = _kernel_cache() / f"_gs_{h['kernel']}.py"
+        path.write_text(src)
+        kern = _load_generated(path, "_gs")
+        if kern is None:
+            continue  # module load declined — keep the torch path
+        if info["kind"] == "seq":
+            out[h["kernel"]] = _seq_binding(kern, info, ax)
+        else:
+            out[h["kernel"]] = _unrolled_binding(kern, info)
+    return out
+
+
+def scan_handlers(
+    terms: list, *, axis: int | None = -2, covered: set | None = None
+) -> dict:
+    """Mint handler entries for ``applyd``-carrier scan terms.
+
+    The carrier analogue of :func:`gen_handlers`: ``scan_<i>`` entries
+    ``{pattern, kernel, args, axis}`` for each term whose spec is a
+    recognised scan — the *sequence* form (an ``applyd(aff_diag(a,
+    b), h)`` site whose operands carry a step axis) or the *unrolled*
+    form (an ``affd_compose`` tree, e.g. what ``affd_scan2_lift`` /
+    ``affd_scan4_lift`` leave behind).  ``axis`` is recorded in the
+    entry as the declared step axis; ``None`` defers to call-time
+    derivation.
+
+    The caller owns the semantics check for the sequence form: the
+    minted ``scan_<i>_k`` op's declared meaning is the fold, so the
+    handler belongs on sites whose ``a``/``b`` operands genuinely
+    carry a step axis — the binding raises on operands that do not.
+    """
+    from catopt_discovery.meta_arena import (
+        _canon_concrete,
+        _spec_of,
+    )
+
+    skip = covered if covered is not None else set()
+    out: dict[str, dict] = {}
+    for term in terms:
+        pattern = (
+            term
+            if isinstance(term, (tuple, list))
+            else _spec_of(term, {})
+        )
+        if scan_spec(pattern) is None:
+            continue
+        canon = _canon_concrete(pattern)
+        if canon in skip or any(
+            _canon_concrete(h["pattern"]) == canon for h in out.values()
+        ):
+            continue
+        tag = f"scan_{len(out)}"
+        out[tag] = {
+            "pattern": pattern,
+            "kernel": f"{tag}_k",
+            "args": tuple(_spec_metas(pattern)),
+            "axis": axis,
+        }
+    return out
+
+
+def scan_triton_sink(handlers: dict, *, axis: int | None = -2) -> Any:
+    """Build a ``TorchSink`` binding minted scan ops to Triton kernels.
+
+    Same posture as :func:`triton_sink`: ``supported_ops`` reports the
+    ambient table plus every generated scan kernel — the feasibility
+    bound the board prices the carrier claims against — and a claim
+    on an unrecognised spec stays unpriced-unlowerable.
+    """
+    import catopt_torch.torch_bridge as tb
+    from catopt_core.ops import OpTable
+    from catopt_torch.adapters import TorchSink
+
+    bindings = dict(tb._IR_TO_TORCH)
+    bindings.update(scan_triton_bindings(handlers, axis=axis))
+    table = OpTable.core().register(torch_bindings=bindings)
+    return TorchSink(ops=table)

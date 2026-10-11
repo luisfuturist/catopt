@@ -762,6 +762,146 @@ def _time_module(model: Any, x: Any, reps: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+#  The scan-tier probe — generated fold kernel vs today's delivery
+# ---------------------------------------------------------------------------
+
+
+def _spelled_scan(a: Any, b: Any, h: Any) -> Any:
+    """Fold the torch-loop spelling: ``h_t = a_t*h + b_t`` (axis 1)."""
+    for t in range(a.shape[1]):
+        h = a.select(1, t) * h + b.select(1, t)
+    return h
+
+
+def _scan_carrier_ir(batch: int, steps: int, width: int) -> Any:
+    """``applyd(<balanced affd_compose tree>, h)`` over select leaves.
+
+    The form ``affd`` lifts leave behind — per-step ``aff_diag``
+    leaves bracketed into a balanced compose tree (in-order leaves
+    are reverse-chronological, so later steps sit in the LEFT
+    subtree: ``affd_compose(f, g)`` applies ``g`` first).
+    """
+    from catopt_core.ir import IR
+
+    a = Var("a", TensorType((batch, steps, width)))
+    b = Var("b", TensorType((batch, steps, width)))
+    h = Var("h", TensorType((batch, width)))
+    leaves = [
+        Op.make(
+            "aff_diag",
+            Op.make("select", a, dim=1, index=t),
+            Op.make("select", b, dim=1, index=t),
+        )
+        for t in range(steps)
+    ]
+
+    def tree(ls: list) -> Any:
+        if len(ls) == 1:
+            return ls[0]
+        k = len(ls) // 2
+        return Op.make("affd_compose", tree(ls[k:]), tree(ls[:k]))
+
+    return IR(
+        root=Op.make("applyd", tree(leaves), h),
+        inputs=[a, b, h],
+        input_names={"a", "b", "h"},
+        params={},
+    )
+
+
+#: Default probe shapes — AdaLNBlock-style ``(B, T, d)`` fp64 scans.
+_SCAN_PROBE_SHAPES = ((2, 64, 128), (8, 128, 512))
+
+
+def scan_probe(
+    *,
+    shapes: Any = None,
+    reps: int = 100,
+    fused: bool = True,
+) -> list[dict]:
+    """Time the generated scan kernel against today's delivery paths.
+
+    The honest-number arm for the scan tier: per ``(B, T, d)`` shape
+    — fp64 CUDA, AdaLNBlock-style token axis — the row reports median
+    µs for the spelled torch loop (eager and ``torch.compile``-fused),
+    the carrier executor path (generic ``TorchSink`` tuple-passing
+    eval of the ``affd_compose`` tree, the level-batched
+    ``to_batched_scan_module`` slot-gather schedule, and — with
+    *fused* — its ``scan_fused`` compiled schedule), and the
+    generated Triton fold kernel from
+    :func:`~catopt_discovery.genkernel.scan_triton_bindings`.
+    Every arm is verified against the spelled loop before timing.
+    On a host without CUDA+triton the row reports ``delivered:
+    False`` honestly.
+    """
+    import torch
+    from catopt_carriers.scan_lower import to_batched_scan_module
+    from catopt_torch.adapters import TorchSink
+
+    from catopt_discovery import genkernel as gk
+
+    if shapes is None:
+        shapes = _SCAN_PROBE_SHAPES
+    if not (torch.cuda.is_available() and _has_triton()):
+        return [{"delivered": False, "note": "needs cuda + triton"}]
+    _dyno_cfg: Any = torch._dynamo.config
+    _dyno_cfg.recompile_limit = max(int(_dyno_cfg.recompile_limit), 256)
+    kern = gk.scan_triton_bindings(
+        {
+            "s": {
+                "pattern": ("applyd", ("aff_diag", "A", "B"), "H"),
+                "kernel": "sc_probe",
+                "args": ("A", "B", "H"),
+            }
+        }
+    )["sc_probe"]
+    compiled = torch.compile(_spelled_scan)
+    dt, dev = torch.float64, "cuda"
+    rows: list[dict] = []
+    for batch, steps, width in shapes:
+        a = torch.rand(batch, steps, width, device=dev, dtype=dt)
+        a = a * 0.5 + 0.3
+        b = torch.randn(batch, steps, width, device=dev, dtype=dt)
+        h = torch.randn(batch, width, device=dev, dtype=dt)
+        want = _spelled_scan(a, b, h)
+        ir = _scan_carrier_ir(batch, steps, width)
+        generic = TorchSink().lower(ir, params={})
+        batched = to_batched_scan_module(ir)
+        arms: dict[str, Any] = {
+            "spelled": _spelled_scan,
+            "spelled_compiled": compiled,
+            "executor_generic": generic,
+            "executor_batched": batched,
+            "triton_scan": kern,
+        }
+        if fused:
+            arms["executor_fused"] = to_batched_scan_module(
+                ir, fused="compile"
+            )
+        row: dict[str, Any] = {
+            "shape": (batch, steps, width),
+            "delivered": True,
+        }
+        for name, fn in arms.items():
+            torch.testing.assert_close(
+                fn(a, b, h), want, atol=1e-9, rtol=1e-9
+            )
+            row[f"{name}_us"] = _time_module(fn, (a, b, h), reps)
+        row["vs_spelled"] = round(
+            row["spelled_us"] / row["triton_scan_us"], 3
+        )
+        rows.append(row)
+    return rows
+
+
+def _has_triton() -> bool:
+    """Check triton is importable (the codegen tiers' runtime)."""
+    import importlib.util
+
+    return importlib.util.find_spec("triton") is not None
+
+
+# ---------------------------------------------------------------------------
 #  Domain: search — SearchEnv adapted to the Board contract
 # ---------------------------------------------------------------------------
 
@@ -1050,6 +1190,11 @@ def _extras(args: Any, d: Any, ev: list, player: Any) -> None:
                 )
     if args.zoo:
         _zoo_rows()
+    if args.scan_probe:
+        for row in scan_probe():
+            print(
+                f"scan[{row.get('shape', '-')}]: {row}"
+            )  # stdout-compat
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1079,6 +1224,14 @@ def main(argv: list[str] | None = None) -> int:
         "--zoo",
         action="store_true",
         help="run the claim→deliver→time probe over the held-out zoo",
+    )
+    ap.add_argument(
+        "--scan-probe",
+        action="store_true",
+        help=(
+            "time the generated Triton scan kernel against the "
+            "spelled loop and the carrier executor path (CUDA)"
+        ),
     )
     ap.add_argument("--json", type=str, default=None)
     args = ap.parse_args(argv)
