@@ -19,9 +19,15 @@ measures confluence and divergence between laws).  Declared objects
 as *data*, and `opdata` makes a new primitive declarable the same
 way.  Two games are played on this tower: **search** applies 2-cells
 inside one equivalence class (steps 5–6 below); **construction**
-writes new cells (`catopt_discovery.object_synthesis` +
-`evidence`; plan 0020 builds the episode arena).  The certificate
-is the replayable 2-cell; its replay is the referee.
+writes new cells (`catopt_discovery.object_synthesis` + `evidence`,
+played as episodes on `catopt_discovery.arena` / `meta_arena` boards,
+exposed as an RL environment by `catopt_discovery.play` — one CLI,
+five domains, `--deliver`/`--probe`/`--zoo`).  In the `gen` domain the
+board mints a handler for any unnamed elementwise subterm
+(`genkernel`), `claim` declares the handler's own pattern mid-search,
+and `deliver` lowers to a verified module calling generated
+`triton.jit` source.  The certificate is the replayable 2-cell; its
+replay is the referee.
 
 ## The loop, step by step
 
@@ -96,7 +102,7 @@ Two more consequences worth stating plainly:
   them).  Few axioms generate many consequences; the reach is their
   closure.  The split is *measured on the shipped library*, not
   asserted: `rule.kind` marks each member `axiom` / `lemma` /
-  `redundant` (40 / 12 / 2 over `ALL_RULES`), and `rule.derivation`
+  `redundant` (55 / 14 / 2 over `ALL_RULES`), and `rule.derivation`
   records the premise(s) proving each non-axiom.
 - **Choosing the interpretation is the discovery act.**  The same
   graph reads as plain composition, a comonoid (pairing), a
