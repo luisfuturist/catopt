@@ -145,22 +145,27 @@ class LinearPolicy:
             self._hist = self.fresh_hist()
         self._prev_steps = state.steps
 
-    def __call__(self, state: Any) -> Any | None:
-        """Score the unplayed legal moves, sample one, remember it."""
+    def _scored_unplayed(self, state: Any) -> tuple[list, list, list]:
+        """Return ``(acts, feats, exps)`` over the unplayed legal set."""
         self._observe(state)
         acts = [
             a
             for a in self._legal(state)
             if _action_key(a) not in self._played
         ]
-        if not acts:
-            return None
         feats = [self._featurizer(state, a, self._hist) for a in acts]
         logits = [_dot(self._w, f) / self._temp for f in feats]
-        top = max(logits)
+        top = max(logits) if logits else 0.0
         exps = [math.exp(x - top) for x in logits]
+        return acts, feats, exps
+
+    def __call__(self, state: Any) -> Any | None:
+        """Score the unplayed legal moves, sample one, remember it."""
+        acts, feats, exps = self._scored_unplayed(state)
+        if not acts:
+            return None
         if self._greedy:
-            i = logits.index(top)
+            i = exps.index(max(exps))
         elif self._eps and self._rng.random() < self._eps:
             i = self._rng.randrange(len(acts))
         else:
@@ -177,6 +182,37 @@ class LinearPolicy:
         rec = getattr(self._hist, "record", None)
         if rec is not None:
             rec(getattr(action, "op", "?"))
+
+    def imitate(self, state: Any, action: Any) -> bool:
+        """Behavior-cloning step toward a demonstrated *action*.
+
+        Computes the same softmax over the unplayed legal set the
+        sampler uses, then moves the weights toward the expert's
+        features: ``w += lr·(φ_expert - E_π[φ])`` — a cross-entropy
+        update with no baseline and no return, so demonstrations
+        count identically regardless of what the episode later pays.
+        Returns False when the expert move is not in the live legal
+        set (the policy's played mask or the board's legality may
+        diverge from the trace's) — the caller decides whether that
+        step still replays on the board.  No-op when ``learn=False``.
+        """
+        acts, feats, exps = self._scored_unplayed(state)
+        key = _action_key(action)
+        hit = next(
+            (i for i, a in enumerate(acts) if _action_key(a) == key),
+            None,
+        )
+        if hit is None:
+            return False
+        if self._learn:
+            _phi, ephi = _grad_row(feats, exps, hit)
+            for k, v in feats[hit].items():
+                self._w[k] = self._w.get(k, 0.0) + self._lr * v
+            for k, v in ephi.items():
+                self._w[k] = self._w.get(k, 0.0) - self._lr * v
+        self._played.add(key)
+        self._record(action)
+        return True
 
     def _sample(self, exps: list[float]) -> int:
         """Draw an index proportionally to the unnormalized weights."""

@@ -176,6 +176,63 @@ class TestPlayer:
         assert a is not None
 
 
+class TestImitate:
+    def test_imitates_legal_move_and_learns(self):
+        p = mp.MetaLearnedPlayer(0)
+        arena = _silu_board()
+        st = arena.observe()
+        move = ma.Action.saturate()
+        before = p.weights_dict()
+        assert p.imitate(st, move) is True
+        after = p.weights_dict()
+        assert any(before[k] != after[k] for k in before)
+
+    def test_declines_move_outside_legal_set(self):
+        p = mp.MetaLearnedPlayer(0)
+        arena = _silu_board()
+        st = arena.observe()
+        move = ma.Action.saturate()
+        assert p.imitate(st, move) is True
+        # the played mask now holds it — same offer declines
+        assert p.imitate(st, move) is False
+
+    def test_frozen_does_not_learn(self):
+        p = mp.MetaLearnedPlayer(0, learn=False)
+        arena = _silu_board()
+        st = arena.observe()
+        assert p.imitate(st, ma.Action.saturate()) is True
+        assert all(v == 0.0 for v in p.weights_dict().values())
+
+    def test_imitation_warm_start_picks_expert_line(self):
+        # expert: saturate → extract — after imitation the policy
+        # should rank the demonstrated line top under greedy eval
+        p = mp.MetaLearnedPlayer(0)
+        for _ in range(8):
+            arena = _silu_board()
+            st = arena.observe()
+            assert p.imitate(st, ma.Action.saturate())
+            arena.step(ma.Action.saturate())
+            p.imitate(arena.observe(), ma.Action.extract())
+        q = p.frozen(0, greedy=True)
+        arena2 = _silu_board()
+        a = q(arena2.observe())
+        assert a is not None and a.op == "saturate"
+
+    def test_imitate_policy_counts(self):
+        from catopt_discovery import engine as eng
+
+        p = mp.MetaLearnedPlayer(0)
+        res = eng.imitate_policy(
+            p,
+            lambda _i: ma.ScriptedPlayer(),
+            cases=[None, None],
+            board_of=lambda _c: _silu_board(),
+            budget=4,
+        )
+        assert res["shown"] == 4
+        assert res["imitated"] == 4
+
+
 class TestDriver:
     def test_gen_cases_kinds(self):
         cases = mp.gen_cases(0, 20)

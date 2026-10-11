@@ -253,9 +253,8 @@ def profitable(
     # measurement integrity — see gen_probe: per-handler compiled
     # fns would exhaust dynamo's default recompile limit (8) and
     # silently degrade to eager mid-sweep.
-    torch._dynamo.config.recompile_limit = max(
-        int(torch._dynamo.config.recompile_limit), 256
-    )
+    _dyno_cfg: Any = torch._dynamo.config
+    _dyno_cfg.recompile_limit = max(int(_dyno_cfg.recompile_limit), 256)
 
     bindings = tb._IR_TO_TORCH
     keep: dict[str, dict] = {}

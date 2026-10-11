@@ -566,9 +566,8 @@ def gen_probe(case: Any, *, budget: int = 12, reps: int = 200) -> dict:
     # default limit (8) would silently degrade late compiles —
     # and late *baseline* compiles — to eager.  Raise it so both
     # sides are measured as compiled, not corrupted by the cache.
-    torch._dynamo.config.recompile_limit = max(
-        int(torch._dynamo.config.recompile_limit), 256
-    )
+    _dyno_cfg: Any = torch._dynamo.config
+    _dyno_cfg.recompile_limit = max(int(_dyno_cfg.recompile_limit), 256)
 
     ex = case[5]
     device = "cuda" if torch.cuda.is_available() else "cpu"

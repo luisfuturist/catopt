@@ -145,6 +145,44 @@ def train_policy(
     return totals
 
 
+def imitate_policy(
+    player: Any,
+    expert: Callable[[int], Any],
+    cases: Iterable,
+    board_of: Callable[[Any], Board],
+    *,
+    budget: int,
+) -> dict[str, int]:
+    """Warm-start *player* by replaying *expert* episodes.
+
+    Each case runs one episode where the fresh ``expert(index)``
+    picks every action and ``player.imitate(state, action)`` takes a
+    cross-entropy step toward it; the board still executes the move,
+    so the trace is real (the expert acts on true states, not a
+    static log).  The factory is per-case, like ``evaluate``'s arms —
+    a stateful expert (a draining playbook) resets per episode.
+    Returns the per-run counts of demonstrated vs. successfully
+    imitated moves — a gap means the expert's actions left the
+    policy's live legal set, worth knowing.
+    """
+    shown = imitated = 0
+    for i, case in enumerate(cases):
+        board = board_of(case)
+        exp = expert(i)
+        for _ in range(budget):
+            state = board.observe()
+            if _done(state):
+                break
+            action = exp(state)
+            if action is None:
+                break
+            shown += 1
+            if player.imitate(state, action):
+                imitated += 1
+            _state, _rep = board.step(action)
+    return {"shown": shown, "imitated": imitated}
+
+
 def evaluate(
     arms: dict[str, Callable[[int], Any]],
     cases: list,
